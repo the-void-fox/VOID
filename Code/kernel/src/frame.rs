@@ -1,0 +1,46 @@
+//! Физический аллокатор фреймов — простой bump-аллокатор.
+//!
+//! До появления кучи (Веха 4) ядру негде брать память под таблицы страниц.
+//! Этот аллокатор раздаёт 4 КиБ-фреймы из свободной RAM, идущей сразу за образом
+//! ядра (символ `_kernel_end` из linker.ld) и до конца физической RAM.
+//! Освобождения нет — для ранней загрузки этого достаточно; позже заменим
+//! настоящим аллокатором физических страниц.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Размер страницы/фрейма в Sv39.
+pub const PAGE_SIZE: usize = 4096;
+
+extern "C" {
+    /// Конец образа ядра (символ из linker.ld). Нас интересует его адрес.
+    static _kernel_end: u8;
+}
+
+/// Конец физической RAM на QEMU virt при `-m 128M`: 0x8000_0000 + 128 МиБ.
+/// (Жёстко задано под наш runner в .cargo/config.toml; позже возьмём из DTB.)
+const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
+
+/// Адрес следующего свободного фрейма (двигается вверх).
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Инициализировать аллокатор: начать сразу за образом ядра.
+pub fn init() {
+    let start = &raw const _kernel_end as usize;
+    NEXT.store(align_up(start, PAGE_SIZE), Ordering::Relaxed);
+}
+
+/// Выделить один обнулённый фрейм. Возвращает физический адрес (он же
+/// виртуальный, пока RAM отображена идентично). `None` при исчерпании.
+pub fn alloc() -> Option<usize> {
+    let pa = NEXT.fetch_add(PAGE_SIZE, Ordering::Relaxed);
+    if pa + PAGE_SIZE > RAM_END {
+        return None;
+    }
+    // Обнулить фрейм: нулевой PTE = невалидный, поэтому новая таблица сразу «пустая».
+    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE) };
+    Some(pa)
+}
+
+const fn align_up(x: usize, a: usize) -> usize {
+    (x + a - 1) & !(a - 1)
+}
