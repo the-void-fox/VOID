@@ -1,0 +1,21 @@
+# Cargo workspace VOID.
+# Микроядро + общие библиотеки + (в будущем) userspace-серверы — каждый отдельным крейтом.
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "libs/void-abi",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+
+# Ядру нужен предсказуемый код без раскрутки стека.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

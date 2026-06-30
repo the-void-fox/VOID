@@ -1,0 +1,8 @@
+[package]
+name = "void-abi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Общие типы границы ядро/userspace и зачатки объектной модели VOID."
+
+[dependencies]

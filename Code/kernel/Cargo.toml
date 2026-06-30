@@ -1,0 +1,9 @@
+[package]
+name = "void-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Микроядро VOID (bare-metal RISC-V, S-mode)."
+
+[dependencies]
+void-abi = { path = "../libs/void-abi" }
