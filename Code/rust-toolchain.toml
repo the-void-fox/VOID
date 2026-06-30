@@ -1,0 +1,7 @@
+# Декларативный пин Rust-тулчейна (читается rustup).
+# target доустанавливается rustup'ом из host-сети (внутри nix-shell сети нет).
+# Ядро линкуется precompiled-таргетом, поэтому rust-src здесь не нужен
+# (он нужен только rust-analyzer'у/build-std — добавим при необходимости отдельно).
+[toolchain]
+channel = "stable"
+targets = ["riscv64gc-unknown-none-elf"]
