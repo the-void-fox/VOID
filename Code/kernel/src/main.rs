@@ -1,10 +1,15 @@
 //! Микроядро VOID — bare-metal RISC-V, S-mode.
 //!
 //! Веха 1: загрузка из OpenSBI, настройка стека, обнуление .bss, вывод в UART.
+//! Веха 2: вектор trap'ов, обработка исключений (ebreak) и таймерные прерывания.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
 
+mod csr;
+mod sbi;
+mod timer;
+mod trap;
 mod uart;
 
 use core::fmt::Write;
@@ -34,16 +39,29 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 1                            ║");
-    println!("  ║  персистентное контент-адресуемое        ║");
-    println!("  ║  capability-ядро · RISC-V · Rust          ║");
+    println!("  ║  VOID — Веха 2                            ║");
+    println!("  ║  trap'ы, исключения и таймер · RISC-V     ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
     println!("  dtb     : {:#x}", dtb);
     println!("  void-abi: v{}", void_abi::VERSION);
     println!();
-    println!("  [ok] boot + UART работают. Парковка в wfi.");
+
+    // 1) Поставить вектор обработки trap'ов (stvec → trap_entry).
+    trap::init();
+    println!("  [trap] вектор установлен (stvec → trap_entry)");
+
+    // 2) Проверка обработки исключений: намеренно выполняем ebreak.
+    //    Диспетчер поймает breakpoint, перешагнёт инструкцию и вернёт управление сюда.
+    println!("  [test] выполняем ebreak ...");
+    unsafe { core::arch::asm!("ebreak") }
+    println!("  [test] вернулись из ebreak → обработчик исключений работает");
+    println!();
+
+    // 3) Запустить периодический таймер и глобально включить прерывания.
+    timer::init();
+    println!("  [timer] таймер вооружён, прерывания включены — ждём тики (раз в секунду):");
 
     loop {
         // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
