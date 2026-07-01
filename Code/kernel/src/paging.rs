@@ -121,6 +121,7 @@ unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: usize) {
 
 /// Программный обход дерева VA→PA — ровно то, что аппаратно делает MMU.
 /// Возвращает физический адрес или `None`, если страница не отображена.
+#[allow(dead_code)] // отладочный инструмент: пригодится для page fault'ов (Веха 6+)
 pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
     let mut table = root_pa;
     let mut level = 2i32;
