@@ -13,7 +13,7 @@ Code/
 │   ├── build.rs          # передаёт linker.ld линкеру
 │   └── src/{main,uart}.rs, entry.s
 └── libs/
-    └── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap)
+    └── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap, Rights)
 ```
 
 ## Требования

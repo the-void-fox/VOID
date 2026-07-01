@@ -9,12 +9,14 @@
 //! Веха 6: объектная модель — контент-адресуемые значения + изменяемые корни (стержень).
 //! Веха 7.1: драйвер virtio-blk — чтение/запись секторов виртуального диска.
 //! Веха 7.2: персистентный контент-адресуемый store — состояние переживает перезагрузку.
+//! Веха 8: capability — непод­делываемые ссылки на объекты с правами (кто что может трогать).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod cap;
 mod context;
 mod csr;
 mod frame;
@@ -60,8 +62,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 7.2                          ║");
-    println!("  ║  персистентный store · диск               ║");
+    println!("  ║  VOID — Веха 8                            ║");
+    println!("  ║  capability · права на объекты            ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -107,6 +109,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
     println!();
 
+    // Веха 8: capability поверх объектного store (c-space в RAM; персистентность — позже).
+    cap_demo();
+    println!();
+
     // Многозадачность: задачи пишут объекты в общий store (одинаковый вклад → дедуп).
     sched::init();
     sched::spawn("X", writer);
@@ -137,6 +143,77 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     loop {
         // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
         unsafe { core::arch::asm!("wfi") }
+    }
+}
+
+/// Веха 8: демонстрация свойств capability на общем объектном store.
+/// Два домена: `kernel` владеет объектами, `app` получает только то, что ему передали.
+fn cap_demo() {
+    use void_abi::{Cap, Rights};
+
+    println!("  [cap] capability — неподделываемость · аттенуация · отзыв:");
+
+    let kernel = cap::create_domain("kernel");
+    let app = cap::create_domain("app");
+
+    // Неизменяемое значение + изменяемая ячейка-корень на него.
+    let v0 = object::put(b"demo: version 0");
+    object::set_root("demo-cell", v0);
+
+    // 1) Владелец минтит ПОЛНЫЙ capability на ячейку (r/w/g).
+    let owner = cap::mint(kernel, cap::Target::Root("demo-cell"), Rights::ALL);
+    println!("    {} минтит cap->'demo-cell' [{}]", cap::domain_name(kernel), cap::rights_str(Rights::ALL));
+
+    // 2) Передаёт в 'app' СУЖЕННУЮ копию — только чтение (аттенуация: rwg ∩ r-- = r--).
+    let ro = cap::grant(kernel, owner, app, Rights::READ).unwrap();
+    let got = cap::rights(app, ro).unwrap();
+    println!("    grant -> {} с маской [r--] → фактически [{}]  (расширить нельзя)",
+        cap::domain_name(app), cap::rights_str(got));
+
+    // 3) app читает своим cap — разрешено.
+    let _ = cap::read(app, ro, |b| {
+        println!("    {} читает ячейку: \"{}\"", cap::domain_name(app), core::str::from_utf8(b).unwrap_or("?"));
+    });
+
+    // 4) app пытается ПИСАТЬ своим read-only cap — отказ (нет WRITE).
+    let v1 = object::put(b"demo: version 1 (owner-written)");
+    match cap::write_root(app, ro, v1) {
+        Ok(()) => println!("    app записал?! — БАГ"),
+        Err(e) => println!("    app write отклонён: {:?}  ← нет права WRITE", e),
+    }
+
+    // 5) app пытается ПЕРЕДАТЬ дальше — отказ (нет GRANT, аттенуация сработала).
+    let other = cap::create_domain("other");
+    match cap::grant(app, ro, other, Rights::READ) {
+        Ok(_) => println!("    app передал дальше?! — БАГ"),
+        Err(e) => println!("    app grant отклонён: {:?}  ← нет права GRANT", e),
+    }
+
+    // 6) Владелец ПИШЕТ своим полным cap — разрешено (ячейка переезжает на v1).
+    cap::write_root(kernel, owner, v1).unwrap();
+    let _ = cap::read(kernel, owner, |b| {
+        println!("    {} пишет v1, читает: \"{}\"", cap::domain_name(kernel), core::str::from_utf8(b).unwrap_or("?"));
+    });
+
+    // 7) Capability и на НЕИЗМЕНЯЕМОЕ значение (не только на ячейку): read-only по природе.
+    let vcap = cap::mint(app, cap::Target::Value(v0), Rights::READ);
+    let _ = cap::read(app, vcap, |b| {
+        println!("    cap на значение v0: \"{}\"  (значения неизменяемы → только чтение)",
+            core::str::from_utf8(b).unwrap_or("?"));
+    });
+
+    // 8) Подделка: 'app' предъявляет выдуманный дескриптор — отвергнут таблицей.
+    let forged = Cap::new(999, 1);
+    match cap::read(app, forged, |_| {}) {
+        Ok(()) => println!("    подделка сработала?! — БАГ"),
+        Err(e) => println!("    подделанный cap отвергнут: {:?}  ← неподделываемость", e),
+    }
+
+    // 9) Отзыв: kernel отзывает свой cap; прежний дескриптор устаревает (поколение++).
+    cap::revoke(kernel, owner).unwrap();
+    match cap::read(kernel, owner, |_| {}) {
+        Ok(()) => println!("    доступ после отзыва?! — БАГ"),
+        Err(e) => println!("    cap после отзыва: {:?}  ← revocation", e),
     }
 }
 
