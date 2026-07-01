@@ -8,7 +8,7 @@ status: active
 # TODO
 
 ## Сейчас
-- [ ] Веха 10: user-mode (U-mode) + syscall/IPC граница; первый userspace-сервер
+- [ ] Веха 10.2: первый userspace-сервер (сервис через syscall/IPC)
 
 ## Скоро
 - [ ]
@@ -43,7 +43,8 @@ status: active
 > **Фаза 1 закрыта:** все три ингредиента ADR 0002 (персистентность · контент-адресация · capability) + async-модель исполнения над ними собраны и работают в QEMU.
 
 ## Фаза 2 — наружу
-- [ ] **Веха 10.** User-mode (U-mode) + syscall/IPC граница; первый userspace-сервер.
+- [x] **Веха 10.1.** U-mode + граница syscall (`ecall`): страницы `U`, переключение стека через `sscratch`, SYS_WRITE/SYS_EXIT, вход/возврат через `context_switch`. См. [[user-mode]].
+- [ ] **Веха 10.2.** Первый userspace-сервер (сервис через syscall/IPC); процессы со своим `satp`.
 - [ ] **Веха 11.** Драйверный фреймворк в userspace.
 - [ ] **Веха 12.** Слой совместимости (Linux/POSIX-персоналия) как сервер.
 
