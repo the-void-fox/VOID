@@ -7,13 +7,17 @@
 //!
 //! Устройство: арена — непрерывный кусок RAM, взятый у [`crate::frame::reserve`]
 //! (RAM уже отображена идентично в Вехе 3, поэтому физический адрес = виртуальный).
-//! По арене ведётся односвязный список свободных блоков. Узел списка хранится ПРЯМО
-//! в свободной памяти: первые байты свободного блока — это его размер и ссылка на
-//! следующий свободный блок. Выделение — first-fit (первый подходящий).
+//! По арене ведётся односвязный список свободных блоков, **отсортированный по адресу**.
+//! Узел списка хранится ПРЯМО в свободной памяти: первые байты свободного блока — это его
+//! размер и ссылка на следующий свободный блок. Выделение — first-fit (первый подходящий).
 //!
-//! Упрощения (осознанные, чиним позже): нет слияния соседних свободных блоков
-//! (возможна фрагментация); «дырка» перед выровненным началом теряется. Для ранней
-//! кучи этого достаточно; при желании заменим на аллокатор со слиянием/slab.
+//! Освобождение **сливает** соседние свободные блоки (coalescing): список держится в
+//! порядке адресов, и при возврате блока мы примыкаем его к соседу слева/справа, если они
+//! непрерывны. Это не даёт куче деградировать в мелкие несливаемые дырки при частых
+//! alloc/free (а их стало много: `Box`/`Vec`/`Arc`/future).
+//!
+//! Осознанные упрощения (чиним позже): «дырка» перед выровненным началом при экзотических
+//! выравниваниях теряется; арена фиксированного размера (2 МиБ), не растёт.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
@@ -63,15 +67,46 @@ impl FreeListAllocator {
         self.push_free(start, size);
     }
 
-    /// Вернуть регион [addr, addr+size) в свободный список (в голову).
+    /// Вернуть регион [addr, addr+size) в свободный список, сохраняя порядок по адресу
+    /// и **сливая** с примыкающими соседями (слева/справа).
     unsafe fn push_free(&mut self, addr: usize, size: usize) {
         debug_assert!(size >= mem::size_of::<FreeRegion>());
         debug_assert_eq!(align_up(addr, mem::align_of::<FreeRegion>()), addr);
+
+        // Адрес фиктивной головы — чтобы отличать её от реальных блоков (не сливать в неё).
+        let head_addr = &self.head as *const FreeRegion as usize;
+
+        // 1) Дойти до места вставки: `current` — последний узел с адресом < addr
+        //    (или сама голова). После цикла current.next — первый узел с адресом >= addr.
+        let mut current = &mut self.head;
+        while let Some(ref next) = current.next {
+            if next.start() >= addr {
+                break;
+            }
+            current = current.next.as_mut().unwrap();
+        }
+
+        // 2) Слить с последующим блоком, если он примыкает справа: addr+size == next.start.
+        let mut size = size;
+        let merge_next = matches!(current.next, Some(ref n) if addr + size == n.start());
+        if merge_next {
+            let next_node = current.next.take().unwrap();
+            size += next_node.size;
+            current.next = next_node.next.take(); // перецепить хвост списка выше
+        }
+
+        // 3) Слить с предыдущим (current), если это реальный блок и он примыкает слева.
+        if current.start() != head_addr && current.end() == addr {
+            current.size += size;
+            return;
+        }
+
+        // 4) Иначе вставить новый узел [addr, addr+size) между current и current.next.
         let mut node = FreeRegion::new(size);
-        node.next = self.head.next.take();
+        node.next = current.next.take();
         let node_ptr = addr as *mut FreeRegion;
         node_ptr.write(node);
-        self.head.next = Some(&mut *node_ptr);
+        current.next = Some(&mut *node_ptr);
     }
 
     /// First-fit: найти подходящий блок и вынуть его из списка.
