@@ -41,6 +41,18 @@ pub fn alloc() -> Option<usize> {
     Some(pa)
 }
 
+/// Зарезервировать непрерывный блок RAM (размер округляется вверх до страницы).
+/// Возвращает физический адрес начала — используется под арену кучи ядра (Веха 4).
+/// В отличие от [`alloc`], блок не обнуляется: кучей управляет её аллокатор.
+pub fn reserve(bytes: usize) -> Option<usize> {
+    let bytes = align_up(bytes, PAGE_SIZE);
+    let start = NEXT.fetch_add(bytes, Ordering::Relaxed);
+    if start + bytes > RAM_END {
+        return None;
+    }
+    Some(start)
+}
+
 const fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
 }

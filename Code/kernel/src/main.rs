@@ -3,14 +3,19 @@
 //! Веха 1: загрузка из OpenSBI, настройка стека, обнуление .bss, вывод в UART.
 //! Веха 2: вектор trap'ов, обработка исключений (ebreak) и таймерные прерывания.
 //! Веха 3: виртуальная память Sv39 (direct map RAM + W^X), включение трансляции.
+//! Веха 4: куча ядра (free-list аллокатор + #[global_allocator]) → работает `alloc`.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod csr;
 mod frame;
+mod heap;
 mod paging;
 mod sbi;
+mod sync;
 mod timer;
 mod trap;
 mod uart;
@@ -42,8 +47,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 3                            ║");
-    println!("  ║  виртуальная память Sv39 · RISC-V         ║");
+    println!("  ║  VOID — Веха 4                            ║");
+    println!("  ║  куча ядра · alloc/Box/Vec/String         ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -89,7 +94,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     );
     println!();
 
-    // 5) Таймер — доказывает, что trap'ы/прерывания живут и с включённым MMU.
+    // 5) Куча ядра. После init работают Box/Vec/String из `alloc`.
+    heap::init();
+    println!("  [heap] куча ядра готова (2 МиБ, free-list)");
+    heap_demo();
+    println!();
+
+    // 6) Таймер — доказывает, что trap'ы/прерывания живут и с включённым MMU.
     timer::init();
     println!("  [timer] идём под трансляцией, ждём тики:");
 
@@ -97,6 +108,41 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
         unsafe { core::arch::asm!("wfi") }
     }
+}
+
+/// Демонстрация кучи: динамические коллекции + освобождение/переиспользование.
+fn heap_demo() {
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    // Vec растёт динамически (несколько реаллокаций по мере push).
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..16 {
+        v.push(i * i);
+    }
+    println!("  [heap] Vec len={} cap={}: {:?} …", v.len(), v.capacity(), &v[..6]);
+
+    // String тоже живёт на куче.
+    let s = String::from("строки на куче — ок");
+    println!("  [heap] String: \"{}\"", s);
+
+    // Box кладёт значение на кучу.
+    let b = Box::new([0xABu8; 32]);
+    println!("  [heap] Box<[u8;32]> @ {:p}, [0]={:#x}", &*b, b[0]);
+
+    // Освобождение и переиспользование: адрес после free должен вернуться.
+    let a1 = Box::new(0xAAAA_u64);
+    let p1 = &*a1 as *const u64 as usize;
+    drop(a1); // блок уходит обратно в свободный список
+    let a2 = Box::new(0xBBBB_u64);
+    let p2 = &*a2 as *const u64 as usize;
+    println!(
+        "  [heap] free+reuse: {:#x} → {:#x} → {}",
+        p1,
+        p2,
+        if p1 == p2 { "тот же адрес ✓" } else { "другой" },
+    );
 }
 
 #[panic_handler]
