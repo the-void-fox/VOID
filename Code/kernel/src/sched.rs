@@ -14,6 +14,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::context::{context_switch, task_trampoline, Context};
+use crate::csr;
 use crate::sync::SpinLock;
 
 /// Размер стека одной задачи (берётся из кучи).
@@ -63,6 +64,18 @@ impl Scheduler {
 
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
+/// Выполнить `f` с захваченным планировщиком и ВЫКЛЮЧЕННЫМИ прерываниями.
+/// Выключать прерывания обязательно: иначе таймер вытеснит нас прямо посреди работы
+/// со списком задач, а его обработчик снова полезет в SCHED → взаимоблокировка.
+fn with_sched<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
+    let sie = csr::irq_save_disable();
+    let mut guard = SCHED.lock();
+    let r = f(&mut guard);
+    drop(guard);
+    csr::irq_restore(sie);
+    r
+}
+
 /// Инициализировать планировщик: сделать текущее исполнение (kmain) задачей «main».
 /// Её контекст заполнится автоматически при первом переключении с неё.
 pub fn init() {
@@ -72,7 +85,7 @@ pub fn init() {
         stack: Vec::new(), // main работает на загрузочном стеке из linker.ld
         state: State::Runnable,
     });
-    SCHED.lock().tasks.push(main);
+    with_sched(|s| s.tasks.push(main));
 }
 
 /// Создать задачу с собственным стеком, которая начнёт с функции `entry`.
@@ -86,62 +99,72 @@ pub fn spawn(name: &'static str, entry: fn()) {
     context.sp = sp;
     context.s[0] = entry as usize; // s0 = адрес функции задачи (см. task_trampoline)
 
-    let mut sched = SCHED.lock();
-    sched.tasks.push(Box::new(Task {
-        name,
-        context,
-        stack,
-        state: State::Runnable,
-    }));
+    with_sched(|s| {
+        s.tasks.push(Box::new(Task {
+            name,
+            context,
+            stack,
+            state: State::Runnable,
+        }));
+    });
 }
 
-/// Уступить процессор следующей готовой задаче (round-robin).
+/// Уступить процессор следующей готовой задаче (round-robin). Вызывается и кооперативно
+/// (самой задачей), и из обработчика таймера (вытеснение).
 pub fn yield_now() {
-    let old_ctx: *mut Context;
-    let new_ctx: *const Context;
-    {
+    // Выключаем прерывания на всё переключение и запоминаем прежнее состояние SIE ИМЕННО
+    // в локальной переменной: она лежит на стеке этой задачи и переживёт переключение,
+    // поэтому по возвращении сюда мы восстановим SIE ровно таким, каким он был у НАС.
+    // (Кооперативная задача уходила с SIE=1, вытесненная — из trap'а с SIE=0.)
+    let sie = csr::irq_save_disable();
+
+    let switch = {
         let mut sched = SCHED.lock();
         let old = sched.current;
-        let next = match sched.pick_next(old) {
-            Some(n) if n != old => n,
-            _ => return, // некому уступить — продолжаем сами
-        };
-        sched.current = next;
-        // Сырые указатели: задачи в Box'ах, их адреса стабильны и переживут drop замка.
-        old_ctx = &raw mut sched.tasks[old].context;
-        new_ctx = &raw const sched.tasks[next].context;
-    } // ВАЖНО: отпускаем замок ДО переключения, иначе следующая задача не сможет его взять
+        match sched.pick_next(old) {
+            Some(next) if next != old => {
+                sched.current = next;
+                // Сырые указатели: задачи в Box'ах, адреса стабильны.
+                let o = &raw mut sched.tasks[old].context;
+                let n = &raw const sched.tasks[next].context;
+                Some((o, n))
+            }
+            _ => None, // некому уступить
+        }
+    };
 
-    // SAFETY: контексты валидны и стабильны; замок отпущен.
-    unsafe { context_switch(old_ctx, new_ctx) }
+    if let Some((o, n)) = switch {
+        // SAFETY: контексты валидны/стабильны; прерывания выключены на время переключения.
+        unsafe { context_switch(o, n) }
+    }
+
+    csr::irq_restore(sie);
 }
 
 /// Есть ли ещё незавершённые задачи, кроме текущей.
 pub fn other_runnable() -> bool {
-    let sched = SCHED.lock();
-    let cur = sched.current;
-    sched
-        .tasks
-        .iter()
-        .enumerate()
-        .any(|(i, t)| i != cur && t.state != State::Finished)
+    with_sched(|s| {
+        let cur = s.current;
+        s.tasks
+            .iter()
+            .enumerate()
+            .any(|(i, t)| i != cur && t.state != State::Finished)
+    })
 }
 
 /// Имя текущей задачи (для вывода).
 pub fn current_name() -> &'static str {
-    let sched = SCHED.lock();
-    sched.tasks[sched.current].name
+    with_sched(|s| s.tasks[s.current].name)
 }
 
 /// Завершить текущую задачу. Вызывается из task_trampoline, если функция задачи
 /// вернулась. Помечаем себя Finished и уступаем навсегда — pick_next нас больше не выберет.
 #[no_mangle]
 extern "C" fn task_exit() -> ! {
-    {
-        let mut sched = SCHED.lock();
-        let cur = sched.current;
-        sched.tasks[cur].state = State::Finished;
-    }
+    with_sched(|s| {
+        let cur = s.current;
+        s.tasks[cur].state = State::Finished;
+    });
     loop {
         yield_now();
     }

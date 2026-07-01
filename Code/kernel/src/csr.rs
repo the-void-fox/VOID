@@ -74,3 +74,25 @@ pub fn enable_timer_interrupt() {
 pub fn enable_interrupts() {
     unsafe { asm!("csrs sstatus, {0}", in(reg) 1usize << 1, options(nomem, nostack)) }
 }
+
+/// Выключить прерывания S-mode, вернув прежнее значение бита SIE.
+/// Пара к [`irq_restore`] — для критических секций, которые не должны быть вытеснены.
+#[inline]
+pub fn irq_save_disable() -> bool {
+    let prev: usize;
+    // csrrc: атомарно прочитать sstatus и сбросить биты по маске (здесь — SIE).
+    unsafe {
+        asm!("csrrc {0}, sstatus, {1}", out(reg) prev, in(reg) 1usize << 1, options(nomem, nostack))
+    }
+    prev & (1 << 1) != 0
+}
+
+/// Восстановить бит SIE в состояние `enabled` (обычно — из [`irq_save_disable`]).
+#[inline]
+pub fn irq_restore(enabled: bool) {
+    if enabled {
+        unsafe { asm!("csrs sstatus, {0}", in(reg) 1usize << 1, options(nomem, nostack)) }
+    } else {
+        unsafe { asm!("csrc sstatus, {0}", in(reg) 1usize << 1, options(nomem, nostack)) }
+    }
+}

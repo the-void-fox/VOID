@@ -47,5 +47,7 @@ context_switch:
 # context_switch восстановил s0 = адрес функции задачи (мы так настроили Context).
 .globl task_trampoline
 task_trampoline:
+    csrsi sstatus, 2           # SIE=1: задача должна быть вытесняема с самого старта
+                               #        (мы попали сюда из обработчика таймера, где SIE=0)
     jalr s0                    # вызвать функцию задачи
     call task_exit             # если функция вернулась — завершить (не возвращается)
