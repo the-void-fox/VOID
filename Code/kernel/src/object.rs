@@ -1,29 +1,29 @@
 //! Объектная модель + персистентность на диске (Вехи 6, 7.2 и доводка).
 //!
 //! Два кирпича из [[0002-persistent-content-addressed-capability-core]]:
-//! - **Неизменяемые значения**, адресуемые по хэшу содержимого ([`ContentId`]); дедупликация.
+//! - **Неизменяемые значения**, адресуемые по хэшу содержимого ([`ContentId`], BLAKE3); дедуп.
 //! - **Изменяемый корень** — указатель на значение; мутация = новое значение (история версий).
+//!
+//! Объекты образуют **граф**: объект может ссылаться на другие через их `ContentId` (children).
+//! На диске/в хэше это единый КАДР: `[ nchildren(u32) | child-id×n | payload ]`. Адрес покрывает
+//! и ссылки, и полезную нагрузку (как дерево git ссылается на blob'ы). Наружу [`with`] отдаёт
+//! только payload — вызывающему кадр не виден. Ссылки нужны сборщику мусора для трассировки.
 //!
 //! Персистентность (Веха 7.2, см. [[persistence-and-volatility]]): RAM — это КЭШ, диск — истина.
 //! Раскладка диска (секторы по 512 Б):
 //! ```text
 //!   0            суперблок (1 сектор = атомарная запись = точка коммита)
-//!   1 .. 1+16    индекс A  ┐ чередуются: суперблок указывает на активный
+//!   1 .. 17      индекс A  ┐ чередуются: суперблок указывает на активный
 //!   17 .. 33     индекс B  ┘
-//!   33 ..        область объектов (дописывается, никогда не перезаписывается)
+//!   33 ..        область объектов (кадры; дописывается, GC уплотняет перезаписью)
 //! ```
-//! Крах-устойчивость: объекты неизменяемы и только дописываются; индекс пишется в НЕактивный
-//! регион; суперблок (одна атомарная запись сектора) переключает активный индекс и корни.
+//! Крах-устойчивость: индекс пишется в НЕактивный регион; суперблок (одна атомарная запись
+//! сектора) переключает активный индекс и корни. Сбой до суперблока → грузимся со старого.
 //!
-//! Доводка (после Вехи 9):
-//! - **Ленивая загрузка** ([[persistent-store]]): `load` читает только ИНДЕКС; байты объекта
-//!   подтягиваются с диска при первом обращении в [`with`] (промах кэша). Так «RAM = кэш»
-//!   становится правдой, а не фигурой речи — вся база не обязана влезать в RAM.
-//! - **Множественные корни**: карта корней сериализуется в отдельный контент-адресуемый
-//!   объект (roots-blob), его адрес лежит в суперблоке. Персистентен любой именованный корень,
-//!   не только «system».
+//! Доводка (после Вехи 9): ленивая загрузка (load читает лишь индекс), множественные
+//! персистентные корни (roots-blob), BLAKE3, и **сборка мусора** ([`gc`]) — см. [[persistent-store]].
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -33,7 +33,7 @@ use crate::sync::SpinLock;
 use crate::virtio_blk::{self, SECTOR_SIZE as SECTOR};
 
 // ─── раскладка диска ─────────────────────────────────────────────────────────
-const MAGIC: u64 = 0x0003_5346_4449_4F56; // "VOIDFS\x03\x00" (v3: контент-адреса на BLAKE3)
+const MAGIC: u64 = 0x0004_5346_4449_4F56; // "VOIDFS\x04\x00" (v4: кадры со ссылками + GC)
 const SB_SECTOR: u64 = 0;
 const IDX_SECTORS: u64 = 16;
 const IDX_A: u64 = 1;
@@ -52,12 +52,18 @@ const SB_COUNT: usize = 24;
 const SB_ROOTS_PRESENT: usize = 28;
 const SB_ROOTS_ID: usize = 32; // [u8; 32] — контент-адрес roots-blob
 
-/// Объект: (кэшированные) байты и/или местоположение на диске.
-/// Инвариант: хотя бы одно из полей `Some` (иначе объект «ниоткуда»).
+/// Загруженное содержимое объекта: полезная нагрузка + исходящие ссылки.
+struct Loaded {
+    payload: Vec<u8>,
+    children: Vec<ContentId>,
+}
+
+/// Объект: (кэшированное) содержимое и/или местоположение кадра на диске.
+/// Инвариант: хотя бы одно из полей `Some`.
 struct Object {
-    /// Байты значения в RAM. `None` — ещё не подгружены с диска (промах кэша).
-    bytes: Option<Vec<u8>>,
-    /// (сектор, длина) на диске. `None` — только в RAM, ещё не зафиксирован коммитом.
+    /// Содержимое в RAM. `None` — ещё не подгружено с диска (промах кэша).
+    data: Option<Loaded>,
+    /// (сектор, длина КАДРА) на диске. `None` — только в RAM, ещё не зафиксирован.
     disk: Option<(u32, u32)>,
 }
 
@@ -83,32 +89,71 @@ impl Store {
 
 static STORE: SpinLock<Store> = SpinLock::new(Store::new());
 
+// ─── кадр объекта: [ nchildren(u32) | child-id×n | payload ] ───────────────────
+
+fn encode(payload: &[u8], children: &[ContentId]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + children.len() * 32 + payload.len());
+    buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
+    for c in children {
+        buf.extend_from_slice(&c.0);
+    }
+    buf.extend_from_slice(payload);
+    buf
+}
+
+fn decode(frame: &[u8]) -> Loaded {
+    let n = get_u32(frame, 0) as usize;
+    let mut children = Vec::with_capacity(n);
+    let mut off = 4;
+    for _ in 0..n {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&frame[off..off + 32]);
+        children.push(ContentId(id));
+        off += 32;
+    }
+    Loaded { payload: frame[off..].to_vec(), children }
+}
+
 // ─── объектная модель ────────────────────────────────────────────────────────
 
-/// Положить значение, получить контент-адрес. Идемпотентно (дедуп по хэшу).
+/// Положить лист (значение без исходящих ссылок), получить контент-адрес.
 pub fn put(bytes: &[u8]) -> ContentId {
-    let id = ContentId::hash(bytes);
+    put_node(bytes, &[])
+}
+
+/// Положить узел: значение + исходящие ссылки на другие объекты. Адрес покрывает и то, и
+/// другое (одинаковый узел с одинаковыми детьми → один адрес). Идемпотентно (дедуп).
+pub fn put_node(bytes: &[u8], children: &[ContentId]) -> ContentId {
+    let frame = encode(bytes, children);
+    let id = ContentId::hash(&frame);
     STORE.lock().objects.entry(id).or_insert_with(|| Object {
-        bytes: Some(bytes.to_vec()),
+        data: Some(Loaded { payload: bytes.to_vec(), children: children.to_vec() }),
         disk: None,
     });
     id
 }
 
-/// Прочитать значение по адресу под замком. При промахе кэша (байты не в RAM) —
-/// подтянуть их с диска (ленивая загрузка) и закэшировать.
+/// Прочитать полезную нагрузку по адресу под замком. При промахе кэша — подтянуть кадр с
+/// диска (ленивая загрузка), разобрать и закэшировать.
 pub fn with<R>(id: &ContentId, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
     let mut store = STORE.lock();
-    // Нужна ли подгрузка: объект есть, байтов нет, но известно место на диске.
-    let fetch = match store.objects.get(id) {
-        Some(o) => o.bytes.is_none().then(|| o.disk).flatten(),
-        None => None,
+    let ok = ensure_loaded(&mut store, id);
+    let payload = if ok {
+        store.objects.get(id).and_then(|o| o.data.as_ref()).map(|d| d.payload.as_slice())
+    } else {
+        None
     };
-    if let Some((sector, len)) = fetch {
-        let bytes = read_object(sector, len as usize); // читает диск (замок BLK), STORE→BLK
-        store.objects.get_mut(id).unwrap().bytes = Some(bytes);
+    f(payload)
+}
+
+/// Исходящие ссылки объекта (подгружает при необходимости).
+pub fn children(id: &ContentId) -> Vec<ContentId> {
+    let mut store = STORE.lock();
+    if ensure_loaded(&mut store, id) {
+        store.objects.get(id).and_then(|o| o.data.as_ref()).map(|d| d.children.clone()).unwrap_or_default()
+    } else {
+        Vec::new()
     }
-    f(store.objects.get(id).and_then(|o| o.bytes.as_deref()))
 }
 
 /// Число объектов (известно из индекса даже для неподгруженных).
@@ -131,10 +176,73 @@ pub fn root(name: &str) -> Option<ContentId> {
     STORE.lock().roots.get(name).copied()
 }
 
+/// Подгрузить содержимое объекта в RAM, если оно на диске. Возвращает `true`, если объект
+/// существует и данные доступны. Держит замок `STORE`; чтение диска → замок `BLK` (STORE→BLK).
+fn ensure_loaded(store: &mut Store, id: &ContentId) -> bool {
+    match store.objects.get(id) {
+        None => false,
+        Some(o) if o.data.is_some() => true,
+        Some(o) => {
+            let (sector, len) = o.disk.expect("объект без данных и без диска");
+            let frame = read_object(sector, len as usize);
+            store.objects.get_mut(id).unwrap().data = Some(decode(&frame));
+            true
+        }
+    }
+}
+
+// ─── сборка мусора (mark-sweep + уплотнение) ──────────────────────────────────
+
+/// Собрать мусор: оставить только объекты, достижимые (по ссылкам) от корней; остальные —
+/// старые версии и осиротевшие `put` — удалить. Уплотнение произойдёт ближайшим [`commit`]
+/// (у выживших сбрасывается место на диске → перезапишутся подряд). Возвращает (оставлено,
+/// собрано).
+pub fn gc() -> (usize, usize) {
+    let mut store = STORE.lock();
+
+    // Mark: обход в глубину от корней. Попутно подгружаем объекты (нужны их ссылки).
+    let mut reachable: BTreeSet<ContentId> = BTreeSet::new();
+    let mut stack: Vec<ContentId> = store.roots.values().copied().collect();
+    while let Some(id) = stack.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        if ensure_loaded(&mut store, &id) {
+            if let Some(d) = store.objects.get(&id).and_then(|o| o.data.as_ref()) {
+                for c in &d.children {
+                    stack.push(*c);
+                }
+            }
+        }
+    }
+
+    // Sweep: удалить недостижимые.
+    let before = store.objects.len();
+    let dead: Vec<ContentId> = store
+        .objects
+        .keys()
+        .filter(|id| !reachable.contains(id))
+        .copied()
+        .collect();
+    for id in dead {
+        store.objects.remove(&id);
+    }
+
+    // Подготовить уплотнение: выжившие уже загружены (обошли их при mark) → сбросить их
+    // место на диске, чтобы commit переписал всё подряд с начала области объектов.
+    for o in store.objects.values_mut() {
+        o.disk = None;
+    }
+    store.next_free = OBJ_START as u32;
+
+    let kept = store.objects.len();
+    (kept, before - kept)
+}
+
 // ─── персистентность ─────────────────────────────────────────────────────────
 
 /// Загрузить состояние с диска. `true` — были данные; `false` — чистый диск.
-/// ЛЕНИВО: читает только индекс и корни; байты объектов подтянет [`with`] по обращению.
+/// ЛЕНИВО: читает только индекс и корни; содержимое объектов подтянет [`with`]/[`gc`].
 pub fn load() -> bool {
     let mut sb = [0u8; SECTOR];
     if !virtio_blk::read(SB_SECTOR, &mut sb) || get_u64(&sb, SB_MAGIC) != MAGIC {
@@ -169,19 +277,19 @@ pub fn load() -> bool {
     let mut store = STORE.lock();
     store.objects.clear();
     store.roots.clear();
-    // Только МЕТАданные: место на диске, байты не читаем (ленивая загрузка).
+    // Только МЕТАданные: место кадра на диске, содержимое не читаем (ленивая загрузка).
     for (id, sector, len) in entries {
-        store.objects.insert(id, Object { bytes: None, disk: Some((sector, len)) });
+        store.objects.insert(id, Object { data: None, disk: Some((sector, len)) });
     }
     // Корни: подтянуть roots-blob по адресу из суперблока и разобрать.
     if roots_present {
         let mut rid = [0u8; 32];
         rid.copy_from_slice(&sb[SB_ROOTS_ID..SB_ROOTS_ID + 32]);
         let rid = ContentId(rid);
-        if let Some((sector, len)) = store.objects.get(&rid).and_then(|o| o.disk) {
-            let blob = read_object(sector, len as usize);
-            store.roots = deserialize_roots(&blob);
-            store.objects.get_mut(&rid).unwrap().bytes = Some(blob); // закэшировать
+        if ensure_loaded(&mut store, &rid) {
+            if let Some(d) = store.objects.get(&rid).and_then(|o| o.data.as_ref()) {
+                store.roots = deserialize_roots(&d.payload);
+            }
         }
     }
     store.next_free = next_free;
@@ -190,20 +298,20 @@ pub fn load() -> bool {
     true
 }
 
-/// Зафиксировать текущее состояние на диск (checkpoint). Крах-устойчиво: новые объекты
-/// дописываются, индекс — в неактивный регион, суперблок пишется последним (точка коммита).
+/// Зафиксировать состояние на диск (checkpoint). Крах-устойчиво: новые кадры дописываются,
+/// индекс — в неактивный регион, суперблок пишется последним (точка коммита).
 pub fn commit() {
     let mut store = STORE.lock();
 
     // 0) Сериализовать корни в контент-адресуемый объект (roots-blob) и учесть его.
     let roots_blob = serialize_roots(&store.roots);
-    let roots_id = ContentId::hash(&roots_blob);
+    let roots_id = ContentId::hash(&encode(&roots_blob, &[]));
     store.objects.entry(roots_id).or_insert_with(|| Object {
-        bytes: Some(roots_blob),
+        data: Some(Loaded { payload: roots_blob, children: Vec::new() }),
         disk: None,
     });
 
-    // 1) Дописать объекты, которых ещё нет на диске (append-only, они неизменяемы).
+    // 1) Дописать кадры объектов, которых ещё нет на диске (append-only / уплотнение после GC).
     let to_write: Vec<ContentId> = store
         .objects
         .iter()
@@ -211,12 +319,12 @@ pub fn commit() {
         .map(|(id, _)| *id)
         .collect();
     for id in to_write {
-        // У неперсистентного объекта байты всегда в RAM (put/roots-blob) — можно клонировать.
-        let bytes = store.objects[&id].bytes.clone().expect("объект без байтов и без диска");
+        let d = store.objects[&id].data.as_ref().expect("объект без данных и без диска");
+        let frame = encode(&d.payload, &d.children);
         let sector = store.next_free;
-        write_object(sector, &bytes);
-        store.next_free += bytes.len().div_ceil(SECTOR) as u32;
-        store.objects.get_mut(&id).unwrap().disk = Some((sector, bytes.len() as u32));
+        write_object(sector, &frame);
+        store.next_free += frame.len().div_ceil(SECTOR) as u32;
+        store.objects.get_mut(&id).unwrap().disk = Some((sector, frame.len() as u32));
     }
 
     // 2) Записать индекс в НЕактивный регион (у всех объектов теперь есть место на диске).
@@ -265,7 +373,7 @@ pub fn commit() {
 }
 
 // ─── (де)сериализация корней ──────────────────────────────────────────────────
-// Формат roots-blob: count(u32) | [ name_len(u32) | name | ContentId(32) ] * count
+// Формат roots-blob (payload): count(u32) | [ name_len(u32) | name | ContentId(32) ] * count
 
 fn serialize_roots(roots: &BTreeMap<String, ContentId>) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -306,7 +414,7 @@ fn deserialize_roots(bytes: &[u8]) -> BTreeMap<String, ContentId> {
 
 // ─── помощники дисковой (де)сериализации ──────────────────────────────────────
 
-/// Прочитать объект длиной `len` байт, начиная с сектора `start`.
+/// Прочитать кадр длиной `len` байт, начиная с сектора `start`.
 fn read_object(start: u32, len: usize) -> Vec<u8> {
     let sectors = len.div_ceil(SECTOR);
     let mut out = Vec::with_capacity(sectors * SECTOR);
@@ -319,7 +427,7 @@ fn read_object(start: u32, len: usize) -> Vec<u8> {
     out
 }
 
-/// Записать байты объекта, начиная с сектора `start` (последний сектор дополняется нулями).
+/// Записать кадр, начиная с сектора `start` (последний сектор дополняется нулями).
 fn write_object(start: u32, bytes: &[u8]) {
     let sectors = bytes.len().div_ceil(SECTOR);
     for i in 0..sectors {

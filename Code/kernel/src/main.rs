@@ -133,14 +133,23 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     async_demo();
     println!();
 
-    // Новый корень этого запуска и фиксация на диск — переживёт перезагрузку QEMU.
+    // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
+    gc_demo();
+    println!();
+
+    // Новый system root этого запуска.
     let marker = alloc::format!("boot #{} — VOID помнит своё состояние", object::generation() + 1);
     let id = object::put(marker.as_bytes());
     object::set_root("system", id);
+
+    // GC: оставить только достижимое от корней (system, demo-cell, tree); затем commit
+    // уплотняет диск. Осиротевшие put'ы (X/Y/async, старые версии) — это мусор, их соберём.
+    let (kept, collected) = object::gc();
+    println!("  [gc] достижимо от корней: {}, собрано мусора: {}", kept, collected);
     object::commit();
     println!("  [store] новый system root: \"{}\"", marker);
     println!(
-        "  [store] commit → {} объектов, поколение {} (записано на диск)",
+        "  [store] commit → {} объектов, поколение {} (уплотнено на диск)",
         object::len(),
         object::generation(),
     );
@@ -261,6 +270,29 @@ fn async_demo() {
     drop(tx); // исходный отправитель больше не нужен (копии — у производителей)
 
     executor::run(); // крутить, пока все задачи не завершатся
+}
+
+/// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).
+/// Узел ссылается на листья по их ContentId — контент-адресуемый граф (как деревья git).
+fn gc_demo() {
+    println!("  [gc] структурные ссылки — узел ссылается на листья по ContentId:");
+    let a = object::put(b"leaf-A");
+    let b = object::put(b"leaf-B");
+    let c = object::put(b"leaf-C");
+
+    // Версия 1 дерева ссылается на A и B.
+    let v1 = object::put_node(b"tree v1", &[a, b]);
+    object::set_root("tree", v1);
+    println!("    tree v1 -> [A, B]  корень 'tree' = {}", id_short(&v1));
+
+    // Версия 2 ссылается на B и C; корень переезжает → A и v1 осиротели.
+    let v2 = object::put_node(b"tree v2", &[b, c]);
+    object::set_root("tree", v2);
+    println!(
+        "    tree v2 -> [{} детей]  корень 'tree' = {}  (leaf-A и v1 теперь недостижимы)",
+        object::children(&v2).len(),
+        id_short(&v2),
+    );
 }
 
 /// Задача-писатель: кладёт несколько значений в общий объектный store.
