@@ -13,6 +13,7 @@
 //! Веха 9: async-executor — конкурентные future-задачи поверх объектного пространства.
 //! Доводка (после Вехи 9): ленивая загрузка/мультикорни/coalescing, BLAKE3, GC+граф объектов,
 //! virtio-blk на прерываниях (PLIC) + async I/O (пробуждение future из IRQ).
+//! Веха 10: пользовательский режим (U-mode) + syscall'ы + процессы со своим адресным пространством.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -29,6 +30,7 @@ mod heap;
 mod object;
 mod paging;
 mod plic;
+mod proc;
 mod sbi;
 mod sched;
 mod sync;
@@ -145,10 +147,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     async_demo();
     println!();
 
-    // Веха 10.1: выход в пользовательский режим (U-mode) и возврат через syscall.
-    println!("  [user] вход в U-mode (демо syscall'ов):");
-    user::run_user(user::entry(), paging::user_stack_top(), user::trap_stack_top());
-    println!("  [user] вернулись в ядро (S-mode) после SYS_EXIT");
+    // Веха 10.2: изолированные пользовательские процессы со своим адресным пространством.
+    println!("  [proc] два процесса в U-mode (свой satp, кооперативно через SYS_YIELD):");
+    proc::spawn(user::proc_entry(), 0);
+    proc::spawn(user::proc_entry(), 1);
+    proc::run();
+    println!("  [proc] все процессы завершились — обратно в ядро");
     println!();
 
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.

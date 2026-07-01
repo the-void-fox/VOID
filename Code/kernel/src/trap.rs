@@ -5,7 +5,7 @@
 //! [`TrapFrame`] — снимок всех регистров на момент trap'а. Диспетчер смотрит на
 //! `scause` и решает, что это было: таймер, breakpoint или что-то фатальное.
 
-use crate::{csr, plic, println, timer, user};
+use crate::{csr, plic, println, proc, timer};
 
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
@@ -16,7 +16,9 @@ extern "C" {
 
 /// Снимок состояния процессора на момент trap'а. Раскладка строго совпадает с
 /// порядком сохранения в trap_entry.s (поэтому `repr(C)` и фиксированный порядок).
+/// `Copy`/`Default` — чтобы сохранять его как состояние процесса ([[user-mode|proc]]).
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct TrapFrame {
     /// Регистры x0..x31 (x0 всегда 0; x2 — исходный sp).
     pub regs: [usize; 32],
@@ -47,6 +49,14 @@ pub fn init() {
 #[no_mangle]
 pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let scause = csr::read_scause();
+
+    // trap из U-mode (SPP=0). Прерывания в U выключены → это системный вызов. Управление
+    // уходит в планировщик процессов и сюда НЕ возвращается (возобновляется процесс).
+    if frame.sstatus & (1 << 8) == 0 {
+        proc::handle_user_trap(frame, scause);
+    }
+
+    // trap из ядра (S-mode) — как раньше.
     let is_interrupt = scause & csr::INTERRUPT_BIT != 0;
     let code = scause & !csr::INTERRUPT_BIT;
 
@@ -66,36 +76,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
                 println!("  [trap] breakpoint @ {:#x} → перешагиваем {} байт", frame.sepc, len);
                 frame.sepc += len;
             }
-            csr::EXC_ECALL_FROM_U => syscall(frame),
             _ => fatal(frame, scause),
-        }
-    }
-}
-
-/// Диспетчер системных вызовов из U-mode. Соглашение: номер в `a7`, аргументы в `a0..`,
-/// результат в `a0`. После `ecall` продвигаем `sepc` на 4 (кроме exit — он не возвращается).
-fn syscall(frame: &mut TrapFrame) {
-    let num = frame.regs[17]; // a7
-    let a0 = frame.regs[10];
-    let a1 = frame.regs[11];
-    match num {
-        // SYS_WRITE(ptr, len): напечатать буфер пользователя. Ядро читает U-память (SUM=1).
-        1 => {
-            let bytes = unsafe { core::slice::from_raw_parts(a0 as *const u8, a1) };
-            let text = core::str::from_utf8(bytes).unwrap_or("<не-utf8>");
-            crate::print!("{}", text);
-            frame.regs[10] = a1; // вернуть число записанных байт
-            frame.sepc += 4;
-        }
-        // SYS_EXIT(code): завершить программу — вернуться в ядро (longjmp через сохранённый ctx).
-        2 => {
-            println!("  [user] SYS_EXIT({}) — процесс завершился", a0);
-            user::sys_exit(); // не возвращается
-        }
-        other => {
-            println!("  [user] неизвестный syscall {} — игнорирую", other);
-            frame.regs[10] = usize::MAX;
-            frame.sepc += 4;
         }
     }
 }
