@@ -10,6 +10,7 @@
 //! Веха 7.1: драйвер virtio-blk — чтение/запись секторов виртуального диска.
 //! Веха 7.2: персистентный контент-адресуемый store — состояние переживает перезагрузку.
 //! Веха 8: capability — непод­делываемые ссылки на объекты с правами (кто что может трогать).
+//! Веха 9: async-executor — конкурентные future-задачи поверх объектного пространства.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -17,8 +18,10 @@
 extern crate alloc;
 
 mod cap;
+mod chan;
 mod context;
 mod csr;
+mod executor;
 mod frame;
 mod heap;
 mod object;
@@ -62,8 +65,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 8                            ║");
-    println!("  ║  capability · права на объекты            ║");
+    println!("  ║  VOID — Веха 9                            ║");
+    println!("  ║  async-executor · future над объектами    ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -124,6 +127,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         unsafe { core::arch::asm!("wfi") }
     }
     println!("  [sched] задачи завершились (вытеснений таймером: {})", timer::ticks());
+    println!();
+
+    // Веха 9: async-executor поверх объектного store (кооперативные future-задачи).
+    async_demo();
     println!();
 
     // Новый корень этого запуска и фиксация на диск — переживёт перезагрузку QEMU.
@@ -215,6 +222,45 @@ fn cap_demo() {
         Ok(()) => println!("    доступ после отзыва?! — БАГ"),
         Err(e) => println!("    cap после отзыва: {:?}  ← revocation", e),
     }
+}
+
+/// Веха 9: демонстрация async-executor'а поверх объектного store.
+/// Два производителя кладут значения и шлют их адреса через async-канал; потребитель
+/// принимает и читает из store. Всё — на одном стеке, кооперативно через `.await`.
+fn async_demo() {
+    println!("  [async] executor — future-задачи поверх объектного store:");
+
+    let (tx, rx) = chan::channel::<void_abi::ContentId>();
+
+    // Потребитель: печатает объекты по мере поступления их адресов. Паркуется на пустом
+    // канале (Pending) и просыпается, когда производитель пришлёт (send → waker).
+    executor::spawn(async move {
+        for _ in 0..6 {
+            let id = rx.recv().await;
+            object::with(&id, |b| {
+                let s = b.and_then(|x| core::str::from_utf8(x).ok()).unwrap_or("?");
+                println!("    [C] принял {} = \"{}\"", id_short(&id), s);
+            });
+        }
+        println!("    [C] всё принято — завершаюсь");
+    });
+
+    // Два производителя: кладут значение в store, шлют адрес, уступают через yield.await.
+    for who in ["A", "B"] {
+        let tx = tx.clone();
+        executor::spawn(async move {
+            for i in 0..3 {
+                let data = alloc::format!("async-{}-{}", who, i);
+                let id = object::put(data.as_bytes());
+                println!("    [{}] put \"{}\"", who, data);
+                tx.send(id);
+                executor::yield_now().await; // дать другим задачам продвинуться
+            }
+        });
+    }
+    drop(tx); // исходный отправитель больше не нужен (копии — у производителей)
+
+    executor::run(); // крутить, пока все задачи не завершатся
 }
 
 /// Задача-писатель: кладёт несколько значений в общий объектный store.
