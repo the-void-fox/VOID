@@ -6,6 +6,7 @@
 //! Веха 4: куча ядра (free-list аллокатор + #[global_allocator]) → работает `alloc`.
 //! Веха 5: кооперативная многозадачность (контексты + round-robin планировщик).
 //! Веха 5.5: вытеснение по таймеру (preemption) — задачи чередуются без явного yield.
+//! Веха 6: объектная модель — контент-адресуемые значения + изменяемые корни (стержень).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -16,6 +17,7 @@ mod context;
 mod csr;
 mod frame;
 mod heap;
+mod object;
 mod paging;
 mod sbi;
 mod sched;
@@ -55,8 +57,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 5.5                          ║");
-    println!("  ║  вытеснение по таймеру · RISC-V           ║");
+    println!("  ║  VOID — Веха 6                            ║");
+    println!("  ║  объектная модель · контент-адреса        ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -77,23 +79,27 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("  [heap] куча ядра готова (2 МиБ)");
     println!();
 
-    // Веха 5.5: вытесняющая многозадачность.
-    sched::init(); // текущее исполнение (kmain) становится задачей «main»
-    sched::spawn("A", busy_worker);
-    sched::spawn("B", busy_worker);
-    sched::spawn("C", busy_worker);
-    println!("  [sched] A/B/C запущены. Они НЕ вызывают yield — чередует только таймер.");
+    // Веха 6: объектная модель (контент-адресация, дедупликация, корни, история версий).
+    object_demo();
     println!();
 
-    // Запускаем таймер → начинается вытеснение. main спит на wfi; таймер будит ядро,
-    // вытесняет к задачам и по кругу возвращает управление сюда.
+    // Многозадачность (Вехи 5–5.5) по-прежнему работает: две задачи параллельно пишут в
+    // ОБЩЕЕ объектное хранилище, таймер их вытесняет.
+    sched::init();
+    sched::spawn("X", writer);
+    sched::spawn("Y", writer);
+    println!("  [sched] задачи X/Y пишут в общий store (вытесняются таймером):");
     timer::init();
     while sched::other_runnable() {
         // SAFETY: wfi — спать до следующего прерывания (таймера).
         unsafe { core::arch::asm!("wfi") }
     }
+    println!(
+        "  [obj] после задач уникальных объектов: {} (вытеснений таймером: {})",
+        object::len(),
+        timer::ticks(),
+    );
     println!();
-    println!("  [sched] все задачи завершились. Вытеснений (тиков таймера): {}", timer::ticks());
     println!("  [idle] ядро простаивает (wfi).");
 
     loop {
@@ -102,21 +108,57 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
 }
 
-/// Тело демонстрационной задачи: намеренно НЕ вызывает yield. Делает «работу» раундами,
-/// печатая прогресс. Переключить её на другую задачу может только вытеснение по таймеру —
-/// поэтому чередование A/B/C в выводе и есть доказательство, что вытеснение работает.
-fn busy_worker() {
+/// Демонстрация объектной модели: контент-адресация, дедупликация, корни, история версий.
+fn object_demo() {
+    // Неизменяемые значения, адресуемые по хэшу содержимого.
+    let a = object::put(b"hello");
+    let a2 = object::put(b"hello"); // те же байты
+    let b = object::put(b"world");
+    println!("  [obj] put \"hello\"       -> {}", id_short(&a));
+    println!("  [obj] put \"hello\" снова -> {} (тот же адрес: {})", id_short(&a2), a == a2);
+    println!("  [obj] put \"world\"       -> {}", id_short(&b));
+    println!("  [obj] уникальных объектов: {} (не 3 — \"hello\" дедуплицирован)", object::len());
+
+    // Изменяемый корень указывает на неизменяемое значение. Мутация = новое значение.
+    let v0 = object::put(b"state=0");
+    object::set_root("system", v0);
+    let v1 = object::put(b"state=1");
+    object::set_root("system", v1); // переключаем корень на новую версию
+
+    let cur = object::root("system").unwrap();
+    println!("  [obj] корень 'system' -> {} (после двух записей)", id_short(&cur));
+    // Старая версия НЕ исчезла — неизменяемость сохраняет историю.
+    object::with(&v0, |bytes| {
+        let text = bytes.and_then(|b| core::str::from_utf8(b).ok()).unwrap_or("?");
+        println!("  [obj] старая версия v0 всё ещё в store: \"{}\"", text);
+    });
+}
+
+/// Задача-писатель: кладёт несколько значений в общий объектный store.
+fn writer() {
     let name = sched::current_name();
-    println!("    [{}] стартовала", name);
-    for round in 0..5 {
-        // Занятый цикл — имитация полезной работы. acc печатаем, чтобы цикл не выкинули.
-        let mut acc: u64 = 0;
-        for i in 0..300_000u64 {
-            acc = acc.wrapping_add(i ^ (i << 1));
+    for i in 0..3 {
+        let data = alloc::format!("{}-value-{}", name, i);
+        let id = object::put(data.as_bytes());
+        println!("    [{}] put \"{}\" -> {}", name, data, id_short(&id));
+        // Немного занятости, чтобы дать таймеру шанс вытеснить между записями.
+        let mut acc = 0u64;
+        for k in 0..250_000u64 {
+            acc = acc.wrapping_add(k);
         }
-        println!("    [{}] раунд {} (acc={:#x})", name, round, acc);
+        let _ = acc;
     }
-    println!("    [{}] завершилась", name);
+}
+
+/// Короткое hex-представление контент-адреса (первые 5 байт) — для вывода.
+fn id_short(id: &void_abi::ContentId) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut s = alloc::string::String::new();
+    for byte in &id.0[..5] {
+        let _ = write!(s, "{:02x}", byte);
+    }
+    s.push('…');
+    s
 }
 
 #[panic_handler]
