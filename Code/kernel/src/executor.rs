@@ -50,6 +50,19 @@ impl Executor {
 
 static EXECUTOR: SpinLock<Executor> = SpinLock::new(Executor::new());
 
+/// Доступ к executor'у с ВЫКЛЮЧЕННЫМИ прерываниями. Очередь готовых пополняется и из
+/// обработчика прерываний (пробуждение future по IRQ, напр. завершение диска), поэтому её
+/// замок обязан быть irq-safe: иначе IRQ посреди удержания замка → `wake` на том же замке →
+/// взаимоблокировка. (Ср. `with_sched` в [`crate::sched`].)
+fn with_exec<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
+    let sie = crate::csr::irq_save_disable();
+    let mut g = EXECUTOR.lock();
+    let r = f(&mut g);
+    drop(g);
+    crate::csr::irq_restore(sie);
+    r
+}
+
 /// Waker задачи: разбудить = положить её id обратно в очередь готовых.
 struct TaskWaker {
     id: TaskId,
@@ -60,18 +73,19 @@ impl Wake for TaskWaker {
         self.wake_by_ref();
     }
     fn wake_by_ref(self: &Arc<Self>) {
-        EXECUTOR.lock().ready.push_back(self.id);
+        with_exec(|ex| ex.ready.push_back(self.id));
     }
 }
 
 /// Поставить async-задачу в очередь. Опрашиваться начнёт в [`run`].
 pub fn spawn(future: impl Future<Output = ()> + Send + 'static) -> TaskId {
-    let mut ex = EXECUTOR.lock();
-    let id = TaskId(ex.next_id);
-    ex.next_id += 1;
-    ex.tasks.insert(id, Task { future: Box::pin(future) });
-    ex.ready.push_back(id);
-    id
+    with_exec(|ex| {
+        let id = TaskId(ex.next_id);
+        ex.next_id += 1;
+        ex.tasks.insert(id, Task { future: Box::pin(future) });
+        ex.ready.push_back(id);
+        id
+    })
 }
 
 /// Крутить готовые задачи, пока очередь не опустеет (все завершились или спят навсегда).
@@ -81,12 +95,22 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) -> TaskId {
 /// или чужой) захотел бы тот же замок → взаимоблокировка.
 pub fn run() {
     loop {
-        let id = match EXECUTOR.lock().ready.pop_front() {
-            Some(id) => id,
-            None => return,
+        // Взять следующую готовую. Если готовых нет, но незавершённые задачи ещё есть — они
+        // ждут внешнего события (напр. завершения диска): спим на `wfi` до прерывания, которое
+        // разбудит future и пополнит очередь. Возвращаемся, только когда задач не осталось.
+        let id = loop {
+            if let Some(id) = with_exec(|ex| ex.ready.pop_front()) {
+                break id;
+            }
+            if with_exec(|ex| ex.tasks.is_empty()) {
+                return;
+            }
+            // SAFETY: ждать прерывания; таймер/устройства разбудят и пополнят очередь готовых.
+            unsafe { core::arch::asm!("wfi") }
         };
+
         // Задача могла уже завершиться (в очереди остался лишний id) — пропускаем.
-        let mut task = match EXECUTOR.lock().tasks.remove(&id) {
+        let mut task = match with_exec(|ex| ex.tasks.remove(&id)) {
             Some(t) => t,
             None => continue,
         };
@@ -96,7 +120,9 @@ pub fn run() {
         match task.future.as_mut().poll(&mut cx) {
             Poll::Ready(()) => { /* готово: задача уже изъята из карты, дропаем */ }
             Poll::Pending => {
-                EXECUTOR.lock().tasks.insert(id, task);
+                with_exec(|ex| {
+                    ex.tasks.insert(id, task);
+                });
             }
         }
     }

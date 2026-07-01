@@ -13,12 +13,24 @@
 //!
 //! Целимся в virtio **версии 2** (modern, VIRTIO 1.0). Запускать QEMU с
 //! `-global virtio-mmio.force-legacy=false` (см. .cargo/config.toml).
+//!
+//! Два пути завершения запроса:
+//! - **Синхронный** ([`read`]/[`write`]) — опрос кольца used. Используется на ранней загрузке
+//!   (прерывания ещё выключены) — там всё равно делать нечего, кроме ожидания диска.
+//! - **Асинхронный** ([`read_async`]) — прерывание+пробуждение: запрос публикуется, future
+//!   паркуется; по завершении устройство шлёт IRQ через PLIC → [`on_irq`] будит future.
+//!   Это «диск без опроса», настоящий async I/O над [[async-executor]].
 
+use core::future::Future;
+use core::pin::Pin;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
 
-use crate::frame;
+use alloc::boxed::Box;
+
 use crate::sync::SpinLock;
+use crate::{csr, frame};
 
 /// Размер сектора virtio-blk.
 pub const SECTOR_SIZE: usize = 512;
@@ -180,10 +192,92 @@ impl VirtioBlk {
     }
 }
 
+impl VirtioBlk {
+    /// Опубликовать цепочку чтения (3 дескриптора) и дёрнуть устройство. НЕ ждёт завершения —
+    /// его сообщит прерывание. Адреса hdr/buf/status должны жить до завершения (у future — в Box).
+    fn submit_read(&mut self, hdr: u64, buf: u64, status: u64) {
+        let desc = self.desc as *mut Desc;
+        let avail = self.avail as *mut Avail;
+        unsafe {
+            set_desc(desc, 0, hdr, 16, DESC_F_NEXT, 1);
+            set_desc(desc, 1, buf, SECTOR_SIZE as u32, DESC_F_NEXT | DESC_F_WRITE, 2);
+            set_desc(desc, 2, status, 1, DESC_F_WRITE, 0);
+            fence(Ordering::SeqCst);
+            let ai = read_volatile(&(*avail).idx);
+            write_volatile(&mut (*avail).ring[(ai as usize) % QSIZE], 0);
+            fence(Ordering::SeqCst);
+            write_volatile(&mut (*avail).idx, ai.wrapping_add(1));
+            fence(Ordering::SeqCst);
+            w32(self.base, REG_QUEUE_NOTIFY, 0);
+        }
+    }
+
+    /// Отметить, что одна запись used-кольца обработана (после завершения запроса).
+    fn complete(&mut self) {
+        fence(Ordering::SeqCst);
+        self.used_idx = self.used_idx.wrapping_add(1);
+    }
+}
+
 // Безопасно: все поля — адреса/числа; доступ сериализуется внешним SpinLock.
 unsafe impl Send for VirtioBlk {}
 
 static BLK: SpinLock<Option<VirtioBlk>> = SpinLock::new(None);
+
+// ─── состояние прерываний / async ────────────────────────────────────────────
+
+/// База устройства и номер IRQ — читаются из обработчика прерывания (без замка BLK).
+static IRQ_BASE: AtomicUsize = AtomicUsize::new(0);
+static IRQ_NUM: AtomicU32 = AtomicU32::new(0);
+/// Счётчик обработанных прерываний устройства (для наглядности).
+static IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Состояние единственной async-операции (в демо больше одной за раз не бывает).
+struct AsyncIo {
+    active: bool,
+    done: bool,
+    waker: Option<Waker>,
+}
+static ASYNC: SpinLock<AsyncIo> = SpinLock::new(AsyncIo { active: false, done: false, waker: None });
+
+/// Номер IRQ нашего устройства на PLIC (0 — не инициализировано).
+pub fn irq() -> u32 {
+    IRQ_NUM.load(Ordering::Relaxed)
+}
+
+/// Сколько прерываний устройства обработано.
+pub fn irq_count() -> u32 {
+    IRQ_COUNT.load(Ordering::Relaxed)
+}
+
+/// Обработчик прерывания устройства (из [`crate::plic::handle_external`]). Выполняется в
+/// trap-контексте (SIE=0), поэтому замки берёт без доп. отключения прерываний. Замок BLK НЕ
+/// трогает (его может держать синхронный путь) — только подтверждает прерывание и будит future.
+pub fn on_irq() {
+    let base = IRQ_BASE.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            let is = r32(base, REG_INTERRUPT_STATUS);
+            if is != 0 {
+                w32(base, REG_INTERRUPT_ACK, is);
+            }
+        }
+    }
+    IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let waker = {
+        let mut a = ASYNC.lock();
+        if a.active {
+            a.done = true;
+            a.waker.take()
+        } else {
+            None
+        }
+    };
+    if let Some(w) = waker {
+        w.wake(); // разбудить future (executor-очередь irq-safe)
+    }
+}
 
 /// Найти и инициализировать первое virtio-blk устройство. Возвращает true при успехе.
 pub fn init() -> bool {
@@ -244,6 +338,11 @@ pub fn init() -> bool {
             used_idx: 0,
             capacity_sectors: capacity,
         });
+
+        // Запомнить для обработчика прерываний: база + номер IRQ (slot+1 на QEMU virt).
+        IRQ_BASE.store(base, Ordering::Relaxed);
+        let slot = (base - MMIO_BASE) / MMIO_STRIDE;
+        IRQ_NUM.store(slot as u32 + 1, Ordering::Relaxed);
     }
     true
 }
@@ -268,6 +367,85 @@ pub fn write(sector: u64, buf: &[u8; SECTOR_SIZE]) -> bool {
     match guard.as_mut() {
         Some(blk) => blk.request(sector, buf.as_ptr() as usize, true),
         None => false,
+    }
+}
+
+/// Асинхронно прочитать сектор `sector`. Возвращает future: `Some(байты)` при успехе,
+/// `None` при ошибке. Future публикует запрос и **паркуется** до прерывания от устройства —
+/// без опроса. Буферы (заголовок/данные/статус) живут в `Box` (стабильные адреса для DMA).
+pub fn read_async(sector: u64) -> ReadFuture {
+    ReadFuture {
+        hdr: Box::new(ReqHeader { kind: BLK_T_IN, reserved: 0, sector }),
+        buf: Box::new([0u8; SECTOR_SIZE]),
+        status: Box::new(0xff),
+        submitted: false,
+    }
+}
+
+/// Future чтения сектора (см. [`read_async`]).
+pub struct ReadFuture {
+    hdr: Box<ReqHeader>,
+    buf: Box<[u8; SECTOR_SIZE]>,
+    status: Box<u8>,
+    submitted: bool,
+}
+
+impl Future for ReadFuture {
+    type Output = Option<[u8; SECTOR_SIZE]>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut(); // ReadFuture: Unpin (поля — Box/скаляры)
+
+        if !this.submitted {
+            let hp = &*this.hdr as *const ReqHeader as u64;
+            let bp = this.buf.as_ptr() as u64;
+            let sp = &*this.status as *const u8 as u64;
+            let mut g = BLK.lock();
+            let Some(blk) = g.as_mut() else {
+                return Poll::Ready(None); // диск не инициализирован
+            };
+            // Зарегистрировать ожидание ДО notify, чтобы не разминуться с прерыванием.
+            // Замок ASYNC берём с выключенными прерываниями: иначе IRQ посреди удержания
+            // замка → on_irq на том же замке → взаимоблокировка.
+            let sie = csr::irq_save_disable();
+            {
+                let mut a = ASYNC.lock();
+                a.active = true;
+                a.done = false;
+                a.waker = Some(cx.waker().clone());
+            }
+            csr::irq_restore(sie);
+            blk.submit_read(hp, bp, sp);
+            this.submitted = true;
+            return Poll::Pending;
+        }
+
+        // Уже отправлено — проверить завершение (флаг выставляет on_irq).
+        let sie = csr::irq_save_disable();
+        let done = {
+            let mut a = ASYNC.lock();
+            if a.done {
+                a.active = false;
+                true
+            } else {
+                a.waker = Some(cx.waker().clone()); // обновить waker
+                false
+            }
+        };
+        csr::irq_restore(sie);
+
+        if done {
+            if let Some(blk) = BLK.lock().as_mut() {
+                blk.complete();
+            }
+            if *this.status == 0 {
+                Poll::Ready(Some(*this.buf))
+            } else {
+                Poll::Ready(None)
+            }
+        } else {
+            Poll::Pending
+        }
     }
 }
 

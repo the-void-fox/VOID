@@ -5,7 +5,7 @@
 //! [`TrapFrame`] — снимок всех регистров на момент trap'а. Диспетчер смотрит на
 //! `scause` и решает, что это было: таймер, breakpoint или что-то фатальное.
 
-use crate::{csr, println, timer};
+use crate::{csr, plic, println, timer};
 
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
@@ -50,6 +50,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
     if is_interrupt {
         match code {
             csr::IRQ_S_TIMER => timer::on_tick(),
+            csr::IRQ_S_EXTERNAL => plic::handle_external(), // устройства (диск)
             other => println!("  [trap] неизвестное прерывание, код={}", other),
         }
     } else {

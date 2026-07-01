@@ -11,6 +11,8 @@
 //! Веха 7.2: персистентный контент-адресуемый store — состояние переживает перезагрузку.
 //! Веха 8: capability — непод­делываемые ссылки на объекты с правами (кто что может трогать).
 //! Веха 9: async-executor — конкурентные future-задачи поверх объектного пространства.
+//! Доводка (после Вехи 9): ленивая загрузка/мультикорни/coalescing, BLAKE3, GC+граф объектов,
+//! virtio-blk на прерываниях (PLIC) + async I/O (пробуждение future из IRQ).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -26,6 +28,7 @@ mod frame;
 mod heap;
 mod object;
 mod paging;
+mod plic;
 mod sbi;
 mod sched;
 mod sync;
@@ -92,6 +95,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("  [blk]  virtio-blk: {} секторов", virtio_blk::capacity_sectors());
     } else {
         println!("  [blk]  virtio-blk не найден — персистентность недоступна!");
+    }
+
+    // Прерывания устройств: настроить PLIC на IRQ диска и разрешить внешние прерывания S-mode.
+    // Глобально прерывания включит timer::init; синхронный путь на загрузке работает опросом.
+    if virtio_blk::irq() != 0 {
+        plic::init(virtio_blk::irq());
+        csr::enable_external_interrupt();
+        println!("  [plic] внешние прерывания вкл (virtio-blk IRQ {})", virtio_blk::irq());
     }
 
     // Веха 7.2: загрузить состояние с диска (RAM — кэш, диск — истина).
@@ -241,6 +252,17 @@ fn async_demo() {
 
     let (tx, rx) = chan::channel::<void_abi::ContentId>();
 
+    // Async I/O: прочитать сектор 0 БЕЗ опроса — future паркуется до прерывания диска (IRQ).
+    executor::spawn(async {
+        match virtio_blk::read_async(0).await {
+            Some(sec) => println!(
+                "    [D] async-чтение сектора 0: [{:02x} {:02x} {:02x} {:02x}] — разбужен IRQ диска",
+                sec[0], sec[1], sec[2], sec[3],
+            ),
+            None => println!("    [D] async-чтение сектора 0 не удалось"),
+        }
+    });
+
     // Потребитель: печатает объекты по мере поступления их адресов. Паркуется на пустом
     // канале (Pending) и просыпается, когда производитель пришлёт (send → waker).
     executor::spawn(async move {
@@ -270,6 +292,7 @@ fn async_demo() {
     drop(tx); // исходный отправитель больше не нужен (копии — у производителей)
 
     executor::run(); // крутить, пока все задачи не завершатся
+    println!("    [async] прерываний диска обработано: {}", virtio_blk::irq_count());
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).

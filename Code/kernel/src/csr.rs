@@ -24,6 +24,8 @@ pub const INTERRUPT_BIT: usize = 1 << (usize::BITS - 1);
 // Коды причин, на которые мы реально диспетчеризуем (полный список — в `trap::cause_name`).
 /// Прерывание таймера S-mode (когда установлен INTERRUPT_BIT).
 pub const IRQ_S_TIMER: usize = 5;
+/// Внешнее прерывание S-mode (от PLIC): устройства — диск и т.п.
+pub const IRQ_S_EXTERNAL: usize = 9;
 /// Исключение breakpoint — инструкция `ebreak` (когда INTERRUPT_BIT снят).
 pub const EXC_BREAKPOINT: usize = 3;
 
@@ -66,6 +68,12 @@ pub fn read_time() -> u64 {
 #[inline]
 pub fn enable_timer_interrupt() {
     unsafe { asm!("csrs sie, {0}", in(reg) 1usize << 5, options(nomem, nostack)) }
+}
+
+/// Разрешить внешние прерывания S-mode: бит SEIE (9) в `sie` (доставка через PLIC).
+#[inline]
+pub fn enable_external_interrupt() {
+    unsafe { asm!("csrs sie, {0}", in(reg) 1usize << 9, options(nomem, nostack)) }
 }
 
 /// Глобально включить прерывания в S-mode: бит SIE (1) в `sstatus`.
