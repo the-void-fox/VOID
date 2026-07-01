@@ -28,6 +28,8 @@ pub const IRQ_S_TIMER: usize = 5;
 pub const IRQ_S_EXTERNAL: usize = 9;
 /// Исключение breakpoint — инструкция `ebreak` (когда INTERRUPT_BIT снят).
 pub const EXC_BREAKPOINT: usize = 3;
+/// Исключение «environment call from U-mode» — системный вызов из пользовательского режима.
+pub const EXC_ECALL_FROM_U: usize = 8;
 
 // ─── Чтение/запись CSR ──────────────────────────────────────────────────────
 
@@ -45,6 +47,13 @@ pub fn read_scause() -> usize {
     let v: usize;
     unsafe { asm!("csrr {0}, scause", out(reg) v, options(nomem, nostack)) }
     v
+}
+
+/// Записать `sscratch`. Наш инвариант: `sscratch` = вершина ядерного trap-стека, пока
+/// исполняется U-mode, и `0`, пока исполняется ядро (S-mode). Читает/меняет `trap_entry.s`.
+#[inline]
+pub fn write_sscratch(v: usize) {
+    unsafe { asm!("csrw sscratch, {0}", in(reg) v, options(nomem, nostack)) }
 }
 
 /// Доп. информация о trap'е (адрес при page fault и т.п.).

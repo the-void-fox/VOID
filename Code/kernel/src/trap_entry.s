@@ -1,18 +1,15 @@
 # Ассемблерный трамплин обработки trap'ов (S-mode).
 #
-# При любом trap'е (исключение или прерывание) процессор:
-#   - кладёт адрес виновной инструкции в sepc, причину в scause, доп.инфо в stval;
-#   - переносит sstatus.SIE -> sstatus.SPIE и обнуляет SIE (прерывания выключены
-#     на время обработки — поэтому вложенных trap'ов того же типа не будет);
-#   - прыгает по адресу из stvec (сюда, т.к. режим Direct).
+# При любом trap'е процессор кладёт sepc/scause/stval, переносит SIE->SPIE и обнуляет SIE,
+# сохраняет прежний режим в sstatus.SPP, и прыгает по stvec (сюда, режим Direct).
 #
-# Мы пришли в S-mode из S-mode (ядро), стек тот же. Сохраняем ВСЕ регистры в
-# структуру TrapFrame на стеке, передаём указатель на неё в Rust-диспетчер
-# trap_handler(&mut TrapFrame), затем восстанавливаем регистры и возвращаемся
-# инструкцией sret (она же восстановит SIE из SPIE).
+# Переключение стека (Веха 10). Инвариант: sscratch = вершина ЯДЕРНОГО trap-стека, пока
+# исполняется U-mode, и 0, пока исполняется ядро (S-mode).
+#   - trap из U: нельзя строить кадр на пользовательском стеке → переключаемся на ядерный.
+#   - trap из S: стек уже ядерный → работаем на нём (как раньше).
 #
 # Раскладка TrapFrame (см. trap.rs, repr(C)) — 34 ячейки по 8 байт = 272:
-#   слот i (i=0..31) -> регистр xi   (x0 не нужен, но слот держим для простоты индексации)
+#   слот i (i=0..31) -> регистр xi   (x2 = исходный sp виновника trap'а)
 #   слот 32          -> sepc
 #   слот 33          -> sstatus
 
@@ -20,11 +17,25 @@
 .p2align 2                      # stvec требует выравнивания адреса по 4 байта
 .global trap_entry
 trap_entry:
-    addi  sp, sp, -272          # выделить TrapFrame на стеке
+    csrrw sp, sscratch, sp      # sp <-> sscratch
+    bnez  sp, .Lon_stack        # sp != 0 -> trap из U: sp = вершина ядерного trap-стека
+    csrrw sp, sscratch, sp      # trap из S: вернуть sp, sscratch снова 0
+.Lon_stack:
+    addi  sp, sp, -272          # выделить TrapFrame на (теперь точно ядерном) стеке
 
-    sd    x1,   1*8(sp)         # ra
-    addi  x1, sp, 272           # x1 := исходный sp (до выделения кадра)
-    sd    x1,   2*8(sp)         # сохранить исходный sp в слот x2
+    sd    x1,   1*8(sp)         # ra (дальше x1 используем как scratch — оригинал уже сохранён)
+    # Сохранить исходный sp виновника в слот x2:
+    #   trap из S: это sp+272 ; trap из U: он сейчас в sscratch (туда попал при первом swap).
+    csrr  x1, sstatus
+    andi  x1, x1, 0x100         # бит SPP (1<<8): 1 = trap из S, 0 = trap из U
+    bnez  x1, .Lsp_from_s
+    csrr  x1, sscratch          # trap из U: исходный sp = user sp
+    j     .Lsp_store
+.Lsp_from_s:
+    addi  x1, sp, 272           # trap из S: исходный sp = sp+272
+.Lsp_store:
+    sd    x1,   2*8(sp)
+
     sd    x3,   3*8(sp)
     sd    x4,   4*8(sp)
     sd    x5,   5*8(sp)
@@ -55,7 +66,7 @@ trap_entry:
     sd    x30, 30*8(sp)
     sd    x31, 31*8(sp)
 
-    csrr  t0, sepc              # t0 == x5, уже сохранён выше — можно использовать как scratch
+    csrr  t0, sepc
     sd    t0, 32*8(sp)
     csrr  t0, sstatus
     sd    t0, 33*8(sp)
@@ -63,16 +74,20 @@ trap_entry:
     mv    a0, sp                # arg0 = указатель на TrapFrame
     call  trap_handler
 
-    ld    t0, 32*8(sp)         # sepc мог быть изменён обработчиком (напр. перешагнуть ebreak)
+    ld    t0, 32*8(sp)         # sepc мог быть изменён обработчиком
     csrw  sepc, t0
-    ld    t0, 33*8(sp)
+    ld    t0, 33*8(sp)         # sstatus
+    andi  t1, t0, 0x100        # SPP
+    bnez  t1, .Lret_s          # SPP=1 -> возврат в S: sscratch оставляем 0
+    addi  t1, sp, 272          # SPP=0 -> возврат в U: sscratch = вершина trap-стека (sp+272)
+    csrw  sscratch, t1
+.Lret_s:
     csrw  sstatus, t0
 
     ld    x1,   1*8(sp)
-    # x2 (sp) НЕ восстанавливаем из кадра — вернём его через addi ниже
     ld    x3,   3*8(sp)
     ld    x4,   4*8(sp)
-    ld    x5,   5*8(sp)        # вернёт настоящий t0
+    ld    x5,   5*8(sp)
     ld    x6,   6*8(sp)
     ld    x7,   7*8(sp)
     ld    x8,   8*8(sp)
@@ -100,5 +115,5 @@ trap_entry:
     ld    x30, 30*8(sp)
     ld    x31, 31*8(sp)
 
-    addi  sp, sp, 272          # освободить TrapFrame
-    sret                       # вернуться на sepc, восстановив SIE из SPIE
+    ld    x2,   2*8(sp)        # sp последним: user sp (возврат в U) или kernel sp (возврат в S)
+    sret                       # вернуться на sepc, восстановив режим из SPP и SIE из SPIE

@@ -5,7 +5,7 @@
 //! [`TrapFrame`] — снимок всех регистров на момент trap'а. Диспетчер смотрит на
 //! `scause` и решает, что это было: таймер, breakpoint или что-то фатальное.
 
-use crate::{csr, plic, println, timer};
+use crate::{csr, plic, println, timer, user};
 
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
@@ -37,6 +37,9 @@ const REG_NAMES: [&str; 32] = [
 pub fn init() {
     // Адрес функции -> сначала в указатель, потом в usize (так требует линт).
     csr::write_stvec(trap_entry as *const () as usize);
+    // Инвариант переключения стека (Веха 10): в ядре sscratch = 0. trap_entry.s опирается
+    // на это, чтобы отличить trap из ядра (S) от trap'а из пользователя (U).
+    csr::write_sscratch(0);
 }
 
 /// Rust-сторона обработчика. Вызывается из trap_entry.s; `frame` указывает на
@@ -63,7 +66,36 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
                 println!("  [trap] breakpoint @ {:#x} → перешагиваем {} байт", frame.sepc, len);
                 frame.sepc += len;
             }
+            csr::EXC_ECALL_FROM_U => syscall(frame),
             _ => fatal(frame, scause),
+        }
+    }
+}
+
+/// Диспетчер системных вызовов из U-mode. Соглашение: номер в `a7`, аргументы в `a0..`,
+/// результат в `a0`. После `ecall` продвигаем `sepc` на 4 (кроме exit — он не возвращается).
+fn syscall(frame: &mut TrapFrame) {
+    let num = frame.regs[17]; // a7
+    let a0 = frame.regs[10];
+    let a1 = frame.regs[11];
+    match num {
+        // SYS_WRITE(ptr, len): напечатать буфер пользователя. Ядро читает U-память (SUM=1).
+        1 => {
+            let bytes = unsafe { core::slice::from_raw_parts(a0 as *const u8, a1) };
+            let text = core::str::from_utf8(bytes).unwrap_or("<не-utf8>");
+            crate::print!("{}", text);
+            frame.regs[10] = a1; // вернуть число записанных байт
+            frame.sepc += 4;
+        }
+        // SYS_EXIT(code): завершить программу — вернуться в ядро (longjmp через сохранённый ctx).
+        2 => {
+            println!("  [user] SYS_EXIT({}) — процесс завершился", a0);
+            user::sys_exit(); // не возвращается
+        }
+        other => {
+            println!("  [user] неизвестный syscall {} — игнорирую", other);
+            frame.regs[10] = usize::MAX;
+            frame.sepc += 4;
         }
     }
 }

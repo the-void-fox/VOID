@@ -31,6 +31,15 @@ SECTIONS
         _rodata_end = .;
     }
 
+    /* Код и данные пользовательского режима (U-mode) — отдельные страницы, маппятся
+     * как U|R|X (см. paging.rs). Держим на своих страницах, чтобы флаг U не задел ядро. */
+    .user : ALIGN(4K) {
+        _user_start = .;
+        *(.user .user.*)
+        . = ALIGN(4K);
+        _user_end = .;
+    }
+
     /* .data + .bss + стек — всё RW, попадают под direct map как RW. */
     .data : ALIGN(4K) {
         _data_start = .;

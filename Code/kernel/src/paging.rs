@@ -15,6 +15,7 @@
 //! структуры (стек, сами таблицы, будущая куча) остаются доступны по VA == PA.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::frame::{self, PAGE_SIZE};
 
@@ -23,8 +24,19 @@ pub const PTE_V: usize = 1 << 0; // Valid — запись действител�
 pub const PTE_R: usize = 1 << 1; // Read
 pub const PTE_W: usize = 1 << 2; // Write
 pub const PTE_X: usize = 1 << 3; // eXecute
+pub const PTE_U: usize = 1 << 4; // User — страница доступна из U-mode
 pub const PTE_A: usize = 1 << 6; // Accessed — выставляем сами, чтобы не словить fault
 pub const PTE_D: usize = 1 << 7; // Dirty    — то же для записи
+
+/// Число страниц под пользовательский стек (Веха 10).
+const USER_STACK_PAGES: usize = 4;
+/// Вершина пользовательского стека (задаётся в [`init`]).
+static USER_STACK_TOP: AtomicUsize = AtomicUsize::new(0);
+
+/// Вершина пользовательского стека (0, если ещё не настроен).
+pub fn user_stack_top() -> usize {
+    USER_STACK_TOP.load(Ordering::Relaxed)
+}
 
 /// Маска PPN внутри PTE — 44 бита.
 const PPN_MASK: usize = (1 << 44) - 1;
@@ -43,6 +55,8 @@ extern "C" {
     static _text_end: u8;
     static _rodata_start: u8;
     static _rodata_end: u8;
+    static _user_start: u8;
+    static _user_end: u8;
 }
 
 /// Построить корневую таблицу ядра и вернуть её физический адрес.
@@ -64,6 +78,22 @@ pub fn init() -> usize {
         // 3) W^X: перетираем листовые PTE кода и констант более строгими правами.
         map_range(root, text_s, text_e, PTE_R | PTE_X);
         map_range(root, ro_s, ro_e, PTE_R);
+
+        // 4) Веха 10: пользовательский код (.user) как U|R|X и стек U-mode как U|R|W.
+        let user_s = &raw const _user_start as usize;
+        let user_e = &raw const _user_end as usize;
+        map_range(root, user_s, user_e, PTE_R | PTE_X | PTE_U);
+
+        // Стек U-mode из свежих (обнулённых) фреймов; frame::alloc отдаёт их подряд.
+        let mut stack_base = 0;
+        for i in 0..USER_STACK_PAGES {
+            let f = frame::alloc().expect("нет фрейма под стек U-mode");
+            if i == 0 {
+                stack_base = f;
+            }
+            map(root, f, f, PTE_R | PTE_W | PTE_U);
+        }
+        USER_STACK_TOP.store(stack_base + USER_STACK_PAGES * PAGE_SIZE, Ordering::Relaxed);
     }
     root
 }

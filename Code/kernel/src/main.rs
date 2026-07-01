@@ -35,6 +35,7 @@ mod sync;
 mod timer;
 mod trap;
 mod uart;
+mod user;
 mod virtio_blk;
 
 use core::fmt::Write;
@@ -142,6 +143,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // Веха 9: async-executor поверх объектного store (кооперативные future-задачи).
     async_demo();
+    println!();
+
+    // Веха 10.1: выход в пользовательский режим (U-mode) и возврат через syscall.
+    println!("  [user] вход в U-mode (демо syscall'ов):");
+    user::run_user(user::entry(), paging::user_stack_top(), user::trap_stack_top());
+    println!("  [user] вернулись в ядро (S-mode) после SYS_EXIT");
     println!();
 
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
