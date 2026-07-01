@@ -6,5 +6,9 @@ target = "riscv64gc-unknown-none-elf"
 # `cargo run` грузит ядро в QEMU: OpenSBI (-bios default) прыгает в наш ELF
 # по адресу 0x80200000 в S-mode. UART0 выведен в stdio (-nographic).
 # Выход из QEMU: Ctrl-A, затем X.
+#
+# Диск (Веха 7.1): virtio-blk на файле void-disk.img. Создать один раз перед `cargo run`:
+#   truncate -s 16M void-disk.img       (из каталога Code/)
+# force-legacy=false включает modern virtio (version 2), который ждёт наш драйвер.
 [target.riscv64gc-unknown-none-elf]
-runner = "qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -kernel"
+runner = "qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -global virtio-mmio.force-legacy=false -drive file=void-disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel"

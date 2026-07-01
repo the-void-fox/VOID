@@ -1,1 +1,3 @@
 /target
+# Образ диска для virtio-blk (Веха 7.1). Создать: truncate -s 16M void-disk.img
+/void-disk.img

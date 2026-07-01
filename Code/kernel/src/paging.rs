@@ -29,7 +29,9 @@ pub const PTE_D: usize = 1 << 7; // Dirty    — то же для записи
 /// Маска PPN внутри PTE — 44 бита.
 const PPN_MASK: usize = (1 << 44) - 1;
 
-const UART0: usize = 0x1000_0000;
+// MMIO-регион QEMU virt: UART (0x1000_0000) + 8 слотов virtio-mmio (0x1000_1000..0x1000_9000).
+const MMIO_START: usize = 0x1000_0000;
+const MMIO_END: usize = 0x1000_9000;
 const RAM_START: usize = 0x8000_0000;
 const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
 
@@ -53,8 +55,8 @@ pub fn init() -> usize {
     unsafe {
         // 1) direct map всей RAM как RW — база, чтобы всё осталось доступно.
         map_range(root, RAM_START, RAM_END, PTE_R | PTE_W);
-        // 2) MMIO UART (одна страница) как RW — иначе после paging пропадёт вывод.
-        map_range(root, UART0, UART0 + PAGE_SIZE, PTE_R | PTE_W);
+        // 2) MMIO как RW: UART (иначе пропадёт вывод) + слоты virtio-mmio (для диска).
+        map_range(root, MMIO_START, MMIO_END, PTE_R | PTE_W);
         // 3) W^X: перетираем листовые PTE кода и констант более строгими правами.
         map_range(root, text_s, text_e, PTE_R | PTE_X);
         map_range(root, ro_s, ro_e, PTE_R);

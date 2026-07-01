@@ -22,12 +22,13 @@ Code/
 
 ## Сборка и запуск
 ```sh
-nix-shell          # из корня репо: даёт qemu, gdb
+nix-shell                    # из корня репо: даёт qemu, gdb
 cd Code
-cargo run          # собрать ядро и загрузить в QEMU
+truncate -s 16M void-disk.img  # один раз: диск для virtio-blk (gitignore)
+cargo run                    # собрать ядро и загрузить в QEMU
 ```
-Ожидаемый вывод — баннер «VOID — Веха 1» с hart id и адресом DTB.
-Выход из QEMU: **Ctrl-A**, затем **X**.
+Выход из QEMU: **Ctrl-A**, затем **X**. Данные, записанные ядром на `void-disk.img`,
+сохраняются между запусками (персистентность, Веха 7).
 
 ## Отладка (позже)
 QEMU с gdbstub: `qemu-system-riscv64 ... -s -S` + `gdb target/.../void-kernel`.
