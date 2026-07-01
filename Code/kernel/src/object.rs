@@ -33,7 +33,7 @@ use crate::sync::SpinLock;
 use crate::virtio_blk::{self, SECTOR_SIZE as SECTOR};
 
 // ─── раскладка диска ─────────────────────────────────────────────────────────
-const MAGIC: u64 = 0x0002_5346_4449_4F56; // "VOIDFS\x02\x00" (v2: мультикорни/ленивая загрузка)
+const MAGIC: u64 = 0x0003_5346_4449_4F56; // "VOIDFS\x03\x00" (v3: контент-адреса на BLAKE3)
 const SB_SECTOR: u64 = 0;
 const IDX_SECTORS: u64 = 16;
 const IDX_A: u64 = 1;

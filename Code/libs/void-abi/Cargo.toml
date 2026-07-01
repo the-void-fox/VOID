@@ -6,3 +6,6 @@ authors.workspace = true
 description = "Общие типы границы ядро/userspace и зачатки объектной модели VOID."
 
 [dependencies]
+# Криптографический хэш для контент-адресов (ContentId). no_std: без std/rayon —
+# портируемая (portable) реализация, собирается под riscv64 bare-metal.
+blake3 = { version = "1", default-features = false }
