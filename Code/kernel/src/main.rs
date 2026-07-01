@@ -147,12 +147,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     async_demo();
     println!();
 
-    // Веха 10.2: изолированные пользовательские процессы со своим адресным пространством.
-    println!("  [proc] два процесса в U-mode (свой satp, кооперативно через SYS_YIELD):");
-    proc::spawn(user::proc_entry(), 0);
-    proc::spawn(user::proc_entry(), 1);
+    // Веха 10.2: userspace-сервер и клиент, общающиеся через IPC (свои адресные пространства).
+    // P0 = сервер (удваивает число), P1 = клиент (вызывает сервер, id=0).
+    println!("  [proc] userspace-сервер + клиент через IPC (SEND/RECV/REPLY):");
+    proc::spawn(user::server_entry(), 0);
+    proc::spawn(user::client_entry(), 0);
     proc::run();
-    println!("  [proc] все процессы завершились — обратно в ядро");
+    println!("  [proc] сессия процессов завершена — обратно в ядро");
     println!();
 
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.

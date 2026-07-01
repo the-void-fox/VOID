@@ -49,6 +49,8 @@ fn trap_top() -> usize {
 #[derive(PartialEq, Clone, Copy)]
 enum State {
     Runnable,
+    RecvWait,  // заблокирован в RECV (ждёт сообщения)
+    ReplyWait, // заблокирован в CALL (ждёт ответа сервера)
     Finished,
 }
 
@@ -61,6 +63,8 @@ struct Proc {
 struct Table {
     procs: Vec<Proc>,
     current: usize,
+    /// Недоставленные запросы IPC: (отправитель, получатель, сообщение).
+    mailbox: Vec<(usize, usize, usize)>,
 }
 
 impl Table {
@@ -77,7 +81,8 @@ impl Table {
     }
 }
 
-static TABLE: SpinLock<Table> = SpinLock::new(Table { procs: Vec::new(), current: 0 });
+static TABLE: SpinLock<Table> =
+    SpinLock::new(Table { procs: Vec::new(), current: 0, mailbox: Vec::new() });
 
 /// Контекст ядра, в который возвращаемся, когда все процессы завершились.
 static mut RETURN_CTX: Context = Context { ra: 0, sp: 0, s: [0; 12] };
@@ -133,89 +138,136 @@ extern "C" fn proc_enter() -> ! {
 
 // ─── обработка trap'ов из U-mode ──────────────────────────────────────────────
 
-enum Action {
-    Continue, // остаться на том же процессе
-    Yield,    // уступить следующему
-    Exit,     // завершить процесс
-}
-
 /// Обработать trap из U-mode (системный вызов) и возобновить нужный процесс. Не возвращается.
 pub fn handle_user_trap(frame: &mut TrapFrame, scause: usize) -> ! {
-    let action = if scause == csr::EXC_ECALL_FROM_U {
-        dispatch(frame)
-    } else {
-        println!("  [proc] неожиданный trap из U (scause={:#x}) — процесс завершён", scause);
-        Action::Exit
-    };
-
-    // Сохранить состояние текущего процесса и выбрать, кого возобновить.
-    let (next_frame, next_satp, has_next) = {
+    {
         let mut t = TABLE.lock();
         let cur = t.current;
-        t.procs[cur].frame = *frame;
-        match action {
-            Action::Continue => {}
-            Action::Yield => {
-                if let Some(n) = t.next_runnable(cur) {
-                    t.current = n;
-                }
-            }
-            Action::Exit => {
-                t.procs[cur].state = State::Finished;
-                if let Some(n) = t.next_runnable(cur) {
-                    t.current = n;
-                }
-            }
-        }
-        let c = t.current;
-        if t.procs[c].state == State::Runnable {
-            (t.procs[c].frame, t.procs[c].satp, true)
+        t.procs[cur].frame = *frame; // сохранить состояние текущего процесса
+        if scause == csr::EXC_ECALL_FROM_U {
+            syscall(&mut t, cur);
         } else {
-            (TrapFrame::default(), 0, false)
+            println!("  [proc] неожиданный trap из U (scause={:#x}) — процесс завершён", scause);
+            t.procs[cur].state = State::Finished;
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
         }
-    };
+    }
+    resume();
+}
 
-    if has_next {
-        unsafe { enter_user_frame(&next_frame, next_satp, trap_top()) }
+/// Возобновить текущий процесс (или, если он не готов, следующий готовый). Если готовых нет
+/// (все завершены или заблокированы) — вернуться в ядро (в [`run`]). Не возвращается.
+fn resume() -> ! {
+    let mut t = TABLE.lock();
+    let c = t.current;
+    let chosen = if t.procs[c].state == State::Runnable {
+        Some(c)
     } else {
-        // Все процессы завершились → вернуться в ядро (в run).
-        unsafe {
-            let mut discard = Context::default();
-            context_switch(addr_of_mut!(discard), addr_of!(RETURN_CTX));
+        t.next_runnable(c)
+    };
+    match chosen {
+        Some(n) => {
+            t.current = n;
+            let frame = t.procs[n].frame;
+            let satp = t.procs[n].satp;
+            drop(t);
+            unsafe { enter_user_frame(&frame, satp, trap_top()) }
         }
-        loop {} // не достигается
+        None => {
+            drop(t);
+            unsafe {
+                let mut discard = Context::default();
+                context_switch(addr_of_mut!(discard), addr_of!(RETURN_CTX));
+            }
+            loop {} // не достигается
+        }
     }
 }
 
-/// Диспетчер syscall'ов. Номер в `a7`, аргументы в `a0..`, результат в `a0`.
-fn dispatch(frame: &mut TrapFrame) -> Action {
-    let num = frame.regs[17]; // a7
+/// Диспетчер syscall'ов. Номер в `a7`, аргументы в `a0..`, результат в `a0`. Работает прямо
+/// с таблицей: IPC-вызовы затрагивают состояния/кадры ДРУГИХ процессов и выбор `current`.
+fn syscall(t: &mut Table, cur: usize) {
+    let num = t.procs[cur].frame.regs[17]; // a7
     match num {
         // SYS_WRITE(ptr, len): напечатать буфер процесса (ядро читает U-память, SUM=1).
         1 => {
-            let ptr = frame.regs[10];
-            let len = frame.regs[11];
+            let f = &mut t.procs[cur].frame;
+            let (ptr, len) = (f.regs[10], f.regs[11]);
             let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
             crate::print!("{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
-            frame.regs[10] = len;
-            frame.sepc += 4;
-            Action::Continue
+            f.regs[10] = len;
+            f.sepc += 4;
         }
-        // SYS_EXIT(code): завершить процесс.
+        // SYS_EXIT(code): завершить процесс, уступить следующему готовому.
         2 => {
-            println!("  [proc] SYS_EXIT({})", frame.regs[10]);
-            Action::Exit
+            println!("  [proc] P{} SYS_EXIT({})", cur, t.procs[cur].frame.regs[10]);
+            t.procs[cur].state = State::Finished;
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
         }
-        // SYS_YIELD: уступить процессор следующему готовому процессу.
+        // SYS_YIELD: уступить следующему готовому.
         3 => {
-            frame.sepc += 4;
-            Action::Yield
+            t.procs[cur].frame.sepc += 4;
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
+        }
+        // SYS_RECV -> (a0 = сообщение, a1 = отправитель). Блокируется, если запросов нет.
+        4 => {
+            if let Some(pos) = t.mailbox.iter().position(|&(_, to, _)| to == cur) {
+                let (from, _to, msg) = t.mailbox.remove(pos);
+                let f = &mut t.procs[cur].frame;
+                f.regs[10] = msg;
+                f.regs[11] = from;
+                f.sepc += 4;
+            } else {
+                t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
+                if let Some(n) = t.next_runnable(cur) {
+                    t.current = n;
+                }
+            }
+        }
+        // SYS_CALL(dest, msg) -> a0 = ответ. Отправить запрос и ждать ответа (блокируется).
+        5 => {
+            let dest = t.procs[cur].frame.regs[10];
+            let msg = t.procs[cur].frame.regs[11];
+            println!("  [ipc] P{} CALL P{} msg={}", cur, dest, msg);
+            if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
+                // получатель ждёт в RECV — доставить напрямую и разбудить.
+                let f = &mut t.procs[dest].frame;
+                f.regs[10] = msg;
+                f.regs[11] = cur;
+                f.sepc += 4;
+                t.procs[dest].state = State::Runnable;
+            } else {
+                t.mailbox.push((cur, dest, msg)); // получит при следующем RECV
+            }
+            t.procs[cur].state = State::ReplyWait; // sepc двинет доставка ответа
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
+        }
+        // SYS_REPLY(dest, val): ответить клиенту (разбудить его), продолжить работу.
+        6 => {
+            let dest = t.procs[cur].frame.regs[10];
+            let val = t.procs[cur].frame.regs[11];
+            println!("  [ipc] P{} REPLY P{} val={}", cur, dest, val);
+            if dest < t.procs.len() && t.procs[dest].state == State::ReplyWait {
+                let f = &mut t.procs[dest].frame;
+                f.regs[10] = val;
+                f.sepc += 4;
+                t.procs[dest].state = State::Runnable;
+            }
+            t.procs[cur].frame.sepc += 4; // сервер продолжает (остаётся current)
         }
         other => {
+            let f = &mut t.procs[cur].frame;
             println!("  [proc] неизвестный syscall {}", other);
-            frame.regs[10] = usize::MAX;
-            frame.sepc += 4;
-            Action::Continue
+            f.regs[10] = usize::MAX;
+            f.sepc += 4;
         }
     }
 }
