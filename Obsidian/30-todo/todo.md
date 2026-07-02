@@ -51,7 +51,7 @@ status: active
 - [x] **Веха 13.** Сервер объектного store в userspace: `CALL` с буфером запроса + шлюзы `OBJ_PUT`/`OBJ_GET` под cap на `Store`; клиент кладёт/читает объекты по IPC, не касаясь store. См. [[object-store-server]].
 - [x] **Веха 14.** Именованный корень как capability: `OBJ_SET_ROOT`/`OBJ_GET_ROOT` по IPC под store-cap; объект, привязанный к корню, переживает перезагрузку (persistence через userspace-сервер). См. [[persistent-root-ipc]].
 - [x] **Веха 15.** reply-capability: `RECV` выдаёт одноразовый reply-cap (`Target::Reply`), `REPLY` требует его и отзывает — нельзя ответить тому, кто не звал/подделать. См. [[reply-capability]].
-- [ ] **Веха 16.** Вытеснение процессов: таймер в U-mode, таймерный trap = переключение процесса.
+- [x] **Веха 16.** Вытеснение процессов: `sie.STIE` вкл на сессию, таймерный trap из U = переключение процесса (`preempt_tick` + `next_runnable`), ядро с `SIE=0` не вытесняется. См. [[process-preemption]].
 - [ ] **Веха 17.** `BLK_WRITE`: закрыть «только чтение» драйвера блоков.
 - [ ] **Веха 18.** Слой совместимости (Linux/POSIX-персоналия) как сервер.
 
