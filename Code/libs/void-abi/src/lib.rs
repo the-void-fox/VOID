@@ -29,10 +29,11 @@ impl ContentId {
 /// Права, которые несёт capability (битовая маска). Вторая половина модели
 /// KeyKOS/EROS из [[0002-persistent-content-addressed-capability-core]].
 ///
-/// - `READ`  — прочитать значение (или текущую цель ячейки);
+/// - `READ`  — прочитать значение (или текущую цель ячейки); для устройства — читать сектора;
 /// - `WRITE` — переустановить ячейку-корень на новое значение (значения неизменяемы,
 ///   поэтому «запись» — это мутация *ячейки*, а не байтов);
-/// - `GRANT` — передать capability дальше (иначе право «залипает» у обладателя).
+/// - `GRANT` — передать capability дальше (иначе право «залипает» у обладателя);
+/// - `SEND`  — отправить сообщение эндпоинту (право вызвать сервер по IPC).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
 pub struct Rights(pub u32);
@@ -42,7 +43,9 @@ impl Rights {
     pub const READ: Rights = Rights(1 << 0);
     pub const WRITE: Rights = Rights(1 << 1);
     pub const GRANT: Rights = Rights(1 << 2);
-    /// Полный набор — то, что получает владелец при mint.
+    /// Право отправить сообщение эндпоинту (вызвать сервер по IPC) — см. `kernel/src/proc.rs`.
+    pub const SEND: Rights = Rights(1 << 3);
+    /// Полный набор прав на значение/ячейку — то, что получает владелец при mint.
     pub const ALL: Rights = Rights(0b111);
 
     /// Содержит ли `self` все биты из `other`.
@@ -77,6 +80,11 @@ impl Cap {
     /// Собрать дескриптор из номера слота и поколения.
     pub const fn new(slot: u32, generation: u32) -> Cap {
         Cap(((slot as u64) << 32) | generation as u64)
+    }
+    /// Восстановить дескриптор из сырых битов (как он пересекает границу ядро/userspace:
+    /// процесс держит `Cap` как непрозрачное число в регистре и предъявляет его в syscall).
+    pub const fn from_bits(bits: u64) -> Cap {
+        Cap(bits)
     }
     /// Номер слота в c-space.
     pub const fn slot(self) -> u32 {

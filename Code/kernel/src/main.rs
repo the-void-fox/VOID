@@ -147,13 +147,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     async_demo();
     println!();
 
-    // Веха 11: драйвер блоков как userspace-сервер. P0 = сервер-драйвер (читает сектор через
-    // шлюз BLK_READ и отдаёт данные по IPC), P1 = клиент (просит сектор 0, печатает его магию).
-    println!("  [proc] userspace-драйвер блоков (сервер) + клиент через IPC:");
-    proc::spawn(user::blk_server_entry(), 0);
-    proc::spawn(user::blk_client_entry(), 0);
-    proc::run();
-    println!("  [proc] сессия процессов завершена — обратно в ядро");
+    // Веха 12: capability-защищённые IPC-эндпоинты. P0 = драйвер-сервер, ему ядро минтит cap на
+    // УСТРОЙСТВО (право читать сектора). P1 = клиент, ему — cap на ЭНДПОИНТ сервера (право слать
+    // ему сообщения). Без нужного cap ни IPC-вызов, ни доступ к диску невозможны — см. попытку
+    // клиента прочитать диск напрямую в конце.
+    proc_demo();
     println!();
 
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
@@ -305,6 +303,38 @@ fn async_demo() {
 
     executor::run(); // крутить, пока все задачи не завершатся
     println!("    [async] прерываний диска обработано: {}", virtio_blk::irq_count());
+}
+
+/// Веха 12: capability-защищённые IPC-эндпоинты. Драйвер-сервер получает cap на УСТРОЙСТВО,
+/// клиент — cap на ЭНДПОИНТ сервера. `SYS_CALL`/`SYS_BLK_READ` берут дескриптор, а не сырой
+/// pid/номер: без нужного права ядро отказывает. Соединяет [[capabilities]] с [[processes]].
+fn proc_demo() {
+    use void_abi::Rights;
+
+    println!("  [proc] userspace-драйвер + IPC под защитой capability:");
+
+    // Сервер-драйвер: ядро минтит ему cap на УСТРОЙСТВО (право читать сектора). Дескриптор
+    // передаём процессу через a0 — c-space внутри U-mode недоступен, cap живёт как число.
+    let server = proc::spawn("blk-drv", user::blk_server_entry(), 0);
+    let dev = cap::mint(proc::domain(server), cap::Target::Device(cap::Device::Block), Rights::READ);
+    proc::set_arg(server, dev.bits() as usize);
+    println!(
+        "    P{} '{}' ← cap на устройство [{}]",
+        server, cap::domain_name(proc::domain(server)), cap::rights_str(Rights::READ),
+    );
+
+    // Клиент: cap на ЭНДПОИНТ сервера (право слать ему сообщения). Cap на устройство он НЕ
+    // получает — поэтому прямой BLK_READ у него в конце отвергается.
+    let client = proc::spawn("blk-cli", user::blk_client_entry(), 0);
+    let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
+    proc::set_arg(client, ep.bits() as usize);
+    println!(
+        "    P{} '{}' ← cap на эндпоинт P{} [{}]",
+        client, cap::domain_name(proc::domain(client)), server, cap::rights_str(Rights::SEND),
+    );
+
+    proc::run();
+    println!("  [proc] сессия процессов завершена — обратно в ядро");
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).

@@ -27,6 +27,14 @@ use crate::sync::SpinLock;
 /// Идентификатор домена защиты (протопроцесс) — индекс в глобальном c-space.
 pub type DomainId = usize;
 
+/// Устройство, на которое можно держать capability (пока — только блочный диск).
+/// Право `READ` на такой cap — единственный вход к секторам (см. `SYS_BLK_READ` в [[block-driver]]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Device {
+    /// Блочное устройство virtio-blk ([[virtio-blk]]).
+    Block,
+}
+
 /// На что указывает capability.
 #[derive(Clone)]
 pub enum Target {
@@ -34,6 +42,11 @@ pub enum Target {
     Value(ContentId),
     /// Изменяемая именованная ячейка-корень.
     Root(&'static str),
+    /// IPC-эндпоинт: право отправить сообщение процессу-серверу (его id). Держать такой cap
+    /// с правом `SEND` — единственный способ сделать `CALL` этому серверу ([[ipc]], [[processes]]).
+    Endpoint(usize),
+    /// Аппаратное устройство: доступ к железу только по этому cap (право на устройство).
+    Device(Device),
 }
 
 /// Запись в c-space: цель + права на неё.
@@ -145,6 +158,8 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
     let id = match target {
         Target::Value(id) => id,
         Target::Root(name) => object::root(name).ok_or(CapError::Dangling)?,
+        // Эндпоинт/устройство — не значения в store: их «читают» через IPC/BLK_READ, не здесь.
+        Target::Endpoint(_) | Target::Device(_) => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -163,11 +178,42 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
         }
         match e.target {
             Target::Root(name) => name,
-            Target::Value(_) => return Err(CapError::WrongKind),
+            Target::Value(_) | Target::Endpoint(_) | Target::Device(_) => {
+                return Err(CapError::WrongKind)
+            }
         }
     };
     object::set_root(name, new_value);
     Ok(())
+}
+
+/// Разрешить cap на **IPC-эндпоинт** и вернуть id процесса-сервера (требует `SEND`).
+/// Сердце защищённого IPC: `SYS_CALL` берёт не сырой pid, а этот дескриптор — сминтить его
+/// может только ядро при выдаче права, а `resolve` отвергнет подделку/чужую цель.
+pub fn endpoint(dom: DomainId, cap: Cap) -> Result<usize, CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(Rights::SEND) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Endpoint(owner) => Ok(owner),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Разрешить cap на **устройство** и вернуть его (требует прав `need`, напр. `READ`).
+/// Так `SYS_BLK_READ` перестаёт быть открытым для всех: без device-cap доступа к диску нет.
+pub fn device(dom: DomainId, cap: Cap, need: Rights) -> Result<Device, CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Device(d) => Ok(d),
+        _ => Err(CapError::WrongKind),
+    }
 }
 
 // ─── передача и отзыв ──────────────────────────────────────────────────────
@@ -201,11 +247,12 @@ pub fn revoke(dom: DomainId, cap: Cap) -> Result<(), CapError> {
     Ok(())
 }
 
-/// «rwg»-строка прав для вывода.
+/// «rwgs»-строка прав для вывода (read · write · grant · send).
 pub fn rights_str(r: Rights) -> String {
     let mut s = String::new();
     s.push(if r.contains(Rights::READ) { 'r' } else { '-' });
     s.push(if r.contains(Rights::WRITE) { 'w' } else { '-' });
     s.push(if r.contains(Rights::GRANT) { 'g' } else { '-' });
+    s.push(if r.contains(Rights::SEND) { 's' } else { '-' });
     s
 }

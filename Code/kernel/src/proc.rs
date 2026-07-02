@@ -12,10 +12,12 @@
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
+use void_abi::{Cap, Rights};
+
 use crate::context::{context_switch, Context};
 use crate::sync::SpinLock;
 use crate::trap::TrapFrame;
-use crate::{csr, frame, paging, println};
+use crate::{cap, csr, frame, paging, println};
 
 // Ассемблерная функция входа в процесс: satp + восстановление регистров из кадра + sret.
 core::arch::global_asm!(include_str!("enter_user.s"));
@@ -58,6 +60,9 @@ struct Proc {
     satp: usize,
     frame: TrapFrame,
     state: State,
+    /// Домен защиты процесса — его личный c-space ([[capabilities]]). Начальные права
+    /// (эндпоинты, устройства) ядро минтит сюда при spawn; syscall'ы проверяют их отсюда.
+    domain: cap::DomainId,
     /// Приёмный буфер клиента для ответа (VA в его адресном пространстве) — задаётся в CALL,
     /// заполняется в REPLY (передача буфера через IPC).
     recv_buf: usize,
@@ -93,9 +98,11 @@ static mut RETURN_CTX: Context = Context { ra: 0, sp: 0, s: [0; 12] };
 
 // ─── создание и запуск ────────────────────────────────────────────────────────
 
-/// Создать процесс: своё адресное пространство (код `.user` общий, стек приватный),
-/// стартовый кадр (вход `entry`, `a0`=`arg`). Пока Runnable.
-pub fn spawn(entry: usize, arg: usize) {
+/// Создать процесс: свой домен защиты (c-space) + адресное пространство (код `.user` общий,
+/// стек приватный) + стартовый кадр (вход `entry`, `a0`=`arg`). Возвращает id процесса; он же —
+/// адрес эндпоинта для [`cap::Target::Endpoint`]. Пока Runnable. Начальные capability ядро
+/// минтит в его [`domain`] и передаёт дескриптор через [`set_arg`] ДО [`run`].
+pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
     let root = paging::clone_kernel_root();
     // Приватный стек в VPN[2]=1: несколько страниц из свежих фреймов.
     for i in 1..=USER_STACK_PAGES {
@@ -108,13 +115,28 @@ pub fn spawn(entry: usize, arg: usize) {
     frame.regs[2] = USER_STACK_TOP_VA; // sp
     frame.regs[10] = arg; // a0
     frame.sstatus = 1 << 18; // SUM=1, SPP=0 (→U), SPIE=0 (прерывания в U выключены)
-    TABLE.lock().procs.push(Proc {
+    let domain = cap::create_domain(name);
+    let mut t = TABLE.lock();
+    t.procs.push(Proc {
         satp: SATP_SV39 | (root >> 12),
         frame,
         state: State::Runnable,
+        domain,
         recv_buf: 0,
         recv_cap: 0,
     });
+    t.procs.len() - 1
+}
+
+/// Домен защиты (c-space) процесса — сюда ядро минтит его начальные capability до [`run`].
+pub fn domain(pid: usize) -> cap::DomainId {
+    TABLE.lock().procs[pid].domain
+}
+
+/// Задать стартовый аргумент (`a0`) процесса до запуска — например, дескриптор capability,
+/// который процесс предъявит в первом syscall'е.
+pub fn set_arg(pid: usize, a0: usize) {
+    TABLE.lock().procs[pid].frame.regs[10] = a0;
 }
 
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
@@ -245,27 +267,42 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_CALL(dest, msg, recv_buf, recv_cap) -> a0 = число принятых байт. Отправить запрос
-        // и ждать ответа (блокируется); recv_buf/cap — куда положить данные ответа.
+        // SYS_CALL(ep_cap, msg, recv_buf, recv_cap) -> a0 = число принятых байт (или MAX, если
+        // cap не даёт права слать). `ep_cap` — дескриптор эндпоинта в c-space процесса; ядро
+        // резолвит его в id сервера. Отправить запрос и ждать ответа (блокируется).
         5 => {
-            let f = &t.procs[cur].frame;
-            let (dest, msg, rbuf, rcap) = (f.regs[10], f.regs[11], f.regs[12], f.regs[13]);
-            println!("  [ipc] P{} CALL P{} msg={}", cur, dest, msg);
-            t.procs[cur].recv_buf = rbuf;
-            t.procs[cur].recv_cap = rcap;
-            if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
-                // получатель ждёт в RECV — доставить напрямую и разбудить.
-                let df = &mut t.procs[dest].frame;
-                df.regs[10] = msg;
-                df.regs[11] = cur;
-                df.sepc += 4;
-                t.procs[dest].state = State::Runnable;
-            } else {
-                t.mailbox.push((cur, dest, msg)); // получит при следующем RECV
-            }
-            t.procs[cur].state = State::ReplyWait; // sepc двинет доставка ответа
-            if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+            let (ecap, msg, rbuf, rcap) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+            };
+            let dom = t.procs[cur].domain;
+            match cap::endpoint(dom, Cap::from_bits(ecap as u64)) {
+                Ok(dest) => {
+                    println!("  [ipc] P{} CALL P{} (по cap) msg={}", cur, dest, msg);
+                    t.procs[cur].recv_buf = rbuf;
+                    t.procs[cur].recv_cap = rcap;
+                    if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
+                        // получатель ждёт в RECV — доставить напрямую и разбудить.
+                        let df = &mut t.procs[dest].frame;
+                        df.regs[10] = msg;
+                        df.regs[11] = cur;
+                        df.sepc += 4;
+                        t.procs[dest].state = State::Runnable;
+                    } else {
+                        t.mailbox.push((cur, dest, msg)); // получит при следующем RECV
+                    }
+                    t.procs[cur].state = State::ReplyWait; // sepc двинет доставка ответа
+                    if let Some(n) = t.next_runnable(cur) {
+                        t.current = n;
+                    }
+                }
+                Err(e) => {
+                    // Нет валидного cap на эндпоинт — отказ. Процесс не блокируется, продолжает.
+                    println!("  [ipc] P{} CALL отклонён: {:?}  ← нет capability на эндпоинт", cur, e);
+                    let f = &mut t.procs[cur].frame;
+                    f.regs[10] = usize::MAX;
+                    f.sepc += 4;
+                }
             }
         }
         // SYS_REPLY(dest, src_buf, len): ответить клиенту, передав `len` байт из своего буфера
@@ -289,20 +326,33 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             t.procs[cur].frame.sepc += 4; // сервер продолжает (остаётся current)
         }
-        // SYS_BLK_READ(sector, buf): привилегированный шлюз к диску. DMA идёт в ЯДЕРНЫЙ буфер
-        // (страницы процесса не identity-mapped), затем копируем в буфер вызывающего (SUM=1).
+        // SYS_BLK_READ(dev_cap, sector, buf): шлюз к диску ПОД ЗАЩИТОЙ capability. Без валидного
+        // cap на устройство (право READ) — отказ, даже если процесс знает номер сектора. DMA идёт
+        // в ЯДЕРНЫЙ буфер (страницы процесса не identity-mapped), затем копируем вызывающему (SUM=1).
         7 => {
-            let sector = t.procs[cur].frame.regs[10];
-            let ubuf = t.procs[cur].frame.regs[11];
-            println!("  [blk] P{} SYS_BLK_READ сектор {}", cur, sector);
-            let mut tmp = [0u8; 512];
-            let ok = crate::virtio_blk::read(sector as u64, &mut tmp);
-            if ok {
-                let dst = unsafe { core::slice::from_raw_parts_mut(ubuf as *mut u8, 512) };
-                dst.copy_from_slice(&tmp);
-            }
+            let (dcap, sector, ubuf) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
+                Ok(cap::Device::Block) => {
+                    println!("  [blk] P{} SYS_BLK_READ сектор {} (по cap)", cur, sector);
+                    let mut tmp = [0u8; 512];
+                    let ok = crate::virtio_blk::read(sector as u64, &mut tmp);
+                    if ok {
+                        let dst = unsafe { core::slice::from_raw_parts_mut(ubuf as *mut u8, 512) };
+                        dst.copy_from_slice(&tmp);
+                    }
+                    if ok { 0 } else { usize::MAX }
+                }
+                Err(e) => {
+                    println!("  [blk] P{} SYS_BLK_READ отклонён: {:?}  ← нет capability на устройство", cur, e);
+                    usize::MAX
+                }
+            };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = if ok { 0 } else { usize::MAX };
+            f.regs[10] = result;
             f.sepc += 4;
         }
         other => {
