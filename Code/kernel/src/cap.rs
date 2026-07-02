@@ -45,6 +45,10 @@ pub enum Target {
     /// IPC-эндпоинт: право отправить сообщение процессу-серверу (его id). Держать такой cap
     /// с правом `SEND` — единственный способ сделать `CALL` этому серверу ([[ipc]], [[processes]]).
     Endpoint(usize),
+    /// **Одноразовый reply-cap** на вызвавшего клиента (его id). Ядро минтит его серверу при
+    /// доставке запроса (`RECV`); `REPLY` требует его и по исполнении отзывает. Так нельзя
+    /// ответить тому, кто не звал, и нельзя подделать ответ ([[reply-capability]]).
+    Reply(usize),
     /// Аппаратное устройство: доступ к железу только по этому cap (право на устройство).
     Device(Device),
     /// Персистентный объектный [[object-model|store]] как ресурс: `READ` — читать значения по
@@ -162,8 +166,10 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
     let id = match target {
         Target::Value(id) => id,
         Target::Root(name) => object::root(name).ok_or(CapError::Dangling)?,
-        // Эндпоинт/устройство/store — не значения: их «читают» через IPC/BLK_READ/OBJ_GET, не здесь.
-        Target::Endpoint(_) | Target::Device(_) | Target::Store => return Err(CapError::WrongKind),
+        // Эндпоинт/reply/устройство/store — не значения: их «читают» через IPC/BLK_READ/OBJ_GET.
+        Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store => {
+            return Err(CapError::WrongKind)
+        }
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -182,9 +188,8 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
         }
         match e.target {
             Target::Root(name) => name,
-            Target::Value(_) | Target::Endpoint(_) | Target::Device(_) | Target::Store => {
-                return Err(CapError::WrongKind)
-            }
+            Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
+            | Target::Store => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -202,6 +207,20 @@ pub fn endpoint(dom: DomainId, cap: Cap) -> Result<usize, CapError> {
     }
     match e.target {
         Target::Endpoint(owner) => Ok(owner),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Разрешить **reply-cap** и вернуть id клиента, которому адресован ответ (требует `SEND`).
+/// Пара к [`endpoint`], но цель — конкретный вызвавший. `REPLY` затем отзывает cap (одноразовость).
+pub fn reply_endpoint(dom: DomainId, cap: Cap) -> Result<usize, CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(Rights::SEND) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Reply(caller) => Ok(caller),
         _ => Err(CapError::WrongKind),
     }
 }

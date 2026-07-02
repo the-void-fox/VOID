@@ -26,6 +26,9 @@ static NL: [u8; 1] = *b"\n";
 // ASCII-строка (в byte-строках нельзя не-ASCII): демонстрация отказа при прямом доступе к диску.
 static DENIED: [u8; b"[blk-cli] direct disk read DENIED by kernel (no device capability)\n".len()] =
     *b"[blk-cli] direct disk read DENIED by kernel (no device capability)\n";
+// Веха 15: попытка подделать REPLY (предъявив НЕ reply-cap) — ядро отвергает.
+static RFORGE: [u8; b"[blk-cli] forged REPLY DENIED by kernel (not a reply-capability)\n".len()] =
+    *b"[blk-cli] forged REPLY DENIED by kernel (not a reply-capability)\n";
 
 // ── Веха 13/14: сервер объектного store ──
 const OP_PUT: usize = 0;
@@ -99,6 +102,12 @@ extern "C" fn blk_client(ep_cap: usize) -> ! {
         asm!("ecall", in("a7") 7usize, inout("a0") ep_cap => denied, in("a1") 0usize, in("a2") bptr, options(nostack));
         if denied != 0 {
             asm!("ecall", in("a7") 1usize, inout("a0") DENIED.as_ptr() as usize => _, in("a1") DENIED.len(), options(nostack));
+        }
+        // Веха 15: попытка подделать REPLY эндпоинт-cap'ом (не reply-cap) → отказ ядра.
+        let rforge: usize;
+        asm!("ecall", in("a7") 6usize, inout("a0") ep_cap => rforge, in("a1") bptr, in("a2") 8usize, options(nostack));
+        if rforge != 0 {
+            asm!("ecall", in("a7") 1usize, inout("a0") RFORGE.as_ptr() as usize => _, in("a1") RFORGE.len(), options(nostack));
         }
         // SYS_EXIT(0)
         asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn));

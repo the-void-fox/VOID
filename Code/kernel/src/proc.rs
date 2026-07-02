@@ -279,9 +279,10 @@ fn syscall(t: &mut Table, cur: usize) {
             if let Some(pos) = t.mailbox.iter().position(|&(_, to, _)| to == cur) {
                 let (from, _to, op) = t.mailbox.remove(pos);
                 let n = deliver_request(t, from, cur);
+                let rc = cap::mint(t.procs[cur].domain, cap::Target::Reply(from), Rights::SEND);
                 let f = &mut t.procs[cur].frame;
                 f.regs[10] = op;
-                f.regs[11] = from;
+                f.regs[11] = rc.bits() as usize;
                 f.regs[12] = n;
                 f.sepc += 4;
             } else {
@@ -310,10 +311,12 @@ fn syscall(t: &mut Table, cur: usize) {
                     t.procs[cur].send_len = slen;
                     if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
                         // получатель ждёт в RECV — доставить нагрузку в его буфер и разбудить.
+                        // Выдать серверу одноразовый reply-cap на этого клиента (см. [[reply-capability]]).
                         let n = deliver_request(t, cur, dest);
+                        let rc = cap::mint(t.procs[dest].domain, cap::Target::Reply(cur), Rights::SEND);
                         let df = &mut t.procs[dest].frame;
                         df.regs[10] = op;
-                        df.regs[11] = cur;
+                        df.regs[11] = rc.bits() as usize;
                         df.regs[12] = n;
                         df.sepc += 4;
                         t.procs[dest].state = State::Runnable;
@@ -334,26 +337,43 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_REPLY(dest, src_buf, len): ответить клиенту, передав `len` байт из своего буфера
-        // в его приёмный буфер (копирование между адресными пространствами), и разбудить его.
+        // SYS_REPLY(reply_cap, src_buf, len) -> 0/MAX: ответить вызвавшему клиенту, передав `len`
+        // байт из своего буфера в его приёмный буфер, и разбудить его. `reply_cap` — одноразовый
+        // cap на клиента, выданный при `RECV`; ядро резолвит его в id клиента и по исполнении
+        // отзывает. Подделать/переиспользовать нельзя (см. [[reply-capability]]).
         6 => {
-            let f = &t.procs[cur].frame;
-            let (dest, src, len) = (f.regs[10], f.regs[11], f.regs[12]);
-            println!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
-            if dest < t.procs.len() && t.procs[dest].state == State::ReplyWait {
-                let n = len.min(t.procs[dest].recv_cap);
-                // Читаем из текущего (сервера) по SUM=1; пишем в адресное пространство клиента
-                // через трансляцию его таблицы (физический адрес отображён в ядре идентично).
-                let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
-                let droot = root_of(t.procs[dest].satp);
-                let dbuf = t.procs[dest].recv_buf;
-                copy_to_space(droot, dbuf, src_slice);
-                let df = &mut t.procs[dest].frame;
-                df.regs[10] = n; // клиентский CALL вернёт число принятых байт
-                df.sepc += 4;
-                t.procs[dest].state = State::Runnable;
-            }
-            t.procs[cur].frame.sepc += 4; // сервер продолжает (остаётся current)
+            let (rcap, src, len) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::reply_endpoint(dom, Cap::from_bits(rcap as u64)) {
+                Ok(dest) => {
+                    println!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
+                    if dest < t.procs.len() && t.procs[dest].state == State::ReplyWait {
+                        let n = len.min(t.procs[dest].recv_cap);
+                        // Читаем из текущего (сервера) по SUM=1; пишем в пространство клиента через
+                        // трансляцию его таблицы (физ. адрес отображён в ядре идентично).
+                        let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
+                        let droot = root_of(t.procs[dest].satp);
+                        let dbuf = t.procs[dest].recv_buf;
+                        copy_to_space(droot, dbuf, src_slice);
+                        let df = &mut t.procs[dest].frame;
+                        df.regs[10] = n; // клиентский CALL вернёт число принятых байт
+                        df.sepc += 4;
+                        t.procs[dest].state = State::Runnable;
+                    }
+                    let _ = cap::revoke(dom, Cap::from_bits(rcap as u64)); // одноразовость
+                    0
+                }
+                Err(e) => {
+                    println!("  [ipc] P{} REPLY отклонён: {:?}  ← нет reply-capability", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4; // сервер продолжает (остаётся current)
         }
         // SYS_BLK_READ(dev_cap, sector, buf): шлюз к диску ПОД ЗАЩИТОЙ capability. Без валидного
         // cap на устройство (право READ) — отказ, даже если процесс знает номер сектора. DMA идёт
