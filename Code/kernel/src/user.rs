@@ -41,6 +41,21 @@ static RFORGE: [u8; b"[blk-cli] forged REPLY DENIED by kernel (not a reply-capab
 static LBL_A: [u8; 3] = *b" A ";
 static LBL_B: [u8; 3] = *b" B ";
 
+// ── Веха 18.1: POSIX-персоналия (файлы поверх IPC) ──
+// op персоналии кодирует операцию (младший байт) и дескриптор fd (следующий байт): op | (fd<<8).
+const PX_OPEN: usize = 0;
+const PX_READ: usize = 1;
+const PX_WRITE: usize = 2;
+const PX_CLOSE: usize = 3;
+const PX_NFILES: usize = 4; // namespace фикс. размера (у процессов нет кучи — всё на стеке)
+const PX_NAME_MAX: usize = 16;
+const PX_DATA_MAX: usize = 256;
+static FNAME: [u8; b"hello.txt".len()] = *b"hello.txt";
+static FCONTENT: [u8; b"Hello, POSIX personality on VOID!".len()] =
+    *b"Hello, POSIX personality on VOID!";
+static PXPREFIX: [u8; b"[posix-app] read('hello.txt') -> ".len()] =
+    *b"[posix-app] read('hello.txt') -> ";
+
 // ── Веха 13/14: сервер объектного store ──
 const OP_PUT: usize = 0;
 const OP_GET: usize = 1;
@@ -279,6 +294,178 @@ extern "C" fn busy(label: usize) -> ! {
     unsafe { asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn)) }
 }
 
+/// Процесс-**персоналия POSIX** (Веха 18.1): даёт клиентам файловый API `open/read/write/close`
+/// по IPC. Namespace (имена → данные) и таблица дескрипторов живут на СТЕКЕ сервера — у процессов
+/// нет кучи, поэтому фикс. размер. Данные — в `MaybeUninit` (без обнуления), валидность отслеживаем
+/// сами (`used`/`size`). Всё через сырые указатели: ни `memcpy`, ни паник-путей в `.user`.
+#[link_section = ".user"]
+extern "C" fn posix_server(_arg: usize) -> ! {
+    // Namespace на стеке: имена, данные, метаданные.
+    let mut names = MaybeUninit::<[[u8; PX_NAME_MAX]; PX_NFILES]>::uninit();
+    let mut datas = MaybeUninit::<[[u8; PX_DATA_MAX]; PX_NFILES]>::uninit();
+    let names_ptr = names.as_mut_ptr() as *mut u8;
+    let datas_ptr = datas.as_mut_ptr() as *mut u8;
+    let mut name_len = [0usize; PX_NFILES];
+    let mut size = [0usize; PX_NFILES];
+    let mut fused = [false; PX_NFILES];
+    // Дескрипторы: fd → (файл, смещение).
+    let mut fd_file = [0usize; PX_NFILES];
+    let mut fd_off = [0usize; PX_NFILES];
+    let mut fd_used = [false; PX_NFILES];
+
+    let mut req = MaybeUninit::<[u8; 512]>::uninit();
+    let mut rep = MaybeUninit::<[u8; 512]>::uninit();
+    let rptr = req.as_mut_ptr() as usize;
+    let pptr = rep.as_mut_ptr() as usize;
+
+    loop {
+        let op: usize;
+        let from: usize;
+        let len: usize;
+        unsafe {
+            // RECV(req, 512) -> op (opcode | fd<<8), from (reply-cap), len (нагрузка в req)
+            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, options(nostack));
+        }
+        let opcode = op & 0xff;
+        let fd = (op >> 8) & 0xff;
+        let mut reply_len = 0usize; // сколько байт вернём в pptr
+
+        if opcode == PX_OPEN {
+            // req[..len] — имя. Найти файл или создать; выделить fd; вернуть [fd] (0xff — ошибка).
+            let mut fidx = usize::MAX;
+            let mut i = 0;
+            while i < PX_NFILES {
+                if fused[i] && name_len[i] == len {
+                    let mut eq = true;
+                    let mut k = 0;
+                    while k < len {
+                        let a = unsafe { *names_ptr.add(i * PX_NAME_MAX + k) };
+                        let b = unsafe { *(rptr as *const u8).add(k) };
+                        if a != b {
+                            eq = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if eq {
+                        fidx = i;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            if fidx == usize::MAX {
+                let mut j = 0;
+                while j < PX_NFILES {
+                    if !fused[j] {
+                        fidx = j;
+                        break;
+                    }
+                    j += 1;
+                }
+                if fidx != usize::MAX {
+                    fused[fidx] = true;
+                    size[fidx] = 0;
+                    let nl = if len > PX_NAME_MAX { PX_NAME_MAX } else { len };
+                    name_len[fidx] = nl;
+                    let mut k = 0;
+                    while k < nl {
+                        unsafe { *names_ptr.add(fidx * PX_NAME_MAX + k) = *(rptr as *const u8).add(k) };
+                        k += 1;
+                    }
+                }
+            }
+            let mut nfd = usize::MAX;
+            if fidx != usize::MAX {
+                let mut d = 0;
+                while d < PX_NFILES {
+                    if !fd_used[d] {
+                        nfd = d;
+                        break;
+                    }
+                    d += 1;
+                }
+                if nfd != usize::MAX {
+                    fd_used[nfd] = true;
+                    fd_file[nfd] = fidx;
+                    fd_off[nfd] = 0;
+                }
+            }
+            unsafe { *(pptr as *mut u8) = if nfd == usize::MAX { 0xff } else { nfd as u8 } };
+            reply_len = 1;
+        } else if opcode == PX_WRITE {
+            // req[..len] — данные; дописать в файл дескриптора со смещения fd_off.
+            if fd < PX_NFILES && fd_used[fd] {
+                let fi = fd_file[fd];
+                let mut w = fd_off[fd];
+                let mut k = 0;
+                while k < len && w < PX_DATA_MAX {
+                    unsafe { *datas_ptr.add(fi * PX_DATA_MAX + w) = *(rptr as *const u8).add(k) };
+                    w += 1;
+                    k += 1;
+                }
+                fd_off[fd] = w;
+                if w > size[fi] {
+                    size[fi] = w;
+                }
+            }
+        } else if opcode == PX_READ {
+            // Прочитать из файла со смещения до конца (клиент ограничит своим recv_cap).
+            if fd < PX_NFILES && fd_used[fd] {
+                let fi = fd_file[fd];
+                let mut r = fd_off[fd];
+                while r < size[fi] && reply_len < 512 {
+                    unsafe { *(pptr as *mut u8).add(reply_len) = *datas_ptr.add(fi * PX_DATA_MAX + r) };
+                    r += 1;
+                    reply_len += 1;
+                }
+                fd_off[fd] = r;
+            }
+        } else {
+            // PX_CLOSE — освободить дескриптор (файл и его данные остаются в namespace).
+            if fd < PX_NFILES {
+                fd_used[fd] = false;
+            }
+        }
+
+        unsafe {
+            // REPLY(reply-cap, pptr, reply_len)
+            asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") pptr, in("a2") reply_len, options(nostack));
+        }
+    }
+}
+
+/// Процесс-**POSIX-программа** (Веха 18.1): `arg` = cap на эндпоинт персоналии. Пользуется только
+/// POSIX-подобными вызовами (open/write/close/open/read) через IPC-shim — и «не знает», что под
+/// ним VOID. Создаёт файл, пишет строку, закрывает; затем открывает по имени и читает обратно.
+#[link_section = ".user"]
+extern "C" fn posix_client(ep: usize) -> ! {
+    let mut buf = MaybeUninit::<[u8; 512]>::uninit();
+    let bptr = buf.as_mut_ptr() as usize;
+    let name = FNAME.as_ptr() as usize;
+    let content = FCONTENT.as_ptr() as usize;
+    unsafe {
+        // fd = open("hello.txt")  — сервер вернёт fd одним байтом в buf.
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") name, in("a3") FNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
+        let fd = *(bptr as *const u8) as usize;
+        // write(fd, content)
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (fd << 8), in("a2") content, in("a3") FCONTENT.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        // close(fd)
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+        // fd2 = open("hello.txt")  — тот же файл по имени, смещение с нуля.
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") name, in("a3") FNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
+        let fd2 = *(bptr as *const u8) as usize;
+        // n = read(fd2, buf) — вернёт содержимое файла.
+        let n: usize;
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (fd2 << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
+        // Напечатать: префикс + прочитанное содержимое + перевод строки.
+        asm!("ecall", in("a7") 1usize, inout("a0") PXPREFIX.as_ptr() as usize => _, in("a1") PXPREFIX.len(), options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") n, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+        asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn));
+    }
+}
+
 /// Точки входа (identity VA секции `.user`).
 pub fn blk_server_entry() -> usize {
     blk_server as *const () as usize
@@ -294,6 +481,12 @@ pub fn store_client_entry() -> usize {
 }
 pub fn busy_entry() -> usize {
     busy as *const () as usize
+}
+pub fn posix_server_entry() -> usize {
+    posix_server as *const () as usize
+}
+pub fn posix_client_entry() -> usize {
+    posix_client as *const () as usize
 }
 pub fn label_a() -> usize {
     LBL_A.as_ptr() as usize

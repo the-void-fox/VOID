@@ -166,6 +166,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     preempt_demo();
     println!();
 
+    // Веха 18.1: POSIX-персоналия как сервер. Процесс-программа пользуется только POSIX-подобными
+    // open/write/close/read через IPC-shim; сервер-персоналия держит namespace файлов в своей RAM.
+    posix_demo();
+    println!();
+
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
     gc_demo();
     println!();
@@ -399,6 +404,25 @@ fn preempt_demo() {
         "  [proc] оба процесса завершились; вытеснений таймером за сессию: {}",
         timer::ticks() - before,
     );
+}
+
+/// Веха 18.1: POSIX-персоналия как сервер. Программа-клиент пользуется только POSIX-подобными
+/// вызовами (`open/write/close/read`) через тонкий IPC-shim и «не знает», что под ней VOID.
+/// Сервер-персоналия держит namespace файлов в своей RAM (пока без персистентности — Веха 18.2).
+fn posix_demo() {
+    use void_abi::Rights;
+
+    println!("  [proc] POSIX-персоналия (файлы open/write/close/read) через IPC:");
+    let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
+    let client = proc::spawn("posix-app", user::posix_client_entry(), 0);
+    let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
+    proc::set_arg(client, ep.bits() as usize);
+    println!(
+        "    P{} '{}' ← cap на эндпоинт персоналии P{} '{}'",
+        client, cap::domain_name(proc::domain(client)), server, cap::domain_name(proc::domain(server)),
+    );
+    proc::run();
+    println!("  [proc] сессия персоналии завершена — обратно в ядро");
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).
