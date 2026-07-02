@@ -445,6 +445,74 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = result;
             f.sepc += 4;
         }
+        // SYS_OBJ_SET_ROOT(store_cap, name_ptr, name_len, id_ptr) -> 0/MAX: привязать именованный
+        // корень к значению (нужен `WRITE`). Так объект переживает перезагрузку ([[persistent-store]]).
+        10 => {
+            let (scap, nptr, nlen, idp) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) => {
+                    let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
+                    let mut id = [0u8; 32];
+                    let src = unsafe { core::slice::from_raw_parts(idp as *const u8, 32) };
+                    id.copy_from_slice(src);
+                    match core::str::from_utf8(name_bytes) {
+                        Ok(name) => {
+                            crate::object::set_root(name, ContentId(id));
+                            println!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap)", cur, name);
+                            0
+                        }
+                        Err(_) => usize::MAX,
+                    }
+                }
+                Err(e) => {
+                    println!("  [obj] P{} OBJ_SET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
+        // SYS_OBJ_GET_ROOT(store_cap, name_ptr, name_len, id_out) -> 32 (есть) / 0 (нет) / MAX
+        // (отказ): узнать content-id именованного корня (нужен `READ`).
+        11 => {
+            let (scap, nptr, nlen, idout) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(()) => {
+                    let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
+                    match core::str::from_utf8(name_bytes) {
+                        Ok(name) => match crate::object::root(name) {
+                            Some(id) => {
+                                let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
+                                out.copy_from_slice(&id.0);
+                                println!("  [obj] P{} OBJ_GET_ROOT '{}' → есть (по cap)", cur, name);
+                                32
+                            }
+                            None => {
+                                println!("  [obj] P{} OBJ_GET_ROOT '{}' → нет (по cap)", cur, name);
+                                0
+                            }
+                        },
+                        Err(_) => usize::MAX,
+                    }
+                }
+                Err(e) => {
+                    println!("  [obj] P{} OBJ_GET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             println!("  [proc] неизвестный syscall {}", other);
