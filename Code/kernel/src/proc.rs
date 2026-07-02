@@ -542,6 +542,34 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = result;
             f.sepc += 4;
         }
+        // SYS_BLK_WRITE(dev_cap, sector, buf, len) -> 0/MAX: записать сектор ПОД ЗАЩИТОЙ capability
+        // (нужен `WRITE` на устройство). Данные копируем из буфера вызывающего (SUM=1) в ЯДЕРНЫЙ
+        // буфер (страницы процесса не identity-mapped для DMA), недостающее до сектора — нулями.
+        12 => {
+            let (dcap, sector, ubuf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
+                Ok(cap::Device::Block) => {
+                    let mut tmp = [0u8; 512];
+                    let n = len.min(512);
+                    let src = unsafe { core::slice::from_raw_parts(ubuf as *const u8, n) };
+                    tmp[..n].copy_from_slice(src);
+                    let ok = crate::virtio_blk::write(sector as u64, &tmp);
+                    println!("  [blk] P{} SYS_BLK_WRITE сектор {} ({} байт, по cap)", cur, sector, n);
+                    if ok { 0 } else { usize::MAX }
+                }
+                Err(e) => {
+                    println!("  [blk] P{} SYS_BLK_WRITE отклонён: {:?}  ← нет capability (WRITE) на устройство", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             println!("  [proc] неизвестный syscall {}", other);

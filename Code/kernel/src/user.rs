@@ -6,10 +6,11 @@
 //!   1 = WRITE(ptr,len), 2 = EXIT(code),
 //!   4 = RECV(recv_buf,recv_cap) -> (a0=op, a1=from, a2=len),
 //!   5 = CALL(ep_cap,op,send_buf,send_len,recv_buf,recv_cap) -> a0=байт ответа,
-//!   6 = REPLY(dest,src_buf,len), 7 = BLK_READ(dev_cap,sector,buf),
+//!   6 = REPLY(reply_cap,src_buf,len), 7 = BLK_READ(dev_cap,sector,buf),
 //!   8 = OBJ_PUT(store_cap,buf,len,id_out) -> 0/MAX, 9 = OBJ_GET(store_cap,id_ptr,out,cap) -> len,
 //!   10 = OBJ_SET_ROOT(store_cap,name,name_len,id_ptr) -> 0/MAX,
-//!   11 = OBJ_GET_ROOT(store_cap,name,name_len,id_out) -> 32/0/MAX.
+//!   11 = OBJ_GET_ROOT(store_cap,name,name_len,id_out) -> 32/0/MAX,
+//!   12 = BLK_WRITE(dev_cap,sector,buf,len) -> 0/MAX.
 //!
 //! Веха 12: **capability-защищённые эндпоинты** (драйвер-сервер + клиент через IPC).
 //! Веха 13: **сервер объектного store** — процесс с cap на store отдаёт put/get объектов по IPC
@@ -23,6 +24,13 @@ use core::mem::MaybeUninit;
 static PREFIX: [u8; b"[blk-cli] sector 0 via driver-server: ".len()] =
     *b"[blk-cli] sector 0 via driver-server: ";
 static NL: [u8; 1] = *b"\n";
+// Веха 17: BLK_WRITE. В `op` блок-запроса младшие биты = сектор, бит 40 = флаг записи.
+const BLK_WRITE_FLAG: usize = 1 << 40;
+const BLK_TEST_SECTOR: usize = 20000; // заведомо свободный сектор (store использует низкие)
+static PATTERN: [u8; b"VOID block-write via server works".len()] =
+    *b"VOID block-write via server works";
+static WPREFIX: [u8; b"[blk-cli] sector 20000 read back after write: ".len()] =
+    *b"[blk-cli] sector 20000 read back after write: ";
 // ASCII-строка (в byte-строках нельзя не-ASCII): демонстрация отказа при прямом доступе к диску.
 static DENIED: [u8; b"[blk-cli] direct disk read DENIED by kernel (no device capability)\n".len()] =
     *b"[blk-cli] direct disk read DENIED by kernel (no device capability)\n";
@@ -60,25 +68,38 @@ static SDENIED: [u8; b"[store-cli] direct OBJ_PUT DENIED by kernel (no store cap
 /// вне секции `.user`).
 #[link_section = ".user"]
 extern "C" fn blk_server(dev_cap: usize) -> ! {
-    let mut buf = MaybeUninit::<[u8; 512]>::uninit();
+    let mut buf = MaybeUninit::<[u8; 512]>::uninit(); // буфер чтения/ответа
+    let mut req = MaybeUninit::<[u8; 512]>::uninit(); // данные запроса (для записи)
     let bptr = buf.as_mut_ptr() as usize;
+    let rptr = req.as_mut_ptr() as usize;
     loop {
-        let sector: usize;
+        let op: usize;
         let from: usize;
+        let len: usize;
         unsafe {
-            // SYS_RECV(recv_buf=0, recv_cap=0) -> a0=op(=sector), a1=from, a2=len (нагрузки нет)
-            asm!("ecall", in("a7") 4usize, inout("a0") 0usize => sector, inout("a1") 0usize => from, out("a2") _, options(nostack));
-            // SYS_BLK_READ(dev_cap, sector, buf) — прочитать сектор в свой буфер по cap на устройство
-            asm!("ecall", in("a7") 7usize, inout("a0") dev_cap => _, in("a1") sector, in("a2") bptr, options(nostack));
-            // SYS_REPLY(from, buf, 512) — отдать данные клиенту
-            asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 512usize, options(nostack));
+            // SYS_RECV(req, 512) -> a0=op (сектор | флаг записи), a1=from, a2=len (данные в req)
+            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, options(nostack));
+        }
+        let sector = op & 0xffff_ffff; // младшие биты op = номер сектора
+        if op & BLK_WRITE_FLAG == 0 {
+            unsafe {
+                // READ: BLK_READ(dev_cap, sector, buf); REPLY(from, buf, 512)
+                asm!("ecall", in("a7") 7usize, inout("a0") dev_cap => _, in("a1") sector, in("a2") bptr, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 512usize, options(nostack));
+            }
+        } else {
+            unsafe {
+                // WRITE: BLK_WRITE(dev_cap, sector, req, len); REPLY(from, ack=0)
+                asm!("ecall", in("a7") 12usize, inout("a0") dev_cap => _, in("a1") sector, in("a2") rptr, in("a3") len, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 0usize, options(nostack));
+            }
         }
     }
 }
 
-/// Процесс-**клиент**: `arg` = cap на эндпоинт сервера. Просит сектор 0 через `CALL`, печатает
-/// его магию, затем пытается прочитать диск НАПРЯМУЮ (предъявляя эндпоинт-cap, не device) —
-/// и получает отказ ядра: наглядно, что доступ к железу — только по правильному capability.
+/// Процесс-**клиент**: `arg` = cap на эндпоинт сервера. Читает сектор 0 (магия VOIDFS), затем
+/// ЗАПИСЫВАЕТ паттерн в свободный сектор через сервер и читает его обратно (доказывая запись).
+/// В конце пытается обратиться к диску НАПРЯМУЮ и подделать REPLY — оба раза получает отказ ядра.
 #[link_section = ".user"]
 extern "C" fn blk_client(ep_cap: usize) -> ! {
     let mut buf = MaybeUninit::<[u8; 512]>::uninit();
@@ -100,6 +121,16 @@ extern "C" fn blk_client(ep_cap: usize) -> ! {
         asm!("ecall", in("a7") 1usize, inout("a0") PREFIX.as_ptr() as usize => _, in("a1") PREFIX.len(), options(nostack));
         asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") 6usize, options(nostack));
         asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+
+        // Веха 17: ЗАПИСЬ сектора TEST через сервер (op = сектор | флаг записи). Данные = PATTERN;
+        // ядро читает её из .rodata при копировании запроса, сам процесс её не трогает.
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, in("a1") (BLK_TEST_SECTOR | BLK_WRITE_FLAG), in("a2") PATTERN.as_ptr() as usize, in("a3") PATTERN.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        // Прочитать тот же сектор ОБРАТНО и напечатать — доказательство записи.
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, in("a1") BLK_TEST_SECTOR, in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") WPREFIX.as_ptr() as usize => _, in("a1") WPREFIX.len(), options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") PATTERN.len(), options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+
         // Попытка прямого доступа: BLK_READ с эндпоинт-cap (у клиента НЕТ cap на устройство).
         let denied: usize;
         asm!("ecall", in("a7") 7usize, inout("a0") ep_cap => denied, in("a1") 0usize, in("a2") bptr, options(nostack));

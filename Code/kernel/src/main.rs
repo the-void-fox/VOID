@@ -328,11 +328,12 @@ fn proc_demo() {
     // Сервер-драйвер: ядро минтит ему cap на УСТРОЙСТВО (право читать сектора). Дескриптор
     // передаём процессу через a0 — c-space внутри U-mode недоступен, cap живёт как число.
     let server = proc::spawn("blk-drv", user::blk_server_entry(), 0);
-    let dev = cap::mint(proc::domain(server), cap::Target::Device(cap::Device::Block), Rights::READ);
+    let devr = Rights::READ.union(Rights::WRITE); // Веха 17: драйвер умеет и читать, и писать
+    let dev = cap::mint(proc::domain(server), cap::Target::Device(cap::Device::Block), devr);
     proc::set_arg(server, dev.bits() as usize);
     println!(
         "    P{} '{}' ← cap на устройство [{}]",
-        server, cap::domain_name(proc::domain(server)), cap::rights_str(Rights::READ),
+        server, cap::domain_name(proc::domain(server)), cap::rights_str(devr),
     );
 
     // Клиент: cap на ЭНДПОИНТ сервера (право слать ему сообщения). Cap на устройство он НЕ
