@@ -161,6 +161,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     store_demo();
     println!();
 
+    // Веха 16: вытеснение процессов. Два CPU-bound процесса БЕЗ единого yield/IPC — таймер
+    // принудительно переключает их, и вывод меток перемежается (иначе один отработал бы до конца).
+    preempt_demo();
+    println!();
+
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
     gc_demo();
     println!();
@@ -374,6 +379,25 @@ fn store_demo() {
 
     proc::run();
     println!("  [proc] сессия store завершена — обратно в ядро");
+}
+
+/// Веха 16: вытеснение процессов по таймеру. Два CPU-bound процесса крутят busy-loop без единого
+/// `yield`/IPC и печатают свою метку. Кооперативно один отработал бы все печати до второго; с
+/// вытеснением таймер принудительно переключает их — метки ` A `/` B ` перемежаются.
+fn preempt_demo() {
+    println!("  [proc] вытеснение по таймеру — два CPU-bound процесса без yield:");
+    print!("    ");
+    let a = proc::spawn("busy-A", user::busy_entry(), 0);
+    proc::set_arg(a, user::label_a());
+    let b = proc::spawn("busy-B", user::busy_entry(), 0);
+    proc::set_arg(b, user::label_b());
+    let before = timer::ticks();
+    proc::run();
+    println!();
+    println!(
+        "  [proc] оба процесса завершились; вытеснений таймером за сессию: {}",
+        timer::ticks() - before,
+    );
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).

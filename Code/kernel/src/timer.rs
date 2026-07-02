@@ -32,6 +32,19 @@ fn arm_next() {
     sbi::set_timer(next);
 }
 
+/// Вооружить следующее срабатывание (публично) — для старта вытеснения процессов в
+/// [`crate::proc::run`], где таймер включают на время сессии.
+pub fn arm() {
+    arm_next();
+}
+
+/// Тик вытеснения ПРОЦЕССА: перевзвести таймер и учесть тик, но БЕЗ [`crate::sched::yield_now`]
+/// (им вытесняются ядерные нити). Планированием процессов рулит [`crate::proc`].
+pub fn preempt_tick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    arm_next();
+}
+
 /// Сколько было вытеснений с момента запуска таймера.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)

@@ -17,7 +17,7 @@ use void_abi::{Cap, ContentId, Rights};
 use crate::context::{context_switch, Context};
 use crate::sync::SpinLock;
 use crate::trap::TrapFrame;
-use crate::{cap, csr, frame, paging, println};
+use crate::{cap, csr, frame, paging, println, timer};
 
 // Ассемблерная функция входа в процесс: satp + восстановление регистров из кадра + sret.
 core::arch::global_asm!(include_str!("enter_user.s"));
@@ -159,11 +159,13 @@ pub fn run() {
         (0..t.procs.len()).find(|&i| t.procs[i].state == State::Runnable)
     };
     let Some(first) = first else { return };
-    let sstatus_sie = csr::irq_save_disable(); // S-mode SIE (для ядерной стороны)
-    // Замаскировать таймер/внешние в `sie`: иначе они прервут ПРОЦЕСС в U-mode (там sstatus.SIE
-    // не действует) и наш обработчик примет их за неожиданный trap. Процессы кооперативные.
+    let sstatus_sie = csr::irq_save_disable(); // S-mode SIE (ядро НЕ вытесняется: SIE=0 в S-mode)
+    // Вытеснение процессов (Веха 16): разрешить ТАЙМЕР (STIE) — он прервёт процесс в U-mode
+    // (там sstatus.SIE не действует, гейтит только `sie`), и `handle_user_trap` переключит на
+    // следующего. Устройства (SEIE) на время сессии выключаем — их шлюзы работают опросом.
     let saved_sie = csr::read_sie();
-    csr::write_sie(saved_sie & !((1 << 5) | (1 << 9))); // сбросить STIE и SEIE
+    csr::write_sie((saved_sie | (1 << 5)) & !(1 << 9)); // STIE=1, SEIE=0
+    timer::arm(); // вооружить первое вытеснение этой сессии
     TABLE.lock().current = first;
     unsafe {
         let mut launch = Context::default();
@@ -197,6 +199,13 @@ pub fn handle_user_trap(frame: &mut TrapFrame, scause: usize) -> ! {
         t.procs[cur].frame = *frame; // сохранить состояние текущего процесса
         if scause == csr::EXC_ECALL_FROM_U {
             syscall(&mut t, cur);
+        } else if scause == csr::INTERRUPT_BIT | csr::IRQ_S_TIMER {
+            // Вытеснение по таймеру: перевзвести и уступить следующему готовому. Текущий остаётся
+            // Runnable, его кадр уже сохранён; sepc НЕ двигаем — продолжит с прерванного места.
+            timer::preempt_tick();
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
         } else {
             println!("  [proc] неожиданный trap из U (scause={:#x}) — процесс завершён", scause);
             t.procs[cur].state = State::Finished;

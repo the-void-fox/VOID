@@ -50,8 +50,8 @@ pub fn init() {
 pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let scause = csr::read_scause();
 
-    // trap из U-mode (SPP=0). Прерывания в U выключены → это системный вызов. Управление
-    // уходит в планировщик процессов и сюда НЕ возвращается (возобновляется процесс).
+    // trap из U-mode (SPP=0): системный вызов (ecall) ЛИБО таймерное вытеснение (Веха 16).
+    // Управление уходит в планировщик процессов и сюда НЕ возвращается (возобновляется процесс).
     if frame.sstatus & (1 << 8) == 0 {
         proc::handle_user_trap(frame, scause);
     }

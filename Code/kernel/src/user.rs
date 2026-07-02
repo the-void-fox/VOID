@@ -29,6 +29,9 @@ static DENIED: [u8; b"[blk-cli] direct disk read DENIED by kernel (no device cap
 // Веха 15: попытка подделать REPLY (предъявив НЕ reply-cap) — ядро отвергает.
 static RFORGE: [u8; b"[blk-cli] forged REPLY DENIED by kernel (not a reply-capability)\n".len()] =
     *b"[blk-cli] forged REPLY DENIED by kernel (not a reply-capability)\n";
+// Веха 16: метки CPU-bound процессов для демо вытеснения (в .rodata — их читает ЯДРО в WRITE).
+static LBL_A: [u8; 3] = *b" A ";
+static LBL_B: [u8; 3] = *b" B ";
 
 // ── Веха 13/14: сервер объектного store ──
 const OP_PUT: usize = 0;
@@ -220,6 +223,31 @@ extern "C" fn store_client(ep_cap: usize) -> ! {
     }
 }
 
+/// Процесс-**CPU-bound** для демо вытеснения (Веха 16): крутит длинный busy-loop БЕЗ единого
+/// `yield`/IPC и лишь печатает свою метку (`arg` = указатель на неё). Без вытеснения первый
+/// процесс отработал бы все свои печати до второго; с вытеснением по таймеру их вывод
+/// перемежается — видно, что ядро переключает процессы принудительно.
+#[link_section = ".user"]
+extern "C" fn busy(label: usize) -> ! {
+    let mut round = 0usize;
+    while round < 5 {
+        // Чистый счёт в U-mode (никаких syscall) — во время него таймер и вытесняет.
+        let mut acc = 0u64;
+        let mut i = 0u64;
+        while i < 12_000_000 {
+            acc = acc.wrapping_add(i);
+            i += 1;
+        }
+        unsafe {
+            core::arch::asm!("/* {0} */", in(reg) acc, options(nostack)); // не дать выкинуть цикл
+            // SYS_WRITE(label, 3) — ядро читает метку (в .rodata) и печатает.
+            asm!("ecall", in("a7") 1usize, inout("a0") label => _, in("a1") 3usize, options(nostack));
+        }
+        round += 1;
+    }
+    unsafe { asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn)) }
+}
+
 /// Точки входа (identity VA секции `.user`).
 pub fn blk_server_entry() -> usize {
     blk_server as *const () as usize
@@ -232,4 +260,13 @@ pub fn store_server_entry() -> usize {
 }
 pub fn store_client_entry() -> usize {
     store_client as *const () as usize
+}
+pub fn busy_entry() -> usize {
+    busy as *const () as usize
+}
+pub fn label_a() -> usize {
+    LBL_A.as_ptr() as usize
+}
+pub fn label_b() -> usize {
+    LBL_B.as_ptr() as usize
 }
