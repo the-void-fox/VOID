@@ -147,11 +147,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     async_demo();
     println!();
 
-    // Веха 10.2: userspace-сервер и клиент, общающиеся через IPC (свои адресные пространства).
-    // P0 = сервер (удваивает число), P1 = клиент (вызывает сервер, id=0).
-    println!("  [proc] userspace-сервер + клиент через IPC (SEND/RECV/REPLY):");
-    proc::spawn(user::server_entry(), 0);
-    proc::spawn(user::client_entry(), 0);
+    // Веха 11: драйвер блоков как userspace-сервер. P0 = сервер-драйвер (читает сектор через
+    // шлюз BLK_READ и отдаёт данные по IPC), P1 = клиент (просит сектор 0, печатает его магию).
+    println!("  [proc] userspace-драйвер блоков (сервер) + клиент через IPC:");
+    proc::spawn(user::blk_server_entry(), 0);
+    proc::spawn(user::blk_client_entry(), 0);
     proc::run();
     println!("  [proc] сессия процессов завершена — обратно в ядро");
     println!();

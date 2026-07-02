@@ -85,6 +85,22 @@ pub fn enable_external_interrupt() {
     unsafe { asm!("csrs sie, {0}", in(reg) 1usize << 9, options(nomem, nostack)) }
 }
 
+/// Прочитать `sie` (маска разрешённых типов прерываний).
+#[inline]
+pub fn read_sie() -> usize {
+    let v: usize;
+    unsafe { asm!("csrr {0}, sie", out(reg) v, options(nomem, nostack)) }
+    v
+}
+
+/// Записать `sie`. Важно для U-mode: `sstatus.SIE` НЕ маскирует S-прерывания, пока hart в
+/// U-mode, — там они управляются только битами `sie`. Чтобы процесс не был вытеснен таймером,
+/// на время его исполнения нужные биты `sie` сбрасывают (см. `proc::run`).
+#[inline]
+pub fn write_sie(v: usize) {
+    unsafe { asm!("csrw sie, {0}", in(reg) v, options(nomem, nostack)) }
+}
+
 /// Глобально включить прерывания в S-mode: бит SIE (1) в `sstatus`.
 /// До этого вызова прерывания не доставляются, даже если `sie` их разрешает.
 #[inline]

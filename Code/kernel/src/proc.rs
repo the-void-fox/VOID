@@ -58,6 +58,10 @@ struct Proc {
     satp: usize,
     frame: TrapFrame,
     state: State,
+    /// Приёмный буфер клиента для ответа (VA в его адресном пространстве) — задаётся в CALL,
+    /// заполняется в REPLY (передача буфера через IPC).
+    recv_buf: usize,
+    recv_cap: usize,
 }
 
 struct Table {
@@ -104,7 +108,13 @@ pub fn spawn(entry: usize, arg: usize) {
     frame.regs[2] = USER_STACK_TOP_VA; // sp
     frame.regs[10] = arg; // a0
     frame.sstatus = 1 << 18; // SUM=1, SPP=0 (→U), SPIE=0 (прерывания в U выключены)
-    TABLE.lock().procs.push(Proc { satp: SATP_SV39 | (root >> 12), frame, state: State::Runnable });
+    TABLE.lock().procs.push(Proc {
+        satp: SATP_SV39 | (root >> 12),
+        frame,
+        state: State::Runnable,
+        recv_buf: 0,
+        recv_cap: 0,
+    });
 }
 
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
@@ -113,7 +123,11 @@ pub fn run() {
     if TABLE.lock().procs.is_empty() {
         return;
     }
-    let sie = csr::irq_save_disable(); // на время процессов прерывания не нужны
+    let sstatus_sie = csr::irq_save_disable(); // S-mode SIE (для ядерной стороны)
+    // Замаскировать таймер/внешние в `sie`: иначе они прервут ПРОЦЕСС в U-mode (там sstatus.SIE
+    // не действует) и наш обработчик примет их за неожиданный trap. Процессы кооперативные.
+    let saved_sie = csr::read_sie();
+    csr::write_sie(saved_sie & !((1 << 5) | (1 << 9))); // сбросить STIE и SEIE
     TABLE.lock().current = 0;
     unsafe {
         let mut launch = Context::default();
@@ -123,7 +137,8 @@ pub fn run() {
     }
     // ── сюда возвращаемся, когда процессов не осталось ──
     csr::write_sscratch(0);
-    csr::irq_restore(sie);
+    csr::write_sie(saved_sie); // вернуть прежние разрешения прерываний
+    csr::irq_restore(sstatus_sie);
 }
 
 /// Лончер: возобновить текущий (первый) процесс.
@@ -230,17 +245,20 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_CALL(dest, msg) -> a0 = ответ. Отправить запрос и ждать ответа (блокируется).
+        // SYS_CALL(dest, msg, recv_buf, recv_cap) -> a0 = число принятых байт. Отправить запрос
+        // и ждать ответа (блокируется); recv_buf/cap — куда положить данные ответа.
         5 => {
-            let dest = t.procs[cur].frame.regs[10];
-            let msg = t.procs[cur].frame.regs[11];
+            let f = &t.procs[cur].frame;
+            let (dest, msg, rbuf, rcap) = (f.regs[10], f.regs[11], f.regs[12], f.regs[13]);
             println!("  [ipc] P{} CALL P{} msg={}", cur, dest, msg);
+            t.procs[cur].recv_buf = rbuf;
+            t.procs[cur].recv_cap = rcap;
             if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
                 // получатель ждёт в RECV — доставить напрямую и разбудить.
-                let f = &mut t.procs[dest].frame;
-                f.regs[10] = msg;
-                f.regs[11] = cur;
-                f.sepc += 4;
+                let df = &mut t.procs[dest].frame;
+                df.regs[10] = msg;
+                df.regs[11] = cur;
+                df.sepc += 4;
                 t.procs[dest].state = State::Runnable;
             } else {
                 t.mailbox.push((cur, dest, msg)); // получит при следующем RECV
@@ -250,18 +268,42 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.current = n;
             }
         }
-        // SYS_REPLY(dest, val): ответить клиенту (разбудить его), продолжить работу.
+        // SYS_REPLY(dest, src_buf, len): ответить клиенту, передав `len` байт из своего буфера
+        // в его приёмный буфер (копирование между адресными пространствами), и разбудить его.
         6 => {
-            let dest = t.procs[cur].frame.regs[10];
-            let val = t.procs[cur].frame.regs[11];
-            println!("  [ipc] P{} REPLY P{} val={}", cur, dest, val);
+            let f = &t.procs[cur].frame;
+            let (dest, src, len) = (f.regs[10], f.regs[11], f.regs[12]);
+            println!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
             if dest < t.procs.len() && t.procs[dest].state == State::ReplyWait {
-                let f = &mut t.procs[dest].frame;
-                f.regs[10] = val;
-                f.sepc += 4;
+                let n = len.min(t.procs[dest].recv_cap);
+                // Читаем из текущего (сервера) по SUM=1; пишем в адресное пространство клиента
+                // через трансляцию его таблицы (физический адрес отображён в ядре идентично).
+                let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
+                let droot = (t.procs[dest].satp & ((1usize << 44) - 1)) << 12;
+                let dbuf = t.procs[dest].recv_buf;
+                copy_to_space(droot, dbuf, src_slice);
+                let df = &mut t.procs[dest].frame;
+                df.regs[10] = n; // клиентский CALL вернёт число принятых байт
+                df.sepc += 4;
                 t.procs[dest].state = State::Runnable;
             }
             t.procs[cur].frame.sepc += 4; // сервер продолжает (остаётся current)
+        }
+        // SYS_BLK_READ(sector, buf): привилегированный шлюз к диску. DMA идёт в ЯДЕРНЫЙ буфер
+        // (страницы процесса не identity-mapped), затем копируем в буфер вызывающего (SUM=1).
+        7 => {
+            let sector = t.procs[cur].frame.regs[10];
+            let ubuf = t.procs[cur].frame.regs[11];
+            println!("  [blk] P{} SYS_BLK_READ сектор {}", cur, sector);
+            let mut tmp = [0u8; 512];
+            let ok = crate::virtio_blk::read(sector as u64, &mut tmp);
+            if ok {
+                let dst = unsafe { core::slice::from_raw_parts_mut(ubuf as *mut u8, 512) };
+                dst.copy_from_slice(&tmp);
+            }
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = if ok { 0 } else { usize::MAX };
+            f.sepc += 4;
         }
         other => {
             let f = &mut t.procs[cur].frame;
@@ -269,5 +311,20 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = usize::MAX;
             f.sepc += 4;
         }
+    }
+}
+
+/// Скопировать `src` в адресное пространство с корнем `root` по виртуальному адресу `dst_va`,
+/// постранично транслируя (страницы процесса не отображены идентично). Физический адрес назначения
+/// доступен ядру через идентичное отображение RAM, поэтому переключать `satp` не нужно.
+fn copy_to_space(root: usize, mut dst_va: usize, src: &[u8]) {
+    let mut off = 0;
+    while off < src.len() {
+        let Some(pa) = paging::translate(root, dst_va) else { return };
+        let page_off = dst_va & (PAGE - 1);
+        let n = (src.len() - off).min(PAGE - page_off);
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(off), pa as *mut u8, n) };
+        off += n;
+        dst_va += n;
     }
 }
