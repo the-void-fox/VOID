@@ -47,6 +47,10 @@ pub enum Target {
     Endpoint(usize),
     /// Аппаратное устройство: доступ к железу только по этому cap (право на устройство).
     Device(Device),
+    /// Персистентный объектный [[object-model|store]] как ресурс: `READ` — читать значения по
+    /// content-id (`OBJ_GET`), `WRITE` — класть новые значения (`OBJ_PUT`). Так доступ к
+    /// пространству объектов выдаётся процессу-серверу store, а не зашит в каждый процесс.
+    Store,
 }
 
 /// Запись в c-space: цель + права на неё.
@@ -158,8 +162,8 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
     let id = match target {
         Target::Value(id) => id,
         Target::Root(name) => object::root(name).ok_or(CapError::Dangling)?,
-        // Эндпоинт/устройство — не значения в store: их «читают» через IPC/BLK_READ, не здесь.
-        Target::Endpoint(_) | Target::Device(_) => return Err(CapError::WrongKind),
+        // Эндпоинт/устройство/store — не значения: их «читают» через IPC/BLK_READ/OBJ_GET, не здесь.
+        Target::Endpoint(_) | Target::Device(_) | Target::Store => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -178,7 +182,7 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
         }
         match e.target {
             Target::Root(name) => name,
-            Target::Value(_) | Target::Endpoint(_) | Target::Device(_) => {
+            Target::Value(_) | Target::Endpoint(_) | Target::Device(_) | Target::Store => {
                 return Err(CapError::WrongKind)
             }
         }
@@ -212,6 +216,21 @@ pub fn device(dom: DomainId, cap: Cap, need: Rights) -> Result<Device, CapError>
     }
     match e.target {
         Target::Device(d) => Ok(d),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Разрешить cap на **объектный store** (требует прав `need`: `READ` для `OBJ_GET`, `WRITE` для
+/// `OBJ_PUT`). Без такого cap процесс не может обращаться к пространству объектов напрямую —
+/// только через сервер store по IPC.
+pub fn store(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Store => Ok(()),
         _ => Err(CapError::WrongKind),
     }
 }

@@ -154,6 +154,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     proc_demo();
     println!();
 
+    // Веха 13: сервер объектного store в userspace. Процесс с cap на STORE отдаёт put/get объектов
+    // по IPC; клиент (лишь с cap на эндпоинт) кладёт значение, получает его content-id и читает
+    // обратно — не имея прямого доступа к объектному пространству.
+    store_demo();
+    println!();
+
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
     gc_demo();
     println!();
@@ -335,6 +341,38 @@ fn proc_demo() {
 
     proc::run();
     println!("  [proc] сессия процессов завершена — обратно в ядро");
+}
+
+/// Веха 13: сервер объектного store в userspace. Сервер держит cap на STORE (r/w) и обслуживает
+/// put/get по IPC; клиент с cap лишь на ЭНДПОИНТ кладёт значение, получает его content-id и
+/// читает обратно. Так персистентное [[object-model|пространство]] отдаётся как сервис под
+/// capability, а не зашивается в каждый процесс ([[0002-...|ADR 0002]]).
+fn store_demo() {
+    use void_abi::Rights;
+
+    println!("  [proc] userspace-сервер объектного store + клиент через IPC:");
+
+    // Сервер store: cap на сам store с правами читать и писать (r-w-).
+    let rw = Rights::READ.union(Rights::WRITE);
+    let server = proc::spawn("obj-store", user::store_server_entry(), 0);
+    let scap = cap::mint(proc::domain(server), cap::Target::Store, rw);
+    proc::set_arg(server, scap.bits() as usize);
+    println!(
+        "    P{} '{}' ← cap на store [{}]",
+        server, cap::domain_name(proc::domain(server)), cap::rights_str(rw),
+    );
+
+    // Клиент: cap только на ЭНДПОИНТ сервера. Прямого доступа к store у него нет.
+    let client = proc::spawn("store-cli", user::store_client_entry(), 0);
+    let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
+    proc::set_arg(client, ep.bits() as usize);
+    println!(
+        "    P{} '{}' ← cap на эндпоинт P{} [{}]",
+        client, cap::domain_name(proc::domain(client)), server, cap::rights_str(Rights::SEND),
+    );
+
+    proc::run();
+    println!("  [proc] сессия store завершена — обратно в ядро");
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).

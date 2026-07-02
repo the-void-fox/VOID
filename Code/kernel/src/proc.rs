@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
-use void_abi::{Cap, Rights};
+use void_abi::{Cap, ContentId, Rights};
 
 use crate::context::{context_switch, Context};
 use crate::sync::SpinLock;
@@ -37,7 +37,10 @@ const USER_STACK_PAGES: usize = 4;
 const PAGE: usize = 4096;
 
 // ─── ядерный trap-стек для trap'ов из U-mode ──────────────────────────────────
-const TRAP_STACK_SIZE: usize = 16 * 1024;
+// 64 КиБ — как загрузочный стек ядра (linker.ld): syscall'ы делают настоящую работу
+// (`object::put` → BLAKE3 + куча + `println!`), а в debug-сборке кадры крупные. С 16 КиБ
+// стек переполнялся ВНИЗ в read-only секцию `.user` (store page fault на записи локали).
+const TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(align(16))]
 struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
@@ -61,12 +64,17 @@ struct Proc {
     frame: TrapFrame,
     state: State,
     /// Домен защиты процесса — его личный c-space ([[capabilities]]). Начальные права
-    /// (эндпоинты, устройства) ядро минтит сюда при spawn; syscall'ы проверяют их отсюда.
+    /// (эндпоинты, устройства, store) ядро минтит сюда при spawn; syscall'ы проверяют их отсюда.
     domain: cap::DomainId,
-    /// Приёмный буфер клиента для ответа (VA в его адресном пространстве) — задаётся в CALL,
-    /// заполняется в REPLY (передача буфера через IPC).
+    /// Приёмный буфер (VA в своём пространстве) + его размер. Двойного назначения, но НЕ
+    /// одновременно: у клиента в `ReplyWait` — куда лёг бы ответ (`REPLY`); у сервера в
+    /// `RecvWait` — куда лечь входящему запросу (`RECV`). Задаётся в `CALL`/`RECV`.
     recv_buf: usize,
     recv_cap: usize,
+    /// Буфер запроса клиента (VA + длина) — задаётся в `CALL`, копируется в приёмный буфер
+    /// сервера при доставке (`RECV`/прямая доставка). Передача буфера клиент→сервер через IPC.
+    send_buf: usize,
+    send_len: usize,
 }
 
 struct Table {
@@ -124,6 +132,8 @@ pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
         domain,
         recv_buf: 0,
         recv_cap: 0,
+        send_buf: 0,
+        send_len: 0,
     });
     t.procs.len() - 1
 }
@@ -142,15 +152,19 @@ pub fn set_arg(pid: usize, a0: usize) {
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
 /// RETURN_CTX и уходим в лончер (как в [[scheduling|context_switch]]-переключении нитей).
 pub fn run() {
-    if TABLE.lock().procs.is_empty() {
-        return;
-    }
+    // Первый готовый процесс (может быть не индекс 0: после прошлой сессии часть процессов
+    // остаётся Finished/заблокированными). Нет готовых — выходим сразу.
+    let first = {
+        let t = TABLE.lock();
+        (0..t.procs.len()).find(|&i| t.procs[i].state == State::Runnable)
+    };
+    let Some(first) = first else { return };
     let sstatus_sie = csr::irq_save_disable(); // S-mode SIE (для ядерной стороны)
     // Замаскировать таймер/внешние в `sie`: иначе они прервут ПРОЦЕСС в U-mode (там sstatus.SIE
     // не действует) и наш обработчик примет их за неожиданный trap. Процессы кооперативные.
     let saved_sie = csr::read_sie();
     csr::write_sie(saved_sie & !((1 << 5) | (1 << 9))); // сбросить STIE и SEIE
-    TABLE.lock().current = 0;
+    TABLE.lock().current = first;
     unsafe {
         let mut launch = Context::default();
         launch.ra = proc_enter as *const () as usize;
@@ -252,13 +266,23 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.current = n;
             }
         }
-        // SYS_RECV -> (a0 = сообщение, a1 = отправитель). Блокируется, если запросов нет.
+        // SYS_RECV(recv_buf, recv_cap) -> (a0=op, a1=отправитель, a2=длина запроса). Приняв
+        // запрос, копируем его полезную нагрузку из буфера клиента в recv_buf. Нет запроса —
+        // блокировка (RecvWait); recv_buf/cap сохранены, чтобы доставка позже скопировала в них.
         4 => {
+            let (rbuf, rcap) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11])
+            };
+            t.procs[cur].recv_buf = rbuf;
+            t.procs[cur].recv_cap = rcap;
             if let Some(pos) = t.mailbox.iter().position(|&(_, to, _)| to == cur) {
-                let (from, _to, msg) = t.mailbox.remove(pos);
+                let (from, _to, op) = t.mailbox.remove(pos);
+                let n = deliver_request(t, from, cur);
                 let f = &mut t.procs[cur].frame;
-                f.regs[10] = msg;
+                f.regs[10] = op;
                 f.regs[11] = from;
+                f.regs[12] = n;
                 f.sepc += 4;
             } else {
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
@@ -267,29 +291,34 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_CALL(ep_cap, msg, recv_buf, recv_cap) -> a0 = число принятых байт (или MAX, если
-        // cap не даёт права слать). `ep_cap` — дескриптор эндпоинта в c-space процесса; ядро
-        // резолвит его в id сервера. Отправить запрос и ждать ответа (блокируется).
+        // SYS_CALL(ep_cap, op, send_buf, send_len, recv_buf, recv_cap) -> a0 = число байт ответа
+        // (или MAX, если cap не даёт права слать). `ep_cap` — дескриптор эндпоинта в c-space
+        // процесса; ядро резолвит его в id сервера. `send_buf`/`send_len` — полезная нагрузка
+        // запроса (копируется серверу при доставке). Отправить и ждать ответа (блокируется).
         5 => {
-            let (ecap, msg, rbuf, rcap) = {
+            let (ecap, op, sbuf, slen, rbuf, rcap) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13], f.regs[14], f.regs[15])
             };
             let dom = t.procs[cur].domain;
             match cap::endpoint(dom, Cap::from_bits(ecap as u64)) {
                 Ok(dest) => {
-                    println!("  [ipc] P{} CALL P{} (по cap) msg={}", cur, dest, msg);
+                    println!("  [ipc] P{} CALL P{} (по cap) op={} ({} байт)", cur, dest, op, slen);
                     t.procs[cur].recv_buf = rbuf;
                     t.procs[cur].recv_cap = rcap;
+                    t.procs[cur].send_buf = sbuf;
+                    t.procs[cur].send_len = slen;
                     if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
-                        // получатель ждёт в RECV — доставить напрямую и разбудить.
+                        // получатель ждёт в RECV — доставить нагрузку в его буфер и разбудить.
+                        let n = deliver_request(t, cur, dest);
                         let df = &mut t.procs[dest].frame;
-                        df.regs[10] = msg;
+                        df.regs[10] = op;
                         df.regs[11] = cur;
+                        df.regs[12] = n;
                         df.sepc += 4;
                         t.procs[dest].state = State::Runnable;
                     } else {
-                        t.mailbox.push((cur, dest, msg)); // получит при следующем RECV
+                        t.mailbox.push((cur, dest, op)); // нагрузку скопируют при его RECV
                     }
                     t.procs[cur].state = State::ReplyWait; // sepc двинет доставка ответа
                     if let Some(n) = t.next_runnable(cur) {
@@ -316,7 +345,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 // Читаем из текущего (сервера) по SUM=1; пишем в адресное пространство клиента
                 // через трансляцию его таблицы (физический адрес отображён в ядре идентично).
                 let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
-                let droot = (t.procs[dest].satp & ((1usize << 44) - 1)) << 12;
+                let droot = root_of(t.procs[dest].satp);
                 let dbuf = t.procs[dest].recv_buf;
                 copy_to_space(droot, dbuf, src_slice);
                 let df = &mut t.procs[dest].frame;
@@ -355,6 +384,67 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = result;
             f.sepc += 4;
         }
+        // SYS_OBJ_PUT(store_cap, buf, len, id_out) -> 0/MAX: сохранить значение в объектный
+        // [[object-model|store]] (нужен cap на store с правом WRITE) и записать 32-байтный
+        // content-id в id_out. Буферы читаются/пишутся в пространстве вызывающего (он current, SUM=1).
+        8 => {
+            let (scap, buf, len, idout) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) => {
+                    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+                    let id = crate::object::put(bytes);
+                    let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
+                    out.copy_from_slice(&id.0);
+                    println!("  [obj] P{} OBJ_PUT {} байт → content-id (по cap)", cur, len);
+                    0
+                }
+                Err(e) => {
+                    println!("  [obj] P{} OBJ_PUT отклонён: {:?}  ← нет capability на store", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
+        // SYS_OBJ_GET(store_cap, id_ptr, out_buf, out_cap) -> длина (0 — нет; MAX — отказ):
+        // прочитать значение по 32-байтному content-id (нужен cap на store с правом READ).
+        9 => {
+            let (scap, idp, obuf, ocap) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(()) => {
+                    let mut id = [0u8; 32];
+                    let src = unsafe { core::slice::from_raw_parts(idp as *const u8, 32) };
+                    id.copy_from_slice(src);
+                    let n = crate::object::with(&ContentId(id), |b| match b {
+                        Some(bytes) => {
+                            let m = bytes.len().min(ocap);
+                            let out = unsafe { core::slice::from_raw_parts_mut(obuf as *mut u8, m) };
+                            out.copy_from_slice(&bytes[..m]);
+                            m
+                        }
+                        None => 0,
+                    });
+                    println!("  [obj] P{} OBJ_GET → {} байт (по cap)", cur, n);
+                    n
+                }
+                Err(e) => {
+                    println!("  [obj] P{} OBJ_GET отклонён: {:?}  ← нет capability на store", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             println!("  [proc] неизвестный syscall {}", other);
@@ -362,6 +452,11 @@ fn syscall(t: &mut Table, cur: usize) {
             f.sepc += 4;
         }
     }
+}
+
+/// Физический адрес корня таблицы страниц из значения `satp` (PPN → байтовый адрес).
+fn root_of(satp: usize) -> usize {
+    (satp & ((1usize << 44) - 1)) << 12
 }
 
 /// Скопировать `src` в адресное пространство с корнем `root` по виртуальному адресу `dst_va`,
@@ -377,4 +472,49 @@ fn copy_to_space(root: usize, mut dst_va: usize, src: &[u8]) {
         off += n;
         dst_va += n;
     }
+}
+
+/// Скопировать `len` байт МЕЖДУ двумя адресными пространствами: из `src_va` (корень `src_root`)
+/// в `dst_va` (корень `dst_root`). Оба конца транслируем постранично в физические адреса (RAM
+/// идентично отображена в ядре → переключать `satp` не нужно); шаг ограничен границей страницы
+/// с обеих сторон, т.к. буферы могут пересекать страницы независимо.
+fn copy_between_spaces(
+    src_root: usize,
+    mut src_va: usize,
+    dst_root: usize,
+    mut dst_va: usize,
+    len: usize,
+) {
+    let mut off = 0;
+    while off < len {
+        let (Some(spa), Some(dpa)) =
+            (paging::translate(src_root, src_va), paging::translate(dst_root, dst_va))
+        else {
+            return;
+        };
+        let s_off = src_va & (PAGE - 1);
+        let d_off = dst_va & (PAGE - 1);
+        let n = (len - off).min(PAGE - s_off).min(PAGE - d_off);
+        unsafe { core::ptr::copy_nonoverlapping(spa as *const u8, dpa as *mut u8, n) };
+        off += n;
+        src_va += n;
+        dst_va += n;
+    }
+}
+
+/// Доставить полезную нагрузку запроса: скопировать буфер отправителя `from` (`send_buf`/`send_len`)
+/// в приёмный буфер получателя `to` (`recv_buf`/`recv_cap`), усекая по размеру приёмника.
+/// Возвращает число скопированных байт. Клиент в этот момент заблокирован — его память стабильна.
+fn deliver_request(t: &Table, from: usize, to: usize) -> usize {
+    let n = t.procs[from].send_len.min(t.procs[to].recv_cap);
+    if n > 0 {
+        copy_between_spaces(
+            root_of(t.procs[from].satp),
+            t.procs[from].send_buf,
+            root_of(t.procs[to].satp),
+            t.procs[to].recv_buf,
+            n,
+        );
+    }
+    n
 }
