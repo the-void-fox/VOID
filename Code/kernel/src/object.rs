@@ -176,6 +176,13 @@ pub fn root(name: &str) -> Option<ContentId> {
     STORE.lock().roots.get(name).copied()
 }
 
+/// Снять корень `name`. Возвращает `true`, если корень существовал. Объект, на который он
+/// указывал, становится недостижимым и уйдёт ближайшим [`gc`] (если больше ни на что не сослан) —
+/// это делает `unlink` в персоналиях честным: привязку можно не только создать, но и отвязать.
+pub fn del_root(name: &str) -> bool {
+    STORE.lock().roots.remove(name).is_some()
+}
+
 /// Подгрузить содержимое объекта в RAM, если оно на диске. Возвращает `true`, если объект
 /// существует и данные доступны. Держит замок `STORE`; чтение диска → замок `BLK` (STORE→BLK).
 fn ensure_loaded(store: &mut Store, id: &ContentId) -> bool {

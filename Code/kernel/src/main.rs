@@ -406,13 +406,14 @@ fn preempt_demo() {
     );
 }
 
-/// Веха 18.1: POSIX-персоналия как сервер. Программа-клиент пользуется только POSIX-подобными
-/// вызовами (`open/write/close/read`) через тонкий IPC-shim и «не знает», что под ней VOID.
-/// Сервер-персоналия держит namespace файлов в своей RAM (пока без персистентности — Веха 18.2).
+/// Веха 18.1–18.3: POSIX-персоналия как сервер. Программа-клиент пользуется только POSIX-подобными
+/// вызовами (`open/write/close/read/stat/unlink/readdir`, режимы `O_APPEND/O_TRUNC`) через тонкий
+/// IPC-shim и «не знает», что под ней VOID. Файлы персистятся через store (корни-имена + индекс
+/// каталога `.dir`), `unlink` честно снимает корень (объект уходит в GC).
 fn posix_demo() {
     use void_abi::Rights;
 
-    println!("  [proc] POSIX-персоналия (файлы open/write/close/read) через IPC:");
+    println!("  [proc] POSIX-персоналия (open/write/read/close/stat/unlink/readdir) через IPC:");
     // Персоналии — cap на store (файлы персистятся под корнями-именами, Веха 18.2).
     let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));

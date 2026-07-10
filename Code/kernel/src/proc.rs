@@ -570,6 +570,36 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = result;
             f.sepc += 4;
         }
+        // SYS_OBJ_DEL_ROOT(store_cap, name_ptr, name_len) -> 0 (снят) / 1 (не было) / MAX (отказ):
+        // отвязать именованный корень (нужен `WRITE`). Объект уходит в GC, если больше ни на что не
+        // сослан — это делает `unlink` в персоналии честным (Веха 18.3).
+        13 => {
+            let (scap, nptr, nlen) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) => {
+                    let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
+                    match core::str::from_utf8(name_bytes) {
+                        Ok(name) => {
+                            let existed = crate::object::del_root(name);
+                            println!("  [obj] P{} OBJ_DEL_ROOT '{}' → {} (по cap)", cur, name, if existed { "снят" } else { "не было" });
+                            if existed { 0 } else { 1 }
+                        }
+                        Err(_) => usize::MAX,
+                    }
+                }
+                Err(e) => {
+                    println!("  [obj] P{} OBJ_DEL_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             println!("  [proc] неизвестный syscall {}", other);

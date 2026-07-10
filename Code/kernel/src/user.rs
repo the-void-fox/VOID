@@ -10,7 +10,8 @@
 //!   8 = OBJ_PUT(store_cap,buf,len,id_out) -> 0/MAX, 9 = OBJ_GET(store_cap,id_ptr,out,cap) -> len,
 //!   10 = OBJ_SET_ROOT(store_cap,name,name_len,id_ptr) -> 0/MAX,
 //!   11 = OBJ_GET_ROOT(store_cap,name,name_len,id_out) -> 32/0/MAX,
-//!   12 = BLK_WRITE(dev_cap,sector,buf,len) -> 0/MAX.
+//!   12 = BLK_WRITE(dev_cap,sector,buf,len) -> 0/MAX,
+//!   13 = OBJ_DEL_ROOT(store_cap,name,name_len) -> 0/1/MAX  (Веха 18.3: unlink).
 //!
 //! Веха 12: **capability-защищённые эндпоинты** (драйвер-сервер + клиент через IPC).
 //! Веха 13: **сервер объектного store** — процесс с cap на store отдаёт put/get объектов по IPC
@@ -41,15 +42,24 @@ static RFORGE: [u8; b"[blk-cli] forged REPLY DENIED by kernel (not a reply-capab
 static LBL_A: [u8; 3] = *b" A ";
 static LBL_B: [u8; 3] = *b" B ";
 
-// ── Веха 18.1: POSIX-персоналия (файлы поверх IPC) ──
-// op персоналии кодирует операцию (младший байт) и дескриптор fd (следующий байт): op | (fd<<8).
+// ── Веха 18.1/18.3: POSIX-персоналия (файлы поверх IPC) ──
+// op персоналии кодирует операцию (младший байт), дескриптор fd (байт 8..16) и режим open
+// (байт 16..24): op | (fd<<8) | (mode<<16).
 const PX_OPEN: usize = 0;
 const PX_READ: usize = 1;
 const PX_WRITE: usize = 2;
 const PX_CLOSE: usize = 3;
+const PX_STAT: usize = 4; // Веха 18.3: stat(name) -> [exists:1|size:4]
+const PX_UNLINK: usize = 5; // Веха 18.3: unlink(name) — снять корень + убрать из каталога
+const PX_READDIR: usize = 6; // Веха 18.3: readdir() -> имена через '\n'
+const O_APPEND: usize = 1 << 0; // Веха 18.3: открыть с курсором в конце
+const O_TRUNC: usize = 1 << 1; // Веха 18.3: открыть, обнулив содержимое
 const PX_NFILES: usize = 4; // namespace фикс. размера (у процессов нет кучи — всё на стеке)
 const PX_NAME_MAX: usize = 16;
 const PX_DATA_MAX: usize = 256;
+// Индекс каталога (для readdir/unlink): персистится под спец-корнем ".dir" — формат
+// count(1) | [nlen(1) | name]* . Роты-файлы ядро перечислять не даёт, поэтому список имён ведём сами.
+static DIRROOT: [u8; b".dir".len()] = *b".dir";
 static FNAME: [u8; b"hello.txt".len()] = *b"hello.txt";
 static FCONTENT: [u8; b"Hello, POSIX personality on VOID!".len()] =
     *b"Hello, POSIX personality on VOID!";
@@ -57,6 +67,18 @@ static PXPREV: [u8; b"[posix-app] hello.txt from previous boot: ".len()] =
     *b"[posix-app] hello.txt from previous boot: ";
 static PXFIRST: [u8; b"[posix-app] hello.txt not found, writing it (first boot)\n".len()] =
     *b"[posix-app] hello.txt not found, writing it (first boot)\n";
+// Веха 18.3: демо stat/readdir/unlink/append.
+static LOGNAME: [u8; b"log.txt".len()] = *b"log.txt";
+static TICK: [u8; b"tick ".len()] = *b"tick ";
+static LOGPFX: [u8; b"[posix-app] log.txt now (O_APPEND, grows each boot): ".len()] =
+    *b"[posix-app] log.txt now (O_APPEND, grows each boot): ";
+static STATPFX: [u8; b"[posix-app] stat log.txt: size=".len()] =
+    *b"[posix-app] stat log.txt: size=";
+static DIRPFX: [u8; b"[posix-app] readdir: ".len()] = *b"[posix-app] readdir: ";
+static SCRNAME: [u8; b"scratch.txt".len()] = *b"scratch.txt";
+static SCRDATA: [u8; b"scratch-data".len()] = *b"scratch-data";
+static UNLPFX: [u8; b"[posix-app] unlink scratch.txt -> stat exists=".len()] =
+    *b"[posix-app] unlink scratch.txt -> stat exists=";
 
 // ── Веха 13/14: сервер объектного store ──
 const OP_PUT: usize = 0;
@@ -296,10 +318,132 @@ extern "C" fn busy(label: usize) -> ! {
     unsafe { asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn)) }
 }
 
-/// Процесс-**персоналия POSIX** (Вехи 18.1/18.2): даёт клиентам файловый API `open/read/write/close`
-/// по IPC. Namespace (имена → данные) и таблица дескрипторов живут на СТЕКЕ сервера — у процессов
-/// нет кучи, поэтому фикс. размер. Данные — в `MaybeUninit` (без обнуления), валидность отслеживаем
-/// сами (`fused`/`size`). Всё через сырые указатели: ни `memcpy`, ни паник-путей в `.user`.
+// ── Веха 18.3: индекс каталога (для readdir/unlink) ──
+// Формат в RAM = в персистентном виде: count(1) | [nlen(1) | name]* . Всё сырыми указателями,
+// чтобы не тянуть memcpy/паники в `.user`.
+
+/// Есть ли имя в индексе каталога.
+#[link_section = ".user"]
+unsafe fn dir_contains(dir: *const u8, name: *const u8, nlen: usize) -> bool {
+    let cnt = *dir as usize;
+    let mut off = 1usize;
+    let mut e = 0;
+    while e < cnt {
+        let l = *dir.add(off) as usize;
+        off += 1;
+        if l == nlen {
+            let mut k = 0;
+            let mut eq = true;
+            while k < l {
+                if *dir.add(off + k) != *name.add(k) {
+                    eq = false;
+                    break;
+                }
+                k += 1;
+            }
+            if eq {
+                return true;
+            }
+        }
+        off += l;
+        e += 1;
+    }
+    false
+}
+
+/// Добавить имя в индекс, если его ещё нет. Возвращает `true`, если индекс изменился.
+#[link_section = ".user"]
+unsafe fn dir_add(dir: *mut u8, dir_len: &mut usize, name: *const u8, nlen: usize) -> bool {
+    if dir_contains(dir, name, nlen) {
+        return false;
+    }
+    if *dir_len + 1 + nlen > PX_DATA_MAX {
+        return false; // нет места — упрощение (без ENOSPC)
+    }
+    let at = *dir_len;
+    *dir.add(at) = nlen as u8;
+    let mut k = 0;
+    while k < nlen {
+        *dir.add(at + 1 + k) = *name.add(k);
+        k += 1;
+    }
+    *dir_len = at + 1 + nlen;
+    *dir = *dir + 1; // count++
+    true
+}
+
+/// Убрать имя из индекса (сдвиг хвоста). Возвращает `true`, если что-то удалили.
+#[link_section = ".user"]
+unsafe fn dir_remove(dir: *mut u8, dir_len: &mut usize, name: *const u8, nlen: usize) -> bool {
+    let cnt = *dir as usize;
+    let mut off = 1usize;
+    let mut e = 0;
+    while e < cnt {
+        let l = *dir.add(off) as usize;
+        let entry = 1 + l;
+        if l == nlen {
+            let mut k = 0;
+            let mut eq = true;
+            while k < l {
+                if *dir.add(off + 1 + k) != *name.add(k) {
+                    eq = false;
+                    break;
+                }
+                k += 1;
+            }
+            if eq {
+                let mut s = off + entry;
+                let mut d = off;
+                while s < *dir_len {
+                    *dir.add(d) = *dir.add(s);
+                    s += 1;
+                    d += 1;
+                }
+                *dir_len -= entry;
+                *dir = (cnt - 1) as u8; // count--
+                return true;
+            }
+        }
+        off += entry;
+        e += 1;
+    }
+    false
+}
+
+/// Записать индекс каталога в store и привязать к спец-корню ".dir" (переживёт перезагрузку).
+#[link_section = ".user"]
+unsafe fn dir_persist(store_cap: usize, dir: *const u8, dir_len: usize, idb: usize) {
+    asm!("ecall", in("a7") 8usize, inout("a0") store_cap => _, in("a1") dir as usize, in("a2") dir_len, in("a3") idb, options(nostack));
+    asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") DIRROOT.as_ptr() as usize, in("a2") DIRROOT.len(), in("a3") idb, options(nostack));
+}
+
+/// Число в десятичном ASCII в буфер `out`, без кучи/format. Возвращает длину.
+#[link_section = ".user"]
+unsafe fn utoa(mut n: usize, out: *mut u8) -> usize {
+    if n == 0 {
+        *out = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < i {
+        *out.add(j) = tmp[i - 1 - j];
+        j += 1;
+    }
+    i
+}
+
+/// Процесс-**персоналия POSIX** (Вехи 18.1–18.3): даёт клиентам файловый API
+/// `open/read/write/close/stat/unlink/readdir` по IPC. Namespace (имена → данные) и таблица
+/// дескрипторов живут на СТЕКЕ сервера — у процессов нет кучи, поэтому фикс. размер. Данные — в
+/// `MaybeUninit` (без обнуления), валидность отслеживаем сами (`fused`/`size`). Всё через сырые
+/// указатели: ни `memcpy`, ни паник-путей в `.user`.
 ///
 /// Веха 18.2 — **персистентность через store** (`arg` = cap на store): содержимое файла = значение
 /// в объектном пространстве, привязанное к **корню-имени** (`OBJ_SET_ROOT`). Роты хранилища и есть
@@ -316,10 +460,16 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
     let mut size = [0usize; PX_NFILES];
     let mut fused = [false; PX_NFILES];
     let mut dirty = [false; PX_NFILES]; // изменён с последней записи в store
-    // Дескрипторы: fd → (файл, смещение).
+    // Дескрипторы: fd → (файл, смещение). Смещение — СВОЁ на каждый дескриптор: два open одного
+    // файла дают два независимых курсора (Веха 18.3).
     let mut fd_file = [0usize; PX_NFILES];
     let mut fd_off = [0usize; PX_NFILES];
     let mut fd_used = [false; PX_NFILES];
+
+    // Веха 18.3: индекс каталога (readdir) — в RAM в персистентном виде, спец-корень ".dir".
+    let mut dir = MaybeUninit::<[u8; PX_DATA_MAX]>::uninit();
+    let dir_ptr = dir.as_mut_ptr() as *mut u8;
+    let mut dir_len;
 
     let mut req = MaybeUninit::<[u8; 512]>::uninit();
     let mut rep = MaybeUninit::<[u8; 512]>::uninit();
@@ -327,6 +477,25 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
     let rptr = req.as_mut_ptr() as usize;
     let pptr = rep.as_mut_ptr() as usize;
     let idptr = idb.as_mut_ptr() as usize;
+
+    // Поднять индекс каталога с прошлого запуска (get_root(".dir") → get), иначе — пустой.
+    unsafe {
+        let gn: usize;
+        asm!("ecall", in("a7") 11usize, inout("a0") store_cap => gn, in("a1") DIRROOT.as_ptr() as usize, in("a2") DIRROOT.len(), in("a3") idptr, options(nostack));
+        if gn == 32 {
+            let n: usize;
+            asm!("ecall", in("a7") 9usize, inout("a0") store_cap => n, in("a1") idptr, in("a2") dir_ptr as usize, in("a3") PX_DATA_MAX, options(nostack));
+            if n == 0 {
+                *dir_ptr = 0;
+                dir_len = 1;
+            } else {
+                dir_len = n;
+            }
+        } else {
+            *dir_ptr = 0; // count = 0
+            dir_len = 1;
+        }
+    }
 
     loop {
         let op: usize;
@@ -338,6 +507,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
         }
         let opcode = op & 0xff;
         let fd = (op >> 8) & 0xff;
+        let mode = (op >> 16) & 0xff; // Веха 18.3: режимы open (O_APPEND/O_TRUNC)
         let mut reply_len = 0usize; // сколько байт вернём в pptr
 
         if opcode == PX_OPEN {
@@ -397,6 +567,15 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                             asm!("ecall", in("a7") 9usize, inout("a0") store_cap => sz, in("a1") idptr, in("a2") dbuf, in("a3") PX_DATA_MAX, options(nostack));
                         }
                         size[fidx] = sz;
+                        // Веха 18.3: персистентный файл (в т.ч. привязанный к корню ДО появления
+                        // индекса каталога, как hello.txt из 18.2) — занести в индекс, чтобы его
+                        // видел readdir.
+                        unsafe {
+                            let np = names_ptr as usize + fidx * PX_NAME_MAX;
+                            if dir_add(dir_ptr, &mut dir_len, np as *const u8, nl) {
+                                dir_persist(store_cap, dir_ptr, dir_len, idptr);
+                            }
+                        }
                     } else {
                         size[fidx] = 0; // новый файл
                     }
@@ -404,6 +583,11 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
             }
             let mut nfd = usize::MAX;
             if fidx != usize::MAX {
+                // Веха 18.3: O_TRUNC обнуляет содержимое (пометив изменённым — перезапишется на close).
+                if mode & O_TRUNC != 0 {
+                    size[fidx] = 0;
+                    dirty[fidx] = true;
+                }
                 let mut d = 0;
                 while d < PX_NFILES {
                     if !fd_used[d] {
@@ -415,7 +599,8 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                 if nfd != usize::MAX {
                     fd_used[nfd] = true;
                     fd_file[nfd] = fidx;
-                    fd_off[nfd] = 0;
+                    // O_APPEND ставит курсор в конец, иначе — в начало.
+                    fd_off[nfd] = if mode & O_APPEND != 0 { size[fidx] } else { 0 };
                 }
             }
             unsafe { *(pptr as *mut u8) = if nfd == usize::MAX { 0xff } else { nfd as u8 } };
@@ -449,9 +634,120 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                 }
                 fd_off[fd] = r;
             }
+        } else if opcode == PX_STAT {
+            // req[..len] — имя. Вернуть [exists:1 | size:4 LE]. Ищем в RAM, затем среди корней.
+            let mut sz = usize::MAX;
+            let mut i = 0;
+            while i < PX_NFILES {
+                if fused[i] && name_len[i] == len {
+                    let mut eq = true;
+                    let mut k = 0;
+                    while k < len {
+                        let a = unsafe { *names_ptr.add(i * PX_NAME_MAX + k) };
+                        let b = unsafe { *(rptr as *const u8).add(k) };
+                        if a != b {
+                            eq = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if eq {
+                        sz = size[i];
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            if sz == usize::MAX {
+                // Не в RAM — есть ли персистентный корень? Если да, подгрузить ради длины.
+                let gn: usize;
+                unsafe {
+                    asm!("ecall", in("a7") 11usize, inout("a0") store_cap => gn, in("a1") rptr, in("a2") len, in("a3") idptr, options(nostack));
+                }
+                if gn == 32 {
+                    let n: usize;
+                    unsafe {
+                        asm!("ecall", in("a7") 9usize, inout("a0") store_cap => n, in("a1") idptr, in("a2") pptr + 8, in("a3") PX_DATA_MAX, options(nostack));
+                    }
+                    sz = n;
+                }
+            }
+            let exists: u8 = if sz == usize::MAX { 0 } else { 1 };
+            let szv = (if sz == usize::MAX { 0 } else { sz }) as u32;
+            unsafe {
+                *(pptr as *mut u8) = exists;
+                *(pptr as *mut u8).add(1) = (szv & 0xff) as u8;
+                *(pptr as *mut u8).add(2) = ((szv >> 8) & 0xff) as u8;
+                *(pptr as *mut u8).add(3) = ((szv >> 16) & 0xff) as u8;
+                *(pptr as *mut u8).add(4) = ((szv >> 24) & 0xff) as u8;
+            }
+            reply_len = 5;
+        } else if opcode == PX_UNLINK {
+            // req[..len] — имя. Убрать из RAM namespace, снять корень (OBJ_DEL_ROOT) и из каталога.
+            let mut i = 0;
+            while i < PX_NFILES {
+                if fused[i] && name_len[i] == len {
+                    let mut eq = true;
+                    let mut k = 0;
+                    while k < len {
+                        let a = unsafe { *names_ptr.add(i * PX_NAME_MAX + k) };
+                        let b = unsafe { *(rptr as *const u8).add(k) };
+                        if a != b {
+                            eq = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if eq {
+                        fused[i] = false;
+                        // закрыть висящие дескрипторы на удаляемый файл
+                        let mut d = 0;
+                        while d < PX_NFILES {
+                            if fd_used[d] && fd_file[d] == i {
+                                fd_used[d] = false;
+                            }
+                            d += 1;
+                        }
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            unsafe {
+                // снять персистентный корень — объект уйдёт в GC (честный unlink, Веха 18.3)
+                asm!("ecall", in("a7") 13usize, inout("a0") store_cap => _, in("a1") rptr, in("a2") len, options(nostack));
+                // убрать имя из индекса каталога и переписать ".dir"
+                if dir_remove(dir_ptr, &mut dir_len, rptr as *const u8, len) {
+                    dir_persist(store_cap, dir_ptr, dir_len, idptr);
+                }
+                *(pptr as *mut u8) = 0;
+            }
+            reply_len = 1;
+        } else if opcode == PX_READDIR {
+            // Вернуть имена файлов из индекса каталога, разделённые '\n'.
+            let cnt = unsafe { *dir_ptr } as usize;
+            let mut off = 1usize;
+            let mut e = 0;
+            while e < cnt {
+                let nl = unsafe { *dir_ptr.add(off) } as usize;
+                off += 1;
+                let mut k = 0;
+                while k < nl && reply_len < 511 {
+                    unsafe { *(pptr as *mut u8).add(reply_len) = *dir_ptr.add(off + k) };
+                    reply_len += 1;
+                    k += 1;
+                }
+                off += nl;
+                if reply_len < 511 {
+                    unsafe { *(pptr as *mut u8).add(reply_len) = b'\n' };
+                    reply_len += 1;
+                }
+                e += 1;
+            }
         } else {
-            // PX_CLOSE — если файл менялся, записать содержимое в store и привязать к корню-имени
-            // (Веха 18.2: переживёт GC и перезагрузку). Затем освободить дескриптор.
+            // PX_CLOSE — если файл менялся, записать содержимое в store, привязать к корню-имени и
+            // занести имя в индекс каталога (Веха 18.2/18.3: переживёт GC/перезагрузку, виден в
+            // readdir). Затем освободить дескриптор.
             if fd < PX_NFILES && fd_used[fd] {
                 let fi = fd_file[fd];
                 if dirty[fi] {
@@ -461,6 +757,10 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                         // OBJ_PUT(content) -> id; OBJ_SET_ROOT(name, id)
                         asm!("ecall", in("a7") 8usize, inout("a0") store_cap => _, in("a1") dbuf, in("a2") size[fi], in("a3") idptr, options(nostack));
                         asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") nptr, in("a2") name_len[fi], in("a3") idptr, options(nostack));
+                        // Веха 18.3: имя файла — в индекс каталога (idempotent) и переписать ".dir".
+                        if dir_add(dir_ptr, &mut dir_len, nptr as *const u8, name_len[fi]) {
+                            dir_persist(store_cap, dir_ptr, dir_len, idptr);
+                        }
                     }
                     dirty[fi] = false;
                 }
@@ -475,35 +775,78 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
     }
 }
 
-/// Процесс-**POSIX-программа** (Вехи 18.1/18.2): `arg` = cap на эндпоинт персоналии. Пользуется
-/// только POSIX-подобными вызовами через IPC-shim — и «не знает», что под ним VOID. Открывает
-/// `hello.txt` и читает: если файл есть с прошлого запуска — печатает содержимое (persistence);
-/// если пусто (первый запуск) — записывает строку. На `close` персоналия сохраняет файл в store.
+/// Процесс-**POSIX-программа** (Вехи 18.1–18.3): `arg` = cap на эндпоинт персоналии. Пользуется
+/// только POSIX-подобными вызовами через IPC-shim — и «не знает», что под ним VOID. Демонстрирует:
+/// (1) персистентность `hello.txt` (Веха 18.2); (2) `O_APPEND`-лог `log.txt`, растущий с каждой
+/// перезагрузкой; (3) `stat` (размер); (4) `readdir` (список файлов) и честный `unlink` (Веха 18.3).
 #[link_section = ".user"]
 extern "C" fn posix_client(ep: usize) -> ! {
     let mut buf = MaybeUninit::<[u8; 512]>::uninit();
     let bptr = buf.as_mut_ptr() as usize;
+    let mut num = MaybeUninit::<[u8; 24]>::uninit();
+    let numptr = num.as_mut_ptr() as usize;
     let name = FNAME.as_ptr() as usize;
     let content = FCONTENT.as_ptr() as usize;
     unsafe {
-        // fd = open("hello.txt")
+        // ── (1) hello.txt — персистентность (Веха 18.2) ──
         asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") name, in("a3") FNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
         let fd = *(bptr as *const u8) as usize;
-        // n = read(fd) — содержимое файла (пусто на первом запуске).
         let n: usize;
         asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
         if n > 0 {
-            // Файл есть с прошлого запуска — напечатать его содержимое.
             asm!("ecall", in("a7") 1usize, inout("a0") PXPREV.as_ptr() as usize => _, in("a1") PXPREV.len(), options(nostack));
             asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") n, options(nostack));
             asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
         } else {
-            // Первый запуск — записать содержимое (сохранится на close).
             asm!("ecall", in("a7") 1usize, inout("a0") PXFIRST.as_ptr() as usize => _, in("a1") PXFIRST.len(), options(nostack));
             asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (fd << 8), in("a2") content, in("a3") FCONTENT.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
         }
-        // close(fd) — персоналия сохранит изменённый файл в store.
         asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+
+        // ── (2) log.txt — O_APPEND: дописать "tick " (файл растёт с каждой перезагрузкой) ──
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN | (O_APPEND << 16), in("a2") LOGNAME.as_ptr() as usize, in("a3") LOGNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
+        let lfd = *(bptr as *const u8) as usize;
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (lfd << 8), in("a2") TICK.as_ptr() as usize, in("a3") TICK.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (lfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+        // Прочитать весь log.txt (обычный open — курсор в начале) и напечатать.
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") LOGNAME.as_ptr() as usize, in("a3") LOGNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
+        let lfd2 = *(bptr as *const u8) as usize;
+        let ln: usize;
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => ln, in("a1") PX_READ | (lfd2 << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") LOGPFX.as_ptr() as usize => _, in("a1") LOGPFX.len(), options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") ln, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (lfd2 << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+
+        // ── (3) stat("log.txt") → размер ──
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_STAT, in("a2") LOGNAME.as_ptr() as usize, in("a3") LOGNAME.len(), in("a4") bptr, in("a5") 5usize, options(nostack));
+        let sz = *(bptr as *const u8).add(1) as usize
+            | ((*(bptr as *const u8).add(2) as usize) << 8)
+            | ((*(bptr as *const u8).add(3) as usize) << 16)
+            | ((*(bptr as *const u8).add(4) as usize) << 24);
+        asm!("ecall", in("a7") 1usize, inout("a0") STATPFX.as_ptr() as usize => _, in("a1") STATPFX.len(), options(nostack));
+        let dl = utoa(sz, numptr as *mut u8);
+        asm!("ecall", in("a7") 1usize, inout("a0") numptr => _, in("a1") dl, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+
+        // ── (4) scratch.txt: создать, показать в readdir, затем честный unlink → stat exists=0 ──
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") SCRNAME.as_ptr() as usize, in("a3") SCRNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
+        let sfd = *(bptr as *const u8) as usize;
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (sfd << 8), in("a2") SCRDATA.as_ptr() as usize, in("a3") SCRDATA.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (sfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+        let dn: usize;
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => dn, in("a1") PX_READDIR, in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") DIRPFX.as_ptr() as usize => _, in("a1") DIRPFX.len(), options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") dn, options(nostack));
+        // unlink scratch.txt, затем stat — должен исчезнуть (exists=0).
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_UNLINK, in("a2") SCRNAME.as_ptr() as usize, in("a3") SCRNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_STAT, in("a2") SCRNAME.as_ptr() as usize, in("a3") SCRNAME.len(), in("a4") bptr, in("a5") 5usize, options(nostack));
+        let ex = *(bptr as *const u8) as usize;
+        asm!("ecall", in("a7") 1usize, inout("a0") UNLPFX.as_ptr() as usize => _, in("a1") UNLPFX.len(), options(nostack));
+        let el = utoa(ex, numptr as *mut u8);
+        asm!("ecall", in("a7") 1usize, inout("a0") numptr => _, in("a1") el, options(nostack));
+        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+
         asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn));
     }
 }
