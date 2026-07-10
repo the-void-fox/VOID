@@ -8,18 +8,22 @@ status: active
 # TODO
 
 ## Сейчас
-- [x] Доведено до цельного рабочего ядра: persistence по IPC (14), reply-capability (15), вытеснение (16), BLK_WRITE (17). Все дыры безопасности и «кооперативно» закрыты.
-- [x] Веха 18: слой совместимости (POSIX-персоналия как сервер) — **закрыта**, по под-вехам:
-    - [x] 18.1 — сервер-персоналия + POSIX-shim: open/write/close/read, namespace в RAM. См. [[posix-personality]].
-    - [x] 18.2 — персистентность файлов через store: содержимое под корнем-именем (роты = директория), переживает перезагрузку. См. [[posix-personality]].
-    - [x] 18.3 — stat/unlink/readdir, режимы open (O_APPEND/O_TRUNC), смещения на дескриптор; индекс каталога `.dir`; шлюз OBJ_DEL_ROOT (честный unlink). См. [[posix-personality]].
-    - [x] 18.4 — программа `mini-sh` на чистом POSIX-shim (libc-заглушка: sh_open/read/write/close/readdir; mini-cat/echo, stdout=fd1). Программа не знает про IPC/VOID. См. [[posix-personality]].
+- [x] Веха 18: слой совместимости (POSIX-персоналия как сервер) — **закрыта** (18.1–18.4). См. [[posix-personality]].
+- [x] Анализ состояния после Фазы 2: разрывы до работоспособности, SASOS, цена x86-порта. См. [[phase-2-state-analysis]]; решение — [[0003-phase-3-exec-by-hash]].
+- [x] **Веха 19 — программа как объект store** (старт Фазы 3, см. [[0003-phase-3-exec-by-hash]]) — **закрыта**. См. [[exec-from-store]].
+    - [x] 19.1 — отдельный ELF-крейт userspace (`programs/hello`, 8.6 КиБ release): линковка на 0x4000_0000, PHDRS с W^X на этапе линковки, вывод через SYS_WRITE.
+    - [x] 19.2 — минимальный ELF-загрузчик в ядре (`elf.rs`): PT_LOAD → U-страницы (W^X, bss), отказ W+X, entry из `e_entry`; `proc::spawn_elf` (общий путь с `spawn` через `new_address_space`/`create_process`).
+    - [x] 19.3 — демо exec-по-ContentId в kmain (`exec_demo`): первый запуск сидит ELF в store под корнем `bin/hello`, второй грузит С ДИСКА (проверено, content-id совпадает).
 
 ## Скоро
-- [ ]
+- [ ] Веха 20 — UART-ввод + интерактивный shell (`ls`/`cat`/`echo`/`run <имя>`).
+- [ ] Веха 21 — cap-transfer по IPC + персистентный c-space (завершает тезис ADR 0002).
+- [ ] Веха 22 — куча процесса (`SYS_MAP`, ленивые страницы) + user page fault убивает процесс, не ядро.
 
 ## Когда-нибудь
-- [ ]
+- [ ] Фоновый arch-рефакторинг: архзависимое → `kernel/src/arch/riscv64/` (подготовка к x86/aarch64, см. [[phase-2-state-analysis]]).
+- [ ] virtio-net + сетевой стек как userspace-сервер.
+- [ ] Checkpoint процессов — ортогональная персистентность вычислений (наследие KeyKOS).
 
 ---
 
@@ -64,5 +68,14 @@ status: active
     - [x] **18.3.** `stat`/`unlink`/`readdir`, режимы open (`O_APPEND`/`O_TRUNC`), смещения на дескриптор; персистентный индекс каталога `.dir`; шлюз ядра `OBJ_DEL_ROOT` (честный unlink — корень уходит в GC). См. [[posix-personality]].
     - [x] **18.4.** Программа `mini-sh` на чистом POSIX-shim (libc-заглушка `sh_open/read/write/close/readdir`, `mini-cat`/`echo`, stdout=fd 1 → консоль): в теле программы ни `ecall`, ни op-кодов, ни capability — прозрачность личности. См. [[posix-personality]].
 
+## Фаза 3 — самостоятельность (см. [[0003-phase-3-exec-by-hash]])
+Центральный примитив фазы: **программа = контент-адресуемый объект, exec по ContentId** — как derivation в Nix, прямое следствие ADR 0002.
+- [x] **Веха 19.** Программа как объект store: ELF-крейт `programs/hello` → байты в store под корнем `bin/hello` → минимальный ELF-загрузчик (PT_LOAD, W^X) → `spawn_elf` по ContentId; на втором запуске ELF грузится с диска. См. [[exec-from-store]].
+- [ ] **Веха 20.** UART-ввод (IRQ → async-канал) + интерактивный `mini-sh`: `ls`/`cat`/`echo`/`run <имя|hash>`.
+- [ ] **Веха 21.** Cap-transfer по IPC (grant-в-сообщении) + персистентный c-space — capability переживают перезагрузку, тезис ADR 0002 полный.
+- [ ] **Веха 22.** Куча процесса (`SYS_MAP`, ленивые страницы); user page fault убивает процесс, а не ядро; снять лимиты POSIX-персоналии (4 файла × 256 байт).
+
 ## Опционально / исследовательское
-- [ ] SASOS-эксперимент: изоляция средствами Rust вместо железных границ (см. [[0001-rust-riscv-microkernel]]).
+- [ ] SASOS-эксперимент: изоляция средствами Rust вместо железных границ (см. [[0001-rust-riscv-microkernel]]). Практичный первый шаг — гибрид: доверенные серверы в одном AS (модель Theseus/Hubris), код сервера = проверяемый объект по хэшу. См. [[phase-2-state-analysis]].
+- [ ] Порт на x86-64 (Limine boot, GDT/IDT, virtio-pci) — после Фазы 3, чтобы портировать систему, а не демо. Цена — в [[phase-2-state-analysis]].
+- [ ] virtio-net + сетевой стек как userspace-сервер; checkpoint процессов (ортогональная персистентность вычислений).
