@@ -53,8 +53,10 @@ const PX_DATA_MAX: usize = 256;
 static FNAME: [u8; b"hello.txt".len()] = *b"hello.txt";
 static FCONTENT: [u8; b"Hello, POSIX personality on VOID!".len()] =
     *b"Hello, POSIX personality on VOID!";
-static PXPREFIX: [u8; b"[posix-app] read('hello.txt') -> ".len()] =
-    *b"[posix-app] read('hello.txt') -> ";
+static PXPREV: [u8; b"[posix-app] hello.txt from previous boot: ".len()] =
+    *b"[posix-app] hello.txt from previous boot: ";
+static PXFIRST: [u8; b"[posix-app] hello.txt not found, writing it (first boot)\n".len()] =
+    *b"[posix-app] hello.txt not found, writing it (first boot)\n";
 
 // ── Веха 13/14: сервер объектного store ──
 const OP_PUT: usize = 0;
@@ -294,12 +296,17 @@ extern "C" fn busy(label: usize) -> ! {
     unsafe { asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn)) }
 }
 
-/// Процесс-**персоналия POSIX** (Веха 18.1): даёт клиентам файловый API `open/read/write/close`
+/// Процесс-**персоналия POSIX** (Вехи 18.1/18.2): даёт клиентам файловый API `open/read/write/close`
 /// по IPC. Namespace (имена → данные) и таблица дескрипторов живут на СТЕКЕ сервера — у процессов
 /// нет кучи, поэтому фикс. размер. Данные — в `MaybeUninit` (без обнуления), валидность отслеживаем
-/// сами (`used`/`size`). Всё через сырые указатели: ни `memcpy`, ни паник-путей в `.user`.
+/// сами (`fused`/`size`). Всё через сырые указатели: ни `memcpy`, ни паник-путей в `.user`.
+///
+/// Веха 18.2 — **персистентность через store** (`arg` = cap на store): содержимое файла = значение
+/// в объектном пространстве, привязанное к **корню-имени** (`OBJ_SET_ROOT`). Роты хранилища и есть
+/// директория: `open(name)` = `get_root(name)` → есть? загрузить (`OBJ_GET`) : создать. Привязка к
+/// корню и переживает GC ядра (достижимо от корня), и перезагрузку.
 #[link_section = ".user"]
-extern "C" fn posix_server(_arg: usize) -> ! {
+extern "C" fn posix_server(store_cap: usize) -> ! {
     // Namespace на стеке: имена, данные, метаданные.
     let mut names = MaybeUninit::<[[u8; PX_NAME_MAX]; PX_NFILES]>::uninit();
     let mut datas = MaybeUninit::<[[u8; PX_DATA_MAX]; PX_NFILES]>::uninit();
@@ -308,6 +315,7 @@ extern "C" fn posix_server(_arg: usize) -> ! {
     let mut name_len = [0usize; PX_NFILES];
     let mut size = [0usize; PX_NFILES];
     let mut fused = [false; PX_NFILES];
+    let mut dirty = [false; PX_NFILES]; // изменён с последней записи в store
     // Дескрипторы: fd → (файл, смещение).
     let mut fd_file = [0usize; PX_NFILES];
     let mut fd_off = [0usize; PX_NFILES];
@@ -315,8 +323,10 @@ extern "C" fn posix_server(_arg: usize) -> ! {
 
     let mut req = MaybeUninit::<[u8; 512]>::uninit();
     let mut rep = MaybeUninit::<[u8; 512]>::uninit();
+    let mut idb = MaybeUninit::<[u8; 32]>::uninit(); // content-id для OBJ_PUT/GET
     let rptr = req.as_mut_ptr() as usize;
     let pptr = rep.as_mut_ptr() as usize;
+    let idptr = idb.as_mut_ptr() as usize;
 
     loop {
         let op: usize;
@@ -355,6 +365,7 @@ extern "C" fn posix_server(_arg: usize) -> ! {
                 i += 1;
             }
             if fidx == usize::MAX {
+                // Не в RAM — занять свободный слот и попробовать поднять из store, иначе создать.
                 let mut j = 0;
                 while j < PX_NFILES {
                     if !fused[j] {
@@ -365,13 +376,29 @@ extern "C" fn posix_server(_arg: usize) -> ! {
                 }
                 if fidx != usize::MAX {
                     fused[fidx] = true;
-                    size[fidx] = 0;
+                    dirty[fidx] = false;
                     let nl = if len > PX_NAME_MAX { PX_NAME_MAX } else { len };
                     name_len[fidx] = nl;
                     let mut k = 0;
                     while k < nl {
                         unsafe { *names_ptr.add(fidx * PX_NAME_MAX + k) = *(rptr as *const u8).add(k) };
                         k += 1;
+                    }
+                    // Веха 18.2: есть ли корень с этим именем? (get_root)
+                    let gn: usize;
+                    unsafe {
+                        asm!("ecall", in("a7") 11usize, inout("a0") store_cap => gn, in("a1") rptr, in("a2") nl, in("a3") idptr, options(nostack));
+                    }
+                    if gn == 32 {
+                        // Загрузить содержимое по content-id в буфер данных файла (OBJ_GET).
+                        let dbuf = datas_ptr as usize + fidx * PX_DATA_MAX;
+                        let sz: usize;
+                        unsafe {
+                            asm!("ecall", in("a7") 9usize, inout("a0") store_cap => sz, in("a1") idptr, in("a2") dbuf, in("a3") PX_DATA_MAX, options(nostack));
+                        }
+                        size[fidx] = sz;
+                    } else {
+                        size[fidx] = 0; // новый файл
                     }
                 }
             }
@@ -408,6 +435,7 @@ extern "C" fn posix_server(_arg: usize) -> ! {
                 if w > size[fi] {
                     size[fi] = w;
                 }
+                dirty[fi] = true; // Веха 18.2: пометить для записи в store при close
             }
         } else if opcode == PX_READ {
             // Прочитать из файла со смещения до конца (клиент ограничит своим recv_cap).
@@ -422,8 +450,20 @@ extern "C" fn posix_server(_arg: usize) -> ! {
                 fd_off[fd] = r;
             }
         } else {
-            // PX_CLOSE — освободить дескриптор (файл и его данные остаются в namespace).
-            if fd < PX_NFILES {
+            // PX_CLOSE — если файл менялся, записать содержимое в store и привязать к корню-имени
+            // (Веха 18.2: переживёт GC и перезагрузку). Затем освободить дескриптор.
+            if fd < PX_NFILES && fd_used[fd] {
+                let fi = fd_file[fd];
+                if dirty[fi] {
+                    let dbuf = datas_ptr as usize + fi * PX_DATA_MAX;
+                    let nptr = names_ptr as usize + fi * PX_NAME_MAX;
+                    unsafe {
+                        // OBJ_PUT(content) -> id; OBJ_SET_ROOT(name, id)
+                        asm!("ecall", in("a7") 8usize, inout("a0") store_cap => _, in("a1") dbuf, in("a2") size[fi], in("a3") idptr, options(nostack));
+                        asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") nptr, in("a2") name_len[fi], in("a3") idptr, options(nostack));
+                    }
+                    dirty[fi] = false;
+                }
                 fd_used[fd] = false;
             }
         }
@@ -435,9 +475,10 @@ extern "C" fn posix_server(_arg: usize) -> ! {
     }
 }
 
-/// Процесс-**POSIX-программа** (Веха 18.1): `arg` = cap на эндпоинт персоналии. Пользуется только
-/// POSIX-подобными вызовами (open/write/close/open/read) через IPC-shim — и «не знает», что под
-/// ним VOID. Создаёт файл, пишет строку, закрывает; затем открывает по имени и читает обратно.
+/// Процесс-**POSIX-программа** (Вехи 18.1/18.2): `arg` = cap на эндпоинт персоналии. Пользуется
+/// только POSIX-подобными вызовами через IPC-shim — и «не знает», что под ним VOID. Открывает
+/// `hello.txt` и читает: если файл есть с прошлого запуска — печатает содержимое (persistence);
+/// если пусто (первый запуск) — записывает строку. На `close` персоналия сохраняет файл в store.
 #[link_section = ".user"]
 extern "C" fn posix_client(ep: usize) -> ! {
     let mut buf = MaybeUninit::<[u8; 512]>::uninit();
@@ -445,23 +486,24 @@ extern "C" fn posix_client(ep: usize) -> ! {
     let name = FNAME.as_ptr() as usize;
     let content = FCONTENT.as_ptr() as usize;
     unsafe {
-        // fd = open("hello.txt")  — сервер вернёт fd одним байтом в buf.
+        // fd = open("hello.txt")
         asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") name, in("a3") FNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
         let fd = *(bptr as *const u8) as usize;
-        // write(fd, content)
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (fd << 8), in("a2") content, in("a3") FCONTENT.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
-        // close(fd)
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
-        // fd2 = open("hello.txt")  — тот же файл по имени, смещение с нуля.
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") name, in("a3") FNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
-        let fd2 = *(bptr as *const u8) as usize;
-        // n = read(fd2, buf) — вернёт содержимое файла.
+        // n = read(fd) — содержимое файла (пусто на первом запуске).
         let n: usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (fd2 << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
-        // Напечатать: префикс + прочитанное содержимое + перевод строки.
-        asm!("ecall", in("a7") 1usize, inout("a0") PXPREFIX.as_ptr() as usize => _, in("a1") PXPREFIX.len(), options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") n, options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
+        if n > 0 {
+            // Файл есть с прошлого запуска — напечатать его содержимое.
+            asm!("ecall", in("a7") 1usize, inout("a0") PXPREV.as_ptr() as usize => _, in("a1") PXPREV.len(), options(nostack));
+            asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") n, options(nostack));
+            asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+        } else {
+            // Первый запуск — записать содержимое (сохранится на close).
+            asm!("ecall", in("a7") 1usize, inout("a0") PXFIRST.as_ptr() as usize => _, in("a1") PXFIRST.len(), options(nostack));
+            asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (fd << 8), in("a2") content, in("a3") FCONTENT.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        }
+        // close(fd) — персоналия сохранит изменённый файл в store.
+        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
         asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn));
     }
 }

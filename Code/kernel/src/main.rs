@@ -413,13 +413,16 @@ fn posix_demo() {
     use void_abi::Rights;
 
     println!("  [proc] POSIX-персоналия (файлы open/write/close/read) через IPC:");
+    // Персоналии — cap на store (файлы персистятся под корнями-именами, Веха 18.2).
     let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
+    let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
+    proc::set_arg(server, scap.bits() as usize);
     let client = proc::spawn("posix-app", user::posix_client_entry(), 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
-        "    P{} '{}' ← cap на эндпоинт персоналии P{} '{}'",
-        client, cap::domain_name(proc::domain(client)), server, cap::domain_name(proc::domain(server)),
+        "    P{} '{}' [cap store] ← клиент P{} '{}' [cap эндпоинт]",
+        server, cap::domain_name(proc::domain(server)), client, cap::domain_name(proc::domain(client)),
     );
     proc::run();
     println!("  [proc] сессия персоналии завершена — обратно в ядро");
