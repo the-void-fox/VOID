@@ -406,19 +406,19 @@ fn preempt_demo() {
     );
 }
 
-/// Веха 18.1–18.3: POSIX-персоналия как сервер. Программа-клиент пользуется только POSIX-подобными
-/// вызовами (`open/write/close/read/stat/unlink/readdir`, режимы `O_APPEND/O_TRUNC`) через тонкий
-/// IPC-shim и «не знает», что под ней VOID. Файлы персистятся через store (корни-имена + индекс
-/// каталога `.dir`), `unlink` честно снимает корень (объект уходит в GC).
+/// Веха 18.1–18.4: POSIX-персоналия как сервер. Клиент `mini-sh` (Веха 18.4) написан ЦЕЛИКОМ на
+/// POSIX-shim (libc-заглушка): ни `ecall`, ни op-кодов, ни capability в теле — программа «не знает»
+/// ни про IPC, ни про VOID, только про `open/read/write/close/readdir`. Играет сессию
+/// `cat; echo > ; cat; ls` над `motd.txt`; файл персистится через store (Вехи 18.2/18.3).
 fn posix_demo() {
     use void_abi::Rights;
 
-    println!("  [proc] POSIX-персоналия (open/write/read/close/stat/unlink/readdir) через IPC:");
+    println!("  [proc] POSIX-персоналия + программа mini-sh на чистом POSIX-shim (Веха 18.4):");
     // Персоналии — cap на store (файлы персистятся под корнями-именами, Веха 18.2).
     let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
     proc::set_arg(server, scap.bits() as usize);
-    let client = proc::spawn("posix-app", user::posix_client_entry(), 0);
+    let client = proc::spawn("mini-sh", user::mini_sh_entry(), 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(

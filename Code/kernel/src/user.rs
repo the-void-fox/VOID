@@ -60,25 +60,15 @@ const PX_DATA_MAX: usize = 256;
 // Индекс каталога (для readdir/unlink): персистится под спец-корнем ".dir" — формат
 // count(1) | [nlen(1) | name]* . Роты-файлы ядро перечислять не даёт, поэтому список имён ведём сами.
 static DIRROOT: [u8; b".dir".len()] = *b".dir";
-static FNAME: [u8; b"hello.txt".len()] = *b"hello.txt";
-static FCONTENT: [u8; b"Hello, POSIX personality on VOID!".len()] =
-    *b"Hello, POSIX personality on VOID!";
-static PXPREV: [u8; b"[posix-app] hello.txt from previous boot: ".len()] =
-    *b"[posix-app] hello.txt from previous boot: ";
-static PXFIRST: [u8; b"[posix-app] hello.txt not found, writing it (first boot)\n".len()] =
-    *b"[posix-app] hello.txt not found, writing it (first boot)\n";
-// Веха 18.3: демо stat/readdir/unlink/append.
-static LOGNAME: [u8; b"log.txt".len()] = *b"log.txt";
-static TICK: [u8; b"tick ".len()] = *b"tick ";
-static LOGPFX: [u8; b"[posix-app] log.txt now (O_APPEND, grows each boot): ".len()] =
-    *b"[posix-app] log.txt now (O_APPEND, grows each boot): ";
-static STATPFX: [u8; b"[posix-app] stat log.txt: size=".len()] =
-    *b"[posix-app] stat log.txt: size=";
-static DIRPFX: [u8; b"[posix-app] readdir: ".len()] = *b"[posix-app] readdir: ";
-static SCRNAME: [u8; b"scratch.txt".len()] = *b"scratch.txt";
-static SCRDATA: [u8; b"scratch-data".len()] = *b"scratch-data";
-static UNLPFX: [u8; b"[posix-app] unlink scratch.txt -> stat exists=".len()] =
-    *b"[posix-app] unlink scratch.txt -> stat exists=";
+// ── Веха 18.4: программа поверх POSIX-shim (mini-shell) ──
+// Байтовые строки — только ASCII (в них нельзя не-ASCII). Читает их ЯДРО (SYS_WRITE/CALL).
+static MOTD: [u8; b"motd.txt".len()] = *b"motd.txt";
+static MOTDMSG: [u8; b"VOID says hi, written by mini-echo, kept by the personality\n".len()] =
+    *b"VOID says hi, written by mini-echo, kept by the personality\n";
+static CATLBL: [u8; b"[mini-sh] $ cat motd.txt\n".len()] = *b"[mini-sh] $ cat motd.txt\n";
+static ECHOLBL: [u8; b"[mini-sh] $ echo \"...\" > motd.txt\n".len()] =
+    *b"[mini-sh] $ echo \"...\" > motd.txt\n";
+static LSLBL: [u8; b"[mini-sh] $ ls\n".len()] = *b"[mini-sh] $ ls\n";
 
 // ── Веха 13/14: сервер объектного store ──
 const OP_PUT: usize = 0;
@@ -417,28 +407,6 @@ unsafe fn dir_persist(store_cap: usize, dir: *const u8, dir_len: usize, idb: usi
     asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") DIRROOT.as_ptr() as usize, in("a2") DIRROOT.len(), in("a3") idb, options(nostack));
 }
 
-/// Число в десятичном ASCII в буфер `out`, без кучи/format. Возвращает длину.
-#[link_section = ".user"]
-unsafe fn utoa(mut n: usize, out: *mut u8) -> usize {
-    if n == 0 {
-        *out = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 20];
-    let mut i = 0;
-    while n > 0 {
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    let mut j = 0;
-    while j < i {
-        *out.add(j) = tmp[i - 1 - j];
-        j += 1;
-    }
-    i
-}
-
 /// Процесс-**персоналия POSIX** (Вехи 18.1–18.3): даёт клиентам файловый API
 /// `open/read/write/close/stat/unlink/readdir` по IPC. Namespace (имена → данные) и таблица
 /// дескрипторов живут на СТЕКЕ сервера — у процессов нет кучи, поэтому фикс. размер. Данные — в
@@ -775,79 +743,124 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
     }
 }
 
-/// Процесс-**POSIX-программа** (Вехи 18.1–18.3): `arg` = cap на эндпоинт персоналии. Пользуется
-/// только POSIX-подобными вызовами через IPC-shim — и «не знает», что под ним VOID. Демонстрирует:
-/// (1) персистентность `hello.txt` (Веха 18.2); (2) `O_APPEND`-лог `log.txt`, растущий с каждой
-/// перезагрузкой; (3) `stat` (размер); (4) `readdir` (список файлов) и честный `unlink` (Веха 18.3).
+// ── Веха 18.4: POSIX-shim (libc-заглушка) ──
+// Тонкий слой, ПРЯЧУЩИЙ ecall/op-коды/capability/IPC. Программа зовёт только эти функции и
+// «не знает», что под ней VOID: `ep` — непрозрачный дескриптор «связи с ОС», выданный при запуске
+// (как контекст libc). Дескрипторы наружу смещены на +3: 0/1/2 зарезервированы под stdin/stdout/
+// stderr (POSIX). `write` на 1/2 идёт в консоль ядра, на ≥3 — в персоналию.
+const STDOUT: usize = 1;
+const FD_BASE: usize = 3;
+
+/// `open(name, mode) -> fd` (или `usize::MAX`). Программе не видны ни op-код, ни reply-cap.
 #[link_section = ".user"]
-extern "C" fn posix_client(ep: usize) -> ! {
+unsafe fn sh_open(ep: usize, name: *const u8, name_len: usize, mode: usize) -> usize {
+    let mut r = MaybeUninit::<[u8; 4]>::uninit();
+    let rp = r.as_mut_ptr() as usize;
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN | (mode << 16), in("a2") name as usize, in("a3") name_len, in("a4") rp, in("a5") 4usize, options(nostack));
+    let pfd = *(rp as *const u8) as usize;
+    if pfd == 0xff { usize::MAX } else { pfd + FD_BASE }
+}
+
+/// `read(fd, buf, cap) -> n`.
+#[link_section = ".user"]
+unsafe fn sh_read(ep: usize, fd: usize, buf: *mut u8, cap: usize) -> usize {
+    if fd < FD_BASE {
+        return 0;
+    }
+    let pfd = fd - FD_BASE;
+    let n: usize;
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (pfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") buf as usize, in("a5") cap, options(nostack));
+    n
+}
+
+/// `write(fd, buf, len) -> len`. `fd`=1/2 → консоль (программа не знает, что это UART ядра).
+#[link_section = ".user"]
+unsafe fn sh_write(ep: usize, fd: usize, buf: *const u8, len: usize) -> usize {
+    if fd < FD_BASE {
+        // stdout/stderr → SYS_WRITE ядра.
+        asm!("ecall", in("a7") 1usize, inout("a0") buf as usize => _, in("a1") len, options(nostack));
+        return len;
+    }
+    let pfd = fd - FD_BASE;
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (pfd << 8), in("a2") buf as usize, in("a3") len, in("a4") 0usize, in("a5") 0usize, options(nostack));
+    len
+}
+
+/// `close(fd)`.
+#[link_section = ".user"]
+unsafe fn sh_close(ep: usize, fd: usize) {
+    if fd < FD_BASE {
+        return;
+    }
+    let pfd = fd - FD_BASE;
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (pfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+}
+
+/// `readdir(buf, cap) -> n`: имена файлов через '\n' (для `ls`).
+#[link_section = ".user"]
+unsafe fn sh_readdir(ep: usize, buf: *mut u8, cap: usize) -> usize {
+    let n: usize;
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READDIR, in("a2") 0usize, in("a3") 0usize, in("a4") buf as usize, in("a5") cap, options(nostack));
+    n
+}
+
+/// `exit(code)`: завершить процесс (роль C-runtime, не файловый I/O).
+#[link_section = ".user"]
+unsafe fn sh_exit(code: usize) -> ! {
+    asm!("ecall", in("a7") 2usize, in("a0") code, options(nostack, noreturn));
+}
+
+/// `mini-echo`: записать строку в файл (как `echo msg > path`). Только через shim.
+#[link_section = ".user"]
+unsafe fn mini_echo(ep: usize, path: *const u8, path_len: usize, msg: *const u8, msg_len: usize) {
+    let fd = sh_open(ep, path, path_len, O_TRUNC);
+    if fd != usize::MAX {
+        sh_write(ep, fd, msg, msg_len);
+        sh_close(ep, fd);
+    }
+}
+
+/// `mini-cat`: прочитать файл и вывести в stdout (как `cat path`). Только через shim.
+#[link_section = ".user"]
+unsafe fn mini_cat(ep: usize, path: *const u8, path_len: usize) {
     let mut buf = MaybeUninit::<[u8; 512]>::uninit();
-    let bptr = buf.as_mut_ptr() as usize;
-    let mut num = MaybeUninit::<[u8; 24]>::uninit();
-    let numptr = num.as_mut_ptr() as usize;
-    let name = FNAME.as_ptr() as usize;
-    let content = FCONTENT.as_ptr() as usize;
-    unsafe {
-        // ── (1) hello.txt — персистентность (Веха 18.2) ──
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") name, in("a3") FNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
-        let fd = *(bptr as *const u8) as usize;
-        let n: usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
-        if n > 0 {
-            asm!("ecall", in("a7") 1usize, inout("a0") PXPREV.as_ptr() as usize => _, in("a1") PXPREV.len(), options(nostack));
-            asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") n, options(nostack));
-            asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
-        } else {
-            asm!("ecall", in("a7") 1usize, inout("a0") PXFIRST.as_ptr() as usize => _, in("a1") PXFIRST.len(), options(nostack));
-            asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (fd << 8), in("a2") content, in("a3") FCONTENT.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+    let bp = buf.as_mut_ptr() as *mut u8;
+    let fd = sh_open(ep, path, path_len, 0);
+    if fd == usize::MAX {
+        return;
+    }
+    loop {
+        let n = sh_read(ep, fd, bp, 512);
+        if n == 0 {
+            break;
         }
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (fd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+        sh_write(ep, STDOUT, bp, n);
+    }
+    sh_close(ep, fd);
+}
 
-        // ── (2) log.txt — O_APPEND: дописать "tick " (файл растёт с каждой перезагрузкой) ──
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN | (O_APPEND << 16), in("a2") LOGNAME.as_ptr() as usize, in("a3") LOGNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
-        let lfd = *(bptr as *const u8) as usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (lfd << 8), in("a2") TICK.as_ptr() as usize, in("a3") TICK.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (lfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
-        // Прочитать весь log.txt (обычный open — курсор в начале) и напечатать.
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") LOGNAME.as_ptr() as usize, in("a3") LOGNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
-        let lfd2 = *(bptr as *const u8) as usize;
-        let ln: usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => ln, in("a1") PX_READ | (lfd2 << 8), in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") LOGPFX.as_ptr() as usize => _, in("a1") LOGPFX.len(), options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") ln, options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (lfd2 << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
-
-        // ── (3) stat("log.txt") → размер ──
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_STAT, in("a2") LOGNAME.as_ptr() as usize, in("a3") LOGNAME.len(), in("a4") bptr, in("a5") 5usize, options(nostack));
-        let sz = *(bptr as *const u8).add(1) as usize
-            | ((*(bptr as *const u8).add(2) as usize) << 8)
-            | ((*(bptr as *const u8).add(3) as usize) << 16)
-            | ((*(bptr as *const u8).add(4) as usize) << 24);
-        asm!("ecall", in("a7") 1usize, inout("a0") STATPFX.as_ptr() as usize => _, in("a1") STATPFX.len(), options(nostack));
-        let dl = utoa(sz, numptr as *mut u8);
-        asm!("ecall", in("a7") 1usize, inout("a0") numptr => _, in("a1") dl, options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
-
-        // ── (4) scratch.txt: создать, показать в readdir, затем честный unlink → stat exists=0 ──
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN, in("a2") SCRNAME.as_ptr() as usize, in("a3") SCRNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
-        let sfd = *(bptr as *const u8) as usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (sfd << 8), in("a2") SCRDATA.as_ptr() as usize, in("a3") SCRDATA.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (sfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
-        let dn: usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => dn, in("a1") PX_READDIR, in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") DIRPFX.as_ptr() as usize => _, in("a1") DIRPFX.len(), options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") dn, options(nostack));
-        // unlink scratch.txt, затем stat — должен исчезнуть (exists=0).
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_UNLINK, in("a2") SCRNAME.as_ptr() as usize, in("a3") SCRNAME.len(), in("a4") bptr, in("a5") 4usize, options(nostack));
-        asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_STAT, in("a2") SCRNAME.as_ptr() as usize, in("a3") SCRNAME.len(), in("a4") bptr, in("a5") 5usize, options(nostack));
-        let ex = *(bptr as *const u8) as usize;
-        asm!("ecall", in("a7") 1usize, inout("a0") UNLPFX.as_ptr() as usize => _, in("a1") UNLPFX.len(), options(nostack));
-        let el = utoa(ex, numptr as *mut u8);
-        asm!("ecall", in("a7") 1usize, inout("a0") numptr => _, in("a1") el, options(nostack));
-        asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
-
-        asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn));
+/// Процесс-**mini-shell** (Веха 18.4): `arg` = дескриптор персоналии. Написан ЦЕЛИКОМ на POSIX-shim
+/// — ни одного `ecall`, op-кода или capability в теле; «не знает» ни про IPC, ни про VOID. Играет
+/// маленькую сессию `cat; echo > ; cat; ls` над `motd.txt` (файл переживает перезагрузку).
+#[link_section = ".user"]
+extern "C" fn mini_sh(ep: usize) -> ! {
+    let mut buf = MaybeUninit::<[u8; 512]>::uninit();
+    let bp = buf.as_mut_ptr() as *mut u8;
+    unsafe {
+        // $ cat motd.txt   (покажет содержимое с прошлой загрузки — на первой пусто)
+        sh_write(ep, STDOUT, CATLBL.as_ptr(), CATLBL.len());
+        mini_cat(ep, MOTD.as_ptr(), MOTD.len());
+        // $ echo "..." > motd.txt
+        sh_write(ep, STDOUT, ECHOLBL.as_ptr(), ECHOLBL.len());
+        mini_echo(ep, MOTD.as_ptr(), MOTD.len(), MOTDMSG.as_ptr(), MOTDMSG.len());
+        // $ cat motd.txt   (только что записанное)
+        sh_write(ep, STDOUT, CATLBL.as_ptr(), CATLBL.len());
+        mini_cat(ep, MOTD.as_ptr(), MOTD.len());
+        // $ ls
+        sh_write(ep, STDOUT, LSLBL.as_ptr(), LSLBL.len());
+        let n = sh_readdir(ep, bp, 512);
+        sh_write(ep, STDOUT, bp, n);
+        sh_exit(0);
     }
 }
 
@@ -870,8 +883,8 @@ pub fn busy_entry() -> usize {
 pub fn posix_server_entry() -> usize {
     posix_server as *const () as usize
 }
-pub fn posix_client_entry() -> usize {
-    posix_client as *const () as usize
+pub fn mini_sh_entry() -> usize {
+    mini_sh as *const () as usize
 }
 pub fn label_a() -> usize {
     LBL_A.as_ptr() as usize
