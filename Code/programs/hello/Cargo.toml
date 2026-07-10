@@ -1,0 +1,19 @@
+[package]
+name = "hello"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+description = "Первая userspace-программа VOID как отдельный ELF-крейт (Веха 19.1) — грузится ядром по content-id из объектного store, а не вшивается в секцию .user образа ядра."
+
+# ВАЖНО: этот крейт НЕ входит в workspace ядра (см. `exclude` в ../../Cargo.toml) — поэтому он сам
+# себе workspace-root и не может писать `version.workspace = true` и т.п.: значения продублированы.
+#
+# Профиль release настроен под жёсткий размер: весь ELF целиком ложится в объектный store, который
+# кэшируется в куче ядра (всего 2 МиБ!), а сама куча делит эти 2 МиБ ещё с кучей всех прочих демо.
+# opt-level="z" + LTO + panic="abort" (без unwind-таблиц) + strip — цель: единицы-десятки КиБ.
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1

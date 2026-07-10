@@ -17,7 +17,7 @@ use void_abi::{Cap, ContentId, Rights};
 use crate::context::{context_switch, Context};
 use crate::sync::SpinLock;
 use crate::trap::TrapFrame;
-use crate::{cap, csr, frame, paging, println, timer};
+use crate::{cap, csr, elf, frame, paging, println, timer};
 
 // Ассемблерная функция входа в процесс: satp + восстановление регистров из кадра + sret.
 core::arch::global_asm!(include_str!("enter_user.s"));
@@ -35,6 +35,10 @@ const SATP_SV39: usize = 8 << 60;
 const USER_STACK_TOP_VA: usize = 0x8000_0000;
 const USER_STACK_PAGES: usize = 4;
 const PAGE: usize = 4096;
+/// Начало региона VPN[2]=1 — весь тот же незанятый ядром диапазон, где живёт стек процесса, но
+/// теперь ещё и код/данные ELF-программ (Веха 19, [`spawn_elf`]). Совпадает с базой линковки
+/// `programs/*/linker.ld`; [`crate::elf::load`] отвергает сегменты ниже этого адреса.
+pub const USER_REGION_START: usize = 0x4000_0000;
 
 // ─── ядерный trap-стек для trap'ов из U-mode ──────────────────────────────────
 // 64 КиБ — как загрузочный стек ядра (linker.ld): syscall'ы делают настоящую работу
@@ -106,11 +110,11 @@ static mut RETURN_CTX: Context = Context { ra: 0, sp: 0, s: [0; 12] };
 
 // ─── создание и запуск ────────────────────────────────────────────────────────
 
-/// Создать процесс: свой домен защиты (c-space) + адресное пространство (код `.user` общий,
-/// стек приватный) + стартовый кадр (вход `entry`, `a0`=`arg`). Возвращает id процесса; он же —
-/// адрес эндпоинта для [`cap::Target::Endpoint`]. Пока Runnable. Начальные capability ядро
-/// минтит в его [`domain`] и передаёт дескриптор через [`set_arg`] ДО [`run`].
-pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
+/// Новое адресное пространство процесса: клон корня ядра (даёт доступ к ядру и к общему коду
+/// `.user`) + приватный стек в незанятом регионе VPN[2]=1. Общий путь для [`spawn`] (код `.user`,
+/// как раньше) и [`spawn_elf`] (код из ELF, загруженного по content-id, Веха 19) — оба процесса
+/// устроены одинаково, различается лишь ИСТОЧНИК кода/точки входа.
+fn new_address_space() -> usize {
     let root = paging::clone_kernel_root();
     // Приватный стек в VPN[2]=1: несколько страниц из свежих фреймов.
     for i in 1..=USER_STACK_PAGES {
@@ -118,6 +122,14 @@ pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
         let pa = frame::alloc().expect("нет фрейма под стек процесса");
         unsafe { paging::map(root, va, pa, paging::PTE_R | paging::PTE_W | paging::PTE_U) };
     }
+    root
+}
+
+/// Завести запись в таблице процессов: домен защиты (c-space) + стартовый кадр (вход `entry`,
+/// `a0`=`arg`, `sp`=верх стека). Возвращает id процесса; он же — адрес эндпоинта для
+/// [`cap::Target::Endpoint`]. Пока Runnable. Начальные capability ядро минтит в [`domain`] и
+/// передаёт дескриптор через [`set_arg`] ДО [`run`].
+fn create_process(name: &'static str, root: usize, entry: usize, arg: usize) -> usize {
     let mut frame = TrapFrame::default();
     frame.sepc = entry;
     frame.regs[2] = USER_STACK_TOP_VA; // sp
@@ -136,6 +148,29 @@ pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
         send_len: 0,
     });
     t.procs.len() - 1
+}
+
+/// Создать процесс со входом `entry` в общем коде `.user` (как на Вехах 10–18): своё адресное
+/// пространство + стартовый кадр. См. [`create_process`] за деталями инициализации.
+pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
+    let root = new_address_space();
+    create_process(name, root, entry, arg)
+}
+
+/// Веха 19.2/19.3 — создать процесс из СОБСТВЕННОГО статического ELF64/RISC-V (не из `.user`):
+/// новое адресное пространство, [`crate::elf::load`] разбирает `elf` и маппит его `PT_LOAD`-
+/// сегменты по правам `p_flags` (W^X), точка входа — `e_entry` файла, а не адрес функции в
+/// образе ядра. `elf` может быть чем угодно (в т.ч. байтами, прочитанными [[object-model|из
+/// store]] по content-id, см. `main::exec_demo`) — загрузчик не предполагает, что они лежат
+/// где-то конкретно, копирует их в свежие фреймы процесса. Отказ парсинга/раскладки ELF не
+/// заводит процесс и не трогает таблицу — вызывающий получает [`elf::ElfError`].
+pub fn spawn_elf(name: &'static str, elf_bytes: &[u8], arg: usize) -> Result<usize, elf::ElfError> {
+    let root = new_address_space();
+    // Верхняя граница адресов ELF — низ приватного стека этого же адресного пространства: ниже
+    // него код/данные процесса, выше — стек (см. `new_address_space`); нельзя пересекаться.
+    let va_limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+    let entry = elf::load(root, elf_bytes, va_limit)?;
+    Ok(create_process(name, root, entry, arg))
 }
 
 /// Домен защиты (c-space) процесса — сюда ядро минтит его начальные capability до [`run`].

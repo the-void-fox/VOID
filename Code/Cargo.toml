@@ -6,6 +6,13 @@ members = [
     "kernel",
     "libs/void-abi",
 ]
+# Веха 19.1: userspace-программы — ОТДЕЛЬНЫЕ ELF-крейты, не члены этого workspace (у них свой
+# таргет `riscv64gc-unknown-none-elf`, свой линкер-скрипт на другую базу и свой release-профиль
+# под жёсткий размер — см. programs/hello/Cargo.toml). `kernel/build.rs` собирает их отдельным
+# `cargo build` со своим `--target-dir` внутри OUT_DIR (иначе — deadlock на локе target ядра).
+exclude = [
+    "programs/hello",
+]
 
 [workspace.package]
 version = "0.0.1"

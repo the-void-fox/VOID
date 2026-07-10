@@ -1,3 +1,5 @@
 /target
 # Образ диска для virtio-blk (Веха 7.1). Создать: truncate -s 16M void-disk.img
 /void-disk.img
+# target отдельно собираемых userspace-программ (кроме сборки через kernel/build.rs → OUT_DIR)
+/programs/*/target/

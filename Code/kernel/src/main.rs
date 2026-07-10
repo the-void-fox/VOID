@@ -24,6 +24,7 @@ mod cap;
 mod chan;
 mod context;
 mod csr;
+mod elf;
 mod executor;
 mod frame;
 mod heap;
@@ -39,6 +40,12 @@ mod trap;
 mod uart;
 mod user;
 mod virtio_blk;
+
+/// Веха 19.1 — ELF-байты userspace-программы `hello`, встроенные в образ ядра как СЕМЯ. Собраны
+/// `kernel/build.rs` отдельным `cargo build` крейта `programs/hello` (свой target-dir в OUT_DIR).
+/// Это НЕ адрес исполнения — только сырые байты; на диске они окажутся объектом store под корнем
+/// `bin/hello`, а исполнится программа уже ОТТУДА, по content-id (см. `exec_demo`, [[exec-from-store]]).
+static HELLO_ELF: &[u8] = include_bytes!(env!("HELLO_ELF"));
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -169,6 +176,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // Веха 18.1: POSIX-персоналия как сервер. Процесс-программа пользуется только POSIX-подобными
     // open/write/close/read через IPC-shim; сервер-персоналия держит namespace файлов в своей RAM.
     posix_demo();
+    println!();
+
+    // Веха 19: «программа как объект store» — exec по content-id, а не по адресу в образе ядра.
+    // Первый запуск сеет байты ELF (встроенные в ядро) в store и вешает корень bin/hello; второй —
+    // корень уже на диске, seed не участвует, ELF читается ИЗ STORE и грузится kernel/src/elf.rs.
+    exec_demo();
     println!();
 
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
@@ -427,6 +440,54 @@ fn posix_demo() {
     );
     proc::run();
     println!("  [proc] сессия персоналии завершена — обратно в ядро");
+}
+
+/// Веха 19 — «программа как объект store»: exec по content-id. Байты ELF, встроенные в ядро как
+/// СЕМЯ ([`HELLO_ELF`]), кладутся в объектный store и вешаются на корень `bin/hello` ТОЛЬКО если
+/// его ещё нет (первый запуск на чистом диске); дальше ядро — уже независимо от того, был ли
+/// сев, — читает ELF ИЗ STORE по content-id этого корня и запускает через [`proc::spawn_elf`]
+/// ([[exec-from-store]]). На втором запуске (после перезагрузки) корень уже персистентен, seed
+/// не участвует вовсе: программа исполняется тем же путём, что и любой другой объект store.
+fn exec_demo() {
+    println!("  [exec] программа как объект store — exec по content-id (Веха 19):");
+
+    let id = match object::root("bin/hello") {
+        Some(id) => {
+            println!("    ВТОРОЙ запуск: корень 'bin/hello' уже на диске — seed НЕ используется");
+            id
+        }
+        None => {
+            let id = object::put(HELLO_ELF);
+            object::set_root("bin/hello", id);
+            println!(
+                "    ПЕРВЫЙ запуск: корня 'bin/hello' не было — посеяно {} байт ELF из образа ядра",
+                HELLO_ELF.len(),
+            );
+            id
+        }
+    };
+
+    // Прочитать байты ИЗ STORE по content-id (а не взять HELLO_ELF напрямую!) — так путь
+    // одинаков для обоих запусков и не зависит от того, сработал ли seed выше. Копируем в
+    // Vec и сразу отпускаем замок store: дальше `proc::run()` крутит процесс до завершения.
+    let elf_bytes = object::with(&id, |b| b.map(|bytes| bytes.to_vec()));
+    match elf_bytes {
+        Some(bytes) => {
+            println!(
+                "    прочитано {} байт ELF из store по content-id {} — грузим",
+                bytes.len(), id_short(&id),
+            );
+            match proc::spawn_elf("hello", &bytes, 0) {
+                Ok(pid) => {
+                    println!("    P{} 'hello' запущен — вход по e_entry из ELF, не по адресу в ядре", pid);
+                    proc::run();
+                    println!("    [exec] сессия hello завершена — обратно в ядро");
+                }
+                Err(e) => println!("    [exec] ELF-загрузчик отказал: {:?}  ← exec не выполнен", e),
+            }
+        }
+        None => println!("    [exec] не удалось прочитать ELF из store по content-id (не должно случаться)"),
+    }
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).
