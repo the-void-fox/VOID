@@ -9,11 +9,11 @@ status: active
 
 ## Сейчас
 - [x] Доведено до цельного рабочего ядра: persistence по IPC (14), reply-capability (15), вытеснение (16), BLK_WRITE (17). Все дыры безопасности и «кооперативно» закрыты.
-- [ ] Веха 18: слой совместимости (POSIX-персоналия как сервер), по под-вехам:
+- [x] Веха 18: слой совместимости (POSIX-персоналия как сервер) — **закрыта**, по под-вехам:
     - [x] 18.1 — сервер-персоналия + POSIX-shim: open/write/close/read, namespace в RAM. См. [[posix-personality]].
     - [x] 18.2 — персистентность файлов через store: содержимое под корнем-именем (роты = директория), переживает перезагрузку. См. [[posix-personality]].
     - [x] 18.3 — stat/unlink/readdir, режимы open (O_APPEND/O_TRUNC), смещения на дескриптор; индекс каталога `.dir`; шлюз OBJ_DEL_ROOT (честный unlink). См. [[posix-personality]].
-    - [ ] 18.4 — программа только на POSIX-shim (libc-заглушка, mini-cat/echo).
+    - [x] 18.4 — программа `mini-sh` на чистом POSIX-shim (libc-заглушка: sh_open/read/write/close/readdir; mini-cat/echo, stdout=fd1). Программа не знает про IPC/VOID. См. [[posix-personality]].
 
 ## Скоро
 - [ ]
@@ -58,10 +58,11 @@ status: active
 - [x] **Веха 15.** reply-capability: `RECV` выдаёт одноразовый reply-cap (`Target::Reply`), `REPLY` требует его и отзывает — нельзя ответить тому, кто не звал/подделать. См. [[reply-capability]].
 - [x] **Веха 16.** Вытеснение процессов: `sie.STIE` вкл на сессию, таймерный trap из U = переключение процесса (`preempt_tick` + `next_runnable`), ядро с `SIE=0` не вытесняется. См. [[process-preemption]].
 - [x] **Веха 17.** `BLK_WRITE`: шлюз записи сектора под правом `WRITE` на устройство; блок-протокол кодирует сектор+флаг записи в `op`. Клиент пишет и читает сектор обратно через сервер. См. [[block-driver]].
-- [~] **Веха 18.** Слой совместимости — POSIX-персоналия как сервер (по под-вехам 18.1–18.4).
+- [x] **Веха 18.** Слой совместимости — POSIX-персоналия как сервер (под-вехи 18.1–18.4, **закрыта**).
     - [x] **18.1.** Сервер-персоналия + POSIX-shim: open/write/close/read, namespace в RAM сервера, без изменений ядра. См. [[posix-personality]].
     - [x] **18.2.** Персистентность файлов через store: содержимое под корнем-именем (роты хранилища = директория), переживает перезагрузку. См. [[posix-personality]].
     - [x] **18.3.** `stat`/`unlink`/`readdir`, режимы open (`O_APPEND`/`O_TRUNC`), смещения на дескриптор; персистентный индекс каталога `.dir`; шлюз ядра `OBJ_DEL_ROOT` (честный unlink — корень уходит в GC). См. [[posix-personality]].
+    - [x] **18.4.** Программа `mini-sh` на чистом POSIX-shim (libc-заглушка `sh_open/read/write/close/readdir`, `mini-cat`/`echo`, stdout=fd 1 → консоль): в теле программы ни `ecall`, ни op-кодов, ни capability — прозрачность личности. См. [[posix-personality]].
 
 ## Опционально / исследовательское
 - [ ] SASOS-эксперимент: изоляция средствами Rust вместо железных границ (см. [[0001-rust-riscv-microkernel]]).
