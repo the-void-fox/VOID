@@ -12,6 +12,11 @@
 //! Веха 20 — **интерактивность**: `SYS_READ` блокирует процесс до ввода с консоли
 //! ([[uart|кольцевой буфер UART]]), планировщик умеет спать в ожидании ввода ([`wait_stdin`]),
 //! `SYS_EXEC` запускает программу из store по имени корня (право `EXEC`) и ждёт её завершения.
+//!
+//! Веха 22 — **куча процесса и честные фолты**: `SYS_MAP` лениво резервирует диапазон
+//! [USER_HEAP_BASE_VA, heap_brk); страницы выделяются по page fault из U-mode
+//! ([`handle_user_fault`]) или доотображением перед доступом ядра в шлюзах
+//! ([`ensure_heap_range`] — фолт из S-mode фатален). Фолт вне кучи убивает ПРОЦЕСС, не ядро.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -41,6 +46,10 @@ const SATP_SV39: usize = 8 << 60;
 const USER_STACK_TOP_VA: usize = 0x8000_0000;
 const USER_STACK_PAGES: usize = 4;
 const PAGE: usize = 4096;
+/// Веха 22.1: куча процесса растёт вверх отсюда (код/данные ELF ниже, стек — выше, у
+/// 0x8000_0000). `SYS_MAP` только резервирует диапазон [heap_base, heap_brk); страницы
+/// выделяются ЛЕНИВО — по page fault ([`handle_user_fault`]).
+const USER_HEAP_BASE_VA: usize = 0x6000_0000;
 /// Начало региона VPN[2]=1 — весь тот же незанятый ядром диапазон, где живёт стек процесса, но
 /// теперь ещё и код/данные ELF-программ (Веха 19, [`spawn_elf`]). Совпадает с базой линковки
 /// `programs/*/linker.ld`; [`crate::elf::load`] отвергает сегменты ниже этого адреса.
@@ -92,6 +101,9 @@ struct Proc {
     /// `usize::MAX` — нет). Проверяется (`GRANT`) при отправке, копируется в домен получателя
     /// при доставке — как `send_buf`, только для прав.
     send_cap: usize,
+    /// Веха 22.1: ленивая куча процесса — зарезервированный `SYS_MAP` диапазон
+    /// [`USER_HEAP_BASE_VA`, heap_brk). Фолт внутри — выделить страницу; вне — гибель процесса.
+    heap_brk: usize,
 }
 
 struct Table {
@@ -172,6 +184,7 @@ fn create_process_locked(
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
     });
     t.procs.len() - 1
 }
@@ -192,10 +205,9 @@ pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
 /// заводит процесс и не трогает таблицу — вызывающий получает [`elf::ElfError`].
 pub fn spawn_elf(name: &'static str, elf_bytes: &[u8], arg: usize) -> Result<usize, elf::ElfError> {
     let root = new_address_space();
-    // Верхняя граница адресов ELF — низ приватного стека этого же адресного пространства: ниже
-    // него код/данные процесса, выше — стек (см. `new_address_space`); нельзя пересекаться.
-    let va_limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
-    let entry = elf::load(root, elf_bytes, va_limit)?;
+    // Верхняя граница адресов ELF — начало региона кучи (Веха 22): раскладка процесса —
+    // код/данные ELF ниже USER_HEAP_BASE_VA, куча над ними, стек у самого верха.
+    let entry = elf::load(root, elf_bytes, USER_HEAP_BASE_VA)?;
     Ok(create_process(name, root, entry, arg))
 }
 
@@ -301,6 +313,69 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
     }
 }
 
+/// Веха 22.2: page fault из U-mode. Фолт чтения/записи в ленивом диапазоне кучи
+/// [`USER_HEAP_BASE_VA`, heap_brk) — выделить обнулённый фрейм, замапить `U|R|W` и повторить
+/// инструкцию (sepc не двигаем). Любой другой фолт — включая исполнение кучи (W^X живёт и
+/// здесь) и исчерпание фреймов — гибель ПРОЦЕССА, а не ядра: родителю в `SYS_EXEC` уходит MAX.
+fn handle_user_fault(t: &mut Table, cur: usize, scause: usize) {
+    let va = csr::read_stval();
+    let (heap_brk, satp) = (t.procs[cur].heap_brk, t.procs[cur].satp);
+    let lazy = va >= USER_HEAP_BASE_VA && va < heap_brk && scause != csr::EXC_PF_INSN;
+    if lazy {
+        if let Some(pa) = frame::alloc() {
+            let page_va = va & !(PAGE - 1);
+            // SAFETY: satp процесса сейчас активен — после map сбрасываем TLB (sfence.vma),
+            // иначе повтор инструкции мог бы увидеть старую (пустую) трансляцию.
+            unsafe {
+                paging::map(root_of(satp), page_va, pa, paging::PTE_R | paging::PTE_W | paging::PTE_U);
+                core::arch::asm!("sfence.vma");
+            }
+            println!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
+            return; // sepc не тронут — инструкция повторится по замапленной странице
+        }
+        println!("  [mm] P{} фолт кучи {:#x}: фреймы кончились — процесс убит", cur, va);
+    } else {
+        let kind = match scause {
+            csr::EXC_PF_LOAD => "load",
+            csr::EXC_PF_STORE => "store",
+            _ => "exec",
+        };
+        println!(
+            "  [mm] P{} page fault ({}) @ {:#x} вне кучи — процесс убит (ядро живо)",
+            cur, kind, va,
+        );
+    }
+    t.procs[cur].state = State::Finished;
+    wake_exec_waiters(t, cur, usize::MAX);
+    if let Some(n) = t.next_runnable(cur) {
+        t.current = n;
+    }
+}
+
+/// Веха 22.2: доотобразить ленивые страницы кучи ПЕРЕД тем, как ядро само тронет буфер
+/// процесса в шлюзе (`OBJ_GET`/`OBJ_PUT`): фолт из S-mode мы не переживаем (fatal), поэтому
+/// «ленивость» для ядра снимается заранее. Буферы вне кучи (стек, данные ELF) замаплены и так.
+/// `false` — диапазон в куче, но фреймы кончились (шлюзу следует отказать).
+fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
+    if len == 0 || va < USER_HEAP_BASE_VA || va.saturating_add(len) > t.procs[pid].heap_brk {
+        return true; // не куча — обычные (уже отображённые) страницы
+    }
+    let root = root_of(t.procs[pid].satp);
+    let mut page = va & !(PAGE - 1);
+    while page < va + len {
+        if paging::translate(root, page).is_none() {
+            let Some(pa) = frame::alloc() else { return false };
+            unsafe {
+                paging::map(root, page, pa, paging::PTE_R | paging::PTE_W | paging::PTE_U);
+                core::arch::asm!("sfence.vma");
+            }
+            println!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
+        }
+        page += PAGE;
+    }
+    true
+}
+
 /// Лончер: возобновить текущий (первый) процесс.
 extern "C" fn proc_enter() -> ! {
     let (frame, satp) = {
@@ -321,6 +396,12 @@ pub fn handle_user_trap(frame: &mut TrapFrame, scause: usize) -> ! {
         t.procs[cur].frame = *frame; // сохранить состояние текущего процесса
         if scause == csr::EXC_ECALL_FROM_U {
             syscall(&mut t, cur);
+        } else if scause == csr::EXC_PF_LOAD
+            || scause == csr::EXC_PF_STORE
+            || scause == csr::EXC_PF_INSN
+        {
+            // Веха 22.2: page fault из U-mode — ленивая страница кучи или гибель процесса.
+            handle_user_fault(&mut t, cur, scause);
         } else if scause == csr::INTERRUPT_BIT | csr::IRQ_S_TIMER {
             // Вытеснение по таймеру: перевзвести и уступить следующему готовому. Текущий остаётся
             // Runnable, его кадр уже сохранён; sepc НЕ двигаем — продолжит с прерванного места.
@@ -609,7 +690,8 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
-                Ok(()) => {
+                // Веха 22.2: буфер может лежать в ленивой куче — доотобразить до чтения ядром.
+                Ok(()) if ensure_heap_range(t, cur, buf, len) => {
                     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
                     let id = crate::object::put(bytes);
                     let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
@@ -617,6 +699,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     println!("  [obj] P{} OBJ_PUT {} байт → content-id (по cap)", cur, len);
                     0
                 }
+                Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
                     println!("  [obj] P{} OBJ_PUT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
@@ -635,7 +718,9 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
-                Ok(()) => {
+                // Веха 22.2: приёмный буфер может лежать в ленивой куче — доотобразить до
+                // записи ядром (весь ocap: лениво он выделился бы всё равно при чтении).
+                Ok(()) if ensure_heap_range(t, cur, obuf, ocap) => {
                     let mut id = [0u8; 32];
                     let src = unsafe { core::slice::from_raw_parts(idp as *const u8, 32) };
                     id.copy_from_slice(src);
@@ -651,6 +736,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     println!("  [obj] P{} OBJ_GET → {} байт (по cap)", cur, n);
                     n
                 }
+                Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
                     println!("  [obj] P{} OBJ_GET отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
@@ -793,6 +879,30 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = result;
             f.sepc += 4;
         }
+        // SYS_MAP(len) -> VA | MAX (Веха 22.1): зарезервировать len байт кучи ЛЕНИВО — ни один
+        // фрейм не выделяется сейчас; страницы придут по page fault ([`handle_user_fault`]) или
+        // доотображением под шлюз ([`ensure_heap_range`]). Куча растёт вверх от
+        // USER_HEAP_BASE_VA и не смеет дорасти до стека. Без capability: память — свой ресурс
+        // процесса (квоты — отдельная история).
+        17 => {
+            let len = t.procs[cur].frame.regs[10];
+            let start = t.procs[cur].heap_brk;
+            let end = start.saturating_add(len.div_ceil(PAGE) * PAGE);
+            let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+            let result = if len == 0 || end > limit {
+                usize::MAX
+            } else {
+                t.procs[cur].heap_brk = end;
+                println!(
+                    "  [mm] P{} SYS_MAP {} байт → {:#x}..{:#x} (лениво, 0 фреймов)",
+                    cur, len, start, end,
+                );
+                start
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
         // SYS_CAP_DERIVE(cap, mask) -> новый дескриптор / MAX (Веха 21.1): урезанная копия
         // СВОЕГО права в СВОЁМ домене (права ∩ mask). GRANT не нужен — сужать то, чем владеешь,
         // безопасно всегда; передавать другим (CALL/REPLY с cap) — вот что требует GRANT.
@@ -871,8 +981,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         match elf_bytes {
                             Some(bytes) => {
                                 let root = new_address_space();
-                                let va_limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
-                                match elf::load(root, &bytes, va_limit) {
+                                match elf::load(root, &bytes, USER_HEAP_BASE_VA) {
                                     Ok(entry) => {
                                         // Имя процесса обязано жить дольше таблицы — утекает
                                         // (запусков за сессию единицы, приемлемо до Вехи 22).

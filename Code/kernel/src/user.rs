@@ -16,7 +16,8 @@
 //!   13 = OBJ_DEL_ROOT(store_cap,name,name_len) -> 0/1/MAX  (Веха 18.3: unlink),
 //!   14 = READ(buf,cap) -> n  (stdin консоли; блокируется до ввода — Веха 20.2),
 //!   15 = EXEC(store_cap,name,name_len) -> код выхода/MAX  (запуск из store, право EXEC — Веха 20.3),
-//!   16 = CAP_DERIVE(cap,mask) -> дескриптор/MAX  (урезанная копия своего права — Веха 21.1).
+//!   16 = CAP_DERIVE(cap,mask) -> дескриптор/MAX  (урезанная копия своего права — Веха 21.1),
+//!   17 = MAP(len) -> VA/MAX  (ленивая куча процесса; страницы — по page fault — Веха 22.1).
 //!
 //! Веха 12: **capability-защищённые эндпоинты** (драйвер-сервер + клиент через IPC).
 //! Веха 13: **сервер объектного store** — процесс с cap на store отдаёт put/get объектов по IPC
@@ -59,9 +60,11 @@ const PX_UNLINK: usize = 5; // Веха 18.3: unlink(name) — снять кор
 const PX_READDIR: usize = 6; // Веха 18.3: readdir() -> имена через '\n'
 const O_APPEND: usize = 1 << 0; // Веха 18.3: открыть с курсором в конце
 const O_TRUNC: usize = 1 << 1; // Веха 18.3: открыть, обнулив содержимое
-const PX_NFILES: usize = 4; // namespace фикс. размера (у процессов нет кучи — всё на стеке)
-const PX_NAME_MAX: usize = 16;
-const PX_DATA_MAX: usize = 256;
+// Веха 22.3: лимиты сняты кучей (SYS_MAP) — было 4 файла × 256 байт на стеке сервера.
+// Данные файлов теперь в ленивой куче: страницы выделяются по мере реальной записи.
+const PX_NFILES: usize = 16;
+const PX_NAME_MAX: usize = 32;
+const PX_DATA_MAX: usize = 4096;
 // Индекс каталога (для readdir/unlink): персистится под спец-корнем ".dir" — формат
 // count(1) | [nlen(1) | name]* . Роты-файлы ядро перечислять не даёт, поэтому список имён ведём сами.
 static DIRROOT: [u8; b".dir".len()] = *b".dir";
@@ -424,21 +427,28 @@ unsafe fn dir_persist(store_cap: usize, dir: *const u8, dir_len: usize, idb: usi
 /// директория: `open(name)` = `get_root(name)` → есть? загрузить (`OBJ_GET`) : создать. Привязка к
 /// корню и переживает GC ядра (достижимо от корня), и перезагрузку.
 #[link_section = ".user"]
+#[allow(unused_unsafe)]
 extern "C" fn posix_server(store_cap: usize) -> ! {
-    // Namespace на стеке: имена, данные, метаданные.
+    unsafe {
+    // Веха 22.3: ВСЁ состояние сервера, кроме имён, — в его ленивой куче (SYS_MAP): данные
+    // файлов (16 × 4 КиБ), скретч для stat и метаданные. Куча приходит ОБНУЛЁННОЙ (свежие
+    // фреймы ядра) — инициализация не нужна вовсе. Это не только лимиты снимает, но и
+    // обходит ограничение `.user`: zero-init массивов на стеке компилятор превращает в
+    // вызов memset из .text ядра, а страницы ядра из U-mode не исполняются (exec-фолт).
     let mut names = MaybeUninit::<[[u8; PX_NAME_MAX]; PX_NFILES]>::uninit();
-    let mut datas = MaybeUninit::<[[u8; PX_DATA_MAX]; PX_NFILES]>::uninit();
     let names_ptr = names.as_mut_ptr() as *mut u8;
-    let datas_ptr = datas.as_mut_ptr() as *mut u8;
-    let mut name_len = [0usize; PX_NFILES];
-    let mut size = [0usize; PX_NFILES];
-    let mut fused = [false; PX_NFILES];
-    let mut dirty = [false; PX_NFILES]; // изменён с последней записи в store
-    // Дескрипторы: fd → (файл, смещение). Смещение — СВОЁ на каждый дескриптор: два open одного
-    // файла дают два независимых курсора (Веха 18.3).
-    let mut fd_file = [0usize; PX_NFILES];
-    let mut fd_off = [0usize; PX_NFILES];
-    let mut fd_used = [false; PX_NFILES];
+    let heap = unsafe { sys_map((PX_NFILES + 1) * PX_DATA_MAX + PX_DATA_MAX) };
+    let datas_ptr = heap as *mut u8;
+    let scratch = heap + PX_NFILES * PX_DATA_MAX; // OBJ_GET при stat (только узнать длину)
+    // Метаданные — в последней странице кучи (нули = «пусто»): usize-таблицы и u8-флаги.
+    let meta = heap + (PX_NFILES + 1) * PX_DATA_MAX;
+    let name_len = meta as *mut usize; //  [usize; 16] — длина имени файла
+    let size = (meta + 128) as *mut usize; //     [usize; 16] — размер файла
+    let fd_file = (meta + 256) as *mut usize; //  [usize; 16] — fd → файл
+    let fd_off = (meta + 384) as *mut usize; //   [usize; 16] — fd → смещение (курсор)
+    let fused = (meta + 512) as *mut u8; //  [u8; 16] — слот файла занят (1/0)
+    let dirty = (meta + 528) as *mut u8; //  [u8; 16] — изменён с последней записи в store
+    let fd_used = (meta + 544) as *mut u8; // [u8; 16] — дескриптор занят (1/0)
 
     // Веха 18.3: индекс каталога (readdir) — в RAM в персистентном виде, спец-корень ".dir".
     let mut dir = MaybeUninit::<[u8; PX_DATA_MAX]>::uninit();
@@ -489,7 +499,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
             let mut fidx = usize::MAX;
             let mut i = 0;
             while i < PX_NFILES {
-                if fused[i] && name_len[i] == len {
+                if (*fused.add(i)) != 0 && (*name_len.add(i)) == len {
                     let mut eq = true;
                     let mut k = 0;
                     while k < len {
@@ -512,17 +522,17 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                 // Не в RAM — занять свободный слот и попробовать поднять из store, иначе создать.
                 let mut j = 0;
                 while j < PX_NFILES {
-                    if !fused[j] {
+                    if (*fused.add(j)) == 0 {
                         fidx = j;
                         break;
                     }
                     j += 1;
                 }
                 if fidx != usize::MAX {
-                    fused[fidx] = true;
-                    dirty[fidx] = false;
+                    (*fused.add(fidx)) = 1;
+                    (*dirty.add(fidx)) = 0;
                     let nl = if len > PX_NAME_MAX { PX_NAME_MAX } else { len };
-                    name_len[fidx] = nl;
+                    (*name_len.add(fidx)) = nl;
                     let mut k = 0;
                     while k < nl {
                         unsafe { *names_ptr.add(fidx * PX_NAME_MAX + k) = *(rptr as *const u8).add(k) };
@@ -540,7 +550,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                         unsafe {
                             asm!("ecall", in("a7") 9usize, inout("a0") store_cap => sz, in("a1") idptr, in("a2") dbuf, in("a3") PX_DATA_MAX, options(nostack));
                         }
-                        size[fidx] = sz;
+                        (*size.add(fidx)) = sz;
                         // Веха 18.3: персистентный файл (в т.ч. привязанный к корню ДО появления
                         // индекса каталога, как hello.txt из 18.2) — занести в индекс, чтобы его
                         // видел readdir.
@@ -551,7 +561,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                             }
                         }
                     } else {
-                        size[fidx] = 0; // новый файл
+                        (*size.add(fidx)) = 0; // новый файл
                     }
                 }
             }
@@ -559,61 +569,61 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
             if fidx != usize::MAX {
                 // Веха 18.3: O_TRUNC обнуляет содержимое (пометив изменённым — перезапишется на close).
                 if mode & O_TRUNC != 0 {
-                    size[fidx] = 0;
-                    dirty[fidx] = true;
+                    (*size.add(fidx)) = 0;
+                    (*dirty.add(fidx)) = 1;
                 }
                 let mut d = 0;
                 while d < PX_NFILES {
-                    if !fd_used[d] {
+                    if (*fd_used.add(d)) == 0 {
                         nfd = d;
                         break;
                     }
                     d += 1;
                 }
                 if nfd != usize::MAX {
-                    fd_used[nfd] = true;
-                    fd_file[nfd] = fidx;
+                    (*fd_used.add(nfd)) = 1;
+                    (*fd_file.add(nfd)) = fidx;
                     // O_APPEND ставит курсор в конец, иначе — в начало.
-                    fd_off[nfd] = if mode & O_APPEND != 0 { size[fidx] } else { 0 };
+                    (*fd_off.add(nfd)) = if mode & O_APPEND != 0 { *size.add(fidx) } else { 0 };
                 }
             }
             unsafe { *(pptr as *mut u8) = if nfd == usize::MAX { 0xff } else { nfd as u8 } };
             reply_len = 1;
         } else if opcode == PX_WRITE {
             // req[..len] — данные; дописать в файл дескриптора со смещения fd_off.
-            if fd < PX_NFILES && fd_used[fd] {
-                let fi = fd_file[fd];
-                let mut w = fd_off[fd];
+            if fd < PX_NFILES && (*fd_used.add(fd)) != 0 {
+                let fi = *fd_file.add(fd);
+                let mut w = *fd_off.add(fd);
                 let mut k = 0;
                 while k < len && w < PX_DATA_MAX {
                     unsafe { *datas_ptr.add(fi * PX_DATA_MAX + w) = *(rptr as *const u8).add(k) };
                     w += 1;
                     k += 1;
                 }
-                fd_off[fd] = w;
-                if w > size[fi] {
-                    size[fi] = w;
+                (*fd_off.add(fd)) = w;
+                if w > (*size.add(fi)) {
+                    (*size.add(fi)) = w;
                 }
-                dirty[fi] = true; // Веха 18.2: пометить для записи в store при close
+                (*dirty.add(fi)) = 1; // Веха 18.2: пометить для записи в store при close
             }
         } else if opcode == PX_READ {
             // Прочитать из файла со смещения до конца (клиент ограничит своим recv_cap).
-            if fd < PX_NFILES && fd_used[fd] {
-                let fi = fd_file[fd];
-                let mut r = fd_off[fd];
-                while r < size[fi] && reply_len < 512 {
+            if fd < PX_NFILES && (*fd_used.add(fd)) != 0 {
+                let fi = *fd_file.add(fd);
+                let mut r = *fd_off.add(fd);
+                while r < (*size.add(fi)) && reply_len < 512 {
                     unsafe { *(pptr as *mut u8).add(reply_len) = *datas_ptr.add(fi * PX_DATA_MAX + r) };
                     r += 1;
                     reply_len += 1;
                 }
-                fd_off[fd] = r;
+                (*fd_off.add(fd)) = r;
             }
         } else if opcode == PX_STAT {
             // req[..len] — имя. Вернуть [exists:1 | size:4 LE]. Ищем в RAM, затем среди корней.
             let mut sz = usize::MAX;
             let mut i = 0;
             while i < PX_NFILES {
-                if fused[i] && name_len[i] == len {
+                if (*fused.add(i)) != 0 && (*name_len.add(i)) == len {
                     let mut eq = true;
                     let mut k = 0;
                     while k < len {
@@ -626,7 +636,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                         k += 1;
                     }
                     if eq {
-                        sz = size[i];
+                        sz = *size.add(i);
                         break;
                     }
                 }
@@ -639,9 +649,11 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                     asm!("ecall", in("a7") 11usize, inout("a0") store_cap => gn, in("a1") rptr, in("a2") len, in("a3") idptr, options(nostack));
                 }
                 if gn == 32 {
+                    // Веха 22.3: содержимое читаем в СКРЕТЧ кучи, не в 512-байтный буфер
+                    // ответа — файл до PX_DATA_MAX (4 КиБ) переполнил бы его.
                     let n: usize;
                     unsafe {
-                        asm!("ecall", in("a7") 9usize, inout("a0") store_cap => n, in("a1") idptr, in("a2") pptr + 8, in("a3") PX_DATA_MAX, options(nostack));
+                        asm!("ecall", in("a7") 9usize, inout("a0") store_cap => n, in("a1") idptr, in("a2") scratch, in("a3") PX_DATA_MAX, options(nostack));
                     }
                     sz = n;
                 }
@@ -660,7 +672,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
             // req[..len] — имя. Убрать из RAM namespace, снять корень (OBJ_DEL_ROOT) и из каталога.
             let mut i = 0;
             while i < PX_NFILES {
-                if fused[i] && name_len[i] == len {
+                if (*fused.add(i)) != 0 && (*name_len.add(i)) == len {
                     let mut eq = true;
                     let mut k = 0;
                     while k < len {
@@ -673,12 +685,12 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
                         k += 1;
                     }
                     if eq {
-                        fused[i] = false;
+                        (*fused.add(i)) = 0;
                         // закрыть висящие дескрипторы на удаляемый файл
                         let mut d = 0;
                         while d < PX_NFILES {
-                            if fd_used[d] && fd_file[d] == i {
-                                fd_used[d] = false;
+                            if (*fd_used.add(d)) != 0 && (*fd_file.add(d)) == i {
+                                (*fd_used.add(d)) = 0;
                             }
                             d += 1;
                         }
@@ -722,23 +734,23 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
             // PX_CLOSE — если файл менялся, записать содержимое в store, привязать к корню-имени и
             // занести имя в индекс каталога (Веха 18.2/18.3: переживёт GC/перезагрузку, виден в
             // readdir). Затем освободить дескриптор.
-            if fd < PX_NFILES && fd_used[fd] {
-                let fi = fd_file[fd];
-                if dirty[fi] {
+            if fd < PX_NFILES && (*fd_used.add(fd)) != 0 {
+                let fi = *fd_file.add(fd);
+                if (*dirty.add(fi)) != 0 {
                     let dbuf = datas_ptr as usize + fi * PX_DATA_MAX;
                     let nptr = names_ptr as usize + fi * PX_NAME_MAX;
                     unsafe {
                         // OBJ_PUT(content) -> id; OBJ_SET_ROOT(name, id)
-                        asm!("ecall", in("a7") 8usize, inout("a0") store_cap => _, in("a1") dbuf, in("a2") size[fi], in("a3") idptr, options(nostack));
-                        asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") nptr, in("a2") name_len[fi], in("a3") idptr, options(nostack));
+                        asm!("ecall", in("a7") 8usize, inout("a0") store_cap => _, in("a1") dbuf, in("a2") (*size.add(fi)), in("a3") idptr, options(nostack));
+                        asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") nptr, in("a2") (*name_len.add(fi)), in("a3") idptr, options(nostack));
                         // Веха 18.3: имя файла — в индекс каталога (idempotent) и переписать ".dir".
-                        if dir_add(dir_ptr, &mut dir_len, nptr as *const u8, name_len[fi]) {
+                        if dir_add(dir_ptr, &mut dir_len, nptr as *const u8, *name_len.add(fi)) {
                             dir_persist(store_cap, dir_ptr, dir_len, idptr);
                         }
                     }
-                    dirty[fi] = false;
+                    (*dirty.add(fi)) = 0;
                 }
-                fd_used[fd] = false;
+                (*fd_used.add(fd)) = 0;
             }
         }
 
@@ -747,6 +759,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
             asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") pptr, in("a2") reply_len, in("a3") usize::MAX, options(nostack));
         }
     }
+    } // конец unsafe-обёртки тела (метаданные — сырые указатели в кучу, Веха 22.3)
 }
 
 // ── Веха 18.4: POSIX-shim (libc-заглушка) ──
@@ -884,6 +897,72 @@ extern "C" fn mini_sh(ep: usize) -> ! {
         let n = sh_readdir(ep, bp, 512);
         sh_write(ep, STDOUT, bp, n);
         sh_exit(0);
+    }
+}
+
+// ── Веха 22: куча процесса (SYS_MAP, ленивые страницы) и честные фолты ──
+static MM_OK: [u8; b"[heap] 4 lazy pages: written, verified, rest is zeroed - OK\n".len()] =
+    *b"[heap] 4 lazy pages: written, verified, rest is zeroed - OK\n";
+static MM_FAIL: [u8; b"[heap] heap verification FAILED\n".len()] =
+    *b"[heap] heap verification FAILED\n";
+static MM_CRASH: [u8; b"[crash] dereferencing 0x75000000 (unmapped, outside heap)...\n".len()] =
+    *b"[crash] dereferencing 0x75000000 (unmapped, outside heap)...\n";
+
+/// `sys_map(len) -> VA` (роль mmap/sbrk): попросить у ядра len байт кучи. Диапазон ленивый —
+/// физические страницы придут по мере первых обращений (page fault, Веха 22.2).
+#[link_section = ".user"]
+unsafe fn sys_map(len: usize) -> usize {
+    let va: usize;
+    asm!("ecall", in("a7") 17usize, inout("a0") len => va, options(nostack));
+    va
+}
+
+/// Процесс-**демо кучи** (Веха 22): маппит 4 страницы, пишет байт в КАЖДУЮ (каждая запись —
+/// ленивый фолт → ядро выделяет страницу на лету), проверяет написанное и то, что остальное
+/// обнулено (фреймы приходят чистыми). Никакого преаллоцирования — 0 фреймов до первой записи.
+#[link_section = ".user"]
+extern "C" fn heap_user(_arg: usize) -> ! {
+    unsafe {
+        let base = sys_map(4 * 4096);
+        if base == usize::MAX {
+            sh_exit(1);
+        }
+        let p = base as *mut u8;
+        let mut i = 0usize;
+        while i < 4 {
+            *p.add(i * 4096 + i) = 0xA0 + i as u8; // разные страницы — 4 ленивых фолта
+            i += 1;
+        }
+        let mut ok = true;
+        i = 0;
+        while i < 4 {
+            if *p.add(i * 4096 + i) != 0xA0 + i as u8 {
+                ok = false; // записанное читается
+            }
+            if *p.add(i * 4096 + 100) != 0 {
+                ok = false; // нетронутый хвост страницы — нули (свежий фрейм)
+            }
+            i += 1;
+        }
+        if ok {
+            asm!("ecall", in("a7") 1usize, inout("a0") MM_OK.as_ptr() as usize => _, in("a1") MM_OK.len(), options(nostack));
+        } else {
+            asm!("ecall", in("a7") 1usize, inout("a0") MM_FAIL.as_ptr() as usize => _, in("a1") MM_FAIL.len(), options(nostack));
+        }
+        sh_exit(0);
+    }
+}
+
+/// Процесс-**демо гибели** (Веха 22.2): честно предупреждает и лезет по немапленному адресу
+/// вне кучи. Ядро убивает ЕГО, а не паникует само — остальная система живёт дальше.
+#[link_section = ".user"]
+extern "C" fn crash_user(_arg: usize) -> ! {
+    unsafe {
+        asm!("ecall", in("a7") 1usize, inout("a0") MM_CRASH.as_ptr() as usize => _, in("a1") MM_CRASH.len(), options(nostack));
+        // Прямая запись сырым указателем: НЕ write_volatile — в debug-сборке это вызов
+        // функции ядра вне `.user`, и упали бы на exec-фолте раньше, чем на честном store.
+        *(0x7500_0000 as *mut u8) = 1; // ← store page fault, процесс убит
+        sh_exit(0); // не достигается
     }
 }
 
@@ -1123,6 +1202,12 @@ pub fn cap_server_entry() -> usize {
 }
 pub fn cap_client_entry() -> usize {
     cap_client as *const () as usize
+}
+pub fn heap_user_entry() -> usize {
+    heap_user as *const () as usize
+}
+pub fn crash_user_entry() -> usize {
+    crash_user as *const () as usize
 }
 pub fn label_a() -> usize {
     LBL_A.as_ptr() as usize

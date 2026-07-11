@@ -30,6 +30,12 @@ pub const IRQ_S_EXTERNAL: usize = 9;
 pub const EXC_BREAKPOINT: usize = 3;
 /// Исключение «environment call from U-mode» — системный вызов из пользовательского режима.
 pub const EXC_ECALL_FROM_U: usize = 8;
+/// Page fault на исполнении инструкции (Веха 22: кучу не исполняют — гибель процесса).
+pub const EXC_PF_INSN: usize = 12;
+/// Page fault на чтении (Веха 22: в ленивой куче — выделить страницу, иначе гибель процесса).
+pub const EXC_PF_LOAD: usize = 13;
+/// Page fault на записи (Веха 22: как load).
+pub const EXC_PF_STORE: usize = 15;
 
 // ─── Чтение/запись CSR ──────────────────────────────────────────────────────
 

@@ -17,6 +17,7 @@
 //! Веха 19: программа как объект store — exec по content-id (Фаза 3, [[exec-from-store]]).
 //! Веха 20: интерактивность — ввод UART по прерыванию, SYS_READ/SYS_EXEC, shell `vsh`.
 //! Веха 21: capability по IPC (grant-в-сообщении, CAP_DERIVE) + персистентный c-space (.cspace).
+//! Веха 22: куча процесса (SYS_MAP, ленивые страницы) + честные user page fault (гибнет процесс).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -81,8 +82,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 21                           ║");
-    println!("  ║  capability по IPC · c-space в store      ║");
+    println!("  ║  VOID — Веха 22                           ║");
+    println!("  ║  куча процесса · честные page fault       ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -197,8 +198,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     preempt_demo();
     println!();
 
+    // Веха 22: куча процесса и честные фолты. Программа heap маппит 4 страницы лениво (0 фреймов
+    // до первой записи), программа crash лезет по немапленному адресу — гибнет ОНА, а не ядро.
+    mm_demo();
+    println!();
+
     // Веха 18.1: POSIX-персоналия как сервер. Процесс-программа пользуется только POSIX-подобными
-    // open/write/close/read через IPC-shim; сервер-персоналия держит namespace файлов в своей RAM.
+    // open/write/close/read через IPC-shim; сервер-персоналия держит namespace файлов в своей RAM
+    // (с Вехи 22.3 данные файлов — в его ленивой куче: 16 файлов × 4 КиБ вместо 4 × 256 байт).
     posix_demo();
     println!();
 
@@ -242,6 +249,19 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
         unsafe { core::arch::asm!("wfi") }
     }
+}
+
+/// Веха 22: куча процесса + честные фолты. `heap` просит 4 страницы через SYS_MAP — ядро НЕ
+/// выделяет ни одного фрейма (ленивый резерв); каждая первая запись в страницу даёт page fault,
+/// по которому ядро выделяет обнулённый фрейм и повторяет инструкцию. `crash` обращается по
+/// немапленному адресу вне кучи — ядро убивает ЕГО (родителю в SYS_EXEC ушёл бы MAX), а само
+/// живёт дальше: раньше такой фолт валил всю систему «неожиданным trap'ом».
+fn mm_demo() {
+    println!("  [mm] куча процесса (SYS_MAP, ленивые страницы) + честные фолты (Веха 22):");
+    proc::spawn("heap", user::heap_user_entry(), 0);
+    proc::spawn("crash", user::crash_user_entry(), 0);
+    proc::run();
+    println!("  [mm] сессия памяти завершена: crash убит, ядро и остальные живы");
 }
 
 /// Веха 21: cap-transfer по IPC + персистентный c-space. Сервер-раздатчик держит cap на store
