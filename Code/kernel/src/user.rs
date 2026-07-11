@@ -2,18 +2,21 @@
 //! `U|R|X`, см. [[user-mode]]) и общаются с ядром/друг с другом только через `ecall`.
 //! Планирование, адресные пространства и IPC — в [`crate::proc`].
 //!
-//! Соглашение syscall'ов (ABI): номер в `a7`, аргументы в `a0..`, результат в `a0`.
+//! Соглашение syscall'ов (ABI v1 — Веха 21: IPC несёт capability). Номер в `a7`,
+//! аргументы в `a0..`, результат в `a0`.
 //!   1 = WRITE(ptr,len), 2 = EXIT(code),
-//!   4 = RECV(recv_buf,recv_cap) -> (a0=op, a1=from, a2=len),
-//!   5 = CALL(ep_cap,op,send_buf,send_len,recv_buf,recv_cap) -> a0=байт ответа,
-//!   6 = REPLY(reply_cap,src_buf,len), 7 = BLK_READ(dev_cap,sector,buf),
+//!   4 = RECV(recv_buf,recv_cap) -> (a0=op, a1=from, a2=len, a3=принятое право|MAX),
+//!   5 = CALL(ep_cap,op,send_buf,send_len,recv_buf,recv_cap,a6=право|MAX)
+//!       -> (a0=байт ответа|MAX, a1=право из ответа|MAX)  — на передаваемое право нужен GRANT,
+//!   6 = REPLY(reply_cap,src_buf,len,a3=право|MAX), 7 = BLK_READ(dev_cap,sector,buf),
 //!   8 = OBJ_PUT(store_cap,buf,len,id_out) -> 0/MAX, 9 = OBJ_GET(store_cap,id_ptr,out,cap) -> len,
 //!   10 = OBJ_SET_ROOT(store_cap,name,name_len,id_ptr) -> 0/MAX,
 //!   11 = OBJ_GET_ROOT(store_cap,name,name_len,id_out) -> 32/0/MAX,
 //!   12 = BLK_WRITE(dev_cap,sector,buf,len) -> 0/MAX,
 //!   13 = OBJ_DEL_ROOT(store_cap,name,name_len) -> 0/1/MAX  (Веха 18.3: unlink),
 //!   14 = READ(buf,cap) -> n  (stdin консоли; блокируется до ввода — Веха 20.2),
-//!   15 = EXEC(store_cap,name,name_len) -> код выхода/MAX  (запуск из store, право EXEC — Веха 20.3).
+//!   15 = EXEC(store_cap,name,name_len) -> код выхода/MAX  (запуск из store, право EXEC — Веха 20.3),
+//!   16 = CAP_DERIVE(cap,mask) -> дескриптор/MAX  (урезанная копия своего права — Веха 21.1).
 //!
 //! Веха 12: **capability-защищённые эндпоинты** (драйвер-сервер + клиент через IPC).
 //! Веха 13: **сервер объектного store** — процесс с cap на store отдаёт put/get объектов по IPC
@@ -109,20 +112,20 @@ extern "C" fn blk_server(dev_cap: usize) -> ! {
         let len: usize;
         unsafe {
             // SYS_RECV(req, 512) -> a0=op (сектор | флаг записи), a1=from, a2=len (данные в req)
-            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, options(nostack));
+            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, out("a3") _, options(nostack));
         }
         let sector = op & 0xffff_ffff; // младшие биты op = номер сектора
         if op & BLK_WRITE_FLAG == 0 {
             unsafe {
                 // READ: BLK_READ(dev_cap, sector, buf); REPLY(from, buf, 512)
                 asm!("ecall", in("a7") 7usize, inout("a0") dev_cap => _, in("a1") sector, in("a2") bptr, options(nostack));
-                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 512usize, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 512usize, in("a3") usize::MAX, options(nostack));
             }
         } else {
             unsafe {
                 // WRITE: BLK_WRITE(dev_cap, sector, req, len); REPLY(from, ack=0)
                 asm!("ecall", in("a7") 12usize, inout("a0") dev_cap => _, in("a1") sector, in("a2") rptr, in("a3") len, options(nostack));
-                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 0usize, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") bptr, in("a2") 0usize, in("a3") usize::MAX, options(nostack));
             }
         }
     }
@@ -141,11 +144,12 @@ extern "C" fn blk_client(ep_cap: usize) -> ! {
             "ecall",
             in("a7") 5usize,
             inout("a0") ep_cap => _,
-            in("a1") 0usize,   // op = номер сектора 0
+            inout("a1") 0usize => _, // op = номер сектора 0 (возврат: право из ответа — не ждём)
             in("a2") 0usize,   // send_buf: нагрузки нет
             in("a3") 0usize,   // send_len = 0
             in("a4") bptr,     // recv_buf для ответа
             in("a5") 512usize, // recv_cap
+            in("a6") usize::MAX, // право в сообщении не передаём (Веха 21)
             options(nostack),
         );
         // Напечатать: префикс + первые 6 байт сектора (магия "VOIDFS") + перевод строки.
@@ -155,9 +159,9 @@ extern "C" fn blk_client(ep_cap: usize) -> ! {
 
         // Веха 17: ЗАПИСЬ сектора TEST через сервер (op = сектор | флаг записи). Данные = PATTERN;
         // ядро читает её из .rodata при копировании запроса, сам процесс её не трогает.
-        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, in("a1") (BLK_TEST_SECTOR | BLK_WRITE_FLAG), in("a2") PATTERN.as_ptr() as usize, in("a3") PATTERN.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, inout("a1") (BLK_TEST_SECTOR | BLK_WRITE_FLAG) => _, in("a2") PATTERN.as_ptr() as usize, in("a3") PATTERN.len(), in("a4") 0usize, in("a5") 0usize, in("a6") usize::MAX, options(nostack));
         // Прочитать тот же сектор ОБРАТНО и напечатать — доказательство записи.
-        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, in("a1") BLK_TEST_SECTOR, in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, inout("a1") BLK_TEST_SECTOR => _, in("a2") 0usize, in("a3") 0usize, in("a4") bptr, in("a5") 512usize, in("a6") usize::MAX, options(nostack));
         asm!("ecall", in("a7") 1usize, inout("a0") WPREFIX.as_ptr() as usize => _, in("a1") WPREFIX.len(), options(nostack));
         asm!("ecall", in("a7") 1usize, inout("a0") bptr => _, in("a1") PATTERN.len(), options(nostack));
         asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
@@ -170,7 +174,7 @@ extern "C" fn blk_client(ep_cap: usize) -> ! {
         }
         // Веха 15: попытка подделать REPLY эндпоинт-cap'ом (не reply-cap) → отказ ядра.
         let rforge: usize;
-        asm!("ecall", in("a7") 6usize, inout("a0") ep_cap => rforge, in("a1") bptr, in("a2") 8usize, options(nostack));
+        asm!("ecall", in("a7") 6usize, inout("a0") ep_cap => rforge, in("a1") bptr, in("a2") 8usize, in("a3") usize::MAX, options(nostack));
         if rforge != 0 {
             asm!("ecall", in("a7") 1usize, inout("a0") RFORGE.as_ptr() as usize => _, in("a1") RFORGE.len(), options(nostack));
         }
@@ -197,33 +201,33 @@ extern "C" fn store_server(store_cap: usize) -> ! {
         let len: usize;
         unsafe {
             // SYS_RECV(req, 512) -> a0=op, a1=from, a2=len (нагрузка уже в req)
-            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, options(nostack));
+            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, out("a3") _, options(nostack));
         }
         if op == OP_PUT {
             unsafe {
                 // OBJ_PUT(store_cap, req, len, id) → content-id в id; затем REPLY(from, id, 32)
                 asm!("ecall", in("a7") 8usize, inout("a0") store_cap => _, in("a1") rptr, in("a2") len, in("a3") iptr, options(nostack));
-                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") iptr, in("a2") 32usize, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") iptr, in("a2") 32usize, in("a3") usize::MAX, options(nostack));
             }
         } else if op == OP_GET {
             let vlen: usize;
             unsafe {
                 // OBJ_GET(store_cap, id=req, val, 512) → длина; затем REPLY(from, val, длина)
                 asm!("ecall", in("a7") 9usize, inout("a0") store_cap => vlen, in("a1") rptr, in("a2") vptr, in("a3") 512usize, options(nostack));
-                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") vptr, in("a2") vlen, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") vptr, in("a2") vlen, in("a3") usize::MAX, options(nostack));
             }
         } else if op == OP_SET_ROOT {
             // req = [id(32) | name(len-32)]. OBJ_SET_ROOT(store_cap, name=req+32, len-32, id=req).
             unsafe {
                 asm!("ecall", in("a7") 10usize, inout("a0") store_cap => _, in("a1") rptr + 32, in("a2") len - 32, in("a3") rptr, options(nostack));
-                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") rptr, in("a2") 0usize, options(nostack)); // ack
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") rptr, in("a2") 0usize, in("a3") usize::MAX, options(nostack)); // ack
             }
         } else {
             // OP_GET_ROOT: req = name(len). OBJ_GET_ROOT(store_cap, req, len, id) → n (32/0).
             let n: usize;
             unsafe {
                 asm!("ecall", in("a7") 11usize, inout("a0") store_cap => n, in("a1") rptr, in("a2") len, in("a3") iptr, options(nostack));
-                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") iptr, in("a2") n, options(nostack));
+                asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") iptr, in("a2") n, in("a3") usize::MAX, options(nostack));
             }
         }
     }
@@ -246,11 +250,11 @@ extern "C" fn store_client(ep_cap: usize) -> ! {
     unsafe {
         // 1. GET_ROOT("greeting") → в id лёг content-id (n=32), либо n=0 (корня ещё нет).
         let n: usize;
-        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => n, in("a1") OP_GET_ROOT, in("a2") name, in("a3") GREETING.len(), in("a4") iptr, in("a5") 32usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => n, inout("a1") OP_GET_ROOT => _, in("a2") name, in("a3") GREETING.len(), in("a4") iptr, in("a5") 32usize, in("a6") usize::MAX, options(nostack));
         if n == 32 {
             // Корень есть с прошлого запуска: прочитать по нему значение и напечатать.
             let vlen: usize;
-            asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => vlen, in("a1") OP_GET, in("a2") iptr, in("a3") 32usize, in("a4") vptr, in("a5") 512usize, options(nostack));
+            asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => vlen, inout("a1") OP_GET => _, in("a2") iptr, in("a3") 32usize, in("a4") vptr, in("a5") 512usize, in("a6") usize::MAX, options(nostack));
             asm!("ecall", in("a7") 1usize, inout("a0") SP_PREV.as_ptr() as usize => _, in("a1") SP_PREV.len(), options(nostack));
             asm!("ecall", in("a7") 1usize, inout("a0") vptr => _, in("a1") vlen, options(nostack));
             asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
@@ -258,7 +262,7 @@ extern "C" fn store_client(ep_cap: usize) -> ! {
             asm!("ecall", in("a7") 1usize, inout("a0") SP_FIRST.as_ptr() as usize => _, in("a1") SP_FIRST.len(), options(nostack));
         }
         // 2. PUT(MSG) → в id лёг content-id значения.
-        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, in("a1") OP_PUT, in("a2") msg, in("a3") MSG.len(), in("a4") iptr, in("a5") 32usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, inout("a1") OP_PUT => _, in("a2") msg, in("a3") MSG.len(), in("a4") iptr, in("a5") 32usize, in("a6") usize::MAX, options(nostack));
         // 3. Собрать запрос SET_ROOT = [id(32) | "greeting"] сырыми записями (без memcpy в .user).
         let rb = rqptr as *mut u8;
         let mut i = 0usize;
@@ -272,7 +276,7 @@ extern "C" fn store_client(ep_cap: usize) -> ! {
             j += 1;
         }
         // 4. SET_ROOT("greeting" → id): привязать корень (переживёт перезагрузку).
-        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, in("a1") OP_SET_ROOT, in("a2") rqptr, in("a3") 32 + GREETING.len(), in("a4") 0usize, in("a5") 0usize, options(nostack));
+        asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, inout("a1") OP_SET_ROOT => _, in("a2") rqptr, in("a3") 32 + GREETING.len(), in("a4") 0usize, in("a5") 0usize, in("a6") usize::MAX, options(nostack));
         asm!("ecall", in("a7") 1usize, inout("a0") SP_STORED.as_ptr() as usize => _, in("a1") SP_STORED.len(), options(nostack));
         // 5. Попытка прямого доступа: OBJ_PUT с эндпоинт-cap (у клиента НЕТ cap на store).
         let denied: usize;
@@ -473,7 +477,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
         let len: usize;
         unsafe {
             // RECV(req, 512) -> op (opcode | fd<<8), from (reply-cap), len (нагрузка в req)
-            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, options(nostack));
+            asm!("ecall", in("a7") 4usize, inout("a0") rptr => op, inout("a1") 512usize => from, out("a2") len, out("a3") _, options(nostack));
         }
         let opcode = op & 0xff;
         let fd = (op >> 8) & 0xff;
@@ -740,7 +744,7 @@ extern "C" fn posix_server(store_cap: usize) -> ! {
 
         unsafe {
             // REPLY(reply-cap, pptr, reply_len)
-            asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") pptr, in("a2") reply_len, options(nostack));
+            asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") pptr, in("a2") reply_len, in("a3") usize::MAX, options(nostack));
         }
     }
 }
@@ -758,7 +762,7 @@ const FD_BASE: usize = 3;
 unsafe fn sh_open(ep: usize, name: *const u8, name_len: usize, mode: usize) -> usize {
     let mut r = MaybeUninit::<[u8; 4]>::uninit();
     let rp = r.as_mut_ptr() as usize;
-    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_OPEN | (mode << 16), in("a2") name as usize, in("a3") name_len, in("a4") rp, in("a5") 4usize, options(nostack));
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, inout("a1") PX_OPEN | (mode << 16) => _, in("a2") name as usize, in("a3") name_len, in("a4") rp, in("a5") 4usize, in("a6") usize::MAX, options(nostack));
     let pfd = *(rp as *const u8) as usize;
     if pfd == 0xff { usize::MAX } else { pfd + FD_BASE }
 }
@@ -777,7 +781,7 @@ unsafe fn sh_read(ep: usize, fd: usize, buf: *mut u8, cap: usize) -> usize {
     }
     let pfd = fd - FD_BASE;
     let n: usize;
-    asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READ | (pfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") buf as usize, in("a5") cap, options(nostack));
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => n, inout("a1") PX_READ | (pfd << 8) => _, in("a2") 0usize, in("a3") 0usize, in("a4") buf as usize, in("a5") cap, in("a6") usize::MAX, options(nostack));
     n
 }
 
@@ -790,7 +794,7 @@ unsafe fn sh_write(ep: usize, fd: usize, buf: *const u8, len: usize) -> usize {
         return len;
     }
     let pfd = fd - FD_BASE;
-    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_WRITE | (pfd << 8), in("a2") buf as usize, in("a3") len, in("a4") 0usize, in("a5") 0usize, options(nostack));
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, inout("a1") PX_WRITE | (pfd << 8) => _, in("a2") buf as usize, in("a3") len, in("a4") 0usize, in("a5") 0usize, in("a6") usize::MAX, options(nostack));
     len
 }
 
@@ -801,14 +805,14 @@ unsafe fn sh_close(ep: usize, fd: usize) {
         return;
     }
     let pfd = fd - FD_BASE;
-    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, in("a1") PX_CLOSE | (pfd << 8), in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, options(nostack));
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => _, inout("a1") PX_CLOSE | (pfd << 8) => _, in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, in("a6") usize::MAX, options(nostack));
 }
 
 /// `readdir(buf, cap) -> n`: имена файлов через '\n' (для `ls`).
 #[link_section = ".user"]
 unsafe fn sh_readdir(ep: usize, buf: *mut u8, cap: usize) -> usize {
     let n: usize;
-    asm!("ecall", in("a7") 5usize, inout("a0") ep => n, in("a1") PX_READDIR, in("a2") 0usize, in("a3") 0usize, in("a4") buf as usize, in("a5") cap, options(nostack));
+    asm!("ecall", in("a7") 5usize, inout("a0") ep => n, inout("a1") PX_READDIR => _, in("a2") 0usize, in("a3") 0usize, in("a4") buf as usize, in("a5") cap, in("a6") usize::MAX, options(nostack));
     n
 }
 
@@ -880,6 +884,101 @@ extern "C" fn mini_sh(ep: usize) -> ! {
         let n = sh_readdir(ep, bp, 512);
         sh_write(ep, STDOUT, bp, n);
         sh_exit(0);
+    }
+}
+
+// ── Веха 21: передача capability по IPC (сервер-раздатчик прав) ──
+const RO_MASK: usize = 0b101; // READ | GRANT: выдаваемое право (без WRITE — аттенуация)
+static CP_ASK: [u8; b"[cap-cli] asking cap-server for read access to the store...\n".len()] =
+    *b"[cap-cli] asking cap-server for read access to the store...\n";
+static CP_TDENIED: [u8; b"[cap-cli] attaching ep-cap to CALL DENIED by kernel (no GRANT right)\n".len()] =
+    *b"[cap-cli] attaching ep-cap to CALL DENIED by kernel (no GRANT right)\n";
+static CP_RESTORED: [u8; b"[cap-cli] store-cap RESTORED from previous boot (.cspace) - no re-grant needed\n".len()] =
+    *b"[cap-cli] store-cap RESTORED from previous boot (.cspace) - no re-grant needed\n";
+static CP_READ: [u8; b"[cap-cli] reading root 'system' with the cap: ".len()] =
+    *b"[cap-cli] reading root 'system' with the cap: ";
+static CP_NOROOT: [u8; b"[cap-cli] root 'system' not set yet (fresh disk)\n".len()] =
+    *b"[cap-cli] root 'system' not set yet (fresh disk)\n";
+static CP_WDENIED: [u8; b"[cap-cli] OBJ_PUT with the cap DENIED (attenuated: no WRITE)\n".len()] =
+    *b"[cap-cli] OBJ_PUT with the cap DENIED (attenuated: no WRITE)\n";
+// Имя корня читает САМ процесс в U-mode? Нет — только ядро (OBJ_GET_ROOT берёт указатель),
+// но по образцу GREETING кладём в `.user`, чтобы можно было и самому.
+#[link_section = ".user"]
+static SYSNAME: [u8; b"system".len()] = *b"system";
+
+/// Процесс-**раздатчик прав** (Веха 21.1): держит cap на store `[rw-g-]` и на любой запрос
+/// отвечает УРЕЗАННОЙ копией своего права `[r-g--]`: `CAP_DERIVE` (аттенуация у себя) +
+/// `REPLY` с правом в `a3` (grant-в-сообщении). Данные он не передаёт вовсе — только право;
+/// клиент дальше ходит в store сам. Это паттерн KeyKOS: сервер как источник полномочий.
+#[link_section = ".user"]
+extern "C" fn cap_server(store_cap: usize) -> ! {
+    let mut req = MaybeUninit::<[u8; 64]>::uninit();
+    let rptr = req.as_mut_ptr() as usize;
+    loop {
+        let from: usize;
+        unsafe {
+            // RECV: op/нагрузка/приложенное право не важны — любой запрос = «дай почитать».
+            asm!("ecall", in("a7") 4usize, inout("a0") rptr => _, inout("a1") 64usize => from, out("a2") _, out("a3") _, options(nostack));
+            // Урезать своё право до [r-g--] (GRANT оставляем: без него не передать) и отдать.
+            let ro: usize;
+            asm!("ecall", in("a7") 16usize, inout("a0") store_cap => ro, in("a1") RO_MASK, options(nostack));
+            asm!("ecall", in("a7") 6usize, inout("a0") from => _, in("a1") 0usize, in("a2") 0usize, in("a3") ro, options(nostack));
+        }
+    }
+}
+
+/// Процесс-**клиент раздатчика** (Веха 21): стартует БЕЗ прав на store. Первая загрузка
+/// (`restored`=MAX): просит право по IPC — сначала демонстративно пытается приложить к CALL
+/// свой эндпоинт-cap (нет GRANT → отказ ядра ДО отправки), потом честно получает `[r-g--]`
+/// В ОТВЕТЕ сервера. Следующая загрузка: ядро нашло право в ВОССТАНОВЛЕННОМ домене (.cspace)
+/// и отдало дескриптор в `restored` — IPC не нужен, право пережило перезагрузку (ADR 0002).
+/// Полученным правом клиент читает корень 'system' напрямую; запись отклоняется (аттенуация).
+#[link_section = ".user"]
+extern "C" fn cap_client(ep_cap: usize, restored: usize) -> ! {
+    let mut idb = MaybeUninit::<[u8; 32]>::uninit();
+    let mut val = MaybeUninit::<[u8; 96]>::uninit();
+    let iptr = idb.as_mut_ptr() as usize;
+    let vptr = val.as_mut_ptr() as usize;
+    unsafe {
+        let cap: usize;
+        if restored != usize::MAX {
+            asm!("ecall", in("a7") 1usize, inout("a0") CP_RESTORED.as_ptr() as usize => _, in("a1") CP_RESTORED.len(), options(nostack));
+            cap = restored;
+        } else {
+            // 1) Приложить к CALL свой ep-cap: на нём нет GRANT → ядро отклонит ДО отправки.
+            let r: usize;
+            asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => r, inout("a1") 0usize => _, in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, in("a6") ep_cap, options(nostack));
+            if r == usize::MAX {
+                asm!("ecall", in("a7") 1usize, inout("a0") CP_TDENIED.as_ptr() as usize => _, in("a1") CP_TDENIED.len(), options(nostack));
+            }
+            // 2) Честный запрос: право придёт в a1 вместе с ответом.
+            asm!("ecall", in("a7") 1usize, inout("a0") CP_ASK.as_ptr() as usize => _, in("a1") CP_ASK.len(), options(nostack));
+            let got: usize;
+            asm!("ecall", in("a7") 5usize, inout("a0") ep_cap => _, inout("a1") 0usize => got, in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize, in("a6") usize::MAX, options(nostack));
+            cap = got;
+        }
+        if cap != usize::MAX {
+            // Читать СВОИМ правом, без сервера: GET_ROOT('system') → id, GET(id) → значение.
+            let n: usize;
+            asm!("ecall", in("a7") 11usize, inout("a0") cap => n, in("a1") SYSNAME.as_ptr() as usize, in("a2") SYSNAME.len(), in("a3") iptr, options(nostack));
+            if n == 32 {
+                let vlen: usize;
+                asm!("ecall", in("a7") 9usize, inout("a0") cap => vlen, in("a1") iptr, in("a2") vptr, in("a3") 96usize, options(nostack));
+                asm!("ecall", in("a7") 1usize, inout("a0") CP_READ.as_ptr() as usize => _, in("a1") CP_READ.len(), options(nostack));
+                asm!("ecall", in("a7") 1usize, inout("a0") vptr => _, in("a1") vlen, options(nostack));
+                asm!("ecall", in("a7") 1usize, inout("a0") NL.as_ptr() as usize => _, in("a1") NL.len(), options(nostack));
+            } else {
+                asm!("ecall", in("a7") 1usize, inout("a0") CP_NOROOT.as_ptr() as usize => _, in("a1") CP_NOROOT.len(), options(nostack));
+            }
+            // Запись тем же правом → отказ: у копии нет WRITE (аттенуация пережила и передачу,
+            // и — на второй загрузке — перезагрузку).
+            let w: usize;
+            asm!("ecall", in("a7") 8usize, inout("a0") cap => w, in("a1") SYSNAME.as_ptr() as usize, in("a2") SYSNAME.len(), in("a3") iptr, options(nostack));
+            if w == usize::MAX {
+                asm!("ecall", in("a7") 1usize, inout("a0") CP_WDENIED.as_ptr() as usize => _, in("a1") CP_WDENIED.len(), options(nostack));
+            }
+        }
+        asm!("ecall", in("a7") 2usize, in("a0") 0usize, options(nostack, noreturn));
     }
 }
 
@@ -1018,6 +1117,12 @@ pub fn mini_sh_entry() -> usize {
 }
 pub fn vsh_entry() -> usize {
     vsh as *const () as usize
+}
+pub fn cap_server_entry() -> usize {
+    cap_server as *const () as usize
+}
+pub fn cap_client_entry() -> usize {
+    cap_client as *const () as usize
 }
 pub fn label_a() -> usize {
     LBL_A.as_ptr() as usize

@@ -6,7 +6,9 @@
 #![no_std]
 
 /// Версия ABI. Растёт при несовместимых изменениях границы ядро/userspace.
-pub const VERSION: u32 = 0;
+/// v1 — Веха 21: IPC несёт capability (CALL: a6=право, возврат a1; RECV: a3; REPLY: a3),
+/// новые право `EXEC` и syscall `CAP_DERIVE`.
+pub const VERSION: u32 = 1;
 
 /// Контент-адрес неизменяемого значения в объектном store — хэш его содержимого.
 /// Основа контент-адресации из [[0002-persistent-content-addressed-capability-core]].

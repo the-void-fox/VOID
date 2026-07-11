@@ -88,6 +88,10 @@ struct Proc {
     /// сервера при доставке (`RECV`/прямая доставка). Передача буфера клиент→сервер через IPC.
     send_buf: usize,
     send_len: usize,
+    /// Веха 21.1: capability, передаваемая с текущим `CALL` (дескриптор в c-space отправителя;
+    /// `usize::MAX` — нет). Проверяется (`GRANT`) при отправке, копируется в домен получателя
+    /// при доставке — как `send_buf`, только для прав.
+    send_cap: usize,
 }
 
 struct Table {
@@ -167,6 +171,7 @@ fn create_process_locked(
         recv_cap: 0,
         send_buf: 0,
         send_len: 0,
+        send_cap: usize::MAX,
     });
     t.procs.len() - 1
 }
@@ -396,9 +401,11 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.current = n;
             }
         }
-        // SYS_RECV(recv_buf, recv_cap) -> (a0=op, a1=отправитель, a2=длина запроса). Приняв
-        // запрос, копируем его полезную нагрузку из буфера клиента в recv_buf. Нет запроса —
-        // блокировка (RecvWait); recv_buf/cap сохранены, чтобы доставка позже скопировала в них.
+        // SYS_RECV(recv_buf, recv_cap) -> (a0=op, a1=отправитель, a2=длина запроса, a3=принятое
+        // право|MAX — Веха 21.1). Приняв запрос, копируем его полезную нагрузку из буфера клиента
+        // в recv_buf; если клиент передал capability — она уже скопирована в домен сервера
+        // (deliver_request), в a3 — её дескриптор. Нет запроса — блокировка (RecvWait);
+        // recv_buf/cap сохранены, чтобы доставка позже скопировала в них.
         4 => {
             let (rbuf, rcap) = {
                 let f = &t.procs[cur].frame;
@@ -408,12 +415,13 @@ fn syscall(t: &mut Table, cur: usize) {
             t.procs[cur].recv_cap = rcap;
             if let Some(pos) = t.mailbox.iter().position(|&(_, to, _)| to == cur) {
                 let (from, _to, op) = t.mailbox.remove(pos);
-                let n = deliver_request(t, from, cur);
+                let (n, tcap) = deliver_request(t, from, cur);
                 let rc = cap::mint(t.procs[cur].domain, cap::Target::Reply(from), Rights::SEND);
                 let f = &mut t.procs[cur].frame;
                 f.regs[10] = op;
                 f.regs[11] = rc.bits() as usize;
                 f.regs[12] = n;
+                f.regs[13] = tcap;
                 f.sepc += 4;
             } else {
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
@@ -422,16 +430,32 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_CALL(ep_cap, op, send_buf, send_len, recv_buf, recv_cap) -> a0 = число байт ответа
-        // (или MAX, если cap не даёт права слать). `ep_cap` — дескриптор эндпоинта в c-space
-        // процесса; ядро резолвит его в id сервера. `send_buf`/`send_len` — полезная нагрузка
-        // запроса (копируется серверу при доставке). Отправить и ждать ответа (блокируется).
+        // SYS_CALL(ep_cap, op, send_buf, send_len, recv_buf, recv_cap, a6=cap|MAX) ->
+        // (a0 = число байт ответа | MAX, a1 = право из ответа | MAX). `ep_cap` — дескриптор
+        // эндпоинта в c-space процесса; ядро резолвит его в id сервера. `send_buf`/`send_len` —
+        // полезная нагрузка запроса (копируется серверу при доставке). Веха 21.1: `a6` —
+        // capability, передаваемая в сообщении (нужен `GRANT` на неё — проверяется ЗДЕСЬ,
+        // до отправки); сервер получит её копию в своём домене (a3 его RECV). Ответ сервера
+        // тоже может нести право — его дескриптор вернётся в a1. Отправить и ждать (блокируется).
         5 => {
             let (ecap, op, sbuf, slen, rbuf, rcap) = {
                 let f = &t.procs[cur].frame;
                 (f.regs[10], f.regs[11], f.regs[12], f.regs[13], f.regs[14], f.regs[15])
             };
+            let scap = t.procs[cur].frame.regs[16]; // a6: право в сообщении (MAX — нет)
             let dom = t.procs[cur].domain;
+            // Передаваемое право проверяем ДО отправки: нет GRANT — весь CALL отклонён.
+            if scap != usize::MAX {
+                let ok = cap::rights(dom, Cap::from_bits(scap as u64))
+                    .map_or(false, |r| r.contains(Rights::GRANT));
+                if !ok {
+                    println!("  [cap] P{} CALL отклонён: нет права GRANT на передаваемую capability", cur);
+                    let f = &mut t.procs[cur].frame;
+                    f.regs[10] = usize::MAX;
+                    f.sepc += 4;
+                    return;
+                }
+            }
             match cap::endpoint(dom, Cap::from_bits(ecap as u64)) {
                 Ok(dest) => {
                     println!("  [ipc] P{} CALL P{} (по cap) op={} ({} байт)", cur, dest, op, slen);
@@ -439,15 +463,17 @@ fn syscall(t: &mut Table, cur: usize) {
                     t.procs[cur].recv_cap = rcap;
                     t.procs[cur].send_buf = sbuf;
                     t.procs[cur].send_len = slen;
+                    t.procs[cur].send_cap = scap;
                     if dest < t.procs.len() && t.procs[dest].state == State::RecvWait {
                         // получатель ждёт в RECV — доставить нагрузку в его буфер и разбудить.
                         // Выдать серверу одноразовый reply-cap на этого клиента (см. [[reply-capability]]).
-                        let n = deliver_request(t, cur, dest);
+                        let (n, tcap) = deliver_request(t, cur, dest);
                         let rc = cap::mint(t.procs[dest].domain, cap::Target::Reply(cur), Rights::SEND);
                         let df = &mut t.procs[dest].frame;
                         df.regs[10] = op;
                         df.regs[11] = rc.bits() as usize;
                         df.regs[12] = n;
+                        df.regs[13] = tcap;
                         df.sepc += 4;
                         t.procs[dest].state = State::Runnable;
                     } else {
@@ -467,16 +493,32 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_REPLY(reply_cap, src_buf, len) -> 0/MAX: ответить вызвавшему клиенту, передав `len`
-        // байт из своего буфера в его приёмный буфер, и разбудить его. `reply_cap` — одноразовый
-        // cap на клиента, выданный при `RECV`; ядро резолвит его в id клиента и по исполнении
-        // отзывает. Подделать/переиспользовать нельзя (см. [[reply-capability]]).
+        // SYS_REPLY(reply_cap, src_buf, len, a3=cap|MAX) -> 0/MAX: ответить вызвавшему клиенту,
+        // передав `len` байт из своего буфера в его приёмный буфер, и разбудить его. `reply_cap` —
+        // одноразовый cap на клиента, выданный при `RECV`; ядро резолвит его в id клиента и по
+        // исполнении отзывает. Подделать/переиспользовать нельзя (см. [[reply-capability]]).
+        // Веха 21.1: `a3` — право, передаваемое С ОТВЕТОМ (нужен `GRANT`); клиент получит его
+        // дескриптор в a1 своего CALL. Паттерн «сервер-раздатчик»: клиент просит доступ,
+        // сервер отвечает УРЕЗАННОЙ копией своего права (CAP_DERIVE → REPLY).
         6 => {
             let (rcap, src, len) = {
                 let f = &t.procs[cur].frame;
                 (f.regs[10], f.regs[11], f.regs[12])
             };
+            let scap = t.procs[cur].frame.regs[13]; // a3: право в ответе (MAX — нет)
             let dom = t.procs[cur].domain;
+            // Как в CALL: передаваемое право проверяем до доставки — нет GRANT, нет REPLY.
+            if scap != usize::MAX {
+                let ok = cap::rights(dom, Cap::from_bits(scap as u64))
+                    .map_or(false, |r| r.contains(Rights::GRANT));
+                if !ok {
+                    println!("  [cap] P{} REPLY отклонён: нет права GRANT на передаваемую capability", cur);
+                    let f = &mut t.procs[cur].frame;
+                    f.regs[10] = usize::MAX;
+                    f.sepc += 4;
+                    return;
+                }
+            }
             let result = match cap::reply_endpoint(dom, Cap::from_bits(rcap as u64)) {
                 Ok(dest) => {
                     println!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
@@ -484,12 +526,35 @@ fn syscall(t: &mut Table, cur: usize) {
                         let n = len.min(t.procs[dest].recv_cap);
                         // Читаем из текущего (сервера) по SUM=1; пишем в пространство клиента через
                         // трансляцию его таблицы (физ. адрес отображён в ядре идентично).
-                        let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
-                        let droot = root_of(t.procs[dest].satp);
-                        let dbuf = t.procs[dest].recv_buf;
-                        copy_to_space(droot, dbuf, src_slice);
+                        // Пустой ответ (n=0, напр. только право — Веха 21) не строит слайс:
+                        // from_raw_parts из нулевого указателя — UB даже при нулевой длине.
+                        if n > 0 {
+                            let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
+                            let droot = root_of(t.procs[dest].satp);
+                            let dbuf = t.procs[dest].recv_buf;
+                            copy_to_space(droot, dbuf, src_slice);
+                        }
+                        // Право в ответе: скопировать в домен клиента; его дескриптор — в a1 CALL.
+                        let mut tcap = usize::MAX;
+                        if scap != usize::MAX {
+                            if let Ok(nc) = cap::grant(
+                                dom,
+                                Cap::from_bits(scap as u64),
+                                t.procs[dest].domain,
+                                Rights(u32::MAX),
+                            ) {
+                                tcap = nc.bits() as usize;
+                                println!(
+                                    "  [cap] P{} → P{}: право [{}] передано в ответе (grant по IPC)",
+                                    cur, dest,
+                                    cap::rights_str(cap::rights(t.procs[dest].domain, nc).unwrap_or(Rights::NONE)),
+                                );
+                                cap::persist(); // передача права = чекпойнт c-space (Веха 21.3)
+                            }
+                        }
                         let df = &mut t.procs[dest].frame;
                         df.regs[10] = n; // клиентский CALL вернёт число принятых байт
+                        df.regs[11] = tcap; // и дескриптор полученного права (MAX — не было)
                         df.sepc += 4;
                         t.procs[dest].state = State::Runnable;
                     }
@@ -728,6 +793,35 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = result;
             f.sepc += 4;
         }
+        // SYS_CAP_DERIVE(cap, mask) -> новый дескриптор / MAX (Веха 21.1): урезанная копия
+        // СВОЕГО права в СВОЁМ домене (права ∩ mask). GRANT не нужен — сужать то, чем владеешь,
+        // безопасно всегда; передавать другим (CALL/REPLY с cap) — вот что требует GRANT.
+        // Тоже чекпойнт: c-space меняется из userspace → фиксируем на диск.
+        16 => {
+            let (c, mask) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11])
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::derive(dom, Cap::from_bits(c as u64), Rights(mask as u32)) {
+                Ok(nc) => {
+                    println!(
+                        "  [cap] P{} CAP_DERIVE → копия с правами [{}] (аттенуация)",
+                        cur,
+                        cap::rights_str(cap::rights(dom, nc).unwrap_or(Rights::NONE)),
+                    );
+                    cap::persist();
+                    nc.bits() as usize
+                }
+                Err(e) => {
+                    println!("  [cap] P{} CAP_DERIVE отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.regs[10] = result;
+            f.sepc += 4;
+        }
         // SYS_READ(buf, cap) -> n: прочитать доступный ввод консоли (stdin) в буфер процесса —
         // хотя бы один байт. Ввода нет — процесс блокируется (StdinWait), sepc НЕ двигаем:
         // когда [`wait_stdin`] разбудит его по прерыванию UART, `ecall` РЕСТАРТУЕТ и на этот
@@ -874,8 +968,13 @@ fn copy_between_spaces(
 
 /// Доставить полезную нагрузку запроса: скопировать буфер отправителя `from` (`send_buf`/`send_len`)
 /// в приёмный буфер получателя `to` (`recv_buf`/`recv_cap`), усекая по размеру приёмника.
-/// Возвращает число скопированных байт. Клиент в этот момент заблокирован — его память стабильна.
-fn deliver_request(t: &Table, from: usize, to: usize) -> usize {
+/// Клиент в этот момент заблокирован — его память стабильна.
+///
+/// Веха 21.1: если отправитель передаёт capability (`send_cap` != MAX) — скопировать право в
+/// домен получателя ([`cap::grant`], права как есть: аттенуация делается ЗАРАНЕЕ через
+/// `CAP_DERIVE`) и зафиксировать c-space на диск ([`cap::persist`] — передача права = чекпойнт).
+/// Возвращает (скопировано байт, дескриптор права у получателя | MAX).
+fn deliver_request(t: &Table, from: usize, to: usize) -> (usize, usize) {
     let n = t.procs[from].send_len.min(t.procs[to].recv_cap);
     if n > 0 {
         copy_between_spaces(
@@ -886,5 +985,18 @@ fn deliver_request(t: &Table, from: usize, to: usize) -> usize {
             n,
         );
     }
-    n
+    let mut tcap = usize::MAX;
+    if t.procs[from].send_cap != usize::MAX {
+        let c = Cap::from_bits(t.procs[from].send_cap as u64);
+        // GRANT проверен при отправке (`CALL`); маска без сужения — копия прав как есть.
+        if let Ok(nc) = cap::grant(t.procs[from].domain, c, t.procs[to].domain, Rights(u32::MAX)) {
+            tcap = nc.bits() as usize;
+            println!(
+                "  [cap] P{} → P{}: право [{}] передано в сообщении (grant по IPC)",
+                from, to, cap::rights_str(cap::rights(t.procs[to].domain, nc).unwrap_or(Rights::NONE)),
+            );
+            cap::persist();
+        }
+    }
+    (n, tcap)
 }

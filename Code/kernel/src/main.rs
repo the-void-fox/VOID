@@ -16,6 +16,7 @@
 //! Веха 10: пользовательский режим (U-mode) + syscall'ы + процессы со своим адресным пространством.
 //! Веха 19: программа как объект store — exec по content-id (Фаза 3, [[exec-from-store]]).
 //! Веха 20: интерактивность — ввод UART по прерыванию, SYS_READ/SYS_EXEC, shell `vsh`.
+//! Веха 21: capability по IPC (grant-в-сообщении, CAP_DERIVE) + персистентный c-space (.cspace).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -80,8 +81,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 20                           ║");
-    println!("  ║  интерактивность · vsh · exec по хэшу     ║");
+    println!("  ║  VOID — Веха 21                           ║");
+    println!("  ║  capability по IPC · c-space в store      ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -140,6 +141,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     } else {
         println!("  [store] диск пуст — это ПЕРВЫЙ запуск");
     }
+
+    // Веха 21.3: поднять персистентный c-space из спец-корня `.cspace` — домены со слотами,
+    // поколениями и правами на долговечные цели (store/устройства/значения/корни). Дальше
+    // create_domain переиспользует их по имени: процесс новой загрузки находит свои права.
+    let ndom = cap::load();
+    if ndom > 0 {
+        println!("  [cap]  c-space восстановлен из .cspace: {} доменов", ndom);
+    }
     println!();
 
     // Веха 8: capability поверх объектного store (c-space в RAM; персистентность — позже).
@@ -175,6 +184,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // именованному корню и на СЛЕДУЮЩЕМ запуске читает прежнее значение обратно — persistence
     // через userspace-сервер, без прямого доступа к объектному пространству.
     store_demo();
+    println!();
+
+    // Веха 21: передача capability по IPC + персистентный c-space. Клиент получает урезанное
+    // право В ОТВЕТЕ сервера-раздатчика (первая загрузка) или находит его ВОССТАНОВЛЕННЫМ из
+    // .cspace (последующие) — право переживает перезагрузку, тезис ADR 0002 полон.
+    cap_ipc_demo();
     println!();
 
     // Веха 16: вытеснение процессов. Два CPU-bound процесса БЕЗ единого yield/IPC — таймер
@@ -227,6 +242,46 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
         unsafe { core::arch::asm!("wfi") }
     }
+}
+
+/// Веха 21: cap-transfer по IPC + персистентный c-space. Сервер-раздатчик держит cap на store
+/// `[rw-g-]`; клиент — только эндпоинт. Первая загрузка: клиент просит доступ и получает В
+/// ОТВЕТЕ урезанную копию `[r-g--]` (CAP_DERIVE + grant-в-сообщении); передача = чекпойнт
+/// c-space в `.cspace`. Следующие загрузки: ядро находит право в ВОССТАНОВЛЕННОМ домене
+/// клиента и отдаёт его дескриптор без повторной выдачи — capability пережила перезагрузку.
+fn cap_ipc_demo() {
+    use void_abi::Rights;
+
+    println!("  [cap] передача права по IPC + персистентный c-space (Веха 21):");
+    let server = proc::spawn("cap-srv", user::cap_server_entry(), 0);
+    let rwg = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
+    let scap = cap::mint(proc::domain(server), cap::Target::Store, rwg);
+    proc::set_arg(server, scap.bits() as usize);
+    let client = proc::spawn("cap-cli", user::cap_client_entry(), 0);
+    let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
+    proc::set_arg(client, ep.bits() as usize);
+    println!(
+        "    P{} 'cap-srv' [store {}] ← P{} 'cap-cli' [эндпоинт {}]",
+        server, cap::rights_str(rwg), client, cap::rights_str(Rights::SEND),
+    );
+    // Право с прошлой загрузки? Домен клиента поднят из .cspace вместе со слотами — если там
+    // выжил cap на store, отдаём его дескриптор процессу (сам он дескрипторов не помнит:
+    // процессы пока эфемерны, персистентна их ЛИЧНОСТЬ — домен по имени).
+    match cap::find_store_cap(proc::domain(client)) {
+        Some((c, r)) => {
+            println!(
+                "    у 'cap-cli' УЖЕ есть store-cap [{}] — восстановлен из .cspace, минт не нужен",
+                cap::rights_str(r),
+            );
+            proc::set_arg2(client, c.bits() as usize);
+        }
+        None => {
+            println!("    прав на store у 'cap-cli' нет — попросит у раздатчика по IPC");
+            proc::set_arg2(client, usize::MAX);
+        }
+    }
+    proc::run();
+    println!("  [cap] сессия раздатчика завершена — обратно в ядро");
 }
 
 /// Веха 20.4: интерактивная сессия. Сервер-персоналия получает cap на store (r/w — файлы), а
