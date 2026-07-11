@@ -43,8 +43,9 @@ VOID берёт линию персистентных capability-систем (K
 объекты store, исполняются по content-id ([[exec-from-store]]); живой shell `vsh` с вводом
 ([[interactive-shell]]); capability передаются по IPC и переживают перезагрузку вместе с
 c-space ([[ipc-cap-transfer]]); у процессов ленивая куча и честные page fault
-([[process-heap]]). Следующая — Веха 23: userspace целиком в ELF из store (вывод секции
-`.user` из эксплуатации). Анализ разрывов после Фазы 2 — [[phase-2-state-analysis]].
+([[process-heap]]). Начата **Фаза 4 — мультиархитектурность и пакеты** ([[0004-void-pkg]]):
+Веха 23 (userspace в ELF) → arch-рефакторинг → x86_64 bring-up; пакетная дорожка — std-порт
+Rust, uutils, host-мост к nix. Развёрнутый план пакетов — [[void-pkg]].
 
 ## Текущие задачи
 Развёрнутый staged-роадмап — в `[[todo]]`. Кратко (Фаза 3): exec-по-хэшу → UART-ввод +
@@ -56,6 +57,7 @@ c-space ([[ipc-cap-transfer]]); у процессов ленивая куча и
 - [[0001-rust-riscv-microkernel]] — язык, платформа, тип ядра, железная изоляция на старте.
 - [[0002-persistent-content-addressed-capability-core]] — стержневой тезис и почему он чинит провал KeyKOS.
 - [[0003-phase-3-exec-by-hash]] — Фаза 3: программа как контент-адресуемый объект, exec по хэшу.
+- [[0004-void-pkg]] — Фаза 4: пакеты и самодостаточность — резолвер void-pkg (native/nix-cross → linux-abi → wasi) над одним store.
 
 ## Заметки
 Рабочий лог — в `notes/`.
