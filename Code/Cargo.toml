@@ -6,12 +6,12 @@ members = [
     "kernel",
     "libs/void-abi",
 ]
-# Веха 19.1: userspace-программы — ОТДЕЛЬНЫЕ ELF-крейты, не члены этого workspace (у них свой
-# таргет `riscv64gc-unknown-none-elf`, свой линкер-скрипт на другую базу и свой release-профиль
-# под жёсткий размер — см. programs/hello/Cargo.toml). `kernel/build.rs` собирает их отдельным
-# `cargo build` со своим `--target-dir` внутри OUT_DIR (иначе — deadlock на локе target ядра).
+# Веха 19.1/23: userspace-программы — ОТДЕЛЬНЫЙ крейт, не член этого workspace (у него свой
+# линкер-скрипт на базу региона процессов и свой release-профиль под жёсткий размер — см.
+# programs/user/Cargo.toml). `kernel/build.rs` собирает его отдельным `cargo build` со своим
+# `--target-dir` внутри OUT_DIR (иначе — deadlock на локе target ядра).
 exclude = [
-    "programs/hello",
+    "programs/user",
 ]
 
 [workspace.package]
@@ -19,14 +19,13 @@ version = "0.0.1"
 edition = "2021"
 authors = ["voidfox"]
 
-# Ядру нужен предсказуемый код без раскрутки стека.
-# ВНИМАНИЕ (Веха 22): opt-level НЕ поднимать, пока userspace живёт в секции `.user`.
-# Код `.user` не смеет касаться ядра (его страницы без U): в -O0 zero-init массива
-# компилируется в вызов memset из .text (обходится кучей/сырыми указателями — так и
-# сделано), а в -O1 switch-диспетчеризация становится jump-таблицей в .rodata ядра —
-# load-фолт из U. Окончательно класс проблем снимет переезд userspace в ELF из store.
+# Ядру нужен предсказуемый код без раскрутки стека (panic="abort").
+# Веха 23: секция `.user` похоронена — код процессов приходит ТОЛЬКО из ELF в store, у ядра
+# больше нет страниц, исполняемых из U-mode, и мины «memset/jump-таблица вне .user» сняты.
+# Оптимизации ядру разрешены: MMIO ходит через read/write_volatile, asm-блоки — барьеры.
 [profile.dev]
 panic = "abort"
+opt-level = 2
 
 [profile.release]
 panic = "abort"

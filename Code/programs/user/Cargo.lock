@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "hello"
+name = "void-user"
 version = "0.0.1"

@@ -18,6 +18,8 @@
 //! Веха 20: интерактивность — ввод UART по прерыванию, SYS_READ/SYS_EXEC, shell `vsh`.
 //! Веха 21: capability по IPC (grant-в-сообщении, CAP_DERIVE) + персистентный c-space (.cspace).
 //! Веха 22: куча процесса (SYS_MAP, ленивые страницы) + честные user page fault (гибнет процесс).
+//! Веха 23: userspace целиком в ELF из store — секции `.user` больше нет; все программы сеются
+//! в store под корни `bin/<имя>` и исполняются по content-id ([[elf-userspace]]).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -42,14 +44,29 @@ mod sync;
 mod timer;
 mod trap;
 mod uart;
-mod user;
 mod virtio_blk;
 
-/// Веха 19.1 — ELF-байты userspace-программы `hello`, встроенные в образ ядра как СЕМЯ. Собраны
-/// `kernel/build.rs` отдельным `cargo build` крейта `programs/hello` (свой target-dir в OUT_DIR).
-/// Это НЕ адрес исполнения — только сырые байты; на диске они окажутся объектом store под корнем
-/// `bin/hello`, а исполнится программа уже ОТТУДА, по content-id (см. `exec_demo`, [[exec-from-store]]).
-static HELLO_ELF: &[u8] = include_bytes!(env!("HELLO_ELF"));
+/// Веха 23 — ELF-байты ВСЕХ userspace-программ, встроенные в образ ядра как СЕМЕНА. Собраны
+/// `kernel/build.rs` отдельным `cargo build` крейта `programs/user` (свой target-dir в OUT_DIR).
+/// Это НЕ адреса исполнения — только сырые байты: [`seed_programs`] кладёт их в объектный store
+/// под корни `bin/<имя>` (сев по хэшу: изменился бинарь — корень атомарно переезжает), а
+/// исполняются программы всегда ОТТУДА, по content-id ([`spawn_prog`], [[exec-from-store]]).
+/// Секции `.user` в ядре больше нет — это единственный путь появления кода в U-mode.
+static PROGRAMS: &[(&str, &[u8])] = &[
+    ("bin/hello", include_bytes!(env!("PROG_HELLO"))),
+    ("bin/vsh", include_bytes!(env!("PROG_VSH"))),
+    ("bin/posixfs", include_bytes!(env!("PROG_POSIXFS"))),
+    ("bin/mini-sh", include_bytes!(env!("PROG_MINI_SH"))),
+    ("bin/blk-srv", include_bytes!(env!("PROG_BLK_SRV"))),
+    ("bin/blk-cli", include_bytes!(env!("PROG_BLK_CLI"))),
+    ("bin/obj-srv", include_bytes!(env!("PROG_OBJ_SRV"))),
+    ("bin/obj-cli", include_bytes!(env!("PROG_OBJ_CLI"))),
+    ("bin/cap-srv", include_bytes!(env!("PROG_CAP_SRV"))),
+    ("bin/cap-cli", include_bytes!(env!("PROG_CAP_CLI"))),
+    ("bin/busy", include_bytes!(env!("PROG_BUSY"))),
+    ("bin/heap", include_bytes!(env!("PROG_HEAP"))),
+    ("bin/crash", include_bytes!(env!("PROG_CRASH"))),
+];
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -82,8 +99,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 22                           ║");
-    println!("  ║  куча процесса · честные page fault       ║");
+    println!("  ║  VOID — Веха 23                           ║");
+    println!("  ║  userspace целиком в ELF из store         ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -150,6 +167,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     if ndom > 0 {
         println!("  [cap]  c-space восстановлен из .cspace: {} доменов", ndom);
     }
+
+    // Веха 23: посеять/обновить программы системы в store — с этого момента ВЕСЬ userspace
+    // живёт там и исполняется по content-id; в образе ядра остались только семена.
+    seed_programs();
     println!();
 
     // Веха 8: capability поверх объектного store (c-space в RAM; персистентность — позже).
@@ -251,6 +272,49 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
 }
 
+/// Веха 23: посеять/обновить программы системы в store. Каждая — объект под корнем `bin/<имя>`
+/// ([`PROGRAMS`]); сев по хэшу: content-id совпал — корень актуален (диск — истина, семя не
+/// участвует); разошёлся — корень атомарно переезжает на новую версию (обновление системы =
+/// смена корня, старые байты уходят в GC как мусор). Дедуп store делает повторный сев бесплатным.
+fn seed_programs() {
+    let (mut fresh, mut sown, mut updated) = (0usize, 0usize, 0usize);
+    for (root_name, bytes) in PROGRAMS {
+        let id = object::put(bytes);
+        match object::root(root_name) {
+            Some(old) if old == id => fresh += 1,
+            Some(_) => {
+                object::set_root(root_name, id);
+                updated += 1;
+            }
+            None => {
+                object::set_root(root_name, id);
+                sown += 1;
+            }
+        }
+    }
+    println!(
+        "  [seed] программы в store ({} корней bin/*): {} актуально, {} посеяно, {} обновлено",
+        PROGRAMS.len(),
+        fresh,
+        sown,
+        updated,
+    );
+}
+
+/// Запустить программу из store по имени корня (Веха 23): корень → content-id → байты ELF →
+/// [`proc::spawn_elf`]. ВСЕ процессы системы приходят только этим путём — тем же, каким
+/// `SYS_EXEC` запускает программы для vsh. `pname` — имя процесса/домена (личность в .cspace).
+fn spawn_prog(root_name: &str, pname: &'static str, arg: usize) -> usize {
+    let id = object::root(root_name)
+        .unwrap_or_else(|| panic!("{} не посеян в store", root_name));
+    let bytes = object::with(&id, |b| b.map(|x| x.to_vec()))
+        .unwrap_or_else(|| panic!("объект корня {} недоступен", root_name));
+    match proc::spawn_elf(pname, &bytes, arg) {
+        Ok(pid) => pid,
+        Err(e) => panic!("негодный ELF под корнем {}: {:?}", root_name, e),
+    }
+}
+
 /// Веха 22: куча процесса + честные фолты. `heap` просит 4 страницы через SYS_MAP — ядро НЕ
 /// выделяет ни одного фрейма (ленивый резерв); каждая первая запись в страницу даёт page fault,
 /// по которому ядро выделяет обнулённый фрейм и повторяет инструкцию. `crash` обращается по
@@ -258,8 +322,8 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 /// живёт дальше: раньше такой фолт валил всю систему «неожиданным trap'ом».
 fn mm_demo() {
     println!("  [mm] куча процесса (SYS_MAP, ленивые страницы) + честные фолты (Веха 22):");
-    proc::spawn("heap", user::heap_user_entry(), 0);
-    proc::spawn("crash", user::crash_user_entry(), 0);
+    spawn_prog("bin/heap", "heap", 0);
+    spawn_prog("bin/crash", "crash", 0);
     proc::run();
     println!("  [mm] сессия памяти завершена: crash убит, ядро и остальные живы");
 }
@@ -273,11 +337,11 @@ fn cap_ipc_demo() {
     use void_abi::Rights;
 
     println!("  [cap] передача права по IPC + персистентный c-space (Веха 21):");
-    let server = proc::spawn("cap-srv", user::cap_server_entry(), 0);
+    let server = spawn_prog("bin/cap-srv", "cap-srv", 0);
     let rwg = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, rwg);
     proc::set_arg(server, scap.bits() as usize);
-    let client = proc::spawn("cap-cli", user::cap_client_entry(), 0);
+    let client = spawn_prog("bin/cap-cli", "cap-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -313,10 +377,10 @@ fn shell_session() {
     use void_abi::Rights;
 
     println!("  [vsh] интерактивная сессия (Веха 20) — ls · cat · echo · run bin/hello · exit:");
-    let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
+    let server = spawn_prog("bin/posixfs", "posixfs", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
     proc::set_arg(server, scap.bits() as usize);
-    let sh = proc::spawn("vsh", user::vsh_entry(), 0);
+    let sh = spawn_prog("bin/vsh", "vsh", 0);
     let ep = cap::mint(proc::domain(sh), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(sh, ep.bits() as usize);
     let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC);
@@ -465,7 +529,7 @@ fn proc_demo() {
 
     // Сервер-драйвер: ядро минтит ему cap на УСТРОЙСТВО (право читать сектора). Дескриптор
     // передаём процессу через a0 — c-space внутри U-mode недоступен, cap живёт как число.
-    let server = proc::spawn("blk-drv", user::blk_server_entry(), 0);
+    let server = spawn_prog("bin/blk-srv", "blk-drv", 0);
     let devr = Rights::READ.union(Rights::WRITE); // Веха 17: драйвер умеет и читать, и писать
     let dev = cap::mint(proc::domain(server), cap::Target::Device(cap::Device::Block), devr);
     proc::set_arg(server, dev.bits() as usize);
@@ -476,7 +540,7 @@ fn proc_demo() {
 
     // Клиент: cap на ЭНДПОИНТ сервера (право слать ему сообщения). Cap на устройство он НЕ
     // получает — поэтому прямой BLK_READ у него в конце отвергается.
-    let client = proc::spawn("blk-cli", user::blk_client_entry(), 0);
+    let client = spawn_prog("bin/blk-cli", "blk-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -499,7 +563,7 @@ fn store_demo() {
 
     // Сервер store: cap на сам store с правами читать и писать (r-w-).
     let rw = Rights::READ.union(Rights::WRITE);
-    let server = proc::spawn("obj-store", user::store_server_entry(), 0);
+    let server = spawn_prog("bin/obj-srv", "obj-store", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, rw);
     proc::set_arg(server, scap.bits() as usize);
     println!(
@@ -508,7 +572,7 @@ fn store_demo() {
     );
 
     // Клиент: cap только на ЭНДПОИНТ сервера. Прямого доступа к store у него нет.
-    let client = proc::spawn("store-cli", user::store_client_entry(), 0);
+    let client = spawn_prog("bin/obj-cli", "store-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -526,10 +590,11 @@ fn store_demo() {
 fn preempt_demo() {
     println!("  [proc] вытеснение по таймеру — два CPU-bound процесса без yield:");
     print!("    ");
-    let a = proc::spawn("busy-A", user::busy_entry(), 0);
-    proc::set_arg(a, user::label_a());
-    let b = proc::spawn("busy-B", user::busy_entry(), 0);
-    proc::set_arg(b, user::label_b());
+    // a0 выбирает метку внутри программы (0 = " A ", 1 = " B ") — обе печати из её .rodata.
+    let a = spawn_prog("bin/busy", "busy-A", 0);
+    proc::set_arg(a, 0);
+    let b = spawn_prog("bin/busy", "busy-B", 0);
+    proc::set_arg(b, 1);
     let before = timer::ticks();
     proc::run();
     println!();
@@ -548,10 +613,10 @@ fn posix_demo() {
 
     println!("  [proc] POSIX-персоналия + программа mini-sh на чистом POSIX-shim (Веха 18.4):");
     // Персоналии — cap на store (файлы персистятся под корнями-именами, Веха 18.2).
-    let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
+    let server = spawn_prog("bin/posixfs", "posixfs", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
     proc::set_arg(server, scap.bits() as usize);
-    let client = proc::spawn("mini-sh", user::mini_sh_entry(), 0);
+    let client = spawn_prog("bin/mini-sh", "mini-sh", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -562,33 +627,17 @@ fn posix_demo() {
     println!("  [proc] сессия персоналии завершена — обратно в ядро");
 }
 
-/// Веха 19 — «программа как объект store»: exec по content-id. Байты ELF, встроенные в ядро как
-/// СЕМЯ ([`HELLO_ELF`]), кладутся в объектный store и вешаются на корень `bin/hello` ТОЛЬКО если
-/// его ещё нет (первый запуск на чистом диске); дальше ядро — уже независимо от того, был ли
-/// сев, — читает ELF ИЗ STORE по content-id этого корня и запускает через [`proc::spawn_elf`]
-/// ([[exec-from-store]]). На втором запуске (после перезагрузки) корень уже персистентен, seed
-/// не участвует вовсе: программа исполняется тем же путём, что и любой другой объект store.
+/// Веха 19 — «программа как объект store»: exec по content-id, показанный ЯВНО (с печатью
+/// content-id и длины). С Вехи 23 этим путём приходят ВСЕ процессы ([`spawn_prog`]); здесь он
+/// разобран по шагам на `bin/hello`: корень (посеян [`seed_programs`], на втором запуске — уже
+/// с диска) → content-id → байты ИЗ STORE → [`proc::spawn_elf`] ([[exec-from-store]]). Один и
+/// тот же бинарь даёт один и тот же content-id на обеих загрузках — контент-адресация видима.
 fn exec_demo() {
     println!("  [exec] программа как объект store — exec по content-id (Веха 19):");
 
-    let id = match object::root("bin/hello") {
-        Some(id) => {
-            println!("    ВТОРОЙ запуск: корень 'bin/hello' уже на диске — seed НЕ используется");
-            id
-        }
-        None => {
-            let id = object::put(HELLO_ELF);
-            object::set_root("bin/hello", id);
-            println!(
-                "    ПЕРВЫЙ запуск: корня 'bin/hello' не было — посеяно {} байт ELF из образа ядра",
-                HELLO_ELF.len(),
-            );
-            id
-        }
-    };
+    let id = object::root("bin/hello").expect("bin/hello посеян при загрузке");
 
-    // Прочитать байты ИЗ STORE по content-id (а не взять HELLO_ELF напрямую!) — так путь
-    // одинаков для обоих запусков и не зависит от того, сработал ли seed выше. Копируем в
+    // Прочитать байты ИЗ STORE по content-id (а не байты-семя из образа ядра!) — копируем в
     // Vec и сразу отпускаем замок store: дальше `proc::run()` крутит процесс до завершения.
     let elf_bytes = object::with(&id, |b| b.map(|bytes| bytes.to_vec()));
     match elf_bytes {
@@ -640,12 +689,13 @@ fn writer() {
         let data = alloc::format!("{}-value-{}", name, i);
         let id = object::put(data.as_bytes());
         println!("    [{}] put \"{}\" -> {}", name, data, id_short(&id));
-        // Немного занятости, чтобы дать таймеру шанс вытеснить между записями.
+        // Немного занятости, чтобы дать таймеру шанс вытеснить между записями. `black_box` —
+        // чтобы оптимизатор (ядро с Вехи 23 собирается с opt-level>0) не выкинул цикл.
         let mut acc = 0u64;
         for k in 0..250_000u64 {
-            acc = acc.wrapping_add(k);
+            acc = acc.wrapping_add(core::hint::black_box(k));
         }
-        let _ = acc;
+        core::hint::black_box(acc);
     }
 }
 

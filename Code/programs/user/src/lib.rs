@@ -1,0 +1,346 @@
+//! Библиотека userspace-программ VOID (Веха 23): syscall-шимы + POSIX-shim.
+//!
+//! До Вехи 23 код процессов жил в секции `.user` образа ядра и не смел касаться ничего за
+//! пределами своих страниц: ни memset на zero-init, ни jump-таблиц в .rodata, ни вызовов
+//! core-функций — всё писалось сырыми указателями с `MaybeUninit`. Теперь каждая программа —
+//! собственный статический ELF (см. `src/bin/*`), где работает обычный Rust: массивы, слайсы,
+//! `copy_from_slice` — всё линкуется в сам бинарь и исполняется со страниц процесса.
+//!
+//! Здесь — единственное место, где программы видят `ecall`. Соглашение syscall'ов (ABI v1):
+//! номер в `a7`, аргументы в `a0..a6`, результат в `a0` (подробности — в шапке
+//! `kernel/src/proc.rs`). `usize::MAX` (== [`NO_CAP`]) в позиции capability значит «права нет».
+#![no_std]
+
+use core::arch::asm;
+
+// ─── номера syscall'ов (ABI v1, см. libs/void-abi и kernel/src/proc.rs) ───────
+const SYS_WRITE: usize = 1;
+const SYS_EXIT: usize = 2;
+const SYS_YIELD: usize = 3;
+const SYS_RECV: usize = 4;
+const SYS_CALL: usize = 5;
+const SYS_REPLY: usize = 6;
+const SYS_BLK_READ: usize = 7;
+const SYS_OBJ_PUT: usize = 8;
+const SYS_OBJ_GET: usize = 9;
+const SYS_OBJ_SET_ROOT: usize = 10;
+const SYS_OBJ_GET_ROOT: usize = 11;
+const SYS_BLK_WRITE: usize = 12;
+const SYS_OBJ_DEL_ROOT: usize = 13;
+const SYS_READ: usize = 14;
+const SYS_EXEC: usize = 15;
+const SYS_CAP_DERIVE: usize = 16;
+const SYS_MAP: usize = 17;
+
+/// «Capability отсутствует» — в аргументах и результатах IPC.
+pub const NO_CAP: usize = usize::MAX;
+
+/// Паника программы — завершиться ненулевым кодом, не трогая ядро: раскрутки стека нет
+/// (panic="abort"), а печатать backtrace — не забота userspace-программы.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    exit(101)
+}
+
+// ─── базовые syscall'ы ────────────────────────────────────────────────────────
+
+/// `SYS_WRITE`: напечатать байты в консоль (ядро читает буфер процесса по SUM=1).
+pub fn write(buf: &[u8]) {
+    unsafe {
+        asm!("ecall", in("a7") SYS_WRITE, inout("a0") buf.as_ptr() as usize => _,
+             in("a1") buf.len(), options(nostack));
+    }
+}
+
+/// `SYS_EXIT`: завершить процесс с кодом (родителю в `SYS_EXEC` вернётся именно он).
+pub fn exit(code: usize) -> ! {
+    unsafe { asm!("ecall", in("a7") SYS_EXIT, in("a0") code, options(nostack, noreturn)) }
+}
+
+/// `SYS_YIELD`: уступить процессор следующему готовому процессу.
+pub fn yield_now() {
+    unsafe { asm!("ecall", in("a7") SYS_YIELD, inout("a0") 0usize => _, options(nostack)) }
+}
+
+/// Принятый запрос IPC: op отправителя, одноразовый reply-cap, длина нагрузки в буфере
+/// и capability, переданная в сообщении ([`NO_CAP`] — не было).
+pub struct Message {
+    pub op: usize,
+    pub reply_cap: usize,
+    pub len: usize,
+    pub cap: usize,
+}
+
+/// `SYS_RECV`: ждать запрос; нагрузка ложится в `buf` (усечённая по его размеру).
+pub fn recv(buf: &mut [u8]) -> Message {
+    let (op, reply_cap, len, cap);
+    unsafe {
+        asm!("ecall", in("a7") SYS_RECV,
+             inout("a0") buf.as_mut_ptr() as usize => op,
+             inout("a1") buf.len() => reply_cap,
+             out("a2") len, out("a3") cap, options(nostack));
+    }
+    Message { op, reply_cap, len, cap }
+}
+
+/// `SYS_CALL` с передачей capability: послать `send` эндпоинту `ep`, ждать ответа в `recv`.
+/// Возвращает (байт ответа | MAX, право из ответа | [`NO_CAP`]). На передаваемое право
+/// (`cap` != NO_CAP) нужен `GRANT` — иначе ядро отклонит весь вызов.
+pub fn call_full(ep: usize, op: usize, send: &[u8], recv: &mut [u8], cap: usize) -> (usize, usize) {
+    let (n, got);
+    unsafe {
+        asm!("ecall", in("a7") SYS_CALL,
+             inout("a0") ep => n, inout("a1") op => got,
+             in("a2") send.as_ptr() as usize, in("a3") send.len(),
+             in("a4") recv.as_mut_ptr() as usize, in("a5") recv.len(),
+             in("a6") cap, options(nostack));
+    }
+    (n, got)
+}
+
+/// `SYS_CALL` без передачи права — обычный вызов сервера. Возвращает байты ответа (или MAX).
+pub fn call(ep: usize, op: usize, send: &[u8], recv: &mut [u8]) -> usize {
+    call_full(ep, op, send, recv, NO_CAP).0
+}
+
+/// `SYS_REPLY` с передачей capability: ответить клиенту по одноразовому reply-cap.
+pub fn reply_full(reply_cap: usize, buf: &[u8], cap: usize) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_REPLY,
+             inout("a0") reply_cap => r,
+             in("a1") buf.as_ptr() as usize, in("a2") buf.len(),
+             in("a3") cap, options(nostack));
+    }
+    r
+}
+
+/// `SYS_REPLY` без права — обычный ответ сервера.
+pub fn reply(reply_cap: usize, buf: &[u8]) -> usize {
+    reply_full(reply_cap, buf, NO_CAP)
+}
+
+/// `SYS_BLK_READ`: прочитать сектор диска (нужен cap на устройство с `READ`).
+pub fn blk_read(dev_cap: usize, sector: usize, buf: &mut [u8; 512]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_BLK_READ, inout("a0") dev_cap => r,
+             in("a1") sector, in("a2") buf.as_mut_ptr() as usize, options(nostack));
+    }
+    r
+}
+
+/// `SYS_BLK_WRITE`: записать сектор диска (нужен cap на устройство с `WRITE`).
+pub fn blk_write(dev_cap: usize, sector: usize, data: &[u8]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_BLK_WRITE, inout("a0") dev_cap => r,
+             in("a1") sector, in("a2") data.as_ptr() as usize, in("a3") data.len(),
+             options(nostack));
+    }
+    r
+}
+
+/// `SYS_OBJ_PUT`: сохранить значение в store, content-id — в `id_out` (нужен `WRITE`).
+pub fn obj_put(store_cap: usize, data: &[u8], id_out: &mut [u8; 32]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_OBJ_PUT, inout("a0") store_cap => r,
+             in("a1") data.as_ptr() as usize, in("a2") data.len(),
+             in("a3") id_out.as_mut_ptr() as usize, options(nostack));
+    }
+    r
+}
+
+/// `SYS_OBJ_GET`: прочитать значение по content-id (нужен `READ`). Возвращает длину (0 — нет).
+pub fn obj_get(store_cap: usize, id: &[u8; 32], out: &mut [u8]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_OBJ_GET, inout("a0") store_cap => r,
+             in("a1") id.as_ptr() as usize, in("a2") out.as_mut_ptr() as usize,
+             in("a3") out.len(), options(nostack));
+    }
+    r
+}
+
+/// `SYS_OBJ_SET_ROOT`: привязать именованный корень к значению — атомарный чекпойнт store
+/// (нужен `WRITE`). Привязанное переживает и GC, и перезагрузку.
+pub fn obj_set_root(store_cap: usize, name: &[u8], id: &[u8; 32]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_OBJ_SET_ROOT, inout("a0") store_cap => r,
+             in("a1") name.as_ptr() as usize, in("a2") name.len(),
+             in("a3") id.as_ptr() as usize, options(nostack));
+    }
+    r
+}
+
+/// `SYS_OBJ_GET_ROOT`: content-id именованного корня → `id_out`. 32 — есть, 0 — нет, MAX — отказ.
+pub fn obj_get_root(store_cap: usize, name: &[u8], id_out: &mut [u8; 32]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_OBJ_GET_ROOT, inout("a0") store_cap => r,
+             in("a1") name.as_ptr() as usize, in("a2") name.len(),
+             in("a3") id_out.as_mut_ptr() as usize, options(nostack));
+    }
+    r
+}
+
+/// `SYS_OBJ_DEL_ROOT`: отвязать корень (объект уйдёт в GC, если недостижим). 0/1/MAX.
+pub fn obj_del_root(store_cap: usize, name: &[u8]) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_OBJ_DEL_ROOT, inout("a0") store_cap => r,
+             in("a1") name.as_ptr() as usize, in("a2") name.len(), options(nostack));
+    }
+    r
+}
+
+/// `SYS_READ`: прочитать доступный ввод консоли (хотя бы один байт; блокируется до ввода).
+pub fn read_stdin(buf: &mut [u8]) -> usize {
+    let n;
+    unsafe {
+        asm!("ecall", in("a7") SYS_READ, inout("a0") buf.as_mut_ptr() as usize => n,
+             in("a1") buf.len(), options(nostack));
+    }
+    n
+}
+
+/// `SYS_EXEC`: запустить программу из store по имени корня и дождаться завершения
+/// (нужно право `EXEC` на store). Возвращает код выхода ребёнка или MAX.
+pub fn exec(exec_cap: usize, name: &[u8]) -> usize {
+    let code;
+    unsafe {
+        asm!("ecall", in("a7") SYS_EXEC, inout("a0") exec_cap => code,
+             in("a1") name.as_ptr() as usize, in("a2") name.len(), options(nostack));
+    }
+    code
+}
+
+/// `SYS_CAP_DERIVE`: урезанная копия СВОЕГО права (права ∩ mask) — аттенуация у себя,
+/// `GRANT` не нужен. Возвращает новый дескриптор или MAX.
+pub fn cap_derive(cap: usize, mask: usize) -> usize {
+    let r;
+    unsafe {
+        asm!("ecall", in("a7") SYS_CAP_DERIVE, inout("a0") cap => r,
+             in("a1") mask, options(nostack));
+    }
+    r
+}
+
+/// `SYS_MAP`: лениво зарезервировать `len` байт кучи (роль mmap/sbrk). Физические страницы
+/// придут по page fault при первом обращении — обнулёнными. Возвращает VA начала или MAX.
+pub fn heap_map(len: usize) -> usize {
+    let va;
+    unsafe {
+        asm!("ecall", in("a7") SYS_MAP, inout("a0") len => va, options(nostack));
+    }
+    va
+}
+
+// ─── POSIX-shim (Веха 18.4) ───────────────────────────────────────────────────
+
+/// Тонкий слой, ПРЯЧУЩИЙ ecall/op-коды/capability/IPC: программа зовёт `open/read/write/...`
+/// и «не знает», что под ней VOID. `ep` — непрозрачный дескриптор «связи с ОС» (эндпоинт
+/// персоналии), выданный при запуске, как контекст libc. Дескрипторы наружу смещены на
+/// [`FD_BASE`]: 0/1/2 зарезервированы под stdin/stdout/stderr (POSIX); `write` на 1/2 идёт
+/// в консоль ядра, `read` с 0 — в `SYS_READ` (блокируется до ввода).
+pub mod posix {
+    /// op-коды персоналии: операция (младший байт) | fd (байт 8..16) | режим open (байт 16..24).
+    pub const OP_OPEN: usize = 0;
+    pub const OP_READ: usize = 1;
+    pub const OP_WRITE: usize = 2;
+    pub const OP_CLOSE: usize = 3;
+    /// stat(name) -> [exists:1 | size:4 LE]
+    pub const OP_STAT: usize = 4;
+    /// unlink(name): снять корень + убрать из каталога
+    pub const OP_UNLINK: usize = 5;
+    /// readdir() -> имена через '\n'
+    pub const OP_READDIR: usize = 6;
+    /// открыть с курсором в конце
+    pub const O_APPEND: usize = 1 << 0;
+    /// открыть, обнулив содержимое
+    pub const O_TRUNC: usize = 1 << 1;
+
+    pub const STDIN: usize = 0;
+    pub const STDOUT: usize = 1;
+    /// Первый настоящий файловый дескриптор (0/1/2 — потоки консоли).
+    pub const FD_BASE: usize = 3;
+
+    /// `open(name, mode) -> fd` (или `usize::MAX`).
+    pub fn open(ep: usize, name: &[u8], mode: usize) -> usize {
+        let mut r = [0u8; 4];
+        crate::call(ep, OP_OPEN | (mode << 16), name, &mut r);
+        if r[0] == 0xff {
+            usize::MAX
+        } else {
+            r[0] as usize + FD_BASE
+        }
+    }
+
+    /// `read(fd, buf) -> n`. `fd`=0 — stdin консоли (блокируется до ввода).
+    pub fn read(ep: usize, fd: usize, buf: &mut [u8]) -> usize {
+        if fd == STDIN {
+            return crate::read_stdin(buf);
+        }
+        if fd < FD_BASE {
+            return 0;
+        }
+        crate::call(ep, OP_READ | ((fd - FD_BASE) << 8), &[], buf)
+    }
+
+    /// `write(fd, buf) -> len`. `fd`=1/2 → консоль ядра.
+    pub fn write(ep: usize, fd: usize, buf: &[u8]) -> usize {
+        if fd < FD_BASE {
+            crate::write(buf);
+            return buf.len();
+        }
+        crate::call(ep, OP_WRITE | ((fd - FD_BASE) << 8), buf, &mut []);
+        buf.len()
+    }
+
+    /// `close(fd)` — персоналия при закрытии пишет изменённый файл в store (персистентность).
+    pub fn close(ep: usize, fd: usize) {
+        if fd < FD_BASE {
+            return;
+        }
+        crate::call(ep, OP_CLOSE | ((fd - FD_BASE) << 8), &[], &mut []);
+    }
+
+    /// `readdir(buf) -> n`: имена файлов через '\n' (для `ls`).
+    pub fn readdir(ep: usize, buf: &mut [u8]) -> usize {
+        crate::call(ep, OP_READDIR, &[], buf)
+    }
+
+    /// `spawn(name) -> код выхода` (аналог `posix_spawn`+`wait`): запустить программу из store
+    /// по имени корня. `exec_cap` — непрозрачный дескриптор «права запускать». MAX — не запустилось.
+    pub fn spawn(exec_cap: usize, name: &[u8]) -> usize {
+        crate::exec(exec_cap, name)
+    }
+
+    /// `cat path` — прочитать файл и вывести в stdout. Только через shim.
+    pub fn cat(ep: usize, path: &[u8]) {
+        let mut buf = [0u8; 512];
+        let fd = open(ep, path, 0);
+        if fd == usize::MAX {
+            return;
+        }
+        loop {
+            let n = read(ep, fd, &mut buf);
+            if n == 0 {
+                break;
+            }
+            write(ep, STDOUT, &buf[..n]);
+        }
+        close(ep, fd);
+    }
+
+    /// `echo msg > path` — записать строку в файл. Только через shim.
+    pub fn echo_to(ep: usize, path: &[u8], msg: &[u8]) {
+        let fd = open(ep, path, O_TRUNC);
+        if fd != usize::MAX {
+            write(ep, fd, msg);
+            close(ep, fd);
+        }
+    }
+}

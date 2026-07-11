@@ -57,8 +57,8 @@ pub const USER_REGION_START: usize = 0x4000_0000;
 
 // ─── ядерный trap-стек для trap'ов из U-mode ──────────────────────────────────
 // 64 КиБ — как загрузочный стек ядра (linker.ld): syscall'ы делают настоящую работу
-// (`object::put` → BLAKE3 + куча + `println!`), а в debug-сборке кадры крупные. С 16 КиБ
-// стек переполнялся ВНИЗ в read-only секцию `.user` (store page fault на записи локали).
+// (`object::put` → BLAKE3 + куча + `println!`), а в -O0-сборках кадры были крупные: с 16 КиБ
+// стек однажды переполнялся ВНИЗ в соседнюю read-only секцию (store page fault на записи).
 const TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(align(16))]
@@ -135,10 +135,9 @@ static mut RETURN_CTX: Context = Context { ra: 0, sp: 0, s: [0; 12] };
 
 // ─── создание и запуск ────────────────────────────────────────────────────────
 
-/// Новое адресное пространство процесса: клон корня ядра (даёт доступ к ядру и к общему коду
-/// `.user`) + приватный стек в незанятом регионе VPN[2]=1. Общий путь для [`spawn`] (код `.user`,
-/// как раньше) и [`spawn_elf`] (код из ELF, загруженного по content-id, Веха 19) — оба процесса
-/// устроены одинаково, различается лишь ИСТОЧНИК кода/точки входа.
+/// Новое адресное пространство процесса: клон корня ядра (ядро отображено без флага U — нужно
+/// trap-обработчику при satp процесса) + приватный стек в незанятом регионе VPN[2]=1. Код и
+/// данные добавит [`crate::elf::load`]: с Вехи 23 процессы приходят ТОЛЬКО из ELF в store.
 fn new_address_space() -> usize {
     let root = paging::clone_kernel_root();
     // Приватный стек в VPN[2]=1: несколько страниц из свежих фреймов.
@@ -189,15 +188,8 @@ fn create_process_locked(
     t.procs.len() - 1
 }
 
-/// Создать процесс со входом `entry` в общем коде `.user` (как на Вехах 10–18): своё адресное
-/// пространство + стартовый кадр. См. [`create_process`] за деталями инициализации.
-pub fn spawn(name: &'static str, entry: usize, arg: usize) -> usize {
-    let root = new_address_space();
-    create_process(name, root, entry, arg)
-}
-
-/// Веха 19.2/19.3 — создать процесс из СОБСТВЕННОГО статического ELF64/RISC-V (не из `.user`):
-/// новое адресное пространство, [`crate::elf::load`] разбирает `elf` и маппит его `PT_LOAD`-
+/// Веха 19.2/19.3 — создать процесс из статического ELF64/RISC-V (с Вехи 23 — единственный
+/// способ): новое адресное пространство, [`crate::elf::load`] разбирает `elf` и маппит его `PT_LOAD`-
 /// сегменты по правам `p_flags` (W^X), точка входа — `e_entry` файла, а не адрес функции в
 /// образе ядра. `elf` может быть чем угодно (в т.ч. байтами, прочитанными [[object-model|из
 /// store]] по content-id, см. `main::exec_demo`) — загрузчик не предполагает, что они лежат
@@ -457,11 +449,20 @@ fn syscall(t: &mut Table, cur: usize) {
     match num {
         // SYS_WRITE(ptr, len): напечатать буфер процесса (ядро читает U-память, SUM=1).
         1 => {
+            let (ptr, len) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11])
+            };
+            // Веха 23: буфер может лежать в ленивой куче — доотобразить до чтения ядром.
+            let result = if ensure_heap_range(t, cur, ptr, len) {
+                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                crate::print!("{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
+                len
+            } else {
+                usize::MAX
+            };
             let f = &mut t.procs[cur].frame;
-            let (ptr, len) = (f.regs[10], f.regs[11]);
-            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-            crate::print!("{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
-            f.regs[10] = len;
+            f.regs[10] = result;
             f.sepc += 4;
         }
         // SYS_EXIT(code): завершить процесс, уступить следующему готовому. Если кто-то ждёт
@@ -604,7 +605,16 @@ fn syscall(t: &mut Table, cur: usize) {
                 Ok(dest) => {
                     println!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
                     if dest < t.procs.len() && t.procs[dest].state == State::ReplyWait {
-                        let n = len.min(t.procs[dest].recv_cap);
+                        let mut n = len.min(t.procs[dest].recv_cap);
+                        // Веха 23: оба конца могут лежать в ленивых кучах — доотобразить: свой
+                        // буфер ядро читает напрямую (S-фолт фатален), приёмник клиента
+                        // транслируется постранично (немапленное молча пропало бы).
+                        if n > 0
+                            && !(ensure_heap_range(t, cur, src, n)
+                                && ensure_heap_range(t, dest, t.procs[dest].recv_buf, n))
+                        {
+                            n = 0; // фреймы кончились — честнее не доставить ничего
+                        }
                         // Читаем из текущего (сервера) по SUM=1; пишем в пространство клиента через
                         // трансляцию его таблицы (физ. адрес отображён в ядре идентично).
                         // Пустой ответ (n=0, напр. только право — Веха 21) не строит слайс:
@@ -661,7 +671,8 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
-                Ok(cap::Device::Block) => {
+                // Веха 23: приёмный буфер может лежать в ленивой куче — доотобразить.
+                Ok(cap::Device::Block) if ensure_heap_range(t, cur, ubuf, 512) => {
                     println!("  [blk] P{} SYS_BLK_READ сектор {} (по cap)", cur, sector);
                     let mut tmp = [0u8; 512];
                     let ok = crate::virtio_blk::read(sector as u64, &mut tmp);
@@ -671,6 +682,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     }
                     if ok { 0 } else { usize::MAX }
                 }
+                Ok(_) => usize::MAX, // право есть, а фреймов под ленивый буфер нет
                 Err(e) => {
                     println!("  [blk] P{} SYS_BLK_READ отклонён: {:?}  ← нет capability на устройство", cur, e);
                     usize::MAX
@@ -690,8 +702,10 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
-                // Веха 22.2: буфер может лежать в ленивой куче — доотобразить до чтения ядром.
-                Ok(()) if ensure_heap_range(t, cur, buf, len) => {
+                // Веха 22.2: буфер (и id_out — Веха 23) может лежать в ленивой куче —
+                // доотобразить до того, как ядро его тронет.
+                Ok(()) if ensure_heap_range(t, cur, buf, len)
+                    && ensure_heap_range(t, cur, idout, 32) => {
                     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
                     let id = crate::object::put(bytes);
                     let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
@@ -718,9 +732,10 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
-                // Веха 22.2: приёмный буфер может лежать в ленивой куче — доотобразить до
-                // записи ядром (весь ocap: лениво он выделился бы всё равно при чтении).
-                Ok(()) if ensure_heap_range(t, cur, obuf, ocap) => {
+                // Веха 22.2: приёмный буфер (и id_ptr — Веха 23) может лежать в ленивой куче —
+                // доотобразить до записи ядром (весь ocap: лениво он выделился бы всё равно).
+                Ok(()) if ensure_heap_range(t, cur, obuf, ocap)
+                    && ensure_heap_range(t, cur, idp, 32) => {
                     let mut id = [0u8; 32];
                     let src = unsafe { core::slice::from_raw_parts(idp as *const u8, 32) };
                     id.copy_from_slice(src);
@@ -755,7 +770,9 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
-                Ok(()) => {
+                // Веха 23: имя и id могут лежать в ленивой куче — доотобразить до чтения ядром.
+                Ok(()) if ensure_heap_range(t, cur, nptr, nlen)
+                    && ensure_heap_range(t, cur, idp, 32) => {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     let mut id = [0u8; 32];
                     let src = unsafe { core::slice::from_raw_parts(idp as *const u8, 32) };
@@ -773,6 +790,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         Err(_) => usize::MAX,
                     }
                 }
+                Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
                     println!("  [obj] P{} OBJ_SET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
@@ -791,7 +809,9 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
-                Ok(()) => {
+                // Веха 23: имя и id_out могут лежать в ленивой куче — доотобразить.
+                Ok(()) if ensure_heap_range(t, cur, nptr, nlen)
+                    && ensure_heap_range(t, cur, idout, 32) => {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     match core::str::from_utf8(name_bytes) {
                         Ok(name) => match crate::object::root(name) {
@@ -809,6 +829,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         Err(_) => usize::MAX,
                     }
                 }
+                Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
                     println!("  [obj] P{} OBJ_GET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
@@ -828,7 +849,8 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
-                Ok(cap::Device::Block) => {
+                // Веха 23: буфер данных может лежать в ленивой куче — доотобразить.
+                Ok(cap::Device::Block) if ensure_heap_range(t, cur, ubuf, len.min(512)) => {
                     let mut tmp = [0u8; 512];
                     let n = len.min(512);
                     let src = unsafe { core::slice::from_raw_parts(ubuf as *const u8, n) };
@@ -837,6 +859,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     println!("  [blk] P{} SYS_BLK_WRITE сектор {} ({} байт, по cap)", cur, sector, n);
                     if ok { 0 } else { usize::MAX }
                 }
+                Ok(_) => usize::MAX, // право есть, а фреймов под ленивый буфер нет
                 Err(e) => {
                     println!("  [blk] P{} SYS_BLK_WRITE отклонён: {:?}  ← нет capability (WRITE) на устройство", cur, e);
                     usize::MAX
@@ -856,7 +879,8 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
-                Ok(()) => {
+                // Веха 23: имя может лежать в ленивой куче — доотобразить до чтения ядром.
+                Ok(()) if ensure_heap_range(t, cur, nptr, nlen) => {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     match core::str::from_utf8(name_bytes) {
                         Ok(name) => {
@@ -870,6 +894,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         Err(_) => usize::MAX,
                     }
                 }
+                Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
                     println!("  [obj] P{} OBJ_DEL_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
@@ -941,6 +966,13 @@ fn syscall(t: &mut Table, cur: usize) {
                 let f = &t.procs[cur].frame;
                 (f.regs[10], f.regs[11])
             };
+            // Веха 23: приёмный буфер может лежать в ленивой куче — доотобразить до записи ядром.
+            if !ensure_heap_range(t, cur, buf, cap_len) {
+                let f = &mut t.procs[cur].frame;
+                f.regs[10] = usize::MAX;
+                f.sepc += 4;
+                return;
+            }
             let mut n = 0usize;
             while n < cap_len {
                 let Some(b) = uart::getc() else { break };
@@ -972,7 +1004,8 @@ fn syscall(t: &mut Table, cur: usize) {
             let dom = t.procs[cur].domain;
             let mut spawned = false;
             match cap::store(dom, Cap::from_bits(scap as u64), Rights::EXEC) {
-                Ok(()) => {
+                // Веха 23: имя может лежать в ленивой куче — доотобразить до чтения ядром.
+                Ok(()) if ensure_heap_range(t, cur, nptr, nlen) => {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     if let Ok(name) = core::str::from_utf8(name_bytes) {
                         // Байты ELF копируем из store и сразу отпускаем его замок.
@@ -1007,6 +1040,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         }
                     }
                 }
+                Ok(()) => println!("  [exec] P{} SYS_EXEC: фреймы кончились под ленивый буфер имени", cur),
                 Err(e) => println!(
                     "  [exec] P{} SYS_EXEC отклонён: {:?}  ← нет capability (EXEC) на store",
                     cur, e,
@@ -1084,7 +1118,15 @@ fn copy_between_spaces(
 /// `CAP_DERIVE`) и зафиксировать c-space на диск ([`cap::persist`] — передача права = чекпойнт).
 /// Возвращает (скопировано байт, дескриптор права у получателя | MAX).
 fn deliver_request(t: &Table, from: usize, to: usize) -> (usize, usize) {
-    let n = t.procs[from].send_len.min(t.procs[to].recv_cap);
+    let mut n = t.procs[from].send_len.min(t.procs[to].recv_cap);
+    // Веха 23: буферы обеих сторон могут лежать в ленивых кучах — доотобразить, иначе
+    // постраничная трансляция молча пропустила бы немапленные страницы.
+    if n > 0
+        && !(ensure_heap_range(t, from, t.procs[from].send_buf, n)
+            && ensure_heap_range(t, to, t.procs[to].recv_buf, n))
+    {
+        n = 0; // фреймы кончились — честнее не доставить ничего
+    }
     if n > 0 {
         copy_between_spaces(
             root_of(t.procs[from].satp),

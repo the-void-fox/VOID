@@ -1,0 +1,26 @@
+# void-user — базовый userspace VOID (Веха 23): библиотека syscall-шимов (src/lib.rs) + все
+# программы системы как отдельные бинари (src/bin/*). Каждый бинарь — самостоятельный статический
+# ELF64/RISC-V; ядро сеет их в объектный store под корни `bin/<имя>` и исполняет по content-id.
+# Секции `.user` в образе ядра больше не существует — это ЕДИНСТВЕННЫЙ способ появления кода
+# в U-mode.
+#
+# ВАЖНО: крейт НЕ входит в workspace ядра (см. `exclude` в ../../Cargo.toml) — он сам себе
+# workspace-root: свой таргет-скрипт линковки (linker.ld, база 0x4000_0000) и свой release-профиль.
+#
+# Профиль release настроен под жёсткий размер: все ELF ложатся в объектный store, который
+# кэшируется в куче ядра (всего 2 МиБ). opt-level="z" + LTO + panic="abort" + strip.
+# В отличие от кода в бывшей секции `.user`, оптимизации тут БЕЗОПАСНЫ: memset/memcpy приходят
+# из compiler_builtins самого бинаря, jump-таблицы ложатся в его собственную .rodata (страницы U).
+[package]
+name = "void-user"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+description = "Базовый userspace VOID: библиотека syscall-шимов и все программы системы (vsh, posixfs, серверы и демо) как отдельные ELF-бинари, исполняемые из объектного store по content-id."
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
