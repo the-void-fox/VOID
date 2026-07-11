@@ -14,11 +14,15 @@ status: active
     - [x] 19.1 — отдельный ELF-крейт userspace (`programs/hello`, 8.6 КиБ release): линковка на 0x4000_0000, PHDRS с W^X на этапе линковки, вывод через SYS_WRITE.
     - [x] 19.2 — минимальный ELF-загрузчик в ядре (`elf.rs`): PT_LOAD → U-страницы (W^X, bss), отказ W+X, entry из `e_entry`; `proc::spawn_elf` (общий путь с `spawn` через `new_address_space`/`create_process`).
     - [x] 19.3 — демо exec-по-ContentId в kmain (`exec_demo`): первый запуск сидит ELF в store под корнем `bin/hello`, второй грузит С ДИСКА (проверено, content-id совпадает).
+- [x] **Веха 20 — интерактивность: UART-ввод + shell `vsh`** — **закрыта**. См. [[interactive-shell]].
+    - [x] 20.1 — приём UART по прерыванию: FIFO+IER, кольцевой буфер ядра, PLIC на несколько источников; вычерпывание и на таймерных тиках (иначе буферы QEMU переполнялись — ввод терялся).
+    - [x] 20.2 — `SYS_READ` (stdin): блокировка `StdinWait` с РЕСТАРТОМ ecall; `proc::run` стал циклом с idle-ожиданием ввода (`wfi` без потерянных пробуждений — просыпается от pending при SIE=0).
+    - [x] 20.3 — `SYS_EXEC` по имени корня под НОВЫМ правом `Rights::EXEC` (аттенуация «только запуск»); foreground-ожидание ребёнка (`ExecWait` → код выхода в a0); `OBJ_SET_ROOT`/`DEL_ROOT` теперь атомарный чекпойнт — файлы сессии переживают перезагрузку.
+    - [x] 20.4 — интерактивный `vsh` на POSIX-shim (`sh_read(fd=0)`, `sh_spawn`): ls/cat/echo>file/run/help/exit, эхо+backspace; финальная стадия kmain вместо простоя wfi.
 
 ## Скоро
-- [ ] Веха 20 — UART-ввод + интерактивный shell (`ls`/`cat`/`echo`/`run <имя>`).
 - [ ] Веха 21 — cap-transfer по IPC + персистентный c-space (завершает тезис ADR 0002).
-- [ ] Веха 22 — куча процесса (`SYS_MAP`, ленивые страницы) + user page fault убивает процесс, не ядро.
+- [ ] Веха 22 — куча процесса (`SYS_MAP`, ленивые страницы) + user page fault убивает процесс, не ядро; после неё — переезд `vsh` из `.user` в ELF из store.
 
 ## Когда-нибудь
 - [ ] Фоновый arch-рефакторинг: архзависимое → `kernel/src/arch/riscv64/` (подготовка к x86/aarch64, см. [[phase-2-state-analysis]]).
@@ -71,7 +75,7 @@ status: active
 ## Фаза 3 — самостоятельность (см. [[0003-phase-3-exec-by-hash]])
 Центральный примитив фазы: **программа = контент-адресуемый объект, exec по ContentId** — как derivation в Nix, прямое следствие ADR 0002.
 - [x] **Веха 19.** Программа как объект store: ELF-крейт `programs/hello` → байты в store под корнем `bin/hello` → минимальный ELF-загрузчик (PT_LOAD, W^X) → `spawn_elf` по ContentId; на втором запуске ELF грузится с диска. См. [[exec-from-store]].
-- [ ] **Веха 20.** UART-ввод (IRQ → async-канал) + интерактивный `mini-sh`: `ls`/`cat`/`echo`/`run <имя|hash>`.
+- [x] **Веха 20.** UART-ввод по прерыванию (кольцевой буфер, вычерпывание на тиках) + `SYS_READ`/`SYS_EXEC` (право `EXEC`, foreground-ожидание) + интерактивный `vsh`: `ls`/`cat`/`echo > f`/`run bin/hello`/`exit`; смена корня из userspace = атомарный чекпойнт. См. [[interactive-shell]].
 - [ ] **Веха 21.** Cap-transfer по IPC (grant-в-сообщении) + персистентный c-space — capability переживают перезагрузку, тезис ADR 0002 полный.
 - [ ] **Веха 22.** Куча процесса (`SYS_MAP`, ленивые страницы); user page fault убивает процесс, а не ядро; снять лимиты POSIX-персоналии (4 файла × 256 байт).
 
