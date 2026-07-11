@@ -43,6 +43,9 @@ pub fn arm() {
 pub fn preempt_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     arm_next();
+    // Веха 20.1: в сессиях процессов внешние прерывания выключены (SEIE=0) — вычерпываем
+    // ввод UART опросом на каждом тике, чтобы FIFO/буферы QEMU не переполнялись.
+    crate::uart::drain_rx();
 }
 
 /// Сколько было вытеснений с момента запуска таймера.
@@ -54,5 +57,6 @@ pub fn ticks() -> u64 {
 pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     arm_next(); // перевзвести (это же сбрасывает pending-бит таймера)
+    crate::uart::drain_rx(); // Веха 20.1: подобрать ввод, пришедший между прерываниями UART
     crate::sched::yield_now(); // ВЫТЕСНЕНИЕ: уступить процессор следующей задаче
 }

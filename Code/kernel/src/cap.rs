@@ -285,12 +285,13 @@ pub fn revoke(dom: DomainId, cap: Cap) -> Result<(), CapError> {
     Ok(())
 }
 
-/// «rwgs»-строка прав для вывода (read · write · grant · send).
+/// «rwgsx»-строка прав для вывода (read · write · grant · send · exec).
 pub fn rights_str(r: Rights) -> String {
     let mut s = String::new();
     s.push(if r.contains(Rights::READ) { 'r' } else { '-' });
     s.push(if r.contains(Rights::WRITE) { 'w' } else { '-' });
     s.push(if r.contains(Rights::GRANT) { 'g' } else { '-' });
     s.push(if r.contains(Rights::SEND) { 's' } else { '-' });
+    s.push(if r.contains(Rights::EXEC) { 'x' } else { '-' });
     s
 }

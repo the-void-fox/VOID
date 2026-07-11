@@ -14,6 +14,8 @@
 //! Доводка (после Вехи 9): ленивая загрузка/мультикорни/coalescing, BLAKE3, GC+граф объектов,
 //! virtio-blk на прерываниях (PLIC) + async I/O (пробуждение future из IRQ).
 //! Веха 10: пользовательский режим (U-mode) + syscall'ы + процессы со своим адресным пространством.
+//! Веха 19: программа как объект store — exec по content-id (Фаза 3, [[exec-from-store]]).
+//! Веха 20: интерактивность — ввод UART по прерыванию, SYS_READ/SYS_EXEC, shell `vsh`.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -78,8 +80,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 9                            ║");
-    println!("  ║  async-executor · future над объектами    ║");
+    println!("  ║  VOID — Веха 20                           ║");
+    println!("  ║  интерактивность · vsh · exec по хэшу     ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -114,6 +116,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         csr::enable_external_interrupt();
         println!("  [plic] внешние прерывания вкл (virtio-blk IRQ {})", virtio_blk::irq());
     }
+
+    // Веха 20.1: приём UART по прерыванию. Байты копятся в кольцевом буфере ядра с этого
+    // момента — ввод, набранный (или поданный через pipe) во время демо, не теряется и
+    // достанется shell'у в конце загрузки.
+    uart::init_rx();
+    plic::enable(uart::IRQ);
+    println!("  [uart] приём по прерыванию вкл (IRQ {})", uart::IRQ);
 
     // Веха 7.2: загрузить состояние с диска (RAM — кэш, диск — истина).
     if object::load() {
@@ -205,12 +214,48 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         object::generation(),
     );
     println!();
+
+    // Веха 20: интерактивная сессия — ФИНАЛЬНАЯ стадия вместо простоя. Система остаётся
+    // живой, пока пользователь не наберёт `exit`. Записи файлов внутри сессии персистентны:
+    // каждый OBJ_SET_ROOT из userspace — атомарный чекпойнт (см. [[posix-personality]]).
+    shell_session();
+
+    println!();
     println!("  [idle] перезагрузи QEMU — состояние вернётся. Простаиваем (wfi).");
 
     loop {
         // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
         unsafe { core::arch::asm!("wfi") }
     }
+}
+
+/// Веха 20.4: интерактивная сессия. Сервер-персоналия получает cap на store (r/w — файлы), а
+/// `vsh` — ДВА начальных cap: эндпоинт персоналии (a0, право SEND) и cap на store ТОЛЬКО с
+/// правом EXEC (a1): запускать программы можно, читать/писать объекты напрямую — нельзя
+/// (аттенуация «только запуск»). Ввод — SYS_READ с UART по прерыванию; `run bin/hello`
+/// исполняет ELF из store по имени корня (машинерия Вехи 19 руками пользователя).
+fn shell_session() {
+    use void_abi::Rights;
+
+    println!("  [vsh] интерактивная сессия (Веха 20) — ls · cat · echo · run bin/hello · exit:");
+    let server = proc::spawn("posixfs", user::posix_server_entry(), 0);
+    let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
+    proc::set_arg(server, scap.bits() as usize);
+    let sh = proc::spawn("vsh", user::vsh_entry(), 0);
+    let ep = cap::mint(proc::domain(sh), cap::Target::Endpoint(server), Rights::SEND);
+    proc::set_arg(sh, ep.bits() as usize);
+    let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC);
+    proc::set_arg2(sh, xcap.bits() as usize);
+    println!(
+        "    P{} 'posixfs' [{}] ← P{} 'vsh' [эндпоинт {} + store {}]",
+        server,
+        cap::rights_str(Rights::READ.union(Rights::WRITE)),
+        sh,
+        cap::rights_str(Rights::SEND),
+        cap::rights_str(Rights::EXEC),
+    );
+    proc::run();
+    println!("  [vsh] сессия завершена (exit) — обратно в ядро");
 }
 
 /// Веха 8: демонстрация свойств capability на общем объектном store.

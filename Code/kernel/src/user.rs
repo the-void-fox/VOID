@@ -11,7 +11,9 @@
 //!   10 = OBJ_SET_ROOT(store_cap,name,name_len,id_ptr) -> 0/MAX,
 //!   11 = OBJ_GET_ROOT(store_cap,name,name_len,id_out) -> 32/0/MAX,
 //!   12 = BLK_WRITE(dev_cap,sector,buf,len) -> 0/MAX,
-//!   13 = OBJ_DEL_ROOT(store_cap,name,name_len) -> 0/1/MAX  (Веха 18.3: unlink).
+//!   13 = OBJ_DEL_ROOT(store_cap,name,name_len) -> 0/1/MAX  (Веха 18.3: unlink),
+//!   14 = READ(buf,cap) -> n  (stdin консоли; блокируется до ввода — Веха 20.2),
+//!   15 = EXEC(store_cap,name,name_len) -> код выхода/MAX  (запуск из store, право EXEC — Веха 20.3).
 //!
 //! Веха 12: **capability-защищённые эндпоинты** (драйвер-сервер + клиент через IPC).
 //! Веха 13: **сервер объектного store** — процесс с cap на store отдаёт put/get объектов по IPC
@@ -761,9 +763,15 @@ unsafe fn sh_open(ep: usize, name: *const u8, name_len: usize, mode: usize) -> u
     if pfd == 0xff { usize::MAX } else { pfd + FD_BASE }
 }
 
-/// `read(fd, buf, cap) -> n`.
+/// `read(fd, buf, cap) -> n`. `fd`=0 — stdin консоли: SYS_READ ядра, блокируется до ввода
+/// (Веха 20.2; программа не знает, что под этим UART, прерывание и кольцевой буфер).
 #[link_section = ".user"]
 unsafe fn sh_read(ep: usize, fd: usize, buf: *mut u8, cap: usize) -> usize {
+    if fd == 0 {
+        let n: usize;
+        asm!("ecall", in("a7") 14usize, inout("a0") buf as usize => n, in("a1") cap, options(nostack));
+        return n;
+    }
     if fd < FD_BASE {
         return 0;
     }
@@ -808,6 +816,17 @@ unsafe fn sh_readdir(ep: usize, buf: *mut u8, cap: usize) -> usize {
 #[link_section = ".user"]
 unsafe fn sh_exit(code: usize) -> ! {
     asm!("ecall", in("a7") 2usize, in("a0") code, options(nostack, noreturn));
+}
+
+/// `spawn(name) -> код выхода` (аналог `posix_spawn` + `wait`, Веха 20.3): запустить программу
+/// из store по имени корня и дождаться её завершения. `xcap` — непрозрачный дескриптор «права
+/// запускать» (ядро требует `EXEC` на store), выданный при старте так же, как `ep` — дескриптор
+/// «связи с файлами». `usize::MAX` — не запустилось (нет корня/негодный ELF/нет права).
+#[link_section = ".user"]
+unsafe fn sh_spawn(xcap: usize, name: *const u8, name_len: usize) -> usize {
+    let code: usize;
+    asm!("ecall", in("a7") 15usize, inout("a0") xcap => code, in("a1") name as usize, in("a2") name_len, options(nostack));
+    code
 }
 
 /// `mini-echo`: записать строку в файл (как `echo msg > path`). Только через shim.
@@ -864,6 +883,117 @@ extern "C" fn mini_sh(ep: usize) -> ! {
     }
 }
 
+// ── Веха 20.4: интерактивный shell (vsh) ──
+// Статики читает ЯДРО (SYS_WRITE, SUM=1) — можно в .rodata; сравнения команд процесс делает
+// сам в U-mode, поэтому там — прямые сравнения байтов, без статиков-образцов.
+static PROMPT: [u8; b"vsh> ".len()] = *b"vsh> ";
+static VSH_HELP: [u8; b"commands: ls | cat FILE | echo TEXT > FILE | run NAME | help | exit\n".len()] =
+    *b"commands: ls | cat FILE | echo TEXT > FILE | run NAME | help | exit\n";
+static VSH_NOCMD: [u8; b"vsh: unknown command (try 'help')\n".len()] =
+    *b"vsh: unknown command (try 'help')\n";
+static VSH_RUNFAIL: [u8; b"vsh: run failed (no such program in store?)\n".len()] =
+    *b"vsh: run failed (no such program in store?)\n";
+static VSH_EXITED: [u8; b"vsh: program exited, code ".len()] = *b"vsh: program exited, code ";
+static VSH_BS: [u8; 3] = *b"\x08 \x08"; // затереть символ на терминале при backspace
+
+/// Процесс-**интерактивный shell** (Веха 20.4): НАСТОЯЩИЙ ввод с консоли. Написан на POSIX-shim:
+/// stdin — это `sh_read(fd=0)` (блокируется до нажатий), файлы — те же open/read/write через
+/// персоналию, запуск программ — `sh_spawn` (как `posix_spawn`+`wait`). Аргументы: `ep` (a0) —
+/// дескриптор персоналии, `xcap` (a1) — дескриптор права запускать программы из store.
+///
+/// Line-discipline на стороне программы: эхо набранного, backspace (`\x7f`/`\x08`), Enter =
+/// `\r` (терминал) или `\n` (pipe). Команды: `ls`, `cat F`, `echo TEXT > F` (или просто печать),
+/// `run NAME` (например `run bin/hello`), `help`, `exit` — последняя завершает сессию VOID.
+#[link_section = ".user"]
+extern "C" fn vsh(ep: usize, xcap: usize) -> ! {
+    let mut line = MaybeUninit::<[u8; 128]>::uninit(); // собираемая строка команды
+    let lp = line.as_mut_ptr() as *mut u8;
+    let mut inb = MaybeUninit::<[u8; 16]>::uninit(); // порция сырого ввода из SYS_READ
+    let ip = inb.as_mut_ptr() as *mut u8;
+    let mut out = MaybeUninit::<[u8; 512]>::uninit(); // ответы персоналии (ls)
+    let op = out.as_mut_ptr() as *mut u8;
+    unsafe {
+        sh_write(ep, STDOUT, VSH_HELP.as_ptr(), VSH_HELP.len());
+        loop {
+            sh_write(ep, STDOUT, PROMPT.as_ptr(), PROMPT.len());
+            // ── собрать строку: читать порциями, эхо, backspace, до Enter ──
+            let mut llen = 0usize;
+            'line: loop {
+                let n = sh_read(ep, 0, ip, 16); // блокируется, пока нет ввода
+                let mut i = 0;
+                while i < n {
+                    let b = *ip.add(i);
+                    i += 1;
+                    if b == b'\r' || b == b'\n' {
+                        sh_write(ep, STDOUT, NL.as_ptr(), 1);
+                        break 'line;
+                    } else if b == 0x7f || b == 0x08 {
+                        if llen > 0 {
+                            llen -= 1;
+                            sh_write(ep, STDOUT, VSH_BS.as_ptr(), VSH_BS.len());
+                        }
+                    } else if b >= 0x20 && llen < 127 {
+                        *lp.add(llen) = b;
+                        llen += 1;
+                        sh_write(ep, STDOUT, lp.add(llen - 1), 1); // эхо
+                    }
+                }
+            }
+            if llen == 0 {
+                continue;
+            }
+            // ── разобрать команду (без кучи и fmt: прямые сравнения байтов) ──
+            if llen == 4 && *lp == b'e' && *lp.add(1) == b'x' && *lp.add(2) == b'i' && *lp.add(3) == b't' {
+                sh_exit(0);
+            }
+            if llen == 4 && *lp == b'h' && *lp.add(1) == b'e' && *lp.add(2) == b'l' && *lp.add(3) == b'p' {
+                sh_write(ep, STDOUT, VSH_HELP.as_ptr(), VSH_HELP.len());
+                continue;
+            }
+            if llen == 2 && *lp == b'l' && *lp.add(1) == b's' {
+                let n = sh_readdir(ep, op, 512);
+                sh_write(ep, STDOUT, op, n);
+                continue;
+            }
+            if llen > 4 && *lp == b'c' && *lp.add(1) == b'a' && *lp.add(2) == b't' && *lp.add(3) == b' ' {
+                mini_cat(ep, lp.add(4), llen - 4);
+                continue;
+            }
+            if llen >= 5 && *lp == b'e' && *lp.add(1) == b'c' && *lp.add(2) == b'h' && *lp.add(3) == b'o' && *lp.add(4) == b' ' {
+                // `echo TEXT > FILE` — записать; без ` > ` — просто напечатать TEXT.
+                let body = 5usize;
+                let mut sep = usize::MAX; // позиция последнего " > "
+                let mut k = body;
+                while k + 2 < llen {
+                    if *lp.add(k) == b' ' && *lp.add(k + 1) == b'>' && *lp.add(k + 2) == b' ' {
+                        sep = k;
+                    }
+                    k += 1;
+                }
+                if sep != usize::MAX && sep + 3 < llen && sep > body {
+                    mini_echo(ep, lp.add(sep + 3), llen - sep - 3, lp.add(body), sep - body);
+                } else {
+                    sh_write(ep, STDOUT, lp.add(body), llen - body);
+                    sh_write(ep, STDOUT, NL.as_ptr(), 1);
+                }
+                continue;
+            }
+            if llen > 4 && *lp == b'r' && *lp.add(1) == b'u' && *lp.add(2) == b'n' && *lp.add(3) == b' ' {
+                let code = sh_spawn(xcap, lp.add(4), llen - 4);
+                if code == usize::MAX {
+                    sh_write(ep, STDOUT, VSH_RUNFAIL.as_ptr(), VSH_RUNFAIL.len());
+                } else {
+                    sh_write(ep, STDOUT, VSH_EXITED.as_ptr(), VSH_EXITED.len());
+                    let digits = [b'0' + ((code % 10) as u8), b'\n'];
+                    sh_write(ep, STDOUT, digits.as_ptr(), 2);
+                }
+                continue;
+            }
+            sh_write(ep, STDOUT, VSH_NOCMD.as_ptr(), VSH_NOCMD.len());
+        }
+    }
+}
+
 /// Точки входа (identity VA секции `.user`).
 pub fn blk_server_entry() -> usize {
     blk_server as *const () as usize
@@ -885,6 +1015,9 @@ pub fn posix_server_entry() -> usize {
 }
 pub fn mini_sh_entry() -> usize {
     mini_sh as *const () as usize
+}
+pub fn vsh_entry() -> usize {
+    vsh as *const () as usize
 }
 pub fn label_a() -> usize {
     LBL_A.as_ptr() as usize

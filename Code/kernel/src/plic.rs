@@ -16,16 +16,24 @@ const CTX1_ENABLE: usize = PLIC_BASE + 0x2080; // маска источнико�
 const CTX1_THRESHOLD: usize = PLIC_BASE + 0x20_1000; // порог контекста 1
 const CTX1_CLAIM: usize = PLIC_BASE + 0x20_1004; // claim/complete контекста 1
 
-/// Настроить PLIC под один источник `irq`: приоритет > 0, разрешить в контексте 1, порог 0.
+/// Настроить PLIC и разрешить первый источник `irq`: порог 0, приоритет > 0, маска контекста 1.
+/// Дополнительные источники (Веха 20: UART) добавляются через [`enable`].
 pub fn init(irq: u32) {
+    unsafe {
+        // Порог 0 — пропускать любые приоритеты > 0.
+        write_volatile(CTX1_THRESHOLD as *mut u32, 0);
+    }
+    enable(irq);
+}
+
+/// Разрешить ещё один источник `irq` в контексте 1 (приоритет 1 + бит маски).
+pub fn enable(irq: u32) {
     unsafe {
         // Приоритет источника (0 = выключен; берём 1).
         write_volatile((PRIORITY + 4 * irq as usize) as *mut u32, 1);
         // Разрешить источник в битовой маске контекста 1.
         let reg = (CTX1_ENABLE + (irq as usize / 32) * 4) as *mut u32;
         write_volatile(reg, read_volatile(reg) | (1 << (irq % 32)));
-        // Порог 0 — пропускать любые приоритеты > 0.
-        write_volatile(CTX1_THRESHOLD as *mut u32, 0);
     }
 }
 
@@ -49,6 +57,8 @@ pub fn handle_external() {
     }
     if irq == crate::virtio_blk::irq() {
         crate::virtio_blk::on_irq();
+    } else if irq == crate::uart::IRQ {
+        crate::uart::on_irq(); // Веха 20.1: принятые байты → кольцевой буфер
     }
     complete(irq);
 }

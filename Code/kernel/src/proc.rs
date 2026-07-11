@@ -8,7 +8,13 @@
 //!
 //! Модель без ядерных нитей на процесс: каждый trap из U обрабатывается на общем trap-стеке,
 //! после чего ядро возобновляет тот процесс, что стал текущим ([`handle_user_trap`]).
+//!
+//! Веха 20 — **интерактивность**: `SYS_READ` блокирует процесс до ввода с консоли
+//! ([[uart|кольцевой буфер UART]]), планировщик умеет спать в ожидании ввода ([`wait_stdin`]),
+//! `SYS_EXEC` запускает программу из store по имени корня (право `EXEC`) и ждёт её завершения.
 
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -17,7 +23,7 @@ use void_abi::{Cap, ContentId, Rights};
 use crate::context::{context_switch, Context};
 use crate::sync::SpinLock;
 use crate::trap::TrapFrame;
-use crate::{cap, csr, elf, frame, paging, println, timer};
+use crate::{cap, csr, elf, frame, paging, println, timer, uart};
 
 // Ассемблерная функция входа в процесс: satp + восстановление регистров из кадра + sret.
 core::arch::global_asm!(include_str!("enter_user.s"));
@@ -60,6 +66,9 @@ enum State {
     Runnable,
     RecvWait,  // заблокирован в RECV (ждёт сообщения)
     ReplyWait, // заблокирован в CALL (ждёт ответа сервера)
+    StdinWait, // заблокирован в READ (ждёт ввода с консоли, Веха 20.2)
+    /// Заблокирован в EXEC: ждёт завершения процесса-ребёнка с этим id (Веха 20.3).
+    ExecWait(usize),
     Finished,
 }
 
@@ -130,13 +139,25 @@ fn new_address_space() -> usize {
 /// [`cap::Target::Endpoint`]. Пока Runnable. Начальные capability ядро минтит в [`domain`] и
 /// передаёт дескриптор через [`set_arg`] ДО [`run`].
 fn create_process(name: &'static str, root: usize, entry: usize, arg: usize) -> usize {
+    let mut t = TABLE.lock();
+    create_process_locked(&mut t, name, root, entry, arg)
+}
+
+/// То же, что [`create_process`], но под УЖЕ взятым замком таблицы — для `SYS_EXEC` (Веха 20.3),
+/// который создаёт процесс прямо из диспетчера syscall'ов (замок там уже держится).
+fn create_process_locked(
+    t: &mut Table,
+    name: &'static str,
+    root: usize,
+    entry: usize,
+    arg: usize,
+) -> usize {
     let mut frame = TrapFrame::default();
     frame.sepc = entry;
     frame.regs[2] = USER_STACK_TOP_VA; // sp
     frame.regs[10] = arg; // a0
     frame.sstatus = 1 << 18; // SUM=1, SPP=0 (→U), SPIE=0 (прерывания в U выключены)
     let domain = cap::create_domain(name);
-    let mut t = TABLE.lock();
     t.procs.push(Proc {
         satp: SATP_SV39 | (root >> 12),
         frame,
@@ -184,34 +205,95 @@ pub fn set_arg(pid: usize, a0: usize) {
     TABLE.lock().procs[pid].frame.regs[10] = a0;
 }
 
+/// Задать второй стартовый аргумент (`a1`) — когда начальных capability у процесса два
+/// (Веха 20: vsh получает эндпоинт персоналии в `a0` и exec-cap на store в `a1`).
+pub fn set_arg2(pid: usize, a1: usize) {
+    TABLE.lock().procs[pid].frame.regs[11] = a1;
+}
+
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
 /// RETURN_CTX и уходим в лончер (как в [[scheduling|context_switch]]-переключении нитей).
+///
+/// Веха 20.2: сессия стала циклом. Когда готовых процессов не осталось, но кто-то заблокирован
+/// в `SYS_READ` (StdinWait) — ядро НЕ выходит, а спит в [`wait_stdin`] до прерывания UART,
+/// будит читающих и продолжает сессию. Выход — только когда нет ни готовых, ни ждущих ввода.
 pub fn run() {
-    // Первый готовый процесс (может быть не индекс 0: после прошлой сессии часть процессов
-    // остаётся Finished/заблокированными). Нет готовых — выходим сразу.
-    let first = {
-        let t = TABLE.lock();
-        (0..t.procs.len()).find(|&i| t.procs[i].state == State::Runnable)
-    };
-    let Some(first) = first else { return };
     let sstatus_sie = csr::irq_save_disable(); // S-mode SIE (ядро НЕ вытесняется: SIE=0 в S-mode)
-    // Вытеснение процессов (Веха 16): разрешить ТАЙМЕР (STIE) — он прервёт процесс в U-mode
-    // (там sstatus.SIE не действует, гейтит только `sie`), и `handle_user_trap` переключит на
-    // следующего. Устройства (SEIE) на время сессии выключаем — их шлюзы работают опросом.
     let saved_sie = csr::read_sie();
-    csr::write_sie((saved_sie | (1 << 5)) & !(1 << 9)); // STIE=1, SEIE=0
-    timer::arm(); // вооружить первое вытеснение этой сессии
-    TABLE.lock().current = first;
-    unsafe {
-        let mut launch = Context::default();
-        launch.ra = proc_enter as *const () as usize;
-        launch.sp = trap_top();
-        context_switch(addr_of_mut!(RETURN_CTX), addr_of!(launch));
+    loop {
+        // Первый готовый процесс (может быть не индекс 0: после прошлой сессии часть процессов
+        // остаётся Finished/заблокированными).
+        let first = {
+            let t = TABLE.lock();
+            (0..t.procs.len()).find(|&i| t.procs[i].state == State::Runnable)
+        };
+        if let Some(first) = first {
+            // Вытеснение процессов (Веха 16): разрешить ТАЙМЕР (STIE) — он прервёт процесс в
+            // U-mode (там sstatus.SIE не действует, гейтит только `sie`), и `handle_user_trap`
+            // переключит на следующего. Устройства (SEIE) на время сессии выключаем — их шлюзы
+            // работают опросом, а ввод UART скапливается в PLIC как pending до [`wait_stdin`].
+            csr::write_sie((saved_sie | (1 << 5)) & !(1 << 9)); // STIE=1, SEIE=0
+            timer::arm(); // вооружить первое вытеснение этой сессии
+            TABLE.lock().current = first;
+            unsafe {
+                let mut launch = Context::default();
+                launch.ra = proc_enter as *const () as usize;
+                launch.sp = trap_top();
+                context_switch(addr_of_mut!(RETURN_CTX), addr_of!(launch));
+            }
+            // ── сюда возвращаемся, когда готовых не осталось ──
+            csr::write_sscratch(0);
+        }
+        // Готовых нет: если кто-то ждёт ввода — поспать до него и продолжить, иначе сессия окончена.
+        if !wait_stdin(saved_sie) {
+            break;
+        }
     }
-    // ── сюда возвращаемся, когда процессов не осталось ──
-    csr::write_sscratch(0);
     csr::write_sie(saved_sie); // вернуть прежние разрешения прерываний
     csr::irq_restore(sstatus_sie);
+}
+
+/// Idle-ожидание ввода (Веха 20.2). Если есть процессы в StdinWait — спать (`wfi`), пока
+/// прерывание UART не наполнит [[uart|кольцевой буфер]], затем разбудить ждущих и вернуть
+/// `true` (их `SYS_READ` рестартует: sepc не двигали). Ждущих нет — `false`.
+///
+/// Здесь `sstatus.SIE = 0`, поэтому «потерянного пробуждения» нет: `wfi` просыпается от
+/// PENDING прерывания независимо от SIE, а сам обработчик мы пускаем коротким окном с SIE=1.
+fn wait_stdin(saved_sie: usize) -> bool {
+    let waiting: Vec<usize> = {
+        let t = TABLE.lock();
+        (0..t.procs.len()).filter(|&i| t.procs[i].state == State::StdinWait).collect()
+    };
+    if waiting.is_empty() {
+        return false;
+    }
+    // Только внешние прерывания (SEIE): исполнять некого, таймер (STIE) не нужен.
+    csr::write_sie((saved_sie & !(1 << 5)) | (1 << 9));
+    while !uart::has_input() {
+        // SAFETY: wfi в S-mode; проснётся от pending SEIE-прерывания даже при SIE=0.
+        unsafe { core::arch::asm!("wfi") }
+        // Короткое окно с SIE=1 — принять trap: PLIC → uart::on_irq → кольцевой буфер.
+        csr::enable_interrupts();
+        csr::irq_save_disable();
+    }
+    let mut t = TABLE.lock();
+    for pid in waiting {
+        t.procs[pid].state = State::Runnable;
+    }
+    true
+}
+
+/// Разбудить процессы, ждущие в `SYS_EXEC` завершения ребёнка `child` (Веха 20.3): вернуть им
+/// код выхода `code`, продвинуть sepc (их ecall завершён) и сделать готовыми.
+fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
+    for i in 0..t.procs.len() {
+        if t.procs[i].state == State::ExecWait(child) {
+            let f = &mut t.procs[i].frame;
+            f.regs[10] = code;
+            f.sepc += 4;
+            t.procs[i].state = State::Runnable;
+        }
+    }
 }
 
 /// Лончер: возобновить текущий (первый) процесс.
@@ -244,6 +326,7 @@ pub fn handle_user_trap(frame: &mut TrapFrame, scause: usize) -> ! {
         } else {
             println!("  [proc] неожиданный trap из U (scause={:#x}) — процесс завершён", scause);
             t.procs[cur].state = State::Finished;
+            wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
             if let Some(n) = t.next_runnable(cur) {
                 t.current = n;
             }
@@ -295,10 +378,13 @@ fn syscall(t: &mut Table, cur: usize) {
             f.regs[10] = len;
             f.sepc += 4;
         }
-        // SYS_EXIT(code): завершить процесс, уступить следующему готовому.
+        // SYS_EXIT(code): завершить процесс, уступить следующему готовому. Если кто-то ждёт
+        // этот процесс в SYS_EXEC (Веха 20.3) — разбудить, вернув ему код выхода.
         2 => {
-            println!("  [proc] P{} SYS_EXIT({})", cur, t.procs[cur].frame.regs[10]);
+            let code = t.procs[cur].frame.regs[10];
+            println!("  [proc] P{} SYS_EXIT({})", cur, code);
             t.procs[cur].state = State::Finished;
+            wake_exec_waiters(t, cur, code);
             if let Some(n) = t.next_runnable(cur) {
                 t.current = n;
             }
@@ -526,7 +612,11 @@ fn syscall(t: &mut Table, cur: usize) {
                     match core::str::from_utf8(name_bytes) {
                         Ok(name) => {
                             crate::object::set_root(name, ContentId(id));
-                            println!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap)", cur, name);
+                            // Веха 20: смена корня из userspace = атомарный чекпойнт (A/B-индекс,
+                            // [[persistent-store]]). Иначе файлы интерактивной сессии жили бы
+                            // только до выключения QEMU (kmain-commit к этому моменту уже прошёл).
+                            crate::object::commit();
+                            println!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap, чекпойнт)", cur, name);
                             0
                         }
                         Err(_) => usize::MAX,
@@ -620,6 +710,9 @@ fn syscall(t: &mut Table, cur: usize) {
                     match core::str::from_utf8(name_bytes) {
                         Ok(name) => {
                             let existed = crate::object::del_root(name);
+                            if existed {
+                                crate::object::commit(); // Веха 20: снятие корня — тоже чекпойнт
+                            }
                             println!("  [obj] P{} OBJ_DEL_ROOT '{}' → {} (по cap)", cur, name, if existed { "снят" } else { "не было" });
                             if existed { 0 } else { 1 }
                         }
@@ -634,6 +727,93 @@ fn syscall(t: &mut Table, cur: usize) {
             let f = &mut t.procs[cur].frame;
             f.regs[10] = result;
             f.sepc += 4;
+        }
+        // SYS_READ(buf, cap) -> n: прочитать доступный ввод консоли (stdin) в буфер процесса —
+        // хотя бы один байт. Ввода нет — процесс блокируется (StdinWait), sepc НЕ двигаем:
+        // когда [`wait_stdin`] разбудит его по прерыванию UART, `ecall` РЕСТАРТУЕТ и на этот
+        // раз заберёт байты из кольцевого буфера (Веха 20.2).
+        14 => {
+            let (buf, cap_len) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11])
+            };
+            let mut n = 0usize;
+            while n < cap_len {
+                let Some(b) = uart::getc() else { break };
+                // Пишем в U-память вызывающего напрямую: он current, SUM=1 (как в SYS_WRITE).
+                unsafe { *((buf + n) as *mut u8) = b };
+                n += 1;
+            }
+            if n > 0 {
+                let f = &mut t.procs[cur].frame;
+                f.regs[10] = n;
+                f.sepc += 4;
+            } else {
+                t.procs[cur].state = State::StdinWait;
+                if let Some(nx) = t.next_runnable(cur) {
+                    t.current = nx;
+                }
+            }
+        }
+        // SYS_EXEC(store_cap, name_ptr, name_len) -> код выхода ребёнка / MAX: запустить программу
+        // из store ПО ИМЕНИ КОРНЯ и ждать её завершения (foreground, Веха 20.3). Требует права
+        // `EXEC` на store — ОТДЕЛЬНОГО от READ/WRITE: обладатель может запускать программы, не
+        // умея читать или менять объекты (аттенуация «только запуск»). Путь тот же, что в
+        // `exec_demo` ([[exec-from-store]]): корень → content-id → байты ELF → [`elf::load`].
+        15 => {
+            let (scap, nptr, nlen) = {
+                let f = &t.procs[cur].frame;
+                (f.regs[10], f.regs[11], f.regs[12])
+            };
+            let dom = t.procs[cur].domain;
+            let mut spawned = false;
+            match cap::store(dom, Cap::from_bits(scap as u64), Rights::EXEC) {
+                Ok(()) => {
+                    let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
+                    if let Ok(name) = core::str::from_utf8(name_bytes) {
+                        // Байты ELF копируем из store и сразу отпускаем его замок.
+                        let elf_bytes = crate::object::root(name)
+                            .and_then(|id| crate::object::with(&id, |b| b.map(Vec::from)));
+                        match elf_bytes {
+                            Some(bytes) => {
+                                let root = new_address_space();
+                                let va_limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+                                match elf::load(root, &bytes, va_limit) {
+                                    Ok(entry) => {
+                                        // Имя процесса обязано жить дольше таблицы — утекает
+                                        // (запусков за сессию единицы, приемлемо до Вехи 22).
+                                        let pname: &'static str =
+                                            Box::leak(String::from(name).into_boxed_str());
+                                        let child = create_process_locked(t, pname, root, entry, 0);
+                                        println!(
+                                            "  [exec] P{} SYS_EXEC '{}' → P{} (по cap, ждёт завершения)",
+                                            cur, name, child,
+                                        );
+                                        // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
+                                        t.procs[cur].state = State::ExecWait(child);
+                                        t.current = child;
+                                        spawned = true;
+                                    }
+                                    Err(e) => println!(
+                                        "  [exec] P{} SYS_EXEC '{}': негодный ELF: {:?}",
+                                        cur, name, e,
+                                    ),
+                                }
+                            }
+                            None => println!("  [exec] P{} SYS_EXEC: корня '{}' нет в store", cur, name),
+                        }
+                    }
+                }
+                Err(e) => println!(
+                    "  [exec] P{} SYS_EXEC отклонён: {:?}  ← нет capability (EXEC) на store",
+                    cur, e,
+                ),
+            }
+            if !spawned {
+                let f = &mut t.procs[cur].frame;
+                f.regs[10] = usize::MAX;
+                f.sepc += 4;
+            }
         }
         other => {
             let f = &mut t.procs[cur].frame;
