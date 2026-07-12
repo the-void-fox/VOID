@@ -29,7 +29,7 @@ VOID берёт линию персистентных capability-систем (K
 
 ## Стек
 - Язык: **Rust** (`#![no_std]`).
-- Платформа: **RISC-V** (`riscv64gc-unknown-none-elf`), QEMU `virt`, OpenSBI → S-mode ядро → U-mode userspace.
+- Платформа: **RISC-V** (`riscv64gc-unknown-none-elf`), QEMU `virt`, OpenSBI → S-mode ядро → U-mode userspace; с Вехи 24 арх-специфика — за контрактом `arch/`, вторым таргетом собирается **x86_64** (`x86_64-unknown-none`, пока заглушка — bring-up в Вехах 25+).
 - Архитектура: **микроядро** + userspace-серверы. Слои совместимости (Linux/POSIX) — отдельные серверы поверх, не в ядре.
 - Сборка: Cargo workspace. Окружение: `shell.nix` (Rust+target+QEMU+gdb).
 
@@ -39,18 +39,19 @@ VOID берёт линию персистентных capability-систем (K
 - Запуск: `nix-shell` → `cd Code && cargo run`
 
 ## Статус
-**Фазы 0–3 закрыты (Вехи 1–22); Фаза 4 идёт (Веха 23 закрыта).** Тезис ADR 0002 полон,
+**Фазы 0–3 закрыты (Вехи 1–22); Фаза 4 идёт (Вехи 23–24 закрыты).** Тезис ADR 0002 полон,
 система самостоятельна: живой shell `vsh` с вводом ([[interactive-shell]]); capability
 передаются по IPC и переживают перезагрузку вместе с c-space ([[ipc-cap-transfer]]); у
 процессов ленивая куча и честные page fault ([[process-heap]]). С Вехи 23 **весь userspace —
-ELF-объекты store** под корнями `bin/<имя>`, исполняемые по content-id; секции `.user` нет,
-обновление системы = смена корня по хэшу ([[elf-userspace]]). Дальше по Фазе 4
-([[0004-void-pkg]]): arch-рефакторинг → x86_64 bring-up; пакетная дорожка — std-порт Rust,
-uutils, host-мост к nix. Развёрнутый план пакетов — [[void-pkg]].
+ELF-объекты store** под корнями `bin/<имя>`, исполняемые по content-id; обновление системы =
+смена корня по хэшу ([[elf-userspace]]). С Вехи 24 арх-специфика — за узким контрактом
+`arch/`: ядро собирается под **riscv64 и x86_64** из одного дерева ([[arch-boundary]],
+[[0005-multiarch-arch-boundary]]). Дальше по Фазе 4 ([[0004-void-pkg]]): x86_64 bring-up;
+пакетная дорожка — std-порт Rust, uutils, host-мост к nix. План пакетов — [[void-pkg]].
 
 ## Текущие задачи
 Развёрнутый staged-роадмап — в `[[todo]]`. Кратко (Фаза 4): userspace в ELF из store (готово)
-→ arch-рефакторинг (`arch/{riscv64,x86_64}`) → x86_64 bring-up + пакетная дорожка (std-порт,
+→ граница архитектур `arch/` (готово) → x86_64 bring-up + пакетная дорожка (std-порт,
 uutils, host-мост). Дальше: сеть, checkpoint процессов, (опционально) SASOS-гибрид.
 
 ## ADR
@@ -59,6 +60,7 @@ uutils, host-мост). Дальше: сеть, checkpoint процессов, (
 - [[0002-persistent-content-addressed-capability-core]] — стержневой тезис и почему он чинит провал KeyKOS.
 - [[0003-phase-3-exec-by-hash]] — Фаза 3: программа как контент-адресуемый объект, exec по хэшу.
 - [[0004-void-pkg]] — Фаза 4: пакеты и самодостаточность — резолвер void-pkg (native/nix-cross → linux-abi → wasi) над одним store.
+- [[0005-multiarch-arch-boundary]] — мультиархитектурность: узкий контракт `arch/` + cargo-таргеты, без трейтов.
 
 ## Заметки
 Рабочий лог — в `notes/`.
