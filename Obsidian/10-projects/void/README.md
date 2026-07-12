@@ -29,7 +29,7 @@ VOID берёт линию персистентных capability-систем (K
 
 ## Стек
 - Язык: **Rust** (`#![no_std]`).
-- Платформа: **RISC-V** (`riscv64gc-unknown-none-elf`), QEMU `virt`, OpenSBI → S-mode ядро → U-mode userspace; с Вехи 24 арх-специфика — за контрактом `arch/`, второй таргет — **x86_64** (`x86_64-unknown-none`, QEMU `q35`, PVH direct boot; с Вехи 25 ядерная половина живая, userspace — Веха 26+).
+- Платформа: **RISC-V** (`riscv64gc-unknown-none-elf`), QEMU `virt`, OpenSBI → S-mode ядро → U-mode userspace; с Вехи 24 арх-специфика — за контрактом `arch/`, второй таргет — **x86_64** (`x86_64-unknown-none`, QEMU `q35`, PVH direct boot; с Вехи 26 userspace живой: ring3 + `int 0x80`, диск/персистентность — Веха 27).
 - Архитектура: **микроядро** + userspace-серверы. Слои совместимости (Linux/POSIX) — отдельные серверы поверх, не в ядре.
 - Сборка: Cargo workspace. Окружение: `shell.nix` (Rust+target+QEMU+gdb).
 
@@ -39,23 +39,25 @@ VOID берёт линию персистентных capability-систем (K
 - Запуск: `nix-shell` → `cd Code && cargo run`
 
 ## Статус
-**Фазы 0–3 закрыты (Вехи 1–22); Фаза 4 идёт (Вехи 23–25 закрыты).** Тезис ADR 0002 полон,
+**Фазы 0–3 закрыты (Вехи 1–22); Фаза 4 идёт (Вехи 23–26 закрыты).** Тезис ADR 0002 полон,
 система самостоятельна: живой shell `vsh` с вводом ([[interactive-shell]]); capability
 передаются по IPC и переживают перезагрузку вместе с c-space ([[ipc-cap-transfer]]); у
 процессов ленивая куча и честные page fault ([[process-heap]]). С Вехи 23 **весь userspace —
 ELF-объекты store** под корнями `bin/<имя>`, исполняемые по content-id; обновление системы =
 смена корня по хэшу ([[elf-userspace]]). С Вехи 24 арх-специфика — за узким контрактом
 `arch/`: ядро собирается под **riscv64 и x86_64** из одного дерева ([[arch-boundary]],
-[[0005-multiarch-arch-boundary]]), а с Вехи 25 x86_64 **живой**: PVH boot, IDT, PML4 W^X,
-LAPIC-вытеснение — ядерные демо идут на обеих архитектурах ([[x86-bringup]]). Дальше по
-Фазе 4 ([[0004-void-pkg]]): userspace x86_64 (Веха 26); пакетная дорожка — std-порт Rust,
-uutils, host-мост к nix. План пакетов — [[void-pkg]].
+[[0005-multiarch-arch-boundary]]); с Вехи 25 x86_64 живой (PVH boot, PML4 W^X, LAPIC —
+[[x86-bringup]]), а с Вехи 26 на нём **полный userspace**: ring3 + `int 0x80` + iretq,
+интерактивный vsh, программы собираются под обе архитектуры и живут под арх-корнями
+`bin/<arch>/<имя>` ([[x86-userspace]]) — демо-паритет, кроме диска. Дальше по Фазе 4
+([[0004-void-pkg]]): устройства x86_64 (Веха 27: IOAPIC, virtio-pci, персистентность);
+пакетная дорожка — std-порт Rust, uutils, host-мост к nix. План пакетов — [[void-pkg]].
 
 ## Текущие задачи
 Развёрнутый staged-роадмап — в `[[todo]]`. Кратко (Фаза 4): userspace в ELF из store (готово)
-→ граница архитектур `arch/` (готово) → x86_64 ядро (готово) → userspace x86_64 + пакетная
-дорожка (std-порт, uutils, host-мост). Дальше: сеть, checkpoint процессов, (опционально)
-SASOS-гибрид.
+→ граница архитектур `arch/` (готово) → x86_64 ядро + userspace (готово) → устройства x86_64
+(IOAPIC, virtio-pci) + пакетная дорожка (std-порт, uutils, host-мост). Дальше: сеть,
+checkpoint процессов, (опционально) SASOS-гибрид.
 
 ## ADR
 Архитектурные решения в `adr/`. Ключевые:
