@@ -13,8 +13,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::context::{context_switch, task_trampoline, Context};
-use crate::csr;
+use crate::arch::{context_switch, Context};
 use crate::sync::SpinLock;
 
 /// Размер стека одной задачи (берётся из кучи).
@@ -68,11 +67,11 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 /// Выключать прерывания обязательно: иначе таймер вытеснит нас прямо посреди работы
 /// со списком задач, а его обработчик снова полезет в SCHED → взаимоблокировка.
 fn with_sched<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
-    let sie = csr::irq_save_disable();
+    let sie = crate::arch::irq_save_disable();
     let mut guard = SCHED.lock();
     let r = f(&mut guard);
     drop(guard);
-    csr::irq_restore(sie);
+    crate::arch::irq_restore(sie);
     r
 }
 
@@ -94,10 +93,9 @@ pub fn spawn(name: &'static str, entry: fn()) {
     // Стек растёт вниз — начинаем с вершины, выровненной по 16 (требование ABI).
     let sp = align_down(stack.as_ptr() as usize + STACK_SIZE, 16);
 
-    let mut context = Context::default();
-    context.ra = task_trampoline as *const () as usize; // куда «вернётся» при старте
-    context.sp = sp;
-    context.s[0] = entry as usize; // s0 = адрес функции задачи (см. task_trampoline)
+    // Первый запуск пойдёт через арх-трамплин, который вызовет `entry` (Веха 24: как
+    // раскладывать регистры контекста, знает только арх — см. Context::new_task).
+    let context = Context::new_task(entry, sp);
 
     with_sched(|s| {
         s.tasks.push(Box::new(Task {
@@ -116,7 +114,7 @@ pub fn yield_now() {
     // в локальной переменной: она лежит на стеке этой задачи и переживёт переключение,
     // поэтому по возвращении сюда мы восстановим SIE ровно таким, каким он был у НАС.
     // (Кооперативная задача уходила с SIE=1, вытесненная — из trap'а с SIE=0.)
-    let sie = csr::irq_save_disable();
+    let sie = crate::arch::irq_save_disable();
 
     let switch = {
         let mut sched = SCHED.lock();
@@ -138,7 +136,7 @@ pub fn yield_now() {
         unsafe { context_switch(o, n) }
     }
 
-    csr::irq_restore(sie);
+    crate::arch::irq_restore(sie);
 }
 
 /// Есть ли ещё незавершённые задачи, кроме текущей.

@@ -10,26 +10,22 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{csr, sbi};
-
-/// Квант вытеснения: 200_000 тиков при таймбазе 10 МГц = 20 мс.
-const INTERVAL: u64 = 200_000;
+use crate::arch;
 
 /// Сколько таймерных прерываний (вытеснений) уже произошло.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Запустить таймер: вооружить первое срабатывание и включить прерывания.
-/// Вызывать после [`crate::trap::init`] и [`crate::sched::init`].
+/// Вызывать после [`crate::arch::trap_init`] и [`crate::sched::init`].
+/// Квант вытеснения — дело арха ([`arch::timer_arm`]): таймбазы у всех разные.
 pub fn init() {
     arm_next();
-    csr::enable_timer_interrupt(); // sie.STIE — разрешить именно таймерные
-    csr::enable_interrupts(); // sstatus.SIE — глобально включить прерывания
+    arch::timer_hw_init(); // размаскировать таймер + глобально включить прерывания
 }
 
-/// Запрограммировать следующее срабатывание на «сейчас + INTERVAL».
+/// Запрограммировать следующее срабатывание на «сейчас + квант».
 fn arm_next() {
-    let next = csr::read_time() + INTERVAL;
-    sbi::set_timer(next);
+    arch::timer_arm();
 }
 
 /// Вооружить следующее срабатывание (публично) — для старта вытеснения процессов в
@@ -45,7 +41,7 @@ pub fn preempt_tick() {
     arm_next();
     // Веха 20.1: в сессиях процессов внешние прерывания выключены (SEIE=0) — вычерпываем
     // ввод UART опросом на каждом тике, чтобы FIFO/буферы QEMU не переполнялись.
-    crate::uart::drain_rx();
+    arch::console_drain();
 }
 
 /// Сколько было вытеснений с момента запуска таймера.
@@ -57,6 +53,6 @@ pub fn ticks() -> u64 {
 pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     arm_next(); // перевзвести (это же сбрасывает pending-бит таймера)
-    crate::uart::drain_rx(); // Веха 20.1: подобрать ввод, пришедший между прерываниями UART
+    arch::console_drain(); // Веха 20.1: подобрать ввод, пришедший между прерываниями
     crate::sched::yield_now(); // ВЫТЕСНЕНИЕ: уступить процессор следующей задаче
 }

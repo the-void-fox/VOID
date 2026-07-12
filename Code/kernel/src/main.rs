@@ -20,30 +20,26 @@
 //! Веха 22: куча процесса (SYS_MAP, ленивые страницы) + честные user page fault (гибнет процесс).
 //! Веха 23: userspace целиком в ELF из store — секции `.user` больше нет; все программы сеются
 //! в store под корни `bin/<имя>` и исполняются по content-id ([[elf-userspace]]).
+//! Веха 24: граница архитектур — всё арх-специфичное за узким контрактом `arch/`
+//! (riscv64 — рабочая реализация, x86_64 — заглушка); один код, два таргета cargo.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod arch;
 mod cap;
 mod chan;
-mod context;
-mod csr;
 mod elf;
 mod executor;
 mod frame;
 mod heap;
 mod object;
-mod paging;
-mod plic;
 mod proc;
-mod sbi;
 mod sched;
 mod sync;
 mod timer;
-mod trap;
-mod uart;
 mod virtio_blk;
 
 /// Веха 23 — ELF-байты ВСЕХ userspace-программ, встроенные в образ ядра как СЕМЕНА. Собраны
@@ -71,16 +67,13 @@ static PROGRAMS: &[(&str, &[u8])] = &[
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-// Ассемблерная точка входа `_start` (см. entry.s) → вызывает `kmain`.
-core::arch::global_asm!(include_str!("entry.s"));
-
 /// Печать в UART0. Внутреннее API макросов `print!`/`println!`.
 /// Выключаем прерывания на время строки: иначе вытеснение по таймеру могло бы
 /// переключить задачу прямо посреди вывода, и строки разных задач перемешались бы.
 pub fn _print(args: core::fmt::Arguments) {
-    let sie = csr::irq_save_disable();
-    let _ = uart::Uart.write_fmt(args);
-    csr::irq_restore(sie);
+    let sie = arch::irq_save_disable();
+    let _ = arch::Console.write_fmt(args);
+    arch::irq_restore(sie);
 }
 
 #[macro_export]
@@ -99,8 +92,8 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 23                           ║");
-    println!("  ║  userspace целиком в ELF из store         ║");
+    println!("  ║  VOID — Веха 24                           ║");
+    println!("  ║  arch/ : один код — riscv64 и x86_64      ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -109,14 +102,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
 
     // Вектор trap'ов нужен и для page fault'ов, и для таймера.
-    trap::init();
+    arch::trap_init();
     println!("  [trap] вектор установлен");
 
-    // Инфраструктура из прошлых вех (кратко): trap-вектор, Sv39, куча.
-    let root = paging::init();
+    // Инфраструктура из прошлых вех (кратко): trap-вектор, трансляция, куча.
+    let root = arch::mm_init();
     // SAFETY: таблицы идентично отображают текущие PC/SP/UART.
-    unsafe { paging::enable(root) }
-    println!("  [vm]   Sv39 включён (direct map + W^X)");
+    unsafe { arch::mm_enable(root) }
+    println!("  [vm]   {} включён (direct map + W^X)", arch::MM_NAME);
     heap::init();
     println!("  [heap] куча ядра готова (2 МиБ)");
     println!();
@@ -128,20 +121,17 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("  [blk]  virtio-blk не найден — персистентность недоступна!");
     }
 
-    // Прерывания устройств: настроить PLIC на IRQ диска и разрешить внешние прерывания S-mode.
-    // Глобально прерывания включит timer::init; синхронный путь на загрузке работает опросом.
-    if virtio_blk::irq() != 0 {
-        plic::init(virtio_blk::irq());
-        csr::enable_external_interrupt();
-        println!("  [plic] внешние прерывания вкл (virtio-blk IRQ {})", virtio_blk::irq());
-    }
-
-    // Веха 20.1: приём UART по прерыванию. Байты копятся в кольцевом буфере ядра с этого
+    // Прерывания устройств (Веха 24: одним вызовом контракта — контроллер, IRQ диска и
+    // приём консоли по прерыванию). Байты консоли копятся в кольцевом буфере ядра с этого
     // момента — ввод, набранный (или поданный через pipe) во время демо, не теряется и
-    // достанется shell'у в конце загрузки.
-    uart::init_rx();
-    plic::enable(uart::IRQ);
-    println!("  [uart] приём по прерыванию вкл (IRQ {})", uart::IRQ);
+    // достанется shell'у в конце загрузки. Глобально прерывания включит timer::init;
+    // синхронный путь на загрузке работает опросом.
+    arch::init_device_interrupts();
+    println!(
+        "  [irq]  прерывания устройств вкл (диск IRQ {}, консоль IRQ {})",
+        virtio_blk::irq(),
+        arch::CONSOLE_IRQ,
+    );
 
     // Веха 7.2: загрузить состояние с диска (RAM — кэш, диск — истина).
     if object::load() {
@@ -184,8 +174,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("  [sched] X/Y пишут объекты (вытесняются таймером):");
     timer::init();
     while sched::other_runnable() {
-        // SAFETY: wfi — спать до следующего прерывания (таймера).
-        unsafe { core::arch::asm!("wfi") }
+        arch::wait_for_interrupt(); // спать до следующего прерывания (таймера)
     }
     println!("  [sched] задачи завершились (вытеснений таймером: {})", timer::ticks());
     println!();
@@ -264,11 +253,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     shell_session();
 
     println!();
-    println!("  [idle] перезагрузи QEMU — состояние вернётся. Простаиваем (wfi).");
+    println!("  [idle] перезагрузи QEMU — состояние вернётся. Простаиваем до прерываний.");
 
     loop {
-        // SAFETY: wfi — ждать прерывания; в S-mode разрешено.
-        unsafe { core::arch::asm!("wfi") }
+        arch::wait_for_interrupt();
     }
 }
 
@@ -715,6 +703,6 @@ fn panic(info: &PanicInfo) -> ! {
     println!();
     println!("  [PANIC] {}", info);
     loop {
-        unsafe { core::arch::asm!("wfi") }
+        arch::wait_for_interrupt();
     }
 }

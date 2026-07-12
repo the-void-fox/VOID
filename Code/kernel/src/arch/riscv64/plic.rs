@@ -57,8 +57,8 @@ pub fn handle_external() {
     }
     if irq == crate::virtio_blk::irq() {
         crate::virtio_blk::on_irq();
-    } else if irq == crate::uart::IRQ {
-        crate::uart::on_irq(); // Веха 20.1: принятые байты → кольцевой буфер
+    } else if irq == super::uart::IRQ {
+        super::uart::on_irq(); // Веха 20.1: принятые байты → кольцевой буфер
     }
     complete(irq);
 }

@@ -4,4 +4,4 @@
 # (он нужен только rust-analyzer'у/build-std — добавим при необходимости отдельно).
 [toolchain]
 channel = "stable"
-targets = ["riscv64gc-unknown-none-elf"]
+targets = ["riscv64gc-unknown-none-elf", "x86_64-unknown-none"]

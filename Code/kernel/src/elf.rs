@@ -18,7 +18,7 @@
 //! несколько сегментов, делящих одну страницу с разными правами (учтено в `programs/*/linker.ld`
 //! через `ALIGN(4K)` перед каждым сегментом — иначе загрузчик перезаписал бы права страницы).
 
-use crate::{frame, paging};
+use crate::{arch, frame};
 
 /// Почему загрузка ELF не удалась. Ядро не падает на плохом ELF — просто отказывает в exec'е.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub enum ElfError {
     BadMagic,
     /// Не ELF64 (`EI_CLASS`) или не little-endian (`EI_DATA`) — на нашей платформе иначе нельзя.
     BadClass,
-    /// `e_machine` — не RISC-V.
+    /// `e_machine` — не архитектура этого ядра ([`arch::ELF_MACHINE`]).
     BadMachine,
     /// `e_type` — не `ET_EXEC`: поддерживаем только статические исполняемые файлы, не PIE/DYN
     /// (это и значит «без релокаций/динамики» — см. [[exec-from-store]]).
@@ -47,7 +47,6 @@ const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
-const EM_RISCV: u16 = 243;
 const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1 << 0;
@@ -90,7 +89,7 @@ pub fn load(root: usize, bytes: &[u8], va_limit: usize) -> Result<usize, ElfErro
     let e_phentsize = u16_at(bytes, 54) as usize;
     let e_phnum = u16_at(bytes, 56) as usize;
 
-    if e_machine != EM_RISCV {
+    if e_machine != arch::ELF_MACHINE {
         return Err(ElfError::BadMachine);
     }
     if e_type != ET_EXEC {
@@ -121,17 +120,17 @@ pub fn load(root: usize, bytes: &[u8], va_limit: usize) -> Result<usize, ElfErro
         // Права страницы из p_flags + обязательный `U` (страница процесса). W^X: если сошлись
         // оба бита — это либо кривой ELF, либо (что хуже) попытка получить W+X страницу для
         // инъекции кода через store — отказываем безусловно, не пытаясь «угадать» намерение.
-        let mut flags = paging::PTE_U;
+        let mut flags = arch::MAP_U;
         if p_flags & PF_R != 0 {
-            flags |= paging::PTE_R;
+            flags |= arch::MAP_R;
         }
         if p_flags & PF_W != 0 {
-            flags |= paging::PTE_W;
+            flags |= arch::MAP_W;
         }
         if p_flags & PF_X != 0 {
-            flags |= paging::PTE_X;
+            flags |= arch::MAP_X;
         }
-        if flags & paging::PTE_W != 0 && flags & paging::PTE_X != 0 {
+        if flags & arch::MAP_W != 0 && flags & arch::MAP_X != 0 {
             return Err(ElfError::WriteExec);
         }
 
@@ -168,7 +167,7 @@ pub fn load(root: usize, bytes: &[u8], va_limit: usize) -> Result<usize, ElfErro
                 }
             }
 
-            unsafe { paging::map(root, va, pa, flags) };
+            unsafe { arch::map(root, va, pa, flags) };
             va += PAGE;
         }
     }

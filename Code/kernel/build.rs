@@ -14,7 +14,14 @@ const PROGRAMS: &[&str] = &[
 
 fn main() {
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel
-    let linker = dir.join("linker.ld");
+
+    // Веха 24: скрипт линковки — по архитектуре таргета (один проект, N образов).
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let linker = match arch.as_str() {
+        "riscv64" => dir.join("linker.ld"),
+        "x86_64" => dir.join("linker-x86_64.ld"),
+        other => panic!("нет скрипта линковки для target_arch={other}"),
+    };
     println!("cargo:rustc-link-arg=-T{}", linker.display());
     println!("cargo:rerun-if-changed={}", linker.display());
 

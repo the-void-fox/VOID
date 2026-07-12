@@ -5,7 +5,9 @@
 //! [`TrapFrame`] — снимок всех регистров на момент trap'а. Диспетчер смотрит на
 //! `scause` и решает, что это было: таймер, breakpoint или что-то фатальное.
 
-use crate::{csr, plic, println, proc, timer};
+use super::{csr, plic};
+use crate::arch::{FaultKind, UserTrap};
+use crate::{println, proc, timer};
 
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
@@ -26,6 +28,64 @@ pub struct TrapFrame {
     pub sepc: usize,
     /// Снимок sstatus.
     pub sstatus: usize,
+}
+
+/// Методы контракта [`crate::arch`]: общий код (`proc`) работает с кадром только через них —
+/// какие регистры несут номер syscall'а/аргументы/результаты, знает лишь арх (RISC-V ABI:
+/// номер в a7 = x17, аргументы/результаты в a0.. = x10..).
+impl TrapFrame {
+    /// Стартовый кадр процесса: вход `entry`, стек `sp`, первый аргумент `arg` (a0).
+    /// `sstatus`: SPP=0 (возврат в U), SPIE=0 (прерывания в U выключены), SUM=1
+    /// (ядро читает U-память в шлюзах syscall'ов).
+    pub fn new_user(entry: usize, sp: usize, arg: usize) -> Self {
+        let mut f = Self::default();
+        f.sepc = entry;
+        f.regs[2] = sp; // sp = x2
+        f.regs[10] = arg; // a0
+        f.sstatus = 1 << 18; // SUM
+        f
+    }
+
+    /// Номер системного вызова (a7).
+    pub fn syscall_num(&self) -> usize {
+        self.regs[17]
+    }
+
+    /// `i`-й аргумент syscall'а (a0..a6).
+    pub fn arg(&self, i: usize) -> usize {
+        self.regs[10 + i]
+    }
+
+    /// Результат syscall'а (a0).
+    pub fn set_ret(&mut self, v: usize) {
+        self.regs[10] = v;
+    }
+
+    /// `i`-й регистр результата (a0..): многозначные возвраты (RECV/CALL) и стартовые
+    /// аргументы процесса (`proc::set_arg`/`set_arg2` до запуска).
+    pub fn set_ret_at(&mut self, i: usize, v: usize) {
+        self.regs[10 + i] = v;
+    }
+
+    /// Завершить инструкцию syscall'а — сдвинуть адрес возврата за `ecall` (4 байта).
+    /// НЕ вызывается для блокирующих рестартующих syscall'ов (ecall повторится).
+    pub fn advance(&mut self) {
+        self.sepc += 4;
+    }
+}
+
+/// Классифицировать trap из U-mode в арх-нейтральный [`UserTrap`] для `proc` (Веха 24).
+fn classify_user(scause: usize) -> UserTrap {
+    if scause == csr::INTERRUPT_BIT | csr::IRQ_S_TIMER {
+        return UserTrap::TimerTick;
+    }
+    match scause {
+        csr::EXC_ECALL_FROM_U => UserTrap::Syscall,
+        csr::EXC_PF_LOAD => UserTrap::PageFault { va: csr::read_stval(), kind: FaultKind::Load },
+        csr::EXC_PF_STORE => UserTrap::PageFault { va: csr::read_stval(), kind: FaultKind::Store },
+        csr::EXC_PF_INSN => UserTrap::PageFault { va: csr::read_stval(), kind: FaultKind::Exec },
+        other => UserTrap::Unknown(other),
+    }
 }
 
 /// ABI-имена регистров для читаемого дампа.
@@ -50,10 +110,11 @@ pub fn init() {
 pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let scause = csr::read_scause();
 
-    // trap из U-mode (SPP=0): системный вызов (ecall) ЛИБО таймерное вытеснение (Веха 16).
-    // Управление уходит в планировщик процессов и сюда НЕ возвращается (возобновляется процесс).
+    // trap из U-mode (SPP=0): системный вызов (ecall), page fault, вытеснение… Причина
+    // классифицируется в арх-нейтральный UserTrap (Веха 24); управление уходит в планировщик
+    // процессов и сюда НЕ возвращается (возобновляется процесс).
     if frame.sstatus & (1 << 8) == 0 {
-        proc::handle_user_trap(frame, scause);
+        proc::handle_user_trap(frame, classify_user(scause));
     }
 
     // trap из ядра (S-mode) — как раньше.

@@ -55,11 +55,11 @@ static EXECUTOR: SpinLock<Executor> = SpinLock::new(Executor::new());
 /// замок обязан быть irq-safe: иначе IRQ посреди удержания замка → `wake` на том же замке →
 /// взаимоблокировка. (Ср. `with_sched` в [`crate::sched`].)
 fn with_exec<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
-    let sie = crate::csr::irq_save_disable();
+    let sie = crate::arch::irq_save_disable();
     let mut g = EXECUTOR.lock();
     let r = f(&mut g);
     drop(g);
-    crate::csr::irq_restore(sie);
+    crate::arch::irq_restore(sie);
     r
 }
 
@@ -106,7 +106,7 @@ pub fn run() {
                 return;
             }
             // SAFETY: ждать прерывания; таймер/устройства разбудят и пополнят очередь готовых.
-            unsafe { core::arch::asm!("wfi") }
+            crate::arch::wait_for_interrupt();
         };
 
         // Задача могла уже завершиться (в очереди остался лишний id) — пропускаем.

@@ -1,8 +1,8 @@
 //! Веха 10.2 — процессы: своё адресное пространство (satp) + кооперативное планирование.
 //!
-//! Процесс = изолированная единица исполнения в U-mode: собственная таблица страниц
+//! Процесс = изолированная единица исполнения в U-mode: собственное адресное пространство
 //! ([[user-mode]], [[sv39-paging]]) и сохранённый trap-кадр. Ядро возобновляет «текущий»
-//! процесс через [`enter_user_frame`] (переключение `satp` → восстановление регистров → `sret`).
+//! процесс через [`arch::enter_user`] (активация пространства → регистры из кадра → возврат в U).
 //! Один hart, планирование **кооперативное**: процесс уступает через `SYS_YIELD` или завершается
 //! через `SYS_EXIT` (прерывания в U-mode пока выключены).
 //!
@@ -25,24 +25,14 @@ use core::ptr::{addr_of, addr_of_mut};
 
 use void_abi::{Cap, ContentId, Rights};
 
-use crate::context::{context_switch, Context};
+use crate::arch::{self, Context, FaultKind, TrapFrame, UserTrap};
 use crate::sync::SpinLock;
-use crate::trap::TrapFrame;
-use crate::{cap, csr, elf, frame, paging, println, timer, uart};
-
-// Ассемблерная функция входа в процесс: satp + восстановление регистров из кадра + sret.
-core::arch::global_asm!(include_str!("enter_user.s"));
-
-extern "C" {
-    /// Переключить `satp`, загрузить регистры из `*frame`, выставить `sscratch`=trap-стек и `sret`.
-    fn enter_user_frame(frame: *const TrapFrame, satp: usize, trap_top: usize) -> !;
-}
+use crate::{cap, elf, frame, println, timer};
 
 // ─── адресное пространство процесса ────────────────────────────────────────────
-const SATP_SV39: usize = 8 << 60;
 /// Стек процесса живёт в незанятом ядром регионе VPN[2]=1 (0x4000_0000..0x8000_0000),
 /// растёт вниз от 0x8000_0000. Это гарантирует, что маппинг стека не заденет общие
-/// подтаблицы ядра (VPN[2]=0 и 2) — см. [`paging::clone_kernel_root`].
+/// подтаблицы ядра (VPN[2]=0 и 2) — см. [`arch::clone_kernel_root`].
 const USER_STACK_TOP_VA: usize = 0x8000_0000;
 const USER_STACK_PAGES: usize = 4;
 const PAGE: usize = 4096;
@@ -82,7 +72,8 @@ enum State {
 }
 
 struct Proc {
-    satp: usize,
+    /// Токен адресного пространства ([`arch::space_token`]; на RISC-V — значение satp).
+    space: usize,
     frame: TrapFrame,
     state: State,
     /// Домен защиты процесса — его личный c-space ([[capabilities]]). Начальные права
@@ -131,7 +122,7 @@ static TABLE: SpinLock<Table> =
     SpinLock::new(Table { procs: Vec::new(), current: 0, mailbox: Vec::new() });
 
 /// Контекст ядра, в который возвращаемся, когда все процессы завершились.
-static mut RETURN_CTX: Context = Context { ra: 0, sp: 0, s: [0; 12] };
+static mut RETURN_CTX: Context = Context::EMPTY;
 
 // ─── создание и запуск ────────────────────────────────────────────────────────
 
@@ -139,12 +130,12 @@ static mut RETURN_CTX: Context = Context { ra: 0, sp: 0, s: [0; 12] };
 /// trap-обработчику при satp процесса) + приватный стек в незанятом регионе VPN[2]=1. Код и
 /// данные добавит [`crate::elf::load`]: с Вехи 23 процессы приходят ТОЛЬКО из ELF в store.
 fn new_address_space() -> usize {
-    let root = paging::clone_kernel_root();
+    let root = arch::clone_kernel_root();
     // Приватный стек в VPN[2]=1: несколько страниц из свежих фреймов.
     for i in 1..=USER_STACK_PAGES {
         let va = USER_STACK_TOP_VA - i * PAGE;
         let pa = frame::alloc().expect("нет фрейма под стек процесса");
-        unsafe { paging::map(root, va, pa, paging::PTE_R | paging::PTE_W | paging::PTE_U) };
+        unsafe { arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
     }
     root
 }
@@ -167,14 +158,10 @@ fn create_process_locked(
     entry: usize,
     arg: usize,
 ) -> usize {
-    let mut frame = TrapFrame::default();
-    frame.sepc = entry;
-    frame.regs[2] = USER_STACK_TOP_VA; // sp
-    frame.regs[10] = arg; // a0
-    frame.sstatus = 1 << 18; // SUM=1, SPP=0 (→U), SPIE=0 (прерывания в U выключены)
+    let frame = TrapFrame::new_user(entry, USER_STACK_TOP_VA, arg);
     let domain = cap::create_domain(name);
     t.procs.push(Proc {
-        satp: SATP_SV39 | (root >> 12),
+        space: arch::space_token(root),
         frame,
         state: State::Runnable,
         domain,
@@ -211,13 +198,13 @@ pub fn domain(pid: usize) -> cap::DomainId {
 /// Задать стартовый аргумент (`a0`) процесса до запуска — например, дескриптор capability,
 /// который процесс предъявит в первом syscall'е.
 pub fn set_arg(pid: usize, a0: usize) {
-    TABLE.lock().procs[pid].frame.regs[10] = a0;
+    TABLE.lock().procs[pid].frame.set_ret_at(0, a0);
 }
 
 /// Задать второй стартовый аргумент (`a1`) — когда начальных capability у процесса два
 /// (Веха 20: vsh получает эндпоинт персоналии в `a0` и exec-cap на store в `a1`).
 pub fn set_arg2(pid: usize, a1: usize) {
-    TABLE.lock().procs[pid].frame.regs[11] = a1;
+    TABLE.lock().procs[pid].frame.set_ret_at(1, a1);
 }
 
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
@@ -227,8 +214,8 @@ pub fn set_arg2(pid: usize, a1: usize) {
 /// в `SYS_READ` (StdinWait) — ядро НЕ выходит, а спит в [`wait_stdin`] до прерывания UART,
 /// будит читающих и продолжает сессию. Выход — только когда нет ни готовых, ни ждущих ввода.
 pub fn run() {
-    let sstatus_sie = csr::irq_save_disable(); // S-mode SIE (ядро НЕ вытесняется: SIE=0 в S-mode)
-    let saved_sie = csr::read_sie();
+    let sstatus_sie = arch::irq_save_disable(); // S-mode SIE (ядро НЕ вытесняется: SIE=0 в S-mode)
+    let saved_sie = arch::irq_mask_read();
     loop {
         // Первый готовый процесс (может быть не индекс 0: после прошлой сессии часть процессов
         // остаётся Finished/заблокированными).
@@ -241,25 +228,23 @@ pub fn run() {
             // U-mode (там sstatus.SIE не действует, гейтит только `sie`), и `handle_user_trap`
             // переключит на следующего. Устройства (SEIE) на время сессии выключаем — их шлюзы
             // работают опросом, а ввод UART скапливается в PLIC как pending до [`wait_stdin`].
-            csr::write_sie((saved_sie | (1 << 5)) & !(1 << 9)); // STIE=1, SEIE=0
+            arch::irq_mask_preempt(saved_sie); // таймер вкл, устройства выкл
             timer::arm(); // вооружить первое вытеснение этой сессии
             TABLE.lock().current = first;
             unsafe {
-                let mut launch = Context::default();
-                launch.ra = proc_enter as *const () as usize;
-                launch.sp = trap_top();
-                context_switch(addr_of_mut!(RETURN_CTX), addr_of!(launch));
+                let launch = Context::new_kernel(proc_enter, trap_top());
+                arch::context_switch(addr_of_mut!(RETURN_CTX), addr_of!(launch));
             }
             // ── сюда возвращаемся, когда готовых не осталось ──
-            csr::write_sscratch(0);
+            arch::mark_in_kernel();
         }
         // Готовых нет: если кто-то ждёт ввода — поспать до него и продолжить, иначе сессия окончена.
         if !wait_stdin(saved_sie) {
             break;
         }
     }
-    csr::write_sie(saved_sie); // вернуть прежние разрешения прерываний
-    csr::irq_restore(sstatus_sie);
+    arch::irq_mask_write(saved_sie); // вернуть прежние разрешения прерываний
+    arch::irq_restore(sstatus_sie);
 }
 
 /// Idle-ожидание ввода (Веха 20.2). Если есть процессы в StdinWait — спать (`wfi`), пока
@@ -277,13 +262,13 @@ fn wait_stdin(saved_sie: usize) -> bool {
         return false;
     }
     // Только внешние прерывания (SEIE): исполнять некого, таймер (STIE) не нужен.
-    csr::write_sie((saved_sie & !(1 << 5)) | (1 << 9));
-    while !uart::has_input() {
-        // SAFETY: wfi в S-mode; проснётся от pending SEIE-прерывания даже при SIE=0.
-        unsafe { core::arch::asm!("wfi") }
-        // Короткое окно с SIE=1 — принять trap: PLIC → uart::on_irq → кольцевой буфер.
-        csr::enable_interrupts();
-        csr::irq_save_disable();
+    arch::irq_mask_stdin(saved_sie);
+    while !arch::console_has_input() {
+        // Спать до прерывания: проснёмся и от PENDING-прерывания при выключенном SIE.
+        arch::wait_for_interrupt();
+        // Короткое окно с прерываниями — принять trap: контроллер → консоль → кольцевой буфер.
+        arch::enable_interrupts();
+        arch::irq_save_disable();
     }
     let mut t = TABLE.lock();
     for pid in waiting {
@@ -298,8 +283,8 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
     for i in 0..t.procs.len() {
         if t.procs[i].state == State::ExecWait(child) {
             let f = &mut t.procs[i].frame;
-            f.regs[10] = code;
-            f.sepc += 4;
+            f.set_ret(code);
+            f.advance();
             t.procs[i].state = State::Runnable;
         }
     }
@@ -309,32 +294,24 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
 /// [`USER_HEAP_BASE_VA`, heap_brk) — выделить обнулённый фрейм, замапить `U|R|W` и повторить
 /// инструкцию (sepc не двигаем). Любой другой фолт — включая исполнение кучи (W^X живёт и
 /// здесь) и исчерпание фреймов — гибель ПРОЦЕССА, а не ядра: родителю в `SYS_EXEC` уходит MAX.
-fn handle_user_fault(t: &mut Table, cur: usize, scause: usize) {
-    let va = csr::read_stval();
-    let (heap_brk, satp) = (t.procs[cur].heap_brk, t.procs[cur].satp);
-    let lazy = va >= USER_HEAP_BASE_VA && va < heap_brk && scause != csr::EXC_PF_INSN;
+fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
+    let (heap_brk, space) = (t.procs[cur].heap_brk, t.procs[cur].space);
+    let lazy = va >= USER_HEAP_BASE_VA && va < heap_brk && kind != FaultKind::Exec;
     if lazy {
         if let Some(pa) = frame::alloc() {
             let page_va = va & !(PAGE - 1);
-            // SAFETY: satp процесса сейчас активен — после map сбрасываем TLB (sfence.vma),
+            // SAFETY: пространство процесса сейчас активно — после map сбрасываем TLB,
             // иначе повтор инструкции мог бы увидеть старую (пустую) трансляцию.
-            unsafe {
-                paging::map(root_of(satp), page_va, pa, paging::PTE_R | paging::PTE_W | paging::PTE_U);
-                core::arch::asm!("sfence.vma");
-            }
+            unsafe { arch::map(arch::space_root(space), page_va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
+            arch::flush_tlb();
             println!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
             return; // sepc не тронут — инструкция повторится по замапленной странице
         }
         println!("  [mm] P{} фолт кучи {:#x}: фреймы кончились — процесс убит", cur, va);
     } else {
-        let kind = match scause {
-            csr::EXC_PF_LOAD => "load",
-            csr::EXC_PF_STORE => "store",
-            _ => "exec",
-        };
         println!(
             "  [mm] P{} page fault ({}) @ {:#x} вне кучи — процесс убит (ядро живо)",
-            cur, kind, va,
+            cur, kind.name(), va,
         );
     }
     t.procs[cur].state = State::Finished;
@@ -352,15 +329,13 @@ fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
     if len == 0 || va < USER_HEAP_BASE_VA || va.saturating_add(len) > t.procs[pid].heap_brk {
         return true; // не куча — обычные (уже отображённые) страницы
     }
-    let root = root_of(t.procs[pid].satp);
+    let root = arch::space_root(t.procs[pid].space);
     let mut page = va & !(PAGE - 1);
     while page < va + len {
-        if paging::translate(root, page).is_none() {
+        if arch::translate(root, page).is_none() {
             let Some(pa) = frame::alloc() else { return false };
-            unsafe {
-                paging::map(root, page, pa, paging::PTE_R | paging::PTE_W | paging::PTE_U);
-                core::arch::asm!("sfence.vma");
-            }
+            unsafe { arch::map(root, page, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
+            arch::flush_tlb();
             println!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
         }
         page += PAGE;
@@ -370,43 +345,42 @@ fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
 
 /// Лончер: возобновить текущий (первый) процесс.
 extern "C" fn proc_enter() -> ! {
-    let (frame, satp) = {
+    let (frame, space) = {
         let t = TABLE.lock();
         let c = t.current;
-        (t.procs[c].frame, t.procs[c].satp)
+        (t.procs[c].frame, t.procs[c].space)
     };
-    unsafe { enter_user_frame(&frame, satp, trap_top()) }
+    unsafe { arch::enter_user(&frame, space, trap_top()) }
 }
 
 // ─── обработка trap'ов из U-mode ──────────────────────────────────────────────
 
-/// Обработать trap из U-mode (системный вызов) и возобновить нужный процесс. Не возвращается.
-pub fn handle_user_trap(frame: &mut TrapFrame, scause: usize) -> ! {
+/// Обработать trap из U-mode (уже классифицированный архом в [`UserTrap`], Веха 24) и
+/// возобновить нужный процесс. Не возвращается.
+pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
     {
         let mut t = TABLE.lock();
         let cur = t.current;
         t.procs[cur].frame = *frame; // сохранить состояние текущего процесса
-        if scause == csr::EXC_ECALL_FROM_U {
-            syscall(&mut t, cur);
-        } else if scause == csr::EXC_PF_LOAD
-            || scause == csr::EXC_PF_STORE
-            || scause == csr::EXC_PF_INSN
-        {
+        match trap {
+            UserTrap::Syscall => syscall(&mut t, cur),
             // Веха 22.2: page fault из U-mode — ленивая страница кучи или гибель процесса.
-            handle_user_fault(&mut t, cur, scause);
-        } else if scause == csr::INTERRUPT_BIT | csr::IRQ_S_TIMER {
-            // Вытеснение по таймеру: перевзвести и уступить следующему готовому. Текущий остаётся
-            // Runnable, его кадр уже сохранён; sepc НЕ двигаем — продолжит с прерванного места.
-            timer::preempt_tick();
-            if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+            UserTrap::PageFault { va, kind } => handle_user_fault(&mut t, cur, va, kind),
+            UserTrap::TimerTick => {
+                // Вытеснение по таймеру: перевзвести и уступить следующему готовому. Текущий
+                // остаётся Runnable, его кадр сохранён; PC НЕ двигаем — продолжит с прерванного.
+                timer::preempt_tick();
+                if let Some(n) = t.next_runnable(cur) {
+                    t.current = n;
+                }
             }
-        } else {
-            println!("  [proc] неожиданный trap из U (scause={:#x}) — процесс завершён", scause);
-            t.procs[cur].state = State::Finished;
-            wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
-            if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+            UserTrap::Unknown(code) => {
+                println!("  [proc] неожиданный trap из U (код {:#x}) — процесс завершён", code);
+                t.procs[cur].state = State::Finished;
+                wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
+                if let Some(n) = t.next_runnable(cur) {
+                    t.current = n;
+                }
             }
         }
     }
@@ -427,15 +401,15 @@ fn resume() -> ! {
         Some(n) => {
             t.current = n;
             let frame = t.procs[n].frame;
-            let satp = t.procs[n].satp;
+            let space = t.procs[n].space;
             drop(t);
-            unsafe { enter_user_frame(&frame, satp, trap_top()) }
+            unsafe { arch::enter_user(&frame, space, trap_top()) }
         }
         None => {
             drop(t);
             unsafe {
                 let mut discard = Context::default();
-                context_switch(addr_of_mut!(discard), addr_of!(RETURN_CTX));
+                arch::context_switch(addr_of_mut!(discard), addr_of!(RETURN_CTX));
             }
             loop {} // не достигается
         }
@@ -445,13 +419,13 @@ fn resume() -> ! {
 /// Диспетчер syscall'ов. Номер в `a7`, аргументы в `a0..`, результат в `a0`. Работает прямо
 /// с таблицей: IPC-вызовы затрагивают состояния/кадры ДРУГИХ процессов и выбор `current`.
 fn syscall(t: &mut Table, cur: usize) {
-    let num = t.procs[cur].frame.regs[17]; // a7
+    let num = t.procs[cur].frame.syscall_num();
     match num {
         // SYS_WRITE(ptr, len): напечатать буфер процесса (ядро читает U-память, SUM=1).
         1 => {
             let (ptr, len) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11])
+                (f.arg(0), f.arg(1))
             };
             // Веха 23: буфер может лежать в ленивой куче — доотобразить до чтения ядром.
             let result = if ensure_heap_range(t, cur, ptr, len) {
@@ -462,13 +436,13 @@ fn syscall(t: &mut Table, cur: usize) {
                 usize::MAX
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_EXIT(code): завершить процесс, уступить следующему готовому. Если кто-то ждёт
         // этот процесс в SYS_EXEC (Веха 20.3) — разбудить, вернув ему код выхода.
         2 => {
-            let code = t.procs[cur].frame.regs[10];
+            let code = t.procs[cur].frame.arg(0);
             println!("  [proc] P{} SYS_EXIT({})", cur, code);
             t.procs[cur].state = State::Finished;
             wake_exec_waiters(t, cur, code);
@@ -478,7 +452,7 @@ fn syscall(t: &mut Table, cur: usize) {
         }
         // SYS_YIELD: уступить следующему готовому.
         3 => {
-            t.procs[cur].frame.sepc += 4;
+            t.procs[cur].frame.advance();
             if let Some(n) = t.next_runnable(cur) {
                 t.current = n;
             }
@@ -491,7 +465,7 @@ fn syscall(t: &mut Table, cur: usize) {
         4 => {
             let (rbuf, rcap) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11])
+                (f.arg(0), f.arg(1))
             };
             t.procs[cur].recv_buf = rbuf;
             t.procs[cur].recv_cap = rcap;
@@ -500,11 +474,11 @@ fn syscall(t: &mut Table, cur: usize) {
                 let (n, tcap) = deliver_request(t, from, cur);
                 let rc = cap::mint(t.procs[cur].domain, cap::Target::Reply(from), Rights::SEND);
                 let f = &mut t.procs[cur].frame;
-                f.regs[10] = op;
-                f.regs[11] = rc.bits() as usize;
-                f.regs[12] = n;
-                f.regs[13] = tcap;
-                f.sepc += 4;
+                f.set_ret(op);
+                f.set_ret_at(1, rc.bits() as usize);
+                f.set_ret_at(2, n);
+                f.set_ret_at(3, tcap);
+                f.advance();
             } else {
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
                 if let Some(n) = t.next_runnable(cur) {
@@ -522,9 +496,9 @@ fn syscall(t: &mut Table, cur: usize) {
         5 => {
             let (ecap, op, sbuf, slen, rbuf, rcap) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13], f.regs[14], f.regs[15])
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4), f.arg(5))
             };
-            let scap = t.procs[cur].frame.regs[16]; // a6: право в сообщении (MAX — нет)
+            let scap = t.procs[cur].frame.arg(6); // право в сообщении (MAX — нет)
             let dom = t.procs[cur].domain;
             // Передаваемое право проверяем ДО отправки: нет GRANT — весь CALL отклонён.
             if scap != usize::MAX {
@@ -533,8 +507,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 if !ok {
                     println!("  [cap] P{} CALL отклонён: нет права GRANT на передаваемую capability", cur);
                     let f = &mut t.procs[cur].frame;
-                    f.regs[10] = usize::MAX;
-                    f.sepc += 4;
+                    f.set_ret(usize::MAX);
+                    f.advance();
                     return;
                 }
             }
@@ -552,11 +526,11 @@ fn syscall(t: &mut Table, cur: usize) {
                         let (n, tcap) = deliver_request(t, cur, dest);
                         let rc = cap::mint(t.procs[dest].domain, cap::Target::Reply(cur), Rights::SEND);
                         let df = &mut t.procs[dest].frame;
-                        df.regs[10] = op;
-                        df.regs[11] = rc.bits() as usize;
-                        df.regs[12] = n;
-                        df.regs[13] = tcap;
-                        df.sepc += 4;
+                        df.set_ret(op);
+                        df.set_ret_at(1, rc.bits() as usize);
+                        df.set_ret_at(2, n);
+                        df.set_ret_at(3, tcap);
+                        df.advance();
                         t.procs[dest].state = State::Runnable;
                     } else {
                         t.mailbox.push((cur, dest, op)); // нагрузку скопируют при его RECV
@@ -570,8 +544,8 @@ fn syscall(t: &mut Table, cur: usize) {
                     // Нет валидного cap на эндпоинт — отказ. Процесс не блокируется, продолжает.
                     println!("  [ipc] P{} CALL отклонён: {:?}  ← нет capability на эндпоинт", cur, e);
                     let f = &mut t.procs[cur].frame;
-                    f.regs[10] = usize::MAX;
-                    f.sepc += 4;
+                    f.set_ret(usize::MAX);
+                    f.advance();
                 }
             }
         }
@@ -585,9 +559,9 @@ fn syscall(t: &mut Table, cur: usize) {
         6 => {
             let (rcap, src, len) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12])
+                (f.arg(0), f.arg(1), f.arg(2))
             };
-            let scap = t.procs[cur].frame.regs[13]; // a3: право в ответе (MAX — нет)
+            let scap = t.procs[cur].frame.arg(3); // право в ответе (MAX — нет)
             let dom = t.procs[cur].domain;
             // Как в CALL: передаваемое право проверяем до доставки — нет GRANT, нет REPLY.
             if scap != usize::MAX {
@@ -596,8 +570,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 if !ok {
                     println!("  [cap] P{} REPLY отклонён: нет права GRANT на передаваемую capability", cur);
                     let f = &mut t.procs[cur].frame;
-                    f.regs[10] = usize::MAX;
-                    f.sepc += 4;
+                    f.set_ret(usize::MAX);
+                    f.advance();
                     return;
                 }
             }
@@ -621,7 +595,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         // from_raw_parts из нулевого указателя — UB даже при нулевой длине.
                         if n > 0 {
                             let src_slice = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
-                            let droot = root_of(t.procs[dest].satp);
+                            let droot = arch::space_root(t.procs[dest].space);
                             let dbuf = t.procs[dest].recv_buf;
                             copy_to_space(droot, dbuf, src_slice);
                         }
@@ -644,9 +618,9 @@ fn syscall(t: &mut Table, cur: usize) {
                             }
                         }
                         let df = &mut t.procs[dest].frame;
-                        df.regs[10] = n; // клиентский CALL вернёт число принятых байт
-                        df.regs[11] = tcap; // и дескриптор полученного права (MAX — не было)
-                        df.sepc += 4;
+                        df.set_ret(n); // клиентский CALL вернёт число принятых байт
+                        df.set_ret_at(1, tcap); // и дескриптор полученного права (MAX — не было)
+                        df.advance();
                         t.procs[dest].state = State::Runnable;
                     }
                     let _ = cap::revoke(dom, Cap::from_bits(rcap as u64)); // одноразовость
@@ -658,8 +632,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4; // сервер продолжает (остаётся current)
+            f.set_ret(result);
+            f.advance(); // сервер продолжает (остаётся current)
         }
         // SYS_BLK_READ(dev_cap, sector, buf): шлюз к диску ПОД ЗАЩИТОЙ capability. Без валидного
         // cap на устройство (право READ) — отказ, даже если процесс знает номер сектора. DMA идёт
@@ -667,7 +641,7 @@ fn syscall(t: &mut Table, cur: usize) {
         7 => {
             let (dcap, sector, ubuf) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12])
+                (f.arg(0), f.arg(1), f.arg(2))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
@@ -689,8 +663,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_OBJ_PUT(store_cap, buf, len, id_out) -> 0/MAX: сохранить значение в объектный
         // [[object-model|store]] (нужен cap на store с правом WRITE) и записать 32-байтный
@@ -698,7 +672,7 @@ fn syscall(t: &mut Table, cur: usize) {
         8 => {
             let (scap, buf, len, idout) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
@@ -720,15 +694,15 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_OBJ_GET(store_cap, id_ptr, out_buf, out_cap) -> длина (0 — нет; MAX — отказ):
         // прочитать значение по 32-байтному content-id (нужен cap на store с правом READ).
         9 => {
             let (scap, idp, obuf, ocap) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
@@ -758,15 +732,15 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_OBJ_SET_ROOT(store_cap, name_ptr, name_len, id_ptr) -> 0/MAX: привязать именованный
         // корень к значению (нужен `WRITE`). Так объект переживает перезагрузку ([[persistent-store]]).
         10 => {
             let (scap, nptr, nlen, idp) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
@@ -797,15 +771,15 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_OBJ_GET_ROOT(store_cap, name_ptr, name_len, id_out) -> 32 (есть) / 0 (нет) / MAX
         // (отказ): узнать content-id именованного корня (нужен `READ`).
         11 => {
             let (scap, nptr, nlen, idout) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
@@ -836,8 +810,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_BLK_WRITE(dev_cap, sector, buf, len) -> 0/MAX: записать сектор ПОД ЗАЩИТОЙ capability
         // (нужен `WRITE` на устройство). Данные копируем из буфера вызывающего (SUM=1) в ЯДЕРНЫЙ
@@ -845,7 +819,7 @@ fn syscall(t: &mut Table, cur: usize) {
         12 => {
             let (dcap, sector, ubuf, len) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12], f.regs[13])
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
@@ -866,8 +840,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_OBJ_DEL_ROOT(store_cap, name_ptr, name_len) -> 0 (снят) / 1 (не было) / MAX (отказ):
         // отвязать именованный корень (нужен `WRITE`). Объект уходит в GC, если больше ни на что не
@@ -875,7 +849,7 @@ fn syscall(t: &mut Table, cur: usize) {
         13 => {
             let (scap, nptr, nlen) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12])
+                (f.arg(0), f.arg(1), f.arg(2))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
@@ -901,8 +875,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_MAP(len) -> VA | MAX (Веха 22.1): зарезервировать len байт кучи ЛЕНИВО — ни один
         // фрейм не выделяется сейчас; страницы придут по page fault ([`handle_user_fault`]) или
@@ -910,7 +884,7 @@ fn syscall(t: &mut Table, cur: usize) {
         // USER_HEAP_BASE_VA и не смеет дорасти до стека. Без capability: память — свой ресурс
         // процесса (квоты — отдельная история).
         17 => {
-            let len = t.procs[cur].frame.regs[10];
+            let len = t.procs[cur].frame.arg(0);
             let start = t.procs[cur].heap_brk;
             let end = start.saturating_add(len.div_ceil(PAGE) * PAGE);
             let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
@@ -925,8 +899,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 start
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_CAP_DERIVE(cap, mask) -> новый дескриптор / MAX (Веха 21.1): урезанная копия
         // СВОЕГО права в СВОЁМ домене (права ∩ mask). GRANT не нужен — сужать то, чем владеешь,
@@ -935,7 +909,7 @@ fn syscall(t: &mut Table, cur: usize) {
         16 => {
             let (c, mask) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11])
+                (f.arg(0), f.arg(1))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::derive(dom, Cap::from_bits(c as u64), Rights(mask as u32)) {
@@ -954,8 +928,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             };
             let f = &mut t.procs[cur].frame;
-            f.regs[10] = result;
-            f.sepc += 4;
+            f.set_ret(result);
+            f.advance();
         }
         // SYS_READ(buf, cap) -> n: прочитать доступный ввод консоли (stdin) в буфер процесса —
         // хотя бы один байт. Ввода нет — процесс блокируется (StdinWait), sepc НЕ двигаем:
@@ -964,26 +938,26 @@ fn syscall(t: &mut Table, cur: usize) {
         14 => {
             let (buf, cap_len) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11])
+                (f.arg(0), f.arg(1))
             };
             // Веха 23: приёмный буфер может лежать в ленивой куче — доотобразить до записи ядром.
             if !ensure_heap_range(t, cur, buf, cap_len) {
                 let f = &mut t.procs[cur].frame;
-                f.regs[10] = usize::MAX;
-                f.sepc += 4;
+                f.set_ret(usize::MAX);
+                f.advance();
                 return;
             }
             let mut n = 0usize;
             while n < cap_len {
-                let Some(b) = uart::getc() else { break };
+                let Some(b) = arch::console_getc() else { break };
                 // Пишем в U-память вызывающего напрямую: он current, SUM=1 (как в SYS_WRITE).
                 unsafe { *((buf + n) as *mut u8) = b };
                 n += 1;
             }
             if n > 0 {
                 let f = &mut t.procs[cur].frame;
-                f.regs[10] = n;
-                f.sepc += 4;
+                f.set_ret(n);
+                f.advance();
             } else {
                 t.procs[cur].state = State::StdinWait;
                 if let Some(nx) = t.next_runnable(cur) {
@@ -999,7 +973,7 @@ fn syscall(t: &mut Table, cur: usize) {
         15 => {
             let (scap, nptr, nlen) = {
                 let f = &t.procs[cur].frame;
-                (f.regs[10], f.regs[11], f.regs[12])
+                (f.arg(0), f.arg(1), f.arg(2))
             };
             let dom = t.procs[cur].domain;
             let mut spawned = false;
@@ -1048,22 +1022,17 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             if !spawned {
                 let f = &mut t.procs[cur].frame;
-                f.regs[10] = usize::MAX;
-                f.sepc += 4;
+                f.set_ret(usize::MAX);
+                f.advance();
             }
         }
         other => {
             let f = &mut t.procs[cur].frame;
             println!("  [proc] неизвестный syscall {}", other);
-            f.regs[10] = usize::MAX;
-            f.sepc += 4;
+            f.set_ret(usize::MAX);
+            f.advance();
         }
     }
-}
-
-/// Физический адрес корня таблицы страниц из значения `satp` (PPN → байтовый адрес).
-fn root_of(satp: usize) -> usize {
-    (satp & ((1usize << 44) - 1)) << 12
 }
 
 /// Скопировать `src` в адресное пространство с корнем `root` по виртуальному адресу `dst_va`,
@@ -1072,7 +1041,7 @@ fn root_of(satp: usize) -> usize {
 fn copy_to_space(root: usize, mut dst_va: usize, src: &[u8]) {
     let mut off = 0;
     while off < src.len() {
-        let Some(pa) = paging::translate(root, dst_va) else { return };
+        let Some(pa) = arch::translate(root, dst_va) else { return };
         let page_off = dst_va & (PAGE - 1);
         let n = (src.len() - off).min(PAGE - page_off);
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(off), pa as *mut u8, n) };
@@ -1095,7 +1064,7 @@ fn copy_between_spaces(
     let mut off = 0;
     while off < len {
         let (Some(spa), Some(dpa)) =
-            (paging::translate(src_root, src_va), paging::translate(dst_root, dst_va))
+            (arch::translate(src_root, src_va), arch::translate(dst_root, dst_va))
         else {
             return;
         };
@@ -1129,9 +1098,9 @@ fn deliver_request(t: &Table, from: usize, to: usize) -> (usize, usize) {
     }
     if n > 0 {
         copy_between_spaces(
-            root_of(t.procs[from].satp),
+            arch::space_root(t.procs[from].space),
             t.procs[from].send_buf,
-            root_of(t.procs[to].satp),
+            arch::space_root(t.procs[to].space),
             t.procs[to].recv_buf,
             n,
         );

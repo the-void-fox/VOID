@@ -30,7 +30,7 @@ use core::task::{Context, Poll, Waker};
 use alloc::boxed::Box;
 
 use crate::sync::SpinLock;
-use crate::{csr, frame};
+use crate::{arch, frame};
 
 /// Размер сектора virtio-blk.
 pub const SECTOR_SIZE: usize = 512;
@@ -407,21 +407,21 @@ impl Future for ReadFuture {
             // Зарегистрировать ожидание ДО notify, чтобы не разминуться с прерыванием.
             // Замок ASYNC берём с выключенными прерываниями: иначе IRQ посреди удержания
             // замка → on_irq на том же замке → взаимоблокировка.
-            let sie = csr::irq_save_disable();
+            let sie = arch::irq_save_disable();
             {
                 let mut a = ASYNC.lock();
                 a.active = true;
                 a.done = false;
                 a.waker = Some(cx.waker().clone());
             }
-            csr::irq_restore(sie);
+            arch::irq_restore(sie);
             blk.submit_read(hp, bp, sp);
             this.submitted = true;
             return Poll::Pending;
         }
 
         // Уже отправлено — проверить завершение (флаг выставляет on_irq).
-        let sie = csr::irq_save_disable();
+        let sie = arch::irq_save_disable();
         let done = {
             let mut a = ASYNC.lock();
             if a.done {
@@ -432,7 +432,7 @@ impl Future for ReadFuture {
                 false
             }
         };
-        csr::irq_restore(sie);
+        arch::irq_restore(sie);
 
         if done {
             if let Some(blk) = BLK.lock().as_mut() {
