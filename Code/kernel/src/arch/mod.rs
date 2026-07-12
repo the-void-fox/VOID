@@ -27,7 +27,9 @@
 //!   арх сам классифицирует trap из U-mode в [`UserTrap`] и зовёт
 //!   `proc::handle_user_trap(frame, trap)`; `enter_user` — вход в процесс.
 //! - **Контексты**: [`Context`] (opaque: `EMPTY`/`new_task`/`new_kernel`), `context_switch`.
-//! - **Разное**: `ELF_MACHINE` (e_machine загружаемых программ), `power_off`.
+//! - **Разное**: `ELF_MACHINE` (e_machine загружаемых программ), `RAM_LIMIT` (конец RAM
+//!   платформы — для арены фреймов), `USERSPACE_READY` (false на архе в bring-up: kmain
+//!   пропускает процессные демо, пока не готовы вход в U-mode и программы), `power_off`.
 //!
 //! Платформенные константы (адреса RAM/MMIO QEMU virt) пока остаются в общих
 //! `frame`/`virtio_blk` — их черёд отделяться придёт с реальным x86-железом (Вехи 25+),
@@ -55,7 +57,7 @@ pub use imp::{
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
     // разное
-    ELF_MACHINE,
+    ELF_MACHINE, RAM_LIMIT, USERSPACE_READY,
 };
 
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.

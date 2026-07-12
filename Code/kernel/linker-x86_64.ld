@@ -1,11 +1,12 @@
-/* Раскладка памяти ядра VOID для x86_64 — ЗАГЛУШКА Вехи 24.
+/* Раскладка памяти ядра VOID для x86_64 (Веха 25 — PVH direct boot).
  *
- * Цель — линковаться (сборка под оба таргета из одного дерева); настоящая раскладка
- * (Limine, higher-half по 0xffffffff80000000, W^X постранично) придёт с bring-up (Вехи 25+).
- * База 1 МиБ — классическая нижняя загрузка; символы _*_start/_end и _kernel_end
- * повторяют RISC-V-скрипт: на них ссылается общий код (frame.rs). */
+ * QEMU (`-kernel`) грузит ELF64 по физическим адресам сегментов и стартует 32-битный
+ * вход из PVH-ноты (см. arch/x86_64/entry.s). База 1 МиБ — ниже только BIOS/EBDA-дыры.
+ * Ядро живёт identity-mapped (VA == PA), как на RISC-V: та же модель direct map, те же
+ * символы _*_start/_end и _kernel_end для W^X (arch/x86_64/paging.rs) и frame.rs.
+ * Higher-half не используется сознательно — см. ADR 0005/0006. */
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(_start)
+ENTRY(_start32)
 
 BASE_ADDRESS = 0x100000;
 
@@ -13,6 +14,12 @@ SECTIONS
 {
     . = BASE_ADDRESS;
     _kernel_start = .;
+
+    /* PVH-нота — отдельной секцией типа note: LLD сам заведёт под неё PT_NOTE,
+     * в котором её ищет QEMU. Прочие ноты игнорируются (/DISCARD/ ниже). */
+    .note : ALIGN(4) {
+        *(.note.Xen)
+    }
 
     .text : ALIGN(4K) {
         _text_start = .;

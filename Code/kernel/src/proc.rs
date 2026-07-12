@@ -198,13 +198,13 @@ pub fn domain(pid: usize) -> cap::DomainId {
 /// Задать стартовый аргумент (`a0`) процесса до запуска — например, дескриптор capability,
 /// который процесс предъявит в первом syscall'е.
 pub fn set_arg(pid: usize, a0: usize) {
-    TABLE.lock().procs[pid].frame.set_ret_at(0, a0);
+    TABLE.lock().procs[pid].frame.set_start_arg(0, a0);
 }
 
 /// Задать второй стартовый аргумент (`a1`) — когда начальных capability у процесса два
 /// (Веха 20: vsh получает эндпоинт персоналии в `a0` и exec-cap на store в `a1`).
 pub fn set_arg2(pid: usize, a1: usize) {
-    TABLE.lock().procs[pid].frame.set_ret_at(1, a1);
+    TABLE.lock().procs[pid].frame.set_start_arg(1, a1);
 }
 
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в

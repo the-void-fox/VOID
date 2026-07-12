@@ -16,9 +16,9 @@ extern "C" {
     static _kernel_end: u8;
 }
 
-/// Конец физической RAM на QEMU virt при `-m 128M`: 0x8000_0000 + 128 МиБ.
-/// (Жёстко задано под наш runner в .cargo/config.toml; позже возьмём из DTB.)
-const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
+/// Конец физической RAM — платформенная константа арха (`-m 128M` у runner'ов обеих
+/// архитектур в .cargo/config.toml; позже возьмём из DTB / PVH start_info).
+const RAM_END: usize = crate::arch::RAM_LIMIT;
 
 /// Адрес следующего свободного фрейма (двигается вверх).
 static NEXT: AtomicUsize = AtomicUsize::new(0);

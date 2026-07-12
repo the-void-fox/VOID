@@ -1,26 +1,42 @@
-//! Заглушка контракта [`crate::arch`] для x86_64 (Веха 24).
+//! Реализация контракта [`crate::arch`] для x86_64 (Веха 25 — ядро ожило).
 //!
-//! Цель этой вехи — не работающее x86-ядро, а ГРАНИЦА: общий код собирается под
-//! `x86_64-unknown-none` без единого `cfg` вне `arch/`, все точки сращивания перечислены
-//! здесь и обозначены `unimplemented!`. Bring-up (Limine → GDT/IDT → 4-уровневый пейджинг →
-//! LAPIC → syscall/sysret → virtio-pci) — Вехи 25+; по мере его продвижения заглушки одна
-//! за другой превращаются в реализацию, а контракт НЕ меняется.
+//! Живое: PVH direct boot (QEMU `-kernel`, трамплин 32→64 в entry.s), консоль COM1
+//! (вывод), GDT/IDT + полный дамп фатальных trap'ов, 4-уровневый пейджинг с W^X
+//! (paging.rs), LAPIC-таймер (lapic.rs), переключение контекстов ядерных задач
+//! (switch.s) — ядерная половина демо (store, sched, async, GC) работает.
 //!
-//! Что уже настоящее: последовательная консоль COM1 (вывод) и примитивы прерываний
-//! (rflags.IF / cli / sti / hlt) — их хватит, чтобы первый bring-up печатал.
+//! Ещё заглушки (Веха 26+ — userspace): вход в U-mode (нужны TSS + сегменты ring3 +
+//! syscall/sysret), маски прерываний сессий процессов, приём консоли (IOAPIC → IRQ4),
+//! virtio-pci (диск → персистентность). До тех пор [`USERSPACE_READY`] = false —
+//! kmain пропускает процессные демо.
 
 use core::fmt;
 
-// Точка входа: пока прошивка/загрузчик не выбраны (Limine — Вехи 25+), просто стек → kmain.
+mod lapic;
+mod paging;
+mod trap;
+
+// Точка входа: PVH-нота + трамплин 32→64 (см. entry.s).
 core::arch::global_asm!(include_str!("entry.s"));
+// Переключение контекстов ядерных задач.
+core::arch::global_asm!(include_str!("switch.s"));
 
-const STUB: &str = "x86_64: заглушка Вехи 24 — bring-up в Вехах 25+";
+pub use trap::{init as trap_init, TrapFrame};
 
-// ─── консоль (COM1, только вывод) ───────────────────────────────────────────
+const STUB: &str = "x86_64: userspace — Веха 26+";
+
+/// Процессы/U-mode на этой архитектуре ещё в bring-up — kmain пропускает их демо.
+pub const USERSPACE_READY: bool = false;
+
+/// Конец RAM: QEMU q35 `-m 128M` — [0, 128 МиБ) (дыру BIOS < 1 МиБ ядро не трогает:
+/// образ грузится с 1 МиБ, арена фреймов — за ним).
+pub const RAM_LIMIT: usize = 128 * 1024 * 1024;
+
+// ─── консоль (COM1, вывод; приём — с IOAPIC, Веха 26+) ──────────────────────
 
 const COM1: u16 = 0x3f8;
 
-/// IRQ COM1 в классической маршрутизации (8259/IOAPIC) — пока только для печати баннера.
+/// IRQ COM1 в классической маршрутизации — пригодится при подключении IOAPIC.
 pub const CONSOLE_IRQ: u32 = 4;
 
 #[inline]
@@ -29,7 +45,7 @@ fn outb(port: u16, v: u8) {
 }
 
 /// Zero-sized хэндл последовательной консоли (пишем в THR COM1 без инициализации линии —
-/// QEMU этого достаточно; делитель/FIFO настроит bring-up).
+/// QEMU этого достаточно; делитель/FIFO настроит приёмная часть при bring-up ввода).
 pub struct Console;
 
 impl fmt::Write for Console {
@@ -44,7 +60,7 @@ impl fmt::Write for Console {
     }
 }
 
-/// Приём с консоли — часть bring-up (IRQ 4 / опрос LSR): пока ввода нет.
+/// Приём с консоли — вместе с IOAPIC (Веха 26+): пока ввода нет.
 pub fn console_drain() {}
 pub fn console_has_input() -> bool {
     false
@@ -81,7 +97,7 @@ pub fn wait_for_interrupt() {
     unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
 }
 
-// Маски сессий процессов: на x86 лягут на маскировку линий LAPIC/IOAPIC (bring-up).
+// Маски сессий процессов лягут на LVT/IOAPIC, когда появятся процессы (Веха 26+).
 pub fn irq_mask_read() -> usize {
     0
 }
@@ -93,170 +109,179 @@ pub fn irq_mask_stdin(_saved: usize) {
     unimplemented!("{STUB}: маска сна до ввода (устройства вкл, таймер выкл)")
 }
 pub fn mark_in_kernel() {}
-pub fn init_device_interrupts() {
-    // IOAPIC/MSI + virtio-pci — Вехи 25+; без них ядро печатает и останавливается раньше.
-}
 
-// ─── таймер ─────────────────────────────────────────────────────────────────
+/// Маршрутизация прерываний устройств — IOAPIC/MSI + virtio-pci (Веха 26+). Пока
+/// устройств нет: virtio-mmio-пробы честно не находят диска, консоль работает выводом.
+pub fn init_device_interrupts() {}
 
+// ─── таймер (LAPIC) ─────────────────────────────────────────────────────────
+
+/// Включить LAPIC (+ spurious), one-shot LVT-таймер и глобально прерывания.
 pub fn timer_hw_init() {
-    unimplemented!("{STUB}: LAPIC-таймер")
-}
-pub fn timer_arm() {
-    unimplemented!("{STUB}: LAPIC-таймер (one-shot)")
+    lapic::init();
+    enable_interrupts();
 }
 
-// ─── память (4-уровневый пейджинг — bring-up) ───────────────────────────────
+/// Перевзвести квант вытеснения (one-shot: запись initial count = старт отсчёта).
+pub fn timer_arm() {
+    lapic::arm();
+}
+
+// ─── память (4-уровневый пейджинг) ──────────────────────────────────────────
 
 /// Имя схемы трансляции — для баннера загрузки.
-pub const MM_NAME: &str = "x86_64 4-level (заглушка)";
+pub const MM_NAME: &str = "x86_64 4-level";
 
-/// Флаги [`map`]: значения станут битами PTE x86_64 при bring-up (W=1<<1, U=1<<2, NX…).
+pub use paging::{clone_kernel_root, translate};
+
+/// Флаги [`map`] — арх-нейтральные биты; в PTE их переводит сам `map` (x86 наоборот
+/// ЗАПРЕЩАЕТ исполнение битом NX — см. paging.rs).
 pub const MAP_R: usize = 1 << 0;
 pub const MAP_W: usize = 1 << 1;
 pub const MAP_X: usize = 1 << 2;
 pub const MAP_U: usize = 1 << 3;
 
+/// Построить таблицы ядра (direct map + W^X + MMIO) и вернуть корень (PML4).
 pub fn mm_init() -> usize {
-    crate::frame::init(); // обязательство bring-up: арена фреймов — часть mm_init (как на RISC-V)
-    unimplemented!("{STUB}: построение таблиц (PML4) + W^X")
+    paging::init()
 }
-pub unsafe fn mm_enable(_root: usize) {
-    unimplemented!("{STUB}: cr3")
+
+/// Включить трансляцию по корню (CR3). До этого работали ВРЕМЕННЫЕ идентичные
+/// таблицы трамплина (entry.s) — как «до paging::init» на RISC-V.
+///
+/// # Safety
+/// См. paging::enable.
+pub unsafe fn mm_enable(root: usize) {
+    paging::enable(root)
 }
-pub fn clone_kernel_root() -> usize {
-    unimplemented!("{STUB}: клон PML4 ядра")
+
+/// Отобразить страницу `va → pa` с флагами `MAP_*` (перевод в биты PTE — внутри).
+///
+/// # Safety
+/// См. paging::map.
+pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) {
+    let mut pte = 0u64;
+    if flags & MAP_W != 0 {
+        pte |= paging::PTE_W;
+    }
+    if flags & MAP_U != 0 {
+        pte |= paging::PTE_U;
+    }
+    if flags & MAP_X == 0 {
+        pte |= paging::PTE_NX; // x86: исполнение ЗАПРЕЩАЕТСЯ, а не разрешается
+    }
+    paging::map(root, va, pa, pte)
 }
-pub unsafe fn map(_root: usize, _va: usize, _pa: usize, _flags: usize) {
-    unimplemented!("{STUB}: map 4 КиБ-страницы")
-}
-pub fn translate(_root: usize, _va: usize) -> Option<usize> {
-    unimplemented!("{STUB}: программный обход таблиц")
-}
+
+/// Сбросить TLB после смены отображений активного пространства (перезагрузка CR3).
 pub fn flush_tlb() {
-    unimplemented!("{STUB}: invlpg / смена cr3")
-}
-pub fn space_token(_root: usize) -> usize {
-    unimplemented!("{STUB}: токен = значение cr3")
-}
-pub fn space_root(_token: usize) -> usize {
-    unimplemented!("{STUB}: корень из cr3")
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nostack),
+        );
+    }
 }
 
-// ─── trap'ы и вход в U-mode ─────────────────────────────────────────────────
-
-pub fn trap_init() {
-    unimplemented!("{STUB}: GDT/IDT")
+/// Токен адресного пространства — на x86 это значение CR3 (низ = флаги, нулевые).
+pub fn space_token(root: usize) -> usize {
+    root
 }
 
-/// ОБЯЗАТЕЛЬСТВА будущего обработчика trap'ов x86 — те же хуки общего кода, которые сегодня
-/// зовёт riscv64/trap.rs: тик таймера, IRQ диска, классифицированный trap из U-mode.
-/// Не вызывается; перечисляет точки сращивания «арх → общий код» (и не даёт dead-code-анализу
-/// посчитать общий код мёртвым при сборке заглушки).
-#[allow(dead_code)]
-fn trap_dispatch_obligations(frame: &mut TrapFrame) -> ! {
-    use crate::arch::{FaultKind, UserTrap};
-    crate::timer::on_tick(); // прерывание LAPIC-таймера из ядра
-    crate::virtio_blk::on_irq(); // IRQ диска (IOAPIC/MSI → virtio)
-    // Классификатор (аналог classify_user в riscv64/trap.rs) обязан строить ВСЕ варианты:
-    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Load }; // #PF, бит W errcode = 0
-    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Store }; // #PF, бит W errcode = 1
-    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Exec }; // #PF, бит I/D errcode
-    let _ = UserTrap::TimerTick; // вектор LAPIC-таймера из U-mode
-    let _ = UserTrap::Unknown(0); // прочие вектора (#GP, #UD…)
-    // trap из U-mode: классифицировать и отдать планировщику.
-    crate::proc::handle_user_trap(frame, UserTrap::Syscall)
+/// Корень таблиц из токена.
+pub fn space_root(token: usize) -> usize {
+    token & !0xfff
 }
 
-/// Снимок регистров процесса. Раскладка и связь с ABI syscall'ов (rax=номер, rdi..r9=аргументы)
-/// будут зафиксированы при bring-up (Вехи 25+) вместе с трамплином входа.
-#[derive(Clone, Copy, Default)]
-pub struct TrapFrame {
-    regs: [usize; 16],
-    rip: usize,
-    rflags: usize,
-}
-
-impl TrapFrame {
-    pub fn new_user(entry: usize, sp: usize, arg: usize) -> Self {
-        let mut f = Self::default();
-        f.rip = entry;
-        f.regs[7] = sp; // rsp
-        f.regs[1] = arg; // rdi — первый аргумент SysV
-        f.rflags = 1 << 9; // IF
-        f
-    }
-    pub fn syscall_num(&self) -> usize {
-        self.regs[0] // rax
-    }
-    pub fn arg(&self, i: usize) -> usize {
-        self.regs[1 + i] // rdi, rsi, rdx, r10, r8, r9…
-    }
-    pub fn set_ret(&mut self, v: usize) {
-        self.regs[0] = v; // rax
-    }
-    pub fn set_ret_at(&mut self, i: usize, v: usize) {
-        if i == 0 {
-            self.regs[0] = v;
-        } else {
-            self.regs[1 + i] = v;
-        }
-    }
-    pub fn advance(&mut self) {
-        // syscall/sysret вернёт на rcx — уточнится при bring-up; для заглушки — ничего.
-    }
-}
+// ─── вход в процесс (Веха 26+) ──────────────────────────────────────────────
 
 pub unsafe fn enter_user(_frame: &TrapFrame, _space: usize, _trap_top: usize) -> ! {
-    unimplemented!("{STUB}: iretq/sysret в U-mode")
+    unimplemented!("{STUB}: TSS + сегменты ring3 + iretq/sysret")
 }
 
 // ─── контексты ядерных задач ────────────────────────────────────────────────
 
-/// Callee-saved x86_64: rip (возврат), rsp, rbx, rbp, r12..r15.
+/// Callee-saved x86_64. Раскладка строго совпадает со switch.s; адрес возврата не
+/// хранится — он на стеке задачи (финальный `ret` switch.s возобновляет её).
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Context {
-    #[allow(dead_code)]
-    rip: usize,
-    #[allow(dead_code)]
     rsp: usize,
-    #[allow(dead_code)]
-    s: [usize; 6],
+    rbx: usize,
+    rbp: usize,
+    r12: usize,
+    r13: usize,
+    r14: usize,
+    r15: usize,
 }
 
 impl Context {
-    pub const EMPTY: Context = Context { rip: 0, rsp: 0, s: [0; 6] };
+    /// Пустой контекст — для статиков и «заполнится при первом переключении».
+    pub const EMPTY: Context =
+        Context { rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0 };
 
+    /// Контекст новой ядерной ЗАДАЧИ: на дно стека кладётся адрес трамплина (его
+    /// возьмёт `ret` в switch.s), функция задачи — в rbx (её вызовет трамплин; по
+    /// возврату — `sched::task_exit`). Выравнивание: после `ret` rsp кратен 16 —
+    /// SysV-состояние «как после call».
     pub fn new_task(entry: fn(), sp: usize) -> Context {
+        extern "C" {
+            fn x86_task_trampoline();
+        }
+        let top = (sp & !0xf) - 8;
+        unsafe { *(top as *mut usize) = x86_task_trampoline as *const () as usize };
         let mut c = Context::EMPTY;
-        c.rip = entry as usize; // трамплин появится вместе с switch-асм (bring-up)
-        c.rsp = sp;
+        c.rsp = top;
+        c.rbx = entry as usize;
         c
     }
 
+    /// Контекст прямого входа в функцию ядра на заданном стеке (лончер сессии
+    /// процессов): на дно стека — адрес самой функции.
     pub fn new_kernel(entry: extern "C" fn() -> !, sp: usize) -> Context {
+        let top = (sp & !0xf) - 8;
+        unsafe { *(top as *mut usize) = entry as usize };
         let mut c = Context::EMPTY;
-        c.rip = entry as usize;
-        c.rsp = sp;
+        c.rsp = top;
         c
     }
 }
 
-/// Переключение контекстов — ассемблер bring-up (аналог switch.s).
-///
-/// # Safety
-/// Не реализовано.
-pub unsafe fn context_switch(_old: *mut Context, _new: *const Context) {
-    unimplemented!("{STUB}: switch-асм (callee-saved + rsp)")
+extern "C" {
+    /// Сохранить текущий контекст в `*old`, загрузить `*new` и продолжить в нём
+    /// (см. switch.s).
+    pub fn context_switch(old: *mut Context, new: *const Context);
 }
 
 // ─── разное ─────────────────────────────────────────────────────────────────
 
-/// `e_machine` программ этого ядра (EM_X86_64). Программы для x86 появятся с арх-измерением
-/// корней `bin/<arch>/<имя>` (Вехи 25+); сегодняшние сеяные ELF — RISC-V, загрузчик их отвергнет.
+/// `e_machine` программ этого ядра (EM_X86_64). Программы для x86 появятся с
+/// арх-измерением корней `bin/<arch>/<имя>` (Веха 26+); сеяные ELF — RISC-V,
+/// загрузчик их честно отвергнет (BadMachine).
 pub const ELF_MACHINE: u16 = 62;
 
 #[allow(dead_code)]
 pub fn power_off() -> ! {
-    unimplemented!("{STUB}: ACPI/isa-debug-exit")
+    // isa-debug-exit/ACPI — вместе с автотестами; пока честная остановка.
+    loop {
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
+    }
+}
+
+/// ОБЯЗАТЕЛЬСТВА пути процессов (Веха 26+) — хуки общего кода, которые обязан звать
+/// обработчик trap'ов из U-mode, когда появится вход в ring3 (сегодня U-mode нет, и
+/// x86_trap_handler зовёт только timer::on_tick). Держит общий код живым для
+/// dead-code-анализа и перечисляет точки сращивания.
+#[allow(dead_code)]
+fn user_path_obligations(frame: &mut TrapFrame) -> ! {
+    use crate::arch::{FaultKind, UserTrap};
+    crate::virtio_blk::on_irq(); // IRQ диска (IOAPIC/MSI → virtio-pci)
+    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Load }; // #PF, errcode.W=0
+    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Store }; // #PF, errcode.W=1
+    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Exec }; // #PF, errcode.I/D
+    let _ = UserTrap::TimerTick; // тик LAPIC из ring3 → вытеснение
+    let _ = UserTrap::Unknown(0); // прочие вектора (#GP, #UD…)
+    crate::proc::handle_user_trap(frame, UserTrap::Syscall)
 }

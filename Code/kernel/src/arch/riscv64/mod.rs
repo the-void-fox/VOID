@@ -170,6 +170,12 @@ pub unsafe fn enter_user(frame: &TrapFrame, space: usize, trap_top: usize) -> ! 
 /// `e_machine` программ, которые исполняет это ядро (EM_RISCV).
 pub const ELF_MACHINE: u16 = 243;
 
+/// Процессы/U-mode здесь полностью рабочие с Вехи 10.
+pub const USERSPACE_READY: bool = true;
+
+/// Конец RAM: QEMU virt `-m 128M` — [0x8000_0000, 0x8800_0000).
+pub const RAM_LIMIT: usize = 0x8000_0000 + 128 * 1024 * 1024;
+
 /// Выключить машину (SBI SRST; в QEMU — завершить процесс). Задел под автотесты.
 #[allow(dead_code)]
 pub fn power_off() -> ! {
