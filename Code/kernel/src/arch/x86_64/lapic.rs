@@ -3,7 +3,7 @@
 //! Аналог пары SBI TIME + sie.STIE на RISC-V: одноразовый (one-shot) счётчик, который
 //! перевзводится на каждом тике ([`arm`]). Страница LAPIC отображается UC в таблицах
 //! ядра ([`super::paging::init`]); работаем до IOAPIC — линии устройств придут с
-//! virtio-pci (Вехи 26+).
+//! virtio-pci (Веха 27+).
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -49,4 +49,15 @@ pub fn arm() {
 /// End-of-interrupt — сообщить LAPIC, что вектор обслужен (иначе следующий не придёт).
 pub fn eoi() {
     w(REG_EOI, 0);
+}
+
+/// Замаскирован ли LVT-таймер (бит 16) — снимок для масок сессий (Веха 26).
+pub fn timer_masked() -> bool {
+    r(REG_LVT_TIMER) & (1 << 16) != 0
+}
+
+/// Маскировать/размаскировать LVT-таймер, не трогая вектор/режим.
+pub fn set_timer_masked(masked: bool) {
+    let v = r(REG_LVT_TIMER);
+    w(REG_LVT_TIMER, if masked { v | (1 << 16) } else { v & !(1 << 16) });
 }

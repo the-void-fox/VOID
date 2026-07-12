@@ -77,6 +77,10 @@ impl TrapFrame {
     pub fn advance(&mut self) {
         self.sepc += 4;
     }
+
+    /// Перевзвести syscall на рестарт (блокирующий `SYS_READ`): здесь делать нечего —
+    /// sepc не двигали, `ecall` повторится сам. На x86 это явный откат rip.
+    pub fn restart(&mut self) {}
 }
 
 /// Классифицировать trap из U-mode в арх-нейтральный [`UserTrap`] для `proc` (Веха 24).

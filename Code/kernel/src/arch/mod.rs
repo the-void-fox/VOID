@@ -23,13 +23,16 @@
 //!   `MAP_R/W/X/U`, `translate`, `flush_tlb`, токены адресных пространств
 //!   `space_token(корень)`/`space_root(токен)` (на RISC-V токен = значение satp), `MM_NAME`.
 //! - **Trap'ы**: `trap_init`; [`TrapFrame`] — снимок регистров с методами вместо голых
-//!   индексов (`syscall_num`, `arg(i)`, `set_ret`/`set_ret_at`, `advance`, `new_user`);
-//!   арх сам классифицирует trap из U-mode в [`UserTrap`] и зовёт
-//!   `proc::handle_user_trap(frame, trap)`; `enter_user` — вход в процесс.
+//!   индексов (`syscall_num`, `arg(i)`, `set_ret`/`set_ret_at`, `set_start_arg`, `advance`,
+//!   `restart` — перевзвести блокирующий syscall на повтор: на riscv sepc и так стоит на
+//!   `ecall`, на x86 нужен откат rip за `int 0x80`, `new_user`); арх сам классифицирует
+//!   trap из U-mode в [`UserTrap`] и зовёт `proc::handle_user_trap(frame, trap)`;
+//!   `enter_user` — вход в процесс.
 //! - **Контексты**: [`Context`] (opaque: `EMPTY`/`new_task`/`new_kernel`), `context_switch`.
-//! - **Разное**: `ELF_MACHINE` (e_machine загружаемых программ), `RAM_LIMIT` (конец RAM
-//!   платформы — для арены фреймов), `USERSPACE_READY` (false на архе в bring-up: kmain
-//!   пропускает процессные демо, пока не готовы вход в U-mode и программы), `power_off`.
+//! - **Разное**: `ELF_MACHINE` (e_machine загружаемых программ), `ARCH_NAME` (арх-измерение
+//!   корней программ `bin/<arch>/<имя>`), `RAM_LIMIT` (конец RAM платформы — для арены
+//!   фреймов), `USERSPACE_READY` (false на архе в bring-up: kmain пропускает процессные
+//!   демо, пока не готовы вход в U-mode и программы), `power_off`.
 //!
 //! Платформенные константы (адреса RAM/MMIO QEMU virt) пока остаются в общих
 //! `frame`/`virtio_blk` — их черёд отделяться придёт с реальным x86-железом (Вехи 25+),
@@ -57,7 +60,7 @@ pub use imp::{
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
     // разное
-    ELF_MACHINE, RAM_LIMIT, USERSPACE_READY,
+    ARCH_NAME, ELF_MACHINE, RAM_LIMIT, USERSPACE_READY,
 };
 
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.

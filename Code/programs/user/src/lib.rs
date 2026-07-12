@@ -6,12 +6,13 @@
 //! собственный статический ELF (см. `src/bin/*`), где работает обычный Rust: массивы, слайсы,
 //! `copy_from_slice` — всё линкуется в сам бинарь и исполняется со страниц процесса.
 //!
-//! Здесь — единственное место, где программы видят `ecall`. Соглашение syscall'ов (ABI v1):
-//! номер в `a7`, аргументы в `a0..a6`, результат в `a0` (подробности — в шапке
-//! `kernel/src/proc.rs`). `usize::MAX` (== [`NO_CAP`]) в позиции capability значит «права нет».
+//! Здесь — единственное место, где программы видят инструкцию syscall'а (модуль [`abi`],
+//! Веха 26: `ecall` на riscv64, `int 0x80` на x86_64 — один исходник, обе архитектуры).
+//! Соглашение (ABI v1) одинаково ПО СМЫСЛУ: номер + до 7 аргументов + до 4 регистров
+//! результата (подробности — в шапке `kernel/src/proc.rs`; раскладка по регистрам —
+//! в `kernel/src/arch/*/trap.rs`). `usize::MAX` (== [`NO_CAP`]) в позиции capability
+//! значит «права нет».
 #![no_std]
-
-use core::arch::asm;
 
 // ─── номера syscall'ов (ABI v1, см. libs/void-abi и kernel/src/proc.rs) ───────
 const SYS_WRITE: usize = 1;
@@ -42,24 +43,85 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     exit(101)
 }
 
+// ─── арх-слой: инструкция syscall'а (Веха 26) ─────────────────────────────────
+
+/// Единственное арх-специфичное место userspace: как передать ядру номер, до 7
+/// аргументов и забрать до 4 регистров результата. Раскладка зеркалит методы
+/// `TrapFrame` контракта ядра (`arg(i)`, `set_ret_at(i)`).
+mod abi {
+    /// riscv64: номер в a7, аргументы a0..a6, результаты a0..a3 (`ecall`).
+    #[cfg(target_arch = "riscv64")]
+    #[inline(always)]
+    pub fn syscall(
+        num: usize, mut a0: usize, mut a1: usize, mut a2: usize, mut a3: usize,
+        a4: usize, a5: usize, a6: usize,
+    ) -> (usize, usize, usize, usize) {
+        unsafe {
+            core::arch::asm!("ecall", in("a7") num,
+                inout("a0") a0, inout("a1") a1, inout("a2") a2, inout("a3") a3,
+                in("a4") a4, in("a5") a5, in("a6") a6, options(nostack));
+        }
+        (a0, a1, a2, a3)
+    }
+
+    /// riscv64: невозвращающийся syscall (SYS_EXIT).
+    #[cfg(target_arch = "riscv64")]
+    pub fn syscall_noreturn(num: usize, a0: usize) -> ! {
+        unsafe {
+            core::arch::asm!("ecall", in("a7") num, in("a0") a0, options(nostack, noreturn))
+        }
+    }
+
+    /// x86_64: номер в rax, аргументы rdi,rsi,rdx,r10,r8,r9,rbx, результаты
+    /// rax,rdi,rsi,rdx (`int 0x80`). rbx нельзя назвать операндом asm! (резерв LLVM) —
+    /// 7-й аргумент заезжает в него через `xchg` и выезжает обратно.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn syscall(
+        num: usize, mut a0: usize, mut a1: usize, mut a2: usize, a3: usize,
+        a4: usize, a5: usize, a6: usize,
+    ) -> (usize, usize, usize, usize) {
+        let r0;
+        unsafe {
+            core::arch::asm!(
+                "xchg rbx, {a6}",
+                "int 0x80",
+                "xchg rbx, {a6}",
+                a6 = inout(reg) a6 => _,
+                inout("rax") num => r0,
+                inout("rdi") a0, inout("rsi") a1, inout("rdx") a2,
+                in("r10") a3, in("r8") a4, in("r9") a5,
+                options(nostack),
+            );
+        }
+        (r0, a0, a1, a2)
+    }
+
+    /// x86_64: невозвращающийся syscall (SYS_EXIT).
+    #[cfg(target_arch = "x86_64")]
+    pub fn syscall_noreturn(num: usize, a0: usize) -> ! {
+        unsafe {
+            core::arch::asm!("int 0x80", in("rax") num, in("rdi") a0,
+                options(nostack, noreturn))
+        }
+    }
+}
+
 // ─── базовые syscall'ы ────────────────────────────────────────────────────────
 
-/// `SYS_WRITE`: напечатать байты в консоль (ядро читает буфер процесса по SUM=1).
+/// `SYS_WRITE`: напечатать байты в консоль (ядро читает буфер процесса напрямую).
 pub fn write(buf: &[u8]) {
-    unsafe {
-        asm!("ecall", in("a7") SYS_WRITE, inout("a0") buf.as_ptr() as usize => _,
-             in("a1") buf.len(), options(nostack));
-    }
+    abi::syscall(SYS_WRITE, buf.as_ptr() as usize, buf.len(), 0, 0, 0, 0, 0);
 }
 
 /// `SYS_EXIT`: завершить процесс с кодом (родителю в `SYS_EXEC` вернётся именно он).
 pub fn exit(code: usize) -> ! {
-    unsafe { asm!("ecall", in("a7") SYS_EXIT, in("a0") code, options(nostack, noreturn)) }
+    abi::syscall_noreturn(SYS_EXIT, code)
 }
 
 /// `SYS_YIELD`: уступить процессор следующему готовому процессу.
 pub fn yield_now() {
-    unsafe { asm!("ecall", in("a7") SYS_YIELD, inout("a0") 0usize => _, options(nostack)) }
+    abi::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0, 0);
 }
 
 /// Принятый запрос IPC: op отправителя, одноразовый reply-cap, длина нагрузки в буфере
@@ -73,13 +135,8 @@ pub struct Message {
 
 /// `SYS_RECV`: ждать запрос; нагрузка ложится в `buf` (усечённая по его размеру).
 pub fn recv(buf: &mut [u8]) -> Message {
-    let (op, reply_cap, len, cap);
-    unsafe {
-        asm!("ecall", in("a7") SYS_RECV,
-             inout("a0") buf.as_mut_ptr() as usize => op,
-             inout("a1") buf.len() => reply_cap,
-             out("a2") len, out("a3") cap, options(nostack));
-    }
+    let (op, reply_cap, len, cap) =
+        abi::syscall(SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0);
     Message { op, reply_cap, len, cap }
 }
 
@@ -87,14 +144,12 @@ pub fn recv(buf: &mut [u8]) -> Message {
 /// Возвращает (байт ответа | MAX, право из ответа | [`NO_CAP`]). На передаваемое право
 /// (`cap` != NO_CAP) нужен `GRANT` — иначе ядро отклонит весь вызов.
 pub fn call_full(ep: usize, op: usize, send: &[u8], recv: &mut [u8], cap: usize) -> (usize, usize) {
-    let (n, got);
-    unsafe {
-        asm!("ecall", in("a7") SYS_CALL,
-             inout("a0") ep => n, inout("a1") op => got,
-             in("a2") send.as_ptr() as usize, in("a3") send.len(),
-             in("a4") recv.as_mut_ptr() as usize, in("a5") recv.len(),
-             in("a6") cap, options(nostack));
-    }
+    let (n, got, _, _) = abi::syscall(
+        SYS_CALL, ep, op,
+        send.as_ptr() as usize, send.len(),
+        recv.as_mut_ptr() as usize, recv.len(),
+        cap,
+    );
     (n, got)
 }
 
@@ -105,14 +160,7 @@ pub fn call(ep: usize, op: usize, send: &[u8], recv: &mut [u8]) -> usize {
 
 /// `SYS_REPLY` с передачей capability: ответить клиенту по одноразовому reply-cap.
 pub fn reply_full(reply_cap: usize, buf: &[u8], cap: usize) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_REPLY,
-             inout("a0") reply_cap => r,
-             in("a1") buf.as_ptr() as usize, in("a2") buf.len(),
-             in("a3") cap, options(nostack));
-    }
-    r
+    abi::syscall(SYS_REPLY, reply_cap, buf.as_ptr() as usize, buf.len(), cap, 0, 0, 0).0
 }
 
 /// `SYS_REPLY` без права — обычный ответ сервера.
@@ -122,120 +170,77 @@ pub fn reply(reply_cap: usize, buf: &[u8]) -> usize {
 
 /// `SYS_BLK_READ`: прочитать сектор диска (нужен cap на устройство с `READ`).
 pub fn blk_read(dev_cap: usize, sector: usize, buf: &mut [u8; 512]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_BLK_READ, inout("a0") dev_cap => r,
-             in("a1") sector, in("a2") buf.as_mut_ptr() as usize, options(nostack));
-    }
-    r
+    abi::syscall(SYS_BLK_READ, dev_cap, sector, buf.as_mut_ptr() as usize, 0, 0, 0, 0).0
 }
 
 /// `SYS_BLK_WRITE`: записать сектор диска (нужен cap на устройство с `WRITE`).
 pub fn blk_write(dev_cap: usize, sector: usize, data: &[u8]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_BLK_WRITE, inout("a0") dev_cap => r,
-             in("a1") sector, in("a2") data.as_ptr() as usize, in("a3") data.len(),
-             options(nostack));
-    }
-    r
+    abi::syscall(SYS_BLK_WRITE, dev_cap, sector, data.as_ptr() as usize, data.len(), 0, 0, 0).0
 }
 
 /// `SYS_OBJ_PUT`: сохранить значение в store, content-id — в `id_out` (нужен `WRITE`).
 pub fn obj_put(store_cap: usize, data: &[u8], id_out: &mut [u8; 32]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_OBJ_PUT, inout("a0") store_cap => r,
-             in("a1") data.as_ptr() as usize, in("a2") data.len(),
-             in("a3") id_out.as_mut_ptr() as usize, options(nostack));
-    }
-    r
+    abi::syscall(
+        SYS_OBJ_PUT, store_cap,
+        data.as_ptr() as usize, data.len(),
+        id_out.as_mut_ptr() as usize, 0, 0, 0,
+    ).0
 }
 
 /// `SYS_OBJ_GET`: прочитать значение по content-id (нужен `READ`). Возвращает длину (0 — нет).
 pub fn obj_get(store_cap: usize, id: &[u8; 32], out: &mut [u8]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_OBJ_GET, inout("a0") store_cap => r,
-             in("a1") id.as_ptr() as usize, in("a2") out.as_mut_ptr() as usize,
-             in("a3") out.len(), options(nostack));
-    }
-    r
+    abi::syscall(
+        SYS_OBJ_GET, store_cap,
+        id.as_ptr() as usize,
+        out.as_mut_ptr() as usize, out.len(), 0, 0, 0,
+    ).0
 }
 
 /// `SYS_OBJ_SET_ROOT`: привязать именованный корень к значению — атомарный чекпойнт store
 /// (нужен `WRITE`). Привязанное переживает и GC, и перезагрузку.
 pub fn obj_set_root(store_cap: usize, name: &[u8], id: &[u8; 32]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_OBJ_SET_ROOT, inout("a0") store_cap => r,
-             in("a1") name.as_ptr() as usize, in("a2") name.len(),
-             in("a3") id.as_ptr() as usize, options(nostack));
-    }
-    r
+    abi::syscall(
+        SYS_OBJ_SET_ROOT, store_cap,
+        name.as_ptr() as usize, name.len(),
+        id.as_ptr() as usize, 0, 0, 0,
+    ).0
 }
 
 /// `SYS_OBJ_GET_ROOT`: content-id именованного корня → `id_out`. 32 — есть, 0 — нет, MAX — отказ.
 pub fn obj_get_root(store_cap: usize, name: &[u8], id_out: &mut [u8; 32]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_OBJ_GET_ROOT, inout("a0") store_cap => r,
-             in("a1") name.as_ptr() as usize, in("a2") name.len(),
-             in("a3") id_out.as_mut_ptr() as usize, options(nostack));
-    }
-    r
+    abi::syscall(
+        SYS_OBJ_GET_ROOT, store_cap,
+        name.as_ptr() as usize, name.len(),
+        id_out.as_mut_ptr() as usize, 0, 0, 0,
+    ).0
 }
 
 /// `SYS_OBJ_DEL_ROOT`: отвязать корень (объект уйдёт в GC, если недостижим). 0/1/MAX.
 pub fn obj_del_root(store_cap: usize, name: &[u8]) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_OBJ_DEL_ROOT, inout("a0") store_cap => r,
-             in("a1") name.as_ptr() as usize, in("a2") name.len(), options(nostack));
-    }
-    r
+    abi::syscall(SYS_OBJ_DEL_ROOT, store_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0
 }
 
 /// `SYS_READ`: прочитать доступный ввод консоли (хотя бы один байт; блокируется до ввода).
 pub fn read_stdin(buf: &mut [u8]) -> usize {
-    let n;
-    unsafe {
-        asm!("ecall", in("a7") SYS_READ, inout("a0") buf.as_mut_ptr() as usize => n,
-             in("a1") buf.len(), options(nostack));
-    }
-    n
+    abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
 }
 
 /// `SYS_EXEC`: запустить программу из store по имени корня и дождаться завершения
 /// (нужно право `EXEC` на store). Возвращает код выхода ребёнка или MAX.
 pub fn exec(exec_cap: usize, name: &[u8]) -> usize {
-    let code;
-    unsafe {
-        asm!("ecall", in("a7") SYS_EXEC, inout("a0") exec_cap => code,
-             in("a1") name.as_ptr() as usize, in("a2") name.len(), options(nostack));
-    }
-    code
+    abi::syscall(SYS_EXEC, exec_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0
 }
 
 /// `SYS_CAP_DERIVE`: урезанная копия СВОЕГО права (права ∩ mask) — аттенуация у себя,
 /// `GRANT` не нужен. Возвращает новый дескриптор или MAX.
 pub fn cap_derive(cap: usize, mask: usize) -> usize {
-    let r;
-    unsafe {
-        asm!("ecall", in("a7") SYS_CAP_DERIVE, inout("a0") cap => r,
-             in("a1") mask, options(nostack));
-    }
-    r
+    abi::syscall(SYS_CAP_DERIVE, cap, mask, 0, 0, 0, 0, 0).0
 }
 
 /// `SYS_MAP`: лениво зарезервировать `len` байт кучи (роль mmap/sbrk). Физические страницы
 /// придут по page fault при первом обращении — обнулёнными. Возвращает VA начала или MAX.
 pub fn heap_map(len: usize) -> usize {
-    let va;
-    unsafe {
-        asm!("ecall", in("a7") SYS_MAP, inout("a0") len => va, options(nostack));
-    }
-    va
+    abi::syscall(SYS_MAP, len, 0, 0, 0, 0, 0, 0).0
 }
 
 // ─── POSIX-shim (Веха 18.4) ───────────────────────────────────────────────────

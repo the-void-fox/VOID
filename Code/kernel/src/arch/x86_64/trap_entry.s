@@ -52,6 +52,7 @@ TRAP_STUB 30, 0
 TRAP_STUB 31, 0
 TRAP_STUB 32, 0                     # LAPIC-таймер
 TRAP_STUB 255, 0                    # spurious
+TRAP_STUB 128, 0                    # int 0x80 — syscall (шлюз DPL=3, Веха 26)
 
 trap_common:
     push rax                        # regs[14]
@@ -89,7 +90,7 @@ trap_common:
     add rsp, 16                     # vector + err
     iretq
 
-# Таблица адресов стабов для заполнения IDT из Rust ([0..=32] + spurious).
+# Таблица адресов стабов для заполнения IDT из Rust ([0..=32] + spurious + syscall).
 .section .rodata
 .align 8
 .global TRAP_STUBS
@@ -128,3 +129,4 @@ TRAP_STUBS:
     .quad trap_stub_31
     .quad trap_stub_32
     .quad trap_stub_255
+    .quad trap_stub_128

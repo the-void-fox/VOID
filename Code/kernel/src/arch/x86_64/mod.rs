@@ -1,17 +1,18 @@
-//! Реализация контракта [`crate::arch`] для x86_64 (Веха 25 — ядро ожило).
+//! Реализация контракта [`crate::arch`] для x86_64 (Веха 25 — ядро, Веха 26 — userspace).
 //!
 //! Живое: PVH direct boot (QEMU `-kernel`, трамплин 32→64 в entry.s), консоль COM1
-//! (вывод), GDT/IDT + полный дамп фатальных trap'ов, 4-уровневый пейджинг с W^X
-//! (paging.rs), LAPIC-таймер (lapic.rs), переключение контекстов ядерных задач
-//! (switch.s) — ядерная половина демо (store, sched, async, GC) работает.
+//! (вывод + приём опросом LSR на тиках таймера), GDT с ring3 и TSS (gdt.rs), IDT +
+//! syscall `int 0x80` + классификация трапов из ring3 (trap.rs), 4-уровневый пейджинг
+//! с W^X (paging.rs), LAPIC-таймер (lapic.rs), контексты ядерных задач (switch.s),
+//! вход в процессы через iretq (enter_user.s) — весь процессный путь работает.
 //!
-//! Ещё заглушки (Веха 26+ — userspace): вход в U-mode (нужны TSS + сегменты ring3 +
-//! syscall/sysret), маски прерываний сессий процессов, приём консоли (IOAPIC → IRQ4),
-//! virtio-pci (диск → персистентность). До тех пор [`USERSPACE_READY`] = false —
-//! kmain пропускает процессные демо.
+//! Ещё нет (Веха 27+): IOAPIC (консольный RX по прерыванию вместо опроса, линии
+//! устройств), virtio-pci (диск → персистентность на этой архитектуре).
 
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
+mod gdt;
 mod lapic;
 mod paging;
 mod trap;
@@ -20,28 +21,38 @@ mod trap;
 core::arch::global_asm!(include_str!("entry.s"));
 // Переключение контекстов ядерных задач.
 core::arch::global_asm!(include_str!("switch.s"));
+// Вход в процесс: iretq по подготовленному trap-кадру.
+core::arch::global_asm!(include_str!("enter_user.s"));
 
 pub use trap::{init as trap_init, TrapFrame};
 
-const STUB: &str = "x86_64: userspace — Веха 26+";
+/// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
+pub const ARCH_NAME: &str = "x86_64";
 
-/// Процессы/U-mode на этой архитектуре ещё в bring-up — kmain пропускает их демо.
-pub const USERSPACE_READY: bool = false;
+/// Процессы/U-mode работают (Веха 26) — kmain гоняет процессные демо.
+pub const USERSPACE_READY: bool = true;
 
 /// Конец RAM: QEMU q35 `-m 128M` — [0, 128 МиБ) (дыру BIOS < 1 МиБ ядро не трогает:
 /// образ грузится с 1 МиБ, арена фреймов — за ним).
 pub const RAM_LIMIT: usize = 128 * 1024 * 1024;
 
-// ─── консоль (COM1, вывод; приём — с IOAPIC, Веха 26+) ──────────────────────
+// ─── консоль (COM1: вывод напрямую, приём — опросом LSR на тиках таймера) ────
 
 const COM1: u16 = 0x3f8;
 
-/// IRQ COM1 в классической маршрутизации — пригодится при подключении IOAPIC.
+/// IRQ COM1 в классической маршрутизации — пригодится при подключении IOAPIC (Веха 27+).
 pub const CONSOLE_IRQ: u32 = 4;
 
 #[inline]
 fn outb(port: u16, v: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack)) }
+}
+
+#[inline]
+fn inb(port: u16) -> u8 {
+    let v: u8;
+    unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack)) }
+    v
 }
 
 /// Zero-sized хэндл последовательной консоли (пишем в THR COM1 без инициализации линии —
@@ -60,13 +71,40 @@ impl fmt::Write for Console {
     }
 }
 
-/// Приём с консоли — вместе с IOAPIC (Веха 26+): пока ввода нет.
-pub fn console_drain() {}
-pub fn console_has_input() -> bool {
-    false
+// Кольцевой буфер принятых байт — аналог riscv64/uart.rs, только наполняется не по
+// IRQ, а ОПРОСОМ ([`console_drain`] зовётся политикой таймера на каждом тике — и в
+// ядре, и в сессиях процессов; до IOAPIC этого достаточно: латентность — один квант).
+const RX_CAP: usize = 256;
+static mut RX_BUF: [u8; RX_CAP] = [0; RX_CAP];
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // писатель (drain)
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // читатель (getc)
+
+/// Вычерпать приёмный FIFO COM1 в кольцевой буфер (LSR.DR — «данные готовы»).
+/// Зовётся с выключенными прерываниями (из обработчика тика) — гонок нет.
+pub fn console_drain() {
+    let mut head = RX_HEAD.load(Ordering::Relaxed);
+    while inb(COM1 + 5) & 1 != 0 {
+        let b = inb(COM1);
+        if head - RX_TAIL.load(Ordering::Relaxed) < RX_CAP {
+            unsafe { RX_BUF[head % RX_CAP] = b };
+            head += 1;
+        } // переполнение — байт молча теряется (как в riscv-кольце)
+    }
+    RX_HEAD.store(head, Ordering::Relaxed);
 }
+
+pub fn console_has_input() -> bool {
+    RX_HEAD.load(Ordering::Relaxed) != RX_TAIL.load(Ordering::Relaxed)
+}
+
 pub fn console_getc() -> Option<u8> {
-    None
+    let tail = RX_TAIL.load(Ordering::Relaxed);
+    if RX_HEAD.load(Ordering::Relaxed) == tail {
+        return None;
+    }
+    let b = unsafe { RX_BUF[tail % RX_CAP] };
+    RX_TAIL.store(tail + 1, Ordering::Relaxed);
+    Some(b)
 }
 
 // ─── прерывания ─────────────────────────────────────────────────────────────
@@ -92,26 +130,47 @@ pub fn enable_interrupts() {
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) }
 }
 
-/// Спать до прерывания.
+/// Спать до прерывания. ОТЛИЧИЕ от `wfi`: hlt при IF=0 не просыпается от pending-
+/// прерывания — поэтому классический идиом `sti; hlt` (sti вступает в силу ПОСЛЕ
+/// следующей инструкции — прерывание не проскочит между ними, а ОБСЛУЖИТСЯ прямо
+/// в окне hlt), затем cli возвращает состояние «в ядре прерывания выключены».
+/// Семантика для вызывающих та же, что у wfi: вернулись — прерывание случилось
+/// (просто обработчик уже отработал здесь, а не в «коротком окне» после).
 pub fn wait_for_interrupt() {
-    unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) }
 }
 
-// Маски сессий процессов лягут на LVT/IOAPIC, когда появятся процессы (Веха 26+).
+// ─── маски прерываний сессий процессов (Веха 26) ────────────────────────────
+// На riscv это биты sie (таймер/внешние). Здесь устройств на прерываниях ещё нет
+// (IOAPIC — Веха 27+), единственный источник — LVT-таймер LAPIC; он же служит
+// часами опроса консоли ([`console_drain`] на каждом тике), поэтому ОБЕ политики
+// сессий держат таймер включённым: preempt — ради вытеснения, stdin — ради опроса
+// ввода (иначе спать было бы не от чего просыпаться).
+
+/// Снимок маски: бит 0 = LVT-таймер размаскирован.
 pub fn irq_mask_read() -> usize {
-    0
+    (!lapic::timer_masked()) as usize
 }
-pub fn irq_mask_write(_mask: usize) {}
+
+/// Восстановить маску из снимка [`irq_mask_read`].
+pub fn irq_mask_write(mask: usize) {
+    lapic::set_timer_masked(mask & 1 == 0);
+}
+
+/// Сессия процессов: таймер вкл (вытеснение в ring3 + опрос консоли на тиках).
 pub fn irq_mask_preempt(_saved: usize) {
-    unimplemented!("{STUB}: маска сессии процессов (LAPIC-таймер вкл, устройства выкл)")
+    lapic::set_timer_masked(false);
 }
+
+/// Сон до ввода: таймер тоже вкл — тик дренирует COM1 (см. шапку секции).
 pub fn irq_mask_stdin(_saved: usize) {
-    unimplemented!("{STUB}: маска сна до ввода (устройства вкл, таймер выкл)")
+    lapic::set_timer_masked(false);
 }
+
 pub fn mark_in_kernel() {}
 
-/// Маршрутизация прерываний устройств — IOAPIC/MSI + virtio-pci (Веха 26+). Пока
-/// устройств нет: virtio-mmio-пробы честно не находят диска, консоль работает выводом.
+/// Маршрутизация прерываний устройств — IOAPIC/MSI + virtio-pci (Веха 27+). Пока
+/// устройств нет: virtio-mmio-пробы честно не находят диска, ввод консоли — опросом.
 pub fn init_device_interrupts() {}
 
 // ─── таймер (LAPIC) ─────────────────────────────────────────────────────────
@@ -195,10 +254,27 @@ pub fn space_root(token: usize) -> usize {
     token & !0xfff
 }
 
-// ─── вход в процесс (Веха 26+) ──────────────────────────────────────────────
+// ─── вход в процесс (Веха 26) ───────────────────────────────────────────────
 
-pub unsafe fn enter_user(_frame: &TrapFrame, _space: usize, _trap_top: usize) -> ! {
-    unimplemented!("{STUB}: TSS + сегменты ring3 + iretq/sysret")
+/// Войти в процесс: стек следующего трапа из ring3 — в TSS.rsp0 (аналог sscratch),
+/// адресное пространство — в CR3 (заодно полный сброс TLB, как sfence.vma), кадр —
+/// в регистры через iretq (enter_user.s). Селекторы ring3 и IF ставим здесь ВСЕГДА:
+/// стартовые кадры их не заполняют, а кадрам из трапов не даём права понизить их.
+///
+/// # Safety
+/// `space` — валидный токен пространства с отображённым ядром; `frame` — стартовый
+/// или сохранённый трапом кадр этого процесса.
+pub unsafe fn enter_user(frame: &TrapFrame, space: usize, trap_top: usize) -> ! {
+    extern "C" {
+        fn x86_enter_user(f: *const TrapFrame) -> !;
+    }
+    gdt::set_rsp0(trap_top);
+    let mut f = *frame;
+    f.cs = gdt::UCODE_SEL as usize;
+    f.ss = gdt::UDATA_SEL as usize;
+    f.rflags |= 1 << 9; // IF: в U-mode прерывания всегда включены (вытеснение)
+    paging::enable(space_root(space));
+    x86_enter_user(&f)
 }
 
 // ─── контексты ядерных задач ────────────────────────────────────────────────
@@ -257,9 +333,8 @@ extern "C" {
 
 // ─── разное ─────────────────────────────────────────────────────────────────
 
-/// `e_machine` программ этого ядра (EM_X86_64). Программы для x86 появятся с
-/// арх-измерением корней `bin/<arch>/<имя>` (Веха 26+); сеяные ELF — RISC-V,
-/// загрузчик их честно отвергнет (BadMachine).
+/// `e_machine` программ этого ядра (EM_X86_64) — с Вехи 26 программы собираются
+/// под обе архитектуры и сеются под арх-корни `bin/<arch>/<имя>`.
 pub const ELF_MACHINE: u16 = 62;
 
 #[allow(dead_code)]
@@ -270,18 +345,10 @@ pub fn power_off() -> ! {
     }
 }
 
-/// ОБЯЗАТЕЛЬСТВА пути процессов (Веха 26+) — хуки общего кода, которые обязан звать
-/// обработчик trap'ов из U-mode, когда появится вход в ring3 (сегодня U-mode нет, и
-/// x86_trap_handler зовёт только timer::on_tick). Держит общий код живым для
-/// dead-code-анализа и перечисляет точки сращивания.
+/// ОБЯЗАТЕЛЬСТВО пути устройств (Веха 27+): обработчик линии virtio-pci (IOAPIC/MSI)
+/// обязан звать хук IRQ диска — здесь он перечислен, чтобы общий код не считался
+/// мёртвым при сборке этой архитектуры (у riscv его зовёт plic::handle_external).
 #[allow(dead_code)]
-fn user_path_obligations(frame: &mut TrapFrame) -> ! {
-    use crate::arch::{FaultKind, UserTrap};
-    crate::virtio_blk::on_irq(); // IRQ диска (IOAPIC/MSI → virtio-pci)
-    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Load }; // #PF, errcode.W=0
-    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Store }; // #PF, errcode.W=1
-    let _ = UserTrap::PageFault { va: 0, kind: FaultKind::Exec }; // #PF, errcode.I/D
-    let _ = UserTrap::TimerTick; // тик LAPIC из ring3 → вытеснение
-    let _ = UserTrap::Unknown(0); // прочие вектора (#GP, #UD…)
-    crate::proc::handle_user_trap(frame, UserTrap::Syscall)
+fn device_irq_obligations() {
+    crate::virtio_blk::on_irq();
 }

@@ -959,6 +959,9 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.set_ret(n);
                 f.advance();
             } else {
+                // Блокировка до ввода с РЕСТАРТОМ: при пробуждении инструкция syscall'а
+                // повторится (Веха 26: на riscv sepc и так на ecall, на x86 — откат rip).
+                t.procs[cur].frame.restart();
                 t.procs[cur].state = State::StdinWait;
                 if let Some(nx) = t.next_runnable(cur) {
                     t.current = nx;
@@ -982,8 +985,11 @@ fn syscall(t: &mut Table, cur: usize) {
                 Ok(()) if ensure_heap_range(t, cur, nptr, nlen) => {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     if let Ok(name) = core::str::from_utf8(name_bytes) {
+                        // Веха 26: `bin/<имя>` расширяется в арх-корень `bin/<arch>/<имя>` —
+                        // процессы говорят «bin/hello», не зная архитектуры под собой.
+                        let full = crate::prog_root(name);
                         // Байты ELF копируем из store и сразу отпускаем его замок.
-                        let elf_bytes = crate::object::root(name)
+                        let elf_bytes = crate::object::root(&full)
                             .and_then(|id| crate::object::with(&id, |b| b.map(Vec::from)));
                         match elf_bytes {
                             Some(bytes) => {

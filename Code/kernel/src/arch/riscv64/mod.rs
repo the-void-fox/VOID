@@ -170,6 +170,9 @@ pub unsafe fn enter_user(frame: &TrapFrame, space: usize, trap_top: usize) -> ! 
 /// `e_machine` программ, которые исполняет это ядро (EM_RISCV).
 pub const ELF_MACHINE: u16 = 243;
 
+/// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
+pub const ARCH_NAME: &str = "riscv64";
+
 /// Процессы/U-mode здесь полностью рабочие с Вехи 10.
 pub const USERSPACE_READY: bool = true;
 

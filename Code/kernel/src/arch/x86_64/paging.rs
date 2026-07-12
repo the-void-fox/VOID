@@ -68,16 +68,30 @@ pub unsafe fn enable(root_pa: usize) {
 
 /// Создать корневую таблицу процесса: копия PML4 ядра (ядро отображено без U — нужно
 /// обработчику trap'ов при CR3 процесса), слоты процесса добавит elf::load/proc.
-/// Копируются только записи верхнего уровня — подтаблицы ядра разделяются.
+///
+/// ВАЖНОЕ отличие от Sv39 (Веха 26): там user-регион (VPN[2]=1) — отдельный слот
+/// КОРНЯ, и копии корня достаточно. Здесь PML4[0] покрывает 0..512 ГиБ — и ядро,
+/// и user-регион (1..2 ГиБ) живут под ОДНОЙ записью; разделять её PDPT нельзя —
+/// маппинги процессов попали бы в общие таблицы и перепутались между собой.
+/// Поэтому дополнительно копируем PDPT из PML4[0]: его запись [1] (1..2 ГиБ — весь
+/// user: ELF+куча+стек < 0x8000_0000) у ядра пуста, под ней вырастут приватные
+/// таблицы процесса; PD/PT ядра (запись [0], [3]) разделяются как раньше.
 pub fn clone_kernel_root() -> usize {
     let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
     let new = frame::alloc().expect("нет фрейма под PML4 процесса");
+    let pdpt = frame::alloc().expect("нет фрейма под PDPT процесса");
     unsafe {
         let src = kroot as *const u64;
         let dst = new as *mut u64;
         for i in 0..512 {
             *dst.add(i) = *src.add(i);
         }
+        let kpdpt = (*src & ADDR_MASK) as *const u64;
+        let dpdpt = pdpt as *mut u64;
+        for i in 0..512 {
+            *dpdpt.add(i) = *kpdpt.add(i);
+        }
+        *dst = pdpt as u64 | (*src & !ADDR_MASK); // PML4[0] → приватный PDPT, флаги те же
     }
     new
 }

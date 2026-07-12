@@ -17,27 +17,29 @@ fn main() {
 
     // Веха 24: скрипт линковки — по архитектуре таргета (один проект, N образов).
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let linker = match arch.as_str() {
-        "riscv64" => dir.join("linker.ld"),
-        "x86_64" => dir.join("linker-x86_64.ld"),
+    let (linker, prog_target) = match arch.as_str() {
+        "riscv64" => (dir.join("linker.ld"), "riscv64gc-unknown-none-elf"),
+        "x86_64" => (dir.join("linker-x86_64.ld"), "x86_64-unknown-none"),
         other => panic!("нет скрипта линковки для target_arch={other}"),
     };
     println!("cargo:rustc-link-arg=-T{}", linker.display());
     println!("cargo:rerun-if-changed={}", linker.display());
 
-    build_user_programs(&dir);
+    build_user_programs(&dir, prog_target);
 }
 
 /// Веха 19.1/23 — собрать userspace-программы (крейт `programs/user`: библиотека шимов + все
-/// бинари, НЕ член workspace ядра, см. `exclude` в ../Cargo.toml) и передать пути к готовым ELF
+/// бинари, НЕ член workspace ядра, см. `exclude` в ../Cargo.toml) ПОД АРХИТЕКТУРУ ЯДРА
+/// (`target` — Веха 26: у каждой архитектуры свои семена) и передать пути к готовым ELF
 /// через `cargo:rustc-env` (`PROG_<ИМЯ>`), чтобы `main.rs` мог включить их байты через
-/// `include_bytes!(env!(...))`.
+/// `include_bytes!(env!(...))`. Дочерний cargo наследует `Code/.cargo/config.toml` (CWD —
+/// kernel/): оттуда x86-программы получают `relocation-model=static`, как и ядро.
 ///
 /// ВАЖНО: собираем ОТДЕЛЬНЫМ вызовом `cargo build` с СОБСТВЕННЫМ `--target-dir` внутри `OUT_DIR`
 /// ядра. Если бы программы делили `target/` с ядром, этот дочерний `cargo build` попытался бы
 /// взять тот же файловый лок каталога target, который уже держит ВНЕШНИЙ cargo, собирающий
 /// ядро (мы вызваны из его build-скрипта) — гарантированный deadlock.
-fn build_user_programs(kernel_dir: &PathBuf) {
+fn build_user_programs(kernel_dir: &PathBuf, target: &str) {
     let workspace_dir = kernel_dir.parent().expect("kernel/.. должен существовать (Code/)");
     let program_dir = workspace_dir.join("programs").join("user");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -56,7 +58,7 @@ fn build_user_programs(kernel_dir: &PathBuf) {
         .arg("build")
         .arg("--release")
         .arg("--target")
-        .arg("riscv64gc-unknown-none-elf")
+        .arg(target)
         .arg("--manifest-path")
         .arg(program_dir.join("Cargo.toml"))
         .arg("--target-dir")
@@ -65,7 +67,7 @@ fn build_user_programs(kernel_dir: &PathBuf) {
         .expect("не удалось запустить cargo для сборки programs/user");
     assert!(status.success(), "сборка programs/user (userspace ELF-программы) провалилась");
 
-    let bin_dir = program_target_dir.join("riscv64gc-unknown-none-elf").join("release");
+    let bin_dir = program_target_dir.join(target).join("release");
     for name in PROGRAMS {
         let elf_path = bin_dir.join(name);
         assert!(elf_path.is_file(), "ожидался готовый ELF по пути {}", elf_path.display());

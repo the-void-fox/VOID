@@ -24,7 +24,11 @@
 //! (riscv64 — рабочая реализация, x86_64 — заглушка); один код, два таргета cargo.
 //! Веха 25: x86_64 оживает — PVH direct boot (трамплин 32→64), IDT + LAPIC-таймер,
 //! 4-уровневый пейджинг W^X, переключение контекстов: ядерная половина демо работает
-//! на обоих таргетах ([[x86-bringup]]); userspace x86 — Веха 26+.
+//! на обоих таргетах ([[x86-bringup]]).
+//! Веха 26: userspace на x86_64 — ring3 (GDT/TSS) + `int 0x80` + iretq; программы
+//! собираются под обе архитектуры, корни получили арх-измерение `bin/<arch>/<имя>`;
+//! ввод консоли x86 — опросом на тиках; полный демо-паритет, кроме диска (virtio-pci —
+//! Веха 27+, персистентность пока только на riscv).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -46,26 +50,35 @@ mod timer;
 mod virtio_blk;
 
 /// Веха 23 — ELF-байты ВСЕХ userspace-программ, встроенные в образ ядра как СЕМЕНА. Собраны
-/// `kernel/build.rs` отдельным `cargo build` крейта `programs/user` (свой target-dir в OUT_DIR).
-/// Это НЕ адреса исполнения — только сырые байты: [`seed_programs`] кладёт их в объектный store
-/// под корни `bin/<имя>` (сев по хэшу: изменился бинарь — корень атомарно переезжает), а
-/// исполняются программы всегда ОТТУДА, по content-id ([`spawn_prog`], [[exec-from-store]]).
-/// Секции `.user` в ядре больше нет — это единственный путь появления кода в U-mode.
+/// `kernel/build.rs` отдельным `cargo build` крейта `programs/user` (свой target-dir в OUT_DIR)
+/// под АРХИТЕКТУРУ ЭТОГО ядра. Это НЕ адреса исполнения — только сырые байты: [`seed_programs`]
+/// кладёт их в объектный store под арх-корни `bin/<arch>/<имя>` (Веха 26; сев по хэшу:
+/// изменился бинарь — корень атомарно переезжает), а исполняются программы всегда ОТТУДА,
+/// по content-id ([`spawn_prog`], [[exec-from-store]]). Один диск может нести программы
+/// нескольких архитектур — корни не пересекаются.
 static PROGRAMS: &[(&str, &[u8])] = &[
-    ("bin/hello", include_bytes!(env!("PROG_HELLO"))),
-    ("bin/vsh", include_bytes!(env!("PROG_VSH"))),
-    ("bin/posixfs", include_bytes!(env!("PROG_POSIXFS"))),
-    ("bin/mini-sh", include_bytes!(env!("PROG_MINI_SH"))),
-    ("bin/blk-srv", include_bytes!(env!("PROG_BLK_SRV"))),
-    ("bin/blk-cli", include_bytes!(env!("PROG_BLK_CLI"))),
-    ("bin/obj-srv", include_bytes!(env!("PROG_OBJ_SRV"))),
-    ("bin/obj-cli", include_bytes!(env!("PROG_OBJ_CLI"))),
-    ("bin/cap-srv", include_bytes!(env!("PROG_CAP_SRV"))),
-    ("bin/cap-cli", include_bytes!(env!("PROG_CAP_CLI"))),
-    ("bin/busy", include_bytes!(env!("PROG_BUSY"))),
-    ("bin/heap", include_bytes!(env!("PROG_HEAP"))),
-    ("bin/crash", include_bytes!(env!("PROG_CRASH"))),
+    ("hello", include_bytes!(env!("PROG_HELLO"))),
+    ("vsh", include_bytes!(env!("PROG_VSH"))),
+    ("posixfs", include_bytes!(env!("PROG_POSIXFS"))),
+    ("mini-sh", include_bytes!(env!("PROG_MINI_SH"))),
+    ("blk-srv", include_bytes!(env!("PROG_BLK_SRV"))),
+    ("blk-cli", include_bytes!(env!("PROG_BLK_CLI"))),
+    ("obj-srv", include_bytes!(env!("PROG_OBJ_SRV"))),
+    ("obj-cli", include_bytes!(env!("PROG_OBJ_CLI"))),
+    ("cap-srv", include_bytes!(env!("PROG_CAP_SRV"))),
+    ("cap-cli", include_bytes!(env!("PROG_CAP_CLI"))),
+    ("busy", include_bytes!(env!("PROG_BUSY"))),
+    ("heap", include_bytes!(env!("PROG_HEAP"))),
+    ("crash", include_bytes!(env!("PROG_CRASH"))),
 ];
+
+/// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
+/// пользователь vsh говорят «bin/hello», не зная архитектуры; резолвит её ядро — так один
+/// store (и один диск) несёт бинари нескольких архитектур бок о бок.
+pub fn prog_root(name: &str) -> alloc::string::String {
+    let short = name.strip_prefix("bin/").unwrap_or(name);
+    alloc::format!("bin/{}/{}", arch::ARCH_NAME, short)
+}
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -95,8 +108,9 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 25                           ║");
-    println!("  ║  x86_64 оживает: boot·трапы·память·таймер ║");
+    println!("  ║  VOID — Веха 26                           ║");
+    println!("  ║  userspace на riscv64 и x86_64:           ║");
+    println!("  ║  ring3 · int 0x80 · корни bin/<arch>/     ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -186,12 +200,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     async_demo();
     println!();
 
-    // Веха 25: на архитектуре в bring-up (x86_64) процессов ещё нет — вход в U-mode,
-    // syscall-путь и сами программы (bin/<arch>/) приходят Вехой 26+. Ядерная половина
-    // системы (store, планировщики, async, GC) уже прошла выше; процессные демо и shell
-    // до готовности честно пропускаются.
+    // Веха 25/26: на архитектуре в bring-up (сегодня таких нет: riscv64 — с Вехи 10,
+    // x86_64 — с Вехи 26) процессов ещё нет — ядерная половина системы уже прошла выше,
+    // процессные демо и shell до готовности честно пропускаются.
     if !arch::USERSPACE_READY {
-        println!("  [skip] демо процессов/exec/vsh: userspace этой архитектуры в bring-up (Веха 26+)");
+        println!("  [skip] демо процессов/exec/vsh: userspace этой архитектуры в bring-up");
     }
 
     // Веха 12: capability-защищённые IPC-эндпоинты. P0 = драйвер-сервер, ему ядро минтит cap на
@@ -243,8 +256,8 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
 
     // Веха 19: «программа как объект store» — exec по content-id, а не по адресу в образе ядра.
-    // Первый запуск сеет байты ELF (встроенные в ядро) в store и вешает корень bin/hello; второй —
-    // корень уже на диске, seed не участвует, ELF читается ИЗ STORE и грузится kernel/src/elf.rs.
+    // Первый запуск сеет байты ELF (встроенные в ядро) в store под арх-корень bin/<arch>/hello;
+    // второй — корень уже на диске, seed не участвует, ELF читается ИЗ STORE (kernel/src/elf.rs).
     if arch::USERSPACE_READY {
         exec_demo();
         println!();
@@ -287,40 +300,51 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
 }
 
-/// Веха 23: посеять/обновить программы системы в store. Каждая — объект под корнем `bin/<имя>`
-/// ([`PROGRAMS`]); сев по хэшу: content-id совпал — корень актуален (диск — истина, семя не
-/// участвует); разошёлся — корень атомарно переезжает на новую версию (обновление системы =
-/// смена корня, старые байты уходят в GC как мусор). Дедуп store делает повторный сев бесплатным.
+/// Веха 23: посеять/обновить программы системы в store. Каждая — объект под арх-корнем
+/// `bin/<arch>/<имя>` (Веха 26, [`prog_root`]); сев по хэшу: content-id совпал — корень
+/// актуален (диск — истина, семя не участвует); разошёлся — корень атомарно переезжает на
+/// новую версию (обновление системы = смена корня, старые байты уходят в GC как мусор).
+/// Дедуп store делает повторный сев бесплатным. Доарховые корни `bin/<имя>` (Вехи 23–25)
+/// мигрируются: снимаем их, чтобы старые ELF не жили вечно якорями GC.
 fn seed_programs() {
-    let (mut fresh, mut sown, mut updated) = (0usize, 0usize, 0usize);
-    for (root_name, bytes) in PROGRAMS {
+    let (mut fresh, mut sown, mut updated, mut migrated) = (0usize, 0usize, 0usize, 0usize);
+    for (name, bytes) in PROGRAMS {
+        let root_name = prog_root(name);
         let id = object::put(bytes);
-        match object::root(root_name) {
+        match object::root(&root_name) {
             Some(old) if old == id => fresh += 1,
             Some(_) => {
-                object::set_root(root_name, id);
+                object::set_root(&root_name, id);
                 updated += 1;
             }
             None => {
-                object::set_root(root_name, id);
+                object::set_root(&root_name, id);
                 sown += 1;
             }
         }
+        if object::del_root(&alloc::format!("bin/{}", name)) {
+            migrated += 1; // legacy-корень снят — байты уйдут ближайшим GC
+        }
     }
     println!(
-        "  [seed] программы в store ({} корней bin/*): {} актуально, {} посеяно, {} обновлено",
+        "  [seed] программы в store ({} корней bin/{}/*): {} актуально, {} посеяно, {} обновлено",
         PROGRAMS.len(),
+        arch::ARCH_NAME,
         fresh,
         sown,
         updated,
     );
+    if migrated > 0 {
+        println!("  [seed] мигрировано со старых корней bin/*: {}", migrated);
+    }
 }
 
-/// Запустить программу из store по имени корня (Веха 23): корень → content-id → байты ELF →
-/// [`proc::spawn_elf`]. ВСЕ процессы системы приходят только этим путём — тем же, каким
-/// `SYS_EXEC` запускает программы для vsh. `pname` — имя процесса/домена (личность в .cspace).
-fn spawn_prog(root_name: &str, pname: &'static str, arg: usize) -> usize {
-    let id = object::root(root_name)
+/// Запустить программу из store по имени (Веха 23): арх-корень ([`prog_root`]) → content-id →
+/// байты ELF → [`proc::spawn_elf`]. ВСЕ процессы системы приходят только этим путём — тем же,
+/// каким `SYS_EXEC` запускает программы для vsh. `pname` — имя процесса/домена (личность в .cspace).
+fn spawn_prog(name: &str, pname: &'static str, arg: usize) -> usize {
+    let root_name = prog_root(name);
+    let id = object::root(&root_name)
         .unwrap_or_else(|| panic!("{} не посеян в store", root_name));
     let bytes = object::with(&id, |b| b.map(|x| x.to_vec()))
         .unwrap_or_else(|| panic!("объект корня {} недоступен", root_name));
@@ -337,8 +361,8 @@ fn spawn_prog(root_name: &str, pname: &'static str, arg: usize) -> usize {
 /// живёт дальше: раньше такой фолт валил всю систему «неожиданным trap'ом».
 fn mm_demo() {
     println!("  [mm] куча процесса (SYS_MAP, ленивые страницы) + честные фолты (Веха 22):");
-    spawn_prog("bin/heap", "heap", 0);
-    spawn_prog("bin/crash", "crash", 0);
+    spawn_prog("heap", "heap", 0);
+    spawn_prog("crash", "crash", 0);
     proc::run();
     println!("  [mm] сессия памяти завершена: crash убит, ядро и остальные живы");
 }
@@ -352,11 +376,11 @@ fn cap_ipc_demo() {
     use void_abi::Rights;
 
     println!("  [cap] передача права по IPC + персистентный c-space (Веха 21):");
-    let server = spawn_prog("bin/cap-srv", "cap-srv", 0);
+    let server = spawn_prog("cap-srv", "cap-srv", 0);
     let rwg = Rights::READ.union(Rights::WRITE).union(Rights::GRANT);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, rwg);
     proc::set_arg(server, scap.bits() as usize);
-    let client = spawn_prog("bin/cap-cli", "cap-cli", 0);
+    let client = spawn_prog("cap-cli", "cap-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -392,10 +416,10 @@ fn shell_session() {
     use void_abi::Rights;
 
     println!("  [vsh] интерактивная сессия (Веха 20) — ls · cat · echo · run bin/hello · exit:");
-    let server = spawn_prog("bin/posixfs", "posixfs", 0);
+    let server = spawn_prog("posixfs", "posixfs", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
     proc::set_arg(server, scap.bits() as usize);
-    let sh = spawn_prog("bin/vsh", "vsh", 0);
+    let sh = spawn_prog("vsh", "vsh", 0);
     let ep = cap::mint(proc::domain(sh), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(sh, ep.bits() as usize);
     let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC);
@@ -544,7 +568,7 @@ fn proc_demo() {
 
     // Сервер-драйвер: ядро минтит ему cap на УСТРОЙСТВО (право читать сектора). Дескриптор
     // передаём процессу через a0 — c-space внутри U-mode недоступен, cap живёт как число.
-    let server = spawn_prog("bin/blk-srv", "blk-drv", 0);
+    let server = spawn_prog("blk-srv", "blk-drv", 0);
     let devr = Rights::READ.union(Rights::WRITE); // Веха 17: драйвер умеет и читать, и писать
     let dev = cap::mint(proc::domain(server), cap::Target::Device(cap::Device::Block), devr);
     proc::set_arg(server, dev.bits() as usize);
@@ -555,7 +579,7 @@ fn proc_demo() {
 
     // Клиент: cap на ЭНДПОИНТ сервера (право слать ему сообщения). Cap на устройство он НЕ
     // получает — поэтому прямой BLK_READ у него в конце отвергается.
-    let client = spawn_prog("bin/blk-cli", "blk-cli", 0);
+    let client = spawn_prog("blk-cli", "blk-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -578,7 +602,7 @@ fn store_demo() {
 
     // Сервер store: cap на сам store с правами читать и писать (r-w-).
     let rw = Rights::READ.union(Rights::WRITE);
-    let server = spawn_prog("bin/obj-srv", "obj-store", 0);
+    let server = spawn_prog("obj-srv", "obj-store", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, rw);
     proc::set_arg(server, scap.bits() as usize);
     println!(
@@ -587,7 +611,7 @@ fn store_demo() {
     );
 
     // Клиент: cap только на ЭНДПОИНТ сервера. Прямого доступа к store у него нет.
-    let client = spawn_prog("bin/obj-cli", "store-cli", 0);
+    let client = spawn_prog("obj-cli", "store-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -606,9 +630,9 @@ fn preempt_demo() {
     println!("  [proc] вытеснение по таймеру — два CPU-bound процесса без yield:");
     print!("    ");
     // a0 выбирает метку внутри программы (0 = " A ", 1 = " B ") — обе печати из её .rodata.
-    let a = spawn_prog("bin/busy", "busy-A", 0);
+    let a = spawn_prog("busy", "busy-A", 0);
     proc::set_arg(a, 0);
-    let b = spawn_prog("bin/busy", "busy-B", 0);
+    let b = spawn_prog("busy", "busy-B", 0);
     proc::set_arg(b, 1);
     let before = timer::ticks();
     proc::run();
@@ -628,10 +652,10 @@ fn posix_demo() {
 
     println!("  [proc] POSIX-персоналия + программа mini-sh на чистом POSIX-shim (Веха 18.4):");
     // Персоналии — cap на store (файлы персистятся под корнями-именами, Веха 18.2).
-    let server = spawn_prog("bin/posixfs", "posixfs", 0);
+    let server = spawn_prog("posixfs", "posixfs", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
     proc::set_arg(server, scap.bits() as usize);
-    let client = spawn_prog("bin/mini-sh", "mini-sh", 0);
+    let client = spawn_prog("mini-sh", "mini-sh", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
     println!(
@@ -650,7 +674,7 @@ fn posix_demo() {
 fn exec_demo() {
     println!("  [exec] программа как объект store — exec по content-id (Веха 19):");
 
-    let id = object::root("bin/hello").expect("bin/hello посеян при загрузке");
+    let id = object::root(&prog_root("hello")).expect("bin/<arch>/hello посеян при загрузке");
 
     // Прочитать байты ИЗ STORE по content-id (а не байты-семя из образа ядра!) — копируем в
     // Vec и сразу отпускаем замок store: дальше `proc::run()` крутит процесс до завершения.
