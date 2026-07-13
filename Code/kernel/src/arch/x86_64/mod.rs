@@ -1,20 +1,21 @@
-//! Реализация контракта [`crate::arch`] для x86_64 (Веха 25 — ядро, Веха 26 — userspace).
+//! Реализация контракта [`crate::arch`] для x86_64
+//! (Веха 25 — ядро, Веха 26 — userspace, Веха 27 — устройства).
 //!
 //! Живое: PVH direct boot (QEMU `-kernel`, трамплин 32→64 в entry.s), консоль COM1
-//! (вывод + приём опросом LSR на тиках таймера), GDT с ring3 и TSS (gdt.rs), IDT +
-//! syscall `int 0x80` + классификация трапов из ring3 (trap.rs), 4-уровневый пейджинг
-//! с W^X (paging.rs), LAPIC-таймер (lapic.rs), контексты ядерных задач (switch.s),
-//! вход в процессы через iretq (enter_user.s) — весь процессный путь работает.
-//!
-//! Ещё нет (Веха 27+): IOAPIC (консольный RX по прерыванию вместо опроса, линии
-//! устройств), virtio-pci (диск → персистентность на этой архитектуре).
+//! (вывод + приём: IRQ4 через IOAPIC и, в сессиях процессов, опрос LSR на тиках),
+//! GDT с ring3 и TSS (gdt.rs), IDT + syscall `int 0x80` + классификация трапов из
+//! ring3 (trap.rs), 4-уровневый пейджинг с W^X (paging.rs), LAPIC-таймер (lapic.rs),
+//! контексты ядерных задач (switch.s), вход в процессы через iretq (enter_user.s),
+//! virtio-blk-pci: поиск на шине + MSI-X (pci.rs) — диск и персистентность работают.
 
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod gdt;
+mod ioapic;
 mod lapic;
 mod paging;
+mod pci;
 mod trap;
 
 // Точка входа: PVH-нота + трамплин 32→64 (см. entry.s).
@@ -24,6 +25,7 @@ core::arch::global_asm!(include_str!("switch.s"));
 // Вход в процесс: iretq по подготовленному trap-кадру.
 core::arch::global_asm!(include_str!("enter_user.s"));
 
+pub use pci::probe_virtio_blk;
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
@@ -71,9 +73,10 @@ impl fmt::Write for Console {
     }
 }
 
-// Кольцевой буфер принятых байт — аналог riscv64/uart.rs, только наполняется не по
-// IRQ, а ОПРОСОМ ([`console_drain`] зовётся политикой таймера на каждом тике — и в
-// ядре, и в сессиях процессов; до IOAPIC этого достаточно: латентность — один квант).
+// Кольцевой буфер принятых байт — аналог riscv64/uart.rs. Наполняется двумя путями
+// (оба идемпотентны и не пересекаются — прерывания в обработчиках выключены):
+// IRQ4 через IOAPIC (Веха 27 — будит сон до ввода) и опрос на тиках таймера
+// (политика Вехи 20.1 — подбирает байты в сессиях процессов между прерываниями).
 const RX_CAP: usize = 256;
 static mut RX_BUF: [u8; RX_CAP] = [0; RX_CAP];
 static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // писатель (drain)
@@ -140,12 +143,11 @@ pub fn wait_for_interrupt() {
     unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) }
 }
 
-// ─── маски прерываний сессий процессов (Веха 26) ────────────────────────────
-// На riscv это биты sie (таймер/внешние). Здесь устройств на прерываниях ещё нет
-// (IOAPIC — Веха 27+), единственный источник — LVT-таймер LAPIC; он же служит
-// часами опроса консоли ([`console_drain`] на каждом тике), поэтому ОБЕ политики
-// сессий держат таймер включённым: preempt — ради вытеснения, stdin — ради опроса
-// ввода (иначе спать было бы не от чего просыпаться).
+// ─── маски прерываний сессий процессов (Веха 26/27) ─────────────────────────
+// На riscv это биты sie (таймер/внешние). Здесь прерывания устройств (консоль по
+// IOAPIC, диск по MSI-X) обрабатываются trap-диспетчером прозрачно ИЗ ЛЮБОГО кольца
+// (короткая работа + EOI + iretq в прерванное) — маскировать их на сессию незачем;
+// политики управляют только LVT-таймером LAPIC.
 
 /// Снимок маски: бит 0 = LVT-таймер размаскирован.
 pub fn irq_mask_read() -> usize {
@@ -157,21 +159,28 @@ pub fn irq_mask_write(mask: usize) {
     lapic::set_timer_masked(mask & 1 == 0);
 }
 
-/// Сессия процессов: таймер вкл (вытеснение в ring3 + опрос консоли на тиках).
+/// Сессия процессов: таймер вкл — вытеснение в ring3 + опрос консоли на тиках.
 pub fn irq_mask_preempt(_saved: usize) {
     lapic::set_timer_masked(false);
 }
 
-/// Сон до ввода: таймер тоже вкл — тик дренирует COM1 (см. шапку секции).
+/// Сон до ввода: таймер выкл — исполнять некого, разбудит IRQ4 консоли (Веха 27),
+/// как SEIE-путь на riscv.
 pub fn irq_mask_stdin(_saved: usize) {
-    lapic::set_timer_masked(false);
+    lapic::set_timer_masked(true);
 }
 
 pub fn mark_in_kernel() {}
 
-/// Маршрутизация прерываний устройств — IOAPIC/MSI + virtio-pci (Веха 27+). Пока
-/// устройств нет: virtio-mmio-пробы честно не находят диска, ввод консоли — опросом.
-pub fn init_device_interrupts() {}
+/// Маршрутизация прерываний устройств (Веха 27): IOAPIC ведёт GSI4 (COM1) на
+/// [`trap::VEC_CONSOLE`]; сам UART начинает слать прерывания приёма (IER.DR;
+/// OUT2 в MCR — классический «разъём» линии до контроллера). Диск сюда не ходит:
+/// его MSI-X взводит pci.rs при поиске устройства.
+pub fn init_device_interrupts() {
+    ioapic::route(CONSOLE_IRQ, trap::VEC_CONSOLE);
+    outb(COM1 + 1, 0x01); // IER: data ready
+    outb(COM1 + 4, 0x0b); // MCR: DTR | RTS | OUT2
+}
 
 // ─── таймер (LAPIC) ─────────────────────────────────────────────────────────
 
@@ -345,10 +354,3 @@ pub fn power_off() -> ! {
     }
 }
 
-/// ОБЯЗАТЕЛЬСТВО пути устройств (Веха 27+): обработчик линии virtio-pci (IOAPIC/MSI)
-/// обязан звать хук IRQ диска — здесь он перечислен, чтобы общий код не считался
-/// мёртвым при сборке этой архитектуры (у riscv его зовёт plic::handle_external).
-#[allow(dead_code)]
-fn device_irq_obligations() {
-    crate::virtio_blk::on_irq();
-}

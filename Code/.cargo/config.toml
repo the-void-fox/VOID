@@ -17,6 +17,9 @@ runner = "qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -gl
 # собирает PIE, а наш linker-x86_64.ld — классический статический ELF.
 # Запуск (Веха 25, PVH direct boot): `cargo run --target x86_64-unknown-none` — QEMU
 # грузит ELF64 напрямую по PVH-ноте (без GRUB/ISO); COM1 выведен в stdio (-nographic).
+# Диск (Веха 27): ТОТ ЖЕ void-disk.img, что у riscv-раннера, — один store на обе
+# архитектуры (корни программ разведены как bin/<arch>/*). virtio-blk-pci — modern-only
+# (disable-legacy=on соответствует force-legacy=false на mmio).
 [target.x86_64-unknown-none]
 rustflags = ["-C", "relocation-model=static"]
-runner = "qemu-system-x86_64 -machine q35 -m 128M -nographic -kernel"
+runner = "qemu-system-x86_64 -machine q35 -m 128M -nographic -drive file=void-disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0,disable-legacy=on -kernel"

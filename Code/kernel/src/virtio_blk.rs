@@ -1,25 +1,28 @@
-//! Драйвер блочного устройства virtio-blk поверх virtio-mmio (Веха 7.1).
+//! Драйвер блочного устройства virtio-blk (Веха 7.1; Веха 27 — два транспорта).
 //!
 //! Это «руки» для Вехи 7.2: умеет читать и писать 512-байтные секторы виртуального диска.
-//! QEMU `virt` выставляет virtio-устройства как MMIO-регистры; мы работаем с диском через
-//! **split virtqueue** — три общих с устройством кольца в RAM:
+//! Устройство ищет АРХ ([`arch::probe_virtio_blk`]): на QEMU `virt` (riscv) это слот
+//! **virtio-mmio**, на q35 (x86) — **virtio-pci** (общая cfg-структура из vendor-capability;
+//! PCI-обвязку и MSI-X делает арх, сюда приходят готовые MMIO-адреса). Сам протокол
+//! одинаков — **split virtqueue**, три общих с устройством кольца в RAM:
 //!   - **desc** (таблица дескрипторов): куски буферов [адрес, длина, флаги, next];
 //!   - **avail** (кольцо доступных): мы кладём сюда индексы готовых запросов;
 //!   - **used** (кольцо использованных): устройство кладёт сюда завершённые.
 //!
 //! Один запрос к диску — цепочка из 3 дескрипторов: заголовок (тип+сектор), буфер данных
-//! (512 Б), байт статуса. Мы публикуем цепочку в avail, «дёргаем» устройство записью в
-//! QueueNotify и **опрашиваем** used до завершения (без прерываний — так проще для старта).
+//! (512 Б), байт статуса. Мы публикуем цепочку в avail и «дёргаем» устройство (notify —
+//! у каждого транспорта свой адрес).
 //!
-//! Целимся в virtio **версии 2** (modern, VIRTIO 1.0). Запускать QEMU с
-//! `-global virtio-mmio.force-legacy=false` (см. .cargo/config.toml).
+//! Целимся в virtio **modern** (VIRTIO 1.0): mmio версии 2 (`force-legacy=false`),
+//! pci с `disable-legacy=on` (см. .cargo/config.toml).
 //!
 //! Два пути завершения запроса:
 //! - **Синхронный** ([`read`]/[`write`]) — опрос кольца used. Используется на ранней загрузке
 //!   (прерывания ещё выключены) — там всё равно делать нечего, кроме ожидания диска.
 //! - **Асинхронный** ([`read_async`]) — прерывание+пробуждение: запрос публикуется, future
-//!   паркуется; по завершении устройство шлёт IRQ через PLIC → [`on_irq`] будит future.
-//!   Это «диск без опроса», настоящий async I/O над [[async-executor]].
+//!   паркуется; по завершении устройство шлёт IRQ (PLIC на riscv, MSI-X на x86) →
+//!   [`on_irq`] будит future. Это «диск без опроса», настоящий async I/O над
+//!   [[async-executor]].
 
 use core::future::Future;
 use core::pin::Pin;
@@ -38,15 +41,8 @@ pub const SECTOR_SIZE: usize = 512;
 /// Размер очереди (число дескрипторов). Нам хватает 8 (запрос = 3 дескриптора).
 const QSIZE: usize = 8;
 
-// virt-машина QEMU: 8 слотов virtio-mmio по 0x1000, начиная с 0x1000_1000.
-const MMIO_BASE: usize = 0x1000_1000;
-const MMIO_STRIDE: usize = 0x1000;
-const MMIO_SLOTS: usize = 8;
-
-// Регистры virtio-mmio (смещения от базы слота).
-const REG_MAGIC: usize = 0x000; // "virt" = 0x74726976
-const REG_VERSION: usize = 0x004; // 2 = modern
-const REG_DEVICE_ID: usize = 0x008; // 2 = block
+// Регистры virtio-mmio (смещения от базы слота; magic/version/device-id проверяет
+// арх-поиск — arch::probe_virtio_blk).
 const REG_DRIVER_FEATURES: usize = 0x020;
 const REG_DRIVER_FEATURES_SEL: usize = 0x024;
 const REG_QUEUE_SEL: usize = 0x030;
@@ -64,6 +60,22 @@ const REG_QUEUE_DRIVER_HIGH: usize = 0x094;
 const REG_QUEUE_DEVICE_LOW: usize = 0x0a0;
 const REG_QUEUE_DEVICE_HIGH: usize = 0x0a4;
 const REG_CONFIG: usize = 0x100; // конфиг устройства: capacity (u64) в секторах
+
+// Поля структуры common_cfg virtio-pci modern (смещения; все поля LE).
+const PCI_DRIVER_FEATURE_SEL: usize = 0x08;
+const PCI_DRIVER_FEATURE: usize = 0x0c;
+const PCI_MSIX_CONFIG: usize = 0x10; // u16: вектор конфиг-событий (0xffff — нет)
+const PCI_DEVICE_STATUS: usize = 0x14; // u8: те же биты STATUS_*, что и в mmio
+const PCI_QUEUE_SEL: usize = 0x16; // u16
+const PCI_QUEUE_SIZE: usize = 0x18; // u16 (чтение — максимум, запись — наш размер)
+const PCI_QUEUE_MSIX_VECTOR: usize = 0x1a; // u16: запись MSI-X-вектора очереди
+const PCI_QUEUE_ENABLE: usize = 0x1c; // u16
+const PCI_QUEUE_NOTIFY_OFF: usize = 0x1e; // u16: слагаемое notify-адреса
+const PCI_QUEUE_DESC: usize = 0x20; // u64
+const PCI_QUEUE_DRIVER: usize = 0x28; // u64
+const PCI_QUEUE_DEVICE: usize = 0x30; // u64
+/// «Вектора нет» в полях msix_vector.
+const PCI_NO_VECTOR: u16 = 0xffff;
 
 // Биты регистра Status.
 const STATUS_ACKNOWLEDGE: u32 = 1;
@@ -128,10 +140,48 @@ struct ReqHeader {
     sector: u64,
 }
 
-/// Состояние инициализированного устройства. Кольца/база хранятся как адреса (usize),
+/// Транспорт устройства ПОСЛЕ инициализации: что нужно в горячем пути —
+/// куда «дёргать» (notify) и как подтверждать прерывание (ack).
+enum Transport {
+    Mmio { base: usize },
+    /// notify — уже вычисленный адрес очереди 0; isr — байт INTx-статуса
+    /// (читается-и-сбрасывается; при MSI-X не обязателен, но безвреден).
+    Pci { notify: usize, isr: usize },
+}
+
+impl Transport {
+    /// Разбудить устройство: очередь 0 готова к работе.
+    fn notify_queue0(&self) {
+        unsafe {
+            match self {
+                Transport::Mmio { base } => w32(*base, REG_QUEUE_NOTIFY, 0),
+                Transport::Pci { notify, .. } => write_volatile(*notify as *mut u16, 0),
+            }
+        }
+    }
+
+    /// Подтвердить прерывание устройства (чтобы линия/статус не залипли).
+    fn irq_ack(&self) {
+        unsafe {
+            match self {
+                Transport::Mmio { base } => {
+                    let is = r32(*base, REG_INTERRUPT_STATUS);
+                    if is != 0 {
+                        w32(*base, REG_INTERRUPT_ACK, is);
+                    }
+                }
+                Transport::Pci { isr, .. } => {
+                    read_volatile(*isr as *const u8); // чтение = сброс
+                }
+            }
+        }
+    }
+}
+
+/// Состояние инициализированного устройства. Кольца хранятся как адреса (usize),
 /// а не как сырые указатели, — чтобы структура была `Send` и жила под `SpinLock`.
 struct VirtioBlk {
-    base: usize,
+    t: Transport,
     desc: usize,
     avail: usize,
     used: usize,
@@ -172,7 +222,7 @@ impl VirtioBlk {
             fence(Ordering::SeqCst);
 
             // Разбудить устройство.
-            w32(self.base, REG_QUEUE_NOTIFY, 0);
+            self.t.notify_queue0();
 
             // Опрашиваем used, пока устройство не завершит наш запрос.
             while read_volatile(&(*used).idx) == self.used_idx {
@@ -182,10 +232,7 @@ impl VirtioBlk {
             self.used_idx = self.used_idx.wrapping_add(1);
 
             // Мы опрашиваем, но подтвердим прерывание устройства, чтобы оно не залипло.
-            let is = r32(self.base, REG_INTERRUPT_STATUS);
-            if is != 0 {
-                w32(self.base, REG_INTERRUPT_ACK, is);
-            }
+            self.t.irq_ack();
 
             read_volatile(&status) == 0
         }
@@ -208,7 +255,7 @@ impl VirtioBlk {
             fence(Ordering::SeqCst);
             write_volatile(&mut (*avail).idx, ai.wrapping_add(1));
             fence(Ordering::SeqCst);
-            w32(self.base, REG_QUEUE_NOTIFY, 0);
+            self.t.notify_queue0();
         }
     }
 
@@ -226,8 +273,10 @@ static BLK: SpinLock<Option<VirtioBlk>> = SpinLock::new(None);
 
 // ─── состояние прерываний / async ────────────────────────────────────────────
 
-/// База устройства и номер IRQ — читаются из обработчика прерывания (без замка BLK).
-static IRQ_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Как подтверждать прерывание из [`on_irq`] БЕЗ замка BLK (его может держать
+/// синхронный путь): mmio-база ИЛИ адрес pci-ISR-байта; 0 — транспорта нет.
+static IRQ_ACK_MMIO: AtomicUsize = AtomicUsize::new(0);
+static IRQ_ACK_ISR: AtomicUsize = AtomicUsize::new(0);
 static IRQ_NUM: AtomicU32 = AtomicU32::new(0);
 /// Счётчик обработанных прерываний устройства (для наглядности).
 static IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -240,7 +289,7 @@ struct AsyncIo {
 }
 static ASYNC: SpinLock<AsyncIo> = SpinLock::new(AsyncIo { active: false, done: false, waker: None });
 
-/// Номер IRQ нашего устройства на PLIC (0 — не инициализировано).
+/// Номер прерывания устройства (riscv: источник PLIC, x86: вектор MSI-X; 0 — нет).
 pub fn irq() -> u32 {
     IRQ_NUM.load(Ordering::Relaxed)
 }
@@ -250,11 +299,12 @@ pub fn irq_count() -> u32 {
     IRQ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Обработчик прерывания устройства (из [`crate::plic::handle_external`]). Выполняется в
-/// trap-контексте (SIE=0), поэтому замки берёт без доп. отключения прерываний. Замок BLK НЕ
-/// трогает (его может держать синхронный путь) — только подтверждает прерывание и будит future.
+/// Обработчик прерывания устройства (riscv: `plic::handle_external`, x86: вектор MSI-X).
+/// Выполняется в trap-контексте (прерывания выключены), поэтому замки берёт без доп.
+/// отключения. Замок BLK НЕ трогает (его может держать синхронный путь) — только
+/// подтверждает прерывание и будит future.
 pub fn on_irq() {
-    let base = IRQ_BASE.load(Ordering::Relaxed);
+    let base = IRQ_ACK_MMIO.load(Ordering::Relaxed);
     if base != 0 {
         unsafe {
             let is = r32(base, REG_INTERRUPT_STATUS);
@@ -262,6 +312,10 @@ pub fn on_irq() {
                 w32(base, REG_INTERRUPT_ACK, is);
             }
         }
+    }
+    let isr = IRQ_ACK_ISR.load(Ordering::Relaxed);
+    if isr != 0 {
+        unsafe { read_volatile(isr as *const u8) }; // чтение = сброс INTx-статуса
     }
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
@@ -279,12 +333,25 @@ pub fn on_irq() {
     }
 }
 
-/// Найти и инициализировать первое virtio-blk устройство. Возвращает true при успехе.
+/// Найти (через арх) и инициализировать первое virtio-blk устройство.
 pub fn init() -> bool {
-    let Some(base) = probe() else {
+    let Some(dev) = arch::probe_virtio_blk() else {
         return false;
     };
+    let ok = match dev.transport {
+        arch::BlkTransport::Mmio { base } => init_mmio(base),
+        arch::BlkTransport::Pci { common, notify_base, notify_mult, isr, device } => {
+            init_pci(common, notify_base, notify_mult, isr, device)
+        }
+    };
+    if ok {
+        IRQ_NUM.store(dev.irq, Ordering::Relaxed);
+    }
+    ok
+}
 
+/// Инициализация по virtio-mmio (QEMU virt): рукопожатие статуса → фичи → очередь 0.
+fn init_mmio(base: usize) -> bool {
     unsafe {
         // Сброс и рукопожатие статуса.
         w32(base, REG_STATUS, 0);
@@ -313,9 +380,7 @@ pub fn init() -> bool {
         w32(base, REG_QUEUE_NUM, QSIZE as u32);
 
         // Кольца — в обнулённых фреймах (RAM отображена идентично: адрес = физический).
-        let desc = frame::alloc().expect("virtio desc frame");
-        let avail = frame::alloc().expect("virtio avail frame");
-        let used = frame::alloc().expect("virtio used frame");
+        let (desc, avail, used) = alloc_rings();
         write_addr(base, REG_QUEUE_DESC_LOW, REG_QUEUE_DESC_HIGH, desc);
         write_addr(base, REG_QUEUE_DRIVER_LOW, REG_QUEUE_DRIVER_HIGH, avail);
         write_addr(base, REG_QUEUE_DEVICE_LOW, REG_QUEUE_DEVICE_HIGH, used);
@@ -326,25 +391,88 @@ pub fn init() -> bool {
         w32(base, REG_STATUS, status);
 
         // Ёмкость диска (в секторах) из конфиг-пространства.
-        let cap_lo = r32(base, REG_CONFIG) as u64;
-        let cap_hi = r32(base, REG_CONFIG + 4) as u64;
-        let capacity = cap_lo | (cap_hi << 32);
+        let capacity = r32(base, REG_CONFIG) as u64 | (r32(base, REG_CONFIG + 4) as u64) << 32;
 
-        *BLK.lock() = Some(VirtioBlk {
-            base,
-            desc,
-            avail,
-            used,
-            used_idx: 0,
-            capacity_sectors: capacity,
-        });
-
-        // Запомнить для обработчика прерываний: база + номер IRQ (slot+1 на QEMU virt).
-        IRQ_BASE.store(base, Ordering::Relaxed);
-        let slot = (base - MMIO_BASE) / MMIO_STRIDE;
-        IRQ_NUM.store(slot as u32 + 1, Ordering::Relaxed);
+        publish(Transport::Mmio { base }, desc, avail, used, capacity);
+        IRQ_ACK_MMIO.store(base, Ordering::Relaxed);
     }
     true
+}
+
+/// Инициализация по virtio-pci modern (QEMU q35): та же машина состояний, но поля —
+/// в структуре common_cfg (MMIO из BAR, отображён архом), notify — отдельное окно,
+/// прерывание — MSI-X-вектор `irq` (запись 0 таблицы запрограммировал арх).
+fn init_pci(common: usize, notify_base: usize, notify_mult: u32, isr: usize, device: usize) -> bool {
+    let r8p = |off: usize| unsafe { read_volatile((common + off) as *const u8) };
+    let w8p = |off: usize, v: u8| unsafe { write_volatile((common + off) as *mut u8, v) };
+    let r16p = |off: usize| unsafe { read_volatile((common + off) as *const u16) };
+    let w16p = |off: usize, v: u16| unsafe { write_volatile((common + off) as *mut u16, v) };
+    let w32p = |off: usize, v: u32| unsafe { write_volatile((common + off) as *mut u32, v) };
+    let w64p = |off: usize, v: u64| unsafe { write_volatile((common + off) as *mut u64, v) };
+
+    // Сброс и рукопожатие статуса (те же биты, что в mmio).
+    w8p(PCI_DEVICE_STATUS, 0);
+    let mut status = STATUS_ACKNOWLEDGE as u8;
+    w8p(PCI_DEVICE_STATUS, status);
+    status |= STATUS_DRIVER as u8;
+    w8p(PCI_DEVICE_STATUS, status);
+
+    // Фичи: только VIRTIO_F_VERSION_1.
+    w32p(PCI_DRIVER_FEATURE_SEL, 1);
+    w32p(PCI_DRIVER_FEATURE, DRIVER_FEATURE_HI_VERSION_1);
+    w32p(PCI_DRIVER_FEATURE_SEL, 0);
+    w32p(PCI_DRIVER_FEATURE, 0);
+    status |= STATUS_FEATURES_OK as u8;
+    w8p(PCI_DEVICE_STATUS, status);
+    if r8p(PCI_DEVICE_STATUS) & STATUS_FEATURES_OK as u8 == 0 {
+        return false;
+    }
+
+    // Конфиг-события не нужны; прерывание завершений очереди 0 — MSI-X-запись 0.
+    w16p(PCI_MSIX_CONFIG, PCI_NO_VECTOR);
+    w16p(PCI_QUEUE_SEL, 0);
+    if r16p(PCI_QUEUE_SIZE) == 0 {
+        return false;
+    }
+    w16p(PCI_QUEUE_SIZE, QSIZE as u16);
+    w16p(PCI_QUEUE_MSIX_VECTOR, 0);
+    if r16p(PCI_QUEUE_MSIX_VECTOR) != 0 {
+        return false; // устройство не приняло вектор (NO_VECTOR) — без MSI-X не работаем
+    }
+
+    let (desc, avail, used) = alloc_rings();
+    w64p(PCI_QUEUE_DESC, desc as u64);
+    w64p(PCI_QUEUE_DRIVER, avail as u64);
+    w64p(PCI_QUEUE_DEVICE, used as u64);
+    let notify = notify_base + r16p(PCI_QUEUE_NOTIFY_OFF) as usize * notify_mult as usize;
+    w16p(PCI_QUEUE_ENABLE, 1);
+
+    status |= STATUS_DRIVER_OK as u8;
+    w8p(PCI_DEVICE_STATUS, status);
+
+    // Ёмкость (в секторах) — первые 8 байт конфиг-области устройства.
+    let capacity = unsafe {
+        read_volatile(device as *const u32) as u64
+            | (read_volatile((device + 4) as *const u32) as u64) << 32
+    };
+
+    publish(Transport::Pci { notify, isr }, desc, avail, used, capacity);
+    IRQ_ACK_ISR.store(isr, Ordering::Relaxed);
+    true
+}
+
+/// Три кольца очереди — в обнулённых фреймах (RAM идентична: адрес = физический).
+fn alloc_rings() -> (usize, usize, usize) {
+    (
+        frame::alloc().expect("virtio desc frame"),
+        frame::alloc().expect("virtio avail frame"),
+        frame::alloc().expect("virtio used frame"),
+    )
+}
+
+/// Опубликовать готовое устройство под замком.
+fn publish(t: Transport, desc: usize, avail: usize, used: usize, capacity: u64) {
+    *BLK.lock() = Some(VirtioBlk { t, desc, avail, used, used_idx: 0, capacity_sectors: capacity });
 }
 
 /// Ёмкость диска в секторах (0, если не инициализирован).
@@ -447,22 +575,6 @@ impl Future for ReadFuture {
             Poll::Pending
         }
     }
-}
-
-/// Просканировать слоты virtio-mmio, вернуть базу первого блочного устройства (version 2).
-fn probe() -> Option<usize> {
-    for slot in 0..MMIO_SLOTS {
-        let base = MMIO_BASE + slot * MMIO_STRIDE;
-        unsafe {
-            if r32(base, REG_MAGIC) != 0x7472_6976 {
-                continue; // "virt" не найден — слот пуст
-            }
-            if r32(base, REG_VERSION) == 2 && r32(base, REG_DEVICE_ID) == 2 {
-                return Some(base); // modern virtio-blk
-            }
-        }
-    }
-    None
 }
 
 // ─── низкоуровневые помощники ────────────────────────────────────────────────

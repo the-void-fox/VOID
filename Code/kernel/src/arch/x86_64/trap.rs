@@ -22,9 +22,9 @@ use crate::println;
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
 extern "C" {
-    /// Таблица адресов стабов: [0..=32] — вектора 0–32, [33] — spurious (0xFF),
-    /// [34] — syscall (0x80).
-    static TRAP_STUBS: [usize; 35];
+    /// Таблица адресов стабов: [0..=34] — вектора 0–34 (исключения + таймер +
+    /// консоль + диск), [35] — spurious (0xFF), [36] — syscall (0x80).
+    static TRAP_STUBS: [usize; 37];
 }
 
 /// Вектор LAPIC-таймера (первый свободный после 32 исключений).
@@ -33,6 +33,10 @@ pub const VEC_TIMER: u8 = 32;
 pub const VEC_SPURIOUS: u8 = 0xff;
 /// Вектор системных вызовов (`int 0x80`, шлюз с DPL=3 — Веха 26).
 pub const VEC_SYSCALL: u8 = 0x80;
+/// Вектор консольного ввода: IOAPIC маршрутизирует GSI4 (COM1) сюда (Веха 27).
+pub const VEC_CONSOLE: u8 = 33;
+/// Вектор завершений virtio-blk: MSI-X-запись устройства указывает сюда (Веха 27).
+pub const VEC_BLK: u8 = 34;
 
 /// Снимок состояния процессора на момент trap'а. Раскладка = порядок push'ей в
 /// trap_entry.s (адреса растут к концу структуры; регистры — в порядке r15..rax).
@@ -173,11 +177,11 @@ struct IdtPtr {
 pub fn init() {
     super::gdt::init();
     unsafe {
-        for v in 0..=32 {
+        for v in 0..=34 {
             IDT[v] = IdtEntry::gate(TRAP_STUBS[v]);
         }
-        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[33]);
-        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[34]);
+        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[35]);
+        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[36]);
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
@@ -223,8 +227,22 @@ fn classify_user(frame: &TrapFrame) -> UserTrap {
 /// trap, rip уже за инструкцией), остальное — фатальный дамп.
 #[no_mangle]
 extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
-    if frame.vector as u8 == VEC_SPURIOUS {
-        return; // spurious: без EOI по спецификации, откуда бы ни прилетел
+    // Прерывания устройств (Веха 27) обрабатываются НЕЗАВИСИМО от кольца: стаб
+    // полностью сохранил кадр и вернёт его iretq'ом — короткая работа + EOI, и
+    // прерванное (хоть ядро, хоть ring3-процесс) продолжится, как ни в чём не бывало.
+    match frame.vector as u8 {
+        VEC_SPURIOUS => return, // spurious: без EOI по спецификации
+        VEC_CONSOLE => {
+            super::console_drain();
+            lapic::eoi();
+            return;
+        }
+        VEC_BLK => {
+            crate::virtio_blk::on_irq();
+            lapic::eoi();
+            return;
+        }
+        _ => {}
     }
     if frame.cs & 3 == 3 {
         let trap = classify_user(frame);

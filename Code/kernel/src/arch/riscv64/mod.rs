@@ -82,6 +82,28 @@ pub fn init_device_interrupts() {
     plic::enable(uart::IRQ);
 }
 
+// ─── устройства ─────────────────────────────────────────────────────────────
+
+/// Найти virtio-blk на шине virtio-mmio QEMU virt (Веха 27: поиск устройства — дело
+/// арха, разговор с ним — общего драйвера): 8 слотов по 0x1000 от 0x1000_1000;
+/// в слоте ищем magic «virt», версию 2 (modern) и device id 2 (block). Номер
+/// прерывания на PLIC у QEMU virt — слот + 1.
+pub fn probe_virtio_blk() -> Option<crate::arch::BlkDevice> {
+    const MMIO_BASE: usize = 0x1000_1000;
+    const MMIO_STRIDE: usize = 0x1000;
+    for slot in 0..8 {
+        let base = MMIO_BASE + slot * MMIO_STRIDE;
+        let r = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+        if r(0x000) == 0x7472_6976 && r(0x004) == 2 && r(0x008) == 2 {
+            return Some(crate::arch::BlkDevice {
+                transport: crate::arch::BlkTransport::Mmio { base },
+                irq: slot as u32 + 1,
+            });
+        }
+    }
+    None
+}
+
 // ─── таймер ─────────────────────────────────────────────────────────────────
 
 /// Квант вытеснения: 200_000 тиков при таймбазе 10 МГц (QEMU virt) = 20 мс.

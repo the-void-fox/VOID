@@ -21,11 +21,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Корень таблиц ЯДРА (PML4) — основа адресных пространств процессов.
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 
-/// Окно virtio-mmio проб (совместимость с общим драйвером: на x86 устройств там нет,
-/// unassigned-чтения вернут 0xFF и magic не совпадёт — драйвер честно скажет «нет диска»).
-const VIRTIO_MMIO_START: usize = 0x1000_0000;
-const VIRTIO_MMIO_END: usize = 0x1000_9000;
-
 extern "C" {
     static _text_start: u8;
     static _text_end: u8;
@@ -50,9 +45,10 @@ pub fn init() -> usize {
         // 2) W^X: код R+X (без W и без NX), константы R+NX.
         map_range(root, text_s, text_e, 0);
         map_range(root, ro_s, ro_e, PTE_NX);
-        // 3) MMIO: LAPIC + окно virtio-mmio (см. выше).
+        // 3) MMIO контроллеров прерываний: LAPIC + IOAPIC (BAR'ы PCI отобразит
+        //    map_mmio, когда их найдёт pci::probe_virtio_blk — они известны в рантайме).
         map_range(root, super::lapic::LAPIC_BASE, super::lapic::LAPIC_BASE + PAGE_SIZE, PTE_W | PTE_NX);
-        map_range(root, VIRTIO_MMIO_START, VIRTIO_MMIO_END, PTE_W | PTE_NX);
+        map_range(root, super::ioapic::IOAPIC_BASE, super::ioapic::IOAPIC_BASE + PAGE_SIZE, PTE_W | PTE_NX);
     }
     KERNEL_ROOT.store(root, Ordering::Relaxed);
     root
@@ -94,6 +90,19 @@ pub fn clone_kernel_root() -> usize {
         *dst = pdpt as u64 | (*src & !ADDR_MASK); // PML4[0] → приватный PDPT, флаги те же
     }
     new
+}
+
+/// Отобразить MMIO-диапазон [pa, pa+len) идентично (RW+NX) в таблицы ЯДРА уже в
+/// рантайме — BAR'ы PCI известны только после поиска устройства. Зваться обязан ДО
+/// первого клона пространств: новые записи верхних уровней в копии не попадут
+/// (сегодня так и есть: virtio_blk::init идёт раньше первого spawn'а).
+///
+/// # Safety
+/// `pa` — настоящий MMIO этой машины; попадание в RAM перетёрло бы прямое отображение.
+pub unsafe fn map_mmio(pa: usize, len: usize) {
+    let root = KERNEL_ROOT.load(Ordering::Relaxed);
+    map_range(root, pa, pa + len, PTE_W | PTE_NX);
+    super::flush_tlb();
 }
 
 /// Отобразить одну 4 КиБ-страницу `va → pa`. `flags` — биты PTE (`PTE_W`/`PTE_U`/`PTE_NX`),

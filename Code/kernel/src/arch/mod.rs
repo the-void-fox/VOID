@@ -29,6 +29,9 @@
 //!   trap из U-mode в [`UserTrap`] и зовёт `proc::handle_user_trap(frame, trap)`;
 //!   `enter_user` — вход в процесс.
 //! - **Контексты**: [`Context`] (opaque: `EMPTY`/`new_task`/`new_kernel`), `context_switch`.
+//! - **Устройства**: `probe_virtio_blk() -> Option<BlkDevice>` — найти virtio-blk на шине
+//!   СВОЕЙ архитектуры (virtio-mmio у QEMU virt, virtio-pci у q35) и отдать транспорт
+//!   ([`BlkTransport`]) общему драйверу; маршрутизацию IRQ устройства арх берёт на себя.
 //! - **Разное**: `ELF_MACHINE` (e_machine загружаемых программ), `ARCH_NAME` (арх-измерение
 //!   корней программ `bin/<arch>/<имя>`), `RAM_LIMIT` (конец RAM платформы — для арены
 //!   фреймов), `USERSPACE_READY` (false на архе в bring-up: kmain пропускает процессные
@@ -59,6 +62,8 @@ pub use imp::{
     MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
+    // устройства (Веха 27)
+    probe_virtio_blk,
     // разное
     ARCH_NAME, ELF_MACHINE, RAM_LIMIT, USERSPACE_READY,
 };
@@ -99,4 +104,26 @@ pub enum UserTrap {
     TimerTick,
     /// Всё прочее — фатально для процесса; код причины в арх-кодировке (для печати).
     Unknown(usize),
+}
+
+/// Найденное virtio-blk устройство (Веха 27): где у него транспорт и каким номером
+/// приходит его прерывание. Ищет арх ([`probe_virtio_blk`]) — у каждой архитектуры
+/// своя шина (virtio-mmio на QEMU virt, virtio-pci на q35); говорит с устройством
+/// общий драйвер [`crate::virtio_blk`] — virtqueue и рукопожатие статуса одинаковы.
+pub struct BlkDevice {
+    pub transport: BlkTransport,
+    /// Номер прерывания в терминах арха: riscv — источник PLIC, x86 — вектор MSI-X.
+    pub irq: u32,
+}
+
+/// Транспорт virtio-blk: адреса, по которым драйвер найдёт регистры устройства.
+/// Все адреса — уже отображённая архом память (MMIO). Каждая архитектура конструирует
+/// только СВОЙ вариант (mmio — riscv, pci — x86), но матчит драйвер оба — отсюда allow.
+#[allow(dead_code)]
+pub enum BlkTransport {
+    /// virtio-mmio (QEMU virt): база слота регистров.
+    Mmio { base: usize },
+    /// virtio-pci modern (QEMU q35): MMIO-окна структур из vendor-capabilities;
+    /// notify-адрес очереди q = `notify_base + queue_notify_off(q) * notify_mult`.
+    Pci { common: usize, notify_base: usize, notify_mult: u32, isr: usize, device: usize },
 }
