@@ -32,6 +32,8 @@ const SYS_READ: usize = 14;
 const SYS_EXEC: usize = 15;
 const SYS_CAP_DERIVE: usize = 16;
 const SYS_MAP: usize = 17;
+const SYS_ARGS: usize = 18;
+const SYS_STARTCAP: usize = 19;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -228,7 +230,35 @@ pub fn read_stdin(buf: &mut [u8]) -> usize {
 /// `SYS_EXEC`: запустить программу из store по имени корня и дождаться завершения
 /// (нужно право `EXEC` на store). Возвращает код выхода ребёнка или MAX.
 pub fn exec(exec_cap: usize, name: &[u8]) -> usize {
-    abi::syscall(SYS_EXEC, exec_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0
+    exec_args(exec_cap, name, &[])
+}
+
+/// `SYS_EXEC` с аргументами (Веха 30): `args` — argv БЕЗ имени программы, записи разделены
+/// NUL (`b"-l\0/doc"`); имя ядро поставит в argv[0] само. Ребёнок прочитает их `SYS_ARGS(0)`,
+/// env и стартовые capability унаследует от вызывающего.
+pub fn exec_args(exec_cap: usize, name: &[u8], args: &[u8]) -> usize {
+    abi::syscall(
+        SYS_EXEC, exec_cap,
+        name.as_ptr() as usize, name.len(),
+        args.as_ptr() as usize, args.len(), 0, 0,
+    ).0
+}
+
+/// `SYS_ARGS(0)`: argv процесса → `buf` (NUL-разделённые записи, [0] — имя программы).
+/// Возвращает ПОЛНУЮ длину блоба (даже если `buf` меньше — обрежется).
+pub fn args(buf: &mut [u8]) -> usize {
+    abi::syscall(SYS_ARGS, 0, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_ARGS(1)`: окружение процесса (`KEY=VAL\0…`), унаследованное от родителя.
+pub fn env(buf: &mut [u8]) -> usize {
+    abi::syscall(SYS_ARGS, 1, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_STARTCAP(i)`: i-й стартовый capability процесса (преоткрытые права — как preopen'ы
+/// WASI: выданы ядром при spawn'е или унаследованы при exec). [`NO_CAP`] — конец таблицы.
+pub fn start_cap(i: usize) -> usize {
+    abi::syscall(SYS_STARTCAP, i, 0, 0, 0, 0, 0, 0).0
 }
 
 /// `SYS_CAP_DERIVE`: урезанная копия СВОЕГО права (права ∩ mask) — аттенуация у себя,
@@ -290,6 +320,15 @@ pub mod posix {
     pub const OP_UNLINK: usize = 5;
     /// readdir() -> имена через '\n'
     pub const OP_READDIR: usize = 6;
+    /// seek(fd): смещение курсора (Веха 30); whence едет в байте режима op
+    pub const OP_SEEK: usize = 7;
+    /// rename(old, new): перевесить корень + запись каталога (Веха 30)
+    pub const OP_RENAME: usize = 8;
+
+    pub const SEEK_SET: usize = 0;
+    pub const SEEK_CUR: usize = 1;
+    pub const SEEK_END: usize = 2;
+
     /// открыть с курсором в конце
     pub const O_APPEND: usize = 1 << 0;
     /// открыть, обнулив содержимое
@@ -349,6 +388,47 @@ pub mod posix {
     /// по имени корня. `exec_cap` — непрозрачный дескриптор «права запускать». MAX — не запустилось.
     pub fn spawn(exec_cap: usize, name: &[u8]) -> usize {
         crate::exec(exec_cap, name)
+    }
+
+    /// `spawn` с аргументами (Веха 30): `args` — argv без имени, записи разделены NUL.
+    pub fn spawn_args(exec_cap: usize, name: &[u8], args: &[u8]) -> usize {
+        crate::exec_args(exec_cap, name, args)
+    }
+
+    /// `lseek(fd, off, whence) -> новая позиция | MAX`. Смещение знаковое (END обычно с
+    /// минусом); курсор зажимается в [0, размер файла] — дыр в файлах у персоналии нет.
+    pub fn seek(ep: usize, fd: usize, off: isize, whence: usize) -> usize {
+        if fd < FD_BASE {
+            return usize::MAX;
+        }
+        let mut r = [0u8; 8];
+        let n = crate::call(
+            ep,
+            OP_SEEK | ((fd - FD_BASE) << 8) | (whence << 16),
+            &(off as i64).to_le_bytes(),
+            &mut r,
+        );
+        let pos = u64::from_le_bytes(r);
+        if n < 8 || pos == u64::MAX {
+            usize::MAX
+        } else {
+            pos as usize
+        }
+    }
+
+    /// `rename(old, new) -> 0 | MAX`: перевесить файл на новое имя — атомарно для store
+    /// (смена корня) и честно для каталога. Открытые дескрипторы продолжают работать.
+    pub fn rename(ep: usize, old: &[u8], new: &[u8]) -> usize {
+        if old.is_empty() || new.is_empty() || 1 + old.len() + new.len() > 256 {
+            return usize::MAX;
+        }
+        let mut req = [0u8; 256];
+        req[0] = old.len() as u8;
+        req[1..1 + old.len()].copy_from_slice(old);
+        req[1 + old.len()..1 + old.len() + new.len()].copy_from_slice(new);
+        let mut r = [0u8; 1];
+        crate::call(ep, OP_RENAME, &req[..1 + old.len() + new.len()], &mut r);
+        if r[0] == 0 { 0 } else { usize::MAX }
     }
 
     /// `cat path` — прочитать файл и вывести в stdout. Только через shim.

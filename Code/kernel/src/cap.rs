@@ -283,6 +283,21 @@ pub fn grant(from: DomainId, cap: Cap, to: DomainId, mask: Rights) -> Result<Cap
     Ok(alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights }))
 }
 
+/// Наделить потомка (Веха 30): скопировать capability из домена `from` в домен `to` —
+/// БЕЗ требования `GRANT` и без маски, тем же правом. Это не передача равному ([`grant`]),
+/// а наделение СОЗДАВАЕМОГО ребёнка стартовым набором (как preopen'ы WASI): родитель и так
+/// может действовать этим правом сам или проксировать каждый вызов через себя — новых
+/// полномочий у пары родитель+ребёнок не появляется. Зовёт только ядро из `SYS_EXEC`;
+/// syscall'а с такой силой нет.
+pub fn endow(from: DomainId, cap: Cap, to: DomainId) -> Result<Cap, CapError> {
+    let mut cs = CSPACE.lock();
+    let (target, rights) = {
+        let e = resolve(&cs, from, cap)?;
+        (e.target.clone(), e.rights)
+    };
+    Ok(alloc_slot(&mut cs.domains[to], Entry { target, rights }))
+}
+
 /// Отозвать capability: освободить слот и бумкнуть его поколение. Все ранее выданные
 /// дескрипторы на этот слот становятся `Stale` при следующей проверке.
 pub fn revoke(dom: DomainId, cap: Cap) -> Result<(), CapError> {

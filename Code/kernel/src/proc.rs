@@ -17,6 +17,12 @@
 //! [USER_HEAP_BASE_VA, heap_brk); страницы выделяются по page fault из U-mode
 //! ([`handle_user_fault`]) или доотображением перед доступом ядра в шлюзах
 //! ([`ensure_heap_range`] — фолт из S-mode фатален). Фолт вне кучи убивает ПРОЦЕСС, не ядро.
+//!
+//! Веха 30 — **контракт запуска** (ABI v2, [[process-contract]]): `SYS_EXEC` несёт argv;
+//! env и таблица стартовых capability наследуются от родителя ([`cap::endow`] — наделение
+//! потомка, не grant); процесс читает своё наследство через `SYS_ARGS` (argv/env) и
+//! `SYS_STARTCAP` (преоткрытые права, как preopen'ы WASI). То, что Linux кладёт на стек
+//! при execve, у нас спрашивают у ядра — раскладка стека остаётся делом программы.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -64,6 +70,10 @@ const USER_HEAP_BASE_VA: usize = 0x6000_0000;
 /// теперь ещё и код/данные ELF-программ (Веха 19, [`spawn_elf`]). Совпадает с базой линковки
 /// `programs/*/linker.ld`; [`crate::elf::load`] отвергает сегменты ниже этого адреса.
 pub const USER_REGION_START: usize = 0x4000_0000;
+
+/// Веха 30: потолок доп. аргументов `SYS_EXEC` (NUL-разделённый блоб). Столько же, сколько
+/// буфер IPC-запроса, — аргументы длиннее пусть едут объектом store.
+const ARGS_MAX: usize = 512;
 
 // ─── ядерный trap-стек для trap'ов из U-mode ──────────────────────────────────
 // 64 КиБ — как загрузочный стек ядра (linker.ld): syscall'ы делают настоящую работу
@@ -115,6 +125,18 @@ struct Proc {
     /// Веха 22.1: ленивая куча процесса — зарезервированный `SYS_MAP` диапазон
     /// [`USER_HEAP_BASE_VA`, heap_brk). Фолт внутри — выделить страницу; вне — гибель процесса.
     heap_brk: usize,
+    /// Веха 30 — контракт запуска: argv процесса, NUL-разделённые записи, `[0]` — имя
+    /// программы. Читается через `SYS_ARGS(0)`; заполняется при `SYS_EXEC` (имя + доп.
+    /// аргументы вызывающего).
+    args: Vec<u8>,
+    /// Веха 30: окружение (`KEY=VAL\0…`). Читается через `SYS_ARGS(1)`; при `SYS_EXEC`
+    /// наследуется от родителя как есть.
+    env: Vec<u8>,
+    /// Веха 30: таблица стартовых capability (биты дескрипторов В ДОМЕНЕ процесса) —
+    /// «преоткрытые» права, как preopen'ы WASI. Читается через `SYS_STARTCAP(i)`; при
+    /// `SYS_EXEC` наследуется копиями ([`cap::endow`]). Первые два права ядро по традиции
+    /// дублирует в `a0`/`a1` при spawn'е серверов.
+    start_caps: Vec<usize>,
 }
 
 struct Table {
@@ -191,6 +213,14 @@ fn create_process_locked(
         send_len: 0,
         send_cap: usize::MAX,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
+        args: {
+            // argv по умолчанию — только имя программы; SYS_EXEC добавит аргументы вызывающего.
+            let mut a = Vec::from(name.as_bytes());
+            a.push(0);
+            a
+        },
+        env: Vec::new(),
+        start_caps: Vec::new(),
     });
     t.procs.len() - 1
 }
@@ -225,6 +255,19 @@ pub fn set_arg(pid: usize, a0: usize) {
 /// (Веха 20: vsh получает эндпоинт персоналии в `a0` и exec-cap на store в `a1`).
 pub fn set_arg2(pid: usize, a1: usize) {
     TABLE.lock().procs[pid].frame.set_start_arg(1, a1);
+}
+
+/// Веха 30: окружение процесса (блоб `KEY=VAL\0…`) — процесс читает его `SYS_ARGS(1)`,
+/// дети наследуют при `SYS_EXEC`.
+pub fn set_env(pid: usize, env: &[u8]) {
+    TABLE.lock().procs[pid].env = Vec::from(env);
+}
+
+/// Веха 30: добавить стартовый capability (биты дескриптора, уже смещённого В ДОМЕН процесса)
+/// в таблицу преоткрытых прав. Процесс перечисляет её `SYS_STARTCAP(i)`, дети наследуют
+/// копиями при `SYS_EXEC`. Регистры `a0`/`a1` остаются быстрым путём для первых двух прав.
+pub fn push_start_cap(pid: usize, bits: usize) {
+    TABLE.lock().procs[pid].start_caps.push(bits);
 }
 
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
@@ -988,21 +1031,31 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_EXEC(store_cap, name_ptr, name_len) -> код выхода ребёнка / MAX: запустить программу
-        // из store ПО ИМЕНИ КОРНЯ и ждать её завершения (foreground, Веха 20.3). Требует права
-        // `EXEC` на store — ОТДЕЛЬНОГО от READ/WRITE: обладатель может запускать программы, не
-        // умея читать или менять объекты (аттенуация «только запуск»). Путь тот же, что в
-        // `exec_demo` ([[exec-from-store]]): корень → content-id → байты ELF → [`elf::load`].
+        // SYS_EXEC(store_cap, name_ptr, name_len, args_ptr, args_len) -> код выхода ребёнка /
+        // MAX: запустить программу из store ПО ИМЕНИ КОРНЯ и ждать её завершения (foreground,
+        // Веха 20.3). Требует права `EXEC` на store — ОТДЕЛЬНОГО от READ/WRITE: обладатель
+        // может запускать программы, не умея читать или менять объекты (аттенуация «только
+        // запуск»). Путь тот же, что в `exec_demo` ([[exec-from-store]]): корень → content-id →
+        // байты ELF → [`elf::load`].
+        //
+        // Веха 30 — контракт запуска: `args` (NUL-разделённые записи, ≤ [`ARGS_MAX`]) станут
+        // argv ребёнка после имени; env и таблица стартовых capability НАСЛЕДУЮТСЯ от
+        // родителя (права — копиями через [`cap::endow`]: наделение потомка, не grant).
         15 => {
-            let (scap, nptr, nlen) = {
+            let (scap, nptr, nlen, aptr, alen) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1), f.arg(2))
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
             };
             let dom = t.procs[cur].domain;
             let mut spawned = false;
             match cap::store(dom, Cap::from_bits(scap as u64), Rights::EXEC) {
-                // Веха 23: имя может лежать в ленивой куче — доотобразить до чтения ядром.
-                Ok(()) if ensure_heap_range(t, cur, nptr, nlen) => {
+                _ if alen > ARGS_MAX => {
+                    vprintln!("  [exec] P{} SYS_EXEC: аргументы длиннее {} — отказ", cur, ARGS_MAX)
+                }
+                // Веха 23: имя (и аргументы) могут лежать в ленивой куче — доотобразить до чтения.
+                Ok(()) if ensure_heap_range(t, cur, nptr, nlen)
+                    && (alen == 0 || ensure_heap_range(t, cur, aptr, alen)) =>
+                {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     if let Ok(name) = core::str::from_utf8(name_bytes) {
                         // Веха 26: `bin/<имя>` расширяется в арх-корень `bin/<arch>/<имя>` —
@@ -1016,14 +1069,40 @@ fn syscall(t: &mut Table, cur: usize) {
                                 let root = new_address_space();
                                 match elf::load(root, &bytes, USER_HEAP_BASE_VA) {
                                     Ok(entry) => {
+                                        // Наследство собрать ДО создания ребёнка (push в
+                                        // таблицу может перевезти Vec процессов).
+                                        let parent_env = t.procs[cur].env.clone();
+                                        let parent_scaps = t.procs[cur].start_caps.clone();
+                                        // argv ребёнка: имя + доп. аргументы вызывающего.
+                                        let mut args = Vec::from(name.as_bytes());
+                                        args.push(0);
+                                        if alen > 0 {
+                                            args.extend_from_slice(unsafe {
+                                                core::slice::from_raw_parts(aptr as *const u8, alen)
+                                            });
+                                            if *args.last().unwrap() != 0 {
+                                                args.push(0);
+                                            }
+                                        }
                                         // Имя процесса обязано жить дольше таблицы — утекает
                                         // (запусков за сессию единицы, приемлемо до Вехи 22).
                                         let pname: &'static str =
                                             Box::leak(String::from(name).into_boxed_str());
                                         let child = create_process_locked(t, pname, root, entry, 0);
+                                        let cdom = t.procs[child].domain;
+                                        t.procs[child].args = args;
+                                        t.procs[child].env = parent_env;
+                                        for bits in parent_scaps {
+                                            if let Ok(c) =
+                                                cap::endow(dom, Cap::from_bits(bits as u64), cdom)
+                                            {
+                                                t.procs[child].start_caps.push(c.bits() as usize);
+                                            }
+                                        }
                                         vprintln!(
-                                            "  [exec] P{} SYS_EXEC '{}' → P{} (по cap, ждёт завершения)",
+                                            "  [exec] P{} SYS_EXEC '{}' → P{} (по cap, ждёт завершения; наследство: env {} Б, старт-прав {})",
                                             cur, name, child,
+                                            t.procs[child].env.len(), t.procs[child].start_caps.len(),
                                         );
                                         // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
                                         t.procs[cur].state = State::ExecWait(child);
@@ -1051,6 +1130,50 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.set_ret(usize::MAX);
                 f.advance();
             }
+        }
+        // SYS_ARGS(sel, buf, len) -> полная длина блоба (в buf скопировано min(len, полная)):
+        // sel 0 — argv (NUL-разделённые записи, [0] — имя программы), 1 — env (`KEY=VAL\0…`).
+        // Контракт запуска Вехи 30: то, что Linux кладёт на стек при execve, у нас процесс
+        // спрашивает у ядра — раскладка стека остаётся целиком делом программы.
+        18 => {
+            let (sel, ptr, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let blob = match sel {
+                0 => Some(t.procs[cur].args.clone()),
+                1 => Some(t.procs[cur].env.clone()),
+                _ => None,
+            };
+            let result = match blob {
+                None => usize::MAX,
+                Some(b) => {
+                    let n = len.min(b.len());
+                    if n == 0 || ensure_heap_range(t, cur, ptr, n) {
+                        if n > 0 {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(b.as_ptr(), ptr as *mut u8, n)
+                            };
+                        }
+                        b.len()
+                    } else {
+                        usize::MAX
+                    }
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_STARTCAP(i) -> биты i-го стартового capability | MAX (конец таблицы).
+        // Преоткрытые права процесса (как preopen'ы WASI): выданы ядром при spawn'е или
+        // унаследованы от родителя при SYS_EXEC. Дескрипторы валидны в СВОЁМ домене.
+        19 => {
+            let i = t.procs[cur].frame.arg(0);
+            let bits = t.procs[cur].start_caps.get(i).copied().unwrap_or(usize::MAX);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(bits);
+            f.advance();
         }
         other => {
             let f = &mut t.procs[cur].frame;

@@ -37,6 +37,9 @@
 //! Веха 29: store вынесен в крейт `libs/void-store` за трейтом `BlockIo` — одна реализация
 //! формата на ядро (virtio-blk) и хост ([[store-bridge]]): `void-store-import` кладёт
 //! файлы и NAR-архивы (nix build → store) в образ диска без пересборки ядра.
+//! Веха 30: контракт запуска процесса (ABI v2) — `SYS_EXEC` несёт argv, ребёнок наследует
+//! env и стартовые capability (SYS_ARGS/SYS_STARTCAP, «preopen'ы»); персоналия выросла на
+//! seek/rename; vsh: `run NAME ARGS`, `mv`, `tail` ([[process-contract]]) — фундамент std.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -117,9 +120,9 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 29                           ║");
-    println!("  ║  мост host→store:                         ║");
-    println!("  ║  void-store-import · NAR · один формат    ║");
+    println!("  ║  VOID — Веха 30                           ║");
+    println!("  ║  контракт запуска процесса:               ║");
+    println!("  ║  argv · env · start-caps · rename         ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -457,6 +460,11 @@ fn shell_session() {
     proc::set_arg(sh, ep.bits() as usize);
     let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC);
     proc::set_arg2(sh, xcap.bits() as usize);
+    // Веха 30 — контракт запуска: та же пара прав — в таблицу стартовых capability
+    // (её унаследуют программы, которые vsh запустит через SYS_EXEC), плюс окружение.
+    proc::push_start_cap(sh, ep.bits() as usize);
+    proc::push_start_cap(sh, xcap.bits() as usize);
+    proc::set_env(sh, alloc::format!("ARCH={}\0SYSTEM=void\0", arch::ARCH_NAME).as_bytes());
     println!(
         "    P{} 'posixfs' [{}] ← P{} 'vsh' [эндпоинт {} + store {}]",
         server,

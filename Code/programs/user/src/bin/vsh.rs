@@ -5,14 +5,35 @@
 //!
 //! Line-discipline на стороне программы: эхо набранного, backspace (`\x7f`/`\x08`), Enter =
 //! `\r` (терминал) или `\n` (pipe). Команды: `ls`, `cat F`, `echo TEXT > F` (или просто печать),
-//! `run NAME` (например `run bin/hello`), `help`, `exit` — последняя завершает сессию VOID.
+//! `run NAME [ARGS…]` (Веха 30: слова после имени становятся argv ребёнка; например
+//! `run bin/hello мир`), `mv OLD NEW` (rename персоналии), `help`, `exit` — последняя
+//! завершает сессию VOID.
 #![no_std]
 #![no_main]
 
 use void_user as sys;
 use void_user::posix as px;
 
-static HELP: &[u8] = b"commands: ls | cat FILE | echo TEXT > FILE | run NAME | help | exit\n";
+static HELP: &[u8] =
+    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | mv OLD NEW | help | exit\n";
+
+/// Напечатать usize десятично (форматтера в no_std-бинаре нет).
+fn put_dec(ep: usize, mut v: usize) {
+    let mut nb = [0u8; 20];
+    let mut n = 0;
+    loop {
+        nb[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        px::write(ep, px::STDOUT, &nb[n..n + 1]);
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
@@ -23,23 +44,34 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     loop {
         px::write(ep, px::STDOUT, b"vsh> ");
         // ── собрать строку: читать порциями, эхо, backspace, до Enter ──
+        // Эхо — ПАЧКОЙ на порцию ввода, не по байту: SYS_WRITE валидирует UTF-8, и
+        // разрезанный посередине двухбайтный символ (кириллица) печатался бы как «<?>».
         let mut llen = 0usize;
         'line: loop {
             let n = px::read(ep, px::STDIN, &mut inb); // блокируется, пока нет ввода
+            let mut from = llen; // начало ещё не показанного хвоста line[from..llen]
             for &b in &inb[..n] {
                 if b == b'\r' || b == b'\n' {
+                    if llen > from {
+                        px::write(ep, px::STDOUT, &line[from..llen]);
+                    }
                     px::write(ep, px::STDOUT, b"\n");
                     break 'line;
                 } else if b == 0x7f || b == 0x08 {
-                    if llen > 0 {
+                    if llen > from {
+                        llen -= 1; // байт ещё не показан — просто забыть
+                    } else if llen > 0 {
                         llen -= 1;
+                        from = llen;
                         px::write(ep, px::STDOUT, b"\x08 \x08"); // затереть символ на терминале
                     }
                 } else if b >= 0x20 && llen < line.len() - 1 {
                     line[llen] = b;
                     llen += 1;
-                    px::write(ep, px::STDOUT, &line[llen - 1..llen]); // эхо
                 }
+            }
+            if llen > from {
+                px::write(ep, px::STDOUT, &line[from..llen]); // эхо принятого целиком
             }
         }
         let cmd = &line[..llen];
@@ -62,6 +94,23 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             px::cat(ep, path);
             continue;
         }
+        if let Some(path) = cmd.strip_prefix(b"tail ") {
+            // Веха 30: последние 32 байта файла — витрина lseek (SEEK_END со знаковым минусом).
+            let fd = px::open(ep, path, 0);
+            if fd == usize::MAX {
+                px::write(ep, px::STDOUT, b"vsh: no such file\n");
+            } else {
+                px::seek(ep, fd, -32, px::SEEK_END);
+                let mut tb = [0u8; 64];
+                let n = px::read(ep, fd, &mut tb);
+                px::write(ep, px::STDOUT, &tb[..n]);
+                if n == 0 || tb[n - 1] != b'\n' {
+                    px::write(ep, px::STDOUT, b"\n");
+                }
+                px::close(ep, fd);
+            }
+            continue;
+        }
         if let Some(body) = cmd.strip_prefix(b"echo ") {
             // `echo TEXT > FILE` — записать; без ` > ` — просто напечатать TEXT.
             let mut sep = usize::MAX; // позиция последнего " > "
@@ -80,13 +129,52 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             }
             continue;
         }
-        if let Some(name) = cmd.strip_prefix(b"run ") {
-            let code = px::spawn(xcap, name);
+        if let Some(rest) = cmd.strip_prefix(b"run ") {
+            // Веха 30: `run NAME [ARGS…]` — имя до первого пробела, остальные слова
+            // становятся argv ребёнка (NUL-разделённый блоб для SYS_EXEC).
+            let sp = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+            let (name, tail) = (&rest[..sp], &rest[sp..]);
+            let mut ab = [0u8; 128];
+            let mut alen = 0usize;
+            let mut in_word = false;
+            for &b in tail {
+                if b == b' ' {
+                    if in_word {
+                        ab[alen] = 0;
+                        alen += 1;
+                        in_word = false;
+                    }
+                } else if alen < ab.len() - 1 {
+                    ab[alen] = b;
+                    alen += 1;
+                    in_word = true;
+                }
+            }
+            if in_word {
+                ab[alen] = 0;
+                alen += 1;
+            }
+            let code = px::spawn_args(xcap, name, &ab[..alen]);
             if code == usize::MAX {
                 px::write(ep, px::STDOUT, b"vsh: run failed (no such program in store?)\n");
             } else {
                 px::write(ep, px::STDOUT, b"vsh: program exited, code ");
-                px::write(ep, px::STDOUT, &[b'0' + (code % 10) as u8, b'\n']);
+                put_dec(ep, code);
+                px::write(ep, px::STDOUT, b"\n");
+            }
+            continue;
+        }
+        if let Some(rest) = cmd.strip_prefix(b"mv ") {
+            // Веха 30: `mv OLD NEW` — rename персоналии (корень + каталог атомарно для store).
+            match rest.iter().position(|&b| b == b' ') {
+                Some(sp) if sp > 0 && sp + 1 < rest.len() => {
+                    if px::rename(ep, &rest[..sp], &rest[sp + 1..]) != 0 {
+                        px::write(ep, px::STDOUT, b"vsh: mv failed (no such file?)\n");
+                    }
+                }
+                _ => {
+                    px::write(ep, px::STDOUT, b"usage: mv OLD NEW\n");
+                }
             }
             continue;
         }

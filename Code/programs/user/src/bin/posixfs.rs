@@ -1,5 +1,5 @@
-//! POSIX-персоналия (Вехи 18.1–18.3): даёт клиентам файловый API
-//! `open/read/write/close/stat/unlink/readdir` по IPC. Файл = значение в объектном store,
+//! POSIX-персоналия (Вехи 18.1–18.3, seek/rename — Веха 30): даёт клиентам файловый API
+//! `open/read/write/close/stat/unlink/readdir/seek/rename` по IPC. Файл = значение в объектном store,
 //! привязанное к корню-имени (`a0` = cap на store): `open(name)` = `get_root(name)` → есть?
 //! загрузить : создать; `close` изменённого файла = `put` + `set_root` (атомарный чекпойнт).
 //! Привязка к корню переживает и GC ядра, и перезагрузку.
@@ -15,7 +15,7 @@
 #![no_main]
 
 use void_user as sys;
-use void_user::posix::{OP_CLOSE, OP_OPEN, OP_READ, OP_READDIR, OP_STAT, OP_UNLINK, OP_WRITE};
+use void_user::posix::{OP_CLOSE, OP_OPEN, OP_READ, OP_READDIR, OP_RENAME, OP_SEEK, OP_STAT, OP_UNLINK, OP_WRITE};
 use void_user::posix::{O_APPEND, O_TRUNC};
 
 const NFILES: usize = 16;
@@ -239,6 +239,66 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     dir_persist(store_cap, &dir[..dir_len], &mut idb);
                 }
                 rep[0] = 0;
+                reply_len = 1;
+            }
+            OP_SEEK => {
+                // Веха 30. req[..8] — знаковое смещение (i64 LE), whence — в байте режима op
+                // (0=SET, 1=CUR, 2=END). Курсор зажимается в [0, размер] — дыр в файлах нет.
+                // Ответ: новая позиция (u64 LE) или u64::MAX.
+                let mut pos = u64::MAX;
+                if fd < NFILES && fd_used[fd] && len >= 8 {
+                    let off = i64::from_le_bytes(req[..8].try_into().unwrap());
+                    let fi = fd_file[fd];
+                    let base = match mode {
+                        1 => fd_off[fd] as i64,
+                        2 => size[fi] as i64,
+                        _ => 0,
+                    };
+                    let p = (base + off).clamp(0, size[fi] as i64) as usize;
+                    fd_off[fd] = p;
+                    pos = p as u64;
+                }
+                rep[..8].copy_from_slice(&pos.to_le_bytes());
+                reply_len = 8;
+            }
+            OP_RENAME => {
+                // Веха 30. req: old_len(1) | old | new. Перевесить: корень store (смена корня —
+                // атомарный чекпойнт), слот RAM (открытые fd продолжают работать — close
+                // запишет уже под новым именем), запись каталога.
+                rep[0] = 0xff;
+                let ol = if len >= 2 { req[0] as usize } else { usize::MAX };
+                if ol != usize::MAX && 1 + ol < len && len - 1 - ol <= NAME_MAX {
+                    let nl = len - 1 - ol;
+                    let mut oldb = [0u8; NAME_MAX];
+                    let mut newb = [0u8; NAME_MAX];
+                    if ol <= NAME_MAX {
+                        oldb[..ol].copy_from_slice(&req[1..1 + ol]);
+                        newb[..nl].copy_from_slice(&req[1 + ol..len]);
+                        let (old, new) = (&oldb[..ol], &newb[..nl]);
+                        let mut ok = false;
+                        if sys::obj_get_root(store_cap, old, &mut idb) == 32 {
+                            sys::obj_set_root(store_cap, new, &idb);
+                            sys::obj_del_root(store_cap, old);
+                            ok = true;
+                        }
+                        for i in 0..NFILES {
+                            if fused[i] && &names[i][..name_len[i]] == old {
+                                names[i][..nl].copy_from_slice(new);
+                                name_len[i] = nl;
+                                ok = true;
+                                break;
+                            }
+                        }
+                        if ok {
+                            let removed = dir_remove(&mut dir, &mut dir_len, old);
+                            let added = dir_add(&mut dir, &mut dir_len, new);
+                            if removed || added {
+                                dir_persist(store_cap, &dir[..dir_len], &mut idb);
+                            }
+                            rep[0] = 0;
+                        }
+                    }
+                }
                 reply_len = 1;
             }
             OP_READDIR => {

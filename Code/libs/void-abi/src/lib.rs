@@ -8,7 +8,10 @@
 /// Версия ABI. Растёт при несовместимых изменениях границы ядро/userspace.
 /// v1 — Веха 21: IPC несёт capability (CALL: a6=право, возврат a1; RECV: a3; REPLY: a3),
 /// новые право `EXEC` и syscall `CAP_DERIVE`.
-pub const VERSION: u32 = 1;
+/// v2 — Веха 30 (контракт запуска): `SYS_EXEC` несёт argv (a3/a4), новые `SYS_ARGS` (18:
+/// argv/env процесса) и `SYS_STARTCAP` (19: таблица стартовых прав — «preopen'ы»);
+/// env и стартовые права наследуются детям при exec; персоналия: seek (7) и rename (8).
+pub const VERSION: u32 = 2;
 
 /// Контент-адрес неизменяемого значения в объектном store — хэш его содержимого.
 /// Основа контент-адресации из [[0002-persistent-content-addressed-capability-core]].
