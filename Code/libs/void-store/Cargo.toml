@@ -1,0 +1,11 @@
+# void-store — формат и логика персистентного объектного store (Веха 29).
+# no_std + alloc: одна реализация формата диска на всех потребителей —
+# ядро (поверх virtio-blk) и хост-утилиты (поверх файла-образа, см. Code/tools/).
+[package]
+name = "void-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+void-abi = { path = "../void-abi" }

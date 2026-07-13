@@ -1,0 +1,13 @@
+# void-store-import — мост host→store (Веха 29).
+# Отдельный крейт ВНЕ workspace ядра: собирается под хостовый таргет
+# (см. .cargo/config.toml рядом), а не под таргеты ядра.
+[package]
+name = "void-store-import"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+description = "Импорт файлов и NAR-архивов в образ диска VOID (объекты + корни store)."
+
+[dependencies]
+void-abi = { path = "../../libs/void-abi" }
+void-store = { path = "../../libs/void-store" }

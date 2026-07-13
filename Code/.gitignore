@@ -3,3 +3,5 @@
 /void-disk.img
 # target отдельно собираемых userspace-программ (кроме сборки через kernel/build.rs → OUT_DIR)
 /programs/*/target/
+# target хост-утилит (Веха 29) — тоже отдельные крейты со своим таргетом
+/tools/*/target/

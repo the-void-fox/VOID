@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "kernel",
     "libs/void-abi",
+    "libs/void-store",
 ]
 # Веха 19.1/23: userspace-программы — ОТДЕЛЬНЫЙ крейт, не член этого workspace (у него свой
 # линкер-скрипт на базу региона процессов и свой release-профиль под жёсткий размер — см.
@@ -12,6 +13,9 @@ members = [
 # `--target-dir` внутри OUT_DIR (иначе — deadlock на локе target ядра).
 exclude = [
     "programs/user",
+    # Веха 29: хост-утилиты — тоже отдельные крейты: им нужен ХОСТОВЫЙ таргет
+    # (см. tools/*/.cargo/config.toml), а workspace собирается под таргеты ядра.
+    "tools/void-store-import",
 ]
 
 [workspace.package]

@@ -31,6 +31,12 @@
 //! контракт]] `probe_virtio_blk` отдаёт транспорт mmio/pci общему драйверу), прерывание
 //! диска MSI-X, консольный ввод IRQ4 через IOAPIC: персистентность на обеих архитектурах,
 //! ОДИН диск несёт store с программами двух архитектур ([[x86-devices]]).
+//! Веха 28: микробенчи (`bin/bench` + `bench_demo`, замер rdtime/rdtsc из U-mode) и отчёт
+//! памяти — сравнение с Linux-гостем в том же QEMU (корневой README); на время замера
+//! трассировка шлюзов глушится (`vprintln!`).
+//! Веха 29: store вынесен в крейт `libs/void-store` за трейтом `BlockIo` — одна реализация
+//! формата на ядро (virtio-blk) и хост ([[store-bridge]]): `void-store-import` кладёт
+//! файлы и NAR-архивы (nix build → store) в образ диска без пересборки ядра.
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -111,9 +117,9 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 27                           ║");
-    println!("  ║  один диск — две архитектуры:             ║");
-    println!("  ║  virtio-pci · MSI-X · IOAPIC              ║");
+    println!("  ║  VOID — Веха 29                           ║");
+    println!("  ║  мост host→store:                         ║");
+    println!("  ║  void-store-import · NAR · один формат    ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);

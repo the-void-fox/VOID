@@ -7,3 +7,4 @@ description = "Микроядро VOID (bare-metal RISC-V, S-mode)."
 
 [dependencies]
 void-abi = { path = "../libs/void-abi" }
+void-store = { path = "../libs/void-store" }
