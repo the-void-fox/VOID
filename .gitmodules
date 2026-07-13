@@ -1,0 +1,4 @@
+[submodule "vendor/rust"]
+	path = vendor/rust
+	url = https://github.com/rust-lang/rust.git
+	shallow = true
