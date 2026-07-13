@@ -48,8 +48,9 @@ void-pkg (резолвер; сначала на хосте, позже внут�
 - прецедент: Redox — std-порт там начинал один человек.
 
 Уже есть со стороны ядра: SYS_MAP (куча, [[process-heap]]), SYS_EXEC ([[interactive-shell]]),
-файловые op персоналии ([[posix-personality]]). Не хватает для std-минимума: pipes, dup,
-время (rdtime наружу), argv/env, exit-коды шире, больше файловых операций (seek, rename).
+файловые op персоналии ([[posix-personality]]), время в U-mode (Веха 28), argv/env и
+стартовые capability + seek/rename (Веха 30, [[process-contract]]). Из std-минимума
+не хватает только pipes/dup — отложены до реальной потребности (uutils стартует без них).
 
 **nixpkgs-cross** — расширение на C-мир: добавить платформу «void» в локальный оверлей
 nixpkgs, stdenv с кросс-тулчейном на newlib/relibc поверх персоналии. Nix здесь — книга
@@ -90,9 +91,9 @@ WASI capability-based (preopen-дескрипторы) — идеологиче�
    разблокирует release).
 2. **std-порт + uutils + мост**: девайс грузится в vsh, есть настоящие утилиты, всё
    персистентно. Первая честная точка «самодостаточно для энтузиаста». Горизонт — месяцы.
-   Мост — ✅ Веха 29; впереди Веха 30 (контракт запуска: argv/env, стартовые cap,
-   exit-коды, posixfs seek/rename/unlink/stat), Веха 31 (std-порт: `vendor/rust`,
-   ветка `void`, внешний LLVM из nix), Веха 32 (uutils).
+   Мост — ✅ Веха 29; контракт запуска — ✅ Веха 30 ([[process-contract]]: argv/env,
+   стартовые cap наследуются при exec, posixfs seek/rename). Впереди Веха 31
+   (std-порт: `vendor/rust`, ветка `void`, внешний LLVM из nix), Веха 32 (uutils).
 3. **nixpkgs-cross**: C-программы по рецептам nixpkgs.
 4. **linux-abi**: бинарный кэш nixpkgs напрямую — «пользоваться базой nix» в реалистичной
    форме.
