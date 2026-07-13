@@ -25,8 +25,12 @@ Code/
 ├── programs/
 │   └── user/             # userspace: либа шимов (ecall / int 0x80) + 14 бинарей
 │                         #   (vsh, posixfs, mini-sh, hello, bench, драйверы-демо…)
-└── libs/
-    └── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap, Rights)
+├── libs/
+│   ├── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap, Rights)
+│   └── void-store/       # формат и логика store (no_std, трейт BlockIo) —
+│                         #   одна реализация на ядро и хост-утилиты
+└── tools/
+    └── void-store-import/ # мост host→store (отдельный крейт, хостовый musl-таргет)
 ```
 
 ## Требования
@@ -45,6 +49,19 @@ cargo run --target x86_64-unknown-none      # x86_64: QEMU q35, PVH direct boot
 Выход из QEMU: **Ctrl-A**, затем **X**. Состояние store на `void-disk.img`
 переживает перезагрузки и разделяется обеими архитектурами (корни программ
 разведены как `bin/<arch>/<имя>`).
+
+## Импорт с хоста (Веха 29)
+```sh
+# сборка утилиты (в nix-shell: build-скриптам нужен cc; бинарь — статический musl)
+nix-shell --run "cd Code/tools/void-store-import && cargo build --release"
+T=tools/void-store-import/target/x86_64-unknown-linux-musl/release/void-store-import
+
+$T void-disk.img ls                      # корни, поколение, объекты
+$T void-disk.img put файл имя-корня      # файл → объект + корень
+nix-store --dump ПУТЬ > a.nar            # любой путь, в т.ч. $(nix-build ...)
+$T void-disk.img nar a.nar pkg/имя       # NAR → корень на каждый файл
+```
+Не запускать, пока образ занят QEMU (совместного доступа у store нет).
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем

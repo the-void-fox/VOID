@@ -11,9 +11,9 @@ x86_64) из одного дерева исходников, весь userspace 
 
 ```
   ╔══════════════════════════════════════════╗
-  ║  VOID — Веха 27                           ║
-  ║  один диск — две архитектуры:             ║
-  ║  virtio-pci · MSI-X · IOAPIC              ║
+  ║  VOID — Веха 29                           ║
+  ║  мост host→store:                         ║
+  ║  void-store-import · NAR · один формат    ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -122,7 +122,8 @@ userspace счётчиком rdtime/rdtsc). Сравнение с Linux — **г
 процессов · async-executor с диском на прерываниях (PLIC / MSI-X) · IPC с
 передачей прав · userspace-драйвер блочного устройства · сервер объектного
 store · POSIX-персоналия · ленивые кучи процессов и честные page fault'ы ·
-exec-по-хэшу · интерактивный vsh · микробенчи · отчёт памяти.
+exec-по-хэшу · интерактивный vsh · микробенчи · отчёт памяти · импорт с хоста
+(`void-store-import`: файлы и NAR-архивы nix — прямо в образ диска).
 
 ## Сборка и запуск
 
@@ -149,15 +150,21 @@ Code/
 │   └── src/arch/         # контракт архитектур: riscv64 (SBI/PLIC/Sv39),
 │                         #   x86_64 (PVH, GDT/TSS, LAPIC/IOAPIC, PCI/MSI-X)
 ├── programs/user/        # userspace: либа syscall-шимов + 14 программ (ELF)
-└── libs/void-abi/        # типы границы ядро/userspace (ContentId, Cap, Rights)
+├── libs/void-abi/        # типы границы ядро/userspace (ContentId, Cap, Rights)
+├── libs/void-store/      # формат и логика store (no_std) — общие ядру и хосту
+└── tools/void-store-import/  # мост host→store: put/nar/ls/cat в образ диска
 Obsidian/                 # концепция, ADR, заметки вех, роадмап (Obsidian vault)
+vendor/rust               # форк rust 1.97.0 (ветка void) — фундамент std-порта
 ```
 
 Развёрнутая документация — в `Obsidian/10-projects/void/`: ADR 0001–0005,
-заметки каждой вехи (1–27), staged-роадмап (`Obsidian/30-todo/todo.md`).
+заметки каждой вехи (1–29), staged-роадмап (`Obsidian/30-todo/todo.md`).
 
 ## Дальше
 
-Пакетная дорожка (ADR 0004): порт Rust `std` на VOID → кросс-сборка uutils →
-мост host→store. Затем: политика коммитов (до реального железа), сеть,
+Пакетная дорожка (ADR 0004) начата: мост host→store готов —
+`void-store-import` кладёт файлы и NAR-архивы (`nix-store --dump`) в образ
+диска без пересборки ядра. Впереди: контракт запуска процесса (argv/env,
+стартовые capability) → порт Rust `std` (форк уже лежит в `vendor/rust`) →
+кросс-сборка uutils. Затем: политика коммитов (до реального железа), сеть,
 checkpoint процессов. Когда-нибудь: VisionFive 2 / x86-минипк.
