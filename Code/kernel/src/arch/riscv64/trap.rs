@@ -111,6 +111,8 @@ pub fn init() {
     // Инвариант переключения стека (Веха 10): в ядре sscratch = 0. trap_entry.s опирается
     // на это, чтобы отличить trap из ядра (S) от trap'а из пользователя (U).
     csr::write_sscratch(0);
+    // Открыть U-mode счётчики cycle/time/instret (rdtime — замеры бенчей, Веха 28).
+    csr::write_scounteren(0b111);
 }
 
 /// Rust-сторона обработчика. Вызывается из trap_entry.s; `frame` указывает на

@@ -62,6 +62,13 @@ pub fn write_sscratch(v: usize) {
     unsafe { asm!("csrw sscratch, {0}", in(reg) v, options(nomem, nostack)) }
 }
 
+/// `scounteren`: какие счётчики (бит 0 — cycle, 1 — time, 2 — instret) U-mode может
+/// читать напрямую (`rdtime` и др.) — для замеров userspace без syscall'а (Веха 28).
+#[inline]
+pub fn write_scounteren(v: usize) {
+    unsafe { asm!("csrw scounteren, {0}", in(reg) v, options(nomem, nostack)) }
+}
+
 /// Доп. информация о trap'е (адрес при page fault и т.п.).
 #[inline]
 pub fn read_stval() -> usize {

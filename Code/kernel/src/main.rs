@@ -72,6 +72,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("busy", include_bytes!(env!("PROG_BUSY"))),
     ("heap", include_bytes!(env!("PROG_HEAP"))),
     ("crash", include_bytes!(env!("PROG_CRASH"))),
+    ("bench", include_bytes!(env!("PROG_BENCH"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
@@ -265,6 +266,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!();
     }
 
+    // Веха 28: микробенчи — цена syscall/IPC/фолта/store/exec глазами userspace.
+    if arch::USERSPACE_READY {
+        bench_demo();
+        println!();
+    }
+
     // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
     gc_demo();
     println!();
@@ -294,12 +301,30 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         shell_session();
     }
 
+    mem_report();
     println!();
     println!("  [idle] перезагрузи QEMU — состояние вернётся. Простаиваем до прерываний.");
 
     loop {
         arch::wait_for_interrupt();
     }
+}
+
+/// Веха 28: сколько RAM занимает система к концу загрузки. Образ ядра — от кода до
+/// `_kernel_end` (включая .bss с семенами программ); дальше — всё, что раздал
+/// bump-аллокатор фреймов (таблицы страниц, кольца virtio, арена кучи, страницы
+/// процессов; освобождения нет — это ПИК, верхняя оценка).
+fn mem_report() {
+    extern "C" {
+        static _text_start: u8;
+        static _kernel_end: u8;
+    }
+    let image = &raw const _kernel_end as usize - &raw const _text_start as usize;
+    println!(
+        "  [mem] образ ядра: {} КиБ · фреймы после образа (пик): {} КиБ · RAM машины: 128 МиБ",
+        image / 1024,
+        frame::used_bytes() / 1024,
+    );
 }
 
 /// Веха 23: посеять/обновить программы системы в store. Каждая — объект под арх-корнем
@@ -698,6 +723,33 @@ fn exec_demo() {
         }
         None => println!("    [exec] не удалось прочитать ELF из store по content-id (не должно случаться)"),
     }
+}
+
+/// Веха 28: микробенчи из userspace — программа `bench` с capability на store [r w x]
+/// и эндпоинт posixfs меряет rdtime/rdtsc'ом цену null-syscall'а, IPC-круга, page
+/// fault'а, obj_put/obj_get и полного exec. Трассировка шлюзов ([ipc]/[obj]/[mm]…)
+/// на время сессии глушится — иначе мерился бы println, а не системный путь.
+/// Цифры — ЭМУЛЯЦИЯ (QEMU TCG): сравнивать честно только с гостём в том же QEMU.
+fn bench_demo() {
+    use void_abi::Rights;
+
+    println!("  [bench] микробенчи (QEMU TCG — цифры эмуляции, не железа):");
+    let server = spawn_prog("posixfs", "posixfs", 0);
+    let srv_cap =
+        cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
+    proc::set_arg(server, srv_cap.bits() as usize);
+
+    let bench = spawn_prog("bench", "bench", 0);
+    let rwx = Rights::READ.union(Rights::WRITE).union(Rights::EXEC);
+    let scap = cap::mint(proc::domain(bench), cap::Target::Store, rwx);
+    proc::set_arg(bench, scap.bits() as usize);
+    let ep = cap::mint(proc::domain(bench), cap::Target::Endpoint(server), Rights::SEND);
+    proc::set_arg2(bench, ep.bits() as usize);
+
+    proc::set_verbose(false);
+    proc::run();
+    proc::set_verbose(true);
+    println!("  [bench] сессия завершена");
 }
 
 /// Доводка: структурные ссылки между объектами + смена версии (готовит мусор для GC).

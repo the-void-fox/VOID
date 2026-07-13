@@ -53,6 +53,13 @@ pub fn reserve(bytes: usize) -> Option<usize> {
     Some(start)
 }
 
+/// Сколько байт RAM за образом ядра уже роздано (пик: освобождения у bump-аллокатора
+/// нет). Для отчёта потребления памяти (Веха 28).
+pub fn used_bytes() -> usize {
+    let start = align_up(&raw const _kernel_end as usize, PAGE_SIZE);
+    NEXT.load(Ordering::Relaxed).saturating_sub(start)
+}
+
 const fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
 }

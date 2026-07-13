@@ -22,12 +22,32 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use void_abi::{Cap, ContentId, Rights};
 
 use crate::arch::{self, Context, FaultKind, TrapFrame, UserTrap};
 use crate::sync::SpinLock;
 use crate::{cap, elf, frame, println, timer};
+
+/// Болтливость шлюзов syscall'ов ([ipc]/[obj]/[blk]/[mm]/[exec]-строки на каждый вызов).
+/// Демо живут этой трассировкой, но бенчи (Веха 28) она бы утопила — и в шуме, и в
+/// ЦЕНЕ (println дороже самого syscall'а): на время замеров ядро замолкает.
+static VERBOSE: AtomicBool = AtomicBool::new(true);
+
+/// Включить/выключить трассировку шлюзов (бенч-демо глушит её на свою сессию).
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, Ordering::Relaxed);
+}
+
+/// println! шлюза: печатает только при включённой трассировке.
+macro_rules! vprintln {
+    ($($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
 
 // ─── адресное пространство процесса ────────────────────────────────────────────
 /// Стек процесса живёт в незанятом ядром регионе VPN[2]=1 (0x4000_0000..0x8000_0000),
@@ -304,12 +324,12 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
             // иначе повтор инструкции мог бы увидеть старую (пустую) трансляцию.
             unsafe { arch::map(arch::space_root(space), page_va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
             arch::flush_tlb();
-            println!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
+            vprintln!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
             return; // sepc не тронут — инструкция повторится по замапленной странице
         }
-        println!("  [mm] P{} фолт кучи {:#x}: фреймы кончились — процесс убит", cur, va);
+        vprintln!("  [mm] P{} фолт кучи {:#x}: фреймы кончились — процесс убит", cur, va);
     } else {
-        println!(
+        vprintln!(
             "  [mm] P{} page fault ({}) @ {:#x} вне кучи — процесс убит (ядро живо)",
             cur, kind.name(), va,
         );
@@ -336,7 +356,7 @@ fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
             let Some(pa) = frame::alloc() else { return false };
             unsafe { arch::map(root, page, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
             arch::flush_tlb();
-            println!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
+            vprintln!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
         }
         page += PAGE;
     }
@@ -375,7 +395,7 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                 }
             }
             UserTrap::Unknown(code) => {
-                println!("  [proc] неожиданный trap из U (код {:#x}) — процесс завершён", code);
+                vprintln!("  [proc] неожиданный trap из U (код {:#x}) — процесс завершён", code);
                 t.procs[cur].state = State::Finished;
                 wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
                 if let Some(n) = t.next_runnable(cur) {
@@ -443,7 +463,7 @@ fn syscall(t: &mut Table, cur: usize) {
         // этот процесс в SYS_EXEC (Веха 20.3) — разбудить, вернув ему код выхода.
         2 => {
             let code = t.procs[cur].frame.arg(0);
-            println!("  [proc] P{} SYS_EXIT({})", cur, code);
+            vprintln!("  [proc] P{} SYS_EXIT({})", cur, code);
             t.procs[cur].state = State::Finished;
             wake_exec_waiters(t, cur, code);
             if let Some(n) = t.next_runnable(cur) {
@@ -505,7 +525,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 let ok = cap::rights(dom, Cap::from_bits(scap as u64))
                     .map_or(false, |r| r.contains(Rights::GRANT));
                 if !ok {
-                    println!("  [cap] P{} CALL отклонён: нет права GRANT на передаваемую capability", cur);
+                    vprintln!("  [cap] P{} CALL отклонён: нет права GRANT на передаваемую capability", cur);
                     let f = &mut t.procs[cur].frame;
                     f.set_ret(usize::MAX);
                     f.advance();
@@ -514,7 +534,7 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             match cap::endpoint(dom, Cap::from_bits(ecap as u64)) {
                 Ok(dest) => {
-                    println!("  [ipc] P{} CALL P{} (по cap) op={} ({} байт)", cur, dest, op, slen);
+                    vprintln!("  [ipc] P{} CALL P{} (по cap) op={} ({} байт)", cur, dest, op, slen);
                     t.procs[cur].recv_buf = rbuf;
                     t.procs[cur].recv_cap = rcap;
                     t.procs[cur].send_buf = sbuf;
@@ -542,7 +562,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Err(e) => {
                     // Нет валидного cap на эндпоинт — отказ. Процесс не блокируется, продолжает.
-                    println!("  [ipc] P{} CALL отклонён: {:?}  ← нет capability на эндпоинт", cur, e);
+                    vprintln!("  [ipc] P{} CALL отклонён: {:?}  ← нет capability на эндпоинт", cur, e);
                     let f = &mut t.procs[cur].frame;
                     f.set_ret(usize::MAX);
                     f.advance();
@@ -568,7 +588,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 let ok = cap::rights(dom, Cap::from_bits(scap as u64))
                     .map_or(false, |r| r.contains(Rights::GRANT));
                 if !ok {
-                    println!("  [cap] P{} REPLY отклонён: нет права GRANT на передаваемую capability", cur);
+                    vprintln!("  [cap] P{} REPLY отклонён: нет права GRANT на передаваемую capability", cur);
                     let f = &mut t.procs[cur].frame;
                     f.set_ret(usize::MAX);
                     f.advance();
@@ -577,7 +597,7 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             let result = match cap::reply_endpoint(dom, Cap::from_bits(rcap as u64)) {
                 Ok(dest) => {
-                    println!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
+                    vprintln!("  [ipc] P{} REPLY P{} ({} байт)", cur, dest, len);
                     if dest < t.procs.len() && t.procs[dest].state == State::ReplyWait {
                         let mut n = len.min(t.procs[dest].recv_cap);
                         // Веха 23: оба конца могут лежать в ленивых кучах — доотобразить: свой
@@ -609,7 +629,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                 Rights(u32::MAX),
                             ) {
                                 tcap = nc.bits() as usize;
-                                println!(
+                                vprintln!(
                                     "  [cap] P{} → P{}: право [{}] передано в ответе (grant по IPC)",
                                     cur, dest,
                                     cap::rights_str(cap::rights(t.procs[dest].domain, nc).unwrap_or(Rights::NONE)),
@@ -627,7 +647,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     0
                 }
                 Err(e) => {
-                    println!("  [ipc] P{} REPLY отклонён: {:?}  ← нет reply-capability", cur, e);
+                    vprintln!("  [ipc] P{} REPLY отклонён: {:?}  ← нет reply-capability", cur, e);
                     usize::MAX
                 }
             };
@@ -647,7 +667,7 @@ fn syscall(t: &mut Table, cur: usize) {
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
                 // Веха 23: приёмный буфер может лежать в ленивой куче — доотобразить.
                 Ok(cap::Device::Block) if ensure_heap_range(t, cur, ubuf, 512) => {
-                    println!("  [blk] P{} SYS_BLK_READ сектор {} (по cap)", cur, sector);
+                    vprintln!("  [blk] P{} SYS_BLK_READ сектор {} (по cap)", cur, sector);
                     let mut tmp = [0u8; 512];
                     let ok = crate::virtio_blk::read(sector as u64, &mut tmp);
                     if ok {
@@ -658,7 +678,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Ok(_) => usize::MAX, // право есть, а фреймов под ленивый буфер нет
                 Err(e) => {
-                    println!("  [blk] P{} SYS_BLK_READ отклонён: {:?}  ← нет capability на устройство", cur, e);
+                    vprintln!("  [blk] P{} SYS_BLK_READ отклонён: {:?}  ← нет capability на устройство", cur, e);
                     usize::MAX
                 }
             };
@@ -684,12 +704,12 @@ fn syscall(t: &mut Table, cur: usize) {
                     let id = crate::object::put(bytes);
                     let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
                     out.copy_from_slice(&id.0);
-                    println!("  [obj] P{} OBJ_PUT {} байт → content-id (по cap)", cur, len);
+                    vprintln!("  [obj] P{} OBJ_PUT {} байт → content-id (по cap)", cur, len);
                     0
                 }
                 Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
-                    println!("  [obj] P{} OBJ_PUT отклонён: {:?}  ← нет capability на store", cur, e);
+                    vprintln!("  [obj] P{} OBJ_PUT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
                 }
             };
@@ -722,12 +742,12 @@ fn syscall(t: &mut Table, cur: usize) {
                         }
                         None => 0,
                     });
-                    println!("  [obj] P{} OBJ_GET → {} байт (по cap)", cur, n);
+                    vprintln!("  [obj] P{} OBJ_GET → {} байт (по cap)", cur, n);
                     n
                 }
                 Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
-                    println!("  [obj] P{} OBJ_GET отклонён: {:?}  ← нет capability на store", cur, e);
+                    vprintln!("  [obj] P{} OBJ_GET отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
                 }
             };
@@ -758,7 +778,7 @@ fn syscall(t: &mut Table, cur: usize) {
                             // [[persistent-store]]). Иначе файлы интерактивной сессии жили бы
                             // только до выключения QEMU (kmain-commit к этому моменту уже прошёл).
                             crate::object::commit();
-                            println!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap, чекпойнт)", cur, name);
+                            vprintln!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap, чекпойнт)", cur, name);
                             0
                         }
                         Err(_) => usize::MAX,
@@ -766,7 +786,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
-                    println!("  [obj] P{} OBJ_SET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
+                    vprintln!("  [obj] P{} OBJ_SET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
                 }
             };
@@ -792,11 +812,11 @@ fn syscall(t: &mut Table, cur: usize) {
                             Some(id) => {
                                 let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
                                 out.copy_from_slice(&id.0);
-                                println!("  [obj] P{} OBJ_GET_ROOT '{}' → есть (по cap)", cur, name);
+                                vprintln!("  [obj] P{} OBJ_GET_ROOT '{}' → есть (по cap)", cur, name);
                                 32
                             }
                             None => {
-                                println!("  [obj] P{} OBJ_GET_ROOT '{}' → нет (по cap)", cur, name);
+                                vprintln!("  [obj] P{} OBJ_GET_ROOT '{}' → нет (по cap)", cur, name);
                                 0
                             }
                         },
@@ -805,7 +825,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
-                    println!("  [obj] P{} OBJ_GET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
+                    vprintln!("  [obj] P{} OBJ_GET_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
                 }
             };
@@ -830,12 +850,12 @@ fn syscall(t: &mut Table, cur: usize) {
                     let src = unsafe { core::slice::from_raw_parts(ubuf as *const u8, n) };
                     tmp[..n].copy_from_slice(src);
                     let ok = crate::virtio_blk::write(sector as u64, &tmp);
-                    println!("  [blk] P{} SYS_BLK_WRITE сектор {} ({} байт, по cap)", cur, sector, n);
+                    vprintln!("  [blk] P{} SYS_BLK_WRITE сектор {} ({} байт, по cap)", cur, sector, n);
                     if ok { 0 } else { usize::MAX }
                 }
                 Ok(_) => usize::MAX, // право есть, а фреймов под ленивый буфер нет
                 Err(e) => {
-                    println!("  [blk] P{} SYS_BLK_WRITE отклонён: {:?}  ← нет capability (WRITE) на устройство", cur, e);
+                    vprintln!("  [blk] P{} SYS_BLK_WRITE отклонён: {:?}  ← нет capability (WRITE) на устройство", cur, e);
                     usize::MAX
                 }
             };
@@ -862,7 +882,7 @@ fn syscall(t: &mut Table, cur: usize) {
                             if existed {
                                 crate::object::commit(); // Веха 20: снятие корня — тоже чекпойнт
                             }
-                            println!("  [obj] P{} OBJ_DEL_ROOT '{}' → {} (по cap)", cur, name, if existed { "снят" } else { "не было" });
+                            vprintln!("  [obj] P{} OBJ_DEL_ROOT '{}' → {} (по cap)", cur, name, if existed { "снят" } else { "не было" });
                             if existed { 0 } else { 1 }
                         }
                         Err(_) => usize::MAX,
@@ -870,7 +890,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
-                    println!("  [obj] P{} OBJ_DEL_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
+                    vprintln!("  [obj] P{} OBJ_DEL_ROOT отклонён: {:?}  ← нет capability на store", cur, e);
                     usize::MAX
                 }
             };
@@ -892,7 +912,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 usize::MAX
             } else {
                 t.procs[cur].heap_brk = end;
-                println!(
+                vprintln!(
                     "  [mm] P{} SYS_MAP {} байт → {:#x}..{:#x} (лениво, 0 фреймов)",
                     cur, len, start, end,
                 );
@@ -914,7 +934,7 @@ fn syscall(t: &mut Table, cur: usize) {
             let dom = t.procs[cur].domain;
             let result = match cap::derive(dom, Cap::from_bits(c as u64), Rights(mask as u32)) {
                 Ok(nc) => {
-                    println!(
+                    vprintln!(
                         "  [cap] P{} CAP_DERIVE → копия с правами [{}] (аттенуация)",
                         cur,
                         cap::rights_str(cap::rights(dom, nc).unwrap_or(Rights::NONE)),
@@ -923,7 +943,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     nc.bits() as usize
                 }
                 Err(e) => {
-                    println!("  [cap] P{} CAP_DERIVE отклонён: {:?}", cur, e);
+                    vprintln!("  [cap] P{} CAP_DERIVE отклонён: {:?}", cur, e);
                     usize::MAX
                 }
             };
@@ -1001,7 +1021,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                         let pname: &'static str =
                                             Box::leak(String::from(name).into_boxed_str());
                                         let child = create_process_locked(t, pname, root, entry, 0);
-                                        println!(
+                                        vprintln!(
                                             "  [exec] P{} SYS_EXEC '{}' → P{} (по cap, ждёт завершения)",
                                             cur, name, child,
                                         );
@@ -1010,18 +1030,18 @@ fn syscall(t: &mut Table, cur: usize) {
                                         t.current = child;
                                         spawned = true;
                                     }
-                                    Err(e) => println!(
+                                    Err(e) => vprintln!(
                                         "  [exec] P{} SYS_EXEC '{}': негодный ELF: {:?}",
                                         cur, name, e,
                                     ),
                                 }
                             }
-                            None => println!("  [exec] P{} SYS_EXEC: корня '{}' нет в store", cur, name),
+                            None => vprintln!("  [exec] P{} SYS_EXEC: корня '{}' нет в store", cur, name),
                         }
                     }
                 }
-                Ok(()) => println!("  [exec] P{} SYS_EXEC: фреймы кончились под ленивый буфер имени", cur),
-                Err(e) => println!(
+                Ok(()) => vprintln!("  [exec] P{} SYS_EXEC: фреймы кончились под ленивый буфер имени", cur),
+                Err(e) => vprintln!(
                     "  [exec] P{} SYS_EXEC отклонён: {:?}  ← нет capability (EXEC) на store",
                     cur, e,
                 ),
@@ -1034,7 +1054,7 @@ fn syscall(t: &mut Table, cur: usize) {
         }
         other => {
             let f = &mut t.procs[cur].frame;
-            println!("  [proc] неизвестный syscall {}", other);
+            vprintln!("  [proc] неизвестный syscall {}", other);
             f.set_ret(usize::MAX);
             f.advance();
         }
@@ -1117,7 +1137,7 @@ fn deliver_request(t: &Table, from: usize, to: usize) -> (usize, usize) {
         // GRANT проверен при отправке (`CALL`); маска без сужения — копия прав как есть.
         if let Ok(nc) = cap::grant(t.procs[from].domain, c, t.procs[to].domain, Rights(u32::MAX)) {
             tcap = nc.bits() as usize;
-            println!(
+            vprintln!(
                 "  [cap] P{} → P{}: право [{}] передано в сообщении (grant по IPC)",
                 from, to, cap::rights_str(cap::rights(t.procs[to].domain, nc).unwrap_or(Rights::NONE)),
             );

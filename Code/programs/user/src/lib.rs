@@ -243,6 +243,34 @@ pub fn heap_map(len: usize) -> usize {
     abi::syscall(SYS_MAP, len, 0, 0, 0, 0, 0, 0).0
 }
 
+// ─── время (Веха 28 — микробенчи) ─────────────────────────────────────────────
+
+/// Наносекунд в одном тике [`now`]: riscv — таймбаза QEMU virt 10 МГц (100 нс/тик);
+/// x86 — TSC, который в QEMU TCG ходит на ~1 ГГц (1 нс/тик; на железе пересчитать).
+#[cfg(target_arch = "riscv64")]
+pub const TICK_NS: usize = 100;
+#[cfg(target_arch = "x86_64")]
+pub const TICK_NS: usize = 1;
+
+/// Монотонный счётчик времени, читаемый ПРЯМО из U-mode (не syscall): `rdtime`
+/// (ядро открывает его через scounteren) / `rdtsc` (CR4.TSD=0). Для замеров.
+pub fn now() -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let t: usize;
+        unsafe { core::arch::asm!("rdtime {0}", out(reg) t, options(nomem, nostack)) };
+        t
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (lo, hi): (u32, u32);
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack))
+        };
+        (hi as usize) << 32 | lo as usize
+    }
+}
+
 // ─── POSIX-shim (Веха 18.4) ───────────────────────────────────────────────────
 
 /// Тонкий слой, ПРЯЧУЩИЙ ecall/op-коды/capability/IPC: программа зовёт `open/read/write/...`
