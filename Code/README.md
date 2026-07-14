@@ -63,6 +63,21 @@ $T void-disk.img nar a.nar pkg/имя       # NAR → корень на кажд
 ```
 Не запускать, пока образ занят QEMU (совместного доступа у store нет).
 
+## std-программы (Веха 31)
+Тулчейн `void` — stage1 форка `../vendor/rust` (таргеты `riscv64gc-unknown-void-elf`,
+`x86_64-unknown-void`, порт std поверх syscall'ов VOID). Сборка тулчейна (один раз,
+~40 мин; повтор после правок std — ~1 мин) и программ — см. рецепт в
+`Obsidian/10-projects/void/notes/std-port.md`. Коротко:
+```sh
+nix-shell ../toolchain-shell.nix --run "cd ../vendor/rust && python3 x.py build \
+  --stage 1 library --target x86_64-unknown-linux-gnu,riscv64gc-unknown-void-elf,x86_64-unknown-void"
+rustup toolchain link void ../vendor/rust/build/x86_64-unknown-linux-gnu/stage1
+# rust-lld в sysroot — симлинк из rustup; пересоздать после каждого прогона x.py
+
+nix-shell --run "cd Code/programs/std-hello && cargo build --release"   # тулчейн из rust-toolchain.toml
+tools/.../void-store-import void-disk.img put программа bin/<arch>/имя   # доставка мостом
+```
+
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
 `gdb target/<таргет>/debug/void-kernel` → `target remote :1234`.

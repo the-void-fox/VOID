@@ -23,9 +23,10 @@ status: active
 
 - [x] **Веха 30 — контракт запуска процесса — закрыта** (ABI v2, фундамент std): `SYS_EXEC` несёт argv (NUL-блоб ≤512 Б, argv[0] ставит ядро); env и таблица стартовых capability наследуются детям (`cap::endow` — наделение потомка без GRANT: новых полномочий не возникает, модель фабрик KeyKOS); процесс читает наследство `SYS_ARGS`/`SYS_STARTCAP` (преоткрытые права как preopen'ы WASI — раскладку стека контракт не фиксирует вовсе); posixfs: seek (i64+whence, зажим в [0,size]) и rename (корень+RAM-слот+каталог); vsh: `run NAME ARGS`, `mv`, `tail`, десятичный код выхода, эхо пачкой (лечит `<?>` на кириллице). Проверено на обеих архитектурах, 0 паник. См. [[process-contract]].
 
+- [x] **Веха 31 — std-порт — закрыта**: таргеты `riscv64gc-unknown-void-elf` + `x86_64-unknown-void` (tier 3) и `target_os = "void"` в std форка (`vendor/rust`, ветка `void`, `0d7db89a`): pal/_start, stdio→SYS_WRITE/READ, args/env→SYS_ARGS, alloc = bump над ленивым SYS_MAP (dealloc no-op — MVP), Instant=rdtime/rdtsc, sleep/yield честные, thread_local=statik, HashMap работает (xorshift-сиды); fs/net/process/потоки — unsupported. Тулчейн: stage0 = свой rustup stable, LLVM внешний из nix (сабмодуль llvm-project НЕ нужен), stage1 ~40 мин один раз, `rustup toolchain link void`. Критерий превышен: hello-std (обычный Rust, 72–101 КиБ ELF) доставлен мостом и работает в vsh на ОБЕИХ архитектурах — argv/env/sort/HashMap/exit-код 7. Ядро: стек процесса 64 КиБ, куча 8 МиБ (std-ELF в куче дважды). См. [[std-port]].
+
 ## Скоро
 Пакетная дорожка (см. [[0004-void-pkg]], план обсуждён и принят):
-- [ ] **Веха 31 — std-порт**: таргет `*-unknown-void` в `vendor/rust` (ветка `void`), pal поверх наших syscall'ов (stdio/alloc/time/process; fs — IPC к посиксфс; потоки — заглушки как на wasm); сборка тулчейна с внешним LLVM из nix. Критерий: `fn main() { println!("hello std"); }` обычным cargo.
 - [ ] **Веха 32 — uutils**: кросс-сборка coreutils, импорт мостом, настоящие `ls/cat/cp` в vsh с одного диска на обеих архитектурах — первая точка самодостаточности.
 
 ## Когда-нибудь
@@ -103,6 +104,7 @@ status: active
 - [x] **Веха 28.** Микробенчи и отчёт памяти против Linux-гостя в том же QEMU; корневой README («это уже система», цифры, не-претензии). Заодно закрыла Bench-веху из «Когда-нибудь» (crash-тест A/B случился внепланово ещё в Вехе 27).
 - [x] **Веха 29.** Мост host→store: `libs/void-store` (формат как библиотека, `BlockIo`), `void-store-import` (put/nar/ls/cat), NAR-импорт `nix-store --dump` → корни store; форк rust сабмодулем под std-порт. См. [[store-bridge]].
 - [x] **Веха 30.** Контракт запуска (ABI v2): argv в SYS_EXEC, env + стартовые capability наследуются (`cap::endow`), SYS_ARGS/SYS_STARTCAP; posixfs seek/rename; vsh run-с-аргами/mv/tail. См. [[process-contract]].
+- [x] **Веха 31.** std-порт: таргеты *-unknown-void + pal в форке rust; тулчейн void из stage1; hello-std обычным cargo — argv/env/куча/HashMap/exit-код на обеих архитектурах. См. [[std-port]].
 - [ ] **Пакетная дорожка (продолжение).** Веха 30 (контракт запуска) → Веха 31 (std-порт из `vendor/rust`) → Веха 32 (uutils) → nixpkgs-cross через VOID-libc; профили/поколения/откат — свойства store, не менеджера.
 
 ## Опционально / исследовательское
