@@ -40,6 +40,9 @@
 //! Веха 30: контракт запуска процесса (ABI v2) — `SYS_EXEC` несёт argv, ребёнок наследует
 //! env и стартовые capability (SYS_ARGS/SYS_STARTCAP, «preopen'ы»); персоналия выросла на
 //! seek/rename; vsh: `run NAME ARGS`, `mv`, `tail` ([[process-contract]]) — фундамент std.
+//! Веха 31: порт std ([[std-port]]) — таргеты `*-unknown-void` в форке rust (vendor/rust),
+//! обычные Rust-программы обычным cargo; ядро подросло: стек процесса 64 КиБ, куча 8 МиБ
+//! (std-ELF живёт в куче дважды: кэш store + копия загрузчика).
 //! См. роадмап и ADR в Obsidian (`10-projects/void/`).
 #![no_std]
 #![no_main]
@@ -120,9 +123,9 @@ macro_rules! println {
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 30                           ║");
-    println!("  ║  контракт запуска процесса:               ║");
-    println!("  ║  argv · env · start-caps · rename         ║");
+    println!("  ║  VOID — Веха 31                           ║");
+    println!("  ║  порт std: обычный Rust на VOID           ║");
+    println!("  ║  таргеты *-unknown-void · cargo build     ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -140,7 +143,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     unsafe { arch::mm_enable(root) }
     println!("  [vm]   {} включён (direct map + W^X)", arch::MM_NAME);
     heap::init();
-    println!("  [heap] куча ядра готова (2 МиБ)");
+    println!("  [heap] куча ядра готова (8 МиБ)");
     println!();
 
     // Веха 7.1: подключить диск (нужен для персистентности).

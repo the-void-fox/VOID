@@ -1,0 +1,13 @@
+# hello-std — первая std-программа VOID (Веха 31): обычный Rust без no_std,
+# собирается тулчейном «void» (vendor/rust, stage1) под таргеты *-unknown-void.
+# Отдельный крейт вне workspace: свой тулчейн (rust-toolchain.toml рядом) и таргет.
+[package]
+name = "hello-std"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

@@ -13,6 +13,8 @@ members = [
 # `--target-dir` внутри OUT_DIR (иначе — deadlock на локе target ядра).
 exclude = [
     "programs/user",
+    # Веха 31: std-программы — свой тулчейн (void) и таргеты *-unknown-void
+    "programs/std-hello",
     # Веха 29: хост-утилиты — тоже отдельные крейты: им нужен ХОСТОВЫЙ таргет
     # (см. tools/*/.cargo/config.toml), а workspace собирается под таргеты ядра.
     "tools/void-store-import",
