@@ -2,3 +2,7 @@
 	path = vendor/rust
 	url = https://github.com/rust-lang/rust.git
 	shallow = true
+[submodule "vendor/coreutils"]
+	path = vendor/coreutils
+	url = https://github.com/uutils/coreutils
+	shallow = true

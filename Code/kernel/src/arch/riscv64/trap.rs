@@ -28,6 +28,12 @@ pub struct TrapFrame {
     pub sepc: usize,
     /// Снимок sstatus.
     pub sstatus: usize,
+    /// Регистры f0..f31 (Веха 32: uutils считают во float — FP-контекст процесса
+    /// сохраняется честно). Заполняются только на trap'е ИЗ U-mode: ядро своих
+    /// float'ов не имеет, а sstatus.FS процесса всегда ≥ Initial (см. new_user).
+    pub fregs: [usize; 32],
+    /// fcsr (флаги исключений и режим округления FPU).
+    pub fcsr: usize,
 }
 
 /// Методы контракта [`crate::arch`]: общий код (`proc`) работает с кадром только через них —
@@ -36,13 +42,14 @@ pub struct TrapFrame {
 impl TrapFrame {
     /// Стартовый кадр процесса: вход `entry`, стек `sp`, первый аргумент `arg` (a0).
     /// `sstatus`: SPP=0 (возврат в U), SPIE=0 (прерывания в U выключены), SUM=1
-    /// (ядро читает U-память в шлюзах syscall'ов).
+    /// (ядро читает U-память в шлюзах syscall'ов), FS=Initial (FPU включён:
+    /// иначе первая FP-инструкция — illegal instruction; Веха 32, uutils).
     pub fn new_user(entry: usize, sp: usize, arg: usize) -> Self {
         let mut f = Self::default();
         f.sepc = entry;
         f.regs[2] = sp; // sp = x2
         f.regs[10] = arg; // a0
-        f.sstatus = 1 << 18; // SUM
+        f.sstatus = (1 << 18) | (1 << 13); // SUM | FS=Initial
         f
     }
 

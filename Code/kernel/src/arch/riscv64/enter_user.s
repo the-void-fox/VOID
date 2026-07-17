@@ -2,7 +2,8 @@
 #   a0 = *TrapFrame (в памяти ядра; она отображена и в таблице процесса), a1 = satp, a2 = trap_top
 #
 # Раскладка TrapFrame (см. trap.rs, repr(C)): слот i -> регистр xi (i=0..31),
-#   слот 32 -> sepc, слот 33 -> sstatus. a0 (x10) загружаем ПОСЛЕДНИМ (это наша база).
+#   слот 32 -> sepc, слот 33 -> sstatus, слоты 34..65 -> f0..f31, слот 66 -> fcsr.
+#   a0 (x10) загружаем ПОСЛЕДНИМ (это наша база).
 
 .section .text
 .p2align 2
@@ -16,6 +17,46 @@ enter_user_frame:
     csrw  sstatus, t0
     ld    t0, 32*8(a0)          # sepc (точка входа/продолжения)
     csrw  sepc, t0
+
+    # FP-контекст процесса (Веха 32). fld легален: sstatus.FS уже ≥ Initial —
+    # только что записан из кадра (new_user ставит Initial, дальше живёт своё).
+    .option push
+    .option arch, +d
+    ld    t0, 66*8(a0)
+    csrw  fcsr, t0
+    fld   f0,  34*8(a0)
+    fld   f1,  35*8(a0)
+    fld   f2,  36*8(a0)
+    fld   f3,  37*8(a0)
+    fld   f4,  38*8(a0)
+    fld   f5,  39*8(a0)
+    fld   f6,  40*8(a0)
+    fld   f7,  41*8(a0)
+    fld   f8,  42*8(a0)
+    fld   f9,  43*8(a0)
+    fld   f10, 44*8(a0)
+    fld   f11, 45*8(a0)
+    fld   f12, 46*8(a0)
+    fld   f13, 47*8(a0)
+    fld   f14, 48*8(a0)
+    fld   f15, 49*8(a0)
+    fld   f16, 50*8(a0)
+    fld   f17, 51*8(a0)
+    fld   f18, 52*8(a0)
+    fld   f19, 53*8(a0)
+    fld   f20, 54*8(a0)
+    fld   f21, 55*8(a0)
+    fld   f22, 56*8(a0)
+    fld   f23, 57*8(a0)
+    fld   f24, 58*8(a0)
+    fld   f25, 59*8(a0)
+    fld   f26, 60*8(a0)
+    fld   f27, 61*8(a0)
+    fld   f28, 62*8(a0)
+    fld   f29, 63*8(a0)
+    fld   f30, 64*8(a0)
+    fld   f31, 65*8(a0)
+    .option pop
 
     ld    x1,   1*8(a0)
     ld    x2,   2*8(a0)         # sp процесса

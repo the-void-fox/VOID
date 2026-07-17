@@ -8,10 +8,12 @@
 #   - trap из U: нельзя строить кадр на пользовательском стеке → переключаемся на ядерный.
 #   - trap из S: стек уже ядерный → работаем на нём (как раньше).
 #
-# Раскладка TrapFrame (см. trap.rs, repr(C)) — 34 ячейки по 8 байт = 272:
+# Раскладка TrapFrame (см. trap.rs, repr(C)) — 67 ячеек по 8 байт = 536 (кадр 544, 16-выровнен):
 #   слот i (i=0..31) -> регистр xi   (x2 = исходный sp виновника trap'а)
 #   слот 32          -> sepc
 #   слот 33          -> sstatus
+#   слоты 34..65     -> f0..f31 (только на trap'е из U — ядро float'ов не имеет)
+#   слот 66          -> fcsr
 
 .section .text
 .p2align 2                      # stvec требует выравнивания адреса по 4 байта
@@ -21,18 +23,18 @@ trap_entry:
     bnez  sp, .Lon_stack        # sp != 0 -> trap из U: sp = вершина ядерного trap-стека
     csrrw sp, sscratch, sp      # trap из S: вернуть sp, sscratch снова 0
 .Lon_stack:
-    addi  sp, sp, -272          # выделить TrapFrame на (теперь точно ядерном) стеке
+    addi  sp, sp, -544          # выделить TrapFrame на (теперь точно ядерном) стеке
 
     sd    x1,   1*8(sp)         # ra (дальше x1 используем как scratch — оригинал уже сохранён)
     # Сохранить исходный sp виновника в слот x2:
-    #   trap из S: это sp+272 ; trap из U: он сейчас в sscratch (туда попал при первом swap).
+    #   trap из S: это sp+544 ; trap из U: он сейчас в sscratch (туда попал при первом swap).
     csrr  x1, sstatus
     andi  x1, x1, 0x100         # бит SPP (1<<8): 1 = trap из S, 0 = trap из U
     bnez  x1, .Lsp_from_s
     csrr  x1, sscratch          # trap из U: исходный sp = user sp
     j     .Lsp_store
 .Lsp_from_s:
-    addi  x1, sp, 272           # trap из S: исходный sp = sp+272
+    addi  x1, sp, 544           # trap из S: исходный sp = sp+544
 .Lsp_store:
     sd    x1,   2*8(sp)
 
@@ -71,6 +73,51 @@ trap_entry:
     csrr  t0, sstatus
     sd    t0, 33*8(sp)
 
+    # FP-контекст (Веха 32): сохранять только для trap'а из U — там sstatus.FS
+    # процесса ≥ Initial (fsd легален), а ядро float-регистры не трогает.
+    andi  t1, t0, 0x100         # SPP: 1 = из S (пропустить), 0 = из U (сохранить)
+    bnez  t1, .Lno_fsave
+    # Таргет ядра riscv64gc-unknown-none-elf собран без D (ядро не должно
+    # ЭМИТИТЬ float) — включаем расширение только для этих ручных инструкций.
+    .option push
+    .option arch, +d
+    fsd   f0,  34*8(sp)
+    fsd   f1,  35*8(sp)
+    fsd   f2,  36*8(sp)
+    fsd   f3,  37*8(sp)
+    fsd   f4,  38*8(sp)
+    fsd   f5,  39*8(sp)
+    fsd   f6,  40*8(sp)
+    fsd   f7,  41*8(sp)
+    fsd   f8,  42*8(sp)
+    fsd   f9,  43*8(sp)
+    fsd   f10, 44*8(sp)
+    fsd   f11, 45*8(sp)
+    fsd   f12, 46*8(sp)
+    fsd   f13, 47*8(sp)
+    fsd   f14, 48*8(sp)
+    fsd   f15, 49*8(sp)
+    fsd   f16, 50*8(sp)
+    fsd   f17, 51*8(sp)
+    fsd   f18, 52*8(sp)
+    fsd   f19, 53*8(sp)
+    fsd   f20, 54*8(sp)
+    fsd   f21, 55*8(sp)
+    fsd   f22, 56*8(sp)
+    fsd   f23, 57*8(sp)
+    fsd   f24, 58*8(sp)
+    fsd   f25, 59*8(sp)
+    fsd   f26, 60*8(sp)
+    fsd   f27, 61*8(sp)
+    fsd   f28, 62*8(sp)
+    fsd   f29, 63*8(sp)
+    fsd   f30, 64*8(sp)
+    fsd   f31, 65*8(sp)
+    csrr  t1, fcsr
+    sd    t1, 66*8(sp)
+    .option pop
+.Lno_fsave:
+
     mv    a0, sp                # arg0 = указатель на TrapFrame
     call  trap_handler
 
@@ -79,7 +126,7 @@ trap_entry:
     ld    t0, 33*8(sp)         # sstatus
     andi  t1, t0, 0x100        # SPP
     bnez  t1, .Lret_s          # SPP=1 -> возврат в S: sscratch оставляем 0
-    addi  t1, sp, 272          # SPP=0 -> возврат в U: sscratch = вершина trap-стека (sp+272)
+    addi  t1, sp, 544          # SPP=0 -> возврат в U: sscratch = вершина trap-стека (sp+544)
     csrw  sscratch, t1
 .Lret_s:
     csrw  sstatus, t0
