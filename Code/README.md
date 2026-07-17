@@ -77,6 +77,15 @@ rustup toolchain link void ../vendor/rust/build/x86_64-unknown-linux-gnu/stage1
 nix-shell --run "cd Code/programs/std-hello && cargo build --release"   # тулчейн из rust-toolchain.toml
 tools/.../void-store-import void-disk.img put программа bin/<arch>/имя   # доставка мостом
 ```
+После пересборки std у std-программ обязателен `rm -rf target` (cargo не
+отслеживает sysroot — полусвежий кэш даёт бессвязные E0463).
+
+## uutils/coreutils (Веха 32)
+Форк-сабмодуль `../vendor/coreutils` (ветка `void`): multicall-бинарь с
+`cat,echo,wc,head,ls,cp,mv,rm`. Рецепт сборки (кросс, оба таргета, RUSTFLAGS
+строго таргет-скоуп — глобальный ломает host-сборку proc-macro) — в
+`Obsidian/10-projects/void/notes/uutils.md`. Доставка мостом:
+`put <elf> bin/<arch>/coreutils`, запуск: `run bin/coreutils ls`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем

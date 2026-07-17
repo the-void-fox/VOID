@@ -121,9 +121,11 @@ stage1 rustc — ~40 мин на 4 ядрах (одноразово); перес
 
 ## Ограничения (осознанные, до потребителей)
 
-Аллокатор течёт (bump) · fs/process/net unsupported · потоков нет · SystemTime
-нет · random слабый · float на riscv — мина (sstatus.FS). Веха 32 съест первые
-два: uutils хочет std::fs (IPC к posixfs через start-cap) и настоящий аллокатор.
+~~Аллокатор течёт (bump) · fs unsupported · SystemTime нет · float на riscv —
+мина (sstatus.FS)~~ — всё четыре сняты Вехой 32 ([[uutils]]): free-list
+аллокатор, std::fs по IPC к posixfs, SystemTime с фиктивной базой
+(2026-07-01 + uptime), FP-контекст в ядре. Остались: process/net
+unsupported · потоков нет (sort/rayon/ripgrep ждут) · random слабый.
 
 ## Связано
 - [[0004-void-pkg]] · [[void-pkg]] — дорожка; [[process-contract]] — контракт, на который порт опирается

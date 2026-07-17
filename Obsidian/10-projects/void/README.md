@@ -58,14 +58,18 @@ W^X + LAPIC ([[x86-bringup]]), полный userspace ring3 + `int 0x80` с ар
 (ABI v2): argv/env и стартовые capability наследуются при exec ([[process-contract]]),
 посикс-персоналия выросла на seek/rename. Веха 31 — порт std: таргеты
 `*-unknown-void` в форке rust (`vendor/rust`), обычные Rust-программы собираются
-обычным cargo и работают на обеих архитектурах ([[std-port]]). План пакетов — [[void-pkg]].
+обычным cargo и работают на обеих архитектурах ([[std-port]]). Веха 32 — uutils:
+std дорос до std::fs (IPC к posixfs) и настоящего аллокатора, ядро — до FP-контекста;
+multicall coreutils (форк-сабмодуль `vendor/coreutils`) даёт настоящие
+`ls/cat/cp/wc/mv/rm/head/echo` в vsh с одного диска на обеих архитектурах —
+**первая честная точка самодостаточности** ([[uutils]]). План пакетов — [[void-pkg]].
 
 ## Текущие задачи
-Развёрнутый staged-роадмап — в `[[todo]]`. Кратко (Фаза 4): userspace в ELF из store (готово)
+Развёрнутый staged-роадмап — в [[todo]]. Кратко (Фаза 4): userspace в ELF из store (готово)
 → граница архитектур `arch/` (готово) → x86_64: ядро, userspace, устройства (готово) →
 бенчи и README (готово) → host-мост + NAR (готово) → контракт запуска (готово)
-→ std-порт (готово) → uutils (Веха 32). Дальше: сеть, checkpoint процессов,
-(опционально) SASOS-гибрид; перед реальным железом — [[commit-policy]].
+→ std-порт (готово) → uutils (готово). Следующий шаг обсуждается: [[commit-policy]]
+(перед железом), virtio-net, потоки (sort/ripgrep), nixpkgs-cross.
 
 ## ADR
 Архитектурные решения в `adr/`. Ключевые:

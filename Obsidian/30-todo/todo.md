@@ -25,9 +25,14 @@ status: active
 
 - [x] **Веха 31 — std-порт — закрыта**: таргеты `riscv64gc-unknown-void-elf` + `x86_64-unknown-void` (tier 3) и `target_os = "void"` в std форка (`vendor/rust`, ветка `void`, `0d7db89a`): pal/_start, stdio→SYS_WRITE/READ, args/env→SYS_ARGS, alloc = bump над ленивым SYS_MAP (dealloc no-op — MVP), Instant=rdtime/rdtsc, sleep/yield честные, thread_local=statik, HashMap работает (xorshift-сиды); fs/net/process/потоки — unsupported. Тулчейн: stage0 = свой rustup stable, LLVM внешний из nix (сабмодуль llvm-project НЕ нужен), stage1 ~40 мин один раз, `rustup toolchain link void`. Критерий превышен: hello-std (обычный Rust, 72–101 КиБ ELF) доставлен мостом и работает в vsh на ОБЕИХ архитектурах — argv/env/sort/HashMap/exit-код 7. Ядро: стек процесса 64 КиБ, куча 8 МиБ (std-ELF в куче дважды). См. [[std-port]].
 
+- [x] **Веха 32 — uutils — закрыта** (первая честная точка самодостаточности [[0004-void-pkg]]): multicall coreutils 0.9.0 (`ls · cat · cp · wc · mv · rm · head · echo`) собран обычным cargo тулчейном `void` и работает в vsh с одного диска на обеих архитектурах; межарх-демо — `cp` на x86_64, `wc` того же файла на riscv64. std дорос до файлов: std::fs по IPC к posixfs (старт-cap слот 0), free-list аллокатор (bump похоронен), `os::fd`, SystemTime с фиктивной базой. Ядро: FP-контекст riscv (мина Вехи 31 обезврежена), стек процесса 256 КиБ, куча ядра 16 МиБ. Форк uutils — сабмодуль `vendor/coreutils` (ветка `void`, cfg-заплатки «как WASI» + патчи console/filetime); `sort` отложен (rayon/getrandom). См. [[uutils]].
+
 ## Скоро
-Пакетная дорожка (см. [[0004-void-pkg]], план обсуждён и принят):
-- [ ] **Веха 32 — uutils**: кросс-сборка coreutils, импорт мостом, настоящие `ls/cat/cp` в vsh с одного диска на обеих архитектурах — первая точка самодостаточности.
+Лестница [[void-pkg]] дошла до п.2 («самодостаточно для энтузиаста»). Следующий шаг не выбран — кандидаты (обсудить):
+- [ ] Политика коммитов store ([[commit-policy]]) — обязательна перед реальным железом.
+- [ ] virtio-net + сетевой стек.
+- [ ] Потоки (std::thread) — разблокирует sort/rayon/ripgrep.
+- [ ] nixpkgs-cross (C-мир поверх VOID-libc) — следующая ступень лестницы.
 
 ## Когда-нибудь
 - [ ] **Политика коммитов** (обязательна до реального железа, иначе store — «убийца SSD»): group commit по таймеру/порогу вместо чекпойнта на каждый set_root/grant; индекс как объект store (дельты вместо полной перезаписи — сейчас она O(store) на каждый коммит); уплотнение по порогу мусора, а не каждый boot. Анализ и цифры — [[commit-policy]]. Правится теперь в одном месте — `libs/void-store`.
