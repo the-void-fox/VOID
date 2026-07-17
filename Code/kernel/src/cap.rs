@@ -391,7 +391,8 @@ pub fn persist() {
     }; // замок c-space отпущен ДО обращений к store (у него свои замки)
     let id = object::put(&bytes);
     object::set_root(CSPACE_ROOT, id);
-    object::commit();
+    // Веха 33: без прямого commit — фиксацию пачкой сделает group commit
+    // ([`object::maybe_commit`]); передача права переживает крах с окном ≤ ~2 с.
 }
 
 /// Восстановить c-space из `.cspace`. Возвращает число доменов (0 — корня нет, чистый старт).

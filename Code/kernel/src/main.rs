@@ -293,24 +293,52 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     let id = object::put(marker.as_bytes());
     object::set_root("system", id);
 
-    // GC: оставить только достижимое от корней (system, demo-cell, tree); затем commit
-    // уплотняет диск. Осиротевшие put'ы (X/Y/async, старые версии) — это мусор, их соберём.
+    // GC: оставить только достижимое от корней. Веха 33 ([[commit-policy]]): жертвы
+    // становятся НАДГРОБИЯМИ (кадры на диске не трогаются — учтённый мусор), а
+    // уплотнение — не каждый boot, а ПО ПОРОГУ: когда мусора больше половины области.
     let (kept, collected) = object::gc();
     println!("  [gc] достижимо от корней: {}, собрано мусора: {}", kept, collected);
-    object::commit();
+    let (garbage, area) = (object::garbage_bytes(), object::area_bytes());
+    if garbage > 0 && garbage * 2 > area {
+        println!(
+            "  [gc] мусора {} КиБ из {} КиБ (>1/2) — уплотняем (двухфазно, крах-устойчиво)",
+            garbage / 1024,
+            area / 1024,
+        );
+        object::compact();
+    } else {
+        if garbage > 0 {
+            println!(
+                "  [gc] мусор копится: {} КиБ из {} КиБ (порог уплотнения — 1/2)",
+                garbage / 1024,
+                area / 1024,
+            );
+        }
+        object::commit(); // точка синка загрузки: сев, system root, надгробия
+    }
     println!("  [store] новый system root: \"{}\"", marker);
     println!(
-        "  [store] commit → {} объектов, поколение {} (уплотнено на диск)",
+        "  [store] commit → {} объектов, поколение {} · записано за сессию: {} КиБ",
         object::len(),
         object::generation(),
+        object::bytes_written() / 1024,
     );
     println!();
 
     // Веха 20: интерактивная сессия — ФИНАЛЬНАЯ стадия вместо простоя. Система остаётся
     // живой, пока пользователь не наберёт `exit`. Записи файлов внутри сессии персистентны:
-    // каждый OBJ_SET_ROOT из userspace — атомарный чекпойнт (см. [[posix-personality]]).
+    // OBJ_SET_ROOT копится в пачку, фиксирует group commit (порог/период — Веха 33;
+    // выключение питания в окно ≤ ~2 с теряет хвост, но store остаётся консистентным).
     if arch::USERSPACE_READY {
         shell_session();
+        // Веха 33: конец сессии — точка жёсткого синка group commit: хвост
+        // несинхронизированных операций (окно ≤ ~2 с) доезжает до диска.
+        object::commit();
+        println!(
+            "  [store] финальный синк: поколение {} · записано за сессию: {} КиБ",
+            object::generation(),
+            object::bytes_written() / 1024,
+        );
     }
 
     mem_report();

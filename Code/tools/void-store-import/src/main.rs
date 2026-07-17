@@ -203,6 +203,22 @@ fn dir_add(dir: &mut Vec<u8>, name: &str) -> bool {
     true
 }
 
+/// Убрать имя из индекса каталога (сдвиг хвоста). `false` — имени не было.
+fn dir_remove(dir: &mut Vec<u8>, name: &[u8]) -> bool {
+    let cnt = dir[0] as usize;
+    let mut off = 1;
+    for _ in 0..cnt {
+        let l = dir[off] as usize;
+        if &dir[off + 1..off + 1 + l] == name {
+            dir.drain(off..off + 1 + l);
+            dir[0] -= 1;
+            return true;
+        }
+        off += 1 + l;
+    }
+    false
+}
+
 // ─── команды ──────────────────────────────────────────────────────────────────
 
 fn hex12(id: &ContentId) -> String {
@@ -288,6 +304,9 @@ const USAGE: &str = "мост host→store: импорт в образ диск�
   void-store-import <disk.img> cat <корень>              содержимое объекта → stdout
   void-store-import <disk.img> put <файл> <корень>       файл → объект + корень
   void-store-import <disk.img> nar <архив.nar> <префикс> NAR → корень на каждый файл
+  void-store-import <disk.img> del <корень>              снять корень (объект уйдёт в gc)
+  void-store-import <disk.img> gc [--compact]            уборка: mark-sweep; уплотнение
+                                                         по порогу мусора (или форсом)
 
 NAR делается nix'ом: nix-store --dump <путь> > a.nar (работает на любом пути,
 в т.ч. $(nix-build ...) — это и есть поток «nix build → VOID»).";
@@ -319,8 +338,49 @@ fn run() -> Result<(), String> {
         ("cat", Some(root), None) => cmd_cat(&mut store, &mut io, root),
         ("put", Some(file), Some(root)) => cmd_put(&mut store, &mut io, file, root),
         ("nar", Some(archive), Some(prefix)) => cmd_nar(&mut store, &mut io, archive, prefix),
+        ("del", Some(root), None) => cmd_del(&mut store, &mut io, root),
+        ("gc", None, None) => cmd_gc(&mut store, &mut io, false),
+        ("gc", Some(flag), None) if flag == "--compact" => cmd_gc(&mut store, &mut io, true),
         _ => Err(format!("неверные аргументы\n\n{USAGE}")),
     }
+}
+
+/// Снять корень: объект становится недостижимым, уберёт его `gc`.
+/// Поддерживает и запись каталога posixfs (как put — наоборот).
+fn cmd_del(store: &mut Store, io: &mut FileIo, root: &str) -> Result<(), String> {
+    if !store.del_root(root) {
+        return Err(format!("корня '{root}' нет"));
+    }
+    let mut dir = dir_load(store, io);
+    dir_remove(&mut dir, root.as_bytes());
+    let id = store.put(&dir);
+    store.set_root(DIR_ROOT, id);
+    store.commit(io);
+    println!("  корень '{root}' снят (объект уйдёт ближайшим gc) · поколение {}", store.generation());
+    Ok(())
+}
+
+/// Уборка образа: mark-sweep + уплотнение по порогу мусора (Веха 33) или форсом.
+fn cmd_gc(store: &mut Store, io: &mut FileIo, force_compact: bool) -> Result<(), String> {
+    let (kept, collected) = store.gc(io);
+    let (garbage, area) = (store.garbage_bytes(), store.area_bytes());
+    println!(
+        "  gc: живых {kept}, собрано {collected} · мусора {} КиБ из {} КиБ",
+        garbage / 1024,
+        area / 1024,
+    );
+    if force_compact || (garbage > 0 && garbage * 2 > area) {
+        store.compact(io);
+        println!(
+            "  уплотнено (двухфазно): область {} КиБ, поколение {}",
+            store.area_bytes() / 1024,
+            store.generation(),
+        );
+    } else {
+        store.commit(io);
+        println!("  порог уплотнения (1/2) не достигнут — надгробия зафиксированы");
+    }
+    Ok(())
 }
 
 fn main() {

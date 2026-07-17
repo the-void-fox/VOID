@@ -1,12 +1,18 @@
-//! Объектный store ядра — фасад над крейтом `void-store` (Веха 29).
+//! Объектный store ядра — фасад над крейтом `void-store` (Веха 29) + политика
+//! коммитов (Веха 33, [[commit-policy]]).
 //!
-//! Формат диска и вся логика (put/get, корни, GC, A/B-коммит) живут в `libs/void-store` —
+//! Формат диска и вся логика (put/get, корни, GC, дельта-индекс) живут в `libs/void-store` —
 //! одна реализация на ядро и хост-утилиты (`void-store-import`). Здесь остаётся ядерное:
-//! замок ([`SpinLock`]) и носитель — virtio-blk через [`Disk`]. Публичный API модуля
-//! не изменился, остальное ядро правок не заметило.
+//! замок ([`SpinLock`]), носитель — virtio-blk через [`Disk`], и **group commit**:
+//! `set_root`/`del_root` диск не трогают, копится счётчик грязных операций, а фиксацию
+//! делает [`maybe_commit`] — по порогу операций или по периоду (его зовёт планировщик
+//! при каждом возобновлении процесса; вытеснение таймером гарантирует регулярность).
+//! Точки жёсткого синка: конец загрузки и конец vsh-сессии (прямой [`commit`]).
 //!
 //! Порядок замков прежний: `with`/`gc` держат STORE, чтение диска берёт замок BLK
 //! внутри virtio_blk (STORE→BLK).
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 
@@ -14,7 +20,7 @@ use void_abi::ContentId;
 use void_store::{BlockIo, Store, SECTOR};
 
 use crate::sync::SpinLock;
-use crate::virtio_blk;
+use crate::{println, timer, virtio_blk};
 
 /// Носитель ядра: сектор store = сектор virtio-blk (размеры совпадают по построению).
 struct Disk;
@@ -75,9 +81,30 @@ pub fn del_root(name: &str) -> bool {
     STORE.lock().del_root(name)
 }
 
-/// Собрать мусор (mark-sweep от корней + подготовка уплотнения). (оставлено, собрано).
+/// Собрать мусор (mark-sweep от корней; жертвы — надгробиями до уплотнения).
+/// (оставлено, собрано).
 pub fn gc() -> (usize, usize) {
     STORE.lock().gc(&mut Disk)
+}
+
+/// Уплотнить область объектов (двухфазно, крах-устойчиво) — зовётся по порогу мусора.
+pub fn compact() {
+    STORE.lock().compact(&mut Disk)
+}
+
+/// Мусора в области объектов, байт (для порога уплотнения).
+pub fn garbage_bytes() -> u64 {
+    STORE.lock().garbage_bytes()
+}
+
+/// Занято областью объектов, байт (включая мусор).
+pub fn area_bytes() -> u64 {
+    STORE.lock().area_bytes()
+}
+
+/// Всего байт записано на носитель за сессию (честная статистика для замеров).
+pub fn bytes_written() -> u64 {
+    STORE.lock().bytes_written()
 }
 
 /// Загрузить состояние с диска. `true` — были данные; `false` — чистый диск.
@@ -85,7 +112,71 @@ pub fn load() -> bool {
     STORE.lock().load(&mut Disk)
 }
 
-/// Зафиксировать состояние на диск (крах-устойчивый A/B-коммит).
+/// Зафиксировать состояние на диск (крах-устойчиво; пустой коммит — no-op).
 pub fn commit() {
     STORE.lock().commit(&mut Disk)
+}
+
+// ─── group commit (Веха 33) ──────────────────────────────────────────────────
+
+/// Порог: столько грязных операций коммитятся немедленно, не дожидаясь периода.
+const COMMIT_OPS_MAX: u32 = 64;
+/// Период фиксации в тиках таймера (тик ~10 мс → ~2 с). KeyKOS жил минутами,
+/// ext4-журнал — 5 с; нам для демо важно видеть группировку глазами.
+const COMMIT_PERIOD_TICKS: u64 = 200;
+
+/// Тик первой незафиксированной операции (0 — грязных нет).
+static FIRST_DIRTY_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Немедленный синк, если есть несинхронизированное: зовётся при уходе системы в
+/// простой (все процессы блокированы, [`crate::proc`] идёт спать до ввода) — под
+/// нагрузкой пачки собирает [`maybe_commit`], а простой — естественная точка
+/// фиксации хвоста (flush-on-idle, как у журналируемых ФС): окно потерь при
+/// простое схлопывается в ноль.
+pub fn commit_if_dirty() {
+    let mut s = STORE.lock();
+    let dirty = s.dirty_ops();
+    if dirty == 0 {
+        return;
+    }
+    s.commit(&mut Disk);
+    let generation = s.generation();
+    drop(s);
+    FIRST_DIRTY_TICK.store(0, Ordering::Relaxed);
+    println!(
+        "  [store] синк при простое: {} операций одним коммитом → поколение {}",
+        dirty,
+        generation,
+    );
+}
+
+/// Политика group commit: зовётся планировщиком при каждом возобновлении процесса.
+/// Дёшево, пока чисто (одна проверка счётчика под замком); фиксирует пачку операций
+/// одним коммитом по порогу [`COMMIT_OPS_MAX`] или периоду [`COMMIT_PERIOD_TICKS`].
+pub fn maybe_commit() {
+    let mut s = STORE.lock();
+    let dirty = s.dirty_ops();
+    if dirty == 0 {
+        FIRST_DIRTY_TICK.store(0, Ordering::Relaxed);
+        return;
+    }
+    let now = timer::ticks();
+    let first = FIRST_DIRTY_TICK.load(Ordering::Relaxed);
+    if first == 0 {
+        FIRST_DIRTY_TICK.store(now.max(1), Ordering::Relaxed);
+        return;
+    }
+    if dirty >= COMMIT_OPS_MAX || now.saturating_sub(first) >= COMMIT_PERIOD_TICKS {
+        s.commit(&mut Disk);
+        let generation = s.generation();
+        drop(s);
+        FIRST_DIRTY_TICK.store(0, Ordering::Relaxed);
+        // Лог групповой фиксации намеренно тихий не бывает: это и есть демо политики.
+        // Бенчи store не гоняют commit в замерах — шум им не мешает.
+        println!(
+            "  [store] group commit: {} операций одним коммитом → поколение {}",
+            dirty,
+            generation,
+        );
+    }
 }

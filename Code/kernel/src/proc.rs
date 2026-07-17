@@ -327,6 +327,10 @@ fn wait_stdin(saved_sie: usize) -> bool {
     if waiting.is_empty() {
         return false;
     }
+    // Веха 33: уход в простой — естественная точка синка group commit. Под нагрузкой
+    // пачки собирает maybe_commit (порог/период), а здесь фиксируется хвост: «echo и
+    // ушёл пить чай» не ждёт следующего ввода. Прерывания выключены — virtio опросом.
+    crate::object::commit_if_dirty();
     // Только внешние прерывания (SEIE): исполнять некого, таймер (STIE) не нужен.
     arch::irq_mask_stdin(saved_sie);
     while !arch::console_has_input() {
@@ -456,6 +460,10 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
 /// Возобновить текущий процесс (или, если он не готов, следующий готовый). Если готовых нет
 /// (все завершены или заблокированы) — вернуться в ядро (в [`run`]). Не возвращается.
 fn resume() -> ! {
+    // Веха 33: политика group commit живёт здесь — каждый trap из U (включая
+    // вытеснение таймером каждые ~10 мс) проходит через resume, замки в этот
+    // момент не держатся. Пока store чист — это одна проверка счётчика.
+    crate::object::maybe_commit();
     let mut t = TABLE.lock();
     let c = t.current;
     let chosen = if t.procs[c].state == State::Runnable {
@@ -820,11 +828,10 @@ fn syscall(t: &mut Table, cur: usize) {
                     match core::str::from_utf8(name_bytes) {
                         Ok(name) => {
                             crate::object::set_root(name, ContentId(id));
-                            // Веха 20: смена корня из userspace = атомарный чекпойнт (A/B-индекс,
-                            // [[persistent-store]]). Иначе файлы интерактивной сессии жили бы
-                            // только до выключения QEMU (kmain-commit к этому моменту уже прошёл).
-                            crate::object::commit();
-                            vprintln!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap, чекпойнт)", cur, name);
+                            // Веха 33: чекпойнт-на-каждый-чих сменился group commit —
+                            // операция лишь копит счётчик, фиксацию делает политика
+                            // ([`object::maybe_commit`] в resume(): порог или ~2 с).
+                            vprintln!("  [obj] P{} OBJ_SET_ROOT '{}' (по cap, в пачку)", cur, name);
                             0
                         }
                         Err(_) => usize::MAX,
@@ -924,10 +931,8 @@ fn syscall(t: &mut Table, cur: usize) {
                     let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
                     match core::str::from_utf8(name_bytes) {
                         Ok(name) => {
+                            // Веха 33: снятие корня тоже едет пачкой (group commit).
                             let existed = crate::object::del_root(name);
-                            if existed {
-                                crate::object::commit(); // Веха 20: снятие корня — тоже чекпойнт
-                            }
                             vprintln!("  [obj] P{} OBJ_DEL_ROOT '{}' → {} (по cap)", cur, name, if existed { "снят" } else { "не было" });
                             if existed { 0 } else { 1 }
                         }

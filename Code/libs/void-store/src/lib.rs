@@ -1,4 +1,5 @@
-//! void-store — объектная модель + персистентность на диске (Вехи 6, 7.2, вынос — Веха 29).
+//! void-store — объектная модель + персистентность на диске (Вехи 6, 7.2, вынос — Веха 29,
+//! политика коммитов — Веха 33).
 //!
 //! Два кирпича из [[0002-persistent-content-addressed-capability-core]]:
 //! - **Неизменяемые значения**, адресуемые по хэшу содержимого ([`ContentId`], BLAKE3); дедуп.
@@ -9,21 +10,32 @@
 //! и ссылки, и полезную нагрузку (как дерево git ссылается на blob'ы). Наружу [`Store::with`]
 //! отдаёт только payload — вызывающему кадр не виден. Ссылки нужны сборщику мусора.
 //!
-//! Персистентность: RAM — это КЭШ, диск — истина. Раскладка диска (секторы по 512 Б):
+//! Персистентность: RAM — это КЭШ, диск — истина. Раскладка диска v2 (секторы по 512 Б):
 //! ```text
 //!   0            суперблок (1 сектор = атомарная запись = точка коммита)
-//!   1 .. 17      индекс A  ┐ чередуются: суперблок указывает на активный
-//!   17 .. 33     индекс B  ┘
-//!   33 ..        область объектов (кадры; дописывается, GC уплотняет перезаписью)
+//!   1 .. 33     (зарезервировано: A/B-регионы формата v1; v2 их не использует)
+//!   33 ..        область объектов: кадры объектов И индекс-кадры, append-only
 //! ```
-//! Крах-устойчивость: индекс пишется в НЕактивный регион; суперблок (одна атомарная запись
-//! сектора) переключает активный индекс и корни. Сбой до суперблока → грузимся со старого.
+//! **Индекс — дельта-цепочка в области объектов** (Веха 33, [[commit-policy]]): суперблок
+//! указывает (сектор, длина) ПОСЛЕДНЕГО индекс-кадра; каждый кадр несёт ссылку на предыдущий,
+//! новые записи и надгробия (id, удалённые GC). Загрузка реплеит цепочку от старейшего к
+//! новейшему; уплотнение ([`Store::compact`]) пишет полную базу (prev = 0) и обнуляет мусор.
+//! Итог: коммит пишет O(изменений), а не O(store) — «убийца SSD» обезврежен. A/B-регионы
+//! больше не нужны: атомарность даёт один сектор суперблока (пишется последним, после данных).
+//!
+//! **Group commit**: сами [`Store::set_root`]/[`Store::del_root`] диск не трогают — копится
+//! [`Store::dirty_ops`]; политику (порог/период/точки синка) держит владелец (ядро — в
+//! планировщике, хост-утилита — явный `commit` в конце операции).
+//!
+//! Крах-устойчивость: всё новое дописывается в свободные секторы, суперблок — одна атомарная
+//! запись — переключает состояние целиком. Сбой до суперблока → грузимся со старого, окно
+//! несинхронизированных операций теряется (честная цена group commit, как у ext4-журнала).
 //!
 //! **Веха 29:** логика вынесена из ядра в этот `no_std`-крейт. Носитель абстрагирован
 //! трейтом [`BlockIo`]: ядро подставляет virtio-blk, хост-утилиты (`void-store-import`) —
-//! файл-образ. Один формат — одна реализация; и политика коммитов (см. [[commit-policy]])
-//! в будущем правится в одном месте. Ядро оборачивает [`Store`] в свой замок; сама
-//! библиотека синхронизации не делает.
+//! файл-образ. Один формат — одна реализация. Ядро оборачивает [`Store`] в свой замок; сама
+//! библиотека синхронизации не делает. Образы v1 (MAGIC v4) читаются и мигрируют первым
+//! коммитом (кадры объектов не двигаются — переезжает только индекс).
 
 #![no_std]
 
@@ -46,24 +58,45 @@ pub trait BlockIo {
 }
 
 // ─── раскладка диска ─────────────────────────────────────────────────────────
-const MAGIC: u64 = 0x0004_5346_4449_4F56; // "VOIDFS\x04\x00" (v4: кадры со ссылками + GC)
+const MAGIC_V1: u64 = 0x0004_5346_4449_4F56; // "VOIDFS\x04\x00" — формат с A/B-индексом
+const MAGIC: u64 = 0x0005_5346_4449_4F56; // "VOIDFS\x05\x00" — v2: индекс дельта-цепочкой
 const SB_SECTOR: u64 = 0;
 const IDX_SECTORS: u64 = 16;
 const IDX_A: u64 = 1;
 const IDX_B: u64 = IDX_A + IDX_SECTORS;
-const OBJ_START: u64 = IDX_B + IDX_SECTORS; // первый сектор области объектов
+/// Область объектов начинается там же, где в v1 (миграция не двигает кадры);
+/// секторы 1..33 в v2 просто зарезервированы.
+const OBJ_START: u64 = IDX_B + IDX_SECTORS;
 
-const ENTRY_SIZE: usize = 64; // делит 512 → 8 записей в секторе, без «нахлёста»
-const ENTRIES_PER_SECTOR: usize = SECTOR / ENTRY_SIZE;
+/// v1: 64 Б на запись A/B-индекса (8 в секторе). Нужен только загрузчику v1.
+const ENTRY_SIZE_V1: usize = 64;
+const ENTRIES_PER_SECTOR_V1: usize = SECTOR / ENTRY_SIZE_V1;
 
-// смещения полей суперблока
+/// Запись индекс-кадра v2: id(32) + сектор(4) + длина(4).
+const ENTRY_SIZE: usize = 40;
+/// «Сектор» надгробия: запись с ним означает «объект id удалён GC».
+const TOMBSTONE: u32 = u32::MAX;
+/// Длиннее этой цепочка дельт не растёт — следующий коммит пишет полную базу
+/// (иначе загрузка после тысяч коммитов читала бы тысячи кадров).
+const CHAIN_MAX: u32 = 64;
+
+// смещения полей суперблока v2
 const SB_MAGIC: usize = 0;
 const SB_GENERATION: usize = 8;
-const SB_ACTIVE: usize = 16;
-const SB_NEXT_FREE: usize = 20;
-const SB_COUNT: usize = 24;
-const SB_ROOTS_PRESENT: usize = 28;
-const SB_ROOTS_ID: usize = 32; // [u8; 32] — контент-адрес roots-blob
+const SB_NEXT_FREE: usize = 16;
+const SB_IDX_SECTOR: usize = 20; // последний индекс-кадр (0 — индекса нет, store пуст)
+const SB_IDX_LEN: usize = 24;
+const SB_GARBAGE: usize = 32; // u64: мусорных байт в области объектов (для порога уплотнения)
+const SB_ROOTS_PRESENT: usize = 40;
+const SB_ROOTS_ID: usize = 44; // [u8; 32] — контент-адрес roots-blob
+
+// смещения полей суперблока v1 (только для миграции)
+const SB1_GENERATION: usize = 8;
+const SB1_ACTIVE: usize = 16;
+const SB1_NEXT_FREE: usize = 20;
+const SB1_COUNT: usize = 24;
+const SB1_ROOTS_PRESENT: usize = 28;
+const SB1_ROOTS_ID: usize = 32;
 
 /// Загруженное содержимое объекта: полезная нагрузка + исходящие ссылки.
 struct Loaded {
@@ -81,13 +114,29 @@ struct Object {
 }
 
 /// Персистентный контент-адресуемый store. Владелец решает, как его защищать
-/// (ядро — SpinLock) и через какой [`BlockIo`] говорить с носителем.
+/// (ядро — SpinLock) и через какой [`BlockIo`] говорить с носителем — и КОГДА
+/// коммитить ([`Store::dirty_ops`] + [[commit-policy]]).
 pub struct Store {
     objects: BTreeMap<ContentId, Object>,
     roots: BTreeMap<String, ContentId>,
-    next_free: u32,    // следующий свободный сектор области объектов
-    generation: u64,   // номер коммита (растёт)
-    active_index: u32, // какой индекс-регион активен (0=A, 1=B)
+    next_free: u32,  // следующий свободный сектор области объектов
+    generation: u64, // номер коммита (растёт)
+    /// Последний записанный индекс-кадр (сектор, длина); (0,0) — ещё не было.
+    index_tail: (u32, u32),
+    /// Длина текущей цепочки дельт (для форса базы по [`CHAIN_MAX`]).
+    chain_len: u32,
+    /// Мусор в области объектов, байт (кадры, чьи объекты удалены GC).
+    garbage: u64,
+    /// Надгробия, ожидающие фиксации: (id, длина кадра погибшего).
+    pending_dead: Vec<(ContentId, u32)>,
+    /// Операций над корнями с последнего коммита (политика group commit — у владельца).
+    dirty_ops: u32,
+    /// roots-blob последнего коммита — чтобы no-op commit не писал ничего.
+    last_roots_id: Option<ContentId>,
+    /// Следующий коммит обязан писать полную базу индекса (миграция v1 / после compact).
+    need_base: bool,
+    /// Всего байт записано на носитель за сессию (статистика для честных замеров).
+    bytes_written: u64,
 }
 
 impl Store {
@@ -97,7 +146,14 @@ impl Store {
             roots: BTreeMap::new(),
             next_free: OBJ_START as u32,
             generation: 0,
-            active_index: 0,
+            index_tail: (0, 0),
+            chain_len: 0,
+            garbage: 0,
+            pending_dead: Vec::new(),
+            dirty_ops: 0,
+            last_roots_id: None,
+            need_base: true, // первый коммит пустого/нового store — база
+            bytes_written: 0,
         }
     }
 
@@ -159,9 +215,10 @@ impl Store {
         self.generation
     }
 
-    /// Установить/переключить корень `name` (любое имя, персистентен).
+    /// Установить/переключить корень `name` (любое имя; персистентен после коммита).
     pub fn set_root(&mut self, name: &str, id: ContentId) {
         self.roots.insert(String::from(name), id);
+        self.dirty_ops += 1;
     }
 
     /// На какое значение указывает корень `name`.
@@ -173,13 +230,40 @@ impl Store {
     /// указывал, становится недостижимым и уйдёт ближайшим [`Store::gc`] (если больше ни на что
     /// не сослан) — привязку можно не только создать, но и отвязать.
     pub fn del_root(&mut self, name: &str) -> bool {
-        self.roots.remove(name).is_some()
+        let was = self.roots.remove(name).is_some();
+        if was {
+            self.dirty_ops += 1;
+        }
+        was
     }
 
     /// Перечислить корни (имя → адрес). Ядро наружу это не отдаёт (userspace ведёт свой
     /// индекс имён), а хост-утилитам нужно: `void-store-import ls`.
     pub fn roots(&self) -> impl Iterator<Item = (&str, &ContentId)> {
         self.roots.iter().map(|(n, id)| (n.as_str(), id))
+    }
+
+    // ─── политика коммитов: что видит владелец ───────────────────────────────
+
+    /// Сколько операций над корнями накопилось с последнего коммита.
+    /// 0 — на диске всё актуально (с точностью до RAM-кэша объектов без корней).
+    pub fn dirty_ops(&self) -> u32 {
+        self.dirty_ops
+    }
+
+    /// Мусор в области объектов, байт (жертвы GC, ещё не уплотнены).
+    pub fn garbage_bytes(&self) -> u64 {
+        self.garbage
+    }
+
+    /// Занято областью объектов, байт (включая мусор).
+    pub fn area_bytes(&self) -> u64 {
+        (self.next_free as u64 - OBJ_START) * SECTOR as u64
+    }
+
+    /// Всего байт записано на носитель за сессию (кадры + индекс + суперблоки).
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 
     /// Подгрузить содержимое объекта в RAM, если оно на диске. Возвращает `true`, если объект
@@ -197,16 +281,21 @@ impl Store {
         }
     }
 
-    // ─── сборка мусора (mark-sweep + уплотнение) ─────────────────────────────
+    // ─── сборка мусора и уплотнение (разделены — Веха 33) ────────────────────
 
     /// Собрать мусор: оставить только объекты, достижимые (по ссылкам) от корней; остальные —
-    /// старые версии и осиротевшие `put` — удалить. Уплотнение произойдёт ближайшим
-    /// [`Store::commit`] (у выживших сбрасывается место на диске → перезапишутся подряд).
+    /// старые версии и осиротевшие `put` — удалить из RAM и пометить НАДГРОБИЯМИ (кадры на
+    /// диске не трогаются — они становятся учтённым мусором до [`Store::compact`] по порогу).
     /// Возвращает (оставлено, собрано).
     pub fn gc(&mut self, io: &mut impl BlockIo) -> (usize, usize) {
         // Mark: обход в глубину от корней. Попутно подгружаем объекты (нужны их ссылки).
+        // Актуальный roots-blob — тоже корень обхода: сам он от корней не достижим
+        // (он их НОСИТЕЛЬ), а надгробие ему разрушило бы состояние при загрузке.
         let mut reachable: BTreeSet<ContentId> = BTreeSet::new();
         let mut stack: Vec<ContentId> = self.roots.values().copied().collect();
+        if let Some(rid) = self.last_roots_id {
+            stack.push(rid);
+        }
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) {
                 continue;
@@ -220,7 +309,7 @@ impl Store {
             }
         }
 
-        // Sweep: удалить недостижимые.
+        // Sweep: удалить недостижимые из RAM; зафиксированным — надгробие и счёт мусора.
         let before = self.objects.len();
         let dead: Vec<ContentId> = self
             .objects
@@ -229,64 +318,113 @@ impl Store {
             .copied()
             .collect();
         for id in dead {
-            self.objects.remove(&id);
+            if let Some(o) = self.objects.remove(&id) {
+                if let Some((_, len)) = o.disk {
+                    // Мусор меряем секторами: кадр занимает их целиком.
+                    self.garbage += (len as u64).div_ceil(SECTOR as u64) * SECTOR as u64;
+                    self.pending_dead.push((id, len));
+                    self.dirty_ops += 1; // надгробия должны доехать до диска
+                }
+            }
         }
-
-        // Подготовить уплотнение: выжившие уже загружены (обошли их при mark) → сбросить их
-        // место на диске, чтобы commit переписал всё подряд с начала области объектов.
-        for o in self.objects.values_mut() {
-            o.disk = None;
-        }
-        self.next_free = OBJ_START as u32;
 
         let kept = self.objects.len();
         (kept, before - kept)
     }
 
+    /// Уплотнение: переписать живые объекты подряд с начала области и зафиксировать полную
+    /// базу индекса. Дорого (O(живого) × 2) — потому и вызывается ПО ПОРОГУ мусора
+    /// ([[commit-policy]]), а не на каждый boot.
+    ///
+    /// Крах-устойчиво в ДВЕ фазы: сначала живые копируются В КОНЕЦ области (пишем только в
+    /// свободные сектора; суперблок фазы 1 — атомарное переключение на копии), затем — в
+    /// начало (эти сектора после фазы 1 никем не адресуются; суперблок фазы 2 завершает).
+    /// Обрыв в любой точке оставляет консистентное состояние: до суперблока фазы — старое,
+    /// после — новое. Наивная перезапись начала «на месте» ломала бы старый индекс.
+    pub fn compact(&mut self, io: &mut impl BlockIo) {
+        // Всё живое — в RAM (после gc() живые уже прогружены обходом mark).
+        let ids: Vec<ContentId> = self.objects.keys().copied().collect();
+        for id in &ids {
+            self.ensure_loaded(io, id);
+        }
+
+        // Фаза 1: копии живых в конец области + база-индекс + суперблок.
+        for o in self.objects.values_mut() {
+            o.disk = None;
+        }
+        self.pending_dead.clear(); // база пишет только живых — надгробия не нужны
+        self.need_base = true;
+        self.commit(io);
+
+        // Фаза 2: то же самое, но с начала области — бывшие сектора живых теперь мусор,
+        // на них не указывает ни активный индекс, ни суперблок.
+        for o in self.objects.values_mut() {
+            o.disk = None;
+        }
+        self.next_free = OBJ_START as u32;
+        self.garbage = 0;
+        self.need_base = true;
+        self.commit(io);
+    }
+
     // ─── персистентность ─────────────────────────────────────────────────────
 
     /// Загрузить состояние с диска. `true` — были данные; `false` — чистый диск.
-    /// ЛЕНИВО: читает только индекс и корни; содержимое объектов подтянет
-    /// [`Store::with`]/[`Store::gc`].
+    /// ЛЕНИВО: читает только индекс-цепочку и корни; содержимое объектов подтянет
+    /// [`Store::with`]/[`Store::gc`]. Образ v1 читается тоже — первый коммит мигрирует.
     pub fn load(&mut self, io: &mut impl BlockIo) -> bool {
         let mut sb = [0u8; SECTOR];
-        if !io.read(SB_SECTOR, &mut sb) || get_u64(&sb, SB_MAGIC) != MAGIC {
-            return false; // диска нет или он пуст/чужой/старого формата
+        if !io.read(SB_SECTOR, &mut sb) {
+            return false;
         }
-
-        let generation = get_u64(&sb, SB_GENERATION);
-        let active = get_u32(&sb, SB_ACTIVE);
-        let next_free = get_u32(&sb, SB_NEXT_FREE);
-        let count = get_u32(&sb, SB_COUNT) as usize;
-        let roots_present = get_u32(&sb, SB_ROOTS_PRESENT) != 0;
-
-        // Считать записи индекса из активного региона (8 записей на сектор).
-        let idx_start = if active == 0 { IDX_A } else { IDX_B };
-        let mut entries: Vec<(ContentId, u32, u32)> = Vec::with_capacity(count);
-        let sectors = count.div_ceil(ENTRIES_PER_SECTOR);
-        for si in 0..sectors {
-            let mut buf = [0u8; SECTOR];
-            io.read(idx_start + si as u64, &mut buf);
-            for e in 0..ENTRIES_PER_SECTOR {
-                let gi = si * ENTRIES_PER_SECTOR + e;
-                if gi >= count {
-                    break;
-                }
-                let off = e * ENTRY_SIZE;
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&buf[off..off + 32]);
-                entries.push((ContentId(id), get_u32(&buf, off + 32), get_u32(&buf, off + 36)));
-            }
+        match get_u64(&sb, SB_MAGIC) {
+            MAGIC => self.load_v2(io, &sb),
+            MAGIC_V1 => self.load_v1(io, &sb),
+            _ => false, // диска нет или он пуст/чужой/неизвестного формата
         }
+    }
 
+    fn load_v2(&mut self, io: &mut impl BlockIo, sb: &[u8; SECTOR]) -> bool {
         self.objects.clear();
         self.roots.clear();
-        // Только МЕТАданные: место кадра на диске, содержимое не читаем (ленивая загрузка).
-        for (id, sector, len) in entries {
-            self.objects.insert(id, Object { data: None, disk: Some((sector, len)) });
+
+        // Собрать цепочку индекс-кадров от новейшего к базе...
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut cur = (get_u32(sb, SB_IDX_SECTOR), get_u32(sb, SB_IDX_LEN));
+        while cur.0 != 0 {
+            let frame = read_object(io, cur.0, cur.1 as usize);
+            if frame.len() < 12 {
+                break; // повреждённый кадр — дальше цепочку не читаем
+            }
+            let prev = (get_u32(&frame, 0), get_u32(&frame, 4));
+            frames.push(frame);
+            cur = prev;
         }
+        // ...и реплеить ОТ СТАРЕЙШЕГО к новейшему: добавления и надгробия в верном порядке.
+        for frame in frames.iter().rev() {
+            let n = get_u32(frame, 8) as usize;
+            for i in 0..n {
+                let off = 12 + i * ENTRY_SIZE;
+                if off + ENTRY_SIZE > frame.len() {
+                    break;
+                }
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&frame[off..off + 32]);
+                let id = ContentId(id);
+                let sector = get_u32(frame, off + 32);
+                let len = get_u32(frame, off + 36);
+                if sector == TOMBSTONE {
+                    self.objects.remove(&id);
+                } else {
+                    self.objects.insert(id, Object { data: None, disk: Some((sector, len)) });
+                }
+            }
+        }
+        self.chain_len = frames.len() as u32;
+        self.index_tail = (get_u32(sb, SB_IDX_SECTOR), get_u32(sb, SB_IDX_LEN));
+
         // Корни: подтянуть roots-blob по адресу из суперблока и разобрать.
-        if roots_present {
+        if get_u32(sb, SB_ROOTS_PRESENT) != 0 {
             let mut rid = [0u8; 32];
             rid.copy_from_slice(&sb[SB_ROOTS_ID..SB_ROOTS_ID + 32]);
             let rid = ContentId(rid);
@@ -295,83 +433,168 @@ impl Store {
                     self.roots = deserialize_roots(&d.payload);
                 }
             }
+            self.last_roots_id = Some(rid);
         }
-        self.next_free = next_free;
-        self.generation = generation;
-        self.active_index = active;
+        self.next_free = get_u32(sb, SB_NEXT_FREE);
+        self.generation = get_u64(sb, SB_GENERATION);
+        self.garbage = get_u64(sb, SB_GARBAGE);
+        self.pending_dead.clear();
+        self.dirty_ops = 0;
+        self.need_base = false;
         true
     }
 
-    /// Зафиксировать состояние на диск (checkpoint). Крах-устойчиво: новые кадры дописываются,
-    /// индекс — в неактивный регион, суперблок пишется последним (точка коммита).
+    /// Чтение образа v1 (A/B-индекс). Кадры объектов совместимы — мигрирует только
+    /// индекс: первый же коммит запишет базу v2 и суперблок с новым MAGIC.
+    fn load_v1(&mut self, io: &mut impl BlockIo, sb: &[u8; SECTOR]) -> bool {
+        let generation = get_u64(sb, SB1_GENERATION);
+        let active = get_u32(sb, SB1_ACTIVE);
+        let next_free = get_u32(sb, SB1_NEXT_FREE);
+        let count = get_u32(sb, SB1_COUNT) as usize;
+        let roots_present = get_u32(sb, SB1_ROOTS_PRESENT) != 0;
+
+        let idx_start = if active == 0 { IDX_A } else { IDX_B };
+        let mut entries: Vec<(ContentId, u32, u32)> = Vec::with_capacity(count);
+        let sectors = count.div_ceil(ENTRIES_PER_SECTOR_V1);
+        for si in 0..sectors {
+            let mut buf = [0u8; SECTOR];
+            io.read(idx_start + si as u64, &mut buf);
+            for e in 0..ENTRIES_PER_SECTOR_V1 {
+                let gi = si * ENTRIES_PER_SECTOR_V1 + e;
+                if gi >= count {
+                    break;
+                }
+                let off = e * ENTRY_SIZE_V1;
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&buf[off..off + 32]);
+                entries.push((ContentId(id), get_u32(&buf, off + 32), get_u32(&buf, off + 36)));
+            }
+        }
+
+        self.objects.clear();
+        self.roots.clear();
+        for (id, sector, len) in entries {
+            self.objects.insert(id, Object { data: None, disk: Some((sector, len)) });
+        }
+        if roots_present {
+            let mut rid = [0u8; 32];
+            rid.copy_from_slice(&sb[SB1_ROOTS_ID..SB1_ROOTS_ID + 32]);
+            let rid = ContentId(rid);
+            if self.ensure_loaded(io, &rid) {
+                if let Some(d) = self.objects.get(&rid).and_then(|o| o.data.as_ref()) {
+                    self.roots = deserialize_roots(&d.payload);
+                }
+            }
+            self.last_roots_id = Some(rid);
+        }
+        self.next_free = next_free;
+        self.generation = generation;
+        self.index_tail = (0, 0);
+        self.chain_len = 0;
+        self.garbage = 0; // v1 не считал мусор; после миграции счёт честный с нуля
+        self.pending_dead.clear();
+        self.dirty_ops = 0;
+        self.need_base = true; // миграция: первый коммит пишет базу v2
+        true
+    }
+
+    /// Зафиксировать состояние на диск (checkpoint). Крах-устойчиво: кадры и индекс
+    /// дописываются в свободные секторы, суперблок пишется последним (точка коммита).
+    /// Если фиксировать нечего (нет новых объектов/надгробий, корни не менялись) — no-op.
     pub fn commit(&mut self, io: &mut impl BlockIo) {
         // 0) Сериализовать корни в контент-адресуемый объект (roots-blob) и учесть его.
         let roots_blob = serialize_roots(&self.roots);
         let roots_id = ContentId::hash(&encode(&roots_blob, &[]));
+        let force_base = self.need_base;
+        if !force_base
+            && self.last_roots_id == Some(roots_id)
+            && self.pending_dead.is_empty()
+            && self.objects.values().all(|o| o.disk.is_some())
+        {
+            self.dirty_ops = 0; // идемпотентные set_root в то же значение и т.п.
+            return;
+        }
         self.objects.entry(roots_id).or_insert_with(|| Object {
             data: Some(Loaded { payload: roots_blob, children: Vec::new() }),
             disk: None,
         });
 
-        // 1) Дописать кадры объектов, которых ещё нет на диске (append-only / уплотнение после GC).
+        // 1) Дописать кадры объектов, которых ещё нет на диске (append-only). Их записи —
+        //    содержимое будущей дельты.
         let to_write: Vec<ContentId> = self
             .objects
             .iter()
             .filter(|(_, o)| o.disk.is_none())
             .map(|(id, _)| *id)
             .collect();
+        let mut delta: Vec<(ContentId, u32, u32)> = Vec::with_capacity(to_write.len());
         for id in to_write {
             let d = self.objects[&id].data.as_ref().expect("объект без данных и без диска");
             let frame = encode(&d.payload, &d.children);
             let sector = self.next_free;
             write_object(io, sector, &frame);
+            self.bytes_written += frame.len().div_ceil(SECTOR) as u64 * SECTOR as u64;
             self.next_free += frame.len().div_ceil(SECTOR) as u32;
             self.objects.get_mut(&id).unwrap().disk = Some((sector, frame.len() as u32));
+            delta.push((id, sector, frame.len() as u32));
         }
 
-        // 2) Записать индекс в НЕактивный регион (у всех объектов теперь есть место на диске).
-        let new_active = self.active_index ^ 1;
-        let idx_start = if new_active == 0 { IDX_A } else { IDX_B };
-        let entries: Vec<(ContentId, u32, u32)> = self
-            .objects
-            .iter()
-            .map(|(id, o)| {
-                let (sector, len) = o.disk.unwrap();
-                (*id, sector, len)
-            })
-            .collect();
-        let count = entries.len();
-        let sectors = count.div_ceil(ENTRIES_PER_SECTOR);
-        for si in 0..sectors {
-            let mut buf = [0u8; SECTOR];
-            for e in 0..ENTRIES_PER_SECTOR {
-                let gi = si * ENTRIES_PER_SECTOR + e;
-                if gi >= count {
-                    break;
-                }
-                let (id, sector, len) = entries[gi];
-                let off = e * ENTRY_SIZE;
-                buf[off..off + 32].copy_from_slice(&id.0);
-                put_u32(&mut buf, off + 32, sector);
-                put_u32(&mut buf, off + 36, len);
-            }
-            io.write(idx_start + si as u64, &buf);
+        // 2) Индекс-кадр: дельта (новые записи + надгробия) со ссылкой на предыдущий, либо
+        //    полная база (prev = 0) — при миграции/уплотнении/слишком длинной цепочке.
+        let base = force_base || self.chain_len >= CHAIN_MAX;
+        let mut frame: Vec<u8> = Vec::new();
+        let (prev_sector, prev_len) = if base { (0, 0) } else { self.index_tail };
+        frame.extend_from_slice(&prev_sector.to_le_bytes());
+        frame.extend_from_slice(&prev_len.to_le_bytes());
+        let entries: Vec<(ContentId, u32, u32)> = if base {
+            self.objects
+                .iter()
+                .map(|(id, o)| {
+                    let (s, l) = o.disk.unwrap();
+                    (*id, s, l)
+                })
+                .collect()
+        } else {
+            // Надгробия ПЕРЕД добавлениями: если один id и умер, и возродился в этом
+            // же коммите (переиспользованное содержимое), replay при загрузке должен
+            // закончиться «жив» — remove, потом insert.
+            let mut v: Vec<(ContentId, u32, u32)> =
+                self.pending_dead.iter().map(|(id, len)| (*id, TOMBSTONE, *len)).collect();
+            v.extend(delta);
+            v
+        };
+        frame.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (id, sector, len) in &entries {
+            frame.extend_from_slice(&id.0);
+            frame.extend_from_slice(&sector.to_le_bytes());
+            frame.extend_from_slice(&len.to_le_bytes());
         }
+        let idx_sector = self.next_free;
+        write_object(io, idx_sector, &frame);
+        self.bytes_written += frame.len().div_ceil(SECTOR) as u64 * SECTOR as u64;
+        self.next_free += frame.len().div_ceil(SECTOR) as u32;
 
         // 3) Суперблок — последним. Одна запись сектора = атомарная точка коммита.
         let generation = self.generation + 1;
         let mut sb = [0u8; SECTOR];
         put_u64(&mut sb, SB_MAGIC, MAGIC);
         put_u64(&mut sb, SB_GENERATION, generation);
-        put_u32(&mut sb, SB_ACTIVE, new_active);
         put_u32(&mut sb, SB_NEXT_FREE, self.next_free);
-        put_u32(&mut sb, SB_COUNT, count as u32);
+        put_u32(&mut sb, SB_IDX_SECTOR, idx_sector);
+        put_u32(&mut sb, SB_IDX_LEN, frame.len() as u32);
+        put_u64(&mut sb, SB_GARBAGE, self.garbage);
         put_u32(&mut sb, SB_ROOTS_PRESENT, 1);
         sb[SB_ROOTS_ID..SB_ROOTS_ID + 32].copy_from_slice(&roots_id.0);
         io.write(SB_SECTOR, &sb);
+        self.bytes_written += SECTOR as u64;
 
         self.generation = generation;
-        self.active_index = new_active;
+        self.index_tail = (idx_sector, frame.len() as u32);
+        self.chain_len = if base { 1 } else { self.chain_len + 1 };
+        self.last_roots_id = Some(roots_id);
+        self.pending_dead.clear();
+        self.dirty_ops = 0;
+        self.need_base = false;
     }
 }
 
