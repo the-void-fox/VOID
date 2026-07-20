@@ -20,11 +20,12 @@ Code/
 │       ├── object.rs     # контент-адресуемый store: put/get, корни, GC, A/B-коммит
 │       ├── cap.rs        # capability: домены, минт/grant/аттенуация/отзыв, .cspace
 │       ├── proc.rs       # процессы, syscall'ы, IPC (CALL/RECV/REPLY), ленивые кучи
-│       ├── virtio_blk.rs # драйвер: virtqueue общий, транспорт mmio/pci — от арха
+│       ├── virtio_blk.rs # драйвер диска: virtqueue общий, транспорт mmio/pci — от арха
+│       ├── virtio_net.rs # драйвер сети: две очереди RX/TX, опрос, сырые кадры наверх
 │       └── ...           # sched, timer, executor, heap, frame, elf
 ├── programs/
-│   └── user/             # userspace: либа шимов (ecall / int 0x80) + 14 бинарей
-│                         #   (vsh, posixfs, mini-sh, hello, bench, драйверы-демо…)
+│   └── user/             # userspace: либа шимов (ecall / int 0x80) + 15 бинарей
+│                         #   (vsh, posixfs, net-srv, mini-sh, hello, bench, драйверы…)
 ├── libs/
 │   ├── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap, Rights)
 │   └── void-store/       # формат и логика store (no_std, трейт BlockIo) —
@@ -86,6 +87,16 @@ tools/.../void-store-import void-disk.img put программа bin/<arch>/им
 строго таргет-скоуп — глобальный ломает host-сборку proc-macro) — в
 `Obsidian/10-projects/void/notes/uutils.md`. Доставка мостом:
 `put <elf> bin/<arch>/coreutils`, запуск: `run bin/coreutils ls`.
+
+## Сеть (Веха 34)
+Раннеры в `.cargo/config.toml` уже поднимают virtio-net на QEMU SLIRP
+(`-netdev user`, гость `10.0.2.15`, шлюз/DNS `10.0.2.2`/`.3`). Ядро отдаёт лишь
+сырые кадры (`virtio_net.rs`); стек ARP/IPv4/ICMP echo — в userspace-сервере
+`bin/net-srv`, поднимается на загрузке и сам пингует шлюз. Из vsh:
+```
+vsh> ping 10.0.2.2      # RTT в мкс; SLIRP отвечает, не выходя из QEMU
+```
+Подробности — `Obsidian/10-projects/void/notes/virtio-net.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
