@@ -11,9 +11,9 @@ x86_64) из одного дерева исходников, весь userspace 
 
 ```
   ╔══════════════════════════════════════════╗
-  ║  VOID — Веха 34                           ║
-  ║  virtio-net: сетевой стек (ARP/IPv4/ICMP) ║
-  ║  как userspace-сервер, ping из vsh        ║
+  ║  VOID — Веха 35                           ║
+  ║  потоки: std::thread, futex Mutex,        ║
+  ║  нативный thread_local (TLS) на двух арх  ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -64,7 +64,9 @@ SSD-дружелюбие было последним «до железа» пу�
 5. **Микроядерность.** Драйвер блочного устройства, POSIX-слой, сетевой стек
    (ARP/IPv4/ICMP), shell — обычные userspace-процессы, говорящие с ядром через
    синхронный IPC (CALL/RECV/REPLY с reply-capability) и узкий набор
-   syscall'ов (~22). Ядро сети не знает — отдаёт лишь сырые Ethernet-кадры.
+   syscall'ов (~27). Ядро сети не знает — отдаёт лишь сырые Ethernet-кадры;
+   протоколы синхронизации нитей (Mutex/Condvar) — тоже userspace, на одном
+   примитиве futex.
 6. **Мультиархитектурность через узкий контракт.** Вся арх-специфика — в
    `kernel/src/arch/{riscv64,x86_64}` за компилируемым контрактом (~30 функций);
    общий код один, собирается двумя cargo-таргетами.
@@ -117,7 +119,7 @@ userspace счётчиком rdtime/rdtsc). Сравнение с Linux — **г
 
 | | VOID (обе арх.) | Linux 7.1 x86_64 (тот же QEMU) |
 |---|:---:|:---:|
-| Образ ядра в памяти | **~420–530 КиБ** (вместе с семенами всех 15 программ) | ~48 МиБ (резерв до MemTotal) |
+| Образ ядра в памяти | **~420–620 КиБ** (вместе с семенами всех 16 программ) | ~48 МиБ (резерв до MemTotal) |
 | RAM после загрузки + uutils-демо (пик) | **≈ 30–37 МиБ**¹ | ≈ 80 МиБ |
 | Программа userspace | 6–13 КиБ на ELF (no_std) · 85–122 КиБ (std) · 1.8–2.3 МиБ (coreutils: 8 утилит одним бинарём) | — |
 
@@ -142,9 +144,12 @@ Instant/exit-коды — собранный обычным cargo под тар�
 mv/rm/head/echo одним multicall-бинарём; `cp` на x86_64 создаёт файл, `wc`
 на riscv64 его считает — общий диск) · взрослая политика коммитов
 (group commit + синк при простое, дельта-индекс, уплотнение по порогу —
-загрузка пишет на диск килобайты, а не мегабайты) · **сеть**
+загрузка пишет на диск килобайты, а не мегабайты) · сеть
 (`net-srv`: стек ARP/IPv4/ICMP echo в userspace, `ping 10.0.2.2` из vsh —
-ядро отдаёт лишь сырые кадры virtio-net, протоколы в userspace-сервере).
+ядро отдаёт лишь сырые кадры virtio-net, протоколы в userspace-сервере) ·
+**потоки** (`run bin/threads-std`: обычный `std::thread` + `Arc<Mutex>` на
+futex + `thread_local!` через нативный TLS — 4 нити считают общий счётчик, итог
+точен; ядро планирует нити внутри процесса, синхронизация — userspace).
 
 ## Сборка и запуск
 
@@ -170,8 +175,9 @@ Code/
 ├── kernel/               # микроядро: store, cap, IPC, proc, sched, virtio-blk/net
 │   └── src/arch/         # контракт архитектур: riscv64 (SBI/PLIC/Sv39),
 │                         #   x86_64 (PVH, GDT/TSS, LAPIC/IOAPIC, PCI/MSI-X)
-├── programs/user/        # userspace: либа syscall-шимов + 15 программ (ELF)
+├── programs/user/        # userspace: либа syscall-шимов + 16 программ (ELF)
 ├── programs/std-hello/   # первая std-программа (тулчейн void, обычный cargo)
+├── programs/std-threads/ # демо потоков: std::thread + Arc<Mutex> + thread_local
 ├── libs/void-abi/        # типы границы ядро/userspace (ContentId, Cap, Rights)
 ├── libs/void-store/      # формат и логика store (no_std) — общие ядру и хосту
 └── tools/void-store-import/  # мост host→store: put/nar/ls/cat в образ диска
@@ -182,7 +188,7 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 ```
 
 Развёрнутая документация — в `Obsidian/10-projects/void/`: ADR 0001–0005,
-заметки каждой вехи (1–34), staged-роадмап (`Obsidian/30-todo/todo.md`).
+заметки каждой вехи (1–35), staged-роадмап (`Obsidian/30-todo/todo.md`).
 
 ## Дальше
 
@@ -192,6 +198,8 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 обычные Rust-программы и настоящие утилиты собираются обычным cargo (тулчейн
 `void`) и работают на обеих архитектурах с одного диска; политика коммитов
 store дозрела до железа (Веха 33), появилась сеть — стек ARP/IPv4/ICMP echo в
-userspace, `ping` из vsh (Веха 34). Дальше по принятому порядку: потоки
-(разблокируют sort/ripgrep), nixpkgs-cross, бэкенды B/C, checkpoint процессов,
-декларативный init — и реальное железо (VisionFive 2 / x86-минипк).
+userspace, `ping` из vsh (Веха 34), и настоящие потоки — `std::thread`,
+`Arc<Mutex>` на futex, `thread_local!` через нативный TLS (Веха 35, разблокирует
+sort/rayon/ripgrep). Дальше по принятому порядку: nixpkgs-cross, бэкенды B/C,
+checkpoint процессов, декларативный init — и реальное железо (VisionFive 2 /
+x86-минипк).

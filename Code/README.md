@@ -24,8 +24,8 @@ Code/
 │       ├── virtio_net.rs # драйвер сети: две очереди RX/TX, опрос, сырые кадры наверх
 │       └── ...           # sched, timer, executor, heap, frame, elf
 ├── programs/
-│   └── user/             # userspace: либа шимов (ecall / int 0x80) + 15 бинарей
-│                         #   (vsh, posixfs, net-srv, mini-sh, hello, bench, драйверы…)
+│   └── user/             # userspace: либа шимов (ecall / int 0x80) + 16 бинарей
+│                         #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
 ├── libs/
 │   ├── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap, Rights)
 │   └── void-store/       # формат и логика store (no_std, трейт BlockIo) —
@@ -97,6 +97,19 @@ tools/.../void-store-import void-disk.img put программа bin/<arch>/им
 vsh> ping 10.0.2.2      # RTT в мкс; SLIRP отвечает, не выходя из QEMU
 ```
 Подробности — `Obsidian/10-projects/void/notes/virtio-net.md`.
+
+## Потоки (Веха 35)
+Ядро планирует НИТИ внутри процесса (общее адресное пространство и домен, свой
+стек/TLS): `SYS_THREAD_SPAWN/EXIT/JOIN`, `SYS_FUTEX`, `SYS_SET_TLS`. Порт std
+(`vendor/rust`) дорос до `std::thread`, futex `Mutex/Condvar` и нативного
+`thread_local!` (TLS Variant I на riscv / II на x86). Демо:
+```
+vsh> run bin/threads       # no_std: 4 нити, счётчик 200000 под futex-мьютексом
+vsh> run bin/threads-std   # std::thread + Arc<Mutex> + thread_local (доставить мостом)
+```
+`threads-std` — крейт `programs/std-threads` (тулчейн `void`, как std-hello);
+доставка: `put <elf> bin/<arch>/threads-std`. Подробности —
+`Obsidian/10-projects/void/notes/threads.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
