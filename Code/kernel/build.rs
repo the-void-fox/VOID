@@ -9,7 +9,7 @@ use std::process::Command;
 /// исполняются они всегда ИЗ store по content-id, никогда из образа ядра (Веха 23).
 const PROGRAMS: &[&str] = &[
     "hello", "vsh", "posixfs", "mini-sh", "blk-srv", "blk-cli", "obj-srv", "obj-cli", "cap-srv",
-    "cap-cli", "busy", "heap", "crash", "bench",
+    "cap-cli", "busy", "heap", "crash", "bench", "net-srv",
 ];
 
 fn main() {

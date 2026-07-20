@@ -34,6 +34,9 @@ const SYS_CAP_DERIVE: usize = 16;
 const SYS_MAP: usize = 17;
 const SYS_ARGS: usize = 18;
 const SYS_STARTCAP: usize = 19;
+const SYS_NET_SEND: usize = 20;
+const SYS_NET_RECV: usize = 21;
+const SYS_NET_MAC: usize = 22;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -271,6 +274,25 @@ pub fn cap_derive(cap: usize, mask: usize) -> usize {
 /// придут по page fault при первом обращении — обнулёнными. Возвращает VA начала или MAX.
 pub fn heap_map(len: usize) -> usize {
     abi::syscall(SYS_MAP, len, 0, 0, 0, 0, 0, 0).0
+}
+
+// ─── сеть (Веха 34) ────────────────────────────────────────────────────────────
+
+/// `SYS_NET_SEND`: отправить сырой Ethernet-кадр (нужен cap на сетевое устройство,
+/// право `WRITE`). Возвращает 0 или [`NO_CAP`]-подобный MAX при отказе.
+pub fn net_send(dev_cap: usize, frame: &[u8]) -> usize {
+    abi::syscall(SYS_NET_SEND, dev_cap, frame.as_ptr() as usize, frame.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_NET_RECV`: принять один кадр в `buf` (неблокирующе, опрос). Возвращает число байт
+/// (0 — приёмник пуст; MAX — отказ). Нужен cap на устройство, право `READ`.
+pub fn net_recv(dev_cap: usize, buf: &mut [u8]) -> usize {
+    abi::syscall(SYS_NET_RECV, dev_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_NET_MAC`: записать MAC карты (6 байт) в `out`. Возвращает 0/MAX.
+pub fn net_mac(dev_cap: usize, out: &mut [u8; 6]) -> usize {
+    abi::syscall(SYS_NET_MAC, dev_cap, out.as_mut_ptr() as usize, 0, 0, 0, 0, 0).0
 }
 
 // ─── время (Веха 28 — микробенчи) ─────────────────────────────────────────────

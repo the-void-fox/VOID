@@ -15,7 +15,39 @@ use void_user as sys;
 use void_user::posix as px;
 
 static HELP: &[u8] =
-    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | mv OLD NEW | help | exit\n";
+    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | mv OLD NEW | ping IP | help | exit\n";
+
+/// Разобрать IPv4 в точечной записи «A.B.C.D» в 4 байта. `None` — не разобрать.
+fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    let mut val: u32 = 0;
+    let mut digits = 0;
+    for &b in s {
+        if b == b'.' {
+            if digits == 0 || idx >= 3 {
+                return None;
+            }
+            octets[idx] = val as u8;
+            idx += 1;
+            val = 0;
+            digits = 0;
+        } else if b.is_ascii_digit() {
+            val = val * 10 + (b - b'0') as u32;
+            if val > 255 {
+                return None;
+            }
+            digits += 1;
+        } else {
+            return None;
+        }
+    }
+    if idx != 3 || digits == 0 {
+        return None;
+    }
+    octets[3] = val as u8;
+    Some(octets)
+}
 
 /// Напечатать usize десятично (форматтера в no_std-бинаре нет).
 fn put_dec(ep: usize, mut v: usize) {
@@ -174,6 +206,35 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
                 }
                 _ => {
                     px::write(ep, px::STDOUT, b"usage: mv OLD NEW\n");
+                }
+            }
+            continue;
+        }
+        if let Some(ipstr) = cmd.strip_prefix(b"ping ") {
+            // Веха 34: `ping A.B.C.D` — вызвать сетевой сервер (эндпоинт из старт-cap слота 2),
+            // тот делает ARP+ICMP и возвращает RTT. Стек живёт в userspace, не в ядре.
+            match parse_ipv4(ipstr) {
+                Some(ip) => {
+                    let netep = sys::start_cap(2);
+                    if netep == sys::NO_CAP {
+                        px::write(ep, px::STDOUT, "vsh: сети нет\n".as_bytes());
+                    } else {
+                        let mut rep = [0u8; 5];
+                        let n = sys::call(netep, 0 /* OP_PING */, &ip, &mut rep);
+                        if n >= 5 && rep[0] == 0 {
+                            let rtt = u32::from_le_bytes([rep[1], rep[2], rep[3], rep[4]]) as usize;
+                            px::write(ep, px::STDOUT, "ответ от ".as_bytes());
+                            px::write(ep, px::STDOUT, ipstr);
+                            px::write(ep, px::STDOUT, b": ");
+                            put_dec(ep, rtt);
+                            px::write(ep, px::STDOUT, " мкс\n".as_bytes());
+                        } else {
+                            px::write(ep, px::STDOUT, "ping: нет ответа\n".as_bytes());
+                        }
+                    }
+                }
+                None => {
+                    px::write(ep, px::STDOUT, b"usage: ping A.B.C.D\n");
                 }
             }
             continue;

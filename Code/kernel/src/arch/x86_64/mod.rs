@@ -25,7 +25,7 @@ core::arch::global_asm!(include_str!("switch.s"));
 // Вход в процесс: iretq по подготовленному trap-кадру.
 core::arch::global_asm!(include_str!("enter_user.s"));
 
-pub use pci::probe_virtio_blk;
+pub use pci::{probe_virtio_blk, probe_virtio_net};
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).

@@ -1183,6 +1183,81 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(bits);
             f.advance();
         }
+        // SYS_NET_SEND(dev_cap, buf, len) -> 0/MAX (Веха 34): отправить сырой Ethernet-кадр.
+        // Нужен cap на сетевое устройство (право WRITE). Кадр читается из U-памяти (SUM=1),
+        // копируется в ядерный TX-буфер драйвера (страницы процесса не identity-mapped).
+        20 => {
+            let (dcap, buf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
+                Ok(cap::Device::Net) if len <= 2048 && ensure_heap_range(t, cur, buf, len) => {
+                    let mut tmp = [0u8; 2048];
+                    let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+                    tmp[..len].copy_from_slice(src);
+                    vprintln!("  [net] P{} SYS_NET_SEND {} байт (по cap)", cur, len);
+                    if crate::virtio_net::send(&tmp[..len]) { 0 } else { usize::MAX }
+                }
+                Ok(_) => usize::MAX,
+                Err(e) => {
+                    vprintln!("  [net] P{} SYS_NET_SEND отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_NET_RECV(dev_cap, buf, buflen) -> длина кадра (0 — пусто; MAX — отказ).
+        // Неблокирующий опрос приёмного кольца (нужен cap на устройство, право READ).
+        21 => {
+            let (dcap, buf, buflen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
+                Ok(cap::Device::Net) if ensure_heap_range(t, cur, buf, buflen.min(2048)) => {
+                    let mut tmp = [0u8; 2048];
+                    let cap_len = buflen.min(2048);
+                    let n = crate::virtio_net::recv(&mut tmp[..cap_len]);
+                    if n > 0 {
+                        let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
+                        dst.copy_from_slice(&tmp[..n]);
+                        vprintln!("  [net] P{} SYS_NET_RECV {} байт (по cap)", cur, n);
+                    }
+                    n
+                }
+                Ok(_) => usize::MAX,
+                Err(_) => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_NET_MAC(dev_cap, buf6) -> 0/MAX (Веха 34): записать MAC карты (6 байт).
+        22 => {
+            let (dcap, buf) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
+                Ok(cap::Device::Net) if ensure_heap_range(t, cur, buf, 6) => {
+                    let mac = crate::virtio_net::mac();
+                    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 6) };
+                    dst.copy_from_slice(&mac);
+                    0
+                }
+                Ok(_) => usize::MAX,
+                Err(_) => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);

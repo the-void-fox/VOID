@@ -62,6 +62,7 @@ mod sched;
 mod sync;
 mod timer;
 mod virtio_blk;
+mod virtio_net;
 
 /// Веха 23 — ELF-байты ВСЕХ userspace-программ, встроенные в образ ядра как СЕМЕНА. Собраны
 /// `kernel/build.rs` отдельным `cargo build` крейта `programs/user` (свой target-dir в OUT_DIR)
@@ -85,6 +86,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("heap", include_bytes!(env!("PROG_HEAP"))),
     ("crash", include_bytes!(env!("PROG_CRASH"))),
     ("bench", include_bytes!(env!("PROG_BENCH"))),
+    ("net-srv", include_bytes!(env!("PROG_NET_SRV"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
@@ -151,6 +153,17 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("  [blk]  virtio-blk: {} секторов", virtio_blk::capacity_sectors());
     } else {
         println!("  [blk]  virtio-blk не найден — персистентность недоступна!");
+    }
+
+    // Веха 34: подключить сетевую карту (стек — в userspace net-srv, драйвер работает опросом).
+    if virtio_net::init() {
+        let m = virtio_net::mac();
+        println!(
+            "  [net]  virtio-net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5],
+        );
+    } else {
+        println!("  [net]  virtio-net не найден — сеть недоступна");
     }
 
     // Прерывания устройств (Веха 24: одним вызовом контракта — контроллер, IRQ диска и
@@ -482,19 +495,33 @@ fn cap_ipc_demo() {
 fn shell_session() {
     use void_abi::Rights;
 
-    println!("  [vsh] интерактивная сессия (Веха 20) — ls · cat · echo · run bin/hello · exit:");
+    println!("  [vsh] интерактивная сессия (Веха 20) — ls · cat · echo · run bin/hello · ping · exit:");
     let server = spawn_prog("posixfs", "posixfs", 0);
     let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
     proc::set_arg(server, scap.bits() as usize);
+
+    // Веха 34: сетевой сервер — ему cap на сетевое устройство (r/w — слать/принимать кадры).
+    // vsh получит эндпоинт на него (start-cap слот 2) и команду `ping`.
+    let netsrv = spawn_prog("net-srv", "net-srv", 0);
+    let netdev = cap::mint(
+        proc::domain(netsrv),
+        cap::Target::Device(cap::Device::Net),
+        Rights::READ.union(Rights::WRITE),
+    );
+    proc::set_arg(netsrv, netdev.bits() as usize);
+
     let sh = spawn_prog("vsh", "vsh", 0);
     let ep = cap::mint(proc::domain(sh), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(sh, ep.bits() as usize);
     let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC);
     proc::set_arg2(sh, xcap.bits() as usize);
-    // Веха 30 — контракт запуска: та же пара прав — в таблицу стартовых capability
+    let netep = cap::mint(proc::domain(sh), cap::Target::Endpoint(netsrv), Rights::SEND);
+    // Веха 30 — контракт запуска: те же права — в таблицу стартовых capability
     // (её унаследуют программы, которые vsh запустит через SYS_EXEC), плюс окружение.
+    // Слот 0 — эндпоинт персоналии, 1 — EXEC, 2 — эндпоинт net-srv (Веха 34).
     proc::push_start_cap(sh, ep.bits() as usize);
     proc::push_start_cap(sh, xcap.bits() as usize);
+    proc::push_start_cap(sh, netep.bits() as usize);
     proc::set_env(sh, alloc::format!("ARCH={}\0SYSTEM=void\0", arch::ARCH_NAME).as_bytes());
     println!(
         "    P{} 'posixfs' [{}] ← P{} 'vsh' [эндпоинт {} + store {}]",

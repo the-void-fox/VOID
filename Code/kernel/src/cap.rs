@@ -40,6 +40,8 @@ pub type DomainId = usize;
 pub enum Device {
     /// Блочное устройство virtio-blk ([[virtio-blk]]).
     Block,
+    /// Сетевая карта virtio-net (Веха 34): право слать/принимать сырые Ethernet-кадры.
+    Net,
 }
 
 /// На что указывает capability.
@@ -368,6 +370,7 @@ pub fn persist() {
                         Target::Device(Device::Block) => 2,
                         Target::Value(_) => 3,
                         Target::Root(_) => 4,
+                        Target::Device(Device::Net) => 5,
                         Target::Endpoint(_) | Target::Reply(_) => 0, // эфемерные — не переживают
                     },
                     None => 0,
@@ -443,6 +446,7 @@ pub fn load() -> usize {
                         off += 32;
                         Target::Value(ContentId(idb))
                     }
+                    5 => Target::Device(Device::Net),
                     _ => {
                         let l = b[off] as usize;
                         off += 1;

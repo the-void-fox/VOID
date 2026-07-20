@@ -62,8 +62,8 @@ pub use imp::{
     MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
-    // устройства (Веха 27)
-    probe_virtio_blk,
+    // устройства (Веха 27, virtio-net — Веха 34)
+    probe_virtio_blk, probe_virtio_net,
     // разное
     ARCH_NAME, ELF_MACHINE, RAM_LIMIT, USERSPACE_READY,
 };
@@ -126,4 +126,12 @@ pub enum BlkTransport {
     /// virtio-pci modern (QEMU q35): MMIO-окна структур из vendor-capabilities;
     /// notify-адрес очереди q = `notify_base + queue_notify_off(q) * notify_mult`.
     Pci { common: usize, notify_base: usize, notify_mult: u32, isr: usize, device: usize },
+}
+
+/// Найденное virtio-net устройство (Веха 34). Транспорт — тот же split-virtqueue,
+/// что у блока ([`BlkTransport`]: адреса регистров одинаковы для любого virtio),
+/// но у сети ДВЕ очереди (0=приём, 1=передача) и нет IRQ: драйвер работает опросом
+/// колец (прерывания, как синхронный путь blk на загрузке, отложены до потребности).
+pub struct NetDevice {
+    pub transport: BlkTransport,
 }

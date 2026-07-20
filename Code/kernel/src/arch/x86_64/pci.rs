@@ -11,7 +11,7 @@
 //! (адрес 0xFEE0_0000, данные = вектор [`trap::VEC_BLK`]). Ни IOAPIC-маршрутизации,
 //! ни PIRQ-свопов INTx — сообщение приходит вектором, как и положено на PCIe.
 
-use crate::arch::{BlkDevice, BlkTransport};
+use crate::arch::{BlkDevice, BlkTransport, NetDevice};
 
 use super::{paging, trap};
 
@@ -23,6 +23,9 @@ const VENDOR_VIRTIO: u16 = 0x1af4;
 /// 0x1041+1 transitional (0x1001) тоже несёт modern-capabilities — принимаем оба.
 const DEV_BLK_MODERN: u16 = 0x1042;
 const DEV_BLK_TRANSITIONAL: u16 = 0x1001;
+/// virtio-net: 0x1041 modern, 0x1000 transitional (Веха 34).
+const DEV_NET_MODERN: u16 = 0x1041;
+const DEV_NET_TRANSITIONAL: u16 = 0x1000;
 
 #[inline]
 fn outl(port: u16, v: u32) {
@@ -91,55 +94,80 @@ pub fn probe_virtio_blk() -> Option<BlkDevice> {
     None
 }
 
-/// Включить устройство и собрать транспорт из его capabilities.
-fn setup(dev: u32) -> Option<BlkDevice> {
+/// Найти virtio-net на шине 0 (Веха 34) и подготовить транспорт БЕЗ MSI-X: сеть
+/// работает опросом колец, прерывание не программируется (отложено до потребности).
+pub fn probe_virtio_net() -> Option<NetDevice> {
+    for dev in 0..32u32 {
+        let id = cfg_r32(dev, 0);
+        let (vendor, device) = (id as u16, (id >> 16) as u16);
+        if vendor == VENDOR_VIRTIO && (device == DEV_NET_MODERN || device == DEV_NET_TRANSITIONAL) {
+            return setup_transport(dev).map(|t| NetDevice { transport: t });
+        }
+    }
+    None
+}
+
+/// Пройти vendor-capabilities virtio, отобразить BAR-окна структур, вернуть транспорт.
+/// Общее для blk и net: разговор по virtqueue одинаков, отличается лишь MSI-X (у сети нет).
+fn setup_transport(dev: u32) -> Option<BlkTransport> {
     // Command: memory space + bus master (DMA колец). Верхняя половина dword'а —
     // status (биты RW1C); запись прочитанного их сбрасывает — безвредно.
     cfg_w16(dev, 0x04, cfg_r16(dev, 0x04) | 0x6);
 
     let (mut common, mut notify_base, mut notify_mult) = (0usize, 0usize, 0u32);
     let (mut isr, mut device_cfg) = (0usize, 0usize);
-    let (mut msix_ptr, mut msix_table) = (0u32, 0usize);
 
     // Пройти список capabilities (status.bit4 у virtio-устройств QEMU всегда есть).
     let mut ptr = cfg_r8(dev, 0x34) as u32 & !3;
     while ptr != 0 {
-        match cfg_r8(dev, ptr) {
-            // Vendor-capability virtio: тип структуры + [BAR, смещение, длина].
-            0x09 => {
-                let cfg_type = cfg_r8(dev, ptr + 3);
-                let bar = cfg_r8(dev, ptr + 4);
-                let off = cfg_r32(dev, ptr + 8) as usize;
-                let len = cfg_r32(dev, ptr + 12) as usize;
-                let base = bar_addr(dev, bar);
-                if base != 0 && len != 0 {
-                    let addr = base + off;
-                    unsafe { paging::map_mmio(addr, len) };
-                    match cfg_type {
-                        1 => common = addr,
-                        2 => {
-                            notify_base = addr;
-                            notify_mult = cfg_r32(dev, ptr + 16);
-                        }
-                        3 => isr = addr,
-                        4 => device_cfg = addr,
-                        _ => {} // 5 = pci-cfg-доступ, не нужен: BAR'ы отображаемы
+        // Vendor-capability virtio: тип структуры + [BAR, смещение, длина].
+        if cfg_r8(dev, ptr) == 0x09 {
+            let cfg_type = cfg_r8(dev, ptr + 3);
+            let bar = cfg_r8(dev, ptr + 4);
+            let off = cfg_r32(dev, ptr + 8) as usize;
+            let len = cfg_r32(dev, ptr + 12) as usize;
+            let base = bar_addr(dev, bar);
+            if base != 0 && len != 0 {
+                let addr = base + off;
+                unsafe { paging::map_mmio(addr, len) };
+                match cfg_type {
+                    1 => common = addr,
+                    2 => {
+                        notify_base = addr;
+                        notify_mult = cfg_r32(dev, ptr + 16);
                     }
+                    3 => isr = addr,
+                    4 => device_cfg = addr,
+                    _ => {} // 5 = pci-cfg-доступ, не нужен: BAR'ы отображаемы
                 }
             }
-            // MSI-X capability: [таблица: BAR + смещение].
-            0x11 => {
-                msix_ptr = ptr;
-                let t = cfg_r32(dev, ptr + 4);
-                msix_table = bar_addr(dev, (t & 7) as u8) + (t & !7) as usize;
-            }
-            _ => {}
         }
         ptr = cfg_r8(dev, ptr + 1) as u32 & !3;
     }
 
-    if common == 0 || notify_base == 0 || isr == 0 || device_cfg == 0 || msix_ptr == 0 {
-        return None; // не modern virtio или без MSI-X — такой конфиг не поддерживаем
+    if common == 0 || notify_base == 0 || isr == 0 || device_cfg == 0 {
+        return None; // не modern virtio
+    }
+    Some(BlkTransport::Pci { common, notify_base, notify_mult, isr, device: device_cfg })
+}
+
+/// Включить virtio-blk и взвести его MSI-X (диску прерывание нужно — async I/O).
+fn setup(dev: u32) -> Option<BlkDevice> {
+    let transport = setup_transport(dev)?;
+
+    // Найти MSI-X capability и адрес его таблицы.
+    let (mut msix_ptr, mut msix_table) = (0u32, 0usize);
+    let mut ptr = cfg_r8(dev, 0x34) as u32 & !3;
+    while ptr != 0 {
+        if cfg_r8(dev, ptr) == 0x11 {
+            msix_ptr = ptr;
+            let t = cfg_r32(dev, ptr + 4);
+            msix_table = bar_addr(dev, (t & 7) as u8) + (t & !7) as usize;
+        }
+        ptr = cfg_r8(dev, ptr + 1) as u32 & !3;
+    }
+    if msix_ptr == 0 {
+        return None; // без MSI-X диск не поддерживаем
     }
 
     // MSI-X: запись 0 таблицы → LAPIC (физический dest, APIC ID 0), вектор диска,
@@ -155,8 +183,5 @@ fn setup(dev: u32) -> Option<BlkDevice> {
     let ctrl = cfg_r16(dev, msix_ptr + 2);
     cfg_w16(dev, msix_ptr + 2, (ctrl | 0x8000) & !0x4000);
 
-    Some(BlkDevice {
-        transport: BlkTransport::Pci { common, notify_base, notify_mult, isr, device: device_cfg },
-        irq: trap::VEC_BLK as u32,
-    })
+    Some(BlkDevice { transport, irq: trap::VEC_BLK as u32 })
 }

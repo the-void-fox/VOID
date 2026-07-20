@@ -11,7 +11,7 @@ target = "riscv64gc-unknown-none-elf"
 #   truncate -s 16M void-disk.img       (из каталога Code/)
 # force-legacy=false включает modern virtio (version 2), который ждёт наш драйвер.
 [target.riscv64gc-unknown-none-elf]
-runner = "qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -global virtio-mmio.force-legacy=false -drive file=void-disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel"
+runner = "qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -global virtio-mmio.force-legacy=false -drive file=void-disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -netdev user,id=net0 -device virtio-net-device,netdev=net0 -kernel"
 
 # Веха 24/25: второй таргет — x86_64. relocation-model=static: таргет по умолчанию
 # собирает PIE, а наш linker-x86_64.ld — классический статический ELF.
@@ -22,4 +22,4 @@ runner = "qemu-system-riscv64 -machine virt -bios default -m 128M -nographic -gl
 # (disable-legacy=on соответствует force-legacy=false на mmio).
 [target.x86_64-unknown-none]
 rustflags = ["-C", "relocation-model=static"]
-runner = "qemu-system-x86_64 -machine q35 -m 128M -nographic -drive file=void-disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0,disable-legacy=on -kernel"
+runner = "qemu-system-x86_64 -machine q35 -m 128M -nographic -drive file=void-disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0,disable-legacy=on -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-legacy=on -kernel"
