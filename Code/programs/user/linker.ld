@@ -25,6 +25,7 @@ PHDRS
     text   PT_LOAD FLAGS(5); /* R+X — код, никогда W */
     rodata PT_LOAD FLAGS(4); /* R   — константы, никогда W и никогда X */
     data   PT_LOAD FLAGS(6); /* R+W — данные+bss, никогда X (W^X) */
+    tls    PT_TLS  FLAGS(4); /* шаблон TLS (Веха 35): .tdata+.tbss, R (только читается) */
 }
 
 SECTIONS
@@ -47,6 +48,23 @@ SECTIONS
         *(.sdata .sdata.*)
         *(.got .got.*)      /* x86: редкие GOT-ссылки статики — чтобы не осиротели */
     } :data
+
+    /* Веха 35 — шаблон TLS. Модель local-exec: линкер резолвит TPREL-смещения переменных
+       ОТНОСИТЕЛЬНО начала PT_TLS (нет динамических релокаций). .tdata несёт инициализаторы
+       (грузится и как часть data-сегмента), .tbss — нулевой хвост (NOBITS). Рантайм pal
+       (sys/pal/void/tls.rs) копирует шаблон в per-thread блок и ставит tp/база %fs.
+       __tls_align = p_align сегмента (по нему рантайм округляет размер блока для x86). */
+    .tdata : {
+        __tls_start = .;
+        *(.tdata .tdata.*)
+        __tdata_end = .;
+    } :data :tls
+    .tbss : {
+        *(.tbss .tbss.*)
+        *(.tcommon)
+        __tls_end = .;
+    } :data :tls
+    __tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
 
     .bss : ALIGN(8) {
         _bss_start = .;

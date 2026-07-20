@@ -101,6 +101,11 @@ enum State {
     StdinWait, // заблокирован в READ (ждёт ввода с консоли, Веха 20.2)
     /// Заблокирован в EXEC: ждёт завершения процесса-ребёнка с этим id (Веха 20.3).
     ExecWait(usize),
+    /// Веха 35: заблокирован в THREAD_JOIN — ждёт завершения нити с этим id.
+    JoinWait(usize),
+    /// Веха 35: заблокирован в FUTEX_WAIT (ключ — `futex_addr` + пространство нити);
+    /// будит FUTEX_WAKE по тому же адресу или истёкший `futex_deadline`.
+    FutexWait,
     Finished,
 }
 
@@ -140,6 +145,21 @@ struct Proc {
     /// `SYS_EXEC` наследуется копиями ([`cap::endow`]). Первые два права ядро по традиции
     /// дублирует в `a0`/`a1` при spawn'е серверов.
     start_caps: Vec<usize>,
+    /// Веха 35 — группа нитей: индекс ГЛАВНОЙ нити (лидера) процесса. У самого лидера
+    /// `group == собственный индекс`. Нити одной группы делят `space` (адресное
+    /// пространство), `domain` (c-space) и КУЧУ лидера (`heap_brk`, args/env/start_caps
+    /// читаются у него). Свои у нити: кадр, стек, состояние, TLS.
+    group: usize,
+    /// Веха 35 — значение, с которым нить завершилась (THREAD_EXIT); его получает
+    /// присоединяющийся в THREAD_JOIN. Для процесса (SYS_EXIT) роль играет код выхода.
+    retval: usize,
+    /// Веха 35 — адрес futex-слова (в пространстве нити), на котором она спит в
+    /// FUTEX_WAIT; ключ пробуждения = (`space`, `futex_addr`). Валиден лишь в состоянии
+    /// [`State::FutexWait`].
+    futex_addr: usize,
+    /// Веха 35 — дедлайн futex-ожидания в тиках [`arch`]-счётчика (`None` — бессрочно).
+    /// Истёкший дедлайн будит нить с «таймаутом» (проверяется в [`resume`]).
+    futex_deadline: Option<u64>,
 }
 
 struct Table {
@@ -205,6 +225,7 @@ fn create_process_locked(
 ) -> usize {
     let frame = TrapFrame::new_user(entry, USER_STACK_TOP_VA, arg);
     let domain = cap::create_domain(name);
+    let idx = t.procs.len(); // индекс, который получит новый процесс — он же лидер своей группы
     t.procs.push(Proc {
         space: arch::space_token(root),
         frame,
@@ -224,8 +245,44 @@ fn create_process_locked(
         },
         env: Vec::new(),
         start_caps: Vec::new(),
+        group: idx, // новый процесс — лидер собственной группы нитей
+        retval: 0,
+        futex_addr: 0,
+        futex_deadline: None,
     });
-    t.procs.len() - 1
+    idx
+}
+
+/// Веха 35 — завести НИТЬ в существующем процессе `leader`: новая запись в таблице,
+/// делящая его `space` (адресное пространство → все страницы, включая кучу, общие) и
+/// `domain` (c-space → те же capability). Своё у нити — кадр (вход `entry`, стек
+/// `stack_top`, `a0`=`arg`), состояние и TLS. НЕ клонирует пространство и НЕ создаёт
+/// домен: нити процесса — одна единица защиты (модель POSIX-нитей). Возвращает id нити.
+fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, stack_top: usize) -> usize {
+    let frame = TrapFrame::new_user(entry, stack_top, arg);
+    let (space, domain, group) =
+        (t.procs[leader].space, t.procs[leader].domain, t.procs[leader].group);
+    let idx = t.procs.len();
+    t.procs.push(Proc {
+        space,
+        frame,
+        state: State::Runnable,
+        domain,
+        recv_buf: 0,
+        recv_cap: 0,
+        send_buf: 0,
+        send_len: 0,
+        send_cap: usize::MAX,
+        heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
+        args: Vec::new(),
+        env: Vec::new(),
+        start_caps: Vec::new(),
+        group, // та же группа, что у лидера (group лидера == его индекс)
+        retval: 0,
+        futex_addr: 0,
+        futex_deadline: None,
+    });
+    idx
 }
 
 /// Веха 19.2/19.3 — создать процесс из статического ELF64/RISC-V (с Вехи 23 — единственный
@@ -360,12 +417,71 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
     }
 }
 
+/// Веха 35 — разбудить присоединяющихся к нити `thread` (THREAD_JOIN), вернув им её
+/// `retval`. Зеркало [`wake_exec_waiters`] для нитей вместо процессов.
+fn wake_join_waiters(t: &mut Table, thread: usize, retval: usize) {
+    for i in 0..t.procs.len() {
+        if t.procs[i].state == State::JoinWait(thread) {
+            let f = &mut t.procs[i].frame;
+            f.set_ret(retval);
+            f.advance();
+            t.procs[i].state = State::Runnable;
+        }
+    }
+}
+
+/// Веха 35 — разбудить до `count` нитей, спящих в FUTEX_WAIT на слове `uaddr` в
+/// пространстве `space`. Пробуждённой нити syscall вернёт 0 (обычное пробуждение).
+/// Возвращает число разбуженных (результат FUTEX_WAKE).
+fn wake_futex(t: &mut Table, space: usize, uaddr: usize, count: usize) -> usize {
+    let mut woken = 0;
+    for i in 0..t.procs.len() {
+        if woken >= count {
+            break;
+        }
+        if t.procs[i].state == State::FutexWait
+            && t.procs[i].futex_addr == uaddr
+            && t.procs[i].space == space
+        {
+            let f = &mut t.procs[i].frame;
+            f.set_ret(0); // 0 — разбужены (не таймаут)
+            f.advance();
+            t.procs[i].state = State::Runnable;
+            t.procs[i].futex_deadline = None;
+            woken += 1;
+        }
+    }
+    woken
+}
+
+/// Веха 35 — разбудить нити, у которых истёк futex-дедлайн (вернуть им «таймаут» = 1).
+/// Зовётся из [`resume`] на каждом trap'е из U (гранулярность ~ квант вытеснения);
+/// дешёвая проверка при малом числе процессов.
+fn wake_futex_timeouts(t: &mut Table) {
+    let now = arch::now_ticks();
+    for i in 0..t.procs.len() {
+        if t.procs[i].state == State::FutexWait {
+            if let Some(deadline) = t.procs[i].futex_deadline {
+                if now >= deadline {
+                    let f = &mut t.procs[i].frame;
+                    f.set_ret(1); // 1 — истёк таймаут (futex_wait вернёт «не разбужен»)
+                    f.advance();
+                    t.procs[i].state = State::Runnable;
+                    t.procs[i].futex_deadline = None;
+                }
+            }
+        }
+    }
+}
+
 /// Веха 22.2: page fault из U-mode. Фолт чтения/записи в ленивом диапазоне кучи
 /// [`USER_HEAP_BASE_VA`, heap_brk) — выделить обнулённый фрейм, замапить `U|R|W` и повторить
 /// инструкцию (sepc не двигаем). Любой другой фолт — включая исполнение кучи (W^X живёт и
 /// здесь) и исчерпание фреймов — гибель ПРОЦЕССА, а не ядра: родителю в `SYS_EXEC` уходит MAX.
 fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
-    let (heap_brk, space) = (t.procs[cur].heap_brk, t.procs[cur].space);
+    // Веха 35: куча — общая на группу нитей, её граница живёт у лидера (стек нити тоже
+    // ленив и лежит в куче процесса, так что фолт стека любой нити резолвится отсюда).
+    let (heap_brk, space) = (t.procs[t.procs[cur].group].heap_brk, t.procs[cur].space);
     let lazy = va >= USER_HEAP_BASE_VA && va < heap_brk && kind != FaultKind::Exec;
     if lazy {
         if let Some(pa) = frame::alloc() {
@@ -396,7 +512,8 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
 /// «ленивость» для ядра снимается заранее. Буферы вне кучи (стек, данные ELF) замаплены и так.
 /// `false` — диапазон в куче, но фреймы кончились (шлюзу следует отказать).
 fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
-    if len == 0 || va < USER_HEAP_BASE_VA || va.saturating_add(len) > t.procs[pid].heap_brk {
+    // Веха 35: граница кучи — у лидера группы (нити делят кучу процесса).
+    if len == 0 || va < USER_HEAP_BASE_VA || va.saturating_add(len) > t.procs[t.procs[pid].group].heap_brk {
         return true; // не куча — обычные (уже отображённые) страницы
     }
     let root = arch::space_root(t.procs[pid].space);
@@ -431,7 +548,12 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
     {
         let mut t = TABLE.lock();
         let cur = t.current;
+        // Веха 35: TLS-указатель нити (x86 fsbase) НЕ спасается стабом trap'а — во «свежем»
+        // кадре он мусор. Переносим его из прошлого кадра ДО перезаписи (riscv — no-op: tp
+        // в GPR). SYS_SET_TLS, если это он, перепишет уже верным новым значением.
+        let prev = t.procs[cur].frame;
         t.procs[cur].frame = *frame; // сохранить состояние текущего процесса
+        t.procs[cur].frame.carry_tls_from(&prev);
         match trap {
             UserTrap::Syscall => syscall(&mut t, cur),
             // Веха 22.2: page fault из U-mode — ленивая страница кучи или гибель процесса.
@@ -465,6 +587,9 @@ fn resume() -> ! {
     // момент не держатся. Пока store чист — это одна проверка счётчика.
     crate::object::maybe_commit();
     let mut t = TABLE.lock();
+    // Веха 35: разбудить futex-ждунов с истёкшим дедлайном (проверка на каждом trap'е
+    // из U — гранулярность ~кванта вытеснения; для wait_timeout/park_timeout этого хватает).
+    wake_futex_timeouts(&mut t);
     let c = t.current;
     let chosen = if t.procs[c].state == State::Runnable {
         Some(c)
@@ -517,9 +642,17 @@ fn syscall(t: &mut Table, cur: usize) {
         // этот процесс в SYS_EXEC (Веха 20.3) — разбудить, вернув ему код выхода.
         2 => {
             let code = t.procs[cur].frame.arg(0);
-            vprintln!("  [proc] P{} SYS_EXIT({})", cur, code);
-            t.procs[cur].state = State::Finished;
-            wake_exec_waiters(t, cur, code);
+            // Веха 35: процесс уходит ЦЕЛИКОМ — все нити группы становятся Finished
+            // (семантика exit()/возврата из main: прочие нити не переживают процесс).
+            // Родитель ждал в SYS_EXEC ЛИДЕРА (его вернул SYS_EXEC) — будим по лидеру.
+            let leader = t.procs[cur].group;
+            vprintln!("  [proc] P{} SYS_EXIT({}) — процесс P{} (все нити группы)", cur, code, leader);
+            for i in 0..t.procs.len() {
+                if t.procs[i].group == leader {
+                    t.procs[i].state = State::Finished;
+                }
+            }
+            wake_exec_waiters(t, leader, code);
             if let Some(n) = t.next_runnable(cur) {
                 t.current = n;
             }
@@ -955,14 +1088,17 @@ fn syscall(t: &mut Table, cur: usize) {
         // USER_HEAP_BASE_VA и не смеет дорасти до стека. Без capability: память — свой ресурс
         // процесса (квоты — отдельная история).
         17 => {
+            // Веха 35: куча общая на группу — резервируем у лидера (замок таблицы
+            // сериализует SYS_MAP разных нитей, гонки за heap_brk нет).
+            let leader = t.procs[cur].group;
             let len = t.procs[cur].frame.arg(0);
-            let start = t.procs[cur].heap_brk;
+            let start = t.procs[leader].heap_brk;
             let end = start.saturating_add(len.div_ceil(PAGE) * PAGE);
             let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
             let result = if len == 0 || end > limit {
                 usize::MAX
             } else {
-                t.procs[cur].heap_brk = end;
+                t.procs[leader].heap_brk = end;
                 vprintln!(
                     "  [mm] P{} SYS_MAP {} байт → {:#x}..{:#x} (лениво, 0 фреймов)",
                     cur, len, start, end,
@@ -1148,9 +1284,11 @@ fn syscall(t: &mut Table, cur: usize) {
                 let f = &t.procs[cur].frame;
                 (f.arg(0), f.arg(1), f.arg(2))
             };
+            // Веха 35: argv/env — свойство процесса, живут у лидера группы нитей.
+            let leader = t.procs[cur].group;
             let blob = match sel {
-                0 => Some(t.procs[cur].args.clone()),
-                1 => Some(t.procs[cur].env.clone()),
+                0 => Some(t.procs[leader].args.clone()),
+                1 => Some(t.procs[leader].env.clone()),
                 _ => None,
             };
             let result = match blob {
@@ -1178,7 +1316,9 @@ fn syscall(t: &mut Table, cur: usize) {
         // унаследованы от родителя при SYS_EXEC. Дескрипторы валидны в СВОЁМ домене.
         19 => {
             let i = t.procs[cur].frame.arg(0);
-            let bits = t.procs[cur].start_caps.get(i).copied().unwrap_or(usize::MAX);
+            // Веха 35: стартовые capability — у лидера группы (нить делит домен процесса).
+            let leader = t.procs[cur].group;
+            let bits = t.procs[leader].start_caps.get(i).copied().unwrap_or(usize::MAX);
             let f = &mut t.procs[cur].frame;
             f.set_ret(bits);
             f.advance();
@@ -1256,6 +1396,124 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
+            f.advance();
+        }
+        // SYS_THREAD_SPAWN(entry, arg, stack_top) -> tid | MAX (Веха 35): завести НИТЬ в
+        // текущем процессе — контекст в ТОМ ЖЕ адресном пространстве и домене, со своим
+        // стеком (`stack_top` — вершина, userspace выделяет его из кучи процесса лениво).
+        // Возвращает id нити (для THREAD_JOIN). Прав не требует: нить — та же единица
+        // защиты, что процесс (не расширяет полномочий).
+        23 => {
+            let (entry, arg, stack_top) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let leader = t.procs[cur].group;
+            let tid = create_thread_locked(t, leader, entry, arg, stack_top);
+            vprintln!(
+                "  [thread] P{} SYS_THREAD_SPAWN → нить P{} (вход {:#x}, стек {:#x})",
+                cur, tid, entry, stack_top,
+            );
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(tid);
+            f.advance();
+        }
+        // SYS_THREAD_EXIT(retval) (Веха 35): завершить ТЕКУЩУЮ нить (не процесс), отдать
+        // `retval` присоединяющимся (THREAD_JOIN). Не возвращается в вызывающего. Возврат
+        // из main или std::process::exit идут через SYS_EXIT — тот кладёт всю группу.
+        24 => {
+            let retval = t.procs[cur].frame.arg(0);
+            vprintln!("  [thread] P{} SYS_THREAD_EXIT({})", cur, retval);
+            t.procs[cur].state = State::Finished;
+            t.procs[cur].retval = retval;
+            wake_join_waiters(t, cur, retval);
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
+        }
+        // SYS_THREAD_JOIN(tid) -> retval | MAX (Веха 35): дождаться завершения нити `tid`
+        // своей группы и забрать её `retval`. MAX — нет такой нити / чужая группа / это мы
+        // сами. Уже завершилась — вернуть сразу; иначе блок (JoinWait), пробуждение выставит
+        // a0/advance (как ExecWait: не рестарт).
+        25 => {
+            let tid = t.procs[cur].frame.arg(0);
+            let joinable =
+                tid < t.procs.len() && tid != cur && t.procs[tid].group == t.procs[cur].group;
+            if !joinable {
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(usize::MAX);
+                f.advance();
+            } else if t.procs[tid].state == State::Finished {
+                let rv = t.procs[tid].retval;
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(rv);
+                f.advance();
+            } else {
+                t.procs[cur].state = State::JoinWait(tid);
+                if let Some(n) = t.next_runnable(cur) {
+                    t.current = n;
+                }
+            }
+        }
+        // SYS_FUTEX(op, uaddr, val, timeout) (Веха 35): примитив блокировки для Mutex/Condvar/
+        // Parker в std. op 0 — WAIT(uaddr, expected, timeout_ticks): уснуть, если *uaddr ещё
+        // == expected (иначе сразу 0 — «значение сменилось»); timeout в тиках [`arch::now_ticks`]
+        // (0 — бессрочно). op 1 — WAKE(uaddr, count): разбудить до count спящих на слове,
+        // вернуть число. Ключ ожидания — (адресное пространство, uaddr): futex-слова процесса
+        // общие для его нитей. WAIT возвращает 0 (разбужен) либо 1 (истёк таймаут).
+        26 => {
+            let (op, uaddr, val, timeout) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            match op {
+                0 => {
+                    // futex-слово обычно в куче (Arc/Box) — доотобразить до чтения ядром.
+                    let read = if ensure_heap_range(t, cur, uaddr, 4) {
+                        Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
+                    } else {
+                        None
+                    };
+                    match read {
+                        Some(v) if v == val as u32 => {
+                            let deadline = if timeout == 0 {
+                                None
+                            } else {
+                                Some(arch::now_ticks().wrapping_add(timeout as u64))
+                            };
+                            t.procs[cur].state = State::FutexWait;
+                            t.procs[cur].futex_addr = uaddr;
+                            t.procs[cur].futex_deadline = deadline;
+                            if let Some(n) = t.next_runnable(cur) {
+                                t.current = n;
+                            }
+                        }
+                        _ => {
+                            // Значение уже иное (или недоступно) — не спать (EAGAIN): 0.
+                            let f = &mut t.procs[cur].frame;
+                            f.set_ret(0);
+                            f.advance();
+                        }
+                    }
+                }
+                _ => {
+                    let space = t.procs[cur].space;
+                    let woken = wake_futex(t, space, uaddr, val);
+                    let f = &mut t.procs[cur].frame;
+                    f.set_ret(woken);
+                    f.advance();
+                }
+            }
+        }
+        // SYS_SET_TLS(ptr) (Веха 35): задать TLS-указатель нити (tp на riscv / база %fs на
+        // x86). Userspace строит per-thread TLS-блок и сообщает его базу; ядро восстанавливает
+        // указатель на каждом входе в U ([`arch::TrapFrame::set_thread_ptr`]).
+        27 => {
+            let tp = t.procs[cur].frame.arg(0);
+            t.procs[cur].frame.set_thread_ptr(tp);
+            vprintln!("  [thread] P{} SYS_SET_TLS {:#x}", cur, tp);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(0);
             f.advance();
         }
         other => {

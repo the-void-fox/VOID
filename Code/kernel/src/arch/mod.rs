@@ -56,7 +56,7 @@ pub use imp::{
     enable_interrupts, init_device_interrupts, irq_mask_preempt, irq_mask_read, irq_mask_stdin,
     irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel, wait_for_interrupt,
     // таймер
-    timer_arm, timer_hw_init,
+    now_ticks, timer_arm, timer_hw_init,
     // память
     clone_kernel_root, flush_tlb, map, mm_enable, mm_init, space_root, space_token, translate,
     MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,

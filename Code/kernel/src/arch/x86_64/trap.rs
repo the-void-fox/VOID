@@ -55,6 +55,11 @@ pub struct TrapFrame {
     pub rflags: usize,
     pub rsp: usize,
     pub ss: usize,
+    /// Веха 35 — база FS-сегмента нити (её TLS-указатель). НЕ часть аппаратного кадра
+    /// iretq и не трогается trap_entry.s (стаб пишет только слоты 0..21); ядро грузит
+    /// её в `IA32_FS_BASE` на входе в U ([`super::enter_user`]), т.к. `%fs`-относительные
+    /// `#[thread_local]`-доступы иначе читали бы TLS чужой нити. На riscv роль играет `tp`.
+    pub fsbase: usize,
 }
 
 // Индексы регистров в `regs` (порядок push'ей: rax первым → верх структуры).
@@ -125,6 +130,21 @@ impl TrapFrame {
     /// Зеркало riscv-семантики, где sepc и так остаётся на `ecall`.
     pub fn restart(&mut self) {
         self.rip -= 2;
+    }
+
+    /// Веха 35 — TLS-указатель нити: на x86-64 это база сегмента `%fs` (Variant II —
+    /// `.tdata`/`.tbss` лежат по ОТРИЦАТЕЛЬНЫМ смещениям от неё). Кладём в кадр; ядро
+    /// применит `wrmsr IA32_FS_BASE` на входе в U-mode.
+    pub fn set_thread_ptr(&mut self, fsbase: usize) {
+        self.fsbase = fsbase;
+    }
+
+    /// Веха 35 — перенести TLS-указатель из прошлого кадра. `fsbase` НЕ спасается стабом
+    /// trap_entry.s (это не GP-регистр, а MSR), поэтому во «свежем» кадре из трапа слот
+    /// `fsbase` — мусор со стека. Восстанавливаем его из сохранённого кадра, иначе `wrmsr`
+    /// на входе в U загрузил бы мусор и `%fs`-доступы (thread_local) улетели бы в никуда.
+    pub fn carry_tls_from(&mut self, prev: &TrapFrame) {
+        self.fsbase = prev.fsbase;
     }
 }
 

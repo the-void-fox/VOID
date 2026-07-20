@@ -1,0 +1,12 @@
+# threads-std — демо потоков VOID (Веха 35): обычный std::thread + Arc<Mutex> +
+# thread_local!, собирается тулчейном «void» (vendor/rust, stage1) под *-unknown-void.
+[package]
+name = "threads-std"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

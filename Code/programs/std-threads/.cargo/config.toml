@@ -1,0 +1,3 @@
+# Таргет по умолчанию — riscv (как у ядра); x86: cargo build --target x86_64-unknown-void.
+[build]
+target = "riscv64gc-unknown-void-elf"

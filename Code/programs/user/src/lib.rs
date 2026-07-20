@@ -37,6 +37,11 @@ const SYS_STARTCAP: usize = 19;
 const SYS_NET_SEND: usize = 20;
 const SYS_NET_RECV: usize = 21;
 const SYS_NET_MAC: usize = 22;
+const SYS_THREAD_SPAWN: usize = 23;
+const SYS_THREAD_EXIT: usize = 24;
+const SYS_THREAD_JOIN: usize = 25;
+const SYS_FUTEX: usize = 26;
+const SYS_SET_TLS: usize = 27;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -127,6 +132,47 @@ pub fn exit(code: usize) -> ! {
 /// `SYS_YIELD`: уступить процессор следующему готовому процессу.
 pub fn yield_now() {
     abi::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// ─── нити (Веха 35) ───────────────────────────────────────────────────────────
+
+/// `SYS_THREAD_SPAWN`: завести нить, исполняющую `entry(arg)` на стеке с вершиной
+/// `stack_top` (в том же адресном пространстве и домене). Возвращает id нити (для
+/// [`thread_join`]) или [`usize::MAX`]. Стек — забота вызывающего (обычно область,
+/// выделенная из кучи процесса).
+pub fn thread_spawn(entry: usize, arg: usize, stack_top: usize) -> usize {
+    abi::syscall(SYS_THREAD_SPAWN, entry, arg, stack_top, 0, 0, 0, 0).0
+}
+
+/// `SYS_THREAD_EXIT`: завершить ТЕКУЩУЮ нить, отдав `retval` присоединяющемуся
+/// ([`thread_join`]). Процесс продолжают жить прочие нити (в отличие от [`exit`]).
+pub fn thread_exit(retval: usize) -> ! {
+    abi::syscall_noreturn(SYS_THREAD_EXIT, retval)
+}
+
+/// `SYS_THREAD_JOIN`: дождаться нити `tid` своей группы и забрать её `retval`
+/// ([`usize::MAX`] — нет такой нити / чужая группа).
+pub fn thread_join(tid: usize) -> usize {
+    abi::syscall(SYS_THREAD_JOIN, tid, 0, 0, 0, 0, 0, 0).0
+}
+
+/// `SYS_FUTEX` WAIT: уснуть на слове `*uaddr`, пока оно равно `expected`. `timeout_ticks`
+/// = 0 — бессрочно (иначе бюджет в тиках [`now`]). Возврат: 0 — разбужены, 1 — таймаут.
+/// Примитив для Mutex/Condvar/Parker в std.
+pub fn futex_wait(uaddr: *const u32, expected: u32, timeout_ticks: usize) -> usize {
+    abi::syscall(SYS_FUTEX, 0, uaddr as usize, expected as usize, timeout_ticks, 0, 0, 0).0
+}
+
+/// `SYS_FUTEX` WAKE: разбудить до `count` нитей, спящих на слове `*uaddr`. Возврат —
+/// число разбуженных.
+pub fn futex_wake(uaddr: *const u32, count: usize) -> usize {
+    abi::syscall(SYS_FUTEX, 1, uaddr as usize, count, 0, 0, 0, 0).0
+}
+
+/// `SYS_SET_TLS`: задать TLS-указатель текущей нити (`tp` на riscv / база `%fs` на x86).
+/// Зовётся один раз при старте нити, после построения её TLS-блока.
+pub fn set_tls(tp: usize) {
+    abi::syscall(SYS_SET_TLS, tp, 0, 0, 0, 0, 0, 0);
 }
 
 /// Принятый запрос IPC: op отправителя, одноразовый reply-cap, длина нагрузки в буфере

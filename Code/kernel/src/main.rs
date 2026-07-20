@@ -87,6 +87,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("crash", include_bytes!(env!("PROG_CRASH"))),
     ("bench", include_bytes!(env!("PROG_BENCH"))),
     ("net-srv", include_bytes!(env!("PROG_NET_SRV"))),
+    ("threads", include_bytes!(env!("PROG_THREADS"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и

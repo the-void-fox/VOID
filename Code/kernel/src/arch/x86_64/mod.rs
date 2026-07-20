@@ -263,6 +263,25 @@ pub fn space_root(token: usize) -> usize {
     token & !0xfff
 }
 
+/// Веха 35 — монотонный счётчик тиков для futex-дедлайнов (`rdtsc`; ~1 ГГц в QEMU TCG,
+/// TICK_NS=1). Тот же счётчик, что читает U-mode для замеров и `Instant`.
+pub fn now_ticks() -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    (hi as u64) << 32 | lo as u64
+}
+
+/// MSR базы сегмента `%fs` — Веха 35 несёт в нём TLS-указатель нити (Variant II).
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
+/// Записать модельно-специфичный регистр (ring0). `edx:eax = value`, `ecx = msr`.
+#[inline]
+unsafe fn wrmsr(msr: u32, value: u64) {
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    core::arch::asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi, options(nostack, nomem));
+}
+
 // ─── вход в процесс (Веха 26) ───────────────────────────────────────────────
 
 /// Войти в процесс: стек следующего трапа из ring3 — в TSS.rsp0 (аналог sscratch),
@@ -282,6 +301,9 @@ pub unsafe fn enter_user(frame: &TrapFrame, space: usize, trap_top: usize) -> ! 
     f.cs = gdt::UCODE_SEL as usize;
     f.ss = gdt::UDATA_SEL as usize;
     f.rflags |= 1 << 9; // IF: в U-mode прерывания всегда включены (вытеснение)
+    // Веха 35 — TLS нити: загрузить её базу %fs (0 у нитей без TLS — безвредно).
+    // fsbase — глобальный регистр CPU, прошлая нить могла оставить свой → ставим всегда.
+    wrmsr(IA32_FS_BASE, f.fsbase as u64);
     paging::enable(space_root(space));
     x86_enter_user(&f)
 }
