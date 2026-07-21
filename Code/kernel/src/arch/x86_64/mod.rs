@@ -241,6 +241,23 @@ pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) {
     paging::map(root, va, pa, pte)
 }
 
+/// Веха 37 — VA→(PA страницы, флаги MAP_*): обратный перевод листового PTE
+/// (зеркало `map`): R — сам Present, W — PTE_W, X — ОТСУТСТВИЕ PTE_NX, U — PTE_U.
+pub fn page_info(root: usize, va: usize) -> Option<(usize, usize)> {
+    let (pa, pte) = paging::page_info(root, va)?;
+    let mut flags = MAP_R;
+    if pte & paging::PTE_W != 0 {
+        flags |= MAP_W;
+    }
+    if pte & paging::PTE_NX == 0 {
+        flags |= MAP_X;
+    }
+    if pte & paging::PTE_U != 0 {
+        flags |= MAP_U;
+    }
+    Some((pa, flags))
+}
+
 /// Сбросить TLB после смены отображений активного пространства (перезагрузка CR3).
 pub fn flush_tlb() {
     unsafe {

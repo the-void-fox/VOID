@@ -141,6 +141,25 @@ unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: u64) {
     }
 }
 
+/// Веха 37 — обход VA→(PA страницы, сырой листовой PTE) для чекпойнта процессов:
+/// перевод PTE-битов в арх-нейтральные MAP_* делает обёртка в mod.rs (как у `map`,
+/// только в обратную сторону).
+pub fn page_info(root_pa: usize, va: usize) -> Option<(usize, u64)> {
+    let mut table = root_pa;
+    let mut level = 3i32;
+    let mut pte = 0u64;
+    while level >= 0 {
+        let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
+        pte = unsafe { *(table as *const u64).add(idx) };
+        if pte & PTE_P == 0 {
+            return None;
+        }
+        table = (pte & ADDR_MASK) as usize;
+        level -= 1;
+    }
+    Some((table, pte))
+}
+
 /// Программный обход VA→PA (то, что аппаратно делает MMU). None — не отображено.
 pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
     let mut table = root_pa;

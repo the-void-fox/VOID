@@ -52,6 +52,7 @@ extern crate alloc;
 mod arch;
 mod cap;
 mod chan;
+mod checkpoint;
 mod elf;
 mod executor;
 mod frame;
@@ -88,6 +89,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("bench", include_bytes!(env!("PROG_BENCH"))),
     ("net-srv", include_bytes!(env!("PROG_NET_SRV"))),
     ("threads", include_bytes!(env!("PROG_THREADS"))),
+    ("freeze", include_bytes!(env!("PROG_FREEZE"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
@@ -514,7 +516,10 @@ fn shell_session() {
     let sh = spawn_prog("vsh", "vsh", 0);
     let ep = cap::mint(proc::domain(sh), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(sh, ep.bits() as usize);
-    let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC);
+    // Веха 37: к EXEC добавился WRITE — SYS_CHECKPOINT пишет образ процесса в store,
+    // а право наследуют дети vsh (именно ОНИ себя морозят). Аттенуация никуда не делась:
+    // передать дальше урезанную копию можно cap_derive'ом.
+    let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC.union(Rights::WRITE));
     proc::set_arg2(sh, xcap.bits() as usize);
     let netep = cap::mint(proc::domain(sh), cap::Target::Endpoint(netsrv), Rights::SEND);
     // Веха 30 — контракт запуска: те же права — в таблицу стартовых capability

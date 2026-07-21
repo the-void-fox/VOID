@@ -42,6 +42,8 @@ const SYS_THREAD_EXIT: usize = 24;
 const SYS_THREAD_JOIN: usize = 25;
 const SYS_FUTEX: usize = 26;
 const SYS_SET_TLS: usize = 27;
+const SYS_CHECKPOINT: usize = 28;
+const SYS_RESTORE: usize = 29;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -320,6 +322,24 @@ pub fn cap_derive(cap: usize, mask: usize) -> usize {
 /// придут по page fault при первом обращении — обнулёнными. Возвращает VA начала или MAX.
 pub fn heap_map(len: usize) -> usize {
     abi::syscall(SYS_MAP, len, 0, 0, 0, 0, 0, 0).0
+}
+
+// ─── checkpoint процессов (Веха 37) ───────────────────────────────────────────
+
+/// `SYS_CHECKPOINT`: заморозить СЕБЯ в store под корнем `proc/<arch>/<name>` (нужно
+/// право `WRITE` на store — образ пишется объектами). Семантика setjmp: **0** — образ
+/// снят, «живой» продолжает; **1** — этот возврат случился в РАЗМОРОЖЕННОМ процессе
+/// («прошлая жизнь» вернулась из этого же вызова); MAX — отказ.
+pub fn checkpoint(store_cap: usize, name: &[u8]) -> usize {
+    abi::syscall(SYS_CHECKPOINT, store_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_RESTORE`: разморозить процесс из образа `proc/<arch>/<name>` (нужно право
+/// `EXEC` — это запуск). Как [`exec`]: вызывающий ждёт завершения, возврат — код
+/// выхода размороженного (или MAX). args/env тот берёт из образа, стартовые
+/// capability — свежее наследство вызывающего.
+pub fn restore(exec_cap: usize, name: &[u8]) -> usize {
+    abi::syscall(SYS_RESTORE, exec_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0
 }
 
 // ─── сеть (Веха 34) ────────────────────────────────────────────────────────────

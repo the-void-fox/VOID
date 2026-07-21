@@ -58,8 +58,8 @@ pub use imp::{
     // таймер
     now_ticks, timer_arm, timer_hw_init,
     // память
-    clone_kernel_root, flush_tlb, map, mm_enable, mm_init, space_root, space_token, translate,
-    MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
+    clone_kernel_root, flush_tlb, map, mm_enable, mm_init, page_info, space_root, space_token,
+    translate, MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
     // устройства (Веха 27, virtio-net — Веха 34)

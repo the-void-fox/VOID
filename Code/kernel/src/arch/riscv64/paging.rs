@@ -152,6 +152,25 @@ unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: usize) {
     }
 }
 
+/// Веха 37 — обход VA→(PA страницы, флаги MAP_*) для чекпойнта процессов: ядру нужно
+/// не только «куда», но и «с какими правами» страница отображена, чтобы образ восстановил
+/// W^X-раскладку буквально. На Sv39 MAP_* == биты PTE — маска без перевода.
+pub fn page_info(root_pa: usize, va: usize) -> Option<(usize, usize)> {
+    let page = translate(root_pa, va & !(PAGE_SIZE - 1))?;
+    // Листовой PTE уже найден translate'ом; флаги достаём повторным спуском к нему.
+    let mut table = root_pa;
+    let mut level = 2i32;
+    loop {
+        let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
+        let pte = unsafe { *(table as *const usize).add(idx) };
+        if pte & (PTE_R | PTE_X) != 0 || level == 0 {
+            return Some((page, pte & (PTE_R | PTE_W | PTE_X | PTE_U)));
+        }
+        table = ((pte >> 10) & PPN_MASK) << 12;
+        level -= 1;
+    }
+}
+
 /// Программный обход дерева VA→PA — ровно то, что аппаратно делает MMU.
 /// Возвращает физический адрес или `None`, если страница не отображена.
 #[allow(dead_code)] // отладочный инструмент: пригодится для page fault'ов (Веха 6+)

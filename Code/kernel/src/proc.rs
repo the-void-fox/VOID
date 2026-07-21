@@ -23,6 +23,11 @@
 //! потомка, не grant); процесс читает своё наследство через `SYS_ARGS` (argv/env) и
 //! `SYS_STARTCAP` (преоткрытые права, как preopen'ы WASI). То, что Linux кладёт на стек
 //! при execve, у нас спрашивают у ядра — раскладка стека остаётся делом программы.
+//!
+//! Веха 37 — **checkpoint процессов** ([[checkpoint]], [`crate::checkpoint`]):
+//! `SYS_CHECKPOINT` морозит текущий процесс в store (setjmp-семантика: живому 0,
+//! размороженному 1), `SYS_RESTORE` поднимает образ как `SYS_EXEC` — вычисления
+//! переживают перезагрузку.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -59,7 +64,7 @@ macro_rules! vprintln {
 /// Стек процесса живёт в незанятом ядром регионе VPN[2]=1 (0x4000_0000..0x8000_0000),
 /// растёт вниз от 0x8000_0000. Это гарантирует, что маппинг стека не заденет общие
 /// подтаблицы ядра (VPN[2]=0 и 2) — см. [`arch::clone_kernel_root`].
-const USER_STACK_TOP_VA: usize = 0x8000_0000;
+pub const USER_STACK_TOP_VA: usize = 0x8000_0000;
 /// Веха 31: 16 страниц (64 КиБ) — std-программы (fmt, sort) прожорливее к стеку,
 /// чем наши no_std-бинари; переполнение = фолт ниже стека = гибель процесса, не порча.
 /// Веха 32: 64 страницы (256 КиБ) — uutils кладут на стек буферы по 64 КиБ (cat/wc).
@@ -1519,6 +1524,125 @@ fn syscall(t: &mut Table, cur: usize) {
             let f = &mut t.procs[cur].frame;
             f.set_ret(0);
             f.advance();
+        }
+        // SYS_CHECKPOINT(scap, name, len) — Веха 37: заморозить СЕБЯ в store (право WRITE
+        // на store: чекпойнт ПИШЕТ объекты). Образ — под корнем `proc/<arch>/<имя>`.
+        // Семантика setjmp: живому возвращается 0 (образ снят, работает дальше),
+        // РАЗМОРОЖЕННОМУ из образа — 1 («возврат из прошлой жизни»); MAX — отказ.
+        // Морозится только лидер группы без других живых нитей (кадр один).
+        28 => {
+            let (scap, nptr, nlen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let leader = t.procs[cur].group;
+            let solo = cur == leader
+                && (0..t.procs.len()).all(|i| {
+                    i == cur || t.procs[i].group != leader || t.procs[i].state == State::Finished
+                });
+            let mut ret = usize::MAX;
+            match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) if solo && nlen > 0 && nlen <= 64 && ensure_heap_range(t, cur, nptr, nlen) => {
+                    let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
+                    if let Ok(name) = core::str::from_utf8(name_bytes) {
+                        // Кадр образа: результат 1 и продвинутый pc — размороженный
+                        // очнётся РОВНО в возврате из этого syscall'а.
+                        let mut ff = t.procs[cur].frame;
+                        ff.set_ret(1);
+                        ff.advance();
+                        let root_name = alloc::format!("proc/{}/{}", arch::ARCH_NAME, name);
+                        let (space, brk) = (t.procs[cur].space, t.procs[cur].heap_brk);
+                        let (args, env) = (t.procs[cur].args.clone(), t.procs[cur].env.clone());
+                        let pages = crate::checkpoint::freeze(
+                            &root_name, space, &ff, brk, &args, &env,
+                            USER_REGION_START, USER_STACK_TOP_VA,
+                        );
+                        // Чекпойнт обязан быть НА ДИСКЕ к возврату syscall'а — иначе
+                        // «образ» жил бы в RAM до ближайшего простоя (Веха 33).
+                        crate::object::commit_if_dirty();
+                        vprintln!(
+                            "  [ckpt] P{} SYS_CHECKPOINT '{}' — {} страниц, коммит (по cap)",
+                            cur, root_name, pages,
+                        );
+                        ret = 0;
+                    }
+                }
+                Ok(()) => vprintln!(
+                    "  [ckpt] P{} SYS_CHECKPOINT: отказ (другие нити живы / не лидер / имя негодно)",
+                    cur,
+                ),
+                Err(e) => vprintln!(
+                    "  [ckpt] P{} SYS_CHECKPOINT отклонён: {:?}  ← нет capability (WRITE) на store",
+                    cur, e,
+                ),
+            }
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(ret);
+            f.advance();
+        }
+        // SYS_RESTORE(scap, name, len) — Веха 37: разморозить процесс из образа
+        // `proc/<arch>/<имя>` (право EXEC — это запуск процесса, как SYS_EXEC, и ждём
+        // так же). args/env приезжают ИЗ ОБРАЗА (программа их уже прочла), стартовые
+        // capability — свежее наследство размораживающего (права не консервируются:
+        // дескрипторы прошлой жизни умерли вместе с ней — модель exec, не пленение).
+        29 => {
+            let (scap, nptr, nlen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let mut spawned = false;
+            match cap::store(dom, Cap::from_bits(scap as u64), Rights::EXEC) {
+                Ok(()) if nlen > 0 && nlen <= 64 && ensure_heap_range(t, cur, nptr, nlen) => {
+                    let name_bytes = unsafe { core::slice::from_raw_parts(nptr as *const u8, nlen) };
+                    if let Ok(name) = core::str::from_utf8(name_bytes) {
+                        let root_name = alloc::format!("proc/{}/{}", arch::ARCH_NAME, name);
+                        match crate::checkpoint::thaw(&root_name) {
+                            Some(img) => {
+                                let parent_scaps = t.procs[cur].start_caps.clone();
+                                let pname: &'static str = Box::leak(
+                                    alloc::format!("thaw:{}", name).into_boxed_str(),
+                                );
+                                let child = create_process_locked(t, pname, img.root, 0, 0);
+                                let cdom = t.procs[child].domain;
+                                t.procs[child].frame = img.frame;
+                                t.procs[child].heap_brk = img.heap_brk;
+                                t.procs[child].args = img.args;
+                                t.procs[child].env = img.env;
+                                for bits in parent_scaps {
+                                    if let Ok(c) =
+                                        cap::endow(dom, Cap::from_bits(bits as u64), cdom)
+                                    {
+                                        t.procs[child].start_caps.push(c.bits() as usize);
+                                    }
+                                }
+                                vprintln!(
+                                    "  [ckpt] P{} SYS_RESTORE '{}' → P{} ({} страниц; ждёт завершения, права — наследство размораживающего)",
+                                    cur, root_name, child, img.pages,
+                                );
+                                t.procs[cur].state = State::ExecWait(child);
+                                t.current = child;
+                                spawned = true;
+                            }
+                            None => vprintln!(
+                                "  [ckpt] P{} SYS_RESTORE: образа '{}' нет, он чужой архитектуры или негоден",
+                                cur, root_name,
+                            ),
+                        }
+                    }
+                }
+                Ok(()) => vprintln!("  [ckpt] P{} SYS_RESTORE: имя негодно", cur),
+                Err(e) => vprintln!(
+                    "  [ckpt] P{} SYS_RESTORE отклонён: {:?}  ← нет capability (EXEC) на store",
+                    cur, e,
+                ),
+            }
+            if !spawned {
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(usize::MAX);
+                f.advance();
+            }
         }
         other => {
             let f = &mut t.procs[cur].frame;

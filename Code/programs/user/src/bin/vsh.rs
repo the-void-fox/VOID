@@ -6,7 +6,8 @@
 //! Line-discipline на стороне программы: эхо набранного, backspace (`\x7f`/`\x08`), Enter =
 //! `\r` (терминал) или `\n` (pipe). Команды: `ls`, `cat F`, `echo TEXT > F` (или просто печать),
 //! `run NAME [ARGS…]` (Веха 30: слова после имени становятся argv ребёнка; например
-//! `run bin/hello мир`), `mv OLD NEW` (rename персоналии), `help`, `exit` — последняя
+//! `run bin/hello мир`), `thaw NAME` (Веха 37: разморозить процесс из образа
+//! `proc/<arch>/NAME`), `mv OLD NEW` (rename персоналии), `help`, `exit` — последняя
 //! завершает сессию VOID.
 #![no_std]
 #![no_main]
@@ -15,7 +16,7 @@ use void_user as sys;
 use void_user::posix as px;
 
 static HELP: &[u8] =
-    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | mv OLD NEW | ping IP | help | exit\n";
+    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | thaw NAME | mv OLD NEW | ping IP | help | exit\n";
 
 /// Разобрать IPv4 в точечной записи «A.B.C.D» в 4 байта. `None` — не разобрать.
 fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
@@ -191,6 +192,19 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
                 px::write(ep, px::STDOUT, b"vsh: run failed (no such program in store?)\n");
             } else {
                 px::write(ep, px::STDOUT, b"vsh: program exited, code ");
+                put_dec(ep, code);
+                px::write(ep, px::STDOUT, b"\n");
+            }
+            continue;
+        }
+        if let Some(rest) = cmd.strip_prefix(b"thaw ") {
+            // Веха 37: `thaw ИМЯ` — разморозить процесс из образа `proc/<arch>/ИМЯ`
+            // (снятого его же `SYS_CHECKPOINT`); ждём завершения, как run.
+            let code = sys::restore(xcap, rest);
+            if code == usize::MAX {
+                px::write(ep, px::STDOUT, b"vsh: thaw failed (no such image?)\n");
+            } else {
+                px::write(ep, px::STDOUT, b"vsh: thawed program exited, code ");
                 put_dec(ep, code);
                 px::write(ep, px::STDOUT, b"\n");
             }
