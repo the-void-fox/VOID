@@ -207,6 +207,9 @@ pub fn space_root(token: usize) -> usize {
 /// `frame` — валидный стартовый/сохранённый кадр процесса; `trap_top` — вершина ядерного
 /// trap-стека. Не возвращается.
 pub unsafe fn enter_user(frame: &TrapFrame, space: usize, trap_top: usize) -> ! {
+    // Веха 36 — парность контракта с x86: FP-состояние (f0..f31) здесь часть кадра
+    // и восстановится enter_user.s — метод пуст, но точка вызова та же.
+    frame.restore_fp();
     enter_user_frame(frame, space, trap_top)
 }
 

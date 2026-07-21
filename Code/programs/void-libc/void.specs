@@ -1,0 +1,5 @@
+*startfile:
+-T void.ld%s void-crt0.o%s
+
+*lib:
+-( -lvoid -lc -lgcc -)

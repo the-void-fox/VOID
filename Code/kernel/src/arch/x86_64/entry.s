@@ -33,9 +33,12 @@ _start32:
 
     lgdt [gdt64_ptr]
 
-    # PAE — обязательна для long mode.
+    # PAE — обязательна для long mode. OSFXSR|OSXMMEXCPT (Веха 36) — SSE для
+    # userspace: без них любой SSE-опкод в ring3 даёт #UD (ядро само собрано
+    # с soft-float и XMM не трогает; контекст процессов носит fxsave64-область
+    # trap-кадра, см. trap.rs).
     mov eax, cr4
-    or eax, 1 << 5
+    or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
     # Идентичные таблицы: pml4[0] → pdpt; pdpt[0..3] → 4 PD; PD — 2048 × 2 МиБ = 4 ГиБ.

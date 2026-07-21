@@ -60,7 +60,35 @@ pub struct TrapFrame {
     /// её в `IA32_FS_BASE` на входе в U ([`super::enter_user`]), т.к. `%fs`-относительные
     /// `#[thread_local]`-доступы иначе читали бы TLS чужой нити. На riscv роль играет `tp`.
     pub fsbase: usize,
+    /// Веха 36 — FP/SSE-контекст процесса (образ `fxsave64`: x87 + XMM0..15 + MXCSR).
+    /// Как и `fsbase`, не трогается стабом: ядро собрано с soft-float и XMM не касается,
+    /// поэтому живое состояние FPU на входе в трап принадлежит процессу — его снимает
+    /// [`TrapFrame::save_fp`] (proc сразу после копии кадра) и возвращает
+    /// [`TrapFrame::restore_fp`] на входе в U. Зеркало riscv, где f0..f31 спасает сам стаб.
+    pub fx: FxArea,
 }
+
+/// 512-байтная область `fxsave64`. Отдельный тип ради ручного `Default`
+/// (`[u64; 64]` его не даёт) с честным стартовым состоянием FPU.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FxArea(pub [u64; 64]);
+
+impl Default for FxArea {
+    fn default() -> Self {
+        let mut a = [0u64; 64];
+        a[0] = 0x037F; // FCW: все исключения x87 замаскированы (как после finit)
+        a[3] = 0x1F80; // MXCSR: все исключения SSE замаскированы (reset-состояние)
+        FxArea(a)
+    }
+}
+
+/// `fxsave64`/`fxrstor64` требуют 16-выровненный адрес; кадры в таблице процессов не
+/// выровнены — скретч + копия. Один на систему: ядро однопроцессорное, а внутри
+/// trap-обработчиков IF=0 (interrupt gate) — реентерабельность исключена.
+#[repr(C, align(16))]
+struct FxScratch([u64; 64]);
+static mut FX_SCRATCH: FxScratch = FxScratch([0; 64]);
 
 // Индексы регистров в `regs` (порядок push'ей: rax первым → верх структуры).
 pub const RAX: usize = 14;
@@ -145,6 +173,26 @@ impl TrapFrame {
     /// на входе в U загрузил бы мусор и `%fs`-доступы (thread_local) улетели бы в никуда.
     pub fn carry_tls_from(&mut self, prev: &TrapFrame) {
         self.fsbase = prev.fsbase;
+    }
+
+    /// Веха 36 — снять живое состояние FPU/SSE в кадр. Зовётся сразу после копии кадра
+    /// из трапа: слот `fx` там — мусор со стека (стаб его не пишет), а живые XMM в CPU —
+    /// ровно состояние затрапившего процесса (ядро с soft-float их не меняет).
+    pub fn save_fp(&mut self) {
+        unsafe {
+            let p = core::ptr::addr_of_mut!(FX_SCRATCH);
+            core::arch::asm!("fxsave64 [{0}]", in(reg) p, options(nostack));
+            self.fx.0 = (*p).0;
+        }
+    }
+
+    /// Веха 36 — вернуть FPU/SSE-состояние кадра в CPU (вход в U, [`super::enter_user`]).
+    pub fn restore_fp(&self) {
+        unsafe {
+            let p = core::ptr::addr_of_mut!(FX_SCRATCH);
+            (*p).0 = self.fx.0;
+            core::arch::asm!("fxrstor64 [{0}]", in(reg) p, options(nostack));
+        }
     }
 }
 

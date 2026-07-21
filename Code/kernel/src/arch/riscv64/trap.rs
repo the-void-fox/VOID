@@ -101,6 +101,12 @@ impl TrapFrame {
     /// как обычный GPR, во «свежем» кадре он уже верный — переносить нечего (no-op; парный
     /// x86, где `fsbase` — MSR вне кадра).
     pub fn carry_tls_from(&mut self, _prev: &TrapFrame) {}
+
+    /// Веха 36 — FP-контекст: на RISC-V f0..f31+fcsr — часть кадра, их спасает сам стаб
+    /// trap_entry.s (Веха 32) — обе стороны no-op (парный x86, где XMM снимает ядро
+    /// fxsave64-областью кадра).
+    pub fn save_fp(&mut self) {}
+    pub fn restore_fp(&self) {}
 }
 
 /// Классифицировать trap из U-mode в арх-нейтральный [`UserTrap`] для `proc` (Веха 24).

@@ -42,9 +42,31 @@ SECTIONS
         *(.srodata .srodata.*)
     } :rodata
 
+    /* Веха 36 — C-мир: массивы конструкторов/деструкторов gcc. Указатели резолвятся
+       статически (не-PIE) — им хватает R-only сегмента; KEEP — от них никто не
+       ссылается, без KEEP gc-sections их выкинул бы. crt0 void-libc обходит их сам
+       (crti/crtbegin не линкуются: -nostartfiles). Rust-объекты их не эмитят —
+       для Rust-программ секции пусты и безвредны. */
+    .init_array : ALIGN(8) {
+        __init_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
+        __init_array_end = .;
+    } :rodata
+    .fini_array : ALIGN(8) {
+        __fini_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+        KEEP(*(.fini_array))
+        __fini_array_end = .;
+    } :rodata
+
     . = ALIGN(4K);
     .data : {
         *(.data .data.*)
+        /* riscv gcc адресует малые данные относительно gp (linker relaxation):
+           классическая точка gp — начало .sdata + 0x800 (охват ±2 КиБ в обе стороны).
+           crt0 void-libc грузит его в gp; Rust/lld символ не трогают. */
+        PROVIDE(__global_pointer$ = . + 0x800);
         *(.sdata .sdata.*)
         *(.got .got.*)      /* x86: редкие GOT-ссылки статики — чтобы не осиротели */
     } :data

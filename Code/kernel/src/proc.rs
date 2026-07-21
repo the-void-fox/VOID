@@ -554,6 +554,10 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
         let prev = t.procs[cur].frame;
         t.procs[cur].frame = *frame; // сохранить состояние текущего процесса
         t.procs[cur].frame.carry_tls_from(&prev);
+        // Веха 36: FP/SSE-состояние стаб тоже не спасает (x86: fx-слот — мусор со стека) —
+        // снять живые регистры CPU, они принадлежат затрапившему (riscv — no-op: f-регистры
+        // в кадре со времён Вехи 32).
+        t.procs[cur].frame.save_fp();
         match trap {
             UserTrap::Syscall => syscall(&mut t, cur),
             // Веха 22.2: page fault из U-mode — ленивая страница кучи или гибель процесса.

@@ -304,6 +304,9 @@ pub unsafe fn enter_user(frame: &TrapFrame, space: usize, trap_top: usize) -> ! 
     // Веха 35 — TLS нити: загрузить её базу %fs (0 у нитей без TLS — безвредно).
     // fsbase — глобальный регистр CPU, прошлая нить могла оставить свой → ставим всегда.
     wrmsr(IA32_FS_BASE, f.fsbase as u64);
+    // Веха 36 — вернуть FP/SSE-состояние процесса (XMM — глобальные регистры CPU,
+    // симметрично save_fp на трапе; ядро между ними их не трогает — soft-float).
+    f.restore_fp();
     paging::enable(space_root(space));
     x86_enter_user(&f)
 }
