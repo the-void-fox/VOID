@@ -72,7 +72,11 @@ multicall coreutils (форк-сабмодуль `vendor/coreutils`) даёт н
 ([[threads]]): ядро планирует нити внутри процесса (`SYS_THREAD_SPAWN/JOIN`,
 `SYS_FUTEX`, `SYS_SET_TLS`), форк дорос до `std::thread`, futex `Mutex/Condvar`
 и нативного `thread_local!` (TLS Variant I/II) — обычный многопоточный Rust
-работает на обеих архитектурах (разблокирует sort/rayon/ripgrep).
+работает на обеих архитектурах (разблокирует sort/rayon/ripgrep). Веха 36 —
+nixpkgs-cross ([[nixpkgs-cross]]): C-мир — GNU hello и bzip2 по РЕЦЕПТАМ
+nixpkgs (pkgsCross gcc+newlib из кэша + глю `void-libc` ~610 строк + specs)
+работают в vsh на обеих архитектурах; ядро x86 доросло до FP/SSE-контекста
+процессов (fxsave64-область кадра — зеркало riscv Вехи 32).
 План пакетов — [[void-pkg]].
 
 ## Текущие задачи
@@ -80,8 +84,8 @@ multicall coreutils (форк-сабмодуль `vendor/coreutils`) даёт н
 → граница архитектур `arch/` (готово) → x86_64: ядро, userspace, устройства (готово) →
 бенчи и README (готово) → host-мост + NAR (готово) → контракт запуска (готово)
 → std-порт (готово) → uutils (готово) → политика коммитов (готово) → virtio-net
-(готово) → потоки std::thread (готово). Дальше по принятому порядку:
-nixpkgs-cross → бэкенды B/C → checkpoint → декларативный init → реальное железо.
+(готово) → потоки std::thread (готово) → nixpkgs-cross (готово). Дальше по
+принятому порядку: бэкенды B/C → checkpoint → декларативный init → реальное железо.
 
 ## ADR
 Архитектурные решения в `adr/`. Ключевые:

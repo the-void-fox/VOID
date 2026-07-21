@@ -33,9 +33,10 @@ status: active
 
 - [x] **Веха 35 — потоки (std::thread) — закрыта** ([[threads]]): ядро планирует НИТИ внутри процесса (`Proc.group` — общие space/domain/куча лидера, свои кадр/стек/TLS); сисколлы `SYS_THREAD_SPAWN/EXIT/JOIN` + `SYS_FUTEX` (ключ space+uaddr) + `SYS_SET_TLS` (набор до 27), `SYS_EXIT` кладёт всю группу. Форк (`vendor/rust`): `has_thread_local`+local-exec, нативный TLS (tp Variant I / база %fs Variant II, шаблон `.tdata/.tbss` из линкер-скрипта), `Thread::new/join`, futex `Mutex/Condvar/RwLock/Parker`, аллокатор под спин-локом. Демо: `bin/threads` (no_std, счётчик 200000 под самодельным futex-мьютексом) и `bin/threads-std` (обычный `std::thread`+`Arc<Mutex>`+`thread_local!` с тестом изоляции TLS, 80000) — обе арх, паник 0. Лучший баг: x86 `fsbase` (MSR, не GP) затирался мусором на каждом трапе — фикс `carry_tls_from`. Разблокирует sort/rayon/ripgrep.
 
+- [x] **Веха 36 — nixpkgs-cross (C-мир поверх void-libc) — закрыта** ([[nixpkgs-cross]], ступень 3 лестницы [[void-pkg]]): настоящие C-программы по рецептам nixpkgs — GNU hello (autotools+gnulib) и bzip2 — собираются `nix-build nix -A <arch>.<pkg>` и работают в vsh на обеих архитектурах (hello с UTF-8 `--greeting`, bzip2 честно сжимает/разжимает файлы персоналии). Тулчейн НЕ свой: pkgsCross.{riscv64,x86_64}-embedded (gcc 15.2 + newlib 4.5 из кэша), порт = глю `void-libc` (~610 строк: crt0 + стабы newlib поверх ABI VOID + specs, файлы — IPC к posixfs, sbrk — ленивый SYS_MAP) + общий linker.ld дорос до `.init_array`/`__global_pointer$`. Ядро: **FP/SSE-контекст x86** (CR4.OSFXSR, FxArea=fxsave64 в кадре, save_fp на трапе/restore_fp на входе — зеркало riscv-решения Вехи 32; до этого любой SSE-опкод C-кода давал #UD). Лучшие грабли: newlib riscv ждёт `_write`, newlib x86 — `write` (алиасы); `__structuredAttrs` прячет NIX_CFLAGS_COMPILE от cc-wrapper (класть в env.*); gnulib на неизвестной ОС (getprogname #error, getdtablesize→getrlimit) — функции в глю + ac_cv в configure + декларации в config.h.
+
 ## Дальше (порядок принят, но может поменяться)
-Лестница [[void-pkg]] дошла до п.2 («самодостаточно для энтузиаста»). Согласованный порядок:
-3. [ ] nixpkgs-cross (C-мир поверх VOID-libc) — следующая ступень лестницы [[void-pkg]].
+Лестница [[void-pkg]] дошла до п.3 (nixpkgs-cross). Согласованный порядок:
 4. [ ] Бэкенды B и C void-pkg: Linux-ABI персоналия (замыкания кэша nixpkgs как есть) и WASI через wasmi — исследовательские дорожки.
 5. [ ] Checkpoint процессов — ортогональная персистентность вычислений (наследие KeyKOS).
 6. [ ] Декларативный init: system-конфиг как объект-дерево store (какие серверы, какие права, какие программы) вместо сценария kmain; генерации и откат — историей корня. «configuration.nix» родными средствами.
@@ -109,7 +110,7 @@ status: active
 - [x] **Веха 29.** Мост host→store: `libs/void-store` (формат как библиотека, `BlockIo`), `void-store-import` (put/nar/ls/cat), NAR-импорт `nix-store --dump` → корни store; форк rust сабмодулем под std-порт. См. [[store-bridge]].
 - [x] **Веха 30.** Контракт запуска (ABI v2): argv в SYS_EXEC, env + стартовые capability наследуются (`cap::endow`), SYS_ARGS/SYS_STARTCAP; posixfs seek/rename; vsh run-с-аргами/mv/tail. См. [[process-contract]].
 - [x] **Веха 31.** std-порт: таргеты *-unknown-void + pal в форке rust; тулчейн void из stage1; hello-std обычным cargo — argv/env/куча/HashMap/exit-код на обеих архитектурах. См. [[std-port]].
-- [ ] **Пакетная дорожка (продолжение).** Веха 30 (контракт запуска) → Веха 31 (std-порт из `vendor/rust`) → Веха 32 (uutils) → nixpkgs-cross через VOID-libc; профили/поколения/откат — свойства store, не менеджера.
+- [x] **Пакетная дорожка (бэкенд A) закрыта.** Веха 30 (контракт запуска) → Веха 31 (std-порт из `vendor/rust`) → Веха 32 (uutils) → Веха 36 (nixpkgs-cross через void-libc); профили/поколения/откат — свойства store, не менеджера.
 
 ## Опционально / исследовательское
 - [ ] SASOS-эксперимент: изоляция средствами Rust вместо железных границ (см. [[0001-rust-riscv-microkernel]]). Практичный первый шаг — гибрид: доверенные серверы в одном AS (модель Theseus/Hubris), код сервера = проверяемый объект по хэшу. См. [[phase-2-state-analysis]].

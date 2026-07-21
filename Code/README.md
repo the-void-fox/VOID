@@ -24,8 +24,10 @@ Code/
 │       ├── virtio_net.rs # драйвер сети: две очереди RX/TX, опрос, сырые кадры наверх
 │       └── ...           # sched, timer, executor, heap, frame, elf
 ├── programs/
-│   └── user/             # userspace: либа шимов (ecall / int 0x80) + 16 бинарей
-│                         #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
+│   ├── user/             # userspace: либа шимов (ecall / int 0x80) + 16 бинарей
+│   │                     #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
+│   └── void-libc/        # C-глю (Веха 36): crt0 + стабы newlib поверх ABI VOID + specs
+│                         #   (собирает ../nix/default.nix кросс-gcc'ом из pkgsCross)
 ├── libs/
 │   ├── void-abi/         # общие типы границы ядро/userspace (ContentId, Cap, Rights)
 │   └── void-store/       # формат и логика store (no_std, трейт BlockIo) —
@@ -110,6 +112,20 @@ vsh> run bin/threads-std   # std::thread + Arc<Mutex> + thread_local (доста
 `threads-std` — крейт `programs/std-threads` (тулчейн `void`, как std-hello);
 доставка: `put <elf> bin/<arch>/threads-std`. Подробности —
 `Obsidian/10-projects/void/notes/threads.md`.
+
+## C-мир: nixpkgs-cross (Веха 36)
+Настоящие C-программы по рецептам nixpkgs: кросс-gcc+newlib из
+`pkgsCross.{riscv64,x86_64}-embedded` (бинарный кэш) + глю `programs/void-libc`
+(crt0 + стабы newlib поверх ABI VOID: файлы — IPC к posixfs, sbrk — ленивый
+SYS_MAP) + specs-файл. Сборка на хосте, из корня репо:
+```sh
+nix-build nix -A riscv64.hello && nix-build nix -A riscv64.bzip2   # и x86_64.*
+tools/.../void-store-import void-disk.img put result/bin/hello bin/<arch>/hello-gnu
+```
+В vsh: `run bin/hello-gnu --greeting=Привет`, `run bin/bzip2 -z файл` /
+`-d файл.bz2`. Ручная сборка своего C: `gcc -B<void-libc>/lib
+-specs=<void-libc>/lib/void.specs prog.c` (тулчейн — `nix-build nix -A riscv64.cc`).
+Подробности — `Obsidian/10-projects/void/notes/nixpkgs-cross.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем

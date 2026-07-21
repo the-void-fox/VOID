@@ -11,9 +11,9 @@ x86_64) из одного дерева исходников, весь userspace 
 
 ```
   ╔══════════════════════════════════════════╗
-  ║  VOID — Веха 35                           ║
-  ║  потоки: std::thread, futex Mutex,        ║
-  ║  нативный thread_local (TLS) на двух арх  ║
+  ║  VOID — Веха 36                           ║
+  ║  C-мир: GNU hello и bzip2 по рецептам     ║
+  ║  nixpkgs (newlib + void-libc) на двух арх ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -149,7 +149,11 @@ mv/rm/head/echo одним multicall-бинарём; `cp` на x86_64 созда
 ядро отдаёт лишь сырые кадры virtio-net, протоколы в userspace-сервере) ·
 **потоки** (`run bin/threads-std`: обычный `std::thread` + `Arc<Mutex>` на
 futex + `thread_local!` через нативный TLS — 4 нити считают общий счётчик, итог
-точен; ядро планирует нити внутри процесса, синхронизация — userspace).
+точен; ядро планирует нити внутри процесса, синхронизация — userspace) ·
+**C-мир** (`run bin/hello-gnu --greeting=Привет` и `run bin/bzip2 -z файл`:
+настоящие GNU hello и bzip2, собранные ПО РЕЦЕПТАМ nixpkgs кросс-gcc+newlib
+с глю `void-libc` ~610 строк — autotools/gnulib и Makefile-пакеты приходят
+как есть; заодно ядро x86 доросло до FP/SSE-контекста процессов).
 
 ## Сборка и запуск
 
@@ -178,9 +182,11 @@ Code/
 ├── programs/user/        # userspace: либа syscall-шимов + 16 программ (ELF)
 ├── programs/std-hello/   # первая std-программа (тулчейн void, обычный cargo)
 ├── programs/std-threads/ # демо потоков: std::thread + Arc<Mutex> + thread_local
+├── programs/void-libc/   # C-глю: crt0 + стабы newlib поверх ABI VOID + specs
 ├── libs/void-abi/        # типы границы ядро/userspace (ContentId, Cap, Rights)
 ├── libs/void-store/      # формат и логика store (no_std) — общие ядру и хосту
 └── tools/void-store-import/  # мост host→store: put/nar/ls/cat в образ диска
+nix/                      # nixpkgs-cross: pkgsCross gcc+newlib → пакеты VOID (hello, bzip2)
 Obsidian/                 # концепция, ADR, заметки вех, роадмап (Obsidian vault)
 vendor/rust               # форк rust 1.97.0 (ветка void): таргеты *-unknown-void + std
 vendor/coreutils          # форк uutils 0.9.0 (ветка void): cfg-заплатки «как WASI»
@@ -188,7 +194,7 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 ```
 
 Развёрнутая документация — в `Obsidian/10-projects/void/`: ADR 0001–0005,
-заметки каждой вехи (1–35), staged-роадмап (`Obsidian/30-todo/todo.md`).
+заметки каждой вехи (1–36), staged-роадмап (`Obsidian/30-todo/todo.md`).
 
 ## Дальше
 
@@ -198,8 +204,10 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 обычные Rust-программы и настоящие утилиты собираются обычным cargo (тулчейн
 `void`) и работают на обеих архитектурах с одного диска; политика коммитов
 store дозрела до железа (Веха 33), появилась сеть — стек ARP/IPv4/ICMP echo в
-userspace, `ping` из vsh (Веха 34), и настоящие потоки — `std::thread`,
+userspace, `ping` из vsh (Веха 34), настоящие потоки — `std::thread`,
 `Arc<Mutex>` на futex, `thread_local!` через нативный TLS (Веха 35, разблокирует
-sort/rayon/ripgrep). Дальше по принятому порядку: nixpkgs-cross, бэкенды B/C,
-checkpoint процессов, декларативный init — и реальное железо (VisionFive 2 /
-x86-минипк).
+sort/rayon/ripgrep) — и C-мир: GNU hello и bzip2 собираются по рецептам nixpkgs
+(pkgsCross gcc+newlib + глю `void-libc`) и работают с того же диска (Веха 36 —
+ступень «nixpkgs как книга рецептов» ADR 0004 взята). Дальше по принятому
+порядку: бэкенды B/C, checkpoint процессов, декларативный init — и реальное
+железо (VisionFive 2 / x86-минипк).
