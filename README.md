@@ -11,9 +11,9 @@ x86_64) из одного дерева исходников, весь userspace 
 
 ```
   ╔══════════════════════════════════════════╗
-  ║  VOID — Веха 36                           ║
-  ║  C-мир: GNU hello и bzip2 по рецептам     ║
-  ║  nixpkgs (newlib + void-libc) на двух арх ║
+  ║  VOID — Веха 37                           ║
+  ║  checkpoint: вычисления переживают        ║
+  ║  перезагрузку (freeze/thaw, KeyKOS)       ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -64,7 +64,7 @@ SSD-дружелюбие было последним «до железа» пу�
 5. **Микроядерность.** Драйвер блочного устройства, POSIX-слой, сетевой стек
    (ARP/IPv4/ICMP), shell — обычные userspace-процессы, говорящие с ядром через
    синхронный IPC (CALL/RECV/REPLY с reply-capability) и узкий набор
-   syscall'ов (~27). Ядро сети не знает — отдаёт лишь сырые Ethernet-кадры;
+   syscall'ов (~29). Ядро сети не знает — отдаёт лишь сырые Ethernet-кадры;
    протоколы синхронизации нитей (Mutex/Condvar) — тоже userspace, на одном
    примитиве futex.
 6. **Мультиархитектурность через узкий контракт.** Вся арх-специфика — в
@@ -119,7 +119,7 @@ userspace счётчиком rdtime/rdtsc). Сравнение с Linux — **г
 
 | | VOID (обе арх.) | Linux 7.1 x86_64 (тот же QEMU) |
 |---|:---:|:---:|
-| Образ ядра в памяти | **~420–620 КиБ** (вместе с семенами всех 16 программ) | ~48 МиБ (резерв до MemTotal) |
+| Образ ядра в памяти | **~420–620 КиБ** (вместе с семенами всех 17 программ) | ~48 МиБ (резерв до MemTotal) |
 | RAM после загрузки + uutils-демо (пик) | **≈ 30–37 МиБ**¹ | ≈ 80 МиБ |
 | Программа userspace | 6–13 КиБ на ELF (no_std) · 85–122 КиБ (std) · 1.8–2.3 МиБ (coreutils: 8 утилит одним бинарём) | — |
 
@@ -153,7 +153,11 @@ futex + `thread_local!` через нативный TLS — 4 нити счит�
 **C-мир** (`run bin/hello-gnu --greeting=Привет` и `run bin/bzip2 -z файл`:
 настоящие GNU hello и bzip2, собранные ПО РЕЦЕПТАМ nixpkgs кросс-gcc+newlib
 с глю `void-libc` ~610 строк — autotools/gnulib и Makefile-пакеты приходят
-как есть; заодно ядро x86 доросло до FP/SSE-контекста процессов).
+как есть; заодно ядро x86 доросло до FP/SSE-контекста процессов) ·
+**checkpoint процессов** (`run bin/freeze`, затем `thaw пример` — хоть после
+перезагрузки: замороженное вычисление продолжает с того же шага с тем же
+стеком и кучей; образ — дерево объектов store, страницы дедуплицируются,
+семантика setjmp — живому 0, размороженному 1).
 
 ## Сборка и запуск
 
@@ -179,7 +183,7 @@ Code/
 ├── kernel/               # микроядро: store, cap, IPC, proc, sched, virtio-blk/net
 │   └── src/arch/         # контракт архитектур: riscv64 (SBI/PLIC/Sv39),
 │                         #   x86_64 (PVH, GDT/TSS, LAPIC/IOAPIC, PCI/MSI-X)
-├── programs/user/        # userspace: либа syscall-шимов + 16 программ (ELF)
+├── programs/user/        # userspace: либа syscall-шимов + 17 программ (ELF)
 ├── programs/std-hello/   # первая std-программа (тулчейн void, обычный cargo)
 ├── programs/std-threads/ # демо потоков: std::thread + Arc<Mutex> + thread_local
 ├── programs/void-libc/   # C-глю: crt0 + стабы newlib поверх ABI VOID + specs
@@ -194,7 +198,7 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 ```
 
 Развёрнутая документация — в `Obsidian/10-projects/void/`: ADR 0001–0005,
-заметки каждой вехи (1–36), staged-роадмап (`Obsidian/30-todo/todo.md`).
+заметки каждой вехи (1–37), staged-роадмап (`Obsidian/30-todo/todo.md`).
 
 ## Дальше
 
@@ -206,8 +210,9 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 store дозрела до железа (Веха 33), появилась сеть — стек ARP/IPv4/ICMP echo в
 userspace, `ping` из vsh (Веха 34), настоящие потоки — `std::thread`,
 `Arc<Mutex>` на futex, `thread_local!` через нативный TLS (Веха 35, разблокирует
-sort/rayon/ripgrep) — и C-мир: GNU hello и bzip2 собираются по рецептам nixpkgs
+sort/rayon/ripgrep), C-мир: GNU hello и bzip2 собираются по рецептам nixpkgs
 (pkgsCross gcc+newlib + глю `void-libc`) и работают с того же диска (Веха 36 —
-ступень «nixpkgs как книга рецептов» ADR 0004 взята). Дальше по принятому
-порядку: бэкенды B/C, checkpoint процессов, декларативный init — и реальное
-железо (VisionFive 2 / x86-минипк).
+ступень «nixpkgs как книга рецептов» ADR 0004 взята) — и checkpoint процессов
+(Веха 37, наследие KeyKOS): вычисления переживают перезагрузку, freeze/thaw
+с образом-деревом объектов store. Дальше по принятому порядку: бэкенды B/C,
+декларативный init — и реальное железо (VisionFive 2 / x86-минипк).

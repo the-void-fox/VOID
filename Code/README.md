@@ -24,7 +24,7 @@ Code/
 │       ├── virtio_net.rs # драйвер сети: две очереди RX/TX, опрос, сырые кадры наверх
 │       └── ...           # sched, timer, executor, heap, frame, elf
 ├── programs/
-│   ├── user/             # userspace: либа шимов (ecall / int 0x80) + 16 бинарей
+│   ├── user/             # userspace: либа шимов (ecall / int 0x80) + 17 бинарей
 │   │                     #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
 │   └── void-libc/        # C-глю (Веха 36): crt0 + стабы newlib поверх ABI VOID + specs
 │                         #   (собирает ../nix/default.nix кросс-gcc'ом из pkgsCross)
@@ -126,6 +126,16 @@ tools/.../void-store-import void-disk.img put result/bin/hello bin/<arch>/hello-
 `-d файл.bz2`. Ручная сборка своего C: `gcc -B<void-libc>/lib
 -specs=<void-libc>/lib/void.specs prog.c` (тулчейн — `nix-build nix -A riscv64.cc`).
 Подробности — `Obsidian/10-projects/void/notes/nixpkgs-cross.md`.
+
+## Checkpoint процессов (Веха 37)
+Вычисления переживают перезагрузку: процесс морозит себя `SYS_CHECKPOINT`
+(образ — дерево объектов store под `proc/<arch>/<имя>`: страницы — дети
+манифеста, дедуп/GC бесплатно), возврат 0 — живому, 1 — размороженному (setjmp).
+```
+vsh> run bin/freeze     # цикл, на шаге 5 — образ; итог 385 ✓
+vsh> thaw пример        # хоть после перезагрузки: «продолжаю с шага 5, куча цела»
+```
+Подробности — `Obsidian/10-projects/void/notes/checkpoint.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
