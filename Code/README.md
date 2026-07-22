@@ -137,6 +137,21 @@ vsh> thaw пример        # хоть после перезагрузки: «
 ```
 Подробности — `Obsidian/10-projects/void/notes/checkpoint.md`.
 
+## linux-abi: бинари nixpkgs как есть (Веха 38, бэкенд B)
+Неизменённые **static-PIE musl**-бинари из кэша nixpkgs работают под персоналией
+Linux: тонкий транслятор Linux-syscall'ов в ядре (`kernel/src/linux.rs` +
+`proc::linux_syscall`). `SYS_EXEC` авто-детектит `ET_DYN` → linux-личность
+(`Proc.linux`); riscv `ecall` разводится флагом, x86 `syscall` ловится как #UD
+(без MSR/стаба). `brk`/`mmap(anon)` — поверх ленивой кучи (Веха 22).
+```sh
+nix-shell -p pkgsCross.musl64.buildPackages.gcc --run \
+  'x86_64-unknown-linux-musl-gcc -static-pie -fPIE hello.c -o hello'   # riscv64-musl для RISC-V
+tools/.../void-store-import void-disk.img put hello bin/<arch>/lhello
+```
+В vsh: `run bin/lhello`, `run bin/busybox echo …` / `uname -a` / `seq 1 5`
+(busybox 1.37 — один бинарь, мультиплекс по argv; файловые applet'ы отложены).
+Подробности и рецепт сборки busybox — `Obsidian/10-projects/void/notes/linux-abi.md`.
+
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
 `gdb target/<таргет>/debug/void-kernel` → `target remote :1234`.
