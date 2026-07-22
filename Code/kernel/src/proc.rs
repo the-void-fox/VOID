@@ -165,6 +165,10 @@ struct Proc {
     /// Веха 35 — дедлайн futex-ожидания в тиках [`arch`]-счётчика (`None` — бессрочно).
     /// Истёкший дедлайн будит нить с «таймаутом» (проверяется в [`resume`]).
     futex_deadline: Option<u64>,
+    /// Веха 38 — личность linux-abi: процесс — неизменённый static-PIE musl-бинарь из nixpkgs,
+    /// его `ecall`/`syscall` уходит в трансля́тор [`crate::linux`], а не в ABI VOID. Ставится
+    /// при exec'е ET_DYN-образа ([`spawn_linux_locked`]); нити наследуют (у linux их пока нет).
+    linux: bool,
 }
 
 struct Table {
@@ -254,6 +258,7 @@ fn create_process_locked(
         retval: 0,
         futex_addr: 0,
         futex_deadline: None,
+        linux: false, // по умолчанию — родная личность VOID; spawn_linux_locked поставит true
     });
     idx
 }
@@ -286,6 +291,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         retval: 0,
         futex_addr: 0,
         futex_deadline: None,
+        linux: t.procs[leader].linux, // нить наследует личность лидера (у linux нитей пока нет)
     });
     idx
 }
@@ -303,6 +309,50 @@ pub fn spawn_elf(name: &'static str, elf_bytes: &[u8], arg: usize) -> Result<usi
     // код/данные ELF ниже USER_HEAP_BASE_VA, куча над ними, стек у самого верха.
     let entry = elf::load(root, elf_bytes, USER_HEAP_BASE_VA)?;
     Ok(create_process(name, root, entry, arg))
+}
+
+/// Веха 38 — завести LINUX-процесс из static-PIE ELF (ET_DYN) под УЖЕ взятым замком таблицы.
+/// В отличие от [`spawn_elf`] (наш ET_EXEC): образ грузится по базе [`USER_REGION_START`]
+/// ([`elf::load_pie`], musl само-релоцируется), а вместо регистров-аргументов строится
+/// стартовый стек Linux — `argc/argv/envp/`**`auxv`** ([`crate::linux::build_init_stack`]),
+/// по которому musl находит себя, канарейку и (для многопоточных) TLS. Процесс помечается
+/// `linux` — его syscall'ы поедут в трансля́тор [`crate::linux`]. `root` — уже созданное
+/// адресное пространство (клон ядра + стек). `None` — негодный образ или нет памяти.
+fn spawn_linux_locked(
+    t: &mut Table,
+    pname: &'static str,
+    bytes: &[u8],
+    root: usize,
+    args_blob: Vec<u8>,
+) -> Option<usize> {
+    let pie = match elf::load_pie(root, bytes, USER_REGION_START, USER_HEAP_BASE_VA) {
+        Ok(p) => p,
+        Err(e) => {
+            vprintln!("  [linux] негодный PIE-образ: {:?}", e);
+            return None;
+        }
+    };
+    // Минимальное окружение Linux — musl это устраивает (PATH/TERM/HOME на будущее для busybox).
+    let env: &[u8] = b"PATH=/bin:/usr/bin\0TERM=linux\0HOME=/\0";
+    // 16 байт AT_RANDOM (канарейка/ГПСЧ musl) — из счётчика тиков через splitmix64.
+    let mut rnd = [0u8; 16];
+    let mut seed = arch::now_ticks();
+    for chunk in rnd.chunks_mut(8) {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let bytes = seed.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    let (block, sp) = crate::linux::build_init_stack(USER_STACK_TOP_VA, &args_blob, env, &pie, rnd);
+
+    let child = create_process_locked(t, pname, root, pie.entry, 0);
+    // Стартовый кадр: вход = pie.entry, sp = вершина построенного стека (там argc). Аргументы
+    // Linux читает со стека, а не из регистров — a0/rdi обнулены (musl `_start` их игнорирует).
+    t.procs[child].frame = TrapFrame::new_user(pie.entry, sp, 0);
+    t.procs[child].linux = true;
+    t.procs[child].args = args_blob;
+    t.procs[child].env = Vec::from(env);
+    copy_to_space(arch::space_root(t.procs[child].space), sp, &block);
+    Some(child)
 }
 
 /// Домен защиты (c-space) процесса — сюда ядро минтит его начальные capability до [`run`].
@@ -564,7 +614,15 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
         // в кадре со времён Вехи 32).
         t.procs[cur].frame.save_fp();
         match trap {
-            UserTrap::Syscall => syscall(&mut t, cur),
+            // Веха 38: linux-процесс — его ecall (riscv) уходит в трансля́тор [`crate::linux`],
+            // а не в ABI VOID (на x86 linux зовёт ядро `syscall`'ом → ветка Unknown ниже).
+            UserTrap::Syscall => {
+                if t.procs[cur].linux {
+                    linux_syscall(&mut t, cur)
+                } else {
+                    syscall(&mut t, cur)
+                }
+            }
             // Веха 22.2: page fault из U-mode — ленивая страница кучи или гибель процесса.
             UserTrap::PageFault { va, kind } => handle_user_fault(&mut t, cur, va, kind),
             UserTrap::TimerTick => {
@@ -576,11 +634,19 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                 }
             }
             UserTrap::Unknown(code) => {
-                vprintln!("  [proc] неожиданный trap из U (код {:#x}) — процесс завершён", code);
-                t.procs[cur].state = State::Finished;
-                wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
-                if let Some(n) = t.next_runnable(cur) {
-                    t.current = n;
+                // Веха 38: musl x86-64 зовёт ядро инструкцией `syscall` (0F 05); мы её НЕ
+                // включили (EFER.SCE=0), поэтому она приходит как #UD (вектор 6). Для
+                // linux-процесса распознаём опкод и обслуживаем как syscall (rip на инструкции;
+                // linux_syscall перешагнёт её skip_syscall_insn'ом при завершении).
+                if t.procs[cur].linux && is_linux_syscall_insn(&t, cur) {
+                    linux_syscall(&mut t, cur);
+                } else {
+                    vprintln!("  [proc] неожиданный trap из U (код {:#x}) — процесс завершён", code);
+                    t.procs[cur].state = State::Finished;
+                    wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
+                    if let Some(n) = t.next_runnable(cur) {
+                        t.current = n;
+                    }
                 }
             }
         }
@@ -1220,52 +1286,66 @@ fn syscall(t: &mut Table, cur: usize) {
                         match elf_bytes {
                             Some(bytes) => {
                                 let root = new_address_space();
-                                match elf::load(root, &bytes, USER_HEAP_BASE_VA) {
-                                    Ok(entry) => {
-                                        // Наследство собрать ДО создания ребёнка (push в
-                                        // таблицу может перевезти Vec процессов).
-                                        let parent_env = t.procs[cur].env.clone();
-                                        let parent_scaps = t.procs[cur].start_caps.clone();
-                                        // argv ребёнка: имя + доп. аргументы вызывающего.
-                                        let mut args = Vec::from(name.as_bytes());
+                                // argv ребёнка: имя + доп. аргументы вызывающего (общее для обоих путей).
+                                let mut args = Vec::from(name.as_bytes());
+                                args.push(0);
+                                if alen > 0 {
+                                    args.extend_from_slice(unsafe {
+                                        core::slice::from_raw_parts(aptr as *const u8, alen)
+                                    });
+                                    if *args.last().unwrap() != 0 {
                                         args.push(0);
-                                        if alen > 0 {
-                                            args.extend_from_slice(unsafe {
-                                                core::slice::from_raw_parts(aptr as *const u8, alen)
-                                            });
-                                            if *args.last().unwrap() != 0 {
-                                                args.push(0);
-                                            }
-                                        }
-                                        // Имя процесса обязано жить дольше таблицы — утекает
-                                        // (запусков за сессию единицы, приемлемо до Вехи 22).
-                                        let pname: &'static str =
-                                            Box::leak(String::from(name).into_boxed_str());
-                                        let child = create_process_locked(t, pname, root, entry, 0);
-                                        let cdom = t.procs[child].domain;
-                                        t.procs[child].args = args;
-                                        t.procs[child].env = parent_env;
-                                        for bits in parent_scaps {
-                                            if let Ok(c) =
-                                                cap::endow(dom, Cap::from_bits(bits as u64), cdom)
-                                            {
-                                                t.procs[child].start_caps.push(c.bits() as usize);
-                                            }
-                                        }
-                                        vprintln!(
-                                            "  [exec] P{} SYS_EXEC '{}' → P{} (по cap, ждёт завершения; наследство: env {} Б, старт-прав {})",
-                                            cur, name, child,
-                                            t.procs[child].env.len(), t.procs[child].start_caps.len(),
-                                        );
-                                        // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
-                                        t.procs[cur].state = State::ExecWait(child);
-                                        t.current = child;
-                                        spawned = true;
                                     }
-                                    Err(e) => vprintln!(
-                                        "  [exec] P{} SYS_EXEC '{}': негодный ELF: {:?}",
-                                        cur, name, e,
-                                    ),
+                                }
+                                // Имя процесса обязано жить дольше таблицы — утекает
+                                // (запусков за сессию единицы, приемлемо до Вехи 22).
+                                let pname: &'static str =
+                                    Box::leak(String::from(name).into_boxed_str());
+                                // Веха 38: тип ELF решает путь. Наш ET_EXEC — родной запуск
+                                // (argv/env/старт-права через контракт); чужой static-PIE
+                                // ET_DYN — linux-личность (стек Linux + трансля́тор syscall'ов).
+                                let child = if elf::is_pie(&bytes) {
+                                    spawn_linux_locked(t, pname, &bytes, root, args)
+                                } else {
+                                    match elf::load(root, &bytes, USER_HEAP_BASE_VA) {
+                                        Ok(entry) => {
+                                            let c = create_process_locked(t, pname, root, entry, 0);
+                                            let parent_env = t.procs[cur].env.clone();
+                                            t.procs[c].args = args;
+                                            t.procs[c].env = parent_env;
+                                            Some(c)
+                                        }
+                                        Err(e) => {
+                                            vprintln!(
+                                                "  [exec] P{} SYS_EXEC '{}': негодный ELF: {:?}",
+                                                cur, name, e,
+                                            );
+                                            None
+                                        }
+                                    }
+                                };
+                                if let Some(child) = child {
+                                    // Стартовые capability наследуются копиями (`cap::endow`) —
+                                    // и родному ребёнку, и linux-процессу (тому — на будущее,
+                                    // под файловую персоналию; stdio он шлёт напрямую в консоль).
+                                    let cdom = t.procs[child].domain;
+                                    for bits in t.procs[cur].start_caps.clone() {
+                                        if let Ok(c) =
+                                            cap::endow(dom, Cap::from_bits(bits as u64), cdom)
+                                        {
+                                            t.procs[child].start_caps.push(c.bits() as usize);
+                                        }
+                                    }
+                                    vprintln!(
+                                        "  [exec] P{} SYS_EXEC '{}' → P{} ({}; ждёт завершения; env {} Б, старт-прав {})",
+                                        cur, name, child,
+                                        if t.procs[child].linux { "linux-abi" } else { "native" },
+                                        t.procs[child].env.len(), t.procs[child].start_caps.len(),
+                                    );
+                                    // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
+                                    t.procs[cur].state = State::ExecWait(child);
+                                    t.current = child;
+                                    spawned = true;
                                 }
                             }
                             None => vprintln!("  [exec] P{} SYS_EXEC: корня '{}' нет в store", cur, name),
@@ -1650,6 +1730,341 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(usize::MAX);
             f.advance();
         }
+    }
+}
+
+// ─── linux-abi: трансля́тор syscall'ов (Веха 38) ───────────────────────────────
+
+/// Прочитать 2 байта по `user_pc` и проверить, что это `syscall` (0F 05) — распознаёт
+/// #UD от linux-процесса на x86-64 (см. [`handle_user_trap`]). Читаем побайтно с трансляцией:
+/// инструкция теоретически может лежать на стыке страниц.
+fn is_linux_syscall_insn(t: &Table, cur: usize) -> bool {
+    let pc = t.procs[cur].frame.user_pc();
+    let root = arch::space_root(t.procs[cur].space);
+    let byte = |va: usize| -> Option<u8> {
+        arch::translate(root, va).map(|pa| unsafe { *(pa as *const u8) })
+    };
+    byte(pc) == Some(0x0f) && byte(pc + 1) == Some(0x05)
+}
+
+/// Записать `data` в буфер процесса `cur` по VA `va` (доотобразив ленивую кучу). `false` —
+/// адрес недоступен (фреймы кончились). Процесс — current, поэтому пишем прямой ссылкой
+/// (riscv: SUM=1; x86: ring0 пишет U-страницы, SMAP не включён).
+fn lx_put(t: &mut Table, cur: usize, va: usize, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    if !ensure_heap_range(t, cur, va, data.len()) {
+        return false;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), va as *mut u8, data.len()) };
+    true
+}
+
+/// Прочитать срез памяти процесса `cur` длиной `len` по VA `va` для ядра. Возвращает `None`,
+/// если диапазон не удалось обеспечить. Процесс — current (см. [`lx_put`]).
+fn lx_get<'a>(t: &mut Table, cur: usize, va: usize, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if !ensure_heap_range(t, cur, va, len) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(va as *const u8, len) })
+}
+
+/// Веха 38 — трансля́тор Linux-syscall'ов для процессов личности `linux` ([`crate::linux`]).
+/// Зеркало VOID-диспетчера [`syscall`], но номера/семантика — Linux; завершённый вызов
+/// перешагивает свою инструкцию `skip_syscall_insn` (на riscv это sepc+4, на x86 rip+2),
+/// блокирующий (чтение stdin) — оставляет PC на месте для рестарта, как VOID `SYS_READ`.
+fn linux_syscall(t: &mut Table, cur: usize) {
+    use crate::linux::{self, Lx};
+    let nr = t.procs[cur].frame.syscall_num();
+    let a = |t: &Table, i: usize| t.procs[cur].frame.arg(i);
+    let (a0, a1, a2) = (a(t, 0), a(t, 1), a(t, 2));
+
+    let decoded = linux::decode(nr);
+    // Значение результата вычисляем в `ret`; блокирующие/завершающие ветки ставят `done=false`
+    // и сами разбираются с состоянием/PC (тогда общий эпилог не трогает кадр).
+    let mut ret: usize = 0;
+    let mut done = true;
+
+    match decoded {
+        // ── вывод ──────────────────────────────────────────────────────────────
+        Some(Lx::Write) => {
+            let (fd, buf, len) = (a0, a1, a2);
+            if fd == 1 || fd == 2 {
+                ret = match lx_get(t, cur, buf, len) {
+                    Some(b) => {
+                        crate::print!("{}", core::str::from_utf8(b).unwrap_or("<?>"));
+                        len
+                    }
+                    None => linux::err(linux::EFAULT),
+                };
+            } else {
+                ret = linux::err(linux::EBADF);
+            }
+        }
+        Some(Lx::Writev) => {
+            // iov: массив из iovcnt структур { base: u64, len: u64 }.
+            let (fd, iov, iovcnt) = (a0, a1, a2);
+            if fd == 1 || fd == 2 {
+                let mut total = 0usize;
+                let mut ok = true;
+                for i in 0..iovcnt {
+                    let ent = match lx_get(t, cur, iov + i * 16, 16) {
+                        Some(e) => e,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                    let base = usize::from_le_bytes(ent[0..8].try_into().unwrap());
+                    let len = usize::from_le_bytes(ent[8..16].try_into().unwrap());
+                    match lx_get(t, cur, base, len) {
+                        Some(b) => {
+                            crate::print!("{}", core::str::from_utf8(b).unwrap_or("<?>"));
+                            total += len;
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                ret = if ok { total } else { linux::err(linux::EFAULT) };
+            } else {
+                ret = linux::err(linux::EBADF);
+            }
+        }
+        // ── ввод (stdin с консоли, блокирующе) ──────────────────────────────────
+        Some(Lx::Read) => {
+            let (fd, buf, len) = (a0, a1, a2);
+            if fd != 0 {
+                ret = linux::err(linux::EBADF);
+            } else if !ensure_heap_range(t, cur, buf, len) {
+                ret = linux::err(linux::EFAULT);
+            } else {
+                let mut n = 0usize;
+                while n < len {
+                    let Some(b) = arch::console_getc() else { break };
+                    unsafe { *((buf + n) as *mut u8) = b };
+                    n += 1;
+                }
+                if n > 0 || len == 0 {
+                    ret = n;
+                } else {
+                    // Ввода нет — заблокироваться с рестартом (PC на инструкции syscall'а).
+                    t.procs[cur].state = State::StdinWait;
+                    if let Some(nx) = t.next_runnable(cur) {
+                        t.current = nx;
+                    }
+                    done = false;
+                }
+            }
+        }
+        Some(Lx::Readv) => {
+            // Для stdin достаточно наполнить первый непустой iov (короткое чтение допустимо).
+            let (fd, iov, iovcnt) = (a0, a1, a2);
+            if fd != 0 {
+                ret = linux::err(linux::EBADF);
+            } else {
+                let mut got = 0usize;
+                for i in 0..iovcnt {
+                    let ent = match lx_get(t, cur, iov + i * 16, 16) {
+                        Some(e) => e,
+                        None => break,
+                    };
+                    let base = usize::from_le_bytes(ent[0..8].try_into().unwrap());
+                    let len = usize::from_le_bytes(ent[8..16].try_into().unwrap());
+                    if len == 0 || !ensure_heap_range(t, cur, base, len) {
+                        continue;
+                    }
+                    while got < len {
+                        let Some(b) = arch::console_getc() else { break };
+                        unsafe { *((base + got) as *mut u8) = b };
+                        got += 1;
+                    }
+                    if got > 0 {
+                        break;
+                    }
+                }
+                ret = got; // 0 = EOF-подобно (не блокируем readv — им пользуются реже)
+            }
+        }
+        // ── память: brk/mmap поверх ленивой кучи процесса ───────────────────────
+        Some(Lx::Brk) => {
+            let leader = t.procs[cur].group;
+            let cur_brk = t.procs[leader].heap_brk;
+            let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+            ret = if a0 == 0 {
+                cur_brk
+            } else if a0 >= USER_HEAP_BASE_VA && a0 <= limit {
+                t.procs[leader].heap_brk = a0; // растёт/сжимается лениво (страницы по фолту)
+                a0
+            } else {
+                cur_brk // за пределами — не двигаем (Linux: возврат старого = «не удалось»)
+            };
+        }
+        Some(Lx::Mmap) => {
+            // Только анонимные отображения (MAP_ANONYMOUS=0x20): отдаём под них хвост кучи,
+            // страницы приходят по фолту. Файловые (fd != -1) — пока ENOSYS.
+            let (len, flags, fd) = (a1, a2, a(t, 4) as isize);
+            const MAP_ANONYMOUS: usize = 0x20;
+            if flags & MAP_ANONYMOUS == 0 && fd != -1 {
+                ret = linux::err(linux::ENOSYS);
+            } else {
+                let leader = t.procs[cur].group;
+                let start = t.procs[leader].heap_brk;
+                let end = start.saturating_add((len + PAGE - 1) & !(PAGE - 1));
+                let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+                if len == 0 || end > limit {
+                    ret = linux::err(linux::ENOMEM);
+                } else {
+                    t.procs[leader].heap_brk = end;
+                    ret = start;
+                }
+            }
+        }
+        Some(Lx::Munmap) => ret = 0, // bump-куча не освобождает — утечка допустима (демо)
+        Some(Lx::Mprotect) => ret = 0, // W^X задан при загрузке; RELRO→RO чтим как no-op
+        Some(Lx::Madvise) => ret = 0,
+        Some(Lx::Mremap) => ret = linux::err(linux::ENOSYS),
+        // ── TLS и потоковые заглушки ────────────────────────────────────────────
+        Some(Lx::ArchPrctl) => {
+            // x86-64: ARCH_SET_FS(0x1002) — musl кладёт сюда базу TLS; ставим fsbase кадра.
+            const ARCH_SET_FS: usize = 0x1002;
+            if a0 == ARCH_SET_FS {
+                t.procs[cur].frame.set_thread_ptr(a1);
+                ret = 0;
+            } else {
+                ret = linux::err(linux::EINVAL);
+            }
+        }
+        Some(Lx::SetTidAddress) => ret = cur + 1, // «tid» = индекс процесса + 1
+        Some(Lx::SetRobustList) => ret = 0,
+        Some(Lx::RtSigprocmask) => ret = 0,
+        Some(Lx::RtSigaction) => ret = 0, // обработчики сигналов игнорируем (однопоточный CLI)
+        Some(Lx::Rseq) => ret = linux::err(linux::ENOSYS),
+        Some(Lx::Prlimit64) => ret = linux::err(linux::ENOSYS),
+        // ── информация ──────────────────────────────────────────────────────────
+        Some(Lx::Getpid) | Some(Lx::Gettid) => ret = cur + 1,
+        Some(Lx::Getppid) => ret = 1,
+        Some(Lx::Getuid) | Some(Lx::Geteuid) | Some(Lx::Getgid) | Some(Lx::Getegid) => ret = 0,
+        // Мы «root» (uid/gid 0) — сброс привилегий busybox'а на старте no-op (успех).
+        Some(Lx::Setuid) | Some(Lx::Setgid) | Some(Lx::Setgroups) => ret = 0,
+        Some(Lx::Uname) => {
+            let mut buf = [0u8; linux::UTSNAME_SIZE];
+            linux::fill_utsname(&mut buf);
+            ret = if lx_put(t, cur, a0, &buf) { 0 } else { linux::err(linux::EFAULT) };
+        }
+        Some(Lx::Sysinfo) => {
+            let zero = [0u8; 112]; // struct sysinfo — нулями (демо не читает поля критично)
+            ret = if lx_put(t, cur, a0, &zero) { 0 } else { linux::err(linux::EFAULT) };
+        }
+        Some(Lx::Getrandom) => {
+            let (buf, len) = (a0, a1);
+            let mut seed = arch::now_ticks() ^ (buf as u64).rotate_left(17);
+            let mut tmp = alloc::vec![0u8; len];
+            for chunk in tmp.chunks_mut(8) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let bytes = seed.to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            ret = if lx_put(t, cur, buf, &tmp) { len } else { linux::err(linux::EFAULT) };
+        }
+        Some(Lx::Getcwd) => {
+            // Корневой каталог: "/". Linux getcwd возвращает длину включая NUL.
+            ret = if lx_put(t, cur, a0, b"/\0") { 2 } else { linux::err(linux::EFAULT) };
+        }
+        // ── время ────────────────────────────────────────────────────────────────
+        Some(Lx::ClockGettime) => {
+            let ticks = arch::now_ticks();
+            let ns = ticks.wrapping_mul(crate::linux::tick_ns());
+            let ts = [(ns / 1_000_000_000), (ns % 1_000_000_000)];
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&ts[0].to_le_bytes());
+            buf[8..16].copy_from_slice(&ts[1].to_le_bytes());
+            ret = if lx_put(t, cur, a1, &buf) { 0 } else { linux::err(linux::EFAULT) };
+        }
+        Some(Lx::Gettimeofday) => {
+            let ticks = arch::now_ticks();
+            let us = ticks.wrapping_mul(crate::linux::tick_ns()) / 1000;
+            let tv = [(us / 1_000_000), (us % 1_000_000)];
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&tv[0].to_le_bytes());
+            buf[8..16].copy_from_slice(&tv[1].to_le_bytes());
+            ret = if a0 == 0 || lx_put(t, cur, a0, &buf) { 0 } else { linux::err(linux::EFAULT) };
+        }
+        Some(Lx::Nanosleep) | Some(Lx::ClockNanosleep) => ret = 0, // без реального сна (демо)
+        Some(Lx::SchedYield) => {
+            ret = 0;
+            // мягко уступить: пометим ret и дадим общему эпилогу продвинуть; переключение
+            // сделает следующий тик — для CLI этого достаточно.
+        }
+        // ── файловые (пока без ФС: заглушки, что не роняют однопоточный CLI) ─────
+        Some(Lx::Ioctl) => ret = linux::err(linux::ENOTTY), // isatty/TIOCGWINSZ → «не терминал»
+        Some(Lx::Fcntl) => ret = 0,
+        Some(Lx::Close) => ret = 0, // fd 0/1/2 — «закрыты», реальных ресурсов нет
+        Some(Lx::Openat) => ret = linux::err(linux::ENOENT), // ФС ещё нет (Веха 38.x)
+        Some(Lx::Faccessat) => ret = linux::err(linux::ENOENT),
+        Some(Lx::Readlinkat) => ret = linux::err(linux::ENOENT),
+        Some(Lx::Getdents64) => ret = linux::err(linux::ENOSYS),
+        Some(Lx::Lseek) => ret = linux::err(linux::ESPIPE), // консоль не позиционируется
+        Some(Lx::Dup) | Some(Lx::Dup3) => ret = linux::err(linux::ENOSYS),
+        Some(Lx::Ppoll) => ret = linux::err(linux::ENOSYS),
+        Some(Lx::Fstat) => {
+            // fstat(fd, buf): только символьные устройства stdin/out/err (fd 0/1/2).
+            let (fd, buf) = (a0 as isize, a1);
+            if (0..=2).contains(&fd) {
+                let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+                linux::fill_stat_chr(&mut st);
+                ret = if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) };
+            } else {
+                ret = linux::err(linux::EBADF);
+            }
+        }
+        Some(Lx::Newfstatat) => {
+            // newfstatat(dirfd, path, buf, flags): без пути (AT_EMPTY_PATH) и fd 0/1/2 —
+            // символьное устройство; с путём — ФС ещё нет, значит файла нет (ENOENT).
+            const AT_EMPTY_PATH: usize = 0x1000;
+            let (dirfd, path, buf, flags) = (a0 as isize, a1, a2, a(t, 3));
+            let empty_path = flags & AT_EMPTY_PATH != 0
+                || lx_get(t, cur, path, 1).map_or(true, |b| b.first() == Some(&0));
+            if empty_path && (0..=2).contains(&dirfd) {
+                let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+                linux::fill_stat_chr(&mut st);
+                ret = if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) };
+            } else {
+                ret = linux::err(linux::ENOENT);
+            }
+        }
+        // ── завершение ────────────────────────────────────────────────────────────
+        Some(Lx::Exit) | Some(Lx::ExitGroup) => {
+            let code = a0 & 0xff;
+            let leader = t.procs[cur].group;
+            vprintln!("  [linux] P{} exit_group({}) — процесс P{}", cur, code, leader);
+            for i in 0..t.procs.len() {
+                if t.procs[i].group == leader {
+                    t.procs[i].state = State::Finished;
+                }
+            }
+            wake_exec_waiters(t, leader, code);
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
+            done = false; // процесс завершён — PC/кадр не трогаем
+        }
+        None => {
+            vprintln!("  [linux] P{} НЕреализованный syscall #{} — ENOSYS", cur, nr);
+            ret = linux::err(linux::ENOSYS);
+        }
+    }
+
+    if done {
+        let f = &mut t.procs[cur].frame;
+        f.set_ret(ret);
+        f.skip_syscall_insn(); // riscv: sepc+4; x86: rip+2 (пройти `syscall`)
     }
 }
 

@@ -194,6 +194,20 @@ impl TrapFrame {
             core::arch::asm!("fxrstor64 [{0}]", in(reg) p, options(nostack));
         }
     }
+
+    /// Веха 38 — адрес инструкции, вызвавшей trap. Для linux-abi: musl x86-64 зовёт ядро
+    /// инструкцией `syscall` (0F 05), а мы её НЕ включили (EFER.SCE=0) → она даёт #UD с
+    /// rip НА ней; читаем опкод по этому адресу, чтобы отличить syscall от настоящего #UD.
+    pub fn user_pc(&self) -> usize {
+        self.rip
+    }
+
+    /// Веха 38 — перешагнуть инструкцию системного вызова linux-процесса: на x86-64 `syscall`
+    /// (0F 05) — 2 байта. #UD оставил rip на инструкции; двигаем за неё (аналог того, что
+    /// `sysret` сделал бы аппаратно).
+    pub fn skip_syscall_insn(&mut self) {
+        self.rip += 2;
+    }
 }
 
 /// Дескриптор шлюза IDT (interrupt gate, 16 байт).

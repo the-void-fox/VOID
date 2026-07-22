@@ -57,6 +57,7 @@ mod elf;
 mod executor;
 mod frame;
 mod heap;
+mod linux;
 mod object;
 mod proc;
 mod sched;

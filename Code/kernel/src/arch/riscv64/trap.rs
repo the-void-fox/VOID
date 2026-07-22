@@ -107,6 +107,18 @@ impl TrapFrame {
     /// fxsave64-областью кадра).
     pub fn save_fp(&mut self) {}
     pub fn restore_fp(&self) {}
+
+    /// Веха 38 — адрес инструкции, вызвавшей trap (для linux-abi: прочитать опкод и понять,
+    /// `syscall` ли это). На RISC-V — sepc.
+    pub fn user_pc(&self) -> usize {
+        self.sepc
+    }
+
+    /// Веха 38 — перешагнуть инструкцию системного вызова linux-процесса. На RISC-V linux
+    /// использует тот же `ecall`, что и VOID (4 байта) — как обычный [`advance`].
+    pub fn skip_syscall_insn(&mut self) {
+        self.sepc += 4;
+    }
 }
 
 /// Классифицировать trap из U-mode в арх-нейтральный [`UserTrap`] для `proc` (Веха 24).
