@@ -17,6 +17,7 @@ mod ioapic;
 mod lapic;
 mod paging;
 mod pci;
+mod ps2;
 mod trap;
 mod vga;
 
@@ -155,18 +156,25 @@ static mut RX_BUF: [u8; RX_CAP] = [0; RX_CAP];
 static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // писатель (drain)
 static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // читатель (getc)
 
-/// Вычерпать приёмный FIFO COM1 в кольцевой буфер (LSR.DR — «данные готовы»).
-/// Зовётся с выключенными прерываниями (из обработчика тика) — гонок нет.
-pub fn console_drain() {
-    let mut head = RX_HEAD.load(Ordering::Relaxed);
-    while inb(COM1 + 5) & 1 != 0 {
-        let b = inb(COM1);
-        if head - RX_TAIL.load(Ordering::Relaxed) < RX_CAP {
-            unsafe { RX_BUF[head % RX_CAP] = b };
-            head += 1;
-        } // переполнение — байт молча теряется (как в riscv-кольце)
+/// Положить принятый байт в кольцевой буфер (переполнение — байт теряется, как в riscv-кольце).
+/// Единая точка для обоих источников ввода: COM1 (QEMU/serial) и PS/2-клавиатура (реальное
+/// железо, Веха 42). Зовётся с выключенными прерываниями (из обработчика тика/IRQ) — гонок нет.
+pub(super) fn rx_push(b: u8) {
+    let head = RX_HEAD.load(Ordering::Relaxed);
+    if head.wrapping_sub(RX_TAIL.load(Ordering::Relaxed)) < RX_CAP {
+        unsafe { RX_BUF[head % RX_CAP] = b };
+        RX_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
     }
-    RX_HEAD.store(head, Ordering::Relaxed);
+}
+
+/// Вычерпать приёмные буферы в кольцо: COM1 FIFO (LSR.DR — «данные готовы») И скан-коды
+/// PS/2-клавиатуры (Веха 42). На QEMU ввод идёт через COM1 (serial), на реальной машине —
+/// через клавиатуру; оба пути наполняют одно кольцо, `console_getc` их не различает.
+pub fn console_drain() {
+    while inb(COM1 + 5) & 1 != 0 {
+        rx_push(inb(COM1));
+    }
+    ps2::drain();
 }
 
 pub fn console_has_input() -> bool {
@@ -249,10 +257,16 @@ pub fn mark_in_kernel() {}
 /// [`trap::VEC_CONSOLE`]; сам UART начинает слать прерывания приёма (IER.DR;
 /// OUT2 в MCR — классический «разъём» линии до контроллера). Диск сюда не ходит:
 /// его MSI-X взводит pci.rs при поиске устройства.
+///
+/// Веха 42: клавиатура — GSI1 на ТОТ ЖЕ вектор консоли (оба источника ввода наполняют одно
+/// кольцо, `console_drain` черпает и COM1, и PS/2), плюс инициализация контроллера 8042. Так
+/// на реальной машине нажатие клавиши будит систему из сна `wait_stdin` (как IRQ4 в QEMU).
 pub fn init_device_interrupts() {
     ioapic::route(CONSOLE_IRQ, trap::VEC_CONSOLE);
     outb(COM1 + 1, 0x01); // IER: data ready
     outb(COM1 + 4, 0x0b); // MCR: DTR | RTS | OUT2
+    ioapic::route(1, trap::VEC_CONSOLE); // GSI1 — клавиатура PS/2
+    ps2::init();
 }
 
 // ─── таймер (LAPIC) ─────────────────────────────────────────────────────────
