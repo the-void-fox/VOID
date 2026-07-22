@@ -58,6 +58,16 @@ pub fn ram_total() -> usize {
 /// Magic multiboot2 в eax при входе от GRUB (у PVH eax не определён → 0).
 const MULTIBOOT2_MAGIC: usize = 0x36D76289;
 
+/// Как загрузились: `0x36D76289` — реальная машина через GRUB (multiboot2), иначе QEMU (PVH).
+static BOOT_MAGIC_CELL: AtomicUsize = AtomicUsize::new(0);
+
+/// Веха 42 — на РЕАЛЬНОМ железе (загрузка GRUB'ом) ли мы? Отличаем эмулятор (QEMU/PVH) от
+/// металла (GRUB/multiboot2): на металле kmain НЕ гоняет QEMU-демо (часть виснет — ждут таймер/
+/// диск, которых как в QEMU нет), а сразу поднимает систему, как настоящая ОС без «демо на boot».
+pub fn is_real_hardware() -> bool {
+    BOOT_MAGIC_CELL.load(Ordering::Relaxed) == MULTIBOOT2_MAGIC
+}
+
 /// Веха 41 — разобрать инфо-структуру загрузчика и выставить границы RAM. `magic` — eax при
 /// входе (`0x2BADB002` = multiboot/GRUB), `info` — ebx (указатель на инфо). Direct-map и
 /// аллокатор фреймов зажимаются `RAM_CAP`: VOID не нужны гигабайты, а отображать всю память
@@ -67,6 +77,7 @@ const MULTIBOOT2_MAGIC: usize = 0x36D76289;
 /// `info` — валидный указатель инфо-структуры соответствующего типа (гарантирует загрузчик).
 pub fn platform_init(magic: usize, info: usize) {
     const RAM_CAP: usize = 256 * 1024 * 1024;
+    BOOT_MAGIC_CELL.store(magic, Ordering::Relaxed);
     let total = discover_ram(magic, info);
     RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
     RAM_LIMIT_CELL.store(total.min(RAM_CAP), Ordering::Relaxed);

@@ -246,6 +246,12 @@ pub fn ram_total() -> usize {
 /// (QEMU virt) пока no-op — RAM/UART/virtio известны по контракту QEMU (DTB-парсинг впереди).
 pub fn platform_init(_hartid: usize, _dtb: usize) {}
 
+/// Веха 42 — реальное железо? На riscv у нас пока только QEMU virt (плата VisionFive 2 —
+/// впереди), поэтому всегда `false`: демо на загрузке гоняем, как раньше.
+pub fn is_real_hardware() -> bool {
+    false
+}
+
 /// Выключить машину (SBI SRST; в QEMU — завершить процесс). Задел под автотесты.
 #[allow(dead_code)]
 pub fn power_off() -> ! {

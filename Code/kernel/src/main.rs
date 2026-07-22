@@ -226,135 +226,91 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     seed_programs();
     println!();
 
-    // Веха 8: capability поверх объектного store (c-space в RAM; персистентность — позже).
-    cap_demo();
-    println!();
-
-    // Многозадачность: задачи пишут объекты в общий store (одинаковый вклад → дедуп).
-    sched::init();
-    sched::spawn("X", writer);
-    sched::spawn("Y", writer);
-    println!("  [sched] X/Y пишут объекты (вытесняются таймером):");
+    // Веха 42: LAPIC-таймер + прерывания — ЕДИНСТВЕННО НУЖНОЕ отсюда для vsh (клавиатурный IRQ
+    // доставляется через LAPIC; вытеснение процессов — им же). Ставим безусловно, ДО демо/shell'а.
     timer::init();
-    while sched::other_runnable() {
-        arch::wait_for_interrupt(); // спать до следующего прерывания (таймера)
-    }
-    println!("  [sched] задачи завершились (вытеснений таймером: {})", timer::ticks());
-    println!();
 
-    // Веха 9: async-executor поверх объектного store (кооперативные future-задачи).
-    async_demo();
-    println!();
+    // Демо-показ ядра (cap · многозадачность · async · процессы · бенчи) гоняем ТОЛЬКО в
+    // эмуляторе. На РЕАЛЬНОЙ машине (загрузка multiboot2/GRUB) часть демо виснет: ждут таймер/диск,
+    // которых как в QEMU нет (sched-демо крутит `while other_runnable` в ожидании тика). Настоящая
+    // ОС на загрузке демо не гоняет — там сразу поднимаем систему (init::boot ниже).
+    if !arch::is_real_hardware() {
+        // Веха 8: capability поверх объектного store (c-space в RAM; персистентность — позже).
+        cap_demo();
+        println!();
 
-    // Веха 25/26: на архитектуре в bring-up (сегодня таких нет: riscv64 — с Вехи 10,
-    // x86_64 — с Вехи 26) процессов ещё нет — ядерная половина системы уже прошла выше,
-    // процессные демо и shell до готовности честно пропускаются.
-    if !arch::USERSPACE_READY {
-        println!("  [skip] демо процессов/exec/vsh: userspace этой архитектуры в bring-up");
-    }
+        // Многозадачность: задачи пишут объекты в общий store (одинаковый вклад → дедуп).
+        sched::init();
+        sched::spawn("X", writer);
+        sched::spawn("Y", writer);
+        println!("  [sched] X/Y пишут объекты (вытесняются таймером):");
+        while sched::other_runnable() {
+            arch::wait_for_interrupt(); // спать до следующего прерывания (таймера)
+        }
+        println!("  [sched] задачи завершились (вытеснений таймером: {})", timer::ticks());
+        println!();
 
-    // Веха 12: capability-защищённые IPC-эндпоинты. P0 = драйвер-сервер, ему ядро минтит cap на
-    // УСТРОЙСТВО (право читать сектора). P1 = клиент, ему — cap на ЭНДПОИНТ сервера (право слать
-    // ему сообщения). Без нужного cap ни IPC-вызов, ни доступ к диску невозможны — см. попытку
-    // клиента прочитать диск напрямую в конце.
-    if arch::USERSPACE_READY {
+        // Веха 9: async-executor поверх объектного store (кооперативные future-задачи).
+        async_demo();
+        println!();
+
+        // Вехи 12–28: процессные демо (IPC-эндпоинты, store-сервер, cap-transfer, вытеснение,
+        // ленивые кучи, POSIX-персоналия, exec-по-хэшу) и микробенчи — вся живая половина показа.
         proc_demo();
         println!();
-    }
-
-    // Веха 13/14: сервер объектного store в userspace. Процесс с cap на STORE отдаёт put/get и
-    // set_root/get_root по IPC; клиент (лишь с cap на эндпоинт) кладёт значение, привязывает к
-    // именованному корню и на СЛЕДУЮЩЕМ запуске читает прежнее значение обратно — persistence
-    // через userspace-сервер, без прямого доступа к объектному пространству.
-    if arch::USERSPACE_READY {
         store_demo();
         println!();
-    }
-
-    // Веха 21: передача capability по IPC + персистентный c-space. Клиент получает урезанное
-    // право В ОТВЕТЕ сервера-раздатчика (первая загрузка) или находит его ВОССТАНОВЛЕННЫМ из
-    // .cspace (последующие) — право переживает перезагрузку, тезис ADR 0002 полон.
-    if arch::USERSPACE_READY {
         cap_ipc_demo();
         println!();
-    }
-
-    // Веха 16: вытеснение процессов. Два CPU-bound процесса БЕЗ единого yield/IPC — таймер
-    // принудительно переключает их, и вывод меток перемежается (иначе один отработал бы до конца).
-    if arch::USERSPACE_READY {
         preempt_demo();
         println!();
-    }
-
-    // Веха 22: куча процесса и честные фолты. Программа heap маппит 4 страницы лениво (0 фреймов
-    // до первой записи), программа crash лезет по немапленному адресу — гибнет ОНА, а не ядро.
-    if arch::USERSPACE_READY {
         mm_demo();
         println!();
-    }
-
-    // Веха 18.1: POSIX-персоналия как сервер. Процесс-программа пользуется только POSIX-подобными
-    // open/write/close/read через IPC-shim; сервер-персоналия держит namespace файлов в своей RAM
-    // (с Вехи 22.3 данные файлов — в его ленивой куче: 16 файлов × 4 КиБ вместо 4 × 256 байт).
-    if arch::USERSPACE_READY {
         posix_demo();
         println!();
-    }
-
-    // Веха 19: «программа как объект store» — exec по content-id, а не по адресу в образе ядра.
-    // Первый запуск сеет байты ELF (встроенные в ядро) в store под арх-корень bin/<arch>/hello;
-    // второй — корень уже на диске, seed не участвует, ELF читается ИЗ STORE (kernel/src/elf.rs).
-    if arch::USERSPACE_READY {
         exec_demo();
         println!();
-    }
-
-    // Веха 28: микробенчи — цена syscall/IPC/фолта/store/exec глазами userspace.
-    if arch::USERSPACE_READY {
         bench_demo();
         println!();
-    }
 
-    // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
-    gc_demo();
-    println!();
+        // Доводка 3/4: структурные ссылки между объектами (граф) + версия дерева.
+        gc_demo();
+        println!();
 
-    // Новый system root этого запуска.
-    let marker = alloc::format!("boot #{} — VOID помнит своё состояние", object::generation() + 1);
-    let id = object::put(marker.as_bytes());
-    object::set_root("system", id);
-
-    // GC: оставить только достижимое от корней. Веха 33 ([[commit-policy]]): жертвы
-    // становятся НАДГРОБИЯМИ (кадры на диске не трогаются — учтённый мусор), а
-    // уплотнение — не каждый boot, а ПО ПОРОГУ: когда мусора больше половины области.
-    let (kept, collected) = object::gc();
-    println!("  [gc] достижимо от корней: {}, собрано мусора: {}", kept, collected);
-    let (garbage, area) = (object::garbage_bytes(), object::area_bytes());
-    if garbage > 0 && garbage * 2 > area {
-        println!(
-            "  [gc] мусора {} КиБ из {} КиБ (>1/2) — уплотняем (двухфазно, крах-устойчиво)",
-            garbage / 1024,
-            area / 1024,
-        );
-        object::compact();
-    } else {
-        if garbage > 0 {
+        // Новый system root этого запуска + GC/уплотнение/commit (нужен диск — только с демо).
+        let marker =
+            alloc::format!("boot #{} — VOID помнит своё состояние", object::generation() + 1);
+        let id = object::put(marker.as_bytes());
+        object::set_root("system", id);
+        let (kept, collected) = object::gc();
+        println!("  [gc] достижимо от корней: {}, собрано мусора: {}", kept, collected);
+        let (garbage, area) = (object::garbage_bytes(), object::area_bytes());
+        if garbage > 0 && garbage * 2 > area {
             println!(
-                "  [gc] мусор копится: {} КиБ из {} КиБ (порог уплотнения — 1/2)",
+                "  [gc] мусора {} КиБ из {} КиБ (>1/2) — уплотняем (двухфазно, крах-устойчиво)",
                 garbage / 1024,
                 area / 1024,
             );
+            object::compact();
+        } else {
+            if garbage > 0 {
+                println!(
+                    "  [gc] мусор копится: {} КиБ из {} КиБ (порог уплотнения — 1/2)",
+                    garbage / 1024,
+                    area / 1024,
+                );
+            }
+            object::commit(); // точка синка загрузки: сев, system root, надгробия
         }
-        object::commit(); // точка синка загрузки: сев, system root, надгробия
+        println!("  [store] новый system root: \"{}\"", marker);
+        println!(
+            "  [store] commit → {} объектов, поколение {} · записано за сессию: {} КиБ",
+            object::len(),
+            object::generation(),
+            object::bytes_written() / 1024,
+        );
+        println!();
     }
-    println!("  [store] новый system root: \"{}\"", marker);
-    println!(
-        "  [store] commit → {} объектов, поколение {} · записано за сессию: {} КиБ",
-        object::len(),
-        object::generation(),
-        object::bytes_written() / 1024,
-    );
-    println!();
 
     // Веха 40: интерактивная сессия — теперь ДЕКЛАРАТИВНАЯ. Вместо зашитого `shell_session`
     // ядро читает конфиг активного поколения из store (`system/current`) и поднимает по нему

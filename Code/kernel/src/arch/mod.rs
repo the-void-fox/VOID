@@ -66,8 +66,8 @@ pub use imp::{
     probe_virtio_blk, probe_virtio_net,
     // разное
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
-    // платформа (Веха 41): границы RAM из карты памяти загрузчика + ранняя инициализация
-    platform_init, ram_limit, ram_total,
+    // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла
+    is_real_hardware, platform_init, ram_limit, ram_total,
 };
 
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.
