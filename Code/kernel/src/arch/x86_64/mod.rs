@@ -181,9 +181,21 @@ pub(super) fn rx_push(b: u8) {
 /// Вычерпать приёмные буферы в кольцо: COM1 FIFO (LSR.DR — «данные готовы») И скан-коды
 /// PS/2-клавиатуры (Веха 42). На QEMU ввод идёт через COM1 (serial), на реальной машине —
 /// через клавиатуру; оба пути наполняют одно кольцо, `console_getc` их не различает.
+///
+/// Веха 42: у ноутбука НЕТ COM-порта — чтение LSR (0x3F8+5) на открытой шине даёт `0xFF`, где
+/// бит DR всегда «1» → наивный `while LSR&DR` крутился бы ВЕЧНО (это и вешало реальную машину
+/// сразу после включения прерываний). `LSR == 0xFF` — надёжный признак отсутствия UART (у
+/// живого 16550 бит 7 не бывает вместе со всеми): в этом случае COM1 пропускаем. Плюс страховка
+/// от флуда — не больше кольца за проход.
 pub fn console_drain() {
-    while inb(COM1 + 5) & 1 != 0 {
+    let mut n = 0;
+    loop {
+        let lsr = inb(COM1 + 5);
+        if lsr == 0xff || lsr & 1 == 0 || n >= RX_CAP {
+            break;
+        }
         rx_push(inb(COM1));
+        n += 1;
     }
     ps2::drain();
 }
@@ -273,10 +285,14 @@ pub fn mark_in_kernel() {}
 /// кольцо, `console_drain` черпает и COM1, и PS/2), плюс инициализация контроллера 8042. Так
 /// на реальной машине нажатие клавиши будит систему из сна `wait_stdin` (как IRQ4 в QEMU).
 pub fn init_device_interrupts() {
-    ioapic::route(CONSOLE_IRQ, trap::VEC_CONSOLE);
-    outb(COM1 + 1, 0x01); // IER: data ready
-    outb(COM1 + 4, 0x0b); // MCR: DTR | RTS | OUT2
-    ioapic::route(1, trap::VEC_CONSOLE); // GSI1 — клавиатура PS/2
+    // Веха 42: COM1 подключаем к прерыванию ТОЛЬКО если порт реально есть (в QEMU есть, на
+    // ноутбуке нет: LSR читается как 0xFF). Иначе GSI4 слал бы спурьёзные прерывания в пустоту.
+    if inb(COM1 + 5) != 0xff {
+        ioapic::route(CONSOLE_IRQ, trap::VEC_CONSOLE);
+        outb(COM1 + 1, 0x01); // IER: data ready
+        outb(COM1 + 4, 0x0b); // MCR: DTR | RTS | OUT2
+    }
+    ioapic::route(1, trap::VEC_CONSOLE); // GSI1 — клавиатура PS/2 (общий вектор с COM1)
     ps2::init();
 }
 
