@@ -171,6 +171,25 @@ tools/.../void-store-import void-disk.img put …/wasi-run bin/<arch>/wasirun
 void-pkg (A: nixpkgs-cross · B: linux-abi · C: wasi). Подробности —
 `Obsidian/10-projects/void/notes/wasi.md`.
 
+## Декларативный init (Веха 40)
+Система поднимается по КОНФИГУ-объекту из store (`kernel/src/init.rs`), а не по
+зашитому в `kmain` сценарию. Конфиг — текст: `service posixfs store:rw` /
+`shell vsh endpoint:posixfs store:xw env`; init минтит права по токенам в домены и
+разводит эндпоинты по именам сервисов. Поколения = история корня, откат = смена
+`system/current`:
+```
+vsh> switch gen2       # без сети; перезагрузка → ping «сети нет»
+vsh> switch gen1       # полное; перезагрузка → сеть вернулась
+```
+Конфиг арх-нейтрален (init резолвит `bin/<arch>/*`) — один `system/*` на обе арх.
+Пишется в vsh (`sysdef GEN FILE`) ИЛИ генерится настоящим Nix на хосте:
+```sh
+nix eval --raw --file nix/system.nix > /tmp/gen.conf     # язык Nix вычисляет конфиг
+tools/.../void-store-import void-disk.img put /tmp/gen.conf system/gen3
+```
+Модель NixOS: язык вычисляет на хосте, VOID грузит результат. Подробности —
+`Obsidian/10-projects/void/notes/declarative-init.md`.
+
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
 `gdb target/<таргет>/debug/void-kernel` → `target remote :1234`.
