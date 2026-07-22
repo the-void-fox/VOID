@@ -9,16 +9,55 @@
 //! `run bin/hello мир`), `thaw NAME` (Веха 37: разморозить процесс из образа
 //! `proc/<arch>/NAME`), `switch GEN` / `sysdef GEN FILE` (Веха 40: выбрать/задать
 //! поколение системы — декларативный init грузит `system/current` на следующей
-//! загрузке), `mv OLD NEW` (rename персоналии), `help`, `exit` — последняя
-//! завершает сессию VOID.
+//! загрузке), `mv OLD NEW` (rename персоналии), `clear` (Веха 43: ANSI-очистка экрана),
+//! цветной `help`, `exit` — последняя завершает сессию VOID. Вывод цветной (ANSI-коды
+//! понимают и терминал, и VGA-ядро на реальном железе, Веха 43).
 #![no_std]
 #![no_main]
 
 use void_user as sys;
 use void_user::posix as px;
 
-static HELP: &[u8] =
-    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | thaw NAME | switch GEN | sysdef GEN FILE | mv OLD NEW | ping IP | help | exit\n";
+/// ANSI-коды (работают и в терминале QEMU, и на VGA — ядро их толкует, Веха 43).
+const RESET: &[u8] = b"\x1b[0m";
+const C_CMD: &[u8] = b"\x1b[1;33m"; // жёлтый жирный — имя команды
+const C_HEAD: &[u8] = b"\x1b[1;36m"; // голубой жирный — заголовки
+const C_PROMPT: &[u8] = b"\x1b[1;32m"; // зелёный жирный — приглашение
+
+/// Одна строка справки: имя команды (в цвете) + выравнивание + описание (кириллица — UTF-8).
+fn help_row(ep: usize, cmd: &[u8], desc: &str) {
+    px::write(ep, px::STDOUT, b"  ");
+    px::write(ep, px::STDOUT, C_CMD);
+    px::write(ep, px::STDOUT, cmd);
+    px::write(ep, px::STDOUT, RESET);
+    let pad = 18usize.saturating_sub(cmd.len());
+    for _ in 0..pad {
+        px::write(ep, px::STDOUT, b" ");
+    }
+    px::write(ep, px::STDOUT, desc.as_bytes());
+    px::write(ep, px::STDOUT, b"\n");
+}
+
+/// Веха 43 — читаемая цветная справка (вместо одной длинной строки).
+fn print_help(ep: usize) {
+    px::write(ep, px::STDOUT, C_HEAD);
+    px::write(ep, px::STDOUT, "  VOID vsh — команды:".as_bytes());
+    px::write(ep, px::STDOUT, RESET);
+    px::write(ep, px::STDOUT, b"\n");
+    help_row(ep, b"ls", "список файлов");
+    help_row(ep, b"cat FILE", "показать содержимое файла");
+    help_row(ep, b"tail FILE", "последние ~32 байта файла");
+    help_row(ep, b"echo TEXT > FILE", "записать текст в файл (без > — печать)");
+    help_row(ep, b"run NAME [ARGS]", "запустить программу из store");
+    help_row(ep, b"thaw NAME", "разморозить процесс из образа");
+    help_row(ep, b"switch GEN", "выбрать поколение системы (после ребута)");
+    help_row(ep, b"sysdef GEN FILE", "задать поколение из файла-конфига");
+    help_row(ep, b"mv OLD NEW", "переименовать файл");
+    help_row(ep, b"ping IP", "ICMP-пинг адреса A.B.C.D");
+    help_row(ep, b"clear", "очистить экран");
+    help_row(ep, b"help", "эта справка");
+    help_row(ep, b"exit", "завершить сессию VOID");
+}
 
 /// Разобрать IPv4 в точечной записи «A.B.C.D» в 4 байта. `None` — не разобрать.
 fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
@@ -75,9 +114,13 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     let mut line = [0u8; 128]; // собираемая строка команды
     let mut inb = [0u8; 16]; // порция сырого ввода
     let mut out = [0u8; 512]; // ответы персоналии (ls)
-    px::write(ep, px::STDOUT, HELP);
+    print_help(ep);
     loop {
-        px::write(ep, px::STDOUT, b"vsh> ");
+        // Веха 43: цветное приглашение (зелёный `vsh>`). ANSI толкует и терминал, и VGA-ядро.
+        px::write(ep, px::STDOUT, C_PROMPT);
+        px::write(ep, px::STDOUT, b"vsh>");
+        px::write(ep, px::STDOUT, RESET);
+        px::write(ep, px::STDOUT, b" ");
         // ── собрать строку: читать порциями, эхо, backspace, до Enter ──
         // Эхо — ПАЧКОЙ на порцию ввода, не по байту: SYS_WRITE валидирует UTF-8, и
         // разрезанный посередине двухбайтный символ (кириллица) печатался бы как «<?>».
@@ -117,7 +160,12 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             sys::exit(0);
         }
         if cmd == b"help" {
-            px::write(ep, px::STDOUT, HELP);
+            print_help(ep);
+            continue;
+        }
+        if cmd == b"clear" {
+            // Веха 43: ANSI-очистка экрана + курсор в начало (VGA и терминал понимают одинаково).
+            px::write(ep, px::STDOUT, b"\x1b[2J\x1b[H");
             continue;
         }
         if cmd == b"ls" {

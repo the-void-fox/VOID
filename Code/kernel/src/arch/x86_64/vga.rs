@@ -71,37 +71,154 @@ unsafe fn emit(byte: u8) {
     }
 }
 
-/// Веха 41 — напечатать символ Unicode, переведя его в байт **CP866** (в этой раскладке
-/// загружен шрифт знакогенератора, [`load_font`]): ASCII — как есть, кириллица и псевдографика
-/// баннеров — по таблице, прочее — `?`. Так на реальном VGA-экране видна русская консоль.
-pub fn put_char(c: char) {
-    let byte = match c {
+// ── ANSI-разбор для VGA (Веха 43): цвета/clear/курсор. На serial escape-коды толкует терминал
+//    QEMU, а здесь переводим их в атрибуты VGA и действия, НЕ рисуя сами байты последовательности.
+//    Так цвет и `clear` работают одинаково и в эмуляторе, и на реальном экране.
+#[derive(Clone, Copy, PartialEq)]
+enum Ansi {
+    Normal,
+    Esc, // видели ESC (0x1B)
+    Csi, // видели ESC[ — копим параметры до финального байта
+}
+const PARAMS_MAX: usize = 16;
+static mut ANSI: Ansi = Ansi::Normal;
+static mut PARAMS: [u8; PARAMS_MAX] = [0; PARAMS_MAX];
+static mut PLEN: usize = 0;
+static mut FG: u8 = 7; // цвет символа (VGA-палитра)
+static mut BG: u8 = 0; // цвет фона
+static mut BOLD: bool = false; // яркость символа (VGA-бит 3)
+
+/// ANSI-цвет (0..7) → VGA-цвет: у VGA другой порядок (красный=4, синий=1…).
+const ANSI2VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+
+/// Собрать текущий атрибут из fg/bg/bold.
+unsafe fn recompose() {
+    ATTR = (BG << 4) | (if BOLD { 0x08 } else { 0 }) | FG;
+}
+
+/// Применить накопленный SGR (`ESC[ … m`): цвета/яркость/сброс.
+unsafe fn apply_sgr() {
+    let mut nums = [0u32; 8];
+    let mut nn = 0usize;
+    let mut cur = 0u32;
+    for &b in &PARAMS[..PLEN] {
+        if b == b';' {
+            if nn < 8 {
+                nums[nn] = cur;
+                nn += 1;
+            }
+            cur = 0;
+        } else if b.is_ascii_digit() {
+            cur = cur * 10 + (b - b'0') as u32;
+        }
+    }
+    if nn < 8 {
+        nums[nn] = cur;
+        nn += 1;
+    }
+    if PLEN == 0 {
+        nums[0] = 0;
+        nn = 1; // пустой SGR = reset
+    }
+    for &n in &nums[..nn] {
+        match n {
+            0 => {
+                FG = 7;
+                BG = 0;
+                BOLD = false;
+            }
+            1 => BOLD = true,
+            22 => BOLD = false,
+            30..=37 => FG = ANSI2VGA[(n - 30) as usize],
+            39 => FG = 7,
+            40..=47 => BG = ANSI2VGA[(n - 40) as usize],
+            49 => BG = 0,
+            90..=97 => {
+                FG = ANSI2VGA[(n - 90) as usize];
+                BOLD = true;
+            }
+            _ => {}
+        }
+    }
+    recompose();
+}
+
+/// Стереть от курсора до конца строки (`ESC[K`).
+unsafe fn erase_line() {
+    for col in COL..W {
+        put_cell(ROW, col, b' ');
+    }
+}
+
+/// Веха 41 — перевести Unicode-символ в байт **CP866** (в этой раскладке загружен шрифт
+/// знакогенератора, [`load_font`]): ASCII — как есть, кириллица и псевдографика — по таблице,
+/// прочее — `?`.
+fn map_cp866(c: char) -> u8 {
+    match c {
         '\n' | '\r' | '\u{8}' => c as u8,
         ' '..='~' => c as u8, // ASCII 0x20..0x7E
-        // Кириллица (раскладка CP866): А-Я, а-п, р-я, Ё/ё.
-        'А'..='Я' => 0x80 + (c as u32 - 'А' as u32) as u8, // U+0410..042F → 0x80..0x9F
-        'а'..='п' => 0xA0 + (c as u32 - 'а' as u32) as u8, // U+0430..043F → 0xA0..0xAF
-        'р'..='я' => 0xE0 + (c as u32 - 'р' as u32) as u8, // U+0440..044F → 0xE0..0xEF
+        'А'..='Я' => 0x80 + (c as u32 - 'А' as u32) as u8,
+        'а'..='п' => 0xA0 + (c as u32 - 'а' as u32) as u8,
+        'р'..='я' => 0xE0 + (c as u32 - 'р' as u32) as u8,
         'Ё' => 0xF0,
         'ё' => 0xF1,
-        // Псевдографика рамок (баннер, FATAL-бокс) → коды CP437/866.
         '═' => 0xCD, '║' => 0xBA, '╔' => 0xC9, '╗' => 0xBB, '╚' => 0xC8, '╝' => 0xBC,
         '╟' => 0xC7, '╢' => 0xB6, '╠' => 0xCC, '╣' => 0xB9, '╦' => 0xCB, '╩' => 0xCA, '╬' => 0xCE,
         '─' => 0xC4, '│' => 0xB3, '┌' => 0xDA, '┐' => 0xBF, '└' => 0xC0, '┘' => 0xD9,
         '├' => 0xC3, '┤' => 0xB4, '┬' => 0xC2, '┴' => 0xC1, '┼' => 0xC5,
         '█' => 0xDB, '░' => 0xB0, '▒' => 0xB1, '▓' => 0xB2, '•' => 0x07, '°' => 0xF8,
-        // Типографика, часто встречающаяся в наших строках → близкие глифы CP866/437.
-        '—' | '–' => 0xC4, // тире → горизонтальная линия
-        '·' => 0xFA,       // средняя точка (разделитель в отчётах)
+        '—' | '–' => 0xC4,
+        '·' => 0xFA,
         '«' => 0xAE, '»' => 0xAF,
-        '→' => 0x1A, '←' => 0x1B, '↑' => 0x18, '↓' => 0x19, // стрелки (глифы 0x18..0x1B в CP437/866)
+        '→' => 0x1A, '←' => 0x1B, '↑' => 0x18, '↓' => 0x19,
         '…' => b'.',
         _ => b'?',
-    };
-    unsafe { emit(byte) };
+    }
 }
 
-/// Очистить экран и увести курсор в начало (для `clear` из vsh — Веха 41+).
+/// Веха 41/43 — вывести символ на VGA. Обычные — в CP866 текущим цветом; ANSI-последовательности
+/// (`ESC[…m` цвет, `ESC[2J` очистка, `ESC[H` в начало, `ESC[K` до конца строки) перехватываются
+/// и НЕ рисуются (на serial те же коды толкует терминал).
+pub fn put_char(c: char) {
+    unsafe {
+        match ANSI {
+            Ansi::Normal => {
+                if c == '\u{1b}' {
+                    ANSI = Ansi::Esc;
+                } else {
+                    emit(map_cp866(c));
+                }
+            }
+            Ansi::Esc => {
+                if c == '[' {
+                    PLEN = 0;
+                    ANSI = Ansi::Csi;
+                } else {
+                    ANSI = Ansi::Normal; // не CSI — игнорируем
+                }
+            }
+            Ansi::Csi => {
+                if c.is_ascii_digit() || c == ';' {
+                    if PLEN < PARAMS_MAX {
+                        PARAMS[PLEN] = c as u8;
+                        PLEN += 1;
+                    }
+                } else {
+                    match c {
+                        'm' => apply_sgr(),
+                        'J' => clear(),                // ESC[2J — очистить экран (курсор в начало)
+                        'H' | 'f' => { ROW = 0; COL = 0; }
+                        'K' => erase_line(),
+                        _ => {}
+                    }
+                    ANSI = Ansi::Normal;
+                }
+            }
+        }
+    }
+}
+
+/// Очистить экран текущим цветом и увести курсор в начало (для `clear` из vsh — Веха 43).
 pub fn clear() {
     unsafe {
         let blank = ((ATTR as u16) << 8) | b' ' as u16;
@@ -113,11 +230,16 @@ pub fn clear() {
     }
 }
 
-/// Задать атрибут (цвет) последующего текста: младший ниббл — цвет символа, старший — фон
-/// (стандартная палитра VGA). Задел под цветной вывод (Веха полировки TTY).
-#[allow(dead_code)]
-pub fn set_attr(attr: u8) {
-    unsafe { ATTR = attr };
+/// Веха 43 — синхронизировать АППАРАТНЫЙ курсор VGA с позицией письма (CRTC 0x0E/0x0F). Зовётся
+/// после каждой строки — иначе мигающий курсор «висит» там, где его оставил BIOS, а не где пишем.
+pub fn sync_cursor() {
+    unsafe {
+        let pos = (ROW * W + COL) as u16;
+        outb(0x3D4, 0x0F);
+        outb(0x3D5, (pos & 0xff) as u8);
+        outb(0x3D4, 0x0E);
+        outb(0x3D5, (pos >> 8) as u8);
+    }
 }
 
 #[inline]
