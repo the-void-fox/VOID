@@ -11,6 +11,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+mod font;
 mod gdt;
 mod ioapic;
 mod lapic;
@@ -53,8 +54,8 @@ pub fn ram_total() -> usize {
     RAM_TOTAL_CELL.load(Ordering::Relaxed)
 }
 
-/// Magic multiboot1 в eax при входе от GRUB (у PVH eax не определён → 0).
-const MULTIBOOT_MAGIC: usize = 0x2BADB002;
+/// Magic multiboot2 в eax при входе от GRUB (у PVH eax не определён → 0).
+const MULTIBOOT2_MAGIC: usize = 0x36D76289;
 
 /// Веха 41 — разобрать инфо-структуру загрузчика и выставить границы RAM. `magic` — eax при
 /// входе (`0x2BADB002` = multiboot/GRUB), `info` — ebx (указатель на инфо). Direct-map и
@@ -70,16 +71,27 @@ pub fn platform_init(magic: usize, info: usize) {
     RAM_LIMIT_CELL.store(total.min(RAM_CAP), Ordering::Relaxed);
 }
 
-/// Прочитать полную RAM из карты памяти. multiboot: `flags(u32)@0`, `mem_upper(u32)@8` — КиБ
-/// выше 1 МиБ (GRUB/QEMU дают при флаге bit0). PVH/неизвестно — дефолт 128 МиБ (это QEMU).
+/// Прочитать полную RAM из карты памяти multiboot2 (от GRUB). Инфо — список тегов
+/// (`total_size@0`, теги с `@8`); ищем тег «basic meminfo» (type 4): `mem_upper@+8` — КиБ
+/// выше 1 МиБ. PVH/неизвестно — дефолт 128 МиБ (это QEMU, где RAM известна раннеру).
 fn discover_ram(magic: usize, info: usize) -> usize {
-    if magic == MULTIBOOT_MAGIC && info != 0 {
-        let flags = unsafe { core::ptr::read_volatile(info as *const u32) };
-        if flags & 1 != 0 {
-            let mem_upper =
-                unsafe { core::ptr::read_volatile((info + 8) as *const u32) } as usize;
+    if magic != MULTIBOOT2_MAGIC || info == 0 {
+        return 128 * 1024 * 1024;
+    }
+    let rd = |off: usize| unsafe { core::ptr::read_volatile((info + off) as *const u32) };
+    let mut p = 8usize; // теги начинаются после total_size(u32)+reserved(u32)
+    loop {
+        let ty = rd(p);
+        let size = rd(p + 4) as usize;
+        if ty == 0 || size < 8 {
+            break; // завершающий тег или мусор
+        }
+        if ty == 4 {
+            // basic meminfo: mem_lower@+8 (КиБ ниже 1 МиБ), mem_upper@+12 (КиБ выше 1 МиБ).
+            let mem_upper = rd(p + 12) as usize;
             return 0x10_0000 + mem_upper * 1024;
         }
+        p += (size + 7) & !7; // следующий тег — с выравниванием на 8
     }
     128 * 1024 * 1024
 }
@@ -109,21 +121,28 @@ pub struct Console;
 
 impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            if b == b'\n' {
+        // Идём по СИМВОЛАМ: в COM1 (терминал QEMU) — сырой UTF-8, в VGA — перевод в CP866
+        // (там загружен наш шрифт), иначе кириллица на экране машины была бы «?».
+        let mut buf = [0u8; 4];
+        for c in s.chars() {
+            if c == '\n' {
                 outb(COM1, b'\r');
             }
-            outb(COM1, b);
-            // Веха 41: зеркалим в VGA-текст — на реальной машине (без COM-порта) виден ОН.
-            vga::put_byte(b);
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                outb(COM1, b);
+            }
+            // Веха 41: VGA-текст — на реальной машине (без COM-порта) виден ОН.
+            vga::put_char(c);
         }
         Ok(())
     }
 }
 
-/// Веха 41 — ранняя инициализация консоли: очистить VGA-экран от мусора BIOS (на реальной
-/// машине это первое, что видно). На riscv — no-op (там консоль — UART).
+/// Веха 41 — ранняя инициализация консоли: загрузить CP866-шрифт в знакогенератор VGA (чтобы
+/// кириллица рисовалась, а не «?») и очистить экран от мусора BIOS — это первое, что видно на
+/// реальной машине. На riscv — no-op (там консоль — UART).
 pub fn console_init() {
+    vga::load_font();
     vga::clear();
 }
 

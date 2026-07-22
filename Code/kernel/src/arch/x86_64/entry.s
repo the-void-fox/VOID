@@ -20,21 +20,29 @@
     .asciz "Xen"
     .long _start32
 
-# ── Multiboot1-заголовок (читает GRUB — путь для РЕАЛЬНОГО железа, Веха 41) ─────
-# Одна ELF-сборка грузится и QEMU (PVH-нотой), и GRUB'ом (этим заголовком) — на
-# ноутбуке/мини-ПК PVH недоступен, а GRUB есть. Тип загрузки различаем по magic в eax:
-# multiboot кладёт 0x2BADB002 (и mb_info в ebx), PVH — start_info в ebx. Флаги: bit1 —
-# просим у GRUB карту памяти (mem_lower/upper + mmap), bit0 — выравнивание модулей.
-.set MB_MAGIC, 0x1BADB002
-.set MB_FLAGS, 0x00000003
+# ── Multiboot2-заголовок (читает GRUB — путь для РЕАЛЬНОГО железа, Веха 41) ─────
+# Одна ELF-сборка грузится и QEMU (PVH-нотой), и GRUB'ом (этим заголовком): на ноутбуке
+# PVH недоступен, а GRUB есть. Почему MB2, а не MB1: QEMU `-kernel` понимает multiboot1 и
+# грузил бы ИМ (а он 32-битный → отвергает наш ELF64); multiboot2 QEMU не знает → падает на
+# PVH-ноту (cargo run цел), а GRUB грузит по MB2. Тип различаем по magic в eax: multiboot2
+# кладёт 0x36D76289 (и mb2-инфо в ebx), PVH — start_info в ebx.
 # Заголовок — в СВОЮ секцию .multiboot, которую линкер кладёт САМОЙ ПЕРВОЙ: GRUB ищет magic
 # в первых 8 КиБ ФАЙЛА, а .text (с трамплином) выровнен на страницу и уезжает за границу.
+.set MB2_MAGIC, 0xE85250D6
+.set MB2_ARCH, 0                    # 0 = i386 (32-битный protected mode на входе)
 .section .multiboot, "a"
-.align 4
-multiboot_header:
-    .long MB_MAGIC
-    .long MB_FLAGS
-    .long -(MB_MAGIC + MB_FLAGS)    # контрольная сумма: magic+flags+checksum == 0
+.align 8
+mb2_header:
+    .long MB2_MAGIC
+    .long MB2_ARCH
+    .long mb2_header_end - mb2_header
+    .long -(MB2_MAGIC + MB2_ARCH + (mb2_header_end - mb2_header))
+    # обязательный завершающий тег (type 0, size 8)
+    .align 8
+    .short 0
+    .short 0
+    .long 8
+mb2_header_end:
 
 # ── 32-битный трамплин ────────────────────────────────────────────────────────
 .section .text.entry
