@@ -7,7 +7,9 @@
 //! `\r` (терминал) или `\n` (pipe). Команды: `ls`, `cat F`, `echo TEXT > F` (или просто печать),
 //! `run NAME [ARGS…]` (Веха 30: слова после имени становятся argv ребёнка; например
 //! `run bin/hello мир`), `thaw NAME` (Веха 37: разморозить процесс из образа
-//! `proc/<arch>/NAME`), `mv OLD NEW` (rename персоналии), `help`, `exit` — последняя
+//! `proc/<arch>/NAME`), `switch GEN` / `sysdef GEN FILE` (Веха 40: выбрать/задать
+//! поколение системы — декларативный init грузит `system/current` на следующей
+//! загрузке), `mv OLD NEW` (rename персоналии), `help`, `exit` — последняя
 //! завершает сессию VOID.
 #![no_std]
 #![no_main]
@@ -16,7 +18,7 @@ use void_user as sys;
 use void_user::posix as px;
 
 static HELP: &[u8] =
-    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | thaw NAME | mv OLD NEW | ping IP | help | exit\n";
+    b"commands: ls | cat FILE | tail FILE | echo TEXT > FILE | run NAME [ARGS] | thaw NAME | switch GEN | sysdef GEN FILE | mv OLD NEW | ping IP | help | exit\n";
 
 /// Разобрать IPv4 в точечной записи «A.B.C.D» в 4 байта. `None` — не разобрать.
 fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
@@ -207,6 +209,61 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
                 px::write(ep, px::STDOUT, b"vsh: thawed program exited, code ");
                 put_dec(ep, code);
                 px::write(ep, px::STDOUT, b"\n");
+            }
+            continue;
+        }
+        if let Some(name) = cmd.strip_prefix(b"switch ") {
+            // Веха 40: выбрать поколение системы — записать его имя в корень-указатель
+            // `system/current`. Право WRITE на store у vsh есть (a1 = store:xw из конфига).
+            // Вступает в силу на следующей загрузке (декларативный init читает корень).
+            let mut id = [0u8; 32];
+            if sys::obj_put(xcap, name, &mut id) == 0
+                && sys::obj_set_root(xcap, b"system/current", &id) == 0
+            {
+                px::write(ep, px::STDOUT, "vsh: поколение выбрано, перезагрузи QEMU: ".as_bytes());
+                px::write(ep, px::STDOUT, name);
+                px::write(ep, px::STDOUT, b"\n");
+            } else {
+                px::write(ep, px::STDOUT, "vsh: switch failed (нет права WRITE на store?)\n".as_bytes());
+            }
+            continue;
+        }
+        if let Some(rest) = cmd.strip_prefix(b"sysdef ") {
+            // Веха 40: `sysdef ИМЯ ФАЙЛ` — зарегистрировать содержимое файла персоналии как
+            // конфиг поколения `system/ИМЯ` (объект store + корень). Так конфиг, написанный/
+            // доставленный как файл (в т.ч. сгенерированный `nix/system.nix`), становится
+            // поколением, на которое можно `switch`. Читаем файл через персоналию, кладём в store.
+            let sp = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+            let (gname, fname) = (&rest[..sp], rest.get(sp + 1..).unwrap_or(&[]));
+            if gname.is_empty() || fname.is_empty() {
+                px::write(ep, px::STDOUT, "usage: sysdef ИМЯ ФАЙЛ\n".as_bytes());
+                continue;
+            }
+            let fd = px::open(ep, fname, 0);
+            if fd == usize::MAX {
+                px::write(ep, px::STDOUT, b"vsh: sysdef: no such file\n");
+                continue;
+            }
+            // Конфиг мал (несколько строк) — читаем одним буфером.
+            let n = px::read(ep, fd, &mut out);
+            px::close(ep, fd);
+            let mut rootbuf = [0u8; 40]; // "system/" + имя ≤ 32
+            let root = b"system/";
+            rootbuf[..root.len()].copy_from_slice(root);
+            let gl = gname.len().min(rootbuf.len() - root.len());
+            rootbuf[root.len()..root.len() + gl].copy_from_slice(&gname[..gl]);
+            let rlen = root.len() + gl;
+            let mut id = [0u8; 32];
+            if sys::obj_put(xcap, &out[..n], &mut id) == 0
+                && sys::obj_set_root(xcap, &rootbuf[..rlen], &id) == 0
+            {
+                px::write(ep, px::STDOUT, "vsh: поколение записано: ".as_bytes());
+                px::write(ep, px::STDOUT, gname);
+                px::write(ep, px::STDOUT, b" (switch ");
+                px::write(ep, px::STDOUT, gname);
+                px::write(ep, px::STDOUT, ", затем перезагрузка)\n".as_bytes());
+            } else {
+                px::write(ep, px::STDOUT, b"vsh: sysdef failed\n");
             }
             continue;
         }

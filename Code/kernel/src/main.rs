@@ -57,6 +57,7 @@ mod elf;
 mod executor;
 mod frame;
 mod heap;
+mod init;
 mod linux;
 mod object;
 mod proc;
@@ -342,12 +343,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     );
     println!();
 
-    // Веха 20: интерактивная сессия — ФИНАЛЬНАЯ стадия вместо простоя. Система остаётся
-    // живой, пока пользователь не наберёт `exit`. Записи файлов внутри сессии персистентны:
-    // OBJ_SET_ROOT копится в пачку, фиксирует group commit (порог/период — Веха 33;
-    // выключение питания в окно ≤ ~2 с теряет хвост, но store остаётся консистентным).
+    // Веха 40: интерактивная сессия — теперь ДЕКЛАРАТИВНАЯ. Вместо зашитого `shell_session`
+    // ядро читает конфиг активного поколения из store (`system/current`) и поднимает по нему
+    // серверы и shell (`init::boot`). Смена `system/current` (vsh `switch NAME`) + перезагрузка
+    // = загрузка в другую конфигурацию; откат — та же смена корня назад.
     if arch::USERSPACE_READY {
-        shell_session();
+        init::boot();
         // Веха 33: конец сессии — точка жёсткого синка group commit: хвост
         // несинхронизированных операций (окно ≤ ~2 с) доезжает до диска.
         object::commit();
@@ -489,57 +490,6 @@ fn cap_ipc_demo() {
     }
     proc::run();
     println!("  [cap] сессия раздатчика завершена — обратно в ядро");
-}
-
-/// Веха 20.4: интерактивная сессия. Сервер-персоналия получает cap на store (r/w — файлы), а
-/// `vsh` — ДВА начальных cap: эндпоинт персоналии (a0, право SEND) и cap на store ТОЛЬКО с
-/// правом EXEC (a1): запускать программы можно, читать/писать объекты напрямую — нельзя
-/// (аттенуация «только запуск»). Ввод — SYS_READ с UART по прерыванию; `run bin/hello`
-/// исполняет ELF из store по имени корня (машинерия Вехи 19 руками пользователя).
-fn shell_session() {
-    use void_abi::Rights;
-
-    println!("  [vsh] интерактивная сессия (Веха 20) — ls · cat · echo · run bin/hello · ping · exit:");
-    let server = spawn_prog("posixfs", "posixfs", 0);
-    let scap = cap::mint(proc::domain(server), cap::Target::Store, Rights::READ.union(Rights::WRITE));
-    proc::set_arg(server, scap.bits() as usize);
-
-    // Веха 34: сетевой сервер — ему cap на сетевое устройство (r/w — слать/принимать кадры).
-    // vsh получит эндпоинт на него (start-cap слот 2) и команду `ping`.
-    let netsrv = spawn_prog("net-srv", "net-srv", 0);
-    let netdev = cap::mint(
-        proc::domain(netsrv),
-        cap::Target::Device(cap::Device::Net),
-        Rights::READ.union(Rights::WRITE),
-    );
-    proc::set_arg(netsrv, netdev.bits() as usize);
-
-    let sh = spawn_prog("vsh", "vsh", 0);
-    let ep = cap::mint(proc::domain(sh), cap::Target::Endpoint(server), Rights::SEND);
-    proc::set_arg(sh, ep.bits() as usize);
-    // Веха 37: к EXEC добавился WRITE — SYS_CHECKPOINT пишет образ процесса в store,
-    // а право наследуют дети vsh (именно ОНИ себя морозят). Аттенуация никуда не делась:
-    // передать дальше урезанную копию можно cap_derive'ом.
-    let xcap = cap::mint(proc::domain(sh), cap::Target::Store, Rights::EXEC.union(Rights::WRITE));
-    proc::set_arg2(sh, xcap.bits() as usize);
-    let netep = cap::mint(proc::domain(sh), cap::Target::Endpoint(netsrv), Rights::SEND);
-    // Веха 30 — контракт запуска: те же права — в таблицу стартовых capability
-    // (её унаследуют программы, которые vsh запустит через SYS_EXEC), плюс окружение.
-    // Слот 0 — эндпоинт персоналии, 1 — EXEC, 2 — эндпоинт net-srv (Веха 34).
-    proc::push_start_cap(sh, ep.bits() as usize);
-    proc::push_start_cap(sh, xcap.bits() as usize);
-    proc::push_start_cap(sh, netep.bits() as usize);
-    proc::set_env(sh, alloc::format!("ARCH={}\0SYSTEM=void\0", arch::ARCH_NAME).as_bytes());
-    println!(
-        "    P{} 'posixfs' [{}] ← P{} 'vsh' [эндпоинт {} + store {}]",
-        server,
-        cap::rights_str(Rights::READ.union(Rights::WRITE)),
-        sh,
-        cap::rights_str(Rights::SEND),
-        cap::rights_str(Rights::EXEC),
-    );
-    proc::run();
-    println!("  [vsh] сессия завершена (exit) — обратно в ядро");
 }
 
 /// Веха 8: демонстрация свойств capability на общем объектном store.
