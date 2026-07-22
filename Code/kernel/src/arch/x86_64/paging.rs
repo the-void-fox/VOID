@@ -40,8 +40,9 @@ pub fn init() -> usize {
     let ro_e = &raw const _rodata_end as usize;
 
     unsafe {
-        // 1) direct map всей RAM как RW+NX (данные не исполняются).
-        map_range(root, 0, super::RAM_LIMIT, PTE_W | PTE_NX);
+        // 1) direct map всей (используемой) RAM как RW+NX (данные не исполняются). Веха 41:
+        //    граница — обнаруженная `ram_limit()` (зажата CAP'ом), а не зашитая константа.
+        map_range(root, 0, super::ram_limit(), PTE_W | PTE_NX);
         // 2) W^X: код R+X (без W и без NX), константы R+NX.
         map_range(root, text_s, text_e, 0);
         map_range(root, ro_s, ro_e, PTE_NX);

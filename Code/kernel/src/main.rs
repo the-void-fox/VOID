@@ -128,17 +128,30 @@ macro_rules! println {
 /// Главная функция ядра. Вызывается из `_start` с a0=hartid, a1=dtb.
 #[no_mangle]
 pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
+    // Веха 41: очистить консоль (на x86 — VGA-экран от мусора BIOS) ДО первого вывода.
+    arch::console_init();
     println!();
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 31                           ║");
-    println!("  ║  порт std: обычный Rust на VOID           ║");
-    println!("  ║  таргеты *-unknown-void · cargo build     ║");
+    println!("  ║  VOID — Веха 41                           ║");
+    println!("  ║  платформа: загрузка на реальном железе   ║");
+    println!("  ║  (multiboot/GRUB, VGA, карта памяти)      ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
     println!("  dtb     : {:#x}", dtb);
     println!("  void-abi: v{}", void_abi::VERSION);
     println!();
+
+    // Веха 41: платформенная инициализация — разобрать карту памяти загрузчика (multiboot от
+    // GRUB на реальном железе / PVH от QEMU) ДО mm_init: direct-map и аллокатор фреймов возьмут
+    // обнаруженную границу RAM, а не зашитые 128 МиБ. `hartid`/`dtb` на x86 = magic/инфо загрузки.
+    arch::platform_init(hartid, dtb);
+    println!(
+        "  [plat] RAM обнаружено: {} МиБ (используем {} МиБ)",
+        arch::ram_total() / (1024 * 1024),
+        arch::ram_limit().saturating_sub(if arch::ARCH_NAME == "riscv64" { 0x8000_0000 } else { 0 })
+            / (1024 * 1024),
+    );
 
     // Вектор trap'ов нужен и для page fault'ов, и для таймера.
     arch::trap_init();
@@ -379,9 +392,10 @@ fn mem_report() {
     }
     let image = &raw const _kernel_end as usize - &raw const _text_start as usize;
     println!(
-        "  [mem] образ ядра: {} КиБ · фреймы после образа (пик): {} КиБ · RAM машины: 128 МиБ",
+        "  [mem] образ ядра: {} КиБ · фреймы после образа (пик): {} КиБ · RAM машины: {} МиБ",
         image / 1024,
         frame::used_bytes() / 1024,
+        arch::ram_total() / (1024 * 1024),
     );
 }
 

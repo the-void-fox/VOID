@@ -5,3 +5,5 @@
 /programs/*/target/
 # target хост-утилит (Веха 29) — тоже отдельные крейты со своим таргетом
 /tools/*/target/
+# Загрузочный ISO для реального железа (Веха 41). Собрать: boot/mkboot.sh
+/boot/void.iso

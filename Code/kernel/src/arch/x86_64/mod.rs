@@ -17,6 +17,7 @@ mod lapic;
 mod paging;
 mod pci;
 mod trap;
+mod vga;
 
 // Точка входа: PVH-нота + трамплин 32→64 (см. entry.s).
 core::arch::global_asm!(include_str!("entry.s"));
@@ -34,9 +35,54 @@ pub const ARCH_NAME: &str = "x86_64";
 /// Процессы/U-mode работают (Веха 26) — kmain гоняет процессные демо.
 pub const USERSPACE_READY: bool = true;
 
-/// Конец RAM: QEMU q35 `-m 128M` — [0, 128 МиБ) (дыру BIOS < 1 МиБ ядро не трогает:
-/// образ грузится с 1 МиБ, арена фреймов — за ним).
-pub const RAM_LIMIT: usize = 128 * 1024 * 1024;
+/// Операционная граница RAM (адрес конца, exclusive) — теперь ОБНАРУЖИВАЕТСЯ (Веха 41), а не
+/// зашита: `platform_init` читает карту памяти загрузчика (multiboot от GRUB / PVH от QEMU) и
+/// зажимает её CAP'ом (direct-map и аллокатор фреймов — этой границей). До discovery — дефолт
+/// QEMU q35 128 МиБ.
+static RAM_LIMIT_CELL: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
+/// Полная обнаруженная ёмкость RAM (для отчёта; операционно ограничена [`ram_limit`]).
+static RAM_TOTAL_CELL: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
+
+/// Верхняя граница используемой RAM (адрес конца) — читают `frame`/`paging`.
+pub fn ram_limit() -> usize {
+    RAM_LIMIT_CELL.load(Ordering::Relaxed)
+}
+
+/// Полная обнаруженная RAM машины (байты) — для отчёта памяти.
+pub fn ram_total() -> usize {
+    RAM_TOTAL_CELL.load(Ordering::Relaxed)
+}
+
+/// Magic multiboot1 в eax при входе от GRUB (у PVH eax не определён → 0).
+const MULTIBOOT_MAGIC: usize = 0x2BADB002;
+
+/// Веха 41 — разобрать инфо-структуру загрузчика и выставить границы RAM. `magic` — eax при
+/// входе (`0x2BADB002` = multiboot/GRUB), `info` — ebx (указатель на инфо). Direct-map и
+/// аллокатор фреймов зажимаются `RAM_CAP`: VOID не нужны гигабайты, а отображать всю память
+/// 4-КиБ страницами дорого; полную ёмкость печатаем отдельно ради честности отчёта.
+///
+/// # Safety
+/// `info` — валидный указатель инфо-структуры соответствующего типа (гарантирует загрузчик).
+pub fn platform_init(magic: usize, info: usize) {
+    const RAM_CAP: usize = 256 * 1024 * 1024;
+    let total = discover_ram(magic, info);
+    RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
+    RAM_LIMIT_CELL.store(total.min(RAM_CAP), Ordering::Relaxed);
+}
+
+/// Прочитать полную RAM из карты памяти. multiboot: `flags(u32)@0`, `mem_upper(u32)@8` — КиБ
+/// выше 1 МиБ (GRUB/QEMU дают при флаге bit0). PVH/неизвестно — дефолт 128 МиБ (это QEMU).
+fn discover_ram(magic: usize, info: usize) -> usize {
+    if magic == MULTIBOOT_MAGIC && info != 0 {
+        let flags = unsafe { core::ptr::read_volatile(info as *const u32) };
+        if flags & 1 != 0 {
+            let mem_upper =
+                unsafe { core::ptr::read_volatile((info + 8) as *const u32) } as usize;
+            return 0x10_0000 + mem_upper * 1024;
+        }
+    }
+    128 * 1024 * 1024
+}
 
 // ─── консоль (COM1: вывод напрямую, приём — опросом LSR на тиках таймера) ────
 
@@ -68,9 +114,17 @@ impl fmt::Write for Console {
                 outb(COM1, b'\r');
             }
             outb(COM1, b);
+            // Веха 41: зеркалим в VGA-текст — на реальной машине (без COM-порта) виден ОН.
+            vga::put_byte(b);
         }
         Ok(())
     }
+}
+
+/// Веха 41 — ранняя инициализация консоли: очистить VGA-экран от мусора BIOS (на реальной
+/// машине это первое, что видно). На riscv — no-op (там консоль — UART).
+pub fn console_init() {
+    vga::clear();
 }
 
 // Кольцевой буфер принятых байт — аналог riscv64/uart.rs. Наполняется двумя путями

@@ -16,9 +16,11 @@ extern "C" {
     static _kernel_end: u8;
 }
 
-/// Конец физической RAM — платформенная константа арха (`-m 128M` у runner'ов обеих
-/// архитектур в .cargo/config.toml; позже возьмём из DTB / PVH start_info).
-const RAM_END: usize = crate::arch::RAM_LIMIT;
+/// Конец физической RAM — Веха 41: ОБНАРУЖИВАЕТСЯ (`arch::ram_limit()`) из карты памяти
+/// загрузчика (multiboot/PVH), а не зашитая константа. `platform_init` вызывается ДО `init`.
+fn ram_end() -> usize {
+    crate::arch::ram_limit()
+}
 
 /// Адрес следующего свободного фрейма (двигается вверх).
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -33,7 +35,7 @@ pub fn init() {
 /// виртуальный, пока RAM отображена идентично). `None` при исчерпании.
 pub fn alloc() -> Option<usize> {
     let pa = NEXT.fetch_add(PAGE_SIZE, Ordering::Relaxed);
-    if pa + PAGE_SIZE > RAM_END {
+    if pa + PAGE_SIZE > ram_end() {
         return None;
     }
     // Обнулить фрейм: нулевой PTE = невалидный, поэтому новая таблица сразу «пустая».
@@ -47,7 +49,7 @@ pub fn alloc() -> Option<usize> {
 pub fn reserve(bytes: usize) -> Option<usize> {
     let bytes = align_up(bytes, PAGE_SIZE);
     let start = NEXT.fetch_add(bytes, Ordering::Relaxed);
-    if start + bytes > RAM_END {
+    if start + bytes > ram_end() {
         return None;
     }
     Some(start)

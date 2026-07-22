@@ -11,7 +11,7 @@
 # kmain строит настоящие (arch::mm_init, W^X) и перещёлкивает CR3 (arch::mm_enable).
 # Синтаксис Intel (по умолчанию для global_asm! на x86_64).
 
-# ── PVH-нота (читает QEMU) ────────────────────────────────────────────────────
+# ── PVH-нота (читает QEMU при `-kernel`) ──────────────────────────────────────
 .section .note.Xen, "a", @note
 .align 4
     .long 4                         # namesz = len("Xen\0")
@@ -20,13 +20,30 @@
     .asciz "Xen"
     .long _start32
 
+# ── Multiboot1-заголовок (читает GRUB — путь для РЕАЛЬНОГО железа, Веха 41) ─────
+# Одна ELF-сборка грузится и QEMU (PVH-нотой), и GRUB'ом (этим заголовком) — на
+# ноутбуке/мини-ПК PVH недоступен, а GRUB есть. Тип загрузки различаем по magic в eax:
+# multiboot кладёт 0x2BADB002 (и mb_info в ebx), PVH — start_info в ebx. Флаги: bit1 —
+# просим у GRUB карту памяти (mem_lower/upper + mmap), bit0 — выравнивание модулей.
+.set MB_MAGIC, 0x1BADB002
+.set MB_FLAGS, 0x00000003
+# Заголовок — в СВОЮ секцию .multiboot, которую линкер кладёт САМОЙ ПЕРВОЙ: GRUB ищет magic
+# в первых 8 КиБ ФАЙЛА, а .text (с трамплином) выровнен на страницу и уезжает за границу.
+.section .multiboot, "a"
+.align 4
+multiboot_header:
+    .long MB_MAGIC
+    .long MB_FLAGS
+    .long -(MB_MAGIC + MB_FLAGS)    # контрольная сумма: magic+flags+checksum == 0
+
 # ── 32-битный трамплин ────────────────────────────────────────────────────────
 .section .text.entry
 .code32
 .global _start32
 _start32:
     cli
-    mov esi, ebx                    # PVH start_info → 2-й аргумент kmain (как dtb на RISC-V)
+    mov esi, ebx                    # info ptr (PVH start_info | multiboot info) → 2-й арг kmain
+    mov [boot_magic], eax           # magic загрузки → глобал (edi клобберит пейджинг ниже)
 
     # PVH ABI: esp НЕ определён — свой стек до первого push (retf ниже).
     mov esp, offset _boot_stack_top
@@ -96,7 +113,7 @@ _start64:
     mov gs, ax
     mov esi, esi                    # обнулить верхнюю половину rsi (после смены режима — мусор)
     lea rsp, [rip + _boot_stack_top]
-    xor edi, edi                    # hartid = 0 (нет аналога — один процессор)
+    mov edi, [boot_magic]           # 1-й арг kmain = magic загрузки (0x2BADB002 → multiboot)
     call kmain
 3:  hlt
     jmp 3b
@@ -114,6 +131,9 @@ gdt64_ptr:
     .long gdt64                     # 32-битный lgdt: word limit + dword base
 
 .section .bss
+.align 8
+boot_magic:                         # magic загрузки (eax при входе): 0x2BADB002 = multiboot
+    .space 8
 .align 4096
 boot_pml4:
     .space 4096

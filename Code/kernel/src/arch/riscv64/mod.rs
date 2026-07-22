@@ -33,6 +33,10 @@ pub const CONSOLE_IRQ: u32 = uart::IRQ;
 
 pub use uart::{drain_rx as console_drain, getc as console_getc, has_input as console_has_input};
 
+/// Веха 41 — ранняя инициализация консоли: на RISC-V консоль — UART (SBI/NS16550), чистить
+/// нечего (no-op; парный x86, где очищается VGA-экран от мусора BIOS).
+pub fn console_init() {}
+
 // ─── прерывания ─────────────────────────────────────────────────────────────
 
 pub use csr::{enable_interrupts, irq_restore, irq_save_disable};
@@ -225,7 +229,22 @@ pub const ARCH_NAME: &str = "riscv64";
 pub const USERSPACE_READY: bool = true;
 
 /// Конец RAM: QEMU virt `-m 128M` — [0x8000_0000, 0x8800_0000).
-pub const RAM_LIMIT: usize = 0x8000_0000 + 128 * 1024 * 1024;
+const RAM_LIMIT: usize = 0x8000_0000 + 128 * 1024 * 1024;
+
+/// Веха 41 — граница используемой RAM (адрес конца). На riscv пока константа (QEMU virt
+/// 128 МиБ); разбор `/memory` из device tree (a1) — впереди, как x86-memmap.
+pub fn ram_limit() -> usize {
+    RAM_LIMIT
+}
+
+/// Полная RAM машины (байты) — для отчёта (на riscv = размер от базы RAM).
+pub fn ram_total() -> usize {
+    RAM_LIMIT - 0x8000_0000
+}
+
+/// Веха 41 — платформенная инициализация: на x86 разбирает карту памяти загрузчика; на riscv
+/// (QEMU virt) пока no-op — RAM/UART/virtio известны по контракту QEMU (DTB-парсинг впереди).
+pub fn platform_init(_hartid: usize, _dtb: usize) {}
 
 /// Выключить машину (SBI SRST; в QEMU — завершить процесс). Задел под автотесты.
 #[allow(dead_code)]

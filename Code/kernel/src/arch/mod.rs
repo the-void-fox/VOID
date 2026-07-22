@@ -51,7 +51,7 @@ mod imp;
 
 pub use imp::{
     // консоль (init приёма — внутри init_device_interrupts)
-    console_drain, console_getc, console_has_input, Console, CONSOLE_IRQ,
+    console_drain, console_getc, console_has_input, console_init, Console, CONSOLE_IRQ,
     // прерывания
     enable_interrupts, init_device_interrupts, irq_mask_preempt, irq_mask_read, irq_mask_stdin,
     irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel, wait_for_interrupt,
@@ -65,7 +65,9 @@ pub use imp::{
     // устройства (Веха 27, virtio-net — Веха 34)
     probe_virtio_blk, probe_virtio_net,
     // разное
-    ARCH_NAME, ELF_MACHINE, RAM_LIMIT, USERSPACE_READY,
+    ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
+    // платформа (Веха 41): границы RAM из карты памяти загрузчика + ранняя инициализация
+    platform_init, ram_limit, ram_total,
 };
 
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.
