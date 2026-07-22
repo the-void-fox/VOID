@@ -24,7 +24,7 @@ pub extern "C" fn _start(ep: usize, _a1: usize) -> ! {
     px::cat(ep, MOTD);
     // $ ls
     px::write(ep, px::STDOUT, b"[mini-sh] $ ls\n");
-    let n = px::readdir(ep, &mut buf);
+    let n = px::readdir(ep, b"/", &mut buf); // Веха 44: список корневого каталога
     px::write(ep, px::STDOUT, &buf[..n]);
     void_user::exit(0);
 }

@@ -1,92 +1,159 @@
-//! POSIX-персоналия (Вехи 18.1–18.3, seek/rename — Веха 30): даёт клиентам файловый API
-//! `open/read/write/close/stat/unlink/readdir/seek/rename` по IPC. Файл = значение в объектном store,
-//! привязанное к корню-имени (`a0` = cap на store): `open(name)` = `get_root(name)` → есть?
-//! загрузить : создать; `close` изменённого файла = `put` + `set_root` (атомарный чекпойнт).
-//! Привязка к корню переживает и GC ядра, и перезагрузку.
+//! POSIX-персоналия (Вехи 18–30, ИЕРАРХИЯ — Веха 44): файловый API `open/read/write/close/stat/
+//! unlink/readdir/seek/rename/mkdir` по IPC, теперь с **каталогами и путями**. Файл = значение
+//! в store под корнем `f<путь>`; каталог = индекс под корнем `d<путь>` (список имён + типов).
+//! И то, и другое — обычные корни, поэтому GC их держит, а иерархия переживает перезагрузку —
+//! БЕЗ изменений в ядре (стройматериал — произвольные имена корней со слэшами).
 //!
-//! Данные файлов (16 × 4 КиБ) и скретч — в ленивой куче (`SYS_MAP`): страницы приходят по мере
-//! реальной записи, по одной на файл. Метаданные — обычные массивы на стеке: с Вехи 23 это
-//! настоящий ELF, memset/memcpy линкуются в сам бинарь, ухищрения времён секции `.user`
-//! (сырые указатели, MaybeUninit) больше не нужны.
+//! Пути абсолютные (`/a/b/c`); голое имя без ведущего `/` (от std-программ) трактуется как
+//! `/<имя>` — файлы таких программ живут в корне `/`. Клиент vsh резолвит относительные пути к
+//! своему `cwd` до отправки, так что сюда приходят готовые абсолютные пути.
 //!
-//! Индекс каталога (для readdir/unlink) персистится под спец-корнем `.dir` — формат
-//! count(1) | [nlen(1) | name]*. Корни-файлы ядро перечислять не даёт, поэтому список имён свой.
+//! Данные открытых файлов (16 слотов × 128 КиБ) — в ленивой куче; индекс каталога и скретч — на
+//! стеке. Совместимость: формат ответа `stat` = `[есть:1 | размер:4 LE | каталог:1]` (старые
+//! клиенты читают первые 5 байт, 6-й игнорируют); `readdir` теперь принимает путь каталога.
 #![no_std]
 #![no_main]
 
 use void_user as sys;
-use void_user::posix::{OP_CLOSE, OP_OPEN, OP_READ, OP_READDIR, OP_RENAME, OP_SEEK, OP_STAT, OP_UNLINK, OP_WRITE};
+use void_user::posix::{
+    OP_CLOSE, OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_RENAME, OP_SEEK, OP_STAT, OP_UNLINK,
+    OP_WRITE,
+};
 use void_user::posix::{O_APPEND, O_TRUNC};
 
 const NFILES: usize = 16;
-const NAME_MAX: usize = 32;
-/// Веха 39: потолок размера файла поднят 4 КиБ → 128 КиБ, чтобы через персоналию
-/// проходили wasm-модули (`bin/wasirun` читает .wasm как обычный файл std::fs).
-/// Буферы файлов — в ленивой куче: реальные страницы приходят лишь на записанное.
+const PATH_MAX: usize = 128;
+/// Веха 39: файл ≤ 128 КиБ (wasm-модули проходят через персоналию). Буферы — в ленивой куче.
 const DATA_MAX: usize = 128 * 1024;
-/// Индекс каталога (имена файлов) — на СТЕКЕ, поэтому свой скромный потолок, не DATA_MAX
-/// (128 КиБ на стеке = переполнение): 16 имён × ≤33 Б укладываются с запасом.
+/// Индекс каталога — на СТЕКЕ, свой скромный потолок (не DATA_MAX): count(u16) + записи.
 const DIR_MAX: usize = 4096;
-static DIRROOT: &[u8] = b".dir";
+/// Имя корня = префикс `f`/`d` + абсолютный путь.
+const ROOT_MAX: usize = 1 + PATH_MAX;
 
-/// Есть ли имя в индексе каталога.
-fn dir_contains(dir: &[u8], name: &[u8]) -> bool {
-    let cnt = dir[0] as usize;
-    let mut off = 1usize;
-    for _ in 0..cnt {
-        let l = dir[off] as usize;
-        off += 1;
-        if &dir[off..off + l] == name {
-            return true;
+// ─── пути ──────────────────────────────────────────────────────────────────────
+/// Нормализовать запрос в абсолютный путь в `out`, вернуть длину. Пусто/`.`/`/` → корень `/`;
+/// голое имя → `/<имя>`; хвостовой `/` (кроме корня) убираем.
+fn normalize(req: &[u8], out: &mut [u8; PATH_MAX]) -> usize {
+    let mut n = 0usize;
+    if req.is_empty() || req == b"." || req == b"/" {
+        out[0] = b'/';
+        return 1;
+    }
+    if req[0] != b'/' {
+        out[0] = b'/';
+        n = 1;
+    }
+    for &b in req {
+        if n < PATH_MAX {
+            out[n] = b;
+            n += 1;
         }
-        off += l;
     }
-    false
+    if n > 1 && out[n - 1] == b'/' {
+        n -= 1; // убрать хвостовой слэш
+    }
+    n
 }
 
-/// Добавить имя в индекс, если его ещё нет. Возвращает `true`, если индекс изменился.
-fn dir_add(dir: &mut [u8], dir_len: &mut usize, name: &[u8]) -> bool {
-    if dir_contains(&dir[..*dir_len], name) {
-        return false;
+/// Родитель пути (`/a/b` → `/a`; `/a` → `/`; `/` → `/`).
+fn parent(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => b"/",
+        Some(i) => &path[..i],
     }
-    if *dir_len + 1 + name.len() > DIR_MAX {
-        return false; // нет места — упрощение (без ENOSPC)
-    }
-    dir[*dir_len] = name.len() as u8;
-    dir[*dir_len + 1..*dir_len + 1 + name.len()].copy_from_slice(name);
-    *dir_len += 1 + name.len();
-    dir[0] += 1; // count++
-    true
 }
 
-/// Убрать имя из индекса (сдвиг хвоста). Возвращает `true`, если что-то удалили.
-fn dir_remove(dir: &mut [u8], dir_len: &mut usize, name: &[u8]) -> bool {
-    let cnt = dir[0] as usize;
-    let mut off = 1usize;
+/// Листовое имя (`/a/b` → `b`; `/` → пусто).
+fn leaf(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// Собрать имя корня `<prefix><path>` в `out`, вернуть длину.
+fn root_name(prefix: u8, path: &[u8], out: &mut [u8; ROOT_MAX]) -> usize {
+    out[0] = prefix;
+    let n = path.len().min(ROOT_MAX - 1);
+    out[1..1 + n].copy_from_slice(&path[..n]);
+    1 + n
+}
+
+// ─── индекс каталога (корень `d<путь>`): count(u16 LE) | [type(1) | nlen(1) | name]* ───
+/// Есть ли `name` в индексе `dir[..len]`; возвращает тип (0=файл, 1=каталог).
+fn idx_type(dir: &[u8], len: usize, name: &[u8]) -> Option<u8> {
+    if len < 2 {
+        return None;
+    }
+    let cnt = u16::from_le_bytes([dir[0], dir[1]]) as usize;
+    let mut off = 2usize;
     for _ in 0..cnt {
-        let l = dir[off] as usize;
-        let entry = 1 + l;
-        if &dir[off + 1..off + 1 + l] == name {
-            dir.copy_within(off + entry..*dir_len, off);
-            *dir_len -= entry;
-            dir[0] = (cnt - 1) as u8; // count--
-            return true;
+        if off + 2 > len {
+            break;
+        }
+        let ty = dir[off];
+        let nl = dir[off + 1] as usize;
+        if off + 2 + nl > len {
+            break;
+        }
+        if &dir[off + 2..off + 2 + nl] == name {
+            return Some(ty);
+        }
+        off += 2 + nl;
+    }
+    None
+}
+
+/// Добавить запись (если её ещё нет). Возвращает новую длину.
+fn idx_add(dir: &mut [u8], mut len: usize, name: &[u8], is_dir: bool) -> usize {
+    if len < 2 {
+        dir[0] = 0;
+        dir[1] = 0;
+        len = 2;
+    }
+    if idx_type(dir, len, name).is_some() || len + 2 + name.len() > DIR_MAX {
+        return len;
+    }
+    dir[len] = is_dir as u8;
+    dir[len + 1] = name.len() as u8;
+    dir[len + 2..len + 2 + name.len()].copy_from_slice(name);
+    let cnt = u16::from_le_bytes([dir[0], dir[1]]) + 1;
+    dir[0..2].copy_from_slice(&cnt.to_le_bytes());
+    len + 2 + name.len()
+}
+
+/// Убрать запись (сдвиг хвоста). Возвращает новую длину (не меняется, если не было).
+fn idx_remove(dir: &mut [u8], mut len: usize, name: &[u8]) -> usize {
+    if len < 2 {
+        return len;
+    }
+    let cnt = u16::from_le_bytes([dir[0], dir[1]]) as usize;
+    let mut off = 2usize;
+    for _ in 0..cnt {
+        if off + 2 > len {
+            break;
+        }
+        let nl = dir[off + 1] as usize;
+        let entry = 2 + nl;
+        if &dir[off + 2..off + 2 + nl] == name {
+            dir.copy_within(off + entry..len, off);
+            len -= entry;
+            dir[0..2].copy_from_slice(&((cnt - 1) as u16).to_le_bytes());
+            return len;
         }
         off += entry;
     }
-    false
+    len
 }
 
-/// Записать индекс каталога в store и привязать к спец-корню ".dir" (переживёт перезагрузку).
-fn dir_persist(store_cap: usize, dir: &[u8], id: &mut [u8; 32]) {
-    sys::obj_put(store_cap, dir, id);
-    sys::obj_set_root(store_cap, DIRROOT, id);
+/// Пуст ли каталог (count == 0).
+fn idx_empty(dir: &[u8], len: usize) -> bool {
+    len < 2 || u16::from_le_bytes([dir[0], dir[1]]) == 0
 }
 
 #[no_mangle]
 pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
-    // Данные файлов + скретч для stat — в ленивой куче: 17 страничных диапазонов адресов,
-    // а физические страницы приходят по одной на реально записанный файл.
+    // Данные открытых файлов — в ленивой куче: NFILES страничных диапазонов, физпамять по факту.
     let heap = sys::heap_map((NFILES + 1) * DATA_MAX);
     if heap == usize::MAX {
         sys::exit(1);
@@ -94,33 +161,55 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     let all = unsafe { core::slice::from_raw_parts_mut(heap as *mut u8, (NFILES + 1) * DATA_MAX) };
     let (files, scratch) = all.split_at_mut(NFILES * DATA_MAX);
 
-    // Метаданные: namespace (имена → данные) и таблица дескрипторов.
-    let mut names = [[0u8; NAME_MAX]; NFILES];
-    let mut name_len = [0usize; NFILES];
+    // Метаданные слотов файлов (кэш открытых) и таблица дескрипторов.
+    let mut paths = [[0u8; PATH_MAX]; NFILES]; // абсолютный путь файла в слоте
+    let mut path_len = [0usize; NFILES];
     let mut size = [0usize; NFILES];
-    let mut fused = [false; NFILES]; // слот файла занят
-    let mut dirty = [false; NFILES]; // изменён с последней записи в store
-    let mut fd_file = [0usize; NFILES]; // fd → файл
-    let mut fd_off = [0usize; NFILES]; // fd → смещение (курсор)
-    let mut fd_used = [false; NFILES]; // дескриптор занят
-
-    let mut dir = [0u8; DIR_MAX];
-    let mut dir_len = 1usize; // count(0) — пустой каталог
+    let mut fused = [false; NFILES];
+    let mut dirty = [false; NFILES];
+    let mut fd_file = [0usize; NFILES];
+    let mut fd_off = [0usize; NFILES];
+    let mut fd_used = [false; NFILES];
 
     let mut req = [0u8; 512];
     let mut rep = [0u8; 512];
-    let mut idb = [0u8; 32]; // content-id для OBJ_PUT/GET
+    let mut idb = [0u8; 32];
+    let mut dir = [0u8; DIR_MAX]; // рабочий буфер индекса каталога
+    let mut pbuf = [0u8; PATH_MAX]; // нормализованный путь запроса
 
-    // Поднять индекс каталога с прошлого запуска (get_root(".dir") → get), иначе — пустой.
-    if sys::obj_get_root(store_cap, DIRROOT, &mut idb) == 32 {
-        let n = sys::obj_get(store_cap, &idb, &mut dir);
-        if n > 0 {
-            dir_len = n;
+    // Убедиться, что корневой каталог `/` существует (первый запуск).
+    {
+        let mut rn = [0u8; ROOT_MAX];
+        let rl = root_name(b'd', b"/", &mut rn);
+        if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) != 32 {
+            dir[0] = 0;
+            dir[1] = 0;
+            sys::obj_put(store_cap, &dir[..2], &mut idb);
+            sys::obj_set_root(store_cap, &rn[..rl], &idb);
         }
     }
 
+    // Прочитать индекс каталога `path` в `dir`, вернуть длину (0 — каталога нет).
+    let read_index = |store: usize,
+                      path: &[u8],
+                      dir: &mut [u8; DIR_MAX],
+                      idb: &mut [u8; 32]|
+     -> Option<usize> {
+        let mut rn = [0u8; ROOT_MAX];
+        let rl = root_name(b'd', path, &mut rn);
+        if sys::obj_get_root(store, &rn[..rl], idb) != 32 {
+            return None;
+        }
+        Some(sys::obj_get(store, idb, dir))
+    };
+    let write_index = |store: usize, path: &[u8], dir: &[u8], idb: &mut [u8; 32]| {
+        let mut rn = [0u8; ROOT_MAX];
+        let rl = root_name(b'd', path, &mut rn);
+        sys::obj_put(store, dir, idb);
+        sys::obj_set_root(store, &rn[..rl], idb);
+    };
+
     loop {
-        // RECV → op (opcode | fd<<8 | mode<<16), reply-cap, нагрузка в req.
         let m = sys::recv(&mut req);
         let opcode = m.op & 0xff;
         let fd = (m.op >> 8) & 0xff;
@@ -129,42 +218,66 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
         let mut reply_len = 0usize;
 
         match opcode {
-            OP_OPEN => {
-                // req[..len] — имя. Найти файл или создать; выделить fd; вернуть [fd] (0xff — ошибка).
-                let nl = len.min(NAME_MAX);
-                let mut fidx = usize::MAX;
-                for i in 0..NFILES {
-                    if fused[i] && &names[i][..name_len[i]] == &req[..len] {
-                        fidx = i;
-                        break;
+            OP_MKDIR => {
+                // Создать каталог: пустой индекс `d<path>` + запись в родителе. rep[0]: 0 ок / 1 ошибка.
+                let pl = normalize(&req[..len], &mut pbuf);
+                let path = &pbuf[..pl];
+                rep[0] = 1;
+                if pl > 1 {
+                    // родитель должен существовать (или это корень)
+                    let par = parent(path);
+                    let par_exists = par == b"/"
+                        || read_index(store_cap, par, &mut dir, &mut idb).is_some();
+                    let exists = read_index(store_cap, path, &mut dir, &mut idb).is_some();
+                    if par_exists && !exists {
+                        dir[0] = 0;
+                        dir[1] = 0;
+                        write_index(store_cap, path, &dir[..2], &mut idb);
+                        // добавить в родителя
+                        let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_add(&mut dir, plen, leaf(path), true);
+                        write_index(store_cap, par, &dir[..nlen], &mut idb);
+                        rep[0] = 0;
                     }
                 }
-                if fidx == usize::MAX {
-                    // Не в RAM — занять свободный слот и попробовать поднять из store, иначе создать.
-                    if let Some(j) = (0..NFILES).find(|&j| !fused[j]) {
-                        fidx = j;
-                        fused[j] = true;
-                        dirty[j] = false;
-                        name_len[j] = nl;
-                        names[j][..nl].copy_from_slice(&req[..nl]);
-                        // Есть ли корень с этим именем? (get_root)
-                        if sys::obj_get_root(store_cap, &req[..nl], &mut idb) == 32 {
-                            // Загрузить содержимое по content-id в буфер данных файла.
-                            let dbuf = &mut files[j * DATA_MAX..(j + 1) * DATA_MAX];
-                            size[j] = sys::obj_get(store_cap, &idb, dbuf);
-                            // Персистентный файл, привязанный к корню ДО появления индекса
-                            // каталога, — занести в индекс, чтобы его видел readdir.
-                            if dir_add(&mut dir, &mut dir_len, &req[..nl]) {
-                                dir_persist(store_cap, &dir[..dir_len], &mut idb);
+                reply_len = 1;
+            }
+            OP_OPEN => {
+                // req — путь; открыть/создать файл, вернуть [fd] (0xff — ошибка).
+                let pl = normalize(&req[..len], &mut pbuf);
+                let path = &pbuf[..pl];
+                // нельзя открыть каталог как файл
+                let is_dir = read_index(store_cap, path, &mut dir, &mut idb).is_some();
+                let mut fidx = usize::MAX;
+                if !is_dir {
+                    // уже в кэше?
+                    for i in 0..NFILES {
+                        if fused[i] && &paths[i][..path_len[i]] == path {
+                            fidx = i;
+                            break;
+                        }
+                    }
+                    if fidx == usize::MAX {
+                        if let Some(j) = (0..NFILES).find(|&j| !fused[j]) {
+                            fidx = j;
+                            fused[j] = true;
+                            dirty[j] = false;
+                            path_len[j] = pl;
+                            paths[j][..pl].copy_from_slice(path);
+                            let mut rn = [0u8; ROOT_MAX];
+                            let rl = root_name(b'f', path, &mut rn);
+                            if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) == 32 {
+                                let dbuf = &mut files[j * DATA_MAX..(j + 1) * DATA_MAX];
+                                size[j] = sys::obj_get(store_cap, &idb, dbuf);
+                            } else {
+                                size[j] = 0; // новый файл (создастся при close)
+                                dirty[j] = true;
                             }
-                        } else {
-                            size[j] = 0; // новый файл
                         }
                     }
                 }
                 let mut nfd = usize::MAX;
                 if fidx != usize::MAX {
-                    // O_TRUNC обнуляет содержимое (пометив изменённым — перезапишется на close).
                     if mode & O_TRUNC != 0 {
                         size[fidx] = 0;
                         dirty[fidx] = true;
@@ -173,7 +286,6 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         nfd = d;
                         fd_used[d] = true;
                         fd_file[d] = fidx;
-                        // O_APPEND ставит курсор в конец, иначе — в начало.
                         fd_off[d] = if mode & O_APPEND != 0 { size[fidx] } else { 0 };
                     }
                 }
@@ -181,7 +293,6 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 reply_len = 1;
             }
             OP_WRITE => {
-                // req[..len] — данные; дописать в файл дескриптора со смещения fd_off.
                 if fd < NFILES && fd_used[fd] {
                     let fi = fd_file[fd];
                     let w = fd_off[fd];
@@ -191,11 +302,10 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     if w + n > size[fi] {
                         size[fi] = w + n;
                     }
-                    dirty[fi] = true; // пометить для записи в store при close
+                    dirty[fi] = true;
                 }
             }
             OP_READ => {
-                // Прочитать из файла со смещения до конца (клиент ограничит своим recv-буфером).
                 if fd < NFILES && fd_used[fd] {
                     let fi = fd_file[fd];
                     let r = fd_off[fd];
@@ -206,51 +316,79 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 }
             }
             OP_STAT => {
-                // req[..len] — имя. Вернуть [exists:1 | size:4 LE]. Ищем в RAM, затем среди корней.
+                // req — путь. rep = [есть:1 | размер:4 LE | каталог:1].
+                let pl = normalize(&req[..len], &mut pbuf);
+                let path = &pbuf[..pl];
                 let mut sz = usize::MAX;
-                for i in 0..NFILES {
-                    if fused[i] && &names[i][..name_len[i]] == &req[..len] {
-                        sz = size[i];
-                        break;
+                let mut is_dir = false;
+                if read_index(store_cap, path, &mut dir, &mut idb).is_some() {
+                    is_dir = true;
+                    sz = 0;
+                } else {
+                    for i in 0..NFILES {
+                        if fused[i] && &paths[i][..path_len[i]] == path {
+                            sz = size[i];
+                            break;
+                        }
+                    }
+                    if sz == usize::MAX {
+                        let mut rn = [0u8; ROOT_MAX];
+                        let rl = root_name(b'f', path, &mut rn);
+                        if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) == 32 {
+                            sz = sys::obj_get(store_cap, &idb, scratch);
+                        }
                     }
                 }
-                if sz == usize::MAX && sys::obj_get_root(store_cap, &req[..len], &mut idb) == 32 {
-                    // Не в RAM, но корень есть — подгрузить ради длины в СКРЕТЧ кучи,
-                    // не в 512-байтный буфер ответа (файл до 4 КиБ переполнил бы его).
-                    sz = sys::obj_get(store_cap, &idb, scratch);
-                }
-                let exists = (sz != usize::MAX) as u8;
+                rep[0] = (sz != usize::MAX) as u8;
                 let szv = if sz == usize::MAX { 0 } else { sz } as u32;
-                rep[0] = exists;
                 rep[1..5].copy_from_slice(&szv.to_le_bytes());
-                reply_len = 5;
+                rep[5] = is_dir as u8;
+                reply_len = 6;
             }
             OP_UNLINK => {
-                // req[..len] — имя. Убрать из RAM namespace, снять корень и убрать из каталога.
-                for i in 0..NFILES {
-                    if fused[i] && &names[i][..name_len[i]] == &req[..len] {
-                        fused[i] = false;
-                        // закрыть висящие дескрипторы на удаляемый файл
-                        for d in 0..NFILES {
-                            if fd_used[d] && fd_file[d] == i {
-                                fd_used[d] = false;
+                // req — путь. Файл: снять корень `f<path>` + убрать из родителя. Каталог: только
+                // пустой — снять `d<path>` + убрать из родителя. rep[0]: 0 ок / 1 ошибка.
+                let pl = normalize(&req[..len], &mut pbuf);
+                let path = &pbuf[..pl];
+                rep[0] = 1;
+                if pl > 1 {
+                    let par = parent(path);
+                    if let Some(dlen) = read_index(store_cap, path, &mut dir, &mut idb) {
+                        // каталог — удаляем, только если пуст
+                        if idx_empty(&dir, dlen) {
+                            let mut rn = [0u8; ROOT_MAX];
+                            let rl = root_name(b'd', path, &mut rn);
+                            sys::obj_del_root(store_cap, &rn[..rl]);
+                            let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
+                            let nlen = idx_remove(&mut dir, plen, leaf(path));
+                            write_index(store_cap, par, &dir[..nlen], &mut idb);
+                            rep[0] = 0;
+                        }
+                    } else {
+                        // файл
+                        for i in 0..NFILES {
+                            if fused[i] && &paths[i][..path_len[i]] == path {
+                                fused[i] = false;
+                                for d in 0..NFILES {
+                                    if fd_used[d] && fd_file[d] == i {
+                                        fd_used[d] = false;
+                                    }
+                                }
+                                break;
                             }
                         }
-                        break;
+                        let mut rn = [0u8; ROOT_MAX];
+                        let rl = root_name(b'f', path, &mut rn);
+                        sys::obj_del_root(store_cap, &rn[..rl]);
+                        let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_remove(&mut dir, plen, leaf(path));
+                        write_index(store_cap, par, &dir[..nlen], &mut idb);
+                        rep[0] = 0;
                     }
                 }
-                // снять персистентный корень — объект уйдёт в GC (честный unlink)
-                sys::obj_del_root(store_cap, &req[..len]);
-                if dir_remove(&mut dir, &mut dir_len, &req[..len]) {
-                    dir_persist(store_cap, &dir[..dir_len], &mut idb);
-                }
-                rep[0] = 0;
                 reply_len = 1;
             }
             OP_SEEK => {
-                // Веха 30. req[..8] — знаковое смещение (i64 LE), whence — в байте режима op
-                // (0=SET, 1=CUR, 2=END). Курсор зажимается в [0, размер] — дыр в файлах нет.
-                // Ответ: новая позиция (u64 LE) или u64::MAX.
                 let mut pos = u64::MAX;
                 if fd < NFILES && fd_used[fd] && len >= 8 {
                     let off = i64::from_le_bytes(req[..8].try_into().unwrap());
@@ -268,79 +406,109 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 reply_len = 8;
             }
             OP_RENAME => {
-                // Веха 30. req: old_len(1) | old | new. Перевесить: корень store (смена корня —
-                // атомарный чекпойнт), слот RAM (открытые fd продолжают работать — close
-                // запишет уже под новым именем), запись каталога.
+                // req: old_len(1) | old | new (абсолютные пути). Перевесить файл-корень + индексы.
                 rep[0] = 0xff;
                 let ol = if len >= 2 { req[0] as usize } else { usize::MAX };
-                if ol != usize::MAX && 1 + ol < len && len - 1 - ol <= NAME_MAX {
-                    let nl = len - 1 - ol;
-                    let mut oldb = [0u8; NAME_MAX];
-                    let mut newb = [0u8; NAME_MAX];
-                    if ol <= NAME_MAX {
-                        oldb[..ol].copy_from_slice(&req[1..1 + ol]);
-                        newb[..nl].copy_from_slice(&req[1 + ol..len]);
-                        let (old, new) = (&oldb[..ol], &newb[..nl]);
-                        let mut ok = false;
-                        if sys::obj_get_root(store_cap, old, &mut idb) == 32 {
-                            sys::obj_set_root(store_cap, new, &idb);
-                            sys::obj_del_root(store_cap, old);
+                if ol != usize::MAX && 1 + ol < len {
+                    let mut oldp = [0u8; PATH_MAX];
+                    let mut newp = [0u8; PATH_MAX];
+                    let onl = normalize(&req[1..1 + ol], &mut oldp);
+                    let nnl = normalize(&req[1 + ol..len], &mut newp);
+                    let (old, new) = (&oldp[..onl], &newp[..nnl]);
+                    let mut ok = false;
+                    // перевесить файл-корень f<old> → f<new>
+                    let mut ro = [0u8; ROOT_MAX];
+                    let mut rnw = [0u8; ROOT_MAX];
+                    let rlo = root_name(b'f', old, &mut ro);
+                    let rln = root_name(b'f', new, &mut rnw);
+                    if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
+                        sys::obj_set_root(store_cap, &rnw[..rln], &idb);
+                        sys::obj_del_root(store_cap, &ro[..rlo]);
+                        ok = true;
+                    }
+                    // слот в кэше
+                    for i in 0..NFILES {
+                        if fused[i] && &paths[i][..path_len[i]] == old {
+                            paths[i][..nnl].copy_from_slice(new);
+                            path_len[i] = nnl;
                             ok = true;
+                            break;
                         }
-                        for i in 0..NFILES {
-                            if fused[i] && &names[i][..name_len[i]] == old {
-                                names[i][..nl].copy_from_slice(new);
-                                name_len[i] = nl;
-                                ok = true;
-                                break;
-                            }
-                        }
-                        if ok {
-                            let removed = dir_remove(&mut dir, &mut dir_len, old);
-                            let added = dir_add(&mut dir, &mut dir_len, new);
-                            if removed || added {
-                                dir_persist(store_cap, &dir[..dir_len], &mut idb);
-                            }
-                            rep[0] = 0;
-                        }
+                    }
+                    if ok {
+                        // индексы родителей
+                        let pold = parent(old);
+                        let plen = read_index(store_cap, pold, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_remove(&mut dir, plen, leaf(old));
+                        write_index(store_cap, pold, &dir[..nlen], &mut idb);
+                        let pnew = parent(new);
+                        let plen = read_index(store_cap, pnew, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_add(&mut dir, plen, leaf(new), false);
+                        write_index(store_cap, pnew, &dir[..nlen], &mut idb);
+                        rep[0] = 0;
                     }
                 }
                 reply_len = 1;
             }
             OP_READDIR => {
-                // Вернуть имена файлов из индекса каталога, разделённые '\n'.
-                let cnt = dir[0] as usize;
-                let mut off = 1usize;
-                for _ in 0..cnt {
-                    let l = dir[off] as usize;
-                    off += 1;
-                    for k in 0..l {
-                        if reply_len < 511 {
-                            rep[reply_len] = dir[off + k];
+                // req — путь каталога (пусто/`.`/`/` → корень). Ответ: имена через '\n',
+                // у каталогов — с хвостовым '/'.
+                let pl = normalize(&req[..len], &mut pbuf);
+                let path = &pbuf[..pl];
+                if let Some(dlen) = read_index(store_cap, path, &mut dir, &mut idb) {
+                    let cnt = if dlen >= 2 {
+                        u16::from_le_bytes([dir[0], dir[1]]) as usize
+                    } else {
+                        0
+                    };
+                    let mut off = 2usize;
+                    for _ in 0..cnt {
+                        if off + 2 > dlen {
+                            break;
+                        }
+                        let ty = dir[off];
+                        let nl = dir[off + 1] as usize;
+                        if off + 2 + nl > dlen {
+                            break;
+                        }
+                        for k in 0..nl {
+                            if reply_len < 510 {
+                                rep[reply_len] = dir[off + 2 + k];
+                                reply_len += 1;
+                            }
+                        }
+                        if ty == 1 && reply_len < 511 {
+                            rep[reply_len] = b'/';
                             reply_len += 1;
                         }
-                    }
-                    off += l;
-                    if reply_len < 511 {
-                        rep[reply_len] = b'\n';
-                        reply_len += 1;
+                        if reply_len < 511 {
+                            rep[reply_len] = b'\n';
+                            reply_len += 1;
+                        }
+                        off += 2 + nl;
                     }
                 }
             }
             _ => {
-                // OP_CLOSE — если файл менялся, записать содержимое в store, привязать к
-                // корню-имени и занести имя в индекс каталога (переживёт GC/перезагрузку,
-                // виден в readdir). Затем освободить дескриптор.
+                // OP_CLOSE — записать изменённый файл в store, привязать к корню `f<path>`,
+                // занести имя в индекс РОДИТЕЛЬСКОГО каталога. Затем освободить дескриптор.
                 let _ = OP_CLOSE;
                 if fd < NFILES && fd_used[fd] {
                     let fi = fd_file[fd];
                     if dirty[fi] {
+                        let path = &paths[fi][..path_len[fi]];
+                        let mut rn = [0u8; ROOT_MAX];
+                        let rl = root_name(b'f', path, &mut rn);
                         sys::obj_put(store_cap, &files[fi * DATA_MAX..fi * DATA_MAX + size[fi]], &mut idb);
-                        sys::obj_set_root(store_cap, &names[fi][..name_len[fi]], &idb);
-                        let nm = names[fi];
-                        if dir_add(&mut dir, &mut dir_len, &nm[..name_len[fi]]) {
-                            dir_persist(store_cap, &dir[..dir_len], &mut idb);
-                        }
+                        sys::obj_set_root(store_cap, &rn[..rl], &idb);
+                        // добавить имя в индекс родителя (скопировать путь — dir/idb переиспользуются)
+                        let mut pcopy = [0u8; PATH_MAX];
+                        let pl = path_len[fi];
+                        pcopy[..pl].copy_from_slice(path);
+                        let par = parent(&pcopy[..pl]);
+                        let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_add(&mut dir, plen, leaf(&pcopy[..pl]), false);
+                        write_index(store_cap, par, &dir[..nlen], &mut idb);
                         dirty[fi] = false;
                     }
                     fd_used[fd] = false;

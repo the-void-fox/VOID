@@ -406,12 +406,14 @@ pub mod posix {
     pub const OP_STAT: usize = 4;
     /// unlink(name): снять корень + убрать из каталога
     pub const OP_UNLINK: usize = 5;
-    /// readdir() -> имена через '\n'
+    /// readdir(path) -> имена через '\n' (Веха 44: каталог в запросе; у подкаталогов хвост '/')
     pub const OP_READDIR: usize = 6;
     /// seek(fd): смещение курсора (Веха 30); whence едет в байте режима op
     pub const OP_SEEK: usize = 7;
     /// rename(old, new): перевесить корень + запись каталога (Веха 30)
     pub const OP_RENAME: usize = 8;
+    /// mkdir(path): создать каталог (Веха 44)
+    pub const OP_MKDIR: usize = 9;
 
     pub const SEEK_SET: usize = 0;
     pub const SEEK_CUR: usize = 1;
@@ -467,9 +469,35 @@ pub mod posix {
         crate::call(ep, OP_CLOSE | ((fd - FD_BASE) << 8), &[], &mut []);
     }
 
-    /// `readdir(buf) -> n`: имена файлов через '\n' (для `ls`).
-    pub fn readdir(ep: usize, buf: &mut [u8]) -> usize {
-        crate::call(ep, OP_READDIR, &[], buf)
+    /// `readdir(path, buf) -> n` (Веха 44): имена в каталоге `path` через '\n'; у подкаталогов —
+    /// хвостовой '/'. Пустой путь / `.` / `/` — корень.
+    pub fn readdir(ep: usize, path: &[u8], buf: &mut [u8]) -> usize {
+        crate::call(ep, OP_READDIR, path, buf)
+    }
+
+    /// `mkdir(path) -> 0 | MAX` (Веха 44): создать каталог (родитель должен существовать).
+    pub fn mkdir(ep: usize, path: &[u8]) -> usize {
+        let mut r = [0u8; 1];
+        crate::call(ep, OP_MKDIR, path, &mut r);
+        if r[0] == 0 { 0 } else { usize::MAX }
+    }
+
+    /// `unlink(path) -> 0 | MAX` (Веха 44): удалить файл (или ПУСТОЙ каталог).
+    pub fn unlink(ep: usize, path: &[u8]) -> usize {
+        let mut r = [0u8; 1];
+        crate::call(ep, OP_UNLINK, path, &mut r);
+        if r[0] == 0 { 0 } else { usize::MAX }
+    }
+
+    /// `stat(path) -> Some((каталог?, размер)) | None` (Веха 44): для `cd`/проверок существования.
+    pub fn stat(ep: usize, path: &[u8]) -> Option<(bool, usize)> {
+        let mut r = [0u8; 6];
+        let n = crate::call(ep, OP_STAT, path, &mut r);
+        if n < 6 || r[0] == 0 {
+            return None;
+        }
+        let size = u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as usize;
+        Some((r[5] != 0, size))
     }
 
     /// `spawn(name) -> код выхода` (аналог `posix_spawn`+`wait`): запустить программу из store

@@ -23,6 +23,8 @@ const RESET: &[u8] = b"\x1b[0m";
 const C_CMD: &[u8] = b"\x1b[1;33m"; // жёлтый жирный — имя команды
 const C_HEAD: &[u8] = b"\x1b[1;36m"; // голубой жирный — заголовки
 const C_PROMPT: &[u8] = b"\x1b[1;32m"; // зелёный жирный — приглашение
+const C_DIR: &[u8] = b"\x1b[1;34m"; // синий жирный — текущий каталог/имена каталогов
+const C_ERR: &[u8] = b"\x1b[1;31m"; // красный жирный — ошибки
 
 /// Одна строка справки: имя команды (в цвете) + выравнивание + описание (кириллица — UTF-8).
 fn help_row(ep: usize, cmd: &[u8], desc: &str) {
@@ -44,7 +46,11 @@ fn print_help(ep: usize) {
     px::write(ep, px::STDOUT, "  VOID vsh — команды:".as_bytes());
     px::write(ep, px::STDOUT, RESET);
     px::write(ep, px::STDOUT, b"\n");
-    help_row(ep, b"ls", "список файлов");
+    help_row(ep, b"ls [DIR]", "список файлов (каталога DIR или текущего)");
+    help_row(ep, b"cd DIR", "сменить каталог (.. — вверх, / — корень)");
+    help_row(ep, b"pwd", "показать текущий каталог");
+    help_row(ep, b"mkdir DIR", "создать каталог");
+    help_row(ep, b"rm PATH", "удалить файл (или пустой каталог)");
     help_row(ep, b"cat FILE", "показать содержимое файла");
     help_row(ep, b"tail FILE", "последние ~32 байта файла");
     help_row(ep, b"echo TEXT > FILE", "записать текст в файл (без > — печать)");
@@ -109,18 +115,83 @@ fn put_dec(ep: usize, mut v: usize) {
     }
 }
 
+/// Веха 44 — разрешить путь `arg` относительно `cwd` в абсолютный нормализованный путь `out`,
+/// вернуть длину. Поддерживает ведущий `/` (абсолютный), `.`, `..`, пустые компоненты. Пустой
+/// `arg` возвращает сам `cwd` (для `ls` без аргумента).
+fn resolve(cwd: &[u8], arg: &[u8], out: &mut [u8; 128]) -> usize {
+    let mut len;
+    if arg.first() == Some(&b'/') {
+        out[0] = b'/';
+        len = 1;
+    } else {
+        len = cwd.len().min(128);
+        out[..len].copy_from_slice(&cwd[..len]);
+        if len == 0 {
+            out[0] = b'/';
+            len = 1;
+        }
+    }
+    let mut i = 0usize;
+    while i < arg.len() {
+        while i < arg.len() && arg[i] == b'/' {
+            i += 1;
+        }
+        let start = i;
+        while i < arg.len() && arg[i] != b'/' {
+            i += 1;
+        }
+        let comp = &arg[start..i];
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if len > 1 {
+                while len > 1 && out[len - 1] != b'/' {
+                    len -= 1;
+                }
+                if len > 1 {
+                    len -= 1; // убрать слэш (кроме корня)
+                }
+            }
+            continue;
+        }
+        if out[len - 1] != b'/' && len < 128 {
+            out[len] = b'/';
+            len += 1;
+        }
+        for &b in comp {
+            if len < 128 {
+                out[len] = b;
+                len += 1;
+            }
+        }
+    }
+    if len == 0 {
+        out[0] = b'/';
+        len = 1;
+    }
+    len
+}
+
 #[no_mangle]
 pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     let mut line = [0u8; 128]; // собираемая строка команды
     let mut inb = [0u8; 16]; // порция сырого ввода
     let mut out = [0u8; 512]; // ответы персоналии (ls)
+    let mut cwd = [0u8; 128]; // Веха 44: текущий каталог (начинаем с корня)
+    cwd[0] = b'/';
+    let mut cwd_len = 1usize;
+    let mut rp = [0u8; 128]; // буфер разрешённого пути
     print_help(ep);
     loop {
-        // Веха 43: цветное приглашение (зелёный `vsh>`). ANSI толкует и терминал, и VGA-ядро.
+        // Веха 43/44: цветное приглашение с текущим каталогом (зелёный `vsh`, синий путь).
         px::write(ep, px::STDOUT, C_PROMPT);
-        px::write(ep, px::STDOUT, b"vsh>");
+        px::write(ep, px::STDOUT, b"vsh");
         px::write(ep, px::STDOUT, RESET);
-        px::write(ep, px::STDOUT, b" ");
+        px::write(ep, px::STDOUT, C_DIR);
+        px::write(ep, px::STDOUT, &cwd[..cwd_len]);
+        px::write(ep, px::STDOUT, RESET);
+        px::write(ep, px::STDOUT, b"> ");
         // ── собрать строку: читать порциями, эхо, backspace, до Enter ──
         // Эхо — ПАЧКОЙ на порцию ввода, не по байту: SYS_WRITE валидирует UTF-8, и
         // разрезанный посередине двухбайтный символ (кириллица) печатался бы как «<?>».
@@ -168,26 +239,73 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             px::write(ep, px::STDOUT, b"\x1b[2J\x1b[H");
             continue;
         }
-        if cmd == b"ls" {
-            let n = px::readdir(ep, &mut out);
-            px::write(ep, px::STDOUT, &out[..n]);
+        if cmd == b"ls" || cmd.strip_prefix(b"ls ").is_some() {
+            // Веха 44: `ls` — текущий каталог; `ls DIR` — указанный (относительно cwd).
+            let arg = cmd.strip_prefix(b"ls ").unwrap_or(b"");
+            let n = resolve(&cwd[..cwd_len], arg, &mut rp);
+            let k = px::readdir(ep, &rp[..n], &mut out);
+            px::write(ep, px::STDOUT, &out[..k]);
+            continue;
+        }
+        if cmd == b"pwd" {
+            // Веха 44: показать текущий каталог.
+            px::write(ep, px::STDOUT, &cwd[..cwd_len]);
+            px::write(ep, px::STDOUT, b"\n");
+            continue;
+        }
+        if let Some(arg) = cmd.strip_prefix(b"cd ") {
+            // Веха 44: сменить каталог (проверив, что цель — существующий каталог).
+            let n = resolve(&cwd[..cwd_len], arg, &mut rp);
+            match px::stat(ep, &rp[..n]) {
+                Some((true, _)) => {
+                    cwd[..n].copy_from_slice(&rp[..n]);
+                    cwd_len = n;
+                }
+                _ => {
+                    px::write(ep, px::STDOUT, C_ERR);
+                    px::write(ep, px::STDOUT, "vsh: нет такого каталога\n".as_bytes());
+                    px::write(ep, px::STDOUT, RESET);
+                }
+            }
+            continue;
+        }
+        if let Some(arg) = cmd.strip_prefix(b"mkdir ") {
+            // Веха 44: создать каталог (относительно cwd).
+            let n = resolve(&cwd[..cwd_len], arg, &mut rp);
+            if px::mkdir(ep, &rp[..n]) != 0 {
+                px::write(ep, px::STDOUT, C_ERR);
+                px::write(ep, px::STDOUT, "vsh: mkdir не удался (уже есть? нет родителя?)\n".as_bytes());
+                px::write(ep, px::STDOUT, RESET);
+            }
+            continue;
+        }
+        if let Some(arg) = cmd.strip_prefix(b"rm ") {
+            // Веха 44: удалить файл (или пустой каталог) — относительно cwd.
+            let n = resolve(&cwd[..cwd_len], arg, &mut rp);
+            if px::unlink(ep, &rp[..n]) != 0 {
+                px::write(ep, px::STDOUT, C_ERR);
+                px::write(ep, px::STDOUT, "vsh: rm не удался (нет файла? каталог не пуст?)\n".as_bytes());
+                px::write(ep, px::STDOUT, RESET);
+            }
             continue;
         }
         if let Some(path) = cmd.strip_prefix(b"cat ") {
-            px::cat(ep, path);
+            let n = resolve(&cwd[..cwd_len], path, &mut rp);
+            px::cat(ep, &rp[..n]);
             continue;
         }
         if let Some(path) = cmd.strip_prefix(b"tail ") {
             // Веха 30: последние 32 байта файла — витрина lseek (SEEK_END со знаковым минусом).
-            let fd = px::open(ep, path, 0);
+            let n = resolve(&cwd[..cwd_len], path, &mut rp);
+            let fd = px::open(ep, &rp[..n], 0);
             if fd == usize::MAX {
                 px::write(ep, px::STDOUT, b"vsh: no such file\n");
             } else {
                 px::seek(ep, fd, -32, px::SEEK_END);
                 let mut tb = [0u8; 64];
-                let n = px::read(ep, fd, &mut tb);
-                px::write(ep, px::STDOUT, &tb[..n]);
-                if n == 0 || tb[n - 1] != b'\n' {
+                let k = px::read(ep, fd, &mut tb);
+                px::write(ep, px::STDOUT, &tb[..k]);
+                if k == 0 || tb[k - 1] != b'\n' {
                     px::write(ep, px::STDOUT, b"\n");
                 }
                 px::close(ep, fd);
@@ -205,7 +323,8 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
                 k += 1;
             }
             if sep != usize::MAX && sep > 0 && sep + 3 < body.len() {
-                px::echo_to(ep, &body[sep + 3..], &body[..sep]);
+                let n = resolve(&cwd[..cwd_len], &body[sep + 3..], &mut rp);
+                px::echo_to(ep, &rp[..n], &body[..sep]);
             } else {
                 px::write(ep, px::STDOUT, body);
                 px::write(ep, px::STDOUT, b"\n");
@@ -316,10 +435,13 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             continue;
         }
         if let Some(rest) = cmd.strip_prefix(b"mv ") {
-            // Веха 30: `mv OLD NEW` — rename персоналии (корень + каталог атомарно для store).
+            // Веха 30/44: `mv OLD NEW` — оба пути резолвятся относительно cwd, затем rename.
             match rest.iter().position(|&b| b == b' ') {
                 Some(sp) if sp > 0 && sp + 1 < rest.len() => {
-                    if px::rename(ep, &rest[..sp], &rest[sp + 1..]) != 0 {
+                    let mut oldr = [0u8; 128];
+                    let ol = resolve(&cwd[..cwd_len], &rest[..sp], &mut oldr);
+                    let nl = resolve(&cwd[..cwd_len], &rest[sp + 1..], &mut rp);
+                    if px::rename(ep, &oldr[..ol], &rp[..nl]) != 0 {
                         px::write(ep, px::STDOUT, b"vsh: mv failed (no such file?)\n");
                     }
                 }
