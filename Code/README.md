@@ -190,6 +190,21 @@ tools/.../void-store-import void-disk.img put /tmp/gen.conf system/gen3
 Модель NixOS: язык вычисляет на хосте, VOID грузит результат. Подробности —
 `Obsidian/10-projects/void/notes/declarative-init.md`.
 
+## Реальное железо: загрузка на x86 (Веха 41)
+x86-ядро грузится не только QEMU (PVH), но и настоящей прошивкой через **GRUB**
+(multiboot1-заголовок в `entry.s`), рисует на **VGA** (0xB8000 — у ноутбука нет
+COM-порта) и берёт размер RAM из **карты памяти** загрузчика (`platform_init` →
+`arch::ram_limit()`). Собрать загрузочный USB и проверить (тот же путь, что на металле):
+```sh
+cargo build --release --target x86_64-unknown-none
+nix-shell -p grub2 xorriso --run 'boot/mkboot.sh target/x86_64-unknown-none/release/void-kernel'
+qemu-system-x86_64 -machine q35 -m 512M -cdrom boot/void.iso -nographic   # проверка через GRUB
+sudo dd if=boot/void.iso of=/dev/sdX bs=4M status=progress && sync        # запись на флешку (СОТРЁТ!)
+```
+На реальной машине появятся баннер, карта памяти, демо и `vsh>`. НЕ поедет с первого
+раза: клавиатура (нужен PS/2/USB-HID), диск/сеть (AHCI/реальный NIC вместо virtio),
+кириллица на VGA (`?`). Подробности — `Obsidian/10-projects/void/notes/platform.md`.
+
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
 `gdb target/<таргет>/debug/void-kernel` → `target remote :1234`.
