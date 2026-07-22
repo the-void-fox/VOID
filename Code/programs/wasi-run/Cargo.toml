@@ -1,0 +1,13 @@
+[package]
+name = "wasi-run"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+
+[dependencies]
+wasmi = { version = "0.36", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

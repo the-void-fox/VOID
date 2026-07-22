@@ -17,6 +17,8 @@ exclude = [
     "programs/std-hello",
     # Веха 35: демо потоков (std::thread + Arc<Mutex> + thread_local)
     "programs/std-threads",
+    # Веха 39: WASI-раннер (wasmi поверх std-порта) — бэкенд C void-pkg
+    "programs/wasi-run",
     # Веха 29: хост-утилиты — тоже отдельные крейты: им нужен ХОСТОВЫЙ таргет
     # (см. tools/*/.cargo/config.toml), а workspace собирается под таргеты ядра.
     "tools/void-store-import",

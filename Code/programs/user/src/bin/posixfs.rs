@@ -20,7 +20,13 @@ use void_user::posix::{O_APPEND, O_TRUNC};
 
 const NFILES: usize = 16;
 const NAME_MAX: usize = 32;
-const DATA_MAX: usize = 4096;
+/// Веха 39: потолок размера файла поднят 4 КиБ → 128 КиБ, чтобы через персоналию
+/// проходили wasm-модули (`bin/wasirun` читает .wasm как обычный файл std::fs).
+/// Буферы файлов — в ленивой куче: реальные страницы приходят лишь на записанное.
+const DATA_MAX: usize = 128 * 1024;
+/// Индекс каталога (имена файлов) — на СТЕКЕ, поэтому свой скромный потолок, не DATA_MAX
+/// (128 КиБ на стеке = переполнение): 16 имён × ≤33 Б укладываются с запасом.
+const DIR_MAX: usize = 4096;
 static DIRROOT: &[u8] = b".dir";
 
 /// Есть ли имя в индексе каталога.
@@ -43,7 +49,7 @@ fn dir_add(dir: &mut [u8], dir_len: &mut usize, name: &[u8]) -> bool {
     if dir_contains(&dir[..*dir_len], name) {
         return false;
     }
-    if *dir_len + 1 + name.len() > DATA_MAX {
+    if *dir_len + 1 + name.len() > DIR_MAX {
         return false; // нет места — упрощение (без ENOSPC)
     }
     dir[*dir_len] = name.len() as u8;
@@ -98,7 +104,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     let mut fd_off = [0usize; NFILES]; // fd → смещение (курсор)
     let mut fd_used = [false; NFILES]; // дескриптор занят
 
-    let mut dir = [0u8; DATA_MAX];
+    let mut dir = [0u8; DIR_MAX];
     let mut dir_len = 1usize; // count(0) — пустой каталог
 
     let mut req = [0u8; 512];

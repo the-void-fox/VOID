@@ -1,0 +1,5 @@
+# Тулчейн std-порта VOID: stage1 форка vendor/rust, прилинкованный как «void»
+# (rustup toolchain link void vendor/rust/build/x86_64-unknown-linux-gnu/stage1).
+# Ближний rust-toolchain.toml побеждает Code/rust-toolchain.toml (stable).
+[toolchain]
+channel = "void"
