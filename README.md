@@ -11,9 +11,9 @@ x86_64) из одного дерева исходников, весь userspace 
 
 ```
   ╔══════════════════════════════════════════╗
-  ║  VOID — Веха 38                           ║
-  ║  linux-abi: неизменённые бинари nixpkgs   ║
-  ║  (hello, busybox) под персоналией Linux   ║
+  ║  VOID — Веха 39                           ║
+  ║  три бэкенда пакетов: native · linux-abi  ║
+  ║  · wasi — один .wasm на обеих архитектурах ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -161,7 +161,11 @@ futex + `thread_local!` через нативный TLS — 4 нити счит�
 **linux-abi** (`run bin/lhello`, `run bin/busybox echo …` / `uname -a` / `seq 1 5`:
 неизменённые static-PIE musl-бинари из кэша nixpkgs — hello и busybox 1.37 —
 работают под персоналией Linux; транслятор Linux-syscall'ов в ядре, без единой
-новой инструкции: riscv `ecall` общий с VOID, x86 `syscall` ловится как #UD).
+новой инструкции: riscv `ecall` общий с VOID, x86 `syscall` ловится как #UD) ·
+**wasi** (`run bin/wasirun hello.wasm`: неизменённый wasm32-wasi-модуль работает
+через интерпретатор wasmi — ОДИН .wasm на обеих архитектурах; раннер — обычная
+userspace-программа поверх порта std, ядро не тронуто). Так закрыты все три
+бэкенда пакетной дорожки (native/nix-cross · linux-abi · wasi).
 
 ## Сборка и запуск
 
@@ -202,7 +206,7 @@ toolchain-shell.nix       # окружение сборки форка (LLVM и�
 ```
 
 Развёрнутая документация — в `Obsidian/10-projects/void/`: ADR 0001–0005,
-заметки каждой вехи (1–38), staged-роадмап (`Obsidian/30-todo/todo.md`).
+заметки каждой вехи (1–39), staged-роадмап (`Obsidian/30-todo/todo.md`).
 
 ## Дальше
 
@@ -218,8 +222,10 @@ sort/rayon/ripgrep), C-мир: GNU hello и bzip2 собираются по ре
 (pkgsCross gcc+newlib + глю `void-libc`) и работают с того же диска (Веха 36 —
 ступень «nixpkgs как книга рецептов» ADR 0004 взята), checkpoint процессов
 (Веха 37, наследие KeyKOS): вычисления переживают перезагрузку, freeze/thaw
-с образом-деревом объектов store — и **linux-abi** (Веха 38, бэкенд B ADR 0004):
-неизменённые static-PIE musl-бинари из кэша nixpkgs (hello, busybox) работают
-под персоналией Linux, транслятор Linux-syscall'ов в ядре без единой новой
-инструкции. Дальше по принятому порядку: бэкенд C (wasi через wasmi),
-декларативный init — и реальное железо (VisionFive 2 / x86-минипк).
+с образом-деревом объектов store, **linux-abi** (Веха 38, бэкенд B): неизменённые
+static-PIE musl-бинари из кэша nixpkgs (hello, busybox) под персоналией Linux —
+и **wasi** (Веха 39, бэкенд C): wasm32-wasi-модули через интерпретатор wasmi,
+один .wasm на обеих архитектурах, раннер в userspace (ядро не тронуто). **Все три
+бэкенда пакетной дорожки ADR 0004 закрыты** (native/nix-cross · linux-abi · wasi).
+Дальше по принятому порядку: декларативный init — и реальное железо
+(VisionFive 2 / x86-минипк).

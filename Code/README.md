@@ -26,6 +26,9 @@ Code/
 ├── programs/
 │   ├── user/             # userspace: либа шимов (ecall / int 0x80) + 17 бинарей
 │   │                     #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
+│   ├── std-hello/        # std-программы (Веха 31/35): тулчейн void, обычный cargo
+│   ├── std-threads/      #   (std::thread + Arc<Mutex> + thread_local)
+│   ├── wasi-run/         # WASI-раннер (Веха 39): wasmi поверх std-порта — бэкенд C
 │   └── void-libc/        # C-глю (Веха 36): crt0 + стабы newlib поверх ABI VOID + specs
 │                         #   (собирает ../nix/default.nix кросс-gcc'ом из pkgsCross)
 ├── libs/
@@ -151,6 +154,22 @@ tools/.../void-store-import void-disk.img put hello bin/<arch>/lhello
 В vsh: `run bin/lhello`, `run bin/busybox echo …` / `uname -a` / `seq 1 5`
 (busybox 1.37 — один бинарь, мультиплекс по argv; файловые applet'ы отложены).
 Подробности и рецепт сборки busybox — `Obsidian/10-projects/void/notes/linux-abi.md`.
+
+## WASI: wasm-модули через wasmi (Веха 39, бэкенд C)
+Неизменённые **wasm32-wasi**-модули работают через интерпретатор wasmi — тот же
+.wasm на ОБЕИХ архитектурах. Микроядерно чисто: `programs/wasi-run` — обычная
+std-программа (тулчейн `void`, крейт `wasmi`), ЯДРО НЕ ТРОНУТО. Читает .wasm как
+файл (`std::fs` → posixfs), замыкает импорты `wasi_snapshot_preview1` на std
+(fd_write → SYS_WRITE, proc_exit → SYS_EXIT, args → `std::env::args`).
+```sh
+cargo +stable build --release --target wasm32-wasip1     # любой wasi-модуль
+tools/.../void-store-import void-disk.img put prog.wasm prog.wasm   # как файл персоналии
+nix-shell shell.nix --run "cd programs/wasi-run && cargo build --release"  # тулчейн void
+tools/.../void-store-import void-disk.img put …/wasi-run bin/<arch>/wasirun
+```
+В vsh: `run bin/wasirun hello.wasm [аргументы…]`. Так закрыты **все три бэкенда**
+void-pkg (A: nixpkgs-cross · B: linux-abi · C: wasi). Подробности —
+`Obsidian/10-projects/void/notes/wasi.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
