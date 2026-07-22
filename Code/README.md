@@ -201,9 +201,11 @@ nix-shell -p grub2 xorriso --run 'boot/mkboot.sh target/x86_64-unknown-none/rele
 qemu-system-x86_64 -machine q35 -m 512M -cdrom boot/void.iso -nographic   # проверка через GRUB
 sudo dd if=boot/void.iso of=/dev/sdX bs=4M status=progress && sync        # запись на флешку (СОТРЁТ!)
 ```
-На реальной машине появятся баннер, карта памяти, демо и `vsh>`. НЕ поедет с первого
-раза: клавиатура (нужен PS/2/USB-HID), диск/сеть (AHCI/реальный NIC вместо virtio),
-кириллица на VGA (`?`). Подробности — `Obsidian/10-projects/void/notes/platform.md`.
+На реальной машине появятся баннер, карта памяти, демо и `vsh>` — с **кириллицей** (шрифт
+CP866 в знакогенераторе VGA, Веха 41) и **интерактивным вводом с PS/2-клавиатуры** (Веха 42,
+`ps2.rs`: скан-коды 8042 → ASCII, IRQ1 через IOAPIC). Проверено на ASUS X54C. НЕ поедет пока:
+диск/сеть (AHCI/реальный NIC вместо virtio), USB-клавиатура (если нет PS/2-эмуляции), русская
+раскладка. Подробности — `Obsidian/10-projects/void/notes/platform.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
