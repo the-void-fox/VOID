@@ -16,13 +16,16 @@ Code/
 │   └── src/
 │       ├── arch/         # контракт архитектур (ADR 0005)
 │       │   ├── riscv64/  # SBI, PLIC, Sv39, trap/context asm
-│       │   └── x86_64/   # PVH-трамплин, GDT/TSS, IDT, LAPIC/IOAPIC, PCI+MSI-X, PML4
+│       │   └── x86_64/   # PVH+multiboot2, GDT/TSS, IDT, LAPIC/IOAPIC, PCI+MSI-X, PML4,
+│       │                 #   VGA-текст+CP866+ANSI, PS/2-клавиатура (реальное железо)
 │       ├── object.rs     # контент-адресуемый store: put/get, корни, GC, A/B-коммит
 │       ├── cap.rs        # capability: домены, минт/grant/аттенуация/отзыв, .cspace
 │       ├── proc.rs       # процессы, syscall'ы, IPC (CALL/RECV/REPLY), ленивые кучи
+│       ├── linux.rs      # linux-abi (Веха 38): трансля́тор Linux-syscall'ов (бэкенд B)
+│       ├── init.rs       # декларативный init (Веха 40): система из конфига-объекта store
 │       ├── virtio_blk.rs # драйвер диска: virtqueue общий, транспорт mmio/pci — от арха
 │       ├── virtio_net.rs # драйвер сети: две очереди RX/TX, опрос, сырые кадры наверх
-│       └── ...           # sched, timer, executor, heap, frame, elf
+│       └── ...           # sched, timer, executor, heap, frame, elf, checkpoint
 ├── programs/
 │   ├── user/             # userspace: либа шимов (ecall / int 0x80) + 17 бинарей
 │   │                     #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
@@ -201,11 +204,24 @@ nix-shell -p grub2 xorriso --run 'boot/mkboot.sh target/x86_64-unknown-none/rele
 qemu-system-x86_64 -machine q35 -m 512M -cdrom boot/void.iso -nographic   # проверка через GRUB
 sudo dd if=boot/void.iso of=/dev/sdX bs=4M status=progress && sync        # запись на флешку (СОТРЁТ!)
 ```
-На реальной машине появятся баннер, карта памяти, демо и `vsh>` — с **кириллицей** (шрифт
+На реальной машине появятся баннер, карта памяти и сразу `vsh>` (QEMU-демо на металле
+пропускаются — `arch::is_real_hardware()` по способу загрузки) — с **кириллицей** (шрифт
 CP866 в знакогенераторе VGA, Веха 41) и **интерактивным вводом с PS/2-клавиатуры** (Веха 42,
 `ps2.rs`: скан-коды 8042 → ASCII, IRQ1 через IOAPIC). Проверено на ASUS X54C. НЕ поедет пока:
 диск/сеть (AHCI/реальный NIC вместо virtio), USB-клавиатура (если нет PS/2-эмуляции), русская
 раскладка. Подробности — `Obsidian/10-projects/void/notes/platform.md`.
+
+## Консоль: цвет и папки (Вехи 43–44)
+vsh печатает **ANSI-коды** — их толкует и терминал QEMU (serial), и VGA-ядро (`vga.rs`
+разбирает `ESC[…m`/`ESC[2J`, двигает аппаратный курсор): цвет и `clear` работают одинаково
+в эмуляторе и на реальном экране (Веха 43, `Obsidian/…/notes/tty.md`). Persona **posixfs
+получила иерархию** (Веха 44, `Obsidian/…/notes/folders.md`) — БЕЗ правок ядра: файл — корень
+`f<путь>`, каталог — индекс-корень `d<путь>`. В vsh:
+```
+vsh/> mkdir notes && cd notes && echo привет > a.txt && ls && cat a.txt && pwd
+```
+Команды `cd`/`pwd`/`mkdir`/`rm` + путь-осознанные `ls [DIR]`/`cat`/`tail`/`echo`/`mv`;
+приглашение показывает текущий каталог. Открытый техдолг — `Obsidian/…/notes/known-gaps.md`.
 
 ## Отладка
 QEMU с gdbstub: добавить `-s -S` к команде раннера, затем
