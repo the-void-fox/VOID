@@ -48,8 +48,13 @@ const IR0_ERDP: usize = 0x18; // u64: указатель извлечения с
 const ERDP_EHB: u64 = 1 << 3; // Event Handler Busy (пишем 1 при обновлении)
 
 const RING_TRBS: usize = 256; // TRB в кольце (одно 4 КиБ-фрейм / 16)
+const TRB_SETUP: u32 = 2; // Setup Stage (control-трансфер)
+const TRB_DATA: u32 = 3; // Data Stage
+const TRB_STATUS: u32 = 4; // Status Stage
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_ADDR_DEV: u32 = 11; // Address Device
+const EV_TRANSFER: u32 = 32; // Transfer Event
 const EV_CMD_COMPLETE: u32 = 33; // Command Completion Event
 
 #[allow(dead_code)] // op/db/rt/max_ports/ctx64/dcbaa частью пригодятся в B/C (перечисление, HID)
@@ -66,6 +71,12 @@ pub struct Xhci {
     event_deq: usize,
     event_cycle: u32, // consumer cycle state кольца событий
     dcbaa: usize, // массив базовых адресов контекстов устройств
+    // Часть B — перечисленное устройство (одно; для клавиатуры хватает):
+    slot: u8, // slot id (0 — нет устройства)
+    ep0_ring: usize, // TR-кольцо управляющего эндпоинта EP0
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    dma_buf: usize, // буфер под дескрипторы/репорты (один фрейм, DMA)
 }
 unsafe impl Send for Xhci {}
 
@@ -152,10 +163,13 @@ pub fn init() -> bool {
             cmd_ring, cmd_enq: 0, cmd_cycle: 1,
             event_ring, event_deq: 0, event_cycle: 1,
             dcbaa,
+            slot: 0, ep0_ring: 0, ep0_enq: 0, ep0_cycle: 1, dma_buf: 0,
         };
 
-        // Порты: сбросить подключённые (нужно для будущего Address Device).
+        // Порты: сбросить подключённые, запомнить ПЕРВЫЙ с устройством (порт + скорость).
         let mut connected = 0u32;
+        let mut dev_port = 0u32;
+        let mut dev_speed = 0u32;
         for p in 1..=max_ports {
             let psc = op + OP_PORTS + (p as usize - 1) * 0x10;
             let v = rd(psc);
@@ -169,16 +183,40 @@ pub fn init() -> bool {
                     }
                 }
                 wr(psc, rd(psc) & !PORTSC_CHANGES | PORTSC_CHANGES); // сбросить биты-изменения
+                if dev_port == 0 && rd(psc) & PORTSC_PED != 0 {
+                    dev_port = p;
+                    dev_speed = (rd(psc) >> 10) & 0xf; // Port Speed [13:10]
+                }
             }
         }
 
-        // Проверка машинерии: Enable Slot → должно вернуть slot id (код завершения 1).
-        let slot = x.enable_slot();
-        crate::println!(
-            "  [usb]  xHCI: {} портов, {} подключено, контекст {} Б; Enable Slot → {}",
-            max_ports, connected, if ctx64 { 64 } else { 32 },
-            match slot { Some(s) => s as i32, None => -1 },
-        );
+        // Часть B — перечислить устройство на первом порту: Enable Slot → Address Device →
+        // прочитать дескриптор устройства (control-трансфер по EP0).
+        let mut desc = [0u8; 18];
+        let mut ok = false;
+        if dev_port != 0 {
+            if let Some(slot) = x.enable_slot() {
+                x.slot = slot;
+                if x.address_device(slot, dev_port, dev_speed)
+                    && x.get_descriptor(1, 0, &mut desc)
+                {
+                    ok = true;
+                }
+            }
+        }
+        if ok {
+            let vid = desc[8] as u16 | (desc[9] as u16) << 8;
+            let pid = desc[10] as u16 | (desc[11] as u16) << 8;
+            crate::println!(
+                "  [usb]  xHCI: порт {}, скорость {}, устройство {:04x}:{:04x} class={} (slot {})",
+                dev_port, dev_speed, vid, pid, desc[4], x.slot,
+            );
+        } else {
+            crate::println!(
+                "  [usb]  xHCI: {} портов, {} подключено — перечисление не удалось (порт {})",
+                max_ports, connected, dev_port,
+            );
+        }
 
         *XHCI.lock() = Some(x);
     }
@@ -188,12 +226,12 @@ pub fn init() -> bool {
 impl Xhci {
     /// Поставить TRB в кольцо команд, позвонить в дверной звонок 0, дождаться Command
     /// Completion Event. Возвращает `[param_lo, param_hi, status, control]` события.
-    unsafe fn command(&mut self, p_lo: u32, p_hi: u32, ctrl_type: u32) -> Option<[u32; 4]> {
+    unsafe fn command(&mut self, p_lo: u32, p_hi: u32, control: u32) -> Option<[u32; 4]> {
         let trb = (self.cmd_ring + self.cmd_enq * 16) as *mut u32;
         write_volatile(trb, p_lo);
         write_volatile(trb.add(1), p_hi);
         write_volatile(trb.add(2), 0);
-        write_volatile(trb.add(3), ctrl_type << 10 | self.cmd_cycle);
+        write_volatile(trb.add(3), control | self.cmd_cycle);
         compiler_fence(Ordering::SeqCst);
         // Продвинуть постановку; предпоследний слот — перед Link, поэтому заворот на 0.
         self.cmd_enq += 1;
@@ -243,7 +281,92 @@ impl Xhci {
     unsafe fn enable_slot(&mut self) -> Option<u8> {
         // command гарантирует Command Completion Event; код завершения в status[31:24]
         // (1 = успех), slot id в control[31:24].
-        let ev = self.command(0, 0, TRB_ENABLE_SLOT)?;
+        let ev = self.command(0, 0, TRB_ENABLE_SLOT << 10)?;
         ((ev[2] >> 24) & 0xff == 1).then(|| (ev[3] >> 24) as u8)
+    }
+
+    /// Address Device (Веха 50 B): собрать input-контекст (slot + EP0), выделить контекст
+    /// устройства в DCBAA[slot] и TR-кольцо EP0, выдать команду. `true` — устройство получило
+    /// адрес и EP0 готов к control-трансферам.
+    unsafe fn address_device(&mut self, slot: u8, port: u32, speed: u32) -> bool {
+        let cs = if self.ctx64 { 64 } else { 32 };
+        let (Some(dev_ctx), Some(ep0_ring), Some(input), Some(dma)) =
+            (frame::alloc(), frame::alloc(), frame::alloc(), frame::alloc())
+        else {
+            return false;
+        };
+        write_volatile((self.dcbaa + slot as usize * 8) as *mut u64, dev_ctx as u64);
+        self.dma_buf = dma;
+        // TR-кольцо EP0 с Link-заворотом.
+        let link = (ep0_ring + (RING_TRBS - 1) * 16) as *mut u32;
+        write_volatile(link as *mut u64, ep0_ring as u64);
+        write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1);
+        self.ep0_ring = ep0_ring;
+        self.ep0_enq = 0;
+        self.ep0_cycle = 1;
+        // Input Control Context (0): Add flags A0 (slot) | A1 (EP0).
+        write_volatile((input + 4) as *mut u32, 0b11);
+        // Slot Context (1): Context Entries=1, Speed; Root Hub Port Number.
+        let sc = input + cs;
+        write_volatile(sc as *mut u32, 1 << 27 | speed << 20);
+        write_volatile((sc + 4) as *mut u32, port << 16);
+        // EP0 Context (2): MPS по скорости, EPType=Control(4), CErr=3; TR dequeue|DCS; avg TRB=8.
+        let ep = input + 2 * cs;
+        let mps: u32 = match speed { 3 => 64, 4 => 512, _ => 8 };
+        write_volatile((ep + 4) as *mut u32, mps << 16 | 4 << 3 | 3 << 1);
+        write_volatile((ep + 8) as *mut u64, ep0_ring as u64 | 1);
+        write_volatile((ep + 16) as *mut u32, 8);
+        compiler_fence(Ordering::SeqCst);
+        let ev = self.command(input as u32, (input as u64 >> 32) as u32,
+            TRB_ADDR_DEV << 10 | (slot as u32) << 24);
+        matches!(ev, Some(e) if (e[2] >> 24) & 0xff == 1)
+    }
+
+    /// Поставить TRB в TR-кольцо EP0 (с заворотом на Link).
+    unsafe fn push_ep0(&mut self, p_lo: u32, p_hi: u32, status: u32, control: u32) {
+        let trb = (self.ep0_ring + self.ep0_enq * 16) as *mut u32;
+        write_volatile(trb, p_lo);
+        write_volatile(trb.add(1), p_hi);
+        write_volatile(trb.add(2), status);
+        write_volatile(trb.add(3), control | self.ep0_cycle);
+        self.ep0_enq += 1;
+        if self.ep0_enq == RING_TRBS - 1 {
+            self.ep0_enq = 0;
+            self.ep0_cycle ^= 1;
+        }
+    }
+
+    /// Управляющий IN-трансфер по EP0: Setup + Data(IN) + Status(OUT, IOC), звонок EP0, ждём
+    /// Transfer Event. Данные приходят в [`Self::dma_buf`]. `true` — успех/короткий пакет.
+    unsafe fn control_in(&mut self, req_type: u8, request: u8, value: u16, index: u16, len: u16) -> bool {
+        let setup = req_type as u64 | (request as u64) << 8 | (value as u64) << 16
+            | (index as u64) << 32 | (len as u64) << 48;
+        // Setup Stage(2): IDT(бит6), TRT=IN(3) в [17:16].
+        self.push_ep0(setup as u32, (setup >> 32) as u32, 8, TRB_SETUP << 10 | 3 << 16 | 1 << 6);
+        // Data Stage(3): DIR=IN(бит16).
+        self.push_ep0(self.dma_buf as u32, (self.dma_buf as u64 >> 32) as u32, len as u32,
+            TRB_DATA << 10 | 1 << 16);
+        // Status Stage(4): DIR=OUT, IOC(бит5).
+        self.push_ep0(0, 0, 0, TRB_STATUS << 10 | 1 << 5);
+        compiler_fence(Ordering::SeqCst);
+        wr(self.db + self.slot as usize * 4, 1); // звонок EP0 (DCI 1)
+        for _ in 0..64 {
+            let Some(ev) = self.wait_event() else { return false };
+            if (ev[3] >> 10) & 0x3f == EV_TRANSFER {
+                let code = (ev[2] >> 24) & 0xff;
+                return code == 1 || code == 13; // успех или короткий пакет
+            }
+        }
+        false
+    }
+
+    /// GET_DESCRIPTOR по EP0 → скопировать `out.len()` байт из DMA-буфера.
+    unsafe fn get_descriptor(&mut self, dtype: u8, index: u8, out: &mut [u8]) -> bool {
+        let value = (dtype as u16) << 8 | index as u16;
+        if !self.control_in(0x80, 6, value, 0, out.len() as u16) {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(self.dma_buf as *const u8, out.as_mut_ptr(), out.len());
+        true
     }
 }
