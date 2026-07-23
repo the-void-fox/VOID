@@ -150,6 +150,26 @@ unsafe fn erase_line() {
     }
 }
 
+/// Первый числовой параметр CSI (для `ESC[nD` и т.п.); нет параметра → `default`, `0` → 1.
+unsafe fn first_param(default: usize) -> usize {
+    let mut v = 0usize;
+    let mut any = false;
+    for &b in &PARAMS[..PLEN] {
+        if b == b';' {
+            break;
+        }
+        if b.is_ascii_digit() {
+            v = v * 10 + (b - b'0') as usize;
+            any = true;
+        }
+    }
+    if any {
+        v.max(1)
+    } else {
+        default
+    }
+}
+
 /// Веха 41 — перевести Unicode-символ в байт **CP866** (в этой раскладке загружен шрифт
 /// знакогенератора, [`load_font`]): ASCII — как есть, кириллица и псевдографика — по таблице,
 /// прочее — `?`.
@@ -209,6 +229,11 @@ pub fn put_char(c: char) {
                         'J' => clear(),                // ESC[2J — очистить экран (курсор в начало)
                         'H' | 'f' => { ROW = 0; COL = 0; }
                         'K' => erase_line(),
+                        // Веха 45 — перемещение курсора (для редактирования строки в vsh).
+                        'A' => ROW = ROW.saturating_sub(first_param(1)),
+                        'B' => ROW = (ROW + first_param(1)).min(H - 1),
+                        'C' => COL = (COL + first_param(1)).min(W - 1),
+                        'D' => COL = COL.saturating_sub(first_param(1)),
                         _ => {}
                     }
                     ANSI = Ansi::Normal;

@@ -173,6 +173,73 @@ fn resolve(cwd: &[u8], arg: &[u8], out: &mut [u8; 128]) -> usize {
     len
 }
 
+/// UTF-8-continuation байт (0x80..0xBF) — не начало символа. Для движения по границам символов.
+fn is_cont(b: u8) -> bool {
+    b & 0xC0 == 0x80
+}
+
+/// Сколько СИМВОЛОВ (не байт) в `bytes` — для сдвига курсора на реальные колонки (кириллица =
+/// 2 байта, но 1 колонка). Невалидный UTF-8 → число байт (запасной путь).
+fn char_count(bytes: &[u8]) -> usize {
+    match core::str::from_utf8(bytes) {
+        Ok(s) => s.chars().count(),
+        Err(_) => bytes.len(),
+    }
+}
+
+/// Напечатать `ESC[<n><fin>` (напр. `ESC[3D` — курсор влево на 3). Для редактора строки.
+fn csi_num(ep: usize, mut n: usize, fin: u8) {
+    let mut buf = [0u8; 24];
+    buf[0] = 0x1b;
+    buf[1] = b'[';
+    let mut k = 2;
+    let mut digs = [0u8; 20];
+    let mut d = 0;
+    if n == 0 {
+        digs[0] = b'0';
+        d = 1;
+    } else {
+        while n > 0 {
+            digs[d] = b'0' + (n % 10) as u8;
+            n /= 10;
+            d += 1;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        buf[k] = digs[d];
+        k += 1;
+    }
+    buf[k] = fin;
+    k += 1;
+    px::write(ep, px::STDOUT, &buf[..k]);
+}
+
+/// Напечатать цветное приглашение (зелёный `vsh`, синий каталог `cwd`, `> `).
+fn print_prompt(ep: usize, cwd: &[u8]) {
+    px::write(ep, px::STDOUT, C_PROMPT);
+    px::write(ep, px::STDOUT, b"vsh");
+    px::write(ep, px::STDOUT, RESET);
+    px::write(ep, px::STDOUT, C_DIR);
+    px::write(ep, px::STDOUT, cwd);
+    px::write(ep, px::STDOUT, RESET);
+    px::write(ep, px::STDOUT, b"> ");
+}
+
+/// Веха 45 — перерисовать строку ввода целиком: в начало (`\r`), приглашение, содержимое,
+/// стереть хвост (`ESC[K`), вернуть курсор на позицию `pos` (в КОЛОНКАХ). `line[..llen]` обязан
+/// быть валидным UTF-8 (вызывающий гарантирует — иначе SYS_WRITE показал бы весь буфер как `<?>`).
+fn redraw(ep: usize, cwd: &[u8], line: &[u8], llen: usize, pos: usize) {
+    px::write(ep, px::STDOUT, b"\r");
+    print_prompt(ep, cwd);
+    px::write(ep, px::STDOUT, &line[..llen]);
+    px::write(ep, px::STDOUT, b"\x1b[K");
+    let back = char_count(&line[pos..llen]);
+    if back > 0 {
+        csi_num(ep, back, b'D');
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     let mut line = [0u8; 128]; // собираемая строка команды
@@ -182,51 +249,148 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     cwd[0] = b'/';
     let mut cwd_len = 1usize;
     let mut rp = [0u8; 128]; // буфер разрешённого пути
+    // Веха 45: история команд — кольцо последних HISTN (для стрелок ↑/↓).
+    const HISTN: usize = 8;
+    let mut hist = [[0u8; 128]; HISTN];
+    let mut hlen = [0usize; HISTN];
+    let mut hhead = 0usize; // следующий слот записи
+    let mut hcount = 0usize; // сколько сохранено (≤ HISTN)
     print_help(ep);
     loop {
-        // Веха 43/44: цветное приглашение с текущим каталогом (зелёный `vsh`, синий путь).
-        px::write(ep, px::STDOUT, C_PROMPT);
-        px::write(ep, px::STDOUT, b"vsh");
-        px::write(ep, px::STDOUT, RESET);
-        px::write(ep, px::STDOUT, C_DIR);
-        px::write(ep, px::STDOUT, &cwd[..cwd_len]);
-        px::write(ep, px::STDOUT, RESET);
-        px::write(ep, px::STDOUT, b"> ");
-        // ── собрать строку: читать порциями, эхо, backspace, до Enter ──
-        // Эхо — ПАЧКОЙ на порцию ввода, не по байту: SYS_WRITE валидирует UTF-8, и
-        // разрезанный посередине двухбайтный символ (кириллица) печатался бы как «<?>».
+        print_prompt(ep, &cwd[..cwd_len]);
+        // ── редактор строки (Веха 45): курсор pos, вставка/удаление в позиции, стрелки, история ──
+        // Стрелки/Home/End/Del приходят ANSI-последовательностями (`ESC[…`) — и с терминала QEMU,
+        // и от PS/2-клавиатуры (ps2.rs шлёт те же коды). Движемся по границам символов (UTF-8).
         let mut llen = 0usize;
+        let mut pos = 0usize;
+        let mut esc = 0u8; // 0 обычный, 1 после ESC, 2 после ESC[ (копим до финального байта)
+        let mut hb = 0usize; // индекс просмотра истории (0 — не просматриваем)
         'line: loop {
-            let n = px::read(ep, px::STDIN, &mut inb); // блокируется, пока нет ввода
-            let mut from = llen; // начало ещё не показанного хвоста line[from..llen]
+            let n = px::read(ep, px::STDIN, &mut inb);
             for &b in &inb[..n] {
-                if b == b'\r' || b == b'\n' {
-                    if llen > from {
-                        px::write(ep, px::STDOUT, &line[from..llen]);
+                match esc {
+                    1 => esc = if b == b'[' { 2 } else { 0 },
+                    2 => {
+                        if b.is_ascii_digit() || b == b';' {
+                            // параметр (напр. '3' в ESC[3~) — остаёмся в состоянии, финал ниже
+                        } else {
+                            esc = 0;
+                            match b {
+                                b'C' => {
+                                    if pos < llen {
+                                        pos += 1;
+                                        while pos < llen && is_cont(line[pos]) {
+                                            pos += 1;
+                                        }
+                                        px::write(ep, px::STDOUT, b"\x1b[C");
+                                    }
+                                }
+                                b'D' => {
+                                    if pos > 0 {
+                                        pos -= 1;
+                                        while pos > 0 && is_cont(line[pos]) {
+                                            pos -= 1;
+                                        }
+                                        px::write(ep, px::STDOUT, b"\x1b[D");
+                                    }
+                                }
+                                b'H' => {
+                                    if pos > 0 {
+                                        csi_num(ep, char_count(&line[..pos]), b'D');
+                                        pos = 0;
+                                    }
+                                }
+                                b'F' => {
+                                    if pos < llen {
+                                        csi_num(ep, char_count(&line[pos..llen]), b'C');
+                                        pos = llen;
+                                    }
+                                }
+                                b'A' => {
+                                    if hb < hcount {
+                                        hb += 1;
+                                        let slot = (hhead + HISTN - hb) % HISTN;
+                                        llen = hlen[slot];
+                                        line[..llen].copy_from_slice(&hist[slot][..llen]);
+                                        pos = llen;
+                                        redraw(ep, &cwd[..cwd_len], &line, llen, pos);
+                                    }
+                                }
+                                b'B' => {
+                                    if hb > 1 {
+                                        hb -= 1;
+                                        let slot = (hhead + HISTN - hb) % HISTN;
+                                        llen = hlen[slot];
+                                        line[..llen].copy_from_slice(&hist[slot][..llen]);
+                                    } else {
+                                        hb = 0;
+                                        llen = 0;
+                                    }
+                                    pos = llen;
+                                    redraw(ep, &cwd[..cwd_len], &line, llen, pos);
+                                }
+                                b'~' => {
+                                    // Delete: удалить символ В позиции курсора (может быть многобайтным)
+                                    if pos < llen {
+                                        let mut end = pos + 1;
+                                        while end < llen && is_cont(line[end]) {
+                                            end += 1;
+                                        }
+                                        line.copy_within(end..llen, pos);
+                                        llen -= end - pos;
+                                        redraw(ep, &cwd[..cwd_len], &line, llen, pos);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    px::write(ep, px::STDOUT, b"\n");
-                    break 'line;
-                } else if b == 0x7f || b == 0x08 {
-                    if llen > from {
-                        llen -= 1; // байт ещё не показан — просто забыть
-                    } else if llen > 0 {
-                        llen -= 1;
-                        from = llen;
-                        px::write(ep, px::STDOUT, b"\x08 \x08"); // затереть символ на терминале
+                    _ => {
+                        if b == 0x1b {
+                            esc = 1;
+                        } else if b == b'\r' || b == b'\n' {
+                            px::write(ep, px::STDOUT, b"\n");
+                            break 'line;
+                        } else if b == 0x7f || b == 0x08 {
+                            // Backspace: удалить символ ПЕРЕД курсором.
+                            if pos > 0 {
+                                let mut start = pos - 1;
+                                while start > 0 && is_cont(line[start]) {
+                                    start -= 1;
+                                }
+                                line.copy_within(pos..llen, start);
+                                llen -= pos - start;
+                                pos = start;
+                                redraw(ep, &cwd[..cwd_len], &line, llen, pos);
+                            }
+                        } else if b >= 0x20 && llen < line.len() - 1 {
+                            // Вставить байт в позицию курсора.
+                            line.copy_within(pos..llen, pos + 1);
+                            line[pos] = b;
+                            llen += 1;
+                            pos += 1;
+                            // Перерисовать лишь когда строка — валидный UTF-8 (не середина
+                            // многобайтного символа): иначе SYS_WRITE показал бы весь буфер как «<?>».
+                            if core::str::from_utf8(&line[..llen]).is_ok() {
+                                redraw(ep, &cwd[..cwd_len], &line, llen, pos);
+                            }
+                        }
                     }
-                } else if b >= 0x20 && llen < line.len() - 1 {
-                    line[llen] = b;
-                    llen += 1;
                 }
-            }
-            if llen > from {
-                px::write(ep, px::STDOUT, &line[from..llen]); // эхо принятого целиком
             }
         }
         let cmd = &line[..llen];
         if cmd.is_empty() {
             continue;
         }
+        // Веха 45: сохранить непустую команду в историю (кольцо).
+        hist[hhead][..llen].copy_from_slice(cmd);
+        hlen[hhead] = llen;
+        hhead = (hhead + 1) % HISTN;
+        if hcount < HISTN {
+            hcount += 1;
+        }
+        let cmd = &line[..llen];
         if cmd == b"exit" {
             sys::exit(0);
         }

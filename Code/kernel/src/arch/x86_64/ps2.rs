@@ -40,6 +40,8 @@ unsafe fn wait_write() {
 // ── состояние модификаторов ──────────────────────────────────────────────────
 static mut SHIFT: bool = false;
 static mut CAPS: bool = false;
+/// Веха 45 — видели префикс 0xE0 (расширенная клавиша: стрелки/Home/End/Del).
+static mut EXT: bool = false;
 
 // ── скан-код набора 1 → ASCII (US-раскладка) ─────────────────────────────────
 // Индекс — скан-код нажатия (0x00..0x3A). Пара (обычный, с Shift). 0 — нет символа.
@@ -114,9 +116,30 @@ pub fn drain() {
         while inb(STATUS) != 0xff && inb(STATUS) & STAT_OUT_FULL != 0 && guard < 256 {
             guard += 1;
             let sc = inb(DATA);
-            // 0xE0 — префикс расширенных клавиш (стрелки/Ctrl-right и т.п.); их байт-хвост
-            // просто пропускаем (обычный ввод команд их не использует).
+            // 0xE0 — префикс расширенных клавиш; следующий байт — код стрелки/Home/End/Del.
             if sc == 0xE0 {
+                EXT = true;
+                continue;
+            }
+            if EXT {
+                // Веха 45: расширенная клавиша → стандартная ANSI-последовательность (её понимает
+                // и терминал QEMU, и разбор в vga.rs/vsh). Только на НАЖАТИЕ (старший бит = 0).
+                EXT = false;
+                if sc & RELEASE == 0 {
+                    let seq: &[u8] = match sc {
+                        0x48 => b"\x1b[A", // Up
+                        0x50 => b"\x1b[B", // Down
+                        0x4D => b"\x1b[C", // Right
+                        0x4B => b"\x1b[D", // Left
+                        0x47 => b"\x1b[H", // Home
+                        0x4F => b"\x1b[F", // End
+                        0x53 => b"\x1b[3~", // Delete
+                        _ => b"",
+                    };
+                    for &b in seq {
+                        super::rx_push(b);
+                    }
+                }
                 continue;
             }
             let released = sc & RELEASE != 0;
