@@ -68,6 +68,8 @@ pub use imp::{
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла
     is_real_hardware, platform_init, ram_limit, ram_total,
+    // установщик на диск (Веха 48): загрузочный модуль multiboot2 (образ) — x86 отдаёт, riscv None
+    boot_module,
 };
 
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.

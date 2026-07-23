@@ -53,6 +53,7 @@ mod ahci;
 mod arch;
 mod cap;
 mod chan;
+mod install;
 mod checkpoint;
 mod elf;
 mod executor;

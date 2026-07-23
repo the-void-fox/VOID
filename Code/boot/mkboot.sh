@@ -26,5 +26,9 @@ mkdir -p "$staging/boot/grub"
 cp "$kernel" "$staging/boot/void-kernel"
 cp "$here/grub.cfg" "$staging/boot/grub/grub.cfg"
 
+# Веха 48: вложить загрузочный ОБРАЗ ДИСКА модулем multiboot2 (то же $kernel в его p1) — из него
+# vsh `install` разворачивает VOID на SATA-диск. Нужен nix-shell с util-linux (sfdisk) и mtools.
+"$here/mkdisk.sh" "$kernel" "$staging/boot/void-disk-boot.img" >/dev/null
+
 grub-mkrescue -o "$here/void.iso" "$staging" 2>/dev/null
 echo "готово: $here/void.iso  (записать на USB: sudo dd if=$here/void.iso of=/dev/sdX bs=4M; sync)"

@@ -32,6 +32,17 @@ pub fn use_ahci() {
     AHCI_ACTIVE.store(true, Ordering::Relaxed);
 }
 
+/// Веха 48 — «заморозка»: после установки на диск ([`crate::install`]) раскладка диска сменилась,
+/// и кэш работающего store'а НЕ должен больше туда писать (иначе group-commit затрёт свежий
+/// образ). Ставит установщик; [`Disk::write`] и коммиты становятся no-op — состояние живёт в RAM
+/// до перезагрузки с диска.
+static FROZEN: AtomicBool = AtomicBool::new(false);
+
+/// Заморозить запись на диск (см. [`FROZEN`]). Необратимо в пределах сессии — дальше ребут.
+pub fn freeze() {
+    FROZEN.store(true, Ordering::Relaxed);
+}
+
 /// Носитель ядра: сектор store = сектор блочного устройства (размеры совпадают по построению).
 struct Disk;
 
@@ -44,6 +55,9 @@ impl BlockIo for Disk {
         }
     }
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool {
+        if FROZEN.load(Ordering::Relaxed) {
+            return true; // Веха 48: после установки диск заморожен — коммиты «успешны», но без записи
+        }
         if AHCI_ACTIVE.load(Ordering::Relaxed) {
             ahci::write(sector, buf)
         } else {

@@ -1768,6 +1768,33 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.advance();
             }
         }
+        // SYS_INSTALL(store_cap) -> p2_start | MAX (Веха 48): установить VOID на AHCI-диск из
+        // загрузочного модуля multiboot2 (образ с USB). Нужен store-cap с правом WRITE — тот же,
+        // что у shell'а (gen1: store:xw): установка меняет содержимое store целиком, право по силе
+        // равно записи. ДИСК СТИРАЕТСЯ. После успеха store заморожен — дальше только ребут.
+        30 => {
+            let scap = t.procs[cur].frame.arg(0);
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) => match crate::install::run() {
+                    Ok(p2) => {
+                        crate::println!("  [install] VOID установлен на диск (store с сектора {}); заморожен — перезагрузись без USB", p2);
+                        p2 as usize
+                    }
+                    Err(e) => {
+                        crate::println!("  [install] отказ: {}", e);
+                        usize::MAX
+                    }
+                },
+                Err(e) => {
+                    vprintln!("  [install] P{} отклонён: {:?}  ← нет capability (WRITE) на store", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);

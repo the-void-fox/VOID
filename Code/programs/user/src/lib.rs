@@ -44,6 +44,7 @@ const SYS_FUTEX: usize = 26;
 const SYS_SET_TLS: usize = 27;
 const SYS_CHECKPOINT: usize = 28;
 const SYS_RESTORE: usize = 29;
+const SYS_INSTALL: usize = 30;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -310,6 +311,14 @@ pub fn env(buf: &mut [u8]) -> usize {
 /// WASI: выданы ядром при spawn'е или унаследованы при exec). [`NO_CAP`] — конец таблицы.
 pub fn start_cap(i: usize) -> usize {
     abi::syscall(SYS_STARTCAP, i, 0, 0, 0, 0, 0, 0).0
+}
+
+/// `SYS_INSTALL(store_cap)` (Веха 48): установить VOID на AHCI-диск из загрузочного модуля
+/// (образ с USB). Нужен store-cap с правом WRITE. **ДИСК СТИРАЕТСЯ.** `Some(p2_start)` — успех
+/// (store заморожен, нужен ребут без USB); `None` — отказ (нет диска/образа/прав), система цела.
+pub fn install(store_cap: usize) -> Option<u64> {
+    let r = abi::syscall(SYS_INSTALL, store_cap, 0, 0, 0, 0, 0, 0).0;
+    (r != NO_CAP).then_some(r as u64)
 }
 
 /// `SYS_CAP_DERIVE`: урезанная копия СВОЕГО права (права ∩ mask) — аттенуация у себя,

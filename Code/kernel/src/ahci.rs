@@ -51,6 +51,11 @@ const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_IDENTIFY: u8 = 0xec;
 
+/// Тип MBR-раздела под store VOID (Веха 48). Произвольный незанятый байт — по нему AHCI
+/// узнаёт «свой» раздел на разбитом диске (загрузчик+ядро в p1, store в p2). Если MBR/раздела
+/// нет — store лежит с сектора 0 на весь диск (как `void-disk.img` в QEMU, обратная совместимость).
+pub const VOID_STORE_TYPE: u8 = 0x9f;
+
 /// Смещения структур внутри фрейма A.
 const OFF_FIS: usize = 0x400; // принятый FIS
 const OFF_CT: usize = 0x500; // таблица команд (CFIS+ACMD+резерв+PRDT)
@@ -60,7 +65,9 @@ struct Ahci {
     port: usize, // база порта: ABAR + 0x100 + порт*0x80
     frame_a: usize, // список команд + FIS + таблица команд
     buf: usize, // DMA-буфер данных (фрейм B)
-    capacity: u64, // ёмкость в секторах
+    capacity: u64, // ёмкость store в секторах (раздел p2 или весь диск)
+    base: u64, // Веха 48 — LBA начала store: 0 (весь диск) или начало раздела VOID
+    total: u64, // Веха 48 — полная ёмкость диска в секторах (для установщика)
 }
 
 unsafe impl Send for Ahci {}
@@ -108,9 +115,9 @@ pub fn init() -> bool {
         wr(port + PX_CMD, rd(port + PX_CMD) | CMD_ST);
     }
 
-    let mut dev = Ahci { port, frame_a, buf, capacity: 0 };
+    let mut dev = Ahci { port, frame_a, buf, capacity: 0, base: 0, total: 0 };
 
-    // 4) IDENTIFY DEVICE → ёмкость (LBA48 в словах 100..103, иначе LBA28 в 60..61).
+    // 4) IDENTIFY DEVICE → полная ёмкость диска (LBA48 в словах 100..103, иначе LBA28 в 60..61).
     if !dev.command(ATA_IDENTIFY, 0, false) {
         return false;
     }
@@ -122,7 +129,34 @@ pub fn init() -> bool {
             | (id.add(103).read_volatile() as u64) << 48;
         let lba28 =
             id.add(60).read_volatile() as u64 | (id.add(61).read_volatile() as u64) << 16;
-        dev.capacity = if lba48 != 0 { lba48 } else { lba28 };
+        dev.total = if lba48 != 0 { lba48 } else { lba28 };
+    }
+    dev.capacity = dev.total; // по умолчанию весь диск
+
+    // 5) Веха 48 — прочитать MBR (СЫРОЙ сектор 0, base ещё 0) и найти раздел store VOID.
+    //    Есть — store живёт на его смещении (диск разбит: p1 загрузчик, p2 store). Нет MBR/
+    //    раздела — store с сектора 0 на весь диск (обратная совместимость с QEMU-образом).
+    if dev.command(ATA_READ_DMA_EXT, 0, false) {
+        unsafe {
+            let m = buf as *const u8;
+            let sig = m.add(510).read_volatile() == 0x55 && m.add(511).read_volatile() == 0xaa;
+            if sig {
+                for i in 0..4 {
+                    let e = m.add(446 + i * 16);
+                    if e.add(4).read_volatile() == VOID_STORE_TYPE {
+                        let rd_le = |o: usize| {
+                            e.add(o).read_volatile() as u64
+                                | (e.add(o + 1).read_volatile() as u64) << 8
+                                | (e.add(o + 2).read_volatile() as u64) << 16
+                                | (e.add(o + 3).read_volatile() as u64) << 24
+                        };
+                        dev.base = rd_le(8); // LBA начала раздела
+                        dev.capacity = rd_le(12); // число секторов раздела
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     *AHCI.lock() = Some(dev);
@@ -198,13 +232,46 @@ impl Ahci {
     }
 }
 
-/// Ёмкость диска в 512-байтных секторах.
+/// Ёмкость store в 512-байтных секторах (раздел p2, если диск разбит, иначе весь диск).
 pub fn capacity_sectors() -> u64 {
     AHCI.lock().as_ref().map_or(0, |d| d.capacity)
 }
 
-/// Прочитать сектор `sector` в `buf` (через DMA-буфер драйвера).
+/// Веха 48 — полная ёмкость физического диска в секторах (нужна установщику для разметки).
+pub fn total_sectors() -> u64 {
+    AHCI.lock().as_ref().map_or(0, |d| d.total)
+}
+
+/// Прочитать сектор `sector` store'а в `buf` (со смещением раздела `base`).
 pub fn read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
+    let g = AHCI.lock();
+    let Some(d) = g.as_ref() else { return false };
+    if !d.command(ATA_READ_DMA_EXT, d.base + sector, false) {
+        return false;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(d.buf as *const u8, buf.as_mut_ptr(), SECTOR) };
+    true
+}
+
+/// Записать `buf` в сектор `sector` store'а (со смещением раздела `base`).
+pub fn write(sector: u64, buf: &[u8; SECTOR]) -> bool {
+    let g = AHCI.lock();
+    let Some(d) = g.as_ref() else { return false };
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), d.buf as *mut u8, SECTOR) };
+    d.command(ATA_WRITE_DMA_EXT, d.base + sector, true)
+}
+
+/// Веха 48 — АБСОЛЮТНАЯ запись сектора диска (БЕЗ смещения раздела) — для установщика:
+/// он кладёт загрузочный образ (MBR, ядро, GRUB) в начало ДИСКА, а не в раздел store.
+pub fn write_abs(sector: u64, buf: &[u8; SECTOR]) -> bool {
+    let g = AHCI.lock();
+    let Some(d) = g.as_ref() else { return false };
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), d.buf as *mut u8, SECTOR) };
+    d.command(ATA_WRITE_DMA_EXT, sector, true)
+}
+
+/// Веха 48 — АБСОЛЮТНОЕ чтение сектора диска (для установщика: правка таблицы разделов в MBR).
+pub fn read_abs(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
     let g = AHCI.lock();
     let Some(d) = g.as_ref() else { return false };
     if !d.command(ATA_READ_DMA_EXT, sector, false) {
@@ -212,12 +279,4 @@ pub fn read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
     }
     unsafe { core::ptr::copy_nonoverlapping(d.buf as *const u8, buf.as_mut_ptr(), SECTOR) };
     true
-}
-
-/// Записать `buf` в сектор `sector` (через DMA-буфер драйвера).
-pub fn write(sector: u64, buf: &[u8; SECTOR]) -> bool {
-    let g = AHCI.lock();
-    let Some(d) = g.as_ref() else { return false };
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), d.buf as *mut u8, SECTOR) };
-    d.command(ATA_WRITE_DMA_EXT, sector, true)
 }

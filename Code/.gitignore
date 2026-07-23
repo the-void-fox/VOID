@@ -7,3 +7,5 @@
 /tools/*/target/
 # Загрузочный ISO для реального железа (Веха 41). Собрать: boot/mkboot.sh
 /boot/void.iso
+# Загрузочный образ диска (Веха 48) — исходник модуля установки. Собрать: boot/mkdisk.sh
+/boot/void-disk-boot.img

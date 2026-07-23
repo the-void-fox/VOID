@@ -115,6 +115,11 @@ pub fn probe_ahci() -> Option<(usize, u32)> {
     None
 }
 
+/// Веха 48 — установщик на диск (образ через multiboot2-модуль) — только x86. Заглушка.
+pub fn boot_module() -> Option<(usize, usize)> {
+    None
+}
+
 /// Найти virtio-net в тех же 8 mmio-слотах (Веха 34): magic «virt», версия 2,
 /// device id **1** (network). IRQ не нужен — драйвер опрашивает кольца.
 pub fn probe_virtio_net() -> Option<crate::arch::NetDevice> {

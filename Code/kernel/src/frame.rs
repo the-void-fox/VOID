@@ -43,10 +43,23 @@ static FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
 /// Сколько фреймов сейчас в списке свободных — для отчёта потребления (Веха 46).
 static FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Инициализировать аллокатор: начать сразу за образом ядра.
+/// Веха 48 — верхняя граница «занятого» перед стартом аллокатора: GRUB кладёт загрузочный
+/// модуль (образ установки) в RAM за образом ядра, и bump не должен раздать его фреймы.
+/// Ставит [`reserve_boot_module`] (из `platform_init`, ДО [`init`]); `init` поднимет до неё старт.
+static RESERVE_END: AtomicUsize = AtomicUsize::new(0);
+
+/// Веха 48 — уберечь регион `[.., end)` от аллокатора (загрузочный модуль multiboot2). Зовётся
+/// из `platform_init` до `init`; безвредно, если `end` ниже конца образа ядра (тогда `init` берёт
+/// конец образа). Только x86 (у riscv загрузочных модулей нет).
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+pub fn reserve_boot_module(end: usize) {
+    RESERVE_END.store(align_up(end, PAGE_SIZE), Ordering::Relaxed);
+}
+
+/// Инициализировать аллокатор: начать за образом ядра ИЛИ за зарезервированным модулем (Веха 48).
 pub fn init() {
-    let start = &raw const _kernel_end as usize;
-    NEXT.store(align_up(start, PAGE_SIZE), Ordering::Relaxed);
+    let start = align_up(&raw const _kernel_end as usize, PAGE_SIZE);
+    NEXT.store(start.max(RESERVE_END.load(Ordering::Relaxed)), Ordering::Relaxed);
 }
 
 /// Выделить один обнулённый фрейм. Возвращает физический адрес (он же

@@ -78,19 +78,26 @@ pub fn is_real_hardware() -> bool {
 pub fn platform_init(magic: usize, info: usize) {
     const RAM_CAP: usize = 256 * 1024 * 1024;
     BOOT_MAGIC_CELL.store(magic, Ordering::Relaxed);
-    let total = discover_ram(magic, info);
+    let total = discover_multiboot(magic, info);
     RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
     RAM_LIMIT_CELL.store(total.min(RAM_CAP), Ordering::Relaxed);
 }
 
-/// Прочитать полную RAM из карты памяти multiboot2 (от GRUB). Инфо — список тегов
-/// (`total_size@0`, теги с `@8`); ищем тег «basic meminfo» (type 4): `mem_upper@+8` — КиБ
-/// выше 1 МиБ. PVH/неизвестно — дефолт 128 МиБ (это QEMU, где RAM известна раннеру).
-fn discover_ram(magic: usize, info: usize) -> usize {
+/// Веха 48 — загрузочный модуль multiboot2 (образ установки VOID, [`boot_module`]): база и
+/// длина в RAM, куда GRUB положил его командой `module2`. 0 — модуля нет (обычная загрузка).
+static MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
+static MODULE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Разобрать карту памяти multiboot2 (от GRUB) И загрузочный модуль (Веха 48) за один проход.
+/// Инфо — список тегов (`total_size@0`, теги с `@8`): type 4 «basic meminfo» (`mem_upper@+12` —
+/// КиБ выше 1 МиБ) → полная RAM; type 3 «module» (`mod_start@+8`, `mod_end@+12`) → образ установки.
+/// PVH/неизвестно — дефолт 128 МиБ RAM (это QEMU, где RAM известна раннеру), модуля нет.
+fn discover_multiboot(magic: usize, info: usize) -> usize {
     if magic != MULTIBOOT2_MAGIC || info == 0 {
         return 128 * 1024 * 1024;
     }
     let rd = |off: usize| unsafe { core::ptr::read_volatile((info + off) as *const u32) };
+    let mut ram = 128 * 1024 * 1024;
     let mut p = 8usize; // теги начинаются после total_size(u32)+reserved(u32)
     loop {
         let ty = rd(p);
@@ -98,14 +105,29 @@ fn discover_ram(magic: usize, info: usize) -> usize {
         if ty == 0 || size < 8 {
             break; // завершающий тег или мусор
         }
-        if ty == 4 {
-            // basic meminfo: mem_lower@+8 (КиБ ниже 1 МиБ), mem_upper@+12 (КиБ выше 1 МиБ).
-            let mem_upper = rd(p + 12) as usize;
-            return 0x10_0000 + mem_upper * 1024;
+        match ty {
+            4 => ram = 0x10_0000 + rd(p + 12) as usize * 1024, // basic meminfo: mem_upper (КиБ)
+            3 => {
+                let (start, end) = (rd(p + 8) as usize, rd(p + 12) as usize);
+                MODULE_BASE.store(start, Ordering::Relaxed);
+                MODULE_LEN.store(end.saturating_sub(start), Ordering::Relaxed);
+                // GRUB кладёт модуль в свободную RAM (обычно сразу за образом ядра) — уберечь его
+                // от bump-аллокатора фреймов: тот стартует с `_kernel_end`, а модуль может быть
+                // выше. Резервируем [.._end), frame::init поднимет старт до этой границы.
+                crate::frame::reserve_boot_module(end);
+            }
+            _ => {}
         }
         p += (size + 7) & !7; // следующий тег — с выравниванием на 8
     }
-    128 * 1024 * 1024
+    ram
+}
+
+/// Веха 48 — загрузочный модуль (образ установки), переданный GRUB через `module2`:
+/// `(база, длина)` в RAM или `None`. Читает установщик [`crate::install`].
+pub fn boot_module() -> Option<(usize, usize)> {
+    let len = MODULE_LEN.load(Ordering::Relaxed);
+    (len != 0).then(|| (MODULE_BASE.load(Ordering::Relaxed), len))
 }
 
 // ─── консоль (COM1: вывод напрямую, приём — опросом LSR на тиках таймера) ────
