@@ -1471,7 +1471,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
                     tmp[..len].copy_from_slice(src);
                     vprintln!("  [net] P{} SYS_NET_SEND {} байт (по cap)", cur, len);
-                    if crate::virtio_net::send(&tmp[..len]) { 0 } else { usize::MAX }
+                    if crate::net::send(&tmp[..len]) { 0 } else { usize::MAX }
                 }
                 Ok(_) => usize::MAX,
                 Err(e) => {
@@ -1495,7 +1495,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 Ok(cap::Device::Net) if ensure_heap_range(t, cur, buf, buflen.min(2048)) => {
                     let mut tmp = [0u8; 2048];
                     let cap_len = buflen.min(2048);
-                    let n = crate::virtio_net::recv(&mut tmp[..cap_len]);
+                    let n = crate::net::recv(&mut tmp[..cap_len]);
                     if n > 0 {
                         let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
                         dst.copy_from_slice(&tmp[..n]);
@@ -1519,7 +1519,7 @@ fn syscall(t: &mut Table, cur: usize) {
             let dom = t.procs[cur].domain;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
                 Ok(cap::Device::Net) if ensure_heap_range(t, cur, buf, 6) => {
-                    let mac = crate::virtio_net::mac();
+                    let mac = crate::net::mac();
                     let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 6) };
                     dst.copy_from_slice(&mac);
                     0

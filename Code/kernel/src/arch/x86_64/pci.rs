@@ -243,6 +243,28 @@ fn setup_ahci(slot: u32) -> Option<(usize, u32)> {
     None
 }
 
+/// Веха 49 — найти сетевую карту Intel e1000 (PRO/1000) на шине 0. Vendor 0x8086, device
+/// 0x100e (82540EM — то, что даёт QEMU `-device e1000`) либо 0x10d3 (82574L, «e1000e»).
+/// Включаем память+bus-master, отдаём базу BAR0 (MMIO с регистрами). `None` — карты нет
+/// (тогда драйвер откатится на virtio-net). Опрос, без прерываний — как virtio-net.
+pub fn probe_e1000() -> Option<usize> {
+    const VENDOR_INTEL: u16 = 0x8086;
+    for dev in 0..32u32 {
+        let id = cfg_r32(dev, 0);
+        let (vendor, device) = (id as u16, (id >> 16) as u16);
+        if vendor == VENDOR_INTEL && (device == 0x100e || device == 0x10d3 || device == 0x100f) {
+            cfg_w16(dev, 0x04, cfg_r16(dev, 0x04) | 0x6); // память + bus master (DMA колец)
+            let base = bar_addr(dev, 0); // BAR0 — регистры карты (MMIO)
+            if base == 0 {
+                return None;
+            }
+            unsafe { paging::map_mmio(base, 0x20000) }; // 128 КиБ регистрового окна
+            return Some(base);
+        }
+    }
+    None
+}
+
 /// Включить virtio-blk и взвести его MSI-X (диску прерывание нужно — async I/O).
 fn setup(dev: u32) -> Option<BlkDevice> {
     let transport = setup_transport(dev)?;

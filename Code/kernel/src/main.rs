@@ -53,7 +53,9 @@ mod ahci;
 mod arch;
 mod cap;
 mod chan;
+mod e1000;
 mod install;
+mod net;
 mod checkpoint;
 mod elf;
 mod executor;
@@ -179,15 +181,24 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("  [blk]  диск не найден — персистентность недоступна!");
     }
 
-    // Веха 34: подключить сетевую карту (стек — в userspace net-srv, драйвер работает опросом).
-    if virtio_net::init() {
-        let m = virtio_net::mac();
-        println!(
-            "  [net]  virtio-net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            m[0], m[1], m[2], m[3], m[4], m[5],
-        );
+    // Веха 34/49: подключить сетевую карту (стек — в userspace net-srv, драйвер работает опросом).
+    // Сперва e1000 — так стоит карта на реальном x86-железе; в QEMU virt/q35 → откат на virtio-net.
+    let net_name = if e1000::init() {
+        net::use_e1000();
+        "e1000"
+    } else if virtio_net::init() {
+        "virtio-net"
     } else {
-        println!("  [net]  virtio-net не найден — сеть недоступна");
+        "нет"
+    };
+    if net_name == "нет" {
+        println!("  [net]  сетевой карты нет — сеть недоступна");
+    } else {
+        let m = net::mac();
+        println!(
+            "  [net]  {}: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            net_name, m[0], m[1], m[2], m[3], m[4], m[5],
+        );
     }
 
     // Прерывания устройств (Веха 24: одним вызовом контракта — контроллер, IRQ диска и

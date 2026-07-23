@@ -120,6 +120,12 @@ pub fn boot_module() -> Option<(usize, usize)> {
     None
 }
 
+/// Веха 49 — сетевая карта e1000 (Intel PRO/1000, PCI) — только x86. На riscv/QEMU-virt сеть
+/// приходит через virtio-mmio. Заглушка: драйвер e1000 откатится на virtio-net.
+pub fn probe_e1000() -> Option<usize> {
+    None
+}
+
 /// Найти virtio-net в тех же 8 mmio-слотах (Веха 34): magic «virt», версия 2,
 /// device id **1** (network). IRQ не нужен — драйвер опрашивает кольца.
 pub fn probe_virtio_net() -> Option<crate::arch::NetDevice> {
