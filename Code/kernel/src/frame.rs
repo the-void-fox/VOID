@@ -131,6 +131,15 @@ pub fn available_bytes() -> usize {
     FREE_COUNT.load(Ordering::Relaxed) * PAGE_SIZE
 }
 
+/// Веха 51 — принадлежит ли физ-адрес нашей RAM (области аллокатора). Нужно сносу адресного
+/// пространства ([`crate::arch::free_address_space`]): в таблицах userspace-драйвера есть листья,
+/// указывающие на MMIO УСТРОЙСТВА (не RAM) — их нельзя класть в список свободных, иначе выдадим
+/// адрес железа как страницу. RAM-фреймы (обычные, DMA, таблицы) — освобождаем; MMIO — минуем.
+pub fn is_ram(pa: usize) -> bool {
+    let start = align_up(&raw const _kernel_end as usize, PAGE_SIZE);
+    pa >= start && pa < ram_end()
+}
+
 const fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
 }

@@ -64,6 +64,14 @@ pub enum Target {
     /// content-id (`OBJ_GET`), `WRITE` — класть новые значения (`OBJ_PUT`). Так доступ к
     /// пространству объектов выдаётся процессу-серверу store, а не зашит в каждый процесс.
     Store,
+    /// Веха 51 — окно MMIO устройства (физ. база + длина): право замапить регистры железа в
+    /// адресное пространство userspace-драйвера (`SYS_MMIO_MAP`). Эфемерно (минтится на загрузке
+    /// после PCI-поиска; не переживает перезагрузку — устройство ищется заново).
+    Mmio { base: usize, len: usize },
+    /// Веха 51 — право выделять DMA-память (`SYS_DMA_ALLOC`): физически-адресуемые страницы под
+    /// кольца/буферы устройства (userspace программирует железо физ-адресами). Без IOMMU это
+    /// ДОВЕРЕННОЕ право (DMA куда угодно) — даётся только драйверам. Эфемерно.
+    Dma,
 }
 
 /// Запись в c-space: цель + права на неё.
@@ -180,10 +188,9 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
     let id = match target {
         Target::Value(id) => id,
         Target::Root(name) => object::root(name).ok_or(CapError::Dangling)?,
-        // Эндпоинт/reply/устройство/store — не значения: их «читают» через IPC/BLK_READ/OBJ_GET.
-        Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store => {
-            return Err(CapError::WrongKind)
-        }
+        // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
+        Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
+        | Target::Mmio { .. } | Target::Dma => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -203,7 +210,9 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
         match e.target {
             Target::Root(name) => name,
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
-            | Target::Store => return Err(CapError::WrongKind),
+            | Target::Store | Target::Mmio { .. } | Target::Dma => {
+                return Err(CapError::WrongKind)
+            }
         }
     };
     object::set_root(name, new_value);
@@ -264,6 +273,34 @@ pub fn store(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
     }
     match e.target {
         Target::Store => Ok(()),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Веха 51 — разрешить cap на **окно MMIO устройства** и вернуть `(база, длина)` физ-региона
+/// (требует `need`, обычно `READ|WRITE`). Так `SYS_MMIO_MAP` даёт userspace-драйверу регистры
+/// железа только при наличии права.
+pub fn mmio(dom: DomainId, cap: Cap, need: Rights) -> Result<(usize, usize), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Mmio { base, len } => Ok((base, len)),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Веха 51 — проверить право на **DMA-память** (`SYS_DMA_ALLOC`). Требует `need` (обычно `WRITE`).
+pub fn dma(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Dma => Ok(()),
         _ => Err(CapError::WrongKind),
     }
 }
@@ -371,7 +408,10 @@ pub fn persist() {
                         Target::Value(_) => 3,
                         Target::Root(_) => 4,
                         Target::Device(Device::Net) => 5,
-                        Target::Endpoint(_) | Target::Reply(_) => 0, // эфемерные — не переживают
+                        // Эфемерные (не переживают ребут): reply, эндпоинты, MMIO/DMA-права
+                        // драйверов (минтятся заново после PCI-поиска).
+                        Target::Endpoint(_) | Target::Reply(_)
+                        | Target::Mmio { .. } | Target::Dma => 0,
                     },
                     None => 0,
                 };

@@ -124,7 +124,11 @@ unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
         }
         let child = (pte & ADDR_MASK) as usize;
         if level == 0 {
-            frame::free(child); // листовая страница
+            // Веха 51: лист userspace-драйвера может указывать на MMIO устройства (не RAM) —
+            // такой НЕ освобождаем (иначе адрес железа попал бы в список свободных фреймов).
+            if frame::is_ram(child) {
+                frame::free(child); // листовая страница RAM
+            }
         } else {
             let kchild = if ktbl != 0 && *k.add(i) & PTE_P != 0 {
                 (*k.add(i) & ADDR_MASK) as usize

@@ -102,6 +102,25 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         Some(cap::mint(dom, cap::Target::Device(cap::Device::Net), parse_rights(r)).bits() as usize)
     } else if let Some(r) = token.strip_prefix("dev:block:") {
         Some(cap::mint(dom, cap::Target::Device(cap::Device::Block), parse_rights(r)).bits() as usize)
+    } else if token == "dma" {
+        // Веха 51 — право выделять DMA-память (userspace-драйверу под кольца/буферы).
+        Some(cap::mint(dom, cap::Target::Dma, Rights::WRITE).bits() as usize)
+    } else if let Some(dev) = token.strip_prefix("mmio:") {
+        // Веха 51 — окно MMIO устройства: найти его на PCI, отдать (физ. база + длина).
+        let region = match dev {
+            "e1000" => crate::arch::probe_e1000().map(|base| (base, 0x20000usize)),
+            _ => None,
+        };
+        match region {
+            Some((base, len)) => Some(
+                cap::mint(dom, cap::Target::Mmio { base, len }, Rights::READ.union(Rights::WRITE))
+                    .bits() as usize,
+            ),
+            None => {
+                println!("  [init] mmio:{} — устройство не найдено (пропуск)", dev);
+                None
+            }
+        }
     } else if let Some(rest) = token.strip_prefix("endpoint:") {
         // endpoint:ИМЯ  или  endpoint:ИМЯ:права (по умолчанию SEND).
         let (svc, rights) = match rest.split_once(':') {
@@ -200,6 +219,25 @@ pub fn boot() {
     };
     println!("  [init] поколение '{}' — поднимаю систему по конфигу:", gen);
     apply(&config);
+
+    // Веха 51 — демо userspace-драйвера: если карта e1000 не занята ядром (в VM сеть на virtio-net),
+    // поднять её драйвер В USERSPACE — процесс сам маппит регистры по MMIO-cap и DMA-память, шлёт
+    // кадр, устройство подтверждает DMA (бит DD). Доказывает фундамент под хостинг Linux-драйверов.
+    // Тихо пропускается, если e1000 нет.
+    if arch::probe_e1000().is_some() {
+        if let Some(pid) = spawn("e1000d") {
+            match (mint_cap(pid, "mmio:e1000", &[]), mint_cap(pid, "dma", &[])) {
+                (Some(m), Some(d)) => {
+                    proc::set_arg(pid, m);
+                    proc::set_arg2(pid, d);
+                    proc::push_start_cap(pid, m);
+                    proc::push_start_cap(pid, d);
+                    println!("  [init] userspace-драйвер e1000d P{} — выданы MMIO+DMA cap", pid);
+                }
+                _ => println!("  [init] e1000d: не удалось выдать MMIO/DMA cap (пропуск)"),
+            }
+        }
+    }
 
     proc::run();
     println!("  [init] сессия '{}' завершена (shell вышел) — обратно в ядро", gen);

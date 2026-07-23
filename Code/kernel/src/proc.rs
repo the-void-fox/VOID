@@ -1795,6 +1795,81 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_MMIO_MAP(mmio_cap, va) -> 0 | MAX (Веха 51): замапить окно MMIO устройства (из cap
+        // база+длина) в адресное пространство userspace-драйвера по адресу `va`. Так драйвер в
+        // userspace получает регистры железа — без cap доступа нет. `va` — в USER-регионе, вне
+        // стека (драйвер сам выбирает окно). Пер-страничное отображение U|R|W.
+        31 => {
+            let (mcap, va) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::WRITE) {
+                Ok((base, len)) => {
+                    let pages = len.div_ceil(PAGE);
+                    let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+                    if va >= USER_REGION_START && va + pages * PAGE <= limit && base % PAGE == 0 {
+                        let root = arch::space_root(t.procs[cur].space);
+                        for i in 0..pages {
+                            unsafe {
+                                arch::map(root, va + i * PAGE, base + i * PAGE,
+                                    arch::MAP_R | arch::MAP_W | arch::MAP_U);
+                            }
+                        }
+                        arch::flush_tlb();
+                        vprintln!("  [drv] P{} SYS_MMIO_MAP {:#x} ({} стр.) → {:#x}", cur, base, pages, va);
+                        0
+                    } else {
+                        usize::MAX
+                    }
+                }
+                Err(e) => {
+                    vprintln!("  [drv] P{} SYS_MMIO_MAP отклонён: {:?}  ← нет cap на MMIO", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_DMA_ALLOC(dma_cap, va) -> физ-адрес | MAX (Веха 51): выделить один обнулённый фрейм,
+        // замапить его в драйвер по `va` (U|R|W) и вернуть его ФИЗИЧЕСКИЙ адрес — им драйвер
+        // программирует DMA устройства. Без IOMMU это доверенное право (dma-cap только у драйверов).
+        32 => {
+            let (dcap, va) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::dma(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
+                Ok(()) => {
+                    let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+                    if va >= USER_REGION_START && va + PAGE <= limit {
+                        match frame::alloc() {
+                            Some(pa) => {
+                                let root = arch::space_root(t.procs[cur].space);
+                                unsafe {
+                                    arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U);
+                                }
+                                arch::flush_tlb();
+                                pa // физ-адрес фрейма (== va в ядре, но драйверу нужен именно физ.)
+                            }
+                            None => usize::MAX,
+                        }
+                    } else {
+                        usize::MAX
+                    }
+                }
+                Err(e) => {
+                    vprintln!("  [drv] P{} SYS_DMA_ALLOC отклонён: {:?}  ← нет cap на DMA", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);

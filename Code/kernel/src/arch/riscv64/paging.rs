@@ -85,7 +85,11 @@ unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
         let child = ((pte >> 10) & PPN_MASK) << 12;
         let leaf = pte & (PTE_R | PTE_W | PTE_X) != 0;
         if level == 0 || leaf {
-            frame::free(child); // листовая страница
+            // Веха 51: листья userspace-драйвера могут указывать на MMIO устройства (не RAM) —
+            // такие НЕ освобождаем (иначе адрес железа попал бы в список свободных фреймов).
+            if frame::is_ram(child) {
+                frame::free(child); // листовая страница RAM
+            }
         } else {
             // Ядерный потомок того же слота (если у ядра он есть и это подтаблица).
             let kchild = if ktbl != 0 && *k.add(i) & PTE_V != 0 && *k.add(i) & (PTE_R | PTE_W | PTE_X) == 0 {

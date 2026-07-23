@@ -105,6 +105,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("net-srv", include_bytes!(env!("PROG_NET_SRV"))),
     ("threads", include_bytes!(env!("PROG_THREADS"))),
     ("freeze", include_bytes!(env!("PROG_FREEZE"))),
+    ("e1000d", include_bytes!(env!("PROG_E1000D"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
@@ -190,13 +191,14 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("  [blk]  диск не найден — персистентность недоступна!");
     }
 
-    // Веха 34/49: подключить сетевую карту (стек — в userspace net-srv, драйвер работает опросом).
-    // Сперва e1000 — так стоит карта на реальном x86-железе; в QEMU virt/q35 → откат на virtio-net.
-    let net_name = if e1000::init() {
+    // Веха 34/49/51: сетевая карта (стек — в userspace net-srv). Сперва virtio-net (в VM быстрее и
+    // оставляет e1000 свободной для userspace-драйвера, Веха 51); если её нет (реальное железо) —
+    // e1000 как встроенный драйвер ядра. Оба работают опросом.
+    let net_name = if virtio_net::init() {
+        "virtio-net"
+    } else if e1000::init() {
         net::use_e1000();
         "e1000"
-    } else if virtio_net::init() {
-        "virtio-net"
     } else {
         "нет"
     };

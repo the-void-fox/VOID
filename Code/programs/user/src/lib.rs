@@ -45,6 +45,8 @@ const SYS_SET_TLS: usize = 27;
 const SYS_CHECKPOINT: usize = 28;
 const SYS_RESTORE: usize = 29;
 const SYS_INSTALL: usize = 30;
+const SYS_MMIO_MAP: usize = 31;
+const SYS_DMA_ALLOC: usize = 32;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -319,6 +321,19 @@ pub fn start_cap(i: usize) -> usize {
 pub fn install(store_cap: usize) -> Option<u64> {
     let r = abi::syscall(SYS_INSTALL, store_cap, 0, 0, 0, 0, 0, 0).0;
     (r != NO_CAP).then_some(r as u64)
+}
+
+/// `SYS_MMIO_MAP(mmio_cap, va)` (Веха 51): замапить окно MMIO устройства (регистры железа) в свой
+/// адресный простор по `va`. `true` — успех (дальше читать/писать регистры по `va` volatile'ом).
+pub fn mmio_map(mmio_cap: usize, va: usize) -> bool {
+    abi::syscall(SYS_MMIO_MAP, mmio_cap, va, 0, 0, 0, 0, 0).0 == 0
+}
+
+/// `SYS_DMA_ALLOC(dma_cap, va)` (Веха 51): выделить DMA-страницу, замапить по `va`, вернуть её
+/// ФИЗИЧЕСКИЙ адрес — им драйвер программирует DMA устройства. `None` — отказ.
+pub fn dma_alloc(dma_cap: usize, va: usize) -> Option<usize> {
+    let r = abi::syscall(SYS_DMA_ALLOC, dma_cap, va, 0, 0, 0, 0, 0).0;
+    (r != NO_CAP).then_some(r)
 }
 
 /// `SYS_CAP_DERIVE`: урезанная копия СВОЕГО права (права ∩ mask) — аттенуация у себя,
