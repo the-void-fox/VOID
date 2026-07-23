@@ -12,7 +12,7 @@
 //! Порядок замков прежний: `with`/`gc` держат STORE, чтение диска берёт замок BLK
 //! внутри virtio_blk (STORE→BLK).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 
@@ -20,17 +20,35 @@ use void_abi::ContentId;
 use void_store::{BlockIo, Store, SECTOR};
 
 use crate::sync::SpinLock;
-use crate::{println, timer, virtio_blk};
+use crate::{ahci, println, timer, virtio_blk};
 
-/// Носитель ядра: сектор store = сектор virtio-blk (размеры совпадают по построению).
+/// Веха 47 — какой носитель активен: AHCI (реальный SATA) или virtio-blk (QEMU). Выбор
+/// делает загрузка ([`use_ahci`]): на железе поднялся AHCI — сектора идут через него,
+/// иначе — через virtio-blk. Формат сектора одинаков (512 Б), поэтому store не различает.
+static AHCI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Переключить носитель store на AHCI (зовёт `kmain`, когда `ahci::init()` удался).
+pub fn use_ahci() {
+    AHCI_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Носитель ядра: сектор store = сектор блочного устройства (размеры совпадают по построению).
 struct Disk;
 
 impl BlockIo for Disk {
     fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR]) -> bool {
-        virtio_blk::read(sector, buf)
+        if AHCI_ACTIVE.load(Ordering::Relaxed) {
+            ahci::read(sector, buf)
+        } else {
+            virtio_blk::read(sector, buf)
+        }
     }
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool {
-        virtio_blk::write(sector, buf)
+        if AHCI_ACTIVE.load(Ordering::Relaxed) {
+            ahci::write(sector, buf)
+        } else {
+            virtio_blk::write(sector, buf)
+        }
     }
 }
 

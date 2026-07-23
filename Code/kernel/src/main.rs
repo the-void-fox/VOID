@@ -49,6 +49,7 @@
 
 extern crate alloc;
 
+mod ahci;
 mod arch;
 mod cap;
 mod chan;
@@ -166,11 +167,15 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("  [heap] куча ядра готова (16 МиБ)");
     println!();
 
-    // Веха 7.1: подключить диск (нужен для персистентности).
-    if virtio_blk::init() {
+    // Веха 7.1/47: подключить диск (нужен для персистентности). Сперва AHCI — так стоит диск
+    // на реальном x86-железе (SATA); в QEMU virt/q35 его нет → откат на virtio-blk (mmio/pci).
+    if ahci::init() {
+        object::use_ahci();
+        println!("  [blk]  AHCI SATA: {} секторов", ahci::capacity_sectors());
+    } else if virtio_blk::init() {
         println!("  [blk]  virtio-blk: {} секторов", virtio_blk::capacity_sectors());
     } else {
-        println!("  [blk]  virtio-blk не найден — персистентность недоступна!");
+        println!("  [blk]  диск не найден — персистентность недоступна!");
     }
 
     // Веха 34: подключить сетевую карту (стек — в userspace net-srv, драйвер работает опросом).

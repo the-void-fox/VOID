@@ -108,6 +108,13 @@ pub fn probe_virtio_blk() -> Option<crate::arch::BlkDevice> {
     None
 }
 
+/// Веха 47 — AHCI (SATA) на этой платформе нет: QEMU `virt` даёт только virtio-mmio, а
+/// таргет-железо riscv (VisionFive 2 и т.п.) использует eMMC/NVMe, не SATA. Заглушка: диск
+/// приходит через virtio-blk, драйвер AHCI откатится на него.
+pub fn probe_ahci() -> Option<(usize, u32)> {
+    None
+}
+
 /// Найти virtio-net в тех же 8 mmio-слотах (Веха 34): magic «virt», версия 2,
 /// device id **1** (network). IRQ не нужен — драйвер опрашивает кольца.
 pub fn probe_virtio_net() -> Option<crate::arch::NetDevice> {

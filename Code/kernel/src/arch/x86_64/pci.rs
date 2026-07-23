@@ -11,6 +11,8 @@
 //! (адрес 0xFEE0_0000, данные = вектор [`trap::VEC_BLK`]). Ни IOAPIC-маршрутизации,
 //! ни PIRQ-свопов INTx — сообщение приходит вектором, как и положено на PCIe.
 
+use core::ptr::read_volatile;
+
 use crate::arch::{BlkDevice, BlkTransport, NetDevice};
 
 use super::{paging, trap};
@@ -149,6 +151,96 @@ fn setup_transport(dev: u32) -> Option<BlkTransport> {
         return None; // не modern virtio
     }
     Some(BlkTransport::Pci { common, notify_base, notify_mult, isr, device: device_cfg })
+}
+
+// ─── AHCI (Веха 47) ──────────────────────────────────────────────────────────
+// Конфиг-доступ С УЧЁТОМ ФУНКЦИИ: на Intel-PCH SATA-контроллер сидит на 00:1f.2 —
+// функция 2, которую обычный virtio-скан (только функция 0) не видит. Индекс `slot`
+// = dev<<3|func; адрес = enable | slot<<8 | off (равно dev<<11|func<<8 у железа PCI).
+fn cfg_addr_f(slot: u32, off: u32) -> u32 {
+    0x8000_0000 | slot << 8 | (off & 0xfc)
+}
+fn cfg_r32f(slot: u32, off: u32) -> u32 {
+    outl(CFG_ADDR, cfg_addr_f(slot, off));
+    inl(CFG_DATA)
+}
+fn cfg_r16f(slot: u32, off: u32) -> u16 {
+    (cfg_r32f(slot, off & !3) >> ((off & 3) * 8)) as u16
+}
+fn cfg_r8f(slot: u32, off: u32) -> u8 {
+    (cfg_r32f(slot, off & !3) >> ((off & 3) * 8)) as u8
+}
+fn cfg_w16f(slot: u32, off: u32, v: u16) {
+    let (a, sh) = (off & !3, (off & 3) * 8);
+    let old = cfg_r32f(slot, a);
+    outl(CFG_ADDR, cfg_addr_f(slot, a));
+    outl(CFG_DATA, (old & !(0xffff << sh)) | (v as u32) << sh);
+}
+
+/// Веха 47 — найти AHCI-контроллер (SATA) с ПОДКЛЮЧЁННЫМ диском. Скан шины 0, ВСЕ функции
+/// (класс 01/06/01 = Mass Storage / SATA / AHCI). У кандидата включаем память+bus-master,
+/// берём ABAR (BAR5), отображаем, включаем AHCI (GHC.AE) и ищем порт с устройством
+/// (PxSSTS.DET==3). Возвращает `(ABAR, номер порта)`; None — AHCI с диском не нашли (тогда
+/// драйвер откатится на virtio-blk). Много-контроллерный случай QEMU (встроенный ich9 без
+/// диска на 1f.2 + добавленный с диском) разрулён проверкой наличия диска в самом порту.
+pub fn probe_ahci() -> Option<(usize, u32)> {
+    for dev in 0..32u32 {
+        for func in 0..8u32 {
+            let slot = dev << 3 | func;
+            let id = cfg_r32f(slot, 0);
+            if id == 0xffff_ffff {
+                if func == 0 {
+                    break; // нет функции 0 — устройства в слоте нет вовсе
+                }
+                continue;
+            }
+            let cc = cfg_r32f(slot, 0x08); // [31:24] class, [23:16] subclass, [15:8] prog-if
+            if (cc >> 24) as u8 == 0x01 && (cc >> 16) as u8 == 0x06 && (cc >> 8) as u8 == 0x01 {
+                if let Some(res) = setup_ahci(slot) {
+                    return Some(res);
+                }
+            }
+            // Одно-функциональное устройство (бит 7 header-type = 0) — функции 1..7 не сканируем.
+            if func == 0 && cfg_r8f(slot, 0x0e) & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Включить контроллер AHCI на `slot`, отобразить ABAR, найти порт с диском.
+fn setup_ahci(slot: u32) -> Option<(usize, u32)> {
+    cfg_w16f(slot, 0x04, cfg_r16f(slot, 0x04) | 0x6); // память + bus master (DMA)
+    let lo = cfg_r32f(slot, 0x24); // BAR5 = 0x10 + 4*5
+    if lo & 1 != 0 {
+        return None; // ABAR обязан быть memory-BAR
+    }
+    let mut abar = (lo & !0xf) as u64;
+    if lo & 0x4 != 0 {
+        abar |= (cfg_r32f(slot, 0x28) as u64) << 32; // 64-битный BAR — верхняя половина
+    }
+    let abar = abar as usize;
+    if abar == 0 {
+        return None;
+    }
+    unsafe {
+        paging::map_mmio(abar, 0x2000); // generic-регистры + до 32 портов (0x100 + 32*0x80)
+        let ghc = (abar + 0x04) as *mut u32;
+        ghc.write_volatile(ghc.read_volatile() | 1 << 31); // GHC.AE — включить AHCI
+    }
+    let pi = unsafe { read_volatile((abar + 0x0c) as *const u32) }; // Ports Implemented
+    for port in 0..32u32 {
+        if pi & (1 << port) == 0 {
+            continue;
+        }
+        let pbase = abar + 0x100 + port as usize * 0x80;
+        let ssts = unsafe { read_volatile((pbase + 0x28) as *const u32) }; // PxSSTS
+        if ssts & 0xf == 3 {
+            return Some((abar, port)); // DET==3: устройство есть и связь установлена
+        }
+    }
+    None
 }
 
 /// Включить virtio-blk и взвести его MSI-X (диску прерывание нужно — async I/O).
