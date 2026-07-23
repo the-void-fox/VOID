@@ -56,7 +56,15 @@ mod chan;
 mod e1000;
 mod install;
 mod net;
+// USB xHCI — только x86 (Веха 50); на riscv/QEMU-virt xHCI нет → заглушка (init всегда false).
+#[cfg(target_arch = "x86_64")]
 mod xhci;
+#[cfg(not(target_arch = "x86_64"))]
+mod xhci {
+    pub fn init() -> bool {
+        false
+    }
+}
 mod checkpoint;
 mod elf;
 mod executor;

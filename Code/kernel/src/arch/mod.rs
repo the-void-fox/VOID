@@ -62,8 +62,8 @@ pub use imp::{
     space_root, space_token, translate, MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
-    // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49, xHCI — Веха 50)
-    probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_xhci,
+    // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49)
+    probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net,
     // разное
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла
@@ -75,6 +75,11 @@ pub use imp::{
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.
 #[allow(unused_imports)]
 pub use imp::power_off;
+
+/// Веха 50 — USB xHCI: поиск контроллера и байт клавиатуры в консоль. Только x86 (на riscv
+/// USB нет, `xhci`-модуль ядра там — заглушка).
+#[cfg(target_arch = "x86_64")]
+pub use imp::{probe_xhci, usb_key};
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).

@@ -222,6 +222,12 @@ pub fn console_drain() {
         n += 1;
     }
     ps2::drain();
+    crate::xhci::poll(); // Веха 50: USB-клавиатура (если поднята) — тот же кольцевой буфер
+}
+
+/// Веха 50 — байт от USB-HID-клавиатуры в кольцо консоли (как PS/2 [`rx_push`]).
+pub fn usb_key(b: u8) {
+    rx_push(b);
 }
 
 pub fn console_has_input() -> bool {
@@ -293,9 +299,11 @@ pub fn irq_mask_preempt(_saved: usize) {
 }
 
 /// Сон до ввода: таймер выкл — исполнять некого, разбудит IRQ4 консоли (Веха 27),
-/// как SEIE-путь на riscv.
+/// как SEIE-путь на riscv. Веха 50: но если поднята USB-клавиатура (у неё нет прерывания —
+/// опрос), таймер ОСТАВЛЯЕМ вкл, чтобы тики опрашивали её (`console_drain` → `xhci::poll`);
+/// иначе HLT спал бы до IRQ консоли и USB-нажатия терялись бы.
 pub fn irq_mask_stdin(_saved: usize) {
-    lapic::set_timer_masked(true);
+    lapic::set_timer_masked(!crate::xhci::has_keyboard());
 }
 
 pub fn mark_in_kernel() {}

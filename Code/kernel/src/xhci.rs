@@ -48,12 +48,14 @@ const IR0_ERDP: usize = 0x18; // u64: указатель извлечения с
 const ERDP_EHB: u64 = 1 << 3; // Event Handler Busy (пишем 1 при обновлении)
 
 const RING_TRBS: usize = 256; // TRB в кольце (одно 4 КиБ-фрейм / 16)
+const TRB_NORMAL: u32 = 1; // Normal (данные interrupt/bulk)
 const TRB_SETUP: u32 = 2; // Setup Stage (control-трансфер)
 const TRB_DATA: u32 = 3; // Data Stage
 const TRB_STATUS: u32 = 4; // Status Stage
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDR_DEV: u32 = 11; // Address Device
+const TRB_CONFIG_EP: u32 = 12; // Configure Endpoint
 const EV_TRANSFER: u32 = 32; // Transfer Event
 const EV_CMD_COMPLETE: u32 = 33; // Command Completion Event
 
@@ -76,7 +78,14 @@ pub struct Xhci {
     ep0_ring: usize, // TR-кольцо управляющего эндпоинта EP0
     ep0_enq: usize,
     ep0_cycle: u32,
-    dma_buf: usize, // буфер под дескрипторы/репорты (один фрейм, DMA)
+    dma_buf: usize, // буфер под дескрипторы (один фрейм, DMA)
+    // Часть C — HID-клавиатура (interrupt IN эндпоинт):
+    int_ring: usize, // TR-кольцо interrupt-эндпоинта (0 — не настроен)
+    int_enq: usize,
+    int_cycle: u32,
+    int_dci: u32, // Device Context Index interrupt-эндпоинта (звонок)
+    int_buf: usize, // буфер под 8-байтные boot-репорты
+    prev: [u8; 6], // предыдущий набор нажатых клавиш (для детекта НОВЫХ нажатий)
 }
 unsafe impl Send for Xhci {}
 
@@ -164,6 +173,7 @@ pub fn init() -> bool {
             event_ring, event_deq: 0, event_cycle: 1,
             dcbaa,
             slot: 0, ep0_ring: 0, ep0_enq: 0, ep0_cycle: 1, dma_buf: 0,
+            int_ring: 0, int_enq: 0, int_cycle: 1, int_dci: 0, int_buf: 0, prev: [0; 6],
         };
 
         // Порты: сбросить подключённые, запомнить ПЕРВЫЙ с устройством (порт + скорость).
@@ -190,31 +200,37 @@ pub fn init() -> bool {
             }
         }
 
-        // Часть B — перечислить устройство на первом порту: Enable Slot → Address Device →
-        // прочитать дескриптор устройства (control-трансфер по EP0).
+        // Часть B/C — перечислить устройство и, если это HID-клавиатура, настроить её.
         let mut desc = [0u8; 18];
-        let mut ok = false;
+        let mut hid = false;
+        let mut enumerated = false;
         if dev_port != 0 {
             if let Some(slot) = x.enable_slot() {
                 x.slot = slot;
                 if x.address_device(slot, dev_port, dev_speed)
                     && x.get_descriptor(1, 0, &mut desc)
                 {
-                    ok = true;
+                    enumerated = true;
+                    hid = x.setup_hid(dev_speed);
                 }
             }
         }
-        if ok {
+        if hid {
+            crate::println!(
+                "  [usb]  xHCI: HID-клавиатура на порту {} (slot {}) — ввод по USB готов",
+                dev_port, x.slot,
+            );
+        } else if enumerated {
             let vid = desc[8] as u16 | (desc[9] as u16) << 8;
             let pid = desc[10] as u16 | (desc[11] as u16) << 8;
             crate::println!(
-                "  [usb]  xHCI: порт {}, скорость {}, устройство {:04x}:{:04x} class={} (slot {})",
-                dev_port, dev_speed, vid, pid, desc[4], x.slot,
+                "  [usb]  xHCI: устройство {:04x}:{:04x} class={} (не HID-клавиатура — ввод не настроен)",
+                vid, pid, desc[4],
             );
         } else {
             crate::println!(
-                "  [usb]  xHCI: {} портов, {} подключено — перечисление не удалось (порт {})",
-                max_ports, connected, dev_port,
+                "  [usb]  xHCI: {} портов, {} подключено — перечисление не удалось",
+                max_ports, connected,
             );
         }
 
@@ -251,26 +267,29 @@ impl Xhci {
         None
     }
 
-    /// Опросить кольцо событий до валидного события (совпал cycle bit), продвинуть ERDP.
+    /// Не-блокирующе взять одно событие, если оно готово (совпал cycle bit), продвинуть ERDP.
+    unsafe fn try_event(&mut self) -> Option<[u32; 4]> {
+        let ev = (self.event_ring + self.event_deq * 16) as *const u32;
+        let ctrl = read_volatile(ev.add(3));
+        if ctrl & 1 != self.event_cycle {
+            return None;
+        }
+        let out = [read_volatile(ev), read_volatile(ev.add(1)), read_volatile(ev.add(2)), ctrl];
+        self.event_deq += 1;
+        if self.event_deq == RING_TRBS {
+            self.event_deq = 0;
+            self.event_cycle ^= 1;
+        }
+        let erdp = self.event_ring + self.event_deq * 16;
+        wr64(self.rt + 0x20 + IR0_ERDP, erdp as u64 | ERDP_EHB);
+        Some(out)
+    }
+
+    /// Дождаться (с таймаутом) любого события — для команд/трансферов при инициализации.
     unsafe fn wait_event(&mut self) -> Option<[u32; 4]> {
         for _ in 0..10_000_000 {
-            let ev = (self.event_ring + self.event_deq * 16) as *const u32;
-            let ctrl = read_volatile(ev.add(3));
-            if ctrl & 1 == self.event_cycle {
-                let out = [
-                    read_volatile(ev),
-                    read_volatile(ev.add(1)),
-                    read_volatile(ev.add(2)),
-                    ctrl,
-                ];
-                self.event_deq += 1;
-                if self.event_deq == RING_TRBS {
-                    self.event_deq = 0;
-                    self.event_cycle ^= 1;
-                }
-                let erdp = self.event_ring + self.event_deq * 16;
-                wr64(self.rt + 0x20 + IR0_ERDP, erdp as u64 | ERDP_EHB);
-                return Some(out);
+            if let Some(ev) = self.try_event() {
+                return Some(ev);
             }
         }
         None
@@ -369,4 +388,176 @@ impl Xhci {
         core::ptr::copy_nonoverlapping(self.dma_buf as *const u8, out.as_mut_ptr(), out.len());
         true
     }
+
+    /// Управляющий трансфер БЕЗ данных (SET_CONFIGURATION, SET_PROTOCOL): Setup + Status(IN,IOC).
+    unsafe fn control_nodata(&mut self, req_type: u8, request: u8, value: u16, index: u16) -> bool {
+        let setup = req_type as u64 | (request as u64) << 8 | (value as u64) << 16
+            | (index as u64) << 32; // wLength=0
+        self.push_ep0(setup as u32, (setup >> 32) as u32, 8, TRB_SETUP << 10 | 1 << 6); // TRT=No Data
+        self.push_ep0(0, 0, 0, TRB_STATUS << 10 | 1 << 16 | 1 << 5); // Status DIR=IN, IOC
+        compiler_fence(Ordering::SeqCst);
+        wr(self.db + self.slot as usize * 4, 1);
+        for _ in 0..64 {
+            let Some(ev) = self.wait_event() else { return false };
+            if (ev[3] >> 10) & 0x3f == EV_TRANSFER {
+                let c = (ev[2] >> 24) & 0xff;
+                return c == 1 || c == 13;
+            }
+        }
+        false
+    }
+
+    /// Часть C — настроить HID-клавиатуру: разобрать config-дескриптор (найти interrupt-IN
+    /// эндпоинт + интерфейс), SET_CONFIGURATION, SET_PROTOCOL(boot), Configure Endpoint, поставить
+    /// первый interrupt-TRB. `true` — это HID-клавиатура и она готова слать репорты.
+    unsafe fn setup_hid(&mut self, speed: u32) -> bool {
+        let mut cfg = [0u8; 96];
+        if !self.get_descriptor(2, 0, &mut cfg) {
+            return false; // config-дескриптор (тип 2)
+        }
+        // Пройти дескрипторы: интерфейс (тип 4, класс[5]=3 HID) + его interrupt-IN эндпоинт (тип 5).
+        let (mut iface, mut is_hid, mut ep_addr, mut ep_mps, mut ep_ivl) = (0u8, false, 0u8, 8u16, 0u8);
+        let mut i = cfg[0] as usize; // после шапки config
+        while i + 4 <= cfg.len() && cfg[i] != 0 {
+            let (blen, btype) = (cfg[i] as usize, cfg[i + 1]);
+            if btype == 4 {
+                iface = cfg[i + 2];
+                is_hid = cfg[i + 5] == 3; // bInterfaceClass = HID
+            } else if btype == 5 && is_hid && cfg[i + 2] & 0x80 != 0 && cfg[i + 3] & 3 == 3 {
+                // Endpoint: IN (бит7 адреса) + Interrupt (атрибуты[1:0]=3).
+                ep_addr = cfg[i + 2];
+                ep_mps = cfg[i + 4] as u16 | (cfg[i + 5] as u16) << 8;
+                ep_ivl = cfg[i + 6];
+            }
+            i += blen.max(1);
+        }
+        if ep_addr == 0 {
+            return false; // не HID с interrupt-IN эндпоинтом
+        }
+        // SET_CONFIGURATION(1); SET_PROTOCOL(boot=0) на интерфейс.
+        self.control_nodata(0x00, 9, 1, 0);
+        self.control_nodata(0x21, 0x0b, 0, iface as u16);
+        self.configure_endpoint(ep_addr, ep_mps, ep_ivl, speed) && {
+            self.queue_report();
+            true
+        }
+    }
+
+    /// Configure Endpoint: добавить interrupt-IN эндпоинт в контекст устройства.
+    unsafe fn configure_endpoint(&mut self, ep_addr: u8, mps: u16, ivl: u8, speed: u32) -> bool {
+        let cs = if self.ctx64 { 64 } else { 32 };
+        let dci = 2 * (ep_addr & 0x0f) as u32 + 1; // IN-эндпоинт: DCI = 2*n+1
+        let (Some(int_ring), Some(input), Some(int_buf)) =
+            (frame::alloc(), frame::alloc(), frame::alloc())
+        else {
+            return false;
+        };
+        let link = (int_ring + (RING_TRBS - 1) * 16) as *mut u32;
+        write_volatile(link as *mut u64, int_ring as u64);
+        write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1);
+        self.int_ring = int_ring;
+        self.int_enq = 0;
+        self.int_cycle = 1;
+        self.int_dci = dci;
+        self.int_buf = int_buf;
+        // Input Control: A0 (slot) | A(dci). Slot Context: Context Entries = dci.
+        write_volatile((input + 4) as *mut u32, 1 | 1 << dci);
+        write_volatile((input + cs) as *mut u32, dci << 27 | speed << 20);
+        // EP Context (индекс dci+1): interval; EPType=Interrupt IN(7), MPS, CErr=3; TR dequeue|DCS.
+        let ep = input + (dci as usize + 1) * cs;
+        let interval = if speed >= 3 { (ivl.max(1) - 1).min(15) as u32 } else { 7 };
+        write_volatile(ep as *mut u32, interval << 16);
+        write_volatile((ep + 4) as *mut u32, (mps as u32) << 16 | 7 << 3 | 3 << 1);
+        write_volatile((ep + 8) as *mut u64, int_ring as u64 | 1);
+        write_volatile((ep + 16) as *mut u32, mps as u32); // avg TRB length
+        compiler_fence(Ordering::SeqCst);
+        let ev = self.command(input as u32, (input as u64 >> 32) as u32,
+            TRB_CONFIG_EP << 10 | (self.slot as u32) << 24);
+        matches!(ev, Some(e) if (e[2] >> 24) & 0xff == 1)
+    }
+
+    /// Поставить Normal-TRB на interrupt-кольцо (приём одного 8-байтного репорта) + звонок.
+    unsafe fn queue_report(&mut self) {
+        let trb = (self.int_ring + self.int_enq * 16) as *mut u32;
+        write_volatile(trb as *mut u64, self.int_buf as u64);
+        write_volatile(trb.add(2), 8); // длина буфера
+        write_volatile(trb.add(3), TRB_NORMAL << 10 | 1 << 5 | 1 << 2 | self.int_cycle); // IOC|ISP
+        self.int_enq += 1;
+        if self.int_enq == RING_TRBS - 1 {
+            self.int_enq = 0;
+            self.int_cycle ^= 1;
+        }
+        compiler_fence(Ordering::SeqCst);
+        wr(self.db + self.slot as usize * 4, self.int_dci); // звонок interrupt-эндпоинта
+    }
+
+    /// Опрос: разобрать пришедшие boot-репорты клавиатуры, отдать НОВЫЕ нажатия в консоль.
+    unsafe fn poll_hid(&mut self) {
+        while let Some(ev) = self.try_event() {
+            if (ev[3] >> 10) & 0x3f != EV_TRANSFER {
+                continue; // не трансфер (порт/команда) — пропустить
+            }
+            let r = core::slice::from_raw_parts(self.int_buf as *const u8, 8);
+            let mods = r[0];
+            let shift = mods & 0x22 != 0; // Left/Right Shift
+            for &k in &r[2..8] {
+                // Новое нажатие: код есть в этом репорте, но не было в прошлом.
+                if k != 0 && !self.prev.contains(&k) {
+                    if let Some(b) = hid_to_ascii(k, shift) {
+                        crate::arch::usb_key(b);
+                    }
+                }
+            }
+            self.prev.copy_from_slice(&r[2..8]);
+            self.queue_report(); // подставить буфер под следующий репорт
+        }
+    }
+}
+
+/// HID Usage (boot keyboard) → ASCII. Достаточно для vsh: буквы, цифры, пробел, Enter, Backspace,
+/// Tab, базовая пунктуация; Shift даёт верхний регистр/символы. Неизвестное — `None`.
+fn hid_to_ascii(k: u8, shift: bool) -> Option<u8> {
+    let b = match k {
+        0x04..=0x1d => {
+            let c = b'a' + (k - 0x04);
+            return Some(if shift { c - 32 } else { c });
+        }
+        0x1e..=0x26 => {
+            let d = b'1' + (k - 0x1e);
+            let sym = [b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'('];
+            return Some(if shift { sym[(k - 0x1e) as usize] } else { d });
+        }
+        0x27 => if shift { b')' } else { b'0' },
+        0x28 => b'\r', // Enter
+        0x2a => 0x08,  // Backspace
+        0x2b => b'\t', // Tab
+        0x2c => b' ',  // Space
+        0x2d => if shift { b'_' } else { b'-' },
+        0x2e => if shift { b'+' } else { b'=' },
+        0x2f => if shift { b'{' } else { b'[' },
+        0x30 => if shift { b'}' } else { b']' },
+        0x31 => if shift { b'|' } else { b'\\' },
+        0x33 => if shift { b':' } else { b';' },
+        0x34 => if shift { b'"' } else { b'\'' },
+        0x36 => if shift { b'<' } else { b',' },
+        0x37 => if shift { b'>' } else { b'.' },
+        0x38 => if shift { b'?' } else { b'/' },
+        _ => return None,
+    };
+    Some(b)
+}
+
+/// Опрос USB-клавиатуры — зовётся из `console_drain` (тик/IRQ) наравне с PS/2 и COM1.
+pub fn poll() {
+    if let Some(x) = XHCI.lock().as_mut() {
+        if x.int_ring != 0 {
+            unsafe { x.poll_hid() }
+        }
+    }
+}
+
+/// Поднята ли USB-клавиатура. Нужно `irq_mask_stdin`: у USB нет прерывания (опрос), поэтому в
+/// режиме сна-до-ввода таймер держим ВКЛ — иначе на её нажатия ничего не проснётся.
+pub fn has_keyboard() -> bool {
+    XHCI.lock().as_ref().map_or(false, |x| x.int_ring != 0)
 }
