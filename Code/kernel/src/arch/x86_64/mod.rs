@@ -316,7 +316,7 @@ pub fn timer_arm() {
 /// Имя схемы трансляции — для баннера загрузки.
 pub const MM_NAME: &str = "x86_64 4-level";
 
-pub use paging::{clone_kernel_root, translate};
+pub use paging::{clone_kernel_root, free_address_space, translate};
 
 /// Флаги [`map`] — арх-нейтральные биты; в PTE их переводит сам `map` (x86 наоборот
 /// ЗАПРЕЩАЕТ исполнение битом NX — см. paging.rs).

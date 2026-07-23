@@ -153,7 +153,7 @@ pub fn now_ticks() -> u64 {
 /// Имя схемы трансляции — для баннера загрузки.
 pub const MM_NAME: &str = "Sv39";
 
-pub use paging::{clone_kernel_root, page_info, translate};
+pub use paging::{clone_kernel_root, free_address_space, page_info, translate};
 
 /// Флаги [`map`] в кодировке этого арха (листовой PTE Sv39).
 pub const MAP_R: usize = paging::PTE_R;

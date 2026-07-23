@@ -53,6 +53,52 @@ pub fn clone_kernel_root() -> usize {
 /// Маска PPN внутри PTE — 44 бита.
 const PPN_MASK: usize = (1 << 44) - 1;
 
+/// Веха 46 — освободить ВСЕ приватные фреймы адресного пространства процесса: листовые
+/// страницы (код/данные/стек/куча) + промежуточные таблицы + сам корень. Ядерные подтаблицы
+/// (общие для всех пространств) НЕ трогаем: их узнаём сравнением с корнем ядра — записи,
+/// скопированные из [`clone_kernel_root`] дословно, идентичны и пропускаются; приватные
+/// (слот VPN[2]=1 у процесса свой) — отличаются и уходят под нож рекурсивно.
+///
+/// # Safety
+/// `root_pa` — корень ПРОЦЕССА, который БОЛЬШЕ НЕ АКТИВЕН (satp уже переключён на живое
+/// пространство): освобождать таблицы под текущим satp нельзя — MMU читала бы их из
+/// списка свободных. Вызывать один раз на пространство.
+pub unsafe fn free_address_space(root_pa: usize) {
+    let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
+    free_private(root_pa, kroot, 2); // Sv39: корень — уровень 2
+}
+
+/// Рекурсивно освободить таблицу `tbl` (уровня `level`) и её приватных потомков. `ktbl` —
+/// параллельная таблица ЯДРА того же уровня (`0` — у ядра её нет): записи, совпадающие с
+/// ядром, — общие, пропускаются; прочие приватны. На уровне 0 записи — листовые страницы.
+unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
+    let t = tbl as *const usize;
+    let k = ktbl as *const usize;
+    for i in 0..512 {
+        let pte = *t.add(i);
+        if pte & PTE_V == 0 {
+            continue;
+        }
+        if ktbl != 0 && pte == *k.add(i) {
+            continue; // общая с ядром запись — не наша
+        }
+        let child = ((pte >> 10) & PPN_MASK) << 12;
+        let leaf = pte & (PTE_R | PTE_W | PTE_X) != 0;
+        if level == 0 || leaf {
+            frame::free(child); // листовая страница
+        } else {
+            // Ядерный потомок того же слота (если у ядра он есть и это подтаблица).
+            let kchild = if ktbl != 0 && *k.add(i) & PTE_V != 0 && *k.add(i) & (PTE_R | PTE_W | PTE_X) == 0 {
+                ((*k.add(i) >> 10) & PPN_MASK) << 12
+            } else {
+                0
+            };
+            free_private(child, kchild, level - 1);
+        }
+    }
+    frame::free(tbl); // сама таблица — после всех детей
+}
+
 // MMIO-регион QEMU virt: UART (0x1000_0000) + 8 слотов virtio-mmio (0x1000_1000..0x1000_9000).
 const MMIO_START: usize = 0x1000_0000;
 const MMIO_END: usize = 0x1000_9000;

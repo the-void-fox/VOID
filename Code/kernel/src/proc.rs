@@ -654,6 +654,38 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
     resume();
 }
 
+/// Веха 46 — маркер «пространство этой группы уже освобождено» в поле `space`. Валидным
+/// токеном (satp/CR3) `usize::MAX` быть не может, поэтому годится как часовой.
+const RECLAIMED: usize = usize::MAX;
+
+/// Веха 46 — собрать корни адресных пространств тех групп, где ВСЕ нити уже `Finished`, и
+/// пометить их `space = RECLAIMED` (чтобы не освободить дважды и не тронуть устаревший корень).
+/// Единая точка для всех путей гибели (SYS_EXIT, linux exit_group, page fault, лишняя нить):
+/// группа освобождается ровно тогда, когда в ней не осталось живых нитей. Возвращает корни —
+/// САМО освобождение делает [`resume`] уже под живым пространством (рушить таблицы под
+/// активным satp/CR3 нельзя).
+fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
+    let mut roots = Vec::new();
+    let n = t.procs.len();
+    for leader in 0..n {
+        if t.procs[leader].group != leader || t.procs[leader].space == RECLAIMED {
+            continue; // только лидеры групп и только ещё не освобождённые
+        }
+        let all_dead =
+            (0..n).all(|i| t.procs[i].group != leader || t.procs[i].state == State::Finished);
+        if !all_dead {
+            continue;
+        }
+        roots.push(arch::space_root(t.procs[leader].space));
+        for i in 0..n {
+            if t.procs[i].group == leader {
+                t.procs[i].space = RECLAIMED;
+            }
+        }
+    }
+    roots
+}
+
 /// Возобновить текущий процесс (или, если он не готов, следующий готовый). Если готовых нет
 /// (все завершены или заблокированы) — вернуться в ядро (в [`run`]). Не возвращается.
 fn resume() -> ! {
@@ -676,8 +708,20 @@ fn resume() -> ! {
             t.current = n;
             let frame = t.procs[n].frame;
             let space = t.procs[n].space;
+            // Веха 46: вернуть фреймы групп, что полностью завершились (страницы, таблицы, корень).
+            let dead = reclaim_dead_spaces(&mut t);
             drop(t);
-            unsafe { arch::enter_user(&frame, space, trap_top()) }
+            unsafe {
+                if !dead.is_empty() {
+                    // Переключиться на ЖИВОЕ пространство ПЕРЕД сносом мёртвых: их таблицы нельзя
+                    // рушить под активным satp/CR3 (MMU потом читала бы их из списка свободных).
+                    arch::mm_enable(arch::space_root(space));
+                    for root in dead {
+                        arch::free_address_space(root);
+                    }
+                }
+                arch::enter_user(&frame, space, trap_top())
+            }
         }
         None => {
             drop(t);

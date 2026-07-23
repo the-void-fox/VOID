@@ -93,6 +93,50 @@ pub fn clone_kernel_root() -> usize {
     new
 }
 
+/// Веха 46 — освободить ВСЕ приватные фреймы адресного пространства процесса (зеркало
+/// riscv64::paging::free_address_space): листовые страницы + промежуточные таблицы + корень.
+/// Общие с ядром узлы узнаём сравнением с корнем ядра. Тонкость x86: под PML4[0] у процесса
+/// СВОЙ PDPT (клон ядерного, [`clone_kernel_root`]) — значит PML4[0] отличается и уходит в
+/// рекурсию, а уже ВНУТРИ приватного PDPT общие с ядром записи ([0],[3] — PD ядра) совпадут
+/// с ядерным PDPT и будут пропущены; приватна лишь запись [1] (user 1..2 ГиБ).
+///
+/// # Safety
+/// `root_pa` — PML4 процесса, который БОЛЬШЕ НЕ АКТИВЕН (CR3 уже переключён на живое
+/// пространство). Вызывать один раз на пространство.
+pub unsafe fn free_address_space(root_pa: usize) {
+    let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
+    free_private(root_pa, kroot, 3); // 4 уровня: PML4 — уровень 3
+}
+
+/// Рекурсивно освободить таблицу `tbl` (уровня `level`) и её приватных потомков; `ktbl` —
+/// параллельная таблица ЯДРА (`0` — её нет). Записи, совпадающие с ядром, — общие, минуем.
+/// Суперстраниц (PS) мы не используем, поэтому лист — только на уровне 0.
+unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
+    let t = tbl as *const u64;
+    let k = ktbl as *const u64;
+    for i in 0..512 {
+        let pte = *t.add(i);
+        if pte & PTE_P == 0 {
+            continue;
+        }
+        if ktbl != 0 && pte == *k.add(i) {
+            continue; // общая с ядром запись
+        }
+        let child = (pte & ADDR_MASK) as usize;
+        if level == 0 {
+            frame::free(child); // листовая страница
+        } else {
+            let kchild = if ktbl != 0 && *k.add(i) & PTE_P != 0 {
+                (*k.add(i) & ADDR_MASK) as usize
+            } else {
+                0
+            };
+            free_private(child, kchild, level - 1);
+        }
+    }
+    frame::free(tbl); // сама таблица — после детей
+}
+
 /// Отобразить MMIO-диапазон [pa, pa+len) идентично (RW+NX) в таблицы ЯДРА уже в
 /// рантайме — BAR'ы PCI известны только после поиска устройства. Зваться обязан ДО
 /// первого клона пространств: новые записи верхних уровней в копии не попадут
