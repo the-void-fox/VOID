@@ -62,8 +62,8 @@ pub use imp::{
     space_root, space_token, translate, MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
-    // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49)
-    probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net,
+    // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49, xHCI — Веха 50)
+    probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_xhci,
     // разное
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла

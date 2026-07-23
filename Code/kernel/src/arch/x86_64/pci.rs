@@ -243,6 +243,46 @@ fn setup_ahci(slot: u32) -> Option<(usize, u32)> {
     None
 }
 
+/// Веха 50 — найти контроллер USB **xHCI** (класс 0x0c/0x03/0x30 — Serial Bus / USB / xHCI),
+/// как probe_ahci — по ВСЕМ функциям (на Intel-PCH xHCI на 00:14.0, но бывает и функция != 0).
+/// Включаем память+bus-master, отображаем BAR0 (регистры, 64 КиБ), отдаём базу. `None` — нет.
+pub fn probe_xhci() -> Option<usize> {
+    for dev in 0..32u32 {
+        for func in 0..8u32 {
+            let slot = dev << 3 | func;
+            let id = cfg_r32f(slot, 0);
+            if id == 0xffff_ffff {
+                if func == 0 {
+                    break;
+                }
+                continue;
+            }
+            let cc = cfg_r32f(slot, 0x08);
+            if (cc >> 24) as u8 == 0x0c && (cc >> 16) as u8 == 0x03 && (cc >> 8) as u8 == 0x30 {
+                cfg_w16f(slot, 0x04, cfg_r16f(slot, 0x04) | 0x6); // память + bus master
+                let lo = cfg_r32f(slot, 0x10); // BAR0
+                if lo & 1 != 0 {
+                    return None;
+                }
+                let mut base = (lo & !0xf) as u64;
+                if lo & 0x4 != 0 {
+                    base |= (cfg_r32f(slot, 0x14) as u64) << 32;
+                }
+                let base = base as usize;
+                if base == 0 {
+                    return None;
+                }
+                unsafe { paging::map_mmio(base, 0x10000) };
+                return Some(base);
+            }
+            if func == 0 && cfg_r8f(slot, 0x0e) & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    None
+}
+
 /// Веха 49 — найти сетевую карту Intel e1000 (PRO/1000) на шине 0. Vendor 0x8086, device
 /// 0x100e (82540EM — то, что даёт QEMU `-device e1000`) либо 0x10d3 (82574L, «e1000e»).
 /// Включаем память+bus-master, отдаём базу BAR0 (MMIO с регистрами). `None` — карты нет

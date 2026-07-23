@@ -56,6 +56,7 @@ mod chan;
 mod e1000;
 mod install;
 mod net;
+mod xhci;
 mod checkpoint;
 mod elf;
 mod executor;
@@ -200,6 +201,10 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             net_name, m[0], m[1], m[2], m[3], m[4], m[5],
         );
     }
+
+    // Веха 50: контроллер USB xHCI (часть A — подъём HCD). Печатает свой статус сам; нет xHCI
+    // (QEMU без `-device qemu-xhci`, riscv) — тихо пропускаем.
+    xhci::init();
 
     // Прерывания устройств (Веха 24: одним вызовом контракта — контроллер, IRQ диска и
     // приём консоли по прерыванию). Байты консоли копятся в кольцевом буфере ядра с этого
