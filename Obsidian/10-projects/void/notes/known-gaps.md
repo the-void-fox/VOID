@@ -93,12 +93,14 @@ status: active
      - ✅ **Фундамент: userspace-драйверы** — закрыт целиком: MMIO+DMA по cap (Веха 51,
        [[userspace-drivers]]) + доставка прерываний в userspace (Веха 52, [[irq]]) — e1000
        в userspace, IRQ по capability (`SYS_IRQ_WAIT`, IOAPIC level-low + oneshot-маска).
-     - ✅ **Linux-API шим `lx_emul`** — каркас взят на Rust (Веха 53, [[lx-emul]]) И на C
-       (Веха 54, [[lx-emul-c]]): ioremap/kmalloc/dma_alloc_coherent/request_irq/driver-model,
-       e1000 как Linux-стилевой драйвер (Rust `bin/lx_e1000` + C `lx_e1000_c` кросс-gcc против
-       void-libc). Дальше — **реальные `.c` из ядра Linux** против шима (полный dde_linux:
-       Lx_kit — scheduler/workqueue/timer, минимальные Linux-заголовки), потом порт подсистемы
-       (NIC/USB) — закроет Atheros/EHCI/wifi X54C. ← следующее
+     - ✅ **Linux-API шим `lx_emul`** — каркас на Rust (Веха 53, [[lx-emul]]) и C (Веха 54,
+       [[lx-emul-c]]): ioremap/kmalloc/dma_alloc_coherent/request_irq/driver-model, e1000 как
+       Linux-стилевой драйвер (Rust `bin/lx_e1000` + C `lx_e1000_c`).
+     - ✅ **Первый неизменённый `.c` из ядра Linux работает на VOID** (Веха 55, [[lx-linux]]):
+       `lib/sort.c` 6.18.7 verbatim против рукописных шим-заголовков `linux/*.h` (начало
+       dde_linux-конвейера), обе арх. Дальше — растить header-поверхность + **Lx_kit**
+       (scheduler/workqueue/timer) к реальному драйверу подсистемы (NIC/USB) — закроет
+       Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
