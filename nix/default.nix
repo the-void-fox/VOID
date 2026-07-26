@@ -265,6 +265,25 @@ let
         '';
       };
 
+      # lx_timer (Веха 63) — jiffies (linux/jiffies.h) + таймеры (linux/timer.h) поверх планировщика.
+      # Тела в lx_kit.c: jiffies по монотонному времени VOID, очередь таймеров, idle-путь стреляет;
+      # msleep стал УСТУПАЮЩИМ. Харнесс: две сони чередуются (msleep уступает) + таймеры стреляют по
+      # возрастанию expires (2 3 1). Обе арх.
+      lx_timer = stdenv.mkDerivation {
+        pname = "lx-timer";
+        version = "0.63";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_timer.c lx_kit.c -o lx-timer
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-timer $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

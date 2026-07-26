@@ -17,10 +17,14 @@
 #include <sys/time.h> /* gettimeofday — монотонное время VOID под udelay/mdelay */
 
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/timer.h>
 
 #include "lx_sched.h" /* кооперативный планировщик (Веха 62) */
+
+static void lx_jiffies_update(void); /* двигает jiffies по монотонному времени VOID (Веха 63) */
 
 void *kmalloc(size_t size, gfp_t flags)
 {
@@ -139,9 +143,165 @@ void mdelay(unsigned long msecs)
 		udelay(1000);
 }
 
+/* msleep — УСТУПАЮЩИЙ сон (Веха 63). В контексте задачи ставит таймер, который её разбудит, и
+ * блокируется (отдаёт процессор другим задачам); вне задачи (нет планировщика) — буси-mdelay. */
+struct lx_sleep_timer {
+	struct timer_list t;
+	struct lx_task   *task;
+};
+
+static void lx_sleep_wake(struct timer_list *tl)
+{
+	struct lx_sleep_timer *st = from_timer(st, tl, t);
+	lx_task_unblock(st->task);
+}
+
 void msleep(unsigned int msecs)
 {
-	mdelay(msecs); /* пока тоже буси; уступающий сон — с планировщиком Lx_kit позже */
+	struct lx_task *self = lx_task_self();
+	struct lx_sleep_timer st;
+
+	if (!self) {
+		mdelay(msecs); /* вне задачи — честная буси-пауза (как было) */
+		return;
+	}
+	lx_jiffies_update();
+	st.task = self;
+	__lx_timer_setup(&st.t, lx_sleep_wake, 0);
+	mod_timer(&st.t, jiffies + msecs_to_jiffies(msecs ? msecs : 1));
+	lx_task_block();     /* уступаем; таймер выстрелит в idle-пути → unblock → вернёмся сюда */
+	timer_delete(&st.t); /* снять на всякий случай (если разбудили не таймером) */
+}
+
+/* ─── jiffies + таймеры (linux/jiffies.h, linux/timer.h, Веха 63) ─────────────
+ * jiffies двигается по МОНОТОННОМУ времени VOID (now_us), обновляется в точках
+ * планирования/задержки. Таймеры — односвязная очередь; цикл планировщика в idle-
+ * пути стреляет выстрелившими (softirq-контекст: sched_current == NULL). */
+
+unsigned long volatile jiffies;            /* глобальный счётчик тиков (linux/jiffies.h) */
+static unsigned long long jiffies_boot_us; /* точка отсчёта (0 = ещё не инициализировано) */
+static struct timer_list *timer_head;      /* очередь заведённых таймеров */
+
+static void lx_jiffies_update(void)
+{
+	if (!jiffies_boot_us)
+		jiffies_boot_us = now_us(); /* ленивая инициализация точки отсчёта */
+	/* 1000000/HZ мкс на один jiffy (HZ=100 → 10000 мкс = 10 мс) */
+	jiffies = (unsigned long)((now_us() - jiffies_boot_us) / (1000000ull / HZ));
+}
+
+u64 get_jiffies_64(void)
+{
+	return jiffies;
+}
+
+void __lx_timer_setup(struct timer_list *t, void (*fn)(struct timer_list *), unsigned int flags)
+{
+	t->function = fn;
+	t->flags = flags;
+	t->expires = 0;
+	t->lx_next = NULL;
+	t->lx_pending = 0;
+}
+
+static void lx_timer_unlink(struct timer_list *t)
+{
+	struct timer_list *prev = NULL, *c = timer_head;
+
+	while (c) {
+		if (c == t) {
+			if (prev)
+				prev->lx_next = c->lx_next;
+			else
+				timer_head = c->lx_next;
+			break;
+		}
+		prev = c;
+		c = c->lx_next;
+	}
+	t->lx_next = NULL;
+	t->lx_pending = 0;
+}
+
+int mod_timer(struct timer_list *t, unsigned long expires)
+{
+	int was = t->lx_pending;
+
+	if (was)
+		lx_timer_unlink(t);
+	t->expires = expires;
+	t->lx_next = timer_head; /* в голову — порядок в очереди не важен, выбираем по expires */
+	timer_head = t;
+	t->lx_pending = 1;
+	return was;
+}
+
+void add_timer(struct timer_list *t)
+{
+	mod_timer(t, t->expires);
+}
+
+int timer_delete(struct timer_list *t)
+{
+	int was = t->lx_pending;
+
+	if (was)
+		lx_timer_unlink(t);
+	return was;
+}
+
+int timer_delete_sync(struct timer_list *t)
+{
+	return timer_delete(t); /* один поток — sync-вариант тождествен */
+}
+
+int timer_pending(const struct timer_list *t)
+{
+	return t->lx_pending;
+}
+
+/* Выстрелить все таймеры, чей срок наступил (jiffies уже обновлён). Коллбэк может
+ * перевзвести/удалить таймеры, поэтому каждый раз ищем due заново от головы. Возвращает
+ * число сработавших (>0 ⇒ мог кого-то разблокировать). */
+static int lx_timers_fire_due(void)
+{
+	int fired = 0;
+
+	for (;;) {
+		struct timer_list *t = timer_head, *due = NULL;
+
+		while (t) {
+			if (time_after_eq(jiffies, t->expires)) {
+				due = t;
+				break;
+			}
+			t = t->lx_next;
+		}
+		if (!due)
+			break;
+		lx_timer_unlink(due);  /* снять ДО коллбэка: он вправе перевзвести этот же таймер */
+		due->function(due);
+		fired++;
+	}
+	return fired;
+}
+
+/* Ближайший срок среди заведённых таймеров. 1 + *next, если есть; иначе 0. */
+static int lx_timers_next(unsigned long *next_exp)
+{
+	struct timer_list *t;
+	unsigned long min = 0;
+	int any = 0;
+
+	for (t = timer_head; t; t = t->lx_next) {
+		if (!any || time_before(t->expires, min)) {
+			min = t->expires;
+			any = 1;
+		}
+	}
+	if (any)
+		*next_exp = min;
+	return any;
 }
 
 /* ─── кооперативный планировщик (lx_sched.h, Веха 62) ─────────────────────────
@@ -302,16 +462,32 @@ struct lx_task *lx_task_self(void)
 void lx_sched_run(void)
 {
 	struct lx_task *t, *next;
+	unsigned long next_exp;
 
 	for (;;) {
+		lx_jiffies_update();
+		lx_timers_fire_due(); /* выстрелившие таймеры → могут сделать задачи готовыми */
+
 		t = sched_head;
 		while (t && t->state != LX_RUNNABLE && t->state != LX_INIT)
 			t = t->next; /* первая готовая от головы (порядок = приоритет) */
-		if (!t)
-			break;       /* готовых нет — все блокированы/мертвы */
-		sched_current = t;
-		lx_task_run(t);
-		sched_current = NULL;
+		if (t) {
+			sched_current = t;
+			lx_task_run(t);
+			sched_current = NULL;
+			continue;
+		}
+
+		/* Готовых задач нет: если тикают таймеры — простаиваем по РЕАЛЬНОМУ времени до
+		 * ближайшего срока и идём на новый круг (там он выстрелит и разблокирует задачу);
+		 * если и таймеров нет — работа окончена. */
+		if (lx_timers_next(&next_exp)) {
+			do
+				lx_jiffies_update();
+			while (time_before(jiffies, next_exp)); /* idle-ожидание тика */
+			continue;
+		}
+		break;
 	}
 
 	/* Реап завершённых — после остановки цикла: указатели на задачи не должны

@@ -127,9 +127,17 @@ status: active
        арх-вставка `arch_execute` для riscv64/x86_64). `lx_task_create`/`lx_sched_run`/`yield`/
        `block`/`unblock`. Следствие: внутри Linux-кода нет гонок, spinlock/mutex/атомики почти no-op.
        Харнесс: round-robin по yield + ping/pong по block/unblock (`pp_seq=121212`), отдельные стеки
-       доказаны, обе арх. Референс подхода собран в `reference/dde-linux/`. Дальше — jiffies/таймеры,
-       wait_event/wake_up, workqueue, module_init-редирект + driver-model/PCI/netdev к e1000 → закроет
-       Atheros/EHCI/wifi X54C. ← следующее
+       доказаны, обе арх. Референс подхода собран в `reference/dde-linux/`.
+     - ✅ **jiffies + таймеры** (Веха 63, [[lx-timer]]): `linux/jiffies.h` (`jiffies`/`HZ=100`/
+       `time_after`/`msecs_to_jiffies`) + `linux/timer.h` (`timer_list`/`mod_timer`/`timer_delete`/
+       `from_timer`). Очередь таймеров в Lx_kit, idle-путь планировщика двигает время по монотонным
+       часам VOID и стреляет выстрелившими (softirq-контекст); **`msleep` стал уступающим**. Харнесс:
+       сони чередуются, таймеры `2 3 1`, обе арх. **Оговорки:** (а) jiffies двигается в точках
+       планирования/задержки, не непрерывно — буси-цикл по `jiffies` без `msleep`/`udelay`/`cpu_relax`
+       время не увидит; (б) idle-ожидание таймера — буси по реальному времени (жжёт хост-CPU, пока
+       все задачи спят; настоящий сон ядра VOID — позже). Дальше — wait_event/wake_up/completion,
+       workqueue+`schedule_delayed_work`, module_init-редирект + driver-model/PCI/netdev к e1000 →
+       закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
