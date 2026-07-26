@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–59, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–60, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -12,6 +12,7 @@ VOID. Растёт по мере роста портируемого кода к
 - **Веха 58** — **`linux/bitops.h`**: битовые операции ядра; реальный `lib/hweight.c`
   (popcount) → `lx-bits`.
 - **Веха 59** — **`linux/err.h`**: идиома «ошибка в указателе» (ERR_PTR/IS_ERR) → `lx-err`.
+- **Веха 60** — **`linux/io.h`**: MMIO-аксессоры регистров (readl/writel) → `lx-io`.
 
 ## Что здесь
 
@@ -31,6 +32,8 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   `hweight*` маршрутизирован в реальный `hweight.c`. Оговорка: `set_bit` пока не атомарен.
 - `err.h`, `errno.h` — инфраструктура (Веха 59): «ошибка в указателе» (ERR_PTR/IS_ERR) +
   проход к newlib errno. Проверяется харнессом (`main_err.c`) — в бою раскроется в драйвере.
+- `io.h` — инфраструктура (Веха 60): MMIO-аксессоры `readl`/`writel`/… + `ioremap` (пока identity;
+  настоящее окно — от lx_emul по MMIO-cap). Харнесс (`main_io.c`) — round-trip на буфере-регистрах.
 
 Наш рантайм и харнессы:
 - **`lx_kit.c`** — **Lx_kit-рантайм**: тела `kmalloc/kzalloc/kcalloc/kmalloc_array/krealloc/kfree` +
@@ -49,10 +52,12 @@ nix-build nix -A <arch>.lx_argv    # argv_split.c + шимы + lx_kit.c + harnes
 nix-build nix -A <arch>.lx_list    # list_sort.c + шимы + harness → VOID-ELF
 nix-build nix -A <arch>.lx_bits    # hweight.c + bitops.h/asm-types + lx_kit.c + harness → VOID-ELF
 nix-build nix -A <arch>.lx_err     # err.h/errno.h + lx_kit.c + harness → VOID-ELF
+nix-build nix -A <arch>.lx_io      # io.h + lx_kit.c + harness → VOID-ELF
 void-store-import void-disk.img put result/bin/lx-sort bin/<arch>/lx-sort
 void-store-import void-disk.img put result/bin/lx-argv bin/<arch>/lx-argv
 void-store-import void-disk.img put result/bin/lx-list bin/<arch>/lx-list
 void-store-import void-disk.img put result/bin/lx-bits bin/<arch>/lx-bits
 void-store-import void-disk.img put result/bin/lx-err bin/<arch>/lx-err
+void-store-import void-disk.img put result/bin/lx-io bin/<arch>/lx-io
 ```
-Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` (чистые вычислялки, обе арх).
+Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` (чистые вычислялки, обе арх).

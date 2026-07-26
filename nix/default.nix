@@ -210,6 +210,24 @@ let
         '';
       };
 
+      # lx_io (Веха 60) — наш шим linux/io.h (MMIO-аксессоры readl/writel/… + ioremap identity).
+      # Харнесс трактует буфер как блок регистров и проверяет round-trip всех ширин + LE-раскладку.
+      # Настоящее окно регистров даёт lx_emul по MMIO-cap — сведём позже. lx_kit.c — ради printk.
+      lx_io = stdenv.mkDerivation {
+        pname = "lx-io";
+        version = "0.60";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_io.c lx_kit.c -o lx-io
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-io $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

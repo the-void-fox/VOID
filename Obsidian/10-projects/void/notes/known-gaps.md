@@ -113,9 +113,12 @@ status: active
        `lib/hweight.c` 6.18.7 (софтовый popcount). Обе арх. Оговорка: set_bit пока не атомарен (под
        IRQ-поток нужны атомики).
      - ✅ **linux/err.h: «ошибка в указателе»** (Веха 59, [[lx-err]]): `ERR_PTR`/`PTR_ERR`/`IS_ERR`/
-       … — идиома возврата ресурса-или-ошибки без out-параметра (драйверы юзают повсюду) + тонкий
-       `errno.h`. Инфраструктура — проверена харнессом, обе арх. Дальше — io/delay/spinlock/timer/
-       workqueue + driver-model/PCI/netdev к драйверу e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
+       … — идиома возврата ресурса-или-ошибки без out-параметра (драйверы юзают повсюду) + тонкий `errno.h`.
+     - ✅ **linux/io.h: MMIO-аксессоры** (Веха 60, [[lx-io]]): `readl`/`writel`/… — доступ к
+       регистрам устройства (e1000 весь на них через `er32`/`ew32`); `_relaxed`/`ioread`/`iowrite`;
+       `ioremap` пока identity (настоящее окно — от lx_emul по MMIO-cap, сведём). Проверено харнессом
+       на буфере-регистрах, обе арх. Дальше — delay/spinlock/timer/workqueue + driver-model/PCI/
+       netdev к драйверу e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
