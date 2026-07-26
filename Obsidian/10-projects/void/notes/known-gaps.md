@@ -106,9 +106,13 @@ status: active
      - ✅ **linux/list.h: двусвязный список ядра** (Веха 57, [[lx-list]]): костяк ядра/драйвера
        (очереди netdev, списки буферов). Шим `list.h` (LIST_HEAD/list_add_tail/list_for_each_entry)
        + `compiler.h` (likely/unlikely) + вынесенный `container_of.h`. Доказано неизменённым
-       `lib/list_sort.c` 6.18.7 (устойчивая merge-сортировка списка) — порядок+целостность кольца,
-       обе арх. Дальше — err/bitops/spinlock/timer/workqueue + driver-model/PCI/netdev к драйверу
-       e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
+       `lib/list_sort.c` 6.18.7 (устойчивая merge-сортировка списка) — порядок+целостность кольца, обе арх.
+     - ✅ **linux/bitops.h: битовые операции ядра** (Веха 58, [[lx-bits]]): вездесущи в драйверах
+       (флаги, битовые карты, маски регистров). Шим `bitops.h` (BIT/GENMASK/set_bit/test_bit/
+       for_each_set_bit/ffs/fls/hweight) + `asm/types.h`; `hweight*` маршрутизирован в реальный
+       `lib/hweight.c` 6.18.7 (софтовый popcount). Обе арх. Оговорка: set_bit пока не атомарен (под
+       IRQ-поток нужны атомики). Дальше — err/io/delay/spinlock/timer/workqueue + driver-model/PCI/
+       netdev к драйверу e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
