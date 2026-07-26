@@ -8,12 +8,8 @@
 #ifndef _LINUX_KERNEL_H_SHIM
 #define _LINUX_KERNEL_H_SHIM
 
+#include <linux/container_of.h> /* container_of() — базовая идиома, вынесена отдельно */
 #include <linux/types.h>
-
-#ifndef container_of
-#define container_of(ptr, type, member) \
-	((type *)((char *)(ptr) - offsetof(type, member)))
-#endif
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 

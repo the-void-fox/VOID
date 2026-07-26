@@ -154,6 +154,25 @@ let
         '';
       };
 
+      # lx_list (Веха 57) — НЕИЗМЕНЁННЫЙ lib/list_sort.c ядра Linux (6.18.7): устойчивая
+      # merge-сортировка двусвязного списка. Растим шим до linux/list.h (костяк ядра) + compiler.h;
+      # container_of вынесен в свой заголовок. Харнесс строит список нашим list.h и зовёт реальный
+      # list_sort(). Доказывает настоящий linux/list.h. lx_kit.c не нужен (список — без аллокатора).
+      lx_list = stdenv.mkDerivation {
+        pname = "lx-list";
+        version = "0.57";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_list.c linux-src/list_sort.c -o lx-list
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-list $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {
