@@ -117,6 +117,24 @@ let
         '';
       };
 
+      # lx_sort (Веха 55) — НЕИЗМЕНЁННЫЙ lib/sort.c ядра Linux (6.18.7) против рукописных
+      # шим-заголовков linux/*.h (начало lx_emul-заголовков): первый реальный .c из Linux на VOID.
+      # -I. находит linux/ (sort.c + harness), -DCONFIG_64BIT (обе арх 64-битные) → 64-битный swap.
+      lx_sort = stdenv.mkDerivation {
+        pname = "lx-sort";
+        version = "0.55";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main.c linux-src/sort.c -o lx-sort
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-sort $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {
