@@ -228,6 +228,24 @@ let
         '';
       };
 
+      # lx_delay (Веха 61) — наш шим linux/delay.h (udelay/mdelay/ndelay), тела в Lx_kit: буси-
+      # ожидание по монотонному времени VOID (gettimeofday → vsys_ticks). Харнесс замеряет, что
+      # пауза РЕАЛЬНО прошла (>= запрошенного). lx_kit.c даёт тела задержек + printk.
+      lx_delay = stdenv.mkDerivation {
+        pname = "lx-delay";
+        version = "0.61";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_delay.c lx_kit.c -o lx-delay
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-delay $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

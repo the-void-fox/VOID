@@ -12,7 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h> /* gettimeofday — монотонное время VOID под udelay/mdelay */
 
+#include <linux/delay.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 
@@ -103,4 +105,37 @@ int printk(const char *fmt, ...)
 	n = vprintf(fmt, ap); /* уровни KERN_* у нас пустые — печатаем строку как есть */
 	va_end(ap);
 	return n;
+}
+
+/* ─── задержки (linux/delay.h) ────────────────────────────────────────────────
+ * Буси-ожидание по МОНОТОННОМУ времени VOID (gettimeofday → vsys_ticks, 1–100 нс/тик).
+ * udelay/ndelay/mdelay в ядре зовутся и в атомарном контексте — крутимся, не спим. */
+static unsigned long long now_us(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (unsigned long long)tv.tv_sec * 1000000ull + (unsigned long long)tv.tv_usec;
+}
+
+void udelay(unsigned long usecs)
+{
+	unsigned long long start = now_us();
+	while (now_us() - start < usecs)
+		; /* буси-ожидание */
+}
+
+void ndelay(unsigned long nsecs)
+{
+	udelay((nsecs + 999) / 1000); /* разрешение времени — микросекунда; округляем вверх */
+}
+
+void mdelay(unsigned long msecs)
+{
+	while (msecs--)
+		udelay(1000);
+}
+
+void msleep(unsigned int msecs)
+{
+	mdelay(msecs); /* пока тоже буси; уступающий сон — с планировщиком Lx_kit позже */
 }

@@ -117,8 +117,13 @@ status: active
      - ✅ **linux/io.h: MMIO-аксессоры** (Веха 60, [[lx-io]]): `readl`/`writel`/… — доступ к
        регистрам устройства (e1000 весь на них через `er32`/`ew32`); `_relaxed`/`ioread`/`iowrite`;
        `ioremap` пока identity (настоящее окно — от lx_emul по MMIO-cap, сведём). Проверено харнессом
-       на буфере-регистрах, обе арх. Дальше — delay/spinlock/timer/workqueue + driver-model/PCI/
-       netdev к драйверу e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
+       на буфере-регистрах, обе арх.
+     - ✅ **linux/delay.h: паузы тайминга** (Веха 61, [[lx-delay]]): `udelay`/`mdelay`/`ndelay` —
+       буси-паузы (у e1000 сброс/линк/EEPROM — сплошь паузы); тела в Lx_kit — буси-ожидание по
+       монотонному времени VOID (`gettimeofday`, 1–100 нс/тик). Харнесс замеряет, что пауза РЕАЛЬНО
+       прошла, обе арх. **Трио инфраструктуры err/io/delay завершено.** Дальше — jiffies/atomic/
+       spinlock/timer/workqueue + driver-model/PCI/netdev к драйверу e1000 → закроет Atheros/EHCI/
+       wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
