@@ -90,9 +90,10 @@ status: active
    - ✅ **USB xHCI + HID-клавиатура** (Веха 50, [[usb]]) — свой USB-стек, клава на xHCI работает.
    - **Хостить Linux-драйверы** (Genode-стиль) — для «длинного хвоста» железа X54C: Atheros NIC,
      EHCI, wifi, GPU. Идёт слоями:
-     - ✅ **Фундамент: userspace-драйверы** (Веха 51, [[userspace-drivers]]) — MMIO+DMA по cap,
-       e1000 в userspace. Осталось из фундамента: **доставка прерываний в userspace**. ← следующее
-     - Затем **Linux-API шим** (`lx_emul`) + порт подсистемы — большой заход.
+     - ✅ **Фундамент: userspace-драйверы** — закрыт целиком: MMIO+DMA по cap (Веха 51,
+       [[userspace-drivers]]) + доставка прерываний в userspace (Веха 52, [[irq]]) — e1000
+       в userspace, IRQ по capability (`SYS_IRQ_WAIT`, IOAPIC level-low + oneshot-маска).
+     - Затем **Linux-API шим** (`lx_emul`) + порт подсистемы — большой заход. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
