@@ -31,7 +31,10 @@ let
         buildPhase = ''
           $CC -O2 -fno-asynchronous-unwind-tables -c crt0.S -o crt0.o
           $CC -O2 -fno-asynchronous-unwind-tables -c void.c -o void.o
-          $AR rcs libvoid.a void.o
+          # Веха 54 — lx_emul (C-порт Linux-API шима) в тот же libvoid.a: программы, не
+          # зовущие его функций (hello/bzip2), .o не тянут (статический архив).
+          $CC -O2 -fno-asynchronous-unwind-tables -c lx_emul.c -o lx_emul.o
+          $AR rcs libvoid.a void.o lx_emul.o
         '';
         installPhase = ''
           mkdir -p $out/lib
@@ -39,6 +42,8 @@ let
           # crt0.o%s из specs нашёл бы ИХ crt0 (libgloss, ждёт __bss_start)
           cp crt0.o $out/lib/void-crt0.o
           cp libvoid.a void.specs void-decls.h $out/lib/
+          # заголовок Linux-API шима — драйверам (чистый API, без syscall.h)
+          cp lx_emul.h $out/lib/
           cp $linkerScript $out/lib/void.ld
         '';
       };
@@ -93,6 +98,24 @@ let
             "gl_cv_func_fcntl_f_dupfd_cloexec=yes"
           ];
       }));
+
+      # lx_e1000 (Веха 54) — Intel e1000 как Linux-СТИЛЕВОЙ драйвер на C поверх шима lx_emul.
+      # НЕ пакет nixpkgs, а свой C-исходник: компилируем кросс-gcc против void-libc (specs
+      # линкуют VOID-ELF), заголовок шима — из глю (-I). Едет на диск мостом, init спавнит.
+      lx_e1000 = stdenv.mkDerivation {
+        pname = "lx_e1000-c";
+        version = "0.54";
+        src = ../Code/programs/lx-cdriver;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I${void-libc}/lib -O2 -static lx_e1000.c -o lx_e1000
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx_e1000 $out/bin/
+        '';
+      };
 
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).

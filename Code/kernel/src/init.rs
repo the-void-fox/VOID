@@ -220,13 +220,17 @@ pub fn boot() {
     println!("  [init] поколение '{}' — поднимаю систему по конфигу:", gen);
     apply(&config);
 
-    // Веха 51–53 — хостируемый userspace-драйвер e1000: если карта не занята ядром (в VM сеть на
-    // virtio-net), поднять её драйвер В USERSPACE. С Вехи 53 это lx_e1000 — Linux-СТИЛЕВОЙ драйвер
-    // поверх шима lx_emul (ioremap/dma_alloc_coherent/request_irq/probe), а не сырые примитивы.
-    // Права те же: MMIO-cap на регистры, DMA-cap, IRQ-cap (прерывание карты → VEC_USERDRV). Тихо
-    // пропускается, если e1000 нет. (Сырой демо-драйвер Вех 51–52 — bin/e1000d, оставлен как образец.)
+    // Веха 51–54 — хостируемый userspace-драйвер e1000: если карта не занята ядром (в VM сеть на
+    // virtio-net), поднять её драйвер В USERSPACE поверх шима lx_emul. Веха 54 — если на диск мостом
+    // импортирован C-драйвер `lx_e1000_c` (C-путь lx_emul), поднять ЕГО; иначе Rust-каркас
+    // `lx_e1000` (Веха 53). Права те же: MMIO-cap на регистры, DMA-cap, IRQ-cap (прерывание карты →
+    // VEC_USERDRV). Тихо пропускается, если e1000 нет. (Сырой демо Вех 51–52 — bin/e1000d, образец.)
     if arch::probe_e1000().is_some() {
-        if let Some(pid) = spawn("lx_e1000") {
+        let (driver, started) = match spawn("lx_e1000_c") {
+            Some(pid) => ("lx_e1000_c", Some(pid)),
+            None => ("lx_e1000", spawn("lx_e1000")),
+        };
+        if let Some(pid) = started {
             match (mint_cap(pid, "mmio:e1000", &[]), mint_cap(pid, "dma", &[])) {
                 (Some(m), Some(d)) => {
                     proc::set_arg(pid, m);
@@ -243,12 +247,13 @@ pub fn boot() {
                         proc::push_start_cap(pid, i);
                     }
                     println!(
-                        "  [init] userspace-драйвер lx_e1000 P{} (на lx_emul) — выданы MMIO+DMA{} cap",
+                        "  [init] userspace-драйвер {} P{} (на lx_emul) — выданы MMIO+DMA{} cap",
+                        driver,
                         pid,
                         if irq.is_some() { "+IRQ" } else { "" },
                     );
                 }
-                _ => println!("  [init] lx_e1000: не удалось выдать MMIO/DMA cap (пропуск)"),
+                _ => println!("  [init] {}: не удалось выдать MMIO/DMA cap (пропуск)", driver),
             }
         }
     }

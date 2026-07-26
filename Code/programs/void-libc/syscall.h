@@ -18,6 +18,13 @@
 #define SYS_MAP 17
 #define SYS_ARGS 18
 #define SYS_STARTCAP 19
+/* Веха 54 — драйверные syscall'ы для C-мира (нити + фундамент userspace-драйверов Вех 51–52). */
+#define SYS_THREAD_SPAWN 23
+#define SYS_THREAD_EXIT 24
+#define SYS_FUTEX 26
+#define SYS_MMIO_MAP 31
+#define SYS_DMA_ALLOC 32
+#define SYS_IRQ_WAIT 33
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
 #define VOID_NO_CAP ((uintptr_t)-1)
@@ -126,4 +133,37 @@ static inline uintptr_t vsys_call(uintptr_t ep, uintptr_t op, const void *send,
                                   size_t send_len, void *recv, size_t recv_len) {
     return vsys(SYS_CALL, ep, op, (uintptr_t)send, send_len, (uintptr_t)recv, recv_len,
                 VOID_NO_CAP);
+}
+
+/* ─── драйверные syscall'ы (Веха 54): нити + MMIO/DMA/IRQ фундамента Вех 51–52 ─── */
+
+/* SYS_THREAD_SPAWN(entry, arg, stack_top) -> tid | VOID_NO_CAP: нить в том же простор/домене. */
+static inline uintptr_t vsys_thread_spawn(uintptr_t entry, uintptr_t arg, uintptr_t stack_top) {
+    return vsys(SYS_THREAD_SPAWN, entry, arg, stack_top, 0, 0, 0, 0);
+}
+/* SYS_THREAD_EXIT(retval): завершить ТЕКУЩУЮ нить (процесс живёт прочими нитями). */
+static inline __attribute__((noreturn)) void vsys_thread_exit(uintptr_t retval) {
+    vsys(SYS_THREAD_EXIT, retval, 0, 0, 0, 0, 0, 0);
+    __builtin_unreachable();
+}
+/* SYS_FUTEX WAIT: уснуть на *uaddr, пока == expected. timeout_ticks=0 — бессрочно. 0=разбужен,1=таймаут. */
+static inline uintptr_t vsys_futex_wait(const uint32_t *uaddr, uint32_t expected,
+                                        uintptr_t timeout_ticks) {
+    return vsys(SYS_FUTEX, 0, (uintptr_t)uaddr, expected, timeout_ticks, 0, 0, 0);
+}
+/* SYS_FUTEX WAKE: разбудить до count нитей на *uaddr; возврат — число разбуженных. */
+static inline uintptr_t vsys_futex_wake(const uint32_t *uaddr, uintptr_t count) {
+    return vsys(SYS_FUTEX, 1, (uintptr_t)uaddr, count, 0, 0, 0, 0);
+}
+/* SYS_MMIO_MAP(cap, va): замапить окно регистров устройства в свой простор. 1 — успех. */
+static inline int vsys_mmio_map(uintptr_t cap, uintptr_t va) {
+    return vsys(SYS_MMIO_MAP, cap, va, 0, 0, 0, 0, 0) == 0;
+}
+/* SYS_DMA_ALLOC(cap, va): DMA-страница по va, возврат — её ФИЗ-адрес (VOID_NO_CAP — отказ). */
+static inline uintptr_t vsys_dma_alloc(uintptr_t cap, uintptr_t va) {
+    return vsys(SYS_DMA_ALLOC, cap, va, 0, 0, 0, 0, 0);
+}
+/* SYS_IRQ_WAIT(cap): уснуть до прерывания устройства. 1 — проснулись по IRQ, 0 — нет права. */
+static inline int vsys_irq_wait(uintptr_t cap) {
+    return vsys(SYS_IRQ_WAIT, cap, 0, 0, 0, 0, 0, 0) == 0;
 }
