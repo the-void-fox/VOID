@@ -79,7 +79,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     let mut tids = [0usize; NTHREADS];
     for i in 0..NTHREADS {
-        tids[i] = sys::thread_spawn(worker as usize, i, stack_top(i));
+        tids[i] = sys::thread_spawn(worker as *const () as usize, i, stack_top(i));
     }
     // Присоединить всех: каждая нить вернёт свой номер (проверка канала retval).
     let mut sum_ids = 0usize;

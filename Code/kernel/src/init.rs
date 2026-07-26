@@ -220,20 +220,21 @@ pub fn boot() {
     println!("  [init] поколение '{}' — поднимаю систему по конфигу:", gen);
     apply(&config);
 
-    // Веха 51 — демо userspace-драйвера: если карта e1000 не занята ядром (в VM сеть на virtio-net),
-    // поднять её драйвер В USERSPACE — процесс сам маппит регистры по MMIO-cap и DMA-память, шлёт
-    // кадр, устройство подтверждает DMA (бит DD). Доказывает фундамент под хостинг Linux-драйверов.
-    // Тихо пропускается, если e1000 нет.
+    // Веха 51–53 — хостируемый userspace-драйвер e1000: если карта не занята ядром (в VM сеть на
+    // virtio-net), поднять её драйвер В USERSPACE. С Вехи 53 это lx_e1000 — Linux-СТИЛЕВОЙ драйвер
+    // поверх шима lx_emul (ioremap/dma_alloc_coherent/request_irq/probe), а не сырые примитивы.
+    // Права те же: MMIO-cap на регистры, DMA-cap, IRQ-cap (прерывание карты → VEC_USERDRV). Тихо
+    // пропускается, если e1000 нет. (Сырой демо-драйвер Вех 51–52 — bin/e1000d, оставлен как образец.)
     if arch::probe_e1000().is_some() {
-        if let Some(pid) = spawn("e1000d") {
+        if let Some(pid) = spawn("lx_e1000") {
             match (mint_cap(pid, "mmio:e1000", &[]), mint_cap(pid, "dma", &[])) {
                 (Some(m), Some(d)) => {
                     proc::set_arg(pid, m);
                     proc::set_arg2(pid, d);
                     proc::push_start_cap(pid, m);
                     proc::push_start_cap(pid, d);
-                    // Веха 52 — IRQ-cap: замаршрутизировать прерывание e1000 на VEC_USERDRV, отдать
-                    // драйверу третьим стартовым правом (он ждёт его в SYS_IRQ_WAIT). start_cap(2).
+                    // IRQ-cap: замаршрутизировать прерывание e1000 на VEC_USERDRV, отдать драйверу
+                    // третьим стартовым правом (шим ждёт его в request_irq → SYS_IRQ_WAIT). start_cap(2).
                     let irq = arch::e1000_irq_setup().map(|vec| {
                         cap::mint(proc::domain(pid), cap::Target::Irq { vector: vec }, Rights::READ)
                             .bits() as usize
@@ -242,12 +243,12 @@ pub fn boot() {
                         proc::push_start_cap(pid, i);
                     }
                     println!(
-                        "  [init] userspace-драйвер e1000d P{} — выданы MMIO+DMA{} cap",
+                        "  [init] userspace-драйвер lx_e1000 P{} (на lx_emul) — выданы MMIO+DMA{} cap",
                         pid,
                         if irq.is_some() { "+IRQ" } else { "" },
                     );
                 }
-                _ => println!("  [init] e1000d: не удалось выдать MMIO/DMA cap (пропуск)"),
+                _ => println!("  [init] lx_e1000: не удалось выдать MMIO/DMA cap (пропуск)"),
             }
         }
     }

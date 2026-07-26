@@ -14,6 +14,12 @@
 //! значит «права нет».
 #![no_std]
 
+/// lx_emul — минимальный Linux-API шим поверх фундамента userspace-драйверов (Веха 53):
+/// `ioremap`/`kmalloc`/`dma_alloc_coherent`/`request_irq`/`readl`-`writel`/driver-model
+/// поверх [`mmio_map`]/[`dma_alloc`]/[`irq_wait`]/[`thread_spawn`]. Первый шаг к хостингу
+/// Linux-драйверов (Genode `dde_linux`-стиль).
+pub mod lx_emul;
+
 // ─── номера syscall'ов (ABI v1, см. libs/void-abi и kernel/src/proc.rs) ───────
 const SYS_WRITE: usize = 1;
 const SYS_EXIT: usize = 2;

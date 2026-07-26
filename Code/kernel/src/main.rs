@@ -106,6 +106,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("threads", include_bytes!(env!("PROG_THREADS"))),
     ("freeze", include_bytes!(env!("PROG_FREEZE"))),
     ("e1000d", include_bytes!(env!("PROG_E1000D"))),
+    ("lx_e1000", include_bytes!(env!("PROG_LX_E1000"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
