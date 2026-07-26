@@ -102,9 +102,13 @@ status: active
      - ✅ **Lx_kit: аллокатор ядра + header-поверхность** (Веха 56, [[lx-kit]]): заведён
        C-рантайм `lx_kit.c` (семейство `kmalloc`/`kfree` над кучей + `printk`); шимы выросли до
        `kernel/slab/gfp/string/ctype/printk.h`. Доказано неизменённым `lib/argv_split.c` 6.18.7 —
-       первый портированный `.c`, честно аллоцирующий память ядровым `kmalloc`, обе арх. Дальше —
-       растить kit (err/bitops/list/spinlock/timer/workqueue) + driver-model/PCI/netdev к реальному
-       драйверу e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
+       первый портированный `.c`, честно аллоцирующий память ядровым `kmalloc`, обе арх.
+     - ✅ **linux/list.h: двусвязный список ядра** (Веха 57, [[lx-list]]): костяк ядра/драйвера
+       (очереди netdev, списки буферов). Шим `list.h` (LIST_HEAD/list_add_tail/list_for_each_entry)
+       + `compiler.h` (likely/unlikely) + вынесенный `container_of.h`. Доказано неизменённым
+       `lib/list_sort.c` 6.18.7 (устойчивая merge-сортировка списка) — порядок+целостность кольца,
+       обе арх. Дальше — err/bitops/spinlock/timer/workqueue + driver-model/PCI/netdev к драйверу
+       e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
