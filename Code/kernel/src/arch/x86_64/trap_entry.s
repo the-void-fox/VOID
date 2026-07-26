@@ -53,6 +53,7 @@ TRAP_STUB 31, 0
 TRAP_STUB 32, 0                     # LAPIC-таймер
 TRAP_STUB 33, 0                     # консоль: IOAPIC GSI4 (Веха 27)
 TRAP_STUB 34, 0                     # диск: MSI-X virtio-blk (Веха 27)
+TRAP_STUB 35, 0                     # userspace-драйвер: IOAPIC IRQ устройства (Веха 52)
 TRAP_STUB 255, 0                    # spurious
 TRAP_STUB 128, 0                    # int 0x80 — syscall (шлюз DPL=3, Веха 26)
 
@@ -132,5 +133,6 @@ TRAP_STUBS:
     .quad trap_stub_32
     .quad trap_stub_33
     .quad trap_stub_34
+    .quad trap_stub_35
     .quad trap_stub_255
     .quad trap_stub_128

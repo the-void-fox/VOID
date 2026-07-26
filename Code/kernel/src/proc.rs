@@ -111,6 +111,9 @@ enum State {
     /// Веха 35: заблокирован в FUTEX_WAIT (ключ — `futex_addr` + пространство нити);
     /// будит FUTEX_WAKE по тому же адресу или истёкший `futex_deadline`.
     FutexWait,
+    /// Веха 52: userspace-драйвер заблокирован в SYS_IRQ_WAIT — ждёт прерывания своего устройства;
+    /// будит [`drain_userdrv_irq`] по флагу [`USERDRV_IRQ_PENDING`], выставленному обработчиком IRQ.
+    IrqWait,
     Finished,
 }
 
@@ -197,6 +200,37 @@ static TABLE: SpinLock<Table> =
 
 /// Контекст ядра, в который возвращаемся, когда все процессы завершились.
 static mut RETURN_CTX: Context = Context::EMPTY;
+
+/// Веха 52 — «пришло прерывание userspace-драйвера» (вектор `VEC_USERDRV`). Обработчик IRQ
+/// выставляет флаг БЕЗ замка таблицы процессов (иначе дедлок с прерванным контекстом), а
+/// планировщик снимает его и будит спящих в `SYS_IRQ_WAIT` ([`drain_userdrv_irq`]).
+static USERDRV_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Веха 52 — из обработчика прерывания (trap): просто отметить, что IRQ пришёл. Пробуждение —
+/// на планировщике, где замок таблицы берётся законно. Зовётся из x86-обработчика VEC_USERDRV;
+/// на riscv userspace-драйверов с IRQ пока нет (USB/e1000 — x86), поэтому там это мёртвый код.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn on_userdrv_irq() {
+    USERDRV_IRQ_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// Веха 52 — если пришёл IRQ драйвера, разбудить всех в `IrqWait` (сделать `Runnable`). Драйвер
+/// сам сверится с состоянием устройства (ICR) при пробуждении — ложное пробуждение безвредно.
+fn drain_userdrv_irq(t: &mut Table) {
+    if USERDRV_IRQ_PENDING.swap(false, Ordering::Relaxed) {
+        for p in &mut t.procs {
+            if p.state == State::IrqWait {
+                p.state = State::Runnable;
+            }
+        }
+    }
+}
+
+/// Веха 52 — есть ли процессы, спящие в `SYS_IRQ_WAIT` (нужно `wait_stdin`: не завершать сессию,
+/// пока драйвер ждёт прерывания).
+fn any_irq_waiting(t: &Table) -> bool {
+    t.procs.iter().any(|p| p.state == State::IrqWait)
+}
 
 // ─── создание и запуск ────────────────────────────────────────────────────────
 
@@ -432,30 +466,36 @@ pub fn run() {
 /// Здесь `sstatus.SIE = 0`, поэтому «потерянного пробуждения» нет: `wfi` просыпается от
 /// PENDING прерывания независимо от SIE, а сам обработчик мы пускаем коротким окном с SIE=1.
 fn wait_stdin(saved_sie: usize) -> bool {
-    let waiting: Vec<usize> = {
+    let (waiting, irq_waiting): (Vec<usize>, bool) = {
         let t = TABLE.lock();
-        (0..t.procs.len()).filter(|&i| t.procs[i].state == State::StdinWait).collect()
+        let w = (0..t.procs.len()).filter(|&i| t.procs[i].state == State::StdinWait).collect();
+        (w, any_irq_waiting(&t)) // Веха 52: сессия жива, пока драйвер ждёт прерывания
     };
-    if waiting.is_empty() {
+    if waiting.is_empty() && !irq_waiting {
         return false;
     }
     // Веха 33: уход в простой — естественная точка синка group commit. Под нагрузкой
     // пачки собирает maybe_commit (порог/период), а здесь фиксируется хвост: «echo и
     // ушёл пить чай» не ждёт следующего ввода. Прерывания выключены — virtio опросом.
     crate::object::commit_if_dirty();
-    // Только внешние прерывания (SEIE): исполнять некого, таймер (STIE) не нужен.
+    // Только внешние прерывания (SEIE): исполнять некого, таймер (STIE) не нужен. IRQ устройств
+    // (консоль, а с Вехи 52 — и userspace-драйвера через IOAPIC) ходят через LAPIC и разбудят HLT.
     arch::irq_mask_stdin(saved_sie);
-    while !arch::console_has_input() {
+    while !arch::console_has_input() && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed) {
         // Спать до прерывания: проснёмся и от PENDING-прерывания при выключенном SIE.
         arch::wait_for_interrupt();
-        // Короткое окно с прерываниями — принять trap: контроллер → консоль → кольцевой буфер.
+        // Короткое окно с прерываниями — принять trap: контроллер → консоль → кольцевой буфер;
+        // IRQ userspace-драйвера выставит USERDRV_IRQ_PENDING (обработчик VEC_USERDRV).
         arch::enable_interrupts();
         arch::irq_save_disable();
     }
     let mut t = TABLE.lock();
-    for pid in waiting {
-        t.procs[pid].state = State::Runnable;
+    if arch::console_has_input() {
+        for pid in waiting {
+            t.procs[pid].state = State::Runnable; // ввод пришёл — будим ждущих READ
+        }
     }
+    drain_userdrv_irq(&mut t); // Веха 52: пришёл IRQ драйвера — будим ждущих SYS_IRQ_WAIT
     true
 }
 
@@ -697,6 +737,8 @@ fn resume() -> ! {
     // Веха 35: разбудить futex-ждунов с истёкшим дедлайном (проверка на каждом trap'е
     // из U — гранулярность ~кванта вытеснения; для wait_timeout/park_timeout этого хватает).
     wake_futex_timeouts(&mut t);
+    // Веха 52: пришёл IRQ userspace-драйвера — разбудить спящих в SYS_IRQ_WAIT.
+    drain_userdrv_irq(&mut t);
     let c = t.current;
     let chosen = if t.procs[c].state == State::Runnable {
         Some(c)
@@ -1869,6 +1911,34 @@ fn syscall(t: &mut Table, cur: usize) {
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
             f.advance();
+        }
+        // SYS_IRQ_WAIT(irq_cap) -> 0 | MAX (Веха 52): усыпить userspace-драйвер до прерывания его
+        // устройства (нужен Irq-cap). Кадр продвигаем СЕЙЧАС (вернётся 0 при пробуждении); процесс
+        // уходит в IrqWait, планировщик даёт ход другим. Разбудит drain_userdrv_irq по флагу от
+        // обработчика VEC_USERDRV. Уже пришедший IRQ поймает drain в resume() сразу — потери нет.
+        33 => {
+            let icap = t.procs[cur].frame.arg(0);
+            let dom = t.procs[cur].domain;
+            match cap::irq(dom, Cap::from_bits(icap as u64), Rights::READ) {
+                Ok(_vector) => {
+                    let f = &mut t.procs[cur].frame;
+                    f.set_ret(0);
+                    f.advance();
+                    t.procs[cur].state = State::IrqWait;
+                    // Веха 52 — «взвести» линию (размаскировать в IOAPIC): если причина уже
+                    // висит на карте, прерывание доставится сразу; обработчик снова замаскирует.
+                    arch::userdrv_irq_arm();
+                    if let Some(n) = t.next_runnable(cur) {
+                        t.current = n;
+                    }
+                }
+                Err(e) => {
+                    vprintln!("  [drv] P{} SYS_IRQ_WAIT отклонён: {:?}  ← нет cap на IRQ", cur, e);
+                    let f = &mut t.procs[cur].frame;
+                    f.set_ret(usize::MAX);
+                    f.advance();
+                }
+            }
         }
         other => {
             let f = &mut t.procs[cur].frame;

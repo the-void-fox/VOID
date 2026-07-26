@@ -23,7 +23,6 @@ fn write(reg: u32, val: u32) {
     }
 }
 
-#[allow(dead_code)]
 fn read(reg: u32) -> u32 {
     unsafe {
         write_volatile((IOAPIC_BASE + IOREGSEL) as *mut u32, reg);
@@ -35,4 +34,26 @@ fn read(reg: u32) -> u32 {
 pub fn route(gsi: u32, vector: u8) {
     write(0x10 + 2 * gsi, vector as u32);
     write(0x11 + 2 * gsi, 0); // destination: APIC ID 0
+}
+
+/// Направить PCI INTx-линию (Веха 52): level-triggered, active-low — как требуют
+/// разделяемые PCI-прерывания (INTA#..INTD#, GSI 16..23 на q35). Иначе edge-режим
+/// не ловит удержание линии картой (e1000 держит INTx, пока не прочитан ICR).
+/// Стартуем ЗАМАСКИРОВАННЫМИ (бит 16): взводит `SYS_IRQ_WAIT` через [`set_userdrv_masked`].
+pub fn route_level_low(gsi: u32, vector: u8) {
+    // low: вектор | mask=1 (1<<16) | polarity=active-low (1<<13) | trigger=level (1<<15).
+    write(0x10 + 2 * gsi, vector as u32 | (1 << 16) | (1 << 13) | (1 << 15));
+    write(0x11 + 2 * gsi, 0); // destination: APIC ID 0
+}
+
+/// Веха 52 — за/раз-маскировать все PCI INTx-линии (GSI 16..23), сведённые на вектор
+/// userspace-драйвера. Модель «oneshot»: `SYS_IRQ_WAIT` размаскирует (взвод перед сном),
+/// обработчик VEC_USERDRV маскирует (иначе level-линию, которую карта держит до чтения ICR,
+/// IOAPIC переотправлял бы штормом). Бит 16 RTE — маска.
+pub fn set_userdrv_masked(masked: bool) {
+    for gsi in 16..24u32 {
+        let lo = read(0x10 + 2 * gsi);
+        let lo = if masked { lo | (1 << 16) } else { lo & !(1 << 16) };
+        write(0x10 + 2 * gsi, lo);
+    }
 }

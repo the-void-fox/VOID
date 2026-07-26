@@ -47,6 +47,7 @@ const SYS_RESTORE: usize = 29;
 const SYS_INSTALL: usize = 30;
 const SYS_MMIO_MAP: usize = 31;
 const SYS_DMA_ALLOC: usize = 32;
+const SYS_IRQ_WAIT: usize = 33;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -334,6 +335,12 @@ pub fn mmio_map(mmio_cap: usize, va: usize) -> bool {
 pub fn dma_alloc(dma_cap: usize, va: usize) -> Option<usize> {
     let r = abi::syscall(SYS_DMA_ALLOC, dma_cap, va, 0, 0, 0, 0, 0).0;
     (r != NO_CAP).then_some(r)
+}
+
+/// `SYS_IRQ_WAIT(irq_cap)` (Веха 52): усыпить драйвер до прерывания его устройства (вместо опроса).
+/// `true` — проснулись по IRQ; `false` — нет права. Драйвер сам сверяется с ICR устройства.
+pub fn irq_wait(irq_cap: usize) -> bool {
+    abi::syscall(SYS_IRQ_WAIT, irq_cap, 0, 0, 0, 0, 0, 0).0 == 0
 }
 
 /// `SYS_CAP_DERIVE`: урезанная копия СВОЕГО права (права ∩ mask) — аттенуация у себя,

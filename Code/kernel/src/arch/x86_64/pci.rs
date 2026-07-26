@@ -243,6 +243,29 @@ fn setup_ahci(slot: u32) -> Option<(usize, u32)> {
     None
 }
 
+/// Веха 52 — настроить прерывание e1000 для userspace-драйвера: включить INTx, замаршрутизировать
+/// его IRQ через IOAPIC на вектор [`trap::VEC_USERDRV`]. QEMU-шная e1000 — legacy INTx (без MSI):
+/// маршрутизируем и её строку прерывания (PCI 0x3C), и PCI-диапазон GSI 16..24 (с запасом — на q35
+/// INTx может уйти туда; лишние маршруты безвредны, драйвер всё равно сверяется с ICR). Возвращает
+/// вектор. `None` — e1000 нет.
+pub fn e1000_irq_setup() -> Option<u8> {
+    for dev in 0..32u32 {
+        let id = cfg_r32(dev, 0);
+        let (vendor, device) = (id as u16, (id >> 16) as u16);
+        if vendor == 0x8086 && (device == 0x100e || device == 0x10d3 || device == 0x100f) {
+            cfg_w16(dev, 0x04, cfg_r16(dev, 0x04) & !(1 << 10)); // снять Interrupt Disable — вкл INTx
+            // PCI INTx под IOAPIC приходит на GSI 16..23 (PIRQA..H), не на ISA-номер из Interrupt
+            // Line. Точное соответствие слот→PIRQ дал бы ACPI _PRT (не парсим) — маршрутизируем все
+            // четыре PCI-линии на наш вектор level/active-low: какую бы карта ни дёрнула, поймаем.
+            for gsi in 16..24 {
+                super::ioapic::route_level_low(gsi, trap::VEC_USERDRV);
+            }
+            return Some(trap::VEC_USERDRV);
+        }
+    }
+    None
+}
+
 /// Веха 50 — найти контроллер USB **xHCI** (класс 0x0c/0x03/0x30 — Serial Bus / USB / xHCI),
 /// как probe_ahci — по ВСЕМ функциям (на Intel-PCH xHCI на 00:14.0, но бывает и функция != 0).
 /// Включаем память+bus-master, отображаем BAR0 (регистры, 64 КиБ), отдаём базу. `None` — нет.

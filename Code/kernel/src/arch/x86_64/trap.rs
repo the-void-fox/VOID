@@ -22,9 +22,9 @@ use crate::println;
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
 extern "C" {
-    /// Таблица адресов стабов: [0..=34] — вектора 0–34 (исключения + таймер +
-    /// консоль + диск), [35] — spurious (0xFF), [36] — syscall (0x80).
-    static TRAP_STUBS: [usize; 37];
+    /// Таблица адресов стабов: [0..=35] — вектора 0–35 (исключения + таймер +
+    /// консоль + диск + userspace-драйвер), [36] — spurious (0xFF), [37] — syscall (0x80).
+    static TRAP_STUBS: [usize; 38];
 }
 
 /// Вектор LAPIC-таймера (первый свободный после 32 исключений).
@@ -37,6 +37,9 @@ pub const VEC_SYSCALL: u8 = 0x80;
 pub const VEC_CONSOLE: u8 = 33;
 /// Вектор завершений virtio-blk: MSI-X-запись устройства указывает сюда (Веха 27).
 pub const VEC_BLK: u8 = 34;
+/// Веха 52 — вектор прерываний userspace-драйверов: IOAPIC маршрутизирует IRQ их устройств сюда,
+/// обработчик будит спящего в `SYS_IRQ_WAIT` (через флаг — без замка таблицы процессов).
+pub const VEC_USERDRV: u8 = 35;
 
 /// Снимок состояния процессора на момент trap'а. Раскладка = порядок push'ей в
 /// trap_entry.s (адреса растут к концу структуры; регистры — в порядке r15..rax).
@@ -259,11 +262,11 @@ struct IdtPtr {
 pub fn init() {
     super::gdt::init();
     unsafe {
-        for v in 0..=34 {
+        for v in 0..=35 {
             IDT[v] = IdtEntry::gate(TRAP_STUBS[v]);
         }
-        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[35]);
-        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[36]);
+        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[36]);
+        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[37]);
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
@@ -321,6 +324,17 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
         }
         VEC_BLK => {
             crate::virtio_blk::on_irq();
+            lapic::eoi();
+            return;
+        }
+        VEC_USERDRV => {
+            // Веха 52 — IRQ устройства userspace-драйвера. Сперва ЗАМАСКИРОВАТЬ линию (oneshot):
+            // карта держит level-INTx, пока драйвер не прочитает ICR, — без маски IOAPIC переотправлял
+            // бы прерывание штормом. Взведёт заново следующий SYS_IRQ_WAIT. Затем выставить флаг
+            // (БЕЗ замка таблицы процессов — иначе дедлок с прерванным контекстом) и EOI; разбудит
+            // спящего в SYS_IRQ_WAIT планировщик (resume/wait_stdin) при следующем проходе.
+            super::ioapic::set_userdrv_masked(true);
+            crate::proc::on_userdrv_irq();
             lapic::eoi();
             return;
         }

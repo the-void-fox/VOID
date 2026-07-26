@@ -28,7 +28,9 @@ core::arch::global_asm!(include_str!("switch.s"));
 // Вход в процесс: iretq по подготовленному trap-кадру.
 core::arch::global_asm!(include_str!("enter_user.s"));
 
-pub use pci::{probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_xhci};
+pub use pci::{
+    e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_xhci,
+};
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
@@ -307,6 +309,13 @@ pub fn irq_mask_stdin(_saved: usize) {
 }
 
 pub fn mark_in_kernel() {}
+
+/// Веха 52 — «взвести» прерывание userspace-драйвера перед сном в `SYS_IRQ_WAIT`: размаскировать
+/// его PCI INTx-линии в IOAPIC. Обработчик VEC_USERDRV снова замаскирует по факту прерывания
+/// (oneshot: level-линию нельзя оставлять размаскированной, пока драйвер не снял причину в ICR).
+pub fn userdrv_irq_arm() {
+    ioapic::set_userdrv_masked(false);
+}
 
 /// Маршрутизация прерываний устройств (Веха 27): IOAPIC ведёт GSI4 (COM1) на
 /// [`trap::VEC_CONSOLE`]; сам UART начинает слать прерывания приёма (IER.DR;

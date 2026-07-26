@@ -126,6 +126,15 @@ pub fn probe_e1000() -> Option<usize> {
     None
 }
 
+/// Веха 52 — маршрутизация IRQ e1000 в userspace — только x86 (IOAPIC). Заглушка.
+pub fn e1000_irq_setup() -> Option<u8> {
+    None
+}
+
+/// Веха 52 — «взвести» IRQ userspace-драйвера перед `SYS_IRQ_WAIT`. На riscv таких драйверов
+/// пока нет (e1000/USB — x86), делать нечего.
+pub fn userdrv_irq_arm() {}
+
 // Веха 50 — xHCI/USB-HID есть только на x86 (probe_xhci/usb_key), поэтому в riscv-контракте их
 // нет: `xhci`-модуль ядра на riscv — заглушка, никто эти функции тут не зовёт.
 

@@ -232,7 +232,20 @@ pub fn boot() {
                     proc::set_arg2(pid, d);
                     proc::push_start_cap(pid, m);
                     proc::push_start_cap(pid, d);
-                    println!("  [init] userspace-драйвер e1000d P{} — выданы MMIO+DMA cap", pid);
+                    // Веха 52 — IRQ-cap: замаршрутизировать прерывание e1000 на VEC_USERDRV, отдать
+                    // драйверу третьим стартовым правом (он ждёт его в SYS_IRQ_WAIT). start_cap(2).
+                    let irq = arch::e1000_irq_setup().map(|vec| {
+                        cap::mint(proc::domain(pid), cap::Target::Irq { vector: vec }, Rights::READ)
+                            .bits() as usize
+                    });
+                    if let Some(i) = irq {
+                        proc::push_start_cap(pid, i);
+                    }
+                    println!(
+                        "  [init] userspace-драйвер e1000d P{} — выданы MMIO+DMA{} cap",
+                        pid,
+                        if irq.is_some() { "+IRQ" } else { "" },
+                    );
                 }
                 _ => println!("  [init] e1000d: не удалось выдать MMIO/DMA cap (пропуск)"),
             }
