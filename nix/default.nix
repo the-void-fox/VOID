@@ -192,6 +192,24 @@ let
         '';
       };
 
+      # lx_err (Веха 59) — наш шим linux/err.h (идиома «ошибка в указателе»: ERR_PTR/PTR_ERR/
+      # IS_ERR/…) + linux/errno.h (проход к newlib). Инфраструктурный заголовок — проверяется
+      # харнессом (в бою раскроется в драйвере). lx_kit.c — ради printk.
+      lx_err = stdenv.mkDerivation {
+        pname = "lx-err";
+        version = "0.59";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_err.c lx_kit.c -o lx-err
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-err $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {
