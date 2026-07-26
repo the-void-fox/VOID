@@ -98,9 +98,13 @@ status: active
        Linux-стилевой драйвер (Rust `bin/lx_e1000` + C `lx_e1000_c`).
      - ✅ **Первый неизменённый `.c` из ядра Linux работает на VOID** (Веха 55, [[lx-linux]]):
        `lib/sort.c` 6.18.7 verbatim против рукописных шим-заголовков `linux/*.h` (начало
-       dde_linux-конвейера), обе арх. Дальше — растить header-поверхность + **Lx_kit**
-       (scheduler/workqueue/timer) к реальному драйверу подсистемы (NIC/USB) — закроет
-       Atheros/EHCI/wifi X54C. ← следующее
+       dde_linux-конвейера), обе арх.
+     - ✅ **Lx_kit: аллокатор ядра + header-поверхность** (Веха 56, [[lx-kit]]): заведён
+       C-рантайм `lx_kit.c` (семейство `kmalloc`/`kfree` над кучей + `printk`); шимы выросли до
+       `kernel/slab/gfp/string/ctype/printk.h`. Доказано неизменённым `lib/argv_split.c` 6.18.7 —
+       первый портированный `.c`, честно аллоцирующий память ядровым `kmalloc`, обе арх. Дальше —
+       растить kit (err/bitops/list/spinlock/timer/workqueue) + driver-model/PCI/netdev к реальному
+       драйверу e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
