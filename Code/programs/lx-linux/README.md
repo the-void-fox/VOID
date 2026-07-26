@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–63, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–64, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -20,6 +20,9 @@ VOID. Растёт по мере роста портируемого кода к
 - **Веха 63** — **jiffies + таймеры** (`linux/jiffies.h`, `linux/timer.h`): `jiffies`/`HZ`/
   `time_after`/`msecs_to_jiffies` + `timer_list`/`mod_timer`/`timer_delete` → `lx-timer`. Очередь
   таймеров в Lx_kit, idle-путь планировщика двигает время и стреляет; **`msleep` стал УСТУПАЮЩИМ**.
+- **Веха 64** — **очереди ожидания + completion** (`linux/wait.h`, `linux/completion.h`):
+  `wait_event`/`wake_up`/`wait_event_timeout` + `wait_for_completion`/`complete` → `lx-wait`. Задача
+  ждёт события железа, уступая процессор; таймаут — через таймер Вехи 63.
 
 ## Что здесь
 
@@ -51,17 +54,22 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   `msecs_to_jiffies`; `timer_list`/`timer_setup`/`mod_timer`/`timer_delete`/`from_timer`. Тела в
   `lx_kit.c`: `jiffies` двигается по монотонному времени VOID, очередь таймеров, idle-путь
   планировщика стреляет выстрелившими (softirq-контекст). `msleep` переведён на уступающий сон.
+- `wait.h`, `completion.h` — синхронизация (Веха 64): `wait_event`/`wait_event_timeout`/`wake_up`
+  (очередь ждущих задач — записи на их стеках, wake переводит в готовые, каждая перепроверяет
+  условие) + `struct completion` (`wait_for_completion`/`complete` поверх wait_event). Тела
+  `__lx_wait`/`__lx_wake_up` — в `lx_kit.c`; completion — inline. Таймаут — через таймер Вехи 63.
 
 Наш рантайм и харнессы:
 - **`lx_kit.c`** — **Lx_kit-рантайм**: тела `kmalloc/…/kfree` + `kmemdup/kstrdup/kstrndup` над кучей
   newlib + `printk` + `udelay`/`mdelay`/`ndelay` (буси-ожидание по монотонному времени) + **кооперативный
   планировщик** (Веха 62: задачи/`arch_execute`/yield/block/unblock) + **jiffies/таймеры** (Веха 63:
-  очередь `timer_list`, idle-путь стреляет, уступающий `msleep`). Растёт к wait_event/workqueue/
-  request_irq/ioremap/DMA.
+  очередь `timer_list`, idle-путь стреляет, уступающий `msleep`) + **очереди ожидания** (Веха 64:
+  `__lx_wait`/`__lx_wake_up`). Растёт к workqueue/request_irq/ioremap/DMA.
 - Харнессы: **`main.c`** — sort; **`main_argv.c`** — argv_split; **`main_list.c`** — list_sort;
   **`main_bits.c`** — bitops; **`main_err.c`** — err.h; **`main_io.c`** — io.h; **`main_delay.c`** — delay.h;
   **`main_sched.c`** — планировщик (yield + block/unblock); **`main_timer.c`** — jiffies/таймеры
-  (уступающий msleep + очередь таймеров по возрастанию expires).
+  (уступающий msleep + таймеры по возрастанию expires); **`main_wait.c`** — wait_event/wake_up,
+  completion, wait_event_timeout (истечение и пробуждение).
 
 Лицензии: vendored-файлы Linux остаются под GPL-2.0 (свои SPDX-заголовки); шимы, рантайм и харнессы —
 код проекта. Хостинг Linux-драйверов по природе смешивает лицензии (портируемые части — GPL).
@@ -78,7 +86,8 @@ nix-build nix -A <arch>.lx_io      # io.h + lx_kit.c + harness → VOID-ELF
 nix-build nix -A <arch>.lx_delay   # delay.h + lx_kit.c + harness → VOID-ELF
 nix-build nix -A <arch>.lx_sched   # lx_sched.h/lx_kit.c (планировщик) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_timer   # jiffies.h/timer.h/lx_kit.c (таймеры) + harness → VOID-ELF
+nix-build nix -A <arch>.lx_wait    # wait.h/completion.h/lx_kit.c (ожидание) + harness → VOID-ELF
 void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя>   # для каждого
 ```
 Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
-`lx-sched` / `lx-timer` (чистые вычислялки, обе арх).
+`lx-sched` / `lx-timer` / `lx-wait` (чистые вычислялки, обе арх).

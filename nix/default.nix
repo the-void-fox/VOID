@@ -284,6 +284,25 @@ let
         '';
       };
 
+      # lx_wait (Веха 64) — очереди ожидания (linux/wait.h) + completion (linux/completion.h) поверх
+      # block/unblock: wait_event/wake_up, wait_event_timeout (через таймер Вехи 63), wait_for_completion.
+      # Тела __lx_wait/__lx_wake_up — в lx_kit.c; completion — inline в шиме. Харнесс: producer/consumer,
+      # completion, таймаут (истечение → 0, пробуждение → остаток jiffies). Обе арх.
+      lx_wait = stdenv.mkDerivation {
+        pname = "lx-wait";
+        version = "0.64";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_wait.c lx_kit.c -o lx-wait
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-wait $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

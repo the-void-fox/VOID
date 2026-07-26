@@ -135,9 +135,15 @@ status: active
        сони чередуются, таймеры `2 3 1`, обе арх. **Оговорки:** (а) jiffies двигается в точках
        планирования/задержки, не непрерывно — буси-цикл по `jiffies` без `msleep`/`udelay`/`cpu_relax`
        время не увидит; (б) idle-ожидание таймера — буси по реальному времени (жжёт хост-CPU, пока
-       все задачи спят; настоящий сон ядра VOID — позже). Дальше — wait_event/wake_up/completion,
-       workqueue+`schedule_delayed_work`, module_init-редирект + driver-model/PCI/netdev к e1000 →
-       закроет Atheros/EHCI/wifi X54C. ← следующее
+       все задачи спят; настоящий сон ядра VOID — позже).
+     - ✅ **Очереди ожидания + completion** (Веха 64, [[lx-wait]]): `linux/wait.h`
+       (`wait_event`/`wait_event_timeout`/`wake_up`) + `linux/completion.h` (`wait_for_completion`/
+       `complete`) — чем драйвер ждёт события железа (сброс/линк/DMA), уступая процессор. Поверх
+       block/unblock: запись ждущего на стеке задачи, wake_up переводит в готовые (перепроверят
+       условие сами — нет потерянных пробуждений в один-поток-модели); таймаут — через таймер Вехи 63.
+       Харнесс: producer/consumer, completion, таймаут (истечение→0, пробуждение→остаток jiffies),
+       обе арх. Дальше — workqueue+`schedule_[delayed_]work`, module_init-редирект + driver-model/PCI/
+       netdev к e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.

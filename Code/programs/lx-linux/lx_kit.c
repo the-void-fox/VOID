@@ -21,6 +21,7 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/timer.h>
+#include <linux/wait.h>
 
 #include "lx_sched.h" /* кооперативный планировщик (Веха 62) */
 
@@ -302,6 +303,53 @@ static int lx_timers_next(unsigned long *next_exp)
 	if (any)
 		*next_exp = min;
 	return any;
+}
+
+/* ─── очереди ожидания (linux/wait.h, Веха 64) ────────────────────────────────
+ * wait_event блокирует задачу на wq (запись ждущего — на её стеке), wake_up переводит
+ * ждущих в готовые (перепроверят условие сами). Таймаут — через встроенный таймер. */
+
+static void lx_wait_timer_cb(struct timer_list *tl)
+{
+	struct lx_wait_entry *e = from_timer(e, tl, timer);
+
+	e->timed_out = 1;
+	lx_task_unblock(e->task);
+}
+
+void __lx_wait(wait_queue_head_t *wq, struct lx_wait_entry *e, int has_deadline,
+               unsigned long deadline)
+{
+	struct lx_wait_entry **pp;
+
+	e->task = lx_task_self();
+	e->timed_out = 0;
+	e->next = wq->waiters; /* в голову списка ждущих */
+	wq->waiters = e;
+
+	if (has_deadline) {
+		__lx_timer_setup(&e->timer, lx_wait_timer_cb, 0);
+		mod_timer(&e->timer, deadline);
+	}
+
+	lx_task_block(); /* уступаем; вернёмся по wake_up или по таймеру */
+
+	if (has_deadline)
+		timer_delete(&e->timer);
+
+	for (pp = &wq->waiters; *pp; pp = &(*pp)->next) /* снять свою запись */
+		if (*pp == e) {
+			*pp = e->next;
+			break;
+		}
+}
+
+void __lx_wake_up(wait_queue_head_t *wq)
+{
+	struct lx_wait_entry *e;
+
+	for (e = wq->waiters; e; e = e->next)
+		lx_task_unblock(e->task);
 }
 
 /* ─── кооперативный планировщик (lx_sched.h, Веха 62) ─────────────────────────
