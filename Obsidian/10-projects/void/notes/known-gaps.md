@@ -150,9 +150,16 @@ status: active
        delayed_work. Харнесс: FIFO-работы, delayed ~30 мс, cancel до срабатывания (не выполнилась),
        обе арх. Оговорка: воркер — демон, при остановке планировщика остаётся заблокированным (стек
        не реапится; для реального драйвера норма). **Рантайм-примитивы Lx_kit готовы** (память/
-       список/биты + err/io/delay + планировщик/таймеры/ожидание/workqueue) — дальше САМ драйвер:
-       module_init-редирект + генератор заглушек → driver-model/PCI → netdev-подмножество →
-       e1000_hw.c → e1000_main.c → закроет Atheros/EHCI/wifi X54C. ← следующее
+       список/биты + err/io/delay + планировщик/таймеры/ожидание/workqueue).
+     - ✅ **driver-model + module_init** (Веха 66, [[lx-driver]]): `linux/device.h` (`struct device`/
+       `device_driver`/`bus_type`, `driver_register`/`device_register` → match по шине → `.probe`,
+       откат при отказе; `dev_*`-логи, drvdata) + `linux/module.h` (`module_init`→фикс-имя
+       `lx_module_init`, `MODULE_*`/`module_param` — в пустоту). Упрощённый `drivers/base/dd.c`.
+       Харнесс: фейк-шина/драйвер/устройство проходят module_init→register→match→probe→remove
+       (`probe=1 remove=1 drvdata=0xabcd`), обе арх. **Начало перехода к самому драйверу** (метод —
+       линкер-ориентированный). Дальше — PCI (`linux/pci.h`: pci_dev встраивает device, pci_driver —
+       device_driver) + первый реальный `.c` и генератор заглушек → netdev-подмножество → e1000_hw.c →
+       e1000_main.c → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.

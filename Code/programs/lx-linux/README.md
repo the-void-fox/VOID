@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–65, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–66, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -26,6 +26,9 @@ VOID. Растёт по мере роста портируемого кода к
 - **Веха 65** — **рабочие очереди** (`linux/workqueue.h`): `schedule_work`/`schedule_delayed_work`/
   `flush_*`/`cancel_*` → `lx-work`. Каждую очередь крутит задача-воркер; delayed — через таймер.
   У e1000 6.18 watchdog именно на delayed_work.
+- **Веха 66** — **driver-model + module_init** (`linux/device.h`, `linux/module.h`): `struct device`/
+  `device_driver`/`bus_type`, `driver_register`/`device_register` (match по шине → `.probe`),
+  `module_init`-редирект в `lx_module_init` → `lx-driver`. **Начало перехода к самому драйверу** (под PCI).
 
 ## Что здесь
 
@@ -65,19 +68,24 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   `INIT_DELAYED_WORK`, `schedule_work`/`schedule_delayed_work`/`queue_work`, `flush_*`, `cancel_*`,
   `alloc_workqueue`/system_wq. Тела в `lx_kit.c`: очередь обслуживает задача-воркер (работа
   исполняется в контексте задачи — можно спать); delayed — через таймер; flush — через wait_event.
+- `device.h`, `module.h` — driver-model + модуль (Веха 66): `struct device`/`device_driver`/
+  `bus_type` + `driver_register`/`device_register` (match по шине → `.probe`, откат при отказе),
+  `dev_*`-логи, `dev_get/set_drvdata`; `module_init(fn)` → `int lx_module_init(void)` (фикс-имя,
+  один драйвер на бинарь), `MODULE_*`/`module_param` — в пустоту. Тела реестра в `lx_kit.c`.
 
 Наш рантайм и харнессы:
 - **`lx_kit.c`** — **Lx_kit-рантайм**: тела `kmalloc/…/kfree` + `kmemdup/kstrdup/kstrndup` над кучей
   newlib + `printk` + `udelay`/`mdelay`/`ndelay` (буси-ожидание по монотонному времени) + **кооперативный
   планировщик** (Веха 62: задачи/`arch_execute`/yield/block/unblock) + **jiffies/таймеры** (Веха 63:
   очередь `timer_list`, idle-путь стреляет, уступающий `msleep`) + **очереди ожидания** (Веха 64:
-  `__lx_wait`/`__lx_wake_up`) + **рабочие очереди** (Веха 65: задача-воркер, delayed через таймер).
-  Растёт к request_irq/ioremap/DMA.
+  `__lx_wait`/`__lx_wake_up`) + **рабочие очереди** (Веха 65: задача-воркер, delayed через таймер) +
+  **driver-model** (Веха 66: реестр драйверов/устройств, match/probe). Растёт к PCI/request_irq/ioremap/DMA.
 - Харнессы: **`main.c`** — sort; **`main_argv.c`** — argv_split; **`main_list.c`** — list_sort;
   **`main_bits.c`** — bitops; **`main_err.c`** — err.h; **`main_io.c`** — io.h; **`main_delay.c`** — delay.h;
   **`main_sched.c`** — планировщик (yield + block/unblock); **`main_timer.c`** — jiffies/таймеры
   (уступающий msleep + таймеры по возрастанию expires); **`main_wait.c`** — wait_event/wake_up,
-  completion, wait_event_timeout; **`main_work.c`** — workqueue (FIFO-работы, delayed, cancel).
+  completion, wait_event_timeout; **`main_work.c`** — workqueue (FIFO-работы, delayed, cancel);
+  **`main_driver.c`** — driver-model (module_init → register → match → probe → remove).
 
 Лицензии: vendored-файлы Linux остаются под GPL-2.0 (свои SPDX-заголовки); шимы, рантайм и харнессы —
 код проекта. Хостинг Linux-драйверов по природе смешивает лицензии (портируемые части — GPL).
@@ -96,7 +104,8 @@ nix-build nix -A <arch>.lx_sched   # lx_sched.h/lx_kit.c (планировщик
 nix-build nix -A <arch>.lx_timer   # jiffies.h/timer.h/lx_kit.c (таймеры) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_wait    # wait.h/completion.h/lx_kit.c (ожидание) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_work    # workqueue.h/lx_kit.c (рабочие очереди) + harness → VOID-ELF
+nix-build nix -A <arch>.lx_driver  # device.h/module.h/lx_kit.c (driver-model) + harness → VOID-ELF
 void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя>   # для каждого
 ```
 Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
-`lx-sched` / `lx-timer` / `lx-wait` / `lx-work` (чистые вычислялки, обе арх).
+`lx-sched` / `lx-timer` / `lx-wait` / `lx-work` / `lx-driver` (чистые вычислялки, обе арх).

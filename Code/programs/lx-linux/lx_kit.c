@@ -17,6 +17,7 @@
 #include <sys/time.h> /* gettimeofday — монотонное время VOID под udelay/mdelay */
 
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -524,6 +525,114 @@ void destroy_workqueue(struct workqueue_struct *wq)
 {
 	if (wq)
 		flush_workqueue(wq); /* воркер (задача) остаётся заблокированным; освободим при реапе */
+}
+
+/* ─── driver-model (linux/device.h, Веха 66) ──────────────────────────────────
+ * Списки зарегистрированных драйверов и устройств; регистрация связывает их по
+ * правилу шины (`bus->match`) и вызывает `.probe`. Упрощённый drivers/base/dd.c. */
+
+static struct device_driver *lx_drivers; /* список драйверов */
+static struct device        *lx_devices; /* список устройств */
+
+static int lx_match(struct device *dev, struct device_driver *drv)
+{
+	if (dev->bus != drv->bus || !dev->bus)
+		return 0;
+	if (dev->bus->match)
+		return dev->bus->match(dev, drv);
+	return 0; /* без матчера шины связать не можем */
+}
+
+/* Попытка связать устройство с драйвером: match → bind → probe (при провале — отвязать). */
+static void lx_try_bind(struct device *dev, struct device_driver *drv)
+{
+	if (dev->driver)
+		return; /* уже связано */
+	if (!lx_match(dev, drv))
+		return;
+	dev->driver = drv;
+	if (drv->probe && drv->probe(dev) != 0)
+		dev->driver = NULL; /* probe отказал (в т.ч. -EPROBE_DEFER) — откат */
+}
+
+int bus_register(struct bus_type *bus)
+{
+	(void)bus; /* глобального реестра шин не держим — match идёт через dev->bus */
+	return 0;
+}
+
+void bus_unregister(struct bus_type *bus)
+{
+	(void)bus;
+}
+
+int driver_register(struct device_driver *drv)
+{
+	struct device *d;
+
+	drv->lx_next = lx_drivers; /* в список драйверов */
+	lx_drivers = drv;
+	for (d = lx_devices; d; d = d->lx_next) /* попробовать связать с уже известными устройствами */
+		lx_try_bind(d, drv);
+	return 0;
+}
+
+void driver_unregister(struct device_driver *drv)
+{
+	struct device_driver **pp;
+	struct device *d;
+
+	for (d = lx_devices; d; d = d->lx_next) /* отвязать связанные устройства */
+		if (d->driver == drv) {
+			if (drv->remove)
+				drv->remove(d);
+			d->driver = NULL;
+		}
+	for (pp = &lx_drivers; *pp; pp = &(*pp)->lx_next)
+		if (*pp == drv) {
+			*pp = drv->lx_next;
+			break;
+		}
+}
+
+int device_add(struct device *dev)
+{
+	struct device_driver *drv;
+
+	dev->lx_next = lx_devices; /* в список устройств */
+	lx_devices = dev;
+	for (drv = lx_drivers; drv; drv = drv->lx_next) { /* найти драйвер */
+		lx_try_bind(dev, drv);
+		if (dev->driver)
+			break;
+	}
+	return 0;
+}
+
+int device_register(struct device *dev)
+{
+	return device_add(dev);
+}
+
+void device_del(struct device *dev)
+{
+	struct device **pp;
+
+	if (dev->driver) { /* отвязать от драйвера */
+		if (dev->driver->remove)
+			dev->driver->remove(dev);
+		dev->driver = NULL;
+	}
+	for (pp = &lx_devices; *pp; pp = &(*pp)->lx_next)
+		if (*pp == dev) {
+			*pp = dev->lx_next;
+			break;
+		}
+}
+
+void device_unregister(struct device *dev)
+{
+	device_del(dev);
 }
 
 /* ─── кооперативный планировщик (lx_sched.h, Веха 62) ─────────────────────────

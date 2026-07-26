@@ -321,6 +321,25 @@ let
         '';
       };
 
+      # lx_driver (Веха 66) — driver-model (linux/device.h) + module_init-редирект (linux/module.h):
+      # регистрация связывает устройство с драйвером по правилу шины и зовёт .probe (упрощённый
+      # drivers/base/dd.c). На этом встанет PCI. Тела в lx_kit.c. Харнесс: фейк-шина/драйвер/устройство
+      # проходят module_init→register→match→probe→remove. Обе арх.
+      lx_driver = stdenv.mkDerivation {
+        pname = "lx-driver";
+        version = "0.66";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_driver.c lx_kit.c -o lx-driver
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-driver $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {
