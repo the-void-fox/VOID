@@ -173,6 +173,25 @@ let
         '';
       };
 
+      # lx_bits (Веха 58) — НЕИЗМЕНЁННЫЙ lib/hweight.c ядра Linux (6.18.7, софтовый popcount) +
+      # наш шим linux/bitops.h (set/clear/test_bit, BIT/GENMASK, for_each_set_bit, hweight-маршрут в
+      # hweight.c) и asm/types.h. Харнесс гоняет битовые операции; -I. находит linux/ и asm/.
+      # lx_kit.c нужен ради printk.
+      lx_bits = stdenv.mkDerivation {
+        pname = "lx-bits";
+        version = "0.58";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_bits.c linux-src/hweight.c lx_kit.c -o lx-bits
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-bits $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {
