@@ -93,7 +93,10 @@ status: active
      - ✅ **Фундамент: userspace-драйверы** — закрыт целиком: MMIO+DMA по cap (Веха 51,
        [[userspace-drivers]]) + доставка прерываний в userspace (Веха 52, [[irq]]) — e1000
        в userspace, IRQ по capability (`SYS_IRQ_WAIT`, IOAPIC level-low + oneshot-маска).
-     - Затем **Linux-API шим** (`lx_emul`) + порт подсистемы — большой заход. ← следующее
+     - ✅ **Linux-API шим `lx_emul`** — первый каркас взят (Веха 53, [[lx-emul]]): ioremap/
+       kmalloc/dma_alloc_coherent/request_irq/driver-model на Rust, e1000 как Linux-стилевой
+       драйвер (`bin/lx_e1000`). Дальше — **C-путь**: реальные `.c` из Linux против шима
+       (Lx_kit, минимальные заголовки), потом порт подсистемы. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
