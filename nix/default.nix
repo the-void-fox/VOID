@@ -246,6 +246,25 @@ let
         '';
       };
 
+      # lx_sched (Веха 62) — костяк кооперативного планировщика Lx_kit: задача = отдельный стек +
+      # setjmp/longjmp, один поток (модель Genode dde_linux). Тела — в lx_kit.c (lx_sched.h).
+      # Харнесс: Демо A round-robin по yield, Демо B ping/pong по block/unblock (wait_event/wake_up),
+      # печать адреса локали доказывает отдельные стеки. Обе арх.
+      lx_sched = stdenv.mkDerivation {
+        pname = "lx-sched";
+        version = "0.62";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_sched.c lx_kit.c -o lx-sched
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-sched $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

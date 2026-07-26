@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–61, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–62, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -14,6 +14,9 @@ VOID. Растёт по мере роста портируемого кода к
 - **Веха 59** — **`linux/err.h`**: идиома «ошибка в указателе» (ERR_PTR/IS_ERR) → `lx-err`.
 - **Веха 60** — **`linux/io.h`**: MMIO-аксессоры регистров (readl/writel) → `lx-io`.
 - **Веха 61** — **`linux/delay.h`**: паузы тайминга железа (udelay/mdelay) → `lx-delay`.
+- **Веха 62** — **кооперативный планировщик Lx_kit** (`lx_sched.h`): задача = отдельный стек +
+  setjmp/longjmp, один поток (модель Genode dde_linux) → `lx-sched`. **Костяк рантайма** под
+  jiffies/таймеры/wait_event/workqueue/kthread. Это НЕ порт `.c` — это наш рантайм.
 
 ## Что здесь
 
@@ -37,13 +40,19 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   настоящее окно — от lx_emul по MMIO-cap). Харнесс (`main_io.c`) — round-trip на буфере-регистрах.
 - `delay.h` — инфраструктура (Веха 61): `udelay`/`mdelay`/`ndelay` — буси-паузы; тела в `lx_kit.c`
   (буси-ожидание по монотонному времени VOID). Харнесс (`main_delay.c`) замеряет реальную паузу.
+- `lx_sched.h` — **рантайм, не шим** (Веха 62): кооперативный планировщик Lx_kit. Задача =
+  отдельный стек + `setjmp`/`longjmp`, один поток; `lx_task_create`/`lx_sched_run`/`lx_sched_yield`/
+  `lx_task_block`/`lx_task_unblock`. Тела — в `lx_kit.c` (+ арх-вставка `arch_execute`: смена SP на
+  свой стек для riscv64/x86_64). Сюда сядут jiffies/таймеры, wait_event/wake_up, workqueue, request_irq.
 
 Наш рантайм и харнессы:
 - **`lx_kit.c`** — **Lx_kit-рантайм**: тела `kmalloc/…/kfree` + `kmemdup/kstrdup/kstrndup` над кучей
-  newlib + `printk` + `udelay`/`mdelay`/`ndelay` (буси-ожидание по монотонному времени). Растёт к
-  таймерам/workqueue/ioremap/DMA.
+  newlib + `printk` + `udelay`/`mdelay`/`ndelay` (буси-ожидание по монотонному времени) + **кооперативный
+  планировщик** (Веха 62: задачи/`arch_execute`/yield/block/unblock). Растёт к jiffies/таймерам/
+  wait_event/workqueue/request_irq/ioremap/DMA.
 - Харнессы: **`main.c`** — sort; **`main_argv.c`** — argv_split; **`main_list.c`** — list_sort;
-  **`main_bits.c`** — bitops; **`main_err.c`** — err.h; **`main_io.c`** — io.h; **`main_delay.c`** — delay.h.
+  **`main_bits.c`** — bitops; **`main_err.c`** — err.h; **`main_io.c`** — io.h; **`main_delay.c`** — delay.h;
+  **`main_sched.c`** — планировщик (round-robin по yield + ping/pong по block/unblock).
 
 Лицензии: vendored-файлы Linux остаются под GPL-2.0 (свои SPDX-заголовки); шимы, рантайм и харнессы —
 код проекта. Хостинг Linux-драйверов по природе смешивает лицензии (портируемые части — GPL).
@@ -58,7 +67,8 @@ nix-build nix -A <arch>.lx_bits    # hweight.c + bitops.h/asm-types + lx_kit.c +
 nix-build nix -A <arch>.lx_err     # err.h/errno.h + lx_kit.c + harness → VOID-ELF
 nix-build nix -A <arch>.lx_io      # io.h + lx_kit.c + harness → VOID-ELF
 nix-build nix -A <arch>.lx_delay   # delay.h + lx_kit.c + harness → VOID-ELF
+nix-build nix -A <arch>.lx_sched   # lx_sched.h/lx_kit.c (планировщик) + harness → VOID-ELF
 void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя>   # для каждого
 ```
-Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay`
-(чистые вычислялки, обе арх).
+Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
+`lx-sched` (чистые вычислялки, обе арх).

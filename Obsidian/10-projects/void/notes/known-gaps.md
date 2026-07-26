@@ -121,9 +121,15 @@ status: active
      - ✅ **linux/delay.h: паузы тайминга** (Веха 61, [[lx-delay]]): `udelay`/`mdelay`/`ndelay` —
        буси-паузы (у e1000 сброс/линк/EEPROM — сплошь паузы); тела в Lx_kit — буси-ожидание по
        монотонному времени VOID (`gettimeofday`, 1–100 нс/тик). Харнесс замеряет, что пауза РЕАЛЬНО
-       прошла, обе арх. **Трио инфраструктуры err/io/delay завершено.** Дальше — jiffies/atomic/
-       spinlock/timer/workqueue + driver-model/PCI/netdev к драйверу e1000 → закроет Atheros/EHCI/
-       wifi X54C. ← следующее
+       прошла, обе арх. **Трио инфраструктуры err/io/delay завершено.**
+     - ✅ **Lx_kit-рантайм: кооперативный планировщик** (Веха 62, [[lx-sched]]): костяк рантайма
+       (не шим) — задача = отдельный стек + `setjmp/longjmp`, ОДИН поток (модель Genode dde_linux;
+       арх-вставка `arch_execute` для riscv64/x86_64). `lx_task_create`/`lx_sched_run`/`yield`/
+       `block`/`unblock`. Следствие: внутри Linux-кода нет гонок, spinlock/mutex/атомики почти no-op.
+       Харнесс: round-robin по yield + ping/pong по block/unblock (`pp_seq=121212`), отдельные стеки
+       доказаны, обе арх. Референс подхода собран в `reference/dde-linux/`. Дальше — jiffies/таймеры,
+       wait_event/wake_up, workqueue, module_init-редирект + driver-model/PCI/netdev к e1000 → закроет
+       Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
