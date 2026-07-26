@@ -135,6 +135,25 @@ let
         '';
       };
 
+      # lx_argv (Веха 56) — НЕИЗМЕНЁННЫЙ lib/argv_split.c ядра Linux (6.18.7) против рукописных
+      # шим-заголовков linux/*.h, теперь ВКЛЮЧАЯ аллокатор: kmalloc-семейство даёт Lx_kit-рантайм
+      # (lx_kit.c) поверх кучи newlib. Первый портированный .c, ЧЕСТНО аллоцирующий память ядровым
+      # kmalloc/kstrndup — фундамент kit под драйверы. -I. находит linux/ (наши шимы + vendored .c).
+      lx_argv = stdenv.mkDerivation {
+        pname = "lx-argv";
+        version = "0.56";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_argv.c linux-src/argv_split.c lx_kit.c -o lx-argv
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-argv $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {
