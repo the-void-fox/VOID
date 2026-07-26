@@ -303,6 +303,24 @@ let
         '';
       };
 
+      # lx_work (Веха 65) — рабочие очереди (linux/workqueue.h): schedule_work/schedule_delayed_work/
+      # flush_*/cancel_* поверх задачи-воркера (Веха 62) и таймеров (Веха 63). У e1000 6.18 watchdog —
+      # на delayed_work. Тела в lx_kit.c. Харнесс: FIFO-работы, delayed через ~30 мс, cancel до срабатывания.
+      lx_work = stdenv.mkDerivation {
+        pname = "lx-work";
+        version = "0.65";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_work.c lx_kit.c -o lx-work
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-work $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

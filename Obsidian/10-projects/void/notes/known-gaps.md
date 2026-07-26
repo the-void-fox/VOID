@@ -142,8 +142,17 @@ status: active
        block/unblock: запись ждущего на стеке задачи, wake_up переводит в готовые (перепроверят
        условие сами — нет потерянных пробуждений в один-поток-модели); таймаут — через таймер Вехи 63.
        Харнесс: producer/consumer, completion, таймаут (истечение→0, пробуждение→остаток jiffies),
-       обе арх. Дальше — workqueue+`schedule_[delayed_]work`, module_init-редирект + driver-model/PCI/
-       netdev к e1000 → закроет Atheros/EHCI/wifi X54C. ← следующее
+       обе арх.
+     - ✅ **Рабочие очереди** (Веха 65, [[lx-work]]): `linux/workqueue.h` — `schedule_work`/
+       `schedule_delayed_work`/`queue_work`/`flush_*`/`cancel_*`/`alloc_workqueue`/system_wq. Каждую
+       очередь крутит задача-воркер (работа исполняется в контексте задачи — можно спать); delayed —
+       через таймер (Веха 63); flush — через wait_event (Веха 64). У e1000 6.18 watchdog именно на
+       delayed_work. Харнесс: FIFO-работы, delayed ~30 мс, cancel до срабатывания (не выполнилась),
+       обе арх. Оговорка: воркер — демон, при остановке планировщика остаётся заблокированным (стек
+       не реапится; для реального драйвера норма). **Рантайм-примитивы Lx_kit готовы** (память/
+       список/биты + err/io/delay + планировщик/таймеры/ожидание/workqueue) — дальше САМ драйвер:
+       module_init-редирект + генератор заглушек → driver-model/PCI → netdev-подмножество →
+       e1000_hw.c → e1000_main.c → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.

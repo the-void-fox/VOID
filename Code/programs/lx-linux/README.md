@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–64, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–65, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -23,6 +23,9 @@ VOID. Растёт по мере роста портируемого кода к
 - **Веха 64** — **очереди ожидания + completion** (`linux/wait.h`, `linux/completion.h`):
   `wait_event`/`wake_up`/`wait_event_timeout` + `wait_for_completion`/`complete` → `lx-wait`. Задача
   ждёт события железа, уступая процессор; таймаут — через таймер Вехи 63.
+- **Веха 65** — **рабочие очереди** (`linux/workqueue.h`): `schedule_work`/`schedule_delayed_work`/
+  `flush_*`/`cancel_*` → `lx-work`. Каждую очередь крутит задача-воркер; delayed — через таймер.
+  У e1000 6.18 watchdog именно на delayed_work.
 
 ## Что здесь
 
@@ -58,18 +61,23 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   (очередь ждущих задач — записи на их стеках, wake переводит в готовые, каждая перепроверяет
   условие) + `struct completion` (`wait_for_completion`/`complete` поверх wait_event). Тела
   `__lx_wait`/`__lx_wake_up` — в `lx_kit.c`; completion — inline. Таймаут — через таймер Вехи 63.
+- `workqueue.h` — отложенная работа (Веха 65): `work_struct`/`delayed_work`, `INIT_WORK`/
+  `INIT_DELAYED_WORK`, `schedule_work`/`schedule_delayed_work`/`queue_work`, `flush_*`, `cancel_*`,
+  `alloc_workqueue`/system_wq. Тела в `lx_kit.c`: очередь обслуживает задача-воркер (работа
+  исполняется в контексте задачи — можно спать); delayed — через таймер; flush — через wait_event.
 
 Наш рантайм и харнессы:
 - **`lx_kit.c`** — **Lx_kit-рантайм**: тела `kmalloc/…/kfree` + `kmemdup/kstrdup/kstrndup` над кучей
   newlib + `printk` + `udelay`/`mdelay`/`ndelay` (буси-ожидание по монотонному времени) + **кооперативный
   планировщик** (Веха 62: задачи/`arch_execute`/yield/block/unblock) + **jiffies/таймеры** (Веха 63:
   очередь `timer_list`, idle-путь стреляет, уступающий `msleep`) + **очереди ожидания** (Веха 64:
-  `__lx_wait`/`__lx_wake_up`). Растёт к workqueue/request_irq/ioremap/DMA.
+  `__lx_wait`/`__lx_wake_up`) + **рабочие очереди** (Веха 65: задача-воркер, delayed через таймер).
+  Растёт к request_irq/ioremap/DMA.
 - Харнессы: **`main.c`** — sort; **`main_argv.c`** — argv_split; **`main_list.c`** — list_sort;
   **`main_bits.c`** — bitops; **`main_err.c`** — err.h; **`main_io.c`** — io.h; **`main_delay.c`** — delay.h;
   **`main_sched.c`** — планировщик (yield + block/unblock); **`main_timer.c`** — jiffies/таймеры
   (уступающий msleep + таймеры по возрастанию expires); **`main_wait.c`** — wait_event/wake_up,
-  completion, wait_event_timeout (истечение и пробуждение).
+  completion, wait_event_timeout; **`main_work.c`** — workqueue (FIFO-работы, delayed, cancel).
 
 Лицензии: vendored-файлы Linux остаются под GPL-2.0 (свои SPDX-заголовки); шимы, рантайм и харнессы —
 код проекта. Хостинг Linux-драйверов по природе смешивает лицензии (портируемые части — GPL).
@@ -87,7 +95,8 @@ nix-build nix -A <arch>.lx_delay   # delay.h + lx_kit.c + harness → VOID-ELF
 nix-build nix -A <arch>.lx_sched   # lx_sched.h/lx_kit.c (планировщик) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_timer   # jiffies.h/timer.h/lx_kit.c (таймеры) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_wait    # wait.h/completion.h/lx_kit.c (ожидание) + harness → VOID-ELF
+nix-build nix -A <arch>.lx_work    # workqueue.h/lx_kit.c (рабочие очереди) + harness → VOID-ELF
 void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя>   # для каждого
 ```
 Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
-`lx-sched` / `lx-timer` / `lx-wait` (чистые вычислялки, обе арх).
+`lx-sched` / `lx-timer` / `lx-wait` / `lx-work` (чистые вычислялки, обе арх).

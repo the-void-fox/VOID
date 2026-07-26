@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/timer.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include "lx_sched.h" /* кооперативный планировщик (Веха 62) */
 
@@ -350,6 +351,179 @@ void __lx_wake_up(wait_queue_head_t *wq)
 
 	for (e = wq->waiters; e; e = e->next)
 		lx_task_unblock(e->task);
+}
+
+/* ─── рабочие очереди (linux/workqueue.h, Веха 65) ────────────────────────────
+ * Каждую очередь обслуживает задача-воркер: крутит очередь работ, блокируется, когда
+ * пусто; queue_work кладёт работу и будит воркера. delayed_work — через таймер (Веха 63).
+ * flush_* блокирует заказчика на flush-очереди воркера, пока работа не отработает. */
+
+struct workqueue_struct {
+	struct work_struct *pending_head;
+	struct work_struct *pending_tail;
+	struct lx_task     *worker;
+	wait_queue_head_t   flush_wq; /* воркер будит после каждой работы — для flush_* */
+	const char         *name;
+};
+
+static struct workqueue_struct *lx_system_wq; /* ленивая системная очередь */
+
+static void lx_work_unlink(struct workqueue_struct *wq, struct work_struct *w)
+{
+	struct work_struct **pp = &wq->pending_head, *prev = NULL;
+
+	for (; *pp; prev = *pp, pp = &(*pp)->lx_next)
+		if (*pp == w) {
+			*pp = w->lx_next;
+			if (wq->pending_tail == w)
+				wq->pending_tail = prev;
+			w->lx_next = NULL;
+			w->lx_pending = 0;
+			return;
+		}
+}
+
+static void lx_worker_fn(void *arg)
+{
+	struct workqueue_struct *wq = arg;
+
+	for (;;) {
+		while (wq->pending_head) {
+			struct work_struct *w = wq->pending_head;
+
+			wq->pending_head = w->lx_next;
+			if (!wq->pending_head)
+				wq->pending_tail = NULL;
+			w->lx_next = NULL;
+			w->lx_pending = 0;
+			w->lx_running = 1;
+			w->func(w);           /* работа исполняется в контексте задачи — МОЖНО спать */
+			w->lx_running = 0;
+			__lx_wake_up(&wq->flush_wq); /* разбудить ждущих flush_* */
+		}
+		lx_task_block(); /* очередь пуста — спим до queue_work */
+	}
+}
+
+struct workqueue_struct *lx_alloc_workqueue(const char *name)
+{
+	struct workqueue_struct *wq = calloc(1, sizeof(*wq));
+
+	if (!wq)
+		return NULL;
+	wq->name = name;
+	init_waitqueue_head(&wq->flush_wq);
+	wq->worker = lx_task_create(lx_worker_fn, wq, name ? name : "wq"); /* воркер */
+	return wq;
+}
+
+struct workqueue_struct *lx_get_system_wq(void)
+{
+	if (!lx_system_wq)
+		lx_system_wq = lx_alloc_workqueue("events");
+	return lx_system_wq;
+}
+
+bool queue_work(struct workqueue_struct *wq, struct work_struct *w)
+{
+	if (w->lx_pending) /* уже в очереди — ядро не перезаводит */
+		return false;
+	w->lx_pending = 1;
+	w->lx_wq = wq;
+	w->lx_next = NULL;
+	if (wq->pending_tail)
+		wq->pending_tail->lx_next = w;
+	else
+		wq->pending_head = w;
+	wq->pending_tail = w;
+	lx_task_unblock(wq->worker); /* разбудить воркера */
+	return true;
+}
+
+/* Таймер delayed_work: по срабатыванию кладём работу в её очередь. */
+static void lx_delayed_work_timer(struct timer_list *tl)
+{
+	struct delayed_work *dw = from_timer(dw, tl, timer);
+
+	queue_work(dw->lx_wq, &dw->work);
+}
+
+void __lx_init_delayed_timer(struct delayed_work *dw)
+{
+	__lx_timer_setup(&dw->timer, lx_delayed_work_timer, 0);
+}
+
+bool queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dw, unsigned long delay)
+{
+	dw->lx_wq = wq;
+	dw->work.lx_wq = wq;
+	if (delay == 0)
+		return queue_work(wq, &dw->work); /* без задержки — сразу */
+	lx_jiffies_update();
+	mod_timer(&dw->timer, jiffies + delay);
+	return true;
+}
+
+bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dw, unsigned long delay)
+{
+	timer_delete(&dw->timer);
+	lx_work_unlink(wq, &dw->work);
+	queue_delayed_work(wq, dw, delay);
+	return true;
+}
+
+void flush_work(struct work_struct *w)
+{
+	if (w->lx_wq)
+		wait_event(w->lx_wq->flush_wq, !w->lx_pending && !w->lx_running);
+}
+
+void flush_delayed_work(struct delayed_work *dw)
+{
+	if (dw->lx_wq)
+		wait_event(dw->lx_wq->flush_wq,
+		           !timer_pending(&dw->timer) && !dw->work.lx_pending && !dw->work.lx_running);
+}
+
+void flush_workqueue(struct workqueue_struct *wq)
+{
+	if (wq)
+		wait_event(wq->flush_wq, !wq->pending_head);
+}
+
+void flush_scheduled_work(void)
+{
+	flush_workqueue(lx_get_system_wq());
+}
+
+bool cancel_work_sync(struct work_struct *w)
+{
+	bool was = w->lx_pending;
+
+	if (w->lx_wq && w->lx_pending)
+		lx_work_unlink(w->lx_wq, w);
+	return was; /* один поток: воркер не может исполнять w прямо сейчас — sync тривиален */
+}
+
+bool cancel_delayed_work(struct delayed_work *dw)
+{
+	bool was = timer_pending(&dw->timer) || dw->work.lx_pending;
+
+	timer_delete(&dw->timer);
+	if (dw->lx_wq && dw->work.lx_pending)
+		lx_work_unlink(dw->lx_wq, &dw->work);
+	return was;
+}
+
+bool cancel_delayed_work_sync(struct delayed_work *dw)
+{
+	return cancel_delayed_work(dw);
+}
+
+void destroy_workqueue(struct workqueue_struct *wq)
+{
+	if (wq)
+		flush_workqueue(wq); /* воркер (задача) остаётся заблокированным; освободим при реапе */
 }
 
 /* ─── кооперативный планировщик (lx_sched.h, Веха 62) ─────────────────────────
