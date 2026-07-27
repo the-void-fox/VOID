@@ -49,11 +49,20 @@ void lx_module_exit(void);
 #define MODULE_DEVICE_TABLE(type, name)
 #define MODULE_SOFTDEP(x)
 
-/* Параметры модуля — в пустоту (объявленная переменная остаётся глобалом с дефолтом). */
+/* Параметры модуля — в пустоту (объявленная переменная остаётся глобалом с дефолтом; счётчики
+ * num_* остаются 0 → check_options берёт значения по умолчанию, как при отсутствии параметров). */
 #define module_param(name, type, perm)
 #define module_param_named(alias, name, type, perm)
 #define module_param_array(name, type, nump, perm)
+#define module_param_array_named(alias, name, type, nump, perm)
 #define module_param_string(name, str, len, perm)
 #define MODULE_PARM_DESC(name, desc)
+
+/* Стрингификация значения макроса (двухуровневая — чтобы аргумент раскрылся). */
+#ifndef __stringify
+#define __stringify_1(x) #x
+#define __stringify(x)   __stringify_1(x)
+#endif
+#define __MODULE_STRING(x) __stringify(x)
 
 #endif /* _LINUX_MODULE_H_SHIM */

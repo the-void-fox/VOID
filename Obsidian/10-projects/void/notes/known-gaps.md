@@ -166,9 +166,17 @@ status: active
        `pci_resource_*`/конфиг-чтение-запись — тела в `lx_kit.c`. Харнесс: синтетический **8086:100E**
        (e1000) → match по id_table → probe «как e1000» читает BAR (`readl`=0xe1000ba5) и конфиг
        (`vendor=8086 device=100e`, `COMMAND=0x0007`) → remove; обе арх. **Все опоры под драйвер
-       готовы** (kit + driver-model + PCI). Дальше — первый реальный `.c` и генератор заглушек →
-       netdev-подмножество (`netdevice.h`/`skbuff.h`/`etherdevice.h`/`dma-mapping.h`) → e1000_hw.c →
-       e1000_main.c → закроет Atheros/EHCI/wifi X54C. ← следующее
+       готовы** (kit + driver-model + PCI).
+     - ✅ **Сам драйвер e1000 компилируется/линкуется/исполняется** (Веха 68, [[lx-e1000-port]]):
+       неизменённые `e1000_hw.c`/`e1000_main.c`/`e1000_param.c` (6.18.7, verbatim, GPL-2.0) собраны
+       против **netdev-подмножества** шимов (~25 новых: `netdevice.h`/`skbuff.h`/`etherdevice.h`/
+       `dma-mapping.h`/`ethtool.h`/`mii.h`/`interrupt.h`/`atomic.h`/… + дорощены types/kernel/compiler/
+       bitops) + рантайма `lx_kit.c` + сетевых заглушек `lx_net.c` («generated_dummies»). 0 ошибок/
+       0 предупреждений обе арх. Харнесс `main_e1000.c` зовёт ЧИСТУЮ логику `e1000_hw.c`: `set_mac_type`
+       (0x100E→e1000_82540), `set_media_type` (читает STATUS через `er32`→`readl`) → `mac_type=5 media=0
+       OK`, обе арх идентично. **Vendored e1000-код исполняется на VOID.** Дальше — оживить: probe/open/
+       TX/RX/ISR против настоящего QEMU-e1000 по MMIO/DMA/IRQ-cap ([[userspace-drivers]], [[irq]]), мост
+       RX/TX ↔ `net-srv` → `ping` через ПОРТИРОВАННЫЙ e1000; тот же конвейер закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.

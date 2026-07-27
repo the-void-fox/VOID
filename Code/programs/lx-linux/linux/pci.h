@@ -175,6 +175,9 @@ int  pci_save_state(struct pci_dev *dev);
 void pci_restore_state(struct pci_dev *dev);
 int  pci_set_power_state(struct pci_dev *dev, pci_power_t state);
 int  pci_enable_wake(struct pci_dev *dev, pci_power_t state, bool enable);
+int  pci_wake_from_d3(struct pci_dev *dev, bool enable);
+int  pcix_get_mmrbc(struct pci_dev *dev);
+int  pcix_set_mmrbc(struct pci_dev *dev, int mmrbc);
 
 /* ─ drvdata / имя (через встроенную базу) ─ */
 static inline void *pci_get_drvdata(struct pci_dev *dev) { return dev_get_drvdata(&dev->dev); }

@@ -359,6 +359,29 @@ let
         '';
       };
 
+      # lx_e1000_port (Веха 68) — НЕИЗМЕНЁННЫЙ драйвер Intel e1000 (Linux 6.18.7:
+      # drivers/net/ethernet/intel/e1000/{e1000_hw,e1000_main,e1000_param}.c, GPL-2.0) собран против
+      # наших шимов linux/*.h + рантайма Lx_kit (lx_kit.c) + сетевых заглушек (lx_net.c). Vendored-код
+      # компилируется с ядровыми флагами (-Wno-unused-parameter/-Wno-pointer-sign). Харнесс зовёт
+      # ЧИСТУЮ логику e1000_hw.c (set_mac_type/set_media_type). Обе арх. Полный probe/TX/RX — след. веха.
+      lx_e1000_port = stdenv.mkDerivation {
+        pname = "lx-e1000";
+        version = "0.68";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -Ilinux-src/e1000 -DCONFIG_64BIT \
+            -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
+            main_e1000.c linux-src/e1000/e1000_main.c linux-src/e1000/e1000_hw.c \
+            linux-src/e1000/e1000_param.c lx_kit.c lx_net.c -o lx-e1000
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-e1000 $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

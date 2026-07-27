@@ -66,6 +66,28 @@ static inline const char *dev_name(const struct device *dev)
 #define dev_err_once(dev, fmt, ...) printk(fmt, ##__VA_ARGS__)
 #define dev_warn_once(dev, fmt, ...) printk(fmt, ##__VA_ARGS__)
 
+/* Управление питанием/пробуждением устройства (учётные). */
+int  device_set_wakeup_enable(struct device *dev, bool enable);
+int  device_wakeup_enable(struct device *dev);
+
+/* dev_pm_ops + DEFINE_SIMPLE_DEV_PM_OPS: у нас питанием не управляем, но символ ops нужен как
+ * цель `.driver.pm = pm_sleep_ptr(&ops)` (pm_sleep_ptr отдаёт NULL). Ссылаемся на suspend/resume,
+ * чтобы они не были «unused». */
+struct dev_pm_ops {
+	int (*suspend)(struct device *dev);
+	int (*resume)(struct device *dev);
+	int (*freeze)(struct device *dev);
+	int (*thaw)(struct device *dev);
+	int (*poweroff)(struct device *dev);
+	int (*restore)(struct device *dev);
+};
+#define DEFINE_SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
+	const struct dev_pm_ops __attribute__((unused)) name = { \
+		.suspend = suspend_fn, .resume = resume_fn, \
+		.freeze = suspend_fn, .thaw = resume_fn, \
+		.poweroff = suspend_fn, .restore = resume_fn, \
+	}
+
 /* Регистрация (тела в lx_kit.c): match по шине → bind → probe. */
 int  bus_register(struct bus_type *bus);
 void bus_unregister(struct bus_type *bus);

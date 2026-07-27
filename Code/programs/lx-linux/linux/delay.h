@@ -14,4 +14,7 @@ void udelay(unsigned long usecs);
 void mdelay(unsigned long msecs);
 void msleep(unsigned int msecs);
 
+/* usleep_range — «сон» в диапазоне мкс; у нас буси-udelay по нижней границе. */
+static inline void usleep_range(unsigned long min, unsigned long max) { (void)max; udelay(min); }
+
 #endif /* _LINUX_DELAY_H_SHIM */

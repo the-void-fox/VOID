@@ -14,4 +14,8 @@
 char **argv_split(gfp_t gfp, const char *str, int *argcp);
 void argv_free(char **argv);
 
+/* strscpy — безопасное копирование строки (ядро 4.3+): не более size, всегда \0-терминирует;
+ * возвращает длину скопированного или -E2BIG при усечении. Тело — в lx_kit.c. */
+ssize_t strscpy(char *dst, const char *src, size_t size);
+
 #endif /* _LINUX_STRING_H_SHIM */

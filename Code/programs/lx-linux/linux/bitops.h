@@ -13,6 +13,7 @@
 
 #include <asm/types.h>
 #include <linux/types.h>
+#include <strings.h> /* newlib: ffs/ffsl/ffsll — та же семантика, что у ядра (не переопределяем) */
 
 #define BITS_PER_LONG      64 /* обе арх VOID 64-битные (-DCONFIG_64BIT) */
 #define BITS_PER_LONG_LONG 64
@@ -69,8 +70,8 @@ static inline int test_and_clear_bit(unsigned long nr, volatile unsigned long *a
 
 static inline unsigned long __ffs(unsigned long word) { return __builtin_ctzl(word); }
 static inline unsigned long __fls(unsigned long word) { return BITS_PER_LONG - 1 - __builtin_clzl(word); }
-static inline int ffs(int x) { return __builtin_ffs(x); }
-static inline int fls(unsigned int x) { return x ? (32 - __builtin_clz(x)) : 0; }
+/* ffs/fls — из newlib <strings.h> (та же семантика 1-based MSB/LSB). fls64 — ядровый, даём сами. */
+static inline int fls64(u64 x) { return x ? (64 - __builtin_clzll(x)) : 0; }
 
 /* Простой (по-битовый) поиск — корректно; ядро оптимизирует по словам, нам довольно правильности. */
 static inline unsigned long find_next_bit(const unsigned long *addr,

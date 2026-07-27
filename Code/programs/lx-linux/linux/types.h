@@ -11,15 +11,18 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h> /* ssize_t/off_t из newlib */
 
-typedef uint8_t u8;
+typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
-typedef uint64_t u64;
-typedef int8_t s8;
-typedef int16_t s16;
-typedef int32_t s32;
-typedef int64_t s64;
+typedef int8_t   s8;
+typedef int16_t  s16;
+typedef int32_t  s32;
+/* Как в ядре (asm-generic/int-ll64.h): 64-битные — именно long long, чтобы %ll в vendored-коде
+ * (dma_addr_t/u64) совпадал по типу на LP64-архах (иначе uint64_t = unsigned long → -Wformat). */
+typedef unsigned long long u64;
+typedef long long          s64;
 
 /* uapi-имена тех же фикс-типов (в ядре — из <asm-generic/int-ll64.h>). */
 typedef u8  __u8;
@@ -30,6 +33,24 @@ typedef s8  __s8;
 typedef s16 __s16;
 typedef s32 __s32;
 typedef s64 __s64;
+
+/* Endian-«меченые» типы (в ядре — sparse-аннотация `__bitwise`; у нас — простые псевдонимы). */
+typedef u16 __le16;
+typedef u32 __le32;
+typedef u64 __le64;
+typedef u16 __be16;
+typedef u32 __be32;
+typedef u64 __be64;
+typedef u16 __sum16; /* контрольная сумма (сеть) */
+typedef u32 __wsum;
+
+/* Разрядные псевдонимы ядра. */
+typedef unsigned int  uint;
+typedef unsigned long ulong;
+
+/* dma_addr_t — адрес для устройства (в один-поток-мире = физический = виртуальный).
+ * Тип u64 (как ядро при 64-битном DMA) — совпадает с %ll в vendored-коде. */
+typedef u64 dma_addr_t;
 
 /* Атрибуты компилятора (в ядре — из <linux/compiler.h>/compiler_attributes.h). */
 #ifndef __always_inline
