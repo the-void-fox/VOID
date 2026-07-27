@@ -21,6 +21,16 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
+/* uapi-имена тех же фикс-типов (в ядре — из <asm-generic/int-ll64.h>). */
+typedef u8  __u8;
+typedef u16 __u16;
+typedef u32 __u32;
+typedef u64 __u64;
+typedef s8  __s8;
+typedef s16 __s16;
+typedef s32 __s32;
+typedef s64 __s64;
+
 /* Атрибуты компилятора (в ядре — из <linux/compiler.h>/compiler_attributes.h). */
 #ifndef __always_inline
 #define __always_inline inline __attribute__((always_inline))

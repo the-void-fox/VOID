@@ -19,6 +19,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/jiffies.h>
+#include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/timer.h>
@@ -633,6 +634,180 @@ void device_del(struct device *dev)
 void device_unregister(struct device *dev)
 {
 	device_del(dev);
+}
+
+/* ─── PCI поверх driver-model (linux/pci.h, Веха 67) ──────────────────────────
+ * `pci_dev` встраивает `struct device`, `pci_driver` — `struct device_driver`.
+ * Регистрация переиспользует driver_register/match/probe Вехи 66: match идёт по
+ * таблице id_table (vendor/device), а мосты lx_pci_dev_probe/remove разворачивают
+ * базовый вызов обратно в pci_driver->probe(pdev, id). Конфиг/BAR — учётные. */
+
+/* Одна запись id_table подходит устройству? PCI_ANY_ID совпадает с любым. */
+static int lx_pci_id_match(const struct pci_device_id *id, struct pci_dev *pdev)
+{
+	if (id->vendor != (u32)PCI_ANY_ID && id->vendor != pdev->vendor)
+		return 0;
+	if (id->device != (u32)PCI_ANY_ID && id->device != pdev->device)
+		return 0;
+	if (id->subvendor != (u32)PCI_ANY_ID && id->subvendor != pdev->subsystem_vendor)
+		return 0;
+	if (id->subdevice != (u32)PCI_ANY_ID && id->subdevice != pdev->subsystem_device)
+		return 0;
+	return 1;
+}
+
+/* match шины PCI: перебрать id_table драйвера; при совпадении запомнить id/драйвер. */
+static int lx_pci_bus_match(struct device *dev, struct device_driver *drv)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct pci_driver *pdrv = to_pci_driver(drv);
+	const struct pci_device_id *id;
+
+	if (!pdrv->id_table)
+		return 0;
+	for (id = pdrv->id_table; id->vendor || id->device || id->subvendor; id++)
+		if (lx_pci_id_match(id, pdev)) {
+			pdev->lx_id = id;
+			pdev->lx_driver = pdrv;
+			return 1;
+		}
+	return 0;
+}
+
+static struct bus_type pci_bus_type = {
+	.name  = "pci",
+	.match = lx_pci_bus_match,
+};
+
+/* Мост probe: базовый device.probe → pci_driver.probe(pdev, совпавший id). */
+static int lx_pci_dev_probe(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+
+	if (pdev->lx_driver && pdev->lx_driver->probe)
+		return pdev->lx_driver->probe(pdev, pdev->lx_id);
+	return 0;
+}
+
+/* Мост remove: базовый device.remove → pci_driver.remove(pdev). */
+static void lx_pci_dev_remove(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+
+	if (pdev->lx_driver && pdev->lx_driver->remove)
+		pdev->lx_driver->remove(pdev);
+}
+
+int pci_register_driver(struct pci_driver *drv)
+{
+	drv->driver.name   = drv->name;   /* проецируем на базовый драйвер... */
+	drv->driver.bus    = &pci_bus_type;
+	drv->driver.probe  = lx_pci_dev_probe;
+	drv->driver.remove = lx_pci_dev_remove;
+	return driver_register(&drv->driver); /* ...и крутим ту же связку Вехи 66 */
+}
+
+void pci_unregister_driver(struct pci_driver *drv)
+{
+	driver_unregister(&drv->driver);
+}
+
+/* Внести синтетическое устройство в шину PCI (роль перечислителя ядра). */
+int lx_pci_register_device(struct pci_dev *pdev)
+{
+	pdev->dev.bus = &pci_bus_type;
+	return device_register(&pdev->dev);
+}
+
+/* Учётное конфиг-слово COMMAND: собираем/разбираем бит в lx_config[PCI_COMMAND]. */
+static void lx_pci_cmd_set(struct pci_dev *pdev, u16 bits)
+{
+	u16 cmd = (u16)(pdev->lx_config[PCI_COMMAND] | (pdev->lx_config[PCI_COMMAND + 1] << 8));
+	cmd |= bits;
+	pdev->lx_config[PCI_COMMAND]     = (u8)(cmd & 0xff);
+	pdev->lx_config[PCI_COMMAND + 1] = (u8)(cmd >> 8);
+}
+
+int pci_enable_device(struct pci_dev *dev)     { lx_pci_cmd_set(dev, PCI_COMMAND_IO | PCI_COMMAND_MEMORY); return 0; }
+int pci_enable_device_mem(struct pci_dev *dev) { lx_pci_cmd_set(dev, PCI_COMMAND_MEMORY); return 0; }
+void pci_disable_device(struct pci_dev *dev)   { (void)dev; }
+void pci_set_master(struct pci_dev *dev)       { lx_pci_cmd_set(dev, PCI_COMMAND_MASTER); }
+int  pci_set_mwi(struct pci_dev *dev)          { lx_pci_cmd_set(dev, PCI_COMMAND_INVALIDATE); return 0; }
+void pci_clear_mwi(struct pci_dev *dev)        { (void)dev; }
+
+/* Битовая маска BAR'ов, чьи флаги содержат запрошенные (реальная семантика). */
+int pci_select_bars(struct pci_dev *dev, unsigned long flags)
+{
+	int i, bars = 0;
+
+	for (i = 0; i < PCI_STD_NUM_BARS; i++)
+		if (dev->resource[i].flags & flags)
+			bars |= 1 << i;
+	return bars;
+}
+
+int pci_request_selected_regions(struct pci_dev *dev, int bars, const char *name)
+{
+	(void)dev; (void)bars; (void)name; /* менеджера регионов не держим */
+	return 0;
+}
+
+void pci_release_selected_regions(struct pci_dev *dev, int bars)
+{
+	(void)dev; (void)bars;
+}
+
+/* Окно BAR: ioremap identity над стартом BAR (реальное окно — по MMIO-cap VOID). */
+void __iomem *pci_ioremap_bar(struct pci_dev *dev, int bar)
+{
+	return ioremap(pci_resource_start(dev, bar), pci_resource_len(dev, bar));
+}
+
+/* ─ конфиг-пространство: little-endian чтение/запись над lx_config[] ─ */
+int pci_read_config_byte(struct pci_dev *dev, int where, u8 *val)
+{
+	*val = dev->lx_config[where];
+	return 0;
+}
+int pci_read_config_word(struct pci_dev *dev, int where, u16 *val)
+{
+	*val = (u16)(dev->lx_config[where] | (dev->lx_config[where + 1] << 8));
+	return 0;
+}
+int pci_read_config_dword(struct pci_dev *dev, int where, u32 *val)
+{
+	*val = (u32)dev->lx_config[where]            | ((u32)dev->lx_config[where + 1] << 8) |
+	       ((u32)dev->lx_config[where + 2] << 16) | ((u32)dev->lx_config[where + 3] << 24);
+	return 0;
+}
+int pci_write_config_byte(struct pci_dev *dev, int where, u8 val)
+{
+	dev->lx_config[where] = val;
+	return 0;
+}
+int pci_write_config_word(struct pci_dev *dev, int where, u16 val)
+{
+	dev->lx_config[where]     = (u8)(val & 0xff);
+	dev->lx_config[where + 1] = (u8)(val >> 8);
+	return 0;
+}
+int pci_write_config_dword(struct pci_dev *dev, int where, u32 val)
+{
+	dev->lx_config[where]     = (u8)(val & 0xff);
+	dev->lx_config[where + 1] = (u8)((val >> 8) & 0xff);
+	dev->lx_config[where + 2] = (u8)((val >> 16) & 0xff);
+	dev->lx_config[where + 3] = (u8)((val >> 24) & 0xff);
+	return 0;
+}
+
+/* Питание/пробуждение/состояние — в один-поток-мире учётные no-op. */
+int  pci_save_state(struct pci_dev *dev)                          { (void)dev; return 0; }
+void pci_restore_state(struct pci_dev *dev)                       { (void)dev; }
+int  pci_set_power_state(struct pci_dev *dev, pci_power_t state)  { (void)dev; (void)state; return 0; }
+int  pci_enable_wake(struct pci_dev *dev, pci_power_t state, bool enable)
+{
+	(void)dev; (void)state; (void)enable;
+	return 0;
 }
 
 /* ─── кооперативный планировщик (lx_sched.h, Веха 62) ─────────────────────────

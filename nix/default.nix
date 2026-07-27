@@ -340,6 +340,25 @@ let
         '';
       };
 
+      # lx_pci (Веха 67) — слой PCI (linux/pci.h) поверх driver-model: pci_dev встраивает device,
+      # pci_driver — device_driver, pci_register_driver крутит ту же связку register→match→probe,
+      # но match по id_table (vendor/device); конфиг-пространство и BAR'ы в pci_dev. Тела в lx_kit.c.
+      # Харнесс: синтетический 8086:100E (e1000) → match → probe читает BAR и конфиг. Обе арх.
+      lx_pci = stdenv.mkDerivation {
+        pname = "lx-pci";
+        version = "0.67";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -DCONFIG_64BIT -O2 -static main_pci.c lx_kit.c -o lx-pci
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-pci $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

@@ -157,8 +157,17 @@ status: active
        `lx_module_init`, `MODULE_*`/`module_param` — в пустоту). Упрощённый `drivers/base/dd.c`.
        Харнесс: фейк-шина/драйвер/устройство проходят module_init→register→match→probe→remove
        (`probe=1 remove=1 drvdata=0xabcd`), обе арх. **Начало перехода к самому драйверу** (метод —
-       линкер-ориентированный). Дальше — PCI (`linux/pci.h`: pci_dev встраивает device, pci_driver —
-       device_driver) + первый реальный `.c` и генератор заглушек → netdev-подмножество → e1000_hw.c →
+       линкер-ориентированный).
+     - ✅ **Шина PCI** (Веха 67, [[lx-pci]]): `linux/pci.h` (`pci_dev` встраивает `struct device`,
+       `pci_driver` — `device_driver`; `id_table`/`PCI_DEVICE`/`PCI_VENDOR_ID_INTEL`; BAR'ы
+       `resource[]`/конфиг `lx_config[]`) + `linux/ioport.h` (`struct resource`/`IORESOURCE_*`).
+       `pci_register_driver` крутит ту же связку match/probe Вехи 66, но match идёт по `id_table`
+       (vendor/device); `pci_enable_device`/`set_master`/`select_bars`/`request_regions`/`ioremap_bar`/
+       `pci_resource_*`/конфиг-чтение-запись — тела в `lx_kit.c`. Харнесс: синтетический **8086:100E**
+       (e1000) → match по id_table → probe «как e1000» читает BAR (`readl`=0xe1000ba5) и конфиг
+       (`vendor=8086 device=100e`, `COMMAND=0x0007`) → remove; обе арх. **Все опоры под драйвер
+       готовы** (kit + driver-model + PCI). Дальше — первый реальный `.c` и генератор заглушек →
+       netdev-подмножество (`netdevice.h`/`skbuff.h`/`etherdevice.h`/`dma-mapping.h`) → e1000_hw.c →
        e1000_main.c → закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).

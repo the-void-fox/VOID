@@ -28,6 +28,7 @@ struct device_driver {
 	int  (*probe)(struct device *dev);
 	void (*remove)(struct device *dev); /* ядро 6.x: remove возвращает void */
 	const void       *of_match_table;
+	const void       *pm; /* dev_pm_ops — управление питанием (у нас не трогаем) */
 	/* приватная линковка Lx_kit (список зарегистрированных драйверов) */
 	struct device_driver *lx_next;
 };

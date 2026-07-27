@@ -14,6 +14,11 @@
 
 #include <linux/types.h>
 
+/* Аннотация адресов MMIO (в ядре — sparse-атрибут; у нас пусто). */
+#ifndef __iomem
+#define __iomem
+#endif
+
 typedef unsigned long phys_addr_t;
 typedef phys_addr_t   resource_size_t;
 
