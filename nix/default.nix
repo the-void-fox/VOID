@@ -397,7 +397,7 @@ let
         dontConfigure = true;
         hardeningDisable = [ "all" ];
         buildPhase = ''
-          $CC ${voidCFlags} -I. -Ilinux-src/e1000 -I${void-libc}/lib -DCONFIG_64BIT \
+          $CC ${voidCFlags} -I. -Ilinux-src/e1000 -I${void-libc}/lib -DCONFIG_64BIT -DLX_HAVE_SYSCALL \
             -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
             drv_e1000.c linux-src/e1000/e1000_main.c linux-src/e1000/e1000_hw.c \
             linux-src/e1000/e1000_param.c lx_kit.c lx_net.c -o lx-e1000-hw

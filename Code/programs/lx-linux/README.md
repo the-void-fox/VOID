@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–69, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–70, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -46,7 +46,14 @@ VOID. Растёт по мере роста портируемого кода к
   microwire-EEPROM/PHY сам). Bring-up идёт КАК задача Lx_kit (vendored `msleep` уступает). Проверено
   (x86, QEMU `-device e1000,mac=…99`): `STATUS=0x80080783 link UP`, `reset_hw` («Issuing a global reset
   to MAC»), `MAC=52:54:00:12:34:99` (совпал с заданным!), `speed=1000 duplex=full — OK`. riscv-virt
-  e1000 нет → собирается/импортируется, не спавнится (как C-драйвер Вехи 54). DMA/кольца TX-RX/IRQ — дальше.
+  e1000 нет → собирается/импортируется, не спавнится (как C-драйвер Вехи 54).
+- **Веха 70** — **портированный e1000 ПЕРЕДАЁТ кадр (DMA-TX) на реальном QEMU-e1000** (`lx-e1000-hw`):
+  `dma_alloc_coherent` в `lx_net.c` сведён с DMA-cap (`vsys_dma_alloc`, `start_cap 1`; guard
+  `-DLX_HAVE_SYSCALL`); драйвер строит TX-кольцо дескрипторов vendored `e1000_setup_all_tx_resources`
+  на РЕАЛЬНОМ DMA, конфигурирует TX-движок (TDBAL/TDLEN/TCTL/TIPG вручную — `e1000_configure_tx` static)
+  и передаёт 60-байтовый кадр: дескриптор → TDT → карта выносит его DMA'ом, ставит DD-бит. Проверено
+  (x86): `setup_all_tx_resources → ring dma=0x13e3000`, `TX: desc0.status=0x01 DD=1 TDH=1 — OK`.
+  RX/IRQ/NAPI + мост к `net-srv` (→ `ping` через портированный e1000) — дальше.
 
 ## Что здесь
 
@@ -122,9 +129,10 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   **driver-model** (Веха 66: реестр драйверов/устройств, match/probe) + **PCI** (Веха 67: `pci_bus_type`
   с match по `id_table`, мосты probe/remove, конфиг/BAR/enable/master).
 - **`lx_net.c`** — **сетевой рантайм/заглушки** (Веха 68, «generated_dummies»): ТЕЛА netdev/skb/dma/napi/
-  irq/страниц, на которые ссылается неизменённый e1000. Часть настоящие (alloc_etherdev/skb-линейка/
-  dma_alloc_coherent через кучу), часть — no-op под пути (probe/open/TX/RX/ISR), что оживут на след.
-  вехе против реального QEMU-e1000 по MMIO/DMA/IRQ-cap. Нужен для ЛИНКОВКИ драйвера.
+  irq/страниц, на которые ссылается неизменённый e1000. Часть настоящие (alloc_etherdev/skb-линейка),
+  часть — no-op под пути (open/RX/ISR), что оживут дальше. **`dma_alloc_coherent`** (Веха 70) под
+  `-DLX_HAVE_SYSCALL` идёт по **DMA-cap** (`vsys_dma_alloc` → device-доступная страница), иначе (сборка-
+  «вычислялка») — куча. Нужен для ЛИНКОВКИ и реального DMA драйвера.
 - Харнессы: **`main.c`** — sort; **`main_argv.c`** — argv_split; **`main_list.c`** — list_sort;
   **`main_bits.c`** — bitops; **`main_err.c`** — err.h; **`main_io.c`** — io.h; **`main_delay.c`** — delay.h;
   **`main_sched.c`** — планировщик (yield + block/unblock); **`main_timer.c`** — jiffies/таймеры
@@ -134,8 +142,9 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   **`main_pci.c`** — PCI (синтетический 8086:100E → match по id_table → probe читает BAR и конфиг);
   **`main_e1000.c`** — **сам драйвер e1000**: линкует vendored `e1000_*.c` + `lx_kit.c` + `lx_net.c`,
   зовёт чистую логику `e1000_hw.c` (`set_mac_type` 0x100E→e1000_82540, `set_media_type` через `er32`→`readl`);
-  **`drv_e1000.c`** — **тот же e1000 на РЕАЛЬНОМ QEMU-e1000** (Веха 69): спавнится init'ом, маппит BAR0 по
-  MMIO-cap (`syscall.h`/`vsys_mmio_map`), bring-up (reset+EEPROM-MAC+STATUS) vendored-кодом как задача Lx_kit.
+  **`drv_e1000.c`** — **тот же e1000 на РЕАЛЬНОМ QEMU-e1000** (Веха 69 MMIO + Веха 70 DMA-TX): спавнится
+  init'ом, маппит BAR0 по MMIO-cap (`syscall.h`/`vsys_mmio_map`), отдаёт DMA-cap в `lx_net.c`; задача
+  Lx_kit делает bring-up (reset+EEPROM-MAC+STATUS) и передаёт кадр через vendored DMA-кольцо (DD-бит).
 
 Лицензии: vendored-файлы Linux остаются под GPL-2.0 (свои SPDX-заголовки); шимы, рантайм и харнессы —
 код проекта. Хостинг Linux-драйверов по природе смешивает лицензии (портируемые части — GPL).
@@ -163,5 +172,6 @@ void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя
 Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
 `lx-sched` / `lx-timer` / `lx-wait` / `lx-work` / `lx-driver` / `lx-pci` / **`lx-e1000`** (чистые
 вычислялки, обе арх). `lx-e1000` печатает `mac_type=5 media=0 — OK` — vendored e1000-код исполняется на VOID.
-**`lx-e1000-hw`** (Веха 69) НЕ запускают из vsh — его спавнит init как userspace-драйвер, когда в QEMU
-есть e1000 (x86, `-device e1000`): маппит BAR по MMIO-cap и читает MAC/STATUS с реального железа.
+**`lx-e1000-hw`** (Вехи 69–70) НЕ запускают из vsh — его спавнит init как userspace-драйвер, когда в QEMU
+есть e1000 (x86, `-device e1000`): маппит BAR по MMIO-cap, читает MAC/STATUS с реального железа и
+**передаёт кадр по DMA** (DMA-cap), карта ставит DD-бит.

@@ -21,6 +21,15 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+/* Настоящий DMA поверх DMA-cap VOID (SYS_DMA_ALLOC) — только в сборке драйвера (-DLX_HAVE_SYSCALL,
+ * -I${void-libc}/lib). В сборке-«вычислялке» (Веха 68) DMA не зовётся → остаётся куча-версия. */
+#ifdef LX_HAVE_SYSCALL
+#include <syscall.h> /* vsys_dma_alloc / VOID_NO_CAP */
+static uintptr_t lx_dma_cap    = VOID_NO_CAP;
+static uintptr_t lx_dma_va_next = 0x58000000UL; /* DMA_BASE, как в lx_emul (Веха 54) */
+void lx_net_set_dma_cap(uintptr_t cap) { lx_dma_cap = cap; }
+#endif
+
 /* ─ состояние системы (e1000 shutdown отличает выключение) ─ */
 enum system_states system_state = SYSTEM_RUNNING;
 
@@ -58,13 +67,31 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 {
 	void *p;
 	(void)dev; (void)gfp;
-	p = kmalloc(size, 0);
+#ifdef LX_HAVE_SYSCALL
+	/* Реальный DMA: страница по DMA-cap, её ФИЗ-адрес — device-доступный (одна страница ≤ 4 КиБ). */
+	if (lx_dma_cap != VOID_NO_CAP && size <= 4096) {
+		uintptr_t va = lx_dma_va_next;
+		uintptr_t pa = vsys_dma_alloc(lx_dma_cap, va);
+		if (pa == VOID_NO_CAP) { *handle = 0; return NULL; }
+		lx_dma_va_next += 4096;
+		memset((void *)va, 0, size);
+		*handle = (dma_addr_t)pa;
+		return (void *)va;
+	}
+#endif
+	p = kmalloc(size, 0); /* «вычислялка» (Веха 68): DMA не задействован — куча */
 	if (p) memset(p, 0, size);
 	*handle = (dma_addr_t)(unsigned long)p;
 	return p;
 }
 void dma_free_coherent(struct device *dev, size_t size, void *vaddr, dma_addr_t handle)
-{ (void)dev; (void)size; (void)handle; kfree(vaddr); }
+{
+	(void)dev; (void)size; (void)handle;
+#ifdef LX_HAVE_SYSCALL
+	if (lx_dma_cap != VOID_NO_CAP) return; /* DMA-страницы не возвращаем (одноразовый bring-up) */
+#endif
+	kfree(vaddr);
+}
 dma_addr_t dma_map_single(struct device *dev, void *ptr, size_t size, int dir)
 { (void)dev; (void)size; (void)dir; return (dma_addr_t)(unsigned long)ptr; }
 void dma_unmap_single(struct device *dev, dma_addr_t addr, size_t size, int dir)

@@ -183,8 +183,16 @@ status: active
        `init.rs` предпочитает `lx-e1000-hw`. Проверено (x86, `-device e1000,mac=…99`): `STATUS=0x80080783
        link UP`, `reset_hw`, `MAC=52:54:00:12:34:99` (совпал с заданным!), `speed=1000 duplex=full — OK`.
        Регрессии чисты (x86 без e1000 — `ping` ок; riscv — не спавнится). **Портированный драйвер трогает
-       реальное железо.** Дальше — DMA-кольца (`dma_alloc_coherent`↔DMA-cap) + IRQ (`request_irq`↔задача на
-       `vsys_irq_wait`) + open/TX/RX/ISR-NAPI, мост RX/TX ↔ `net-srv` → `ping` через ПОРТИРОВАННЫЙ e1000;
+       реальное железо.**
+     - ✅ **Портированный e1000 ПЕРЕДАЁТ кадр (DMA-TX)** (Веха 70, [[lx-e1000-tx]]): `dma_alloc_coherent`
+       в `lx_net.c` сведён с DMA-cap (`vsys_dma_alloc`, start_cap 1; guard `-DLX_HAVE_SYSCALL`). Драйвер
+       строит TX-кольцо дескрипторов vendored `e1000_setup_all_tx_resources` на РЕАЛЬНОМ DMA, конфигурирует
+       TX-движок (TDBAL/TDLEN/TCTL/TIPG вручную — `e1000_configure_tx` static) и передаёт 60-байтовый кадр:
+       дескриптор → TDT → карта выносит его DMA'ом, ставит DD-бит. Проверено (x86): `setup_all_tx_resources
+       → ring dma=0x13e3000` (реальный физ-адрес), `TX: desc0.status=0x01 DD=1 TDH=1 — OK`. Первое
+       использование DMA-cap портированным Linux-драйвером. Регрессии чисты; ядро не менялось. Дальше — RX-кольцо
+       (`e1000_setup_all_rx_resources`+`alloc_rx_buffers`, skb в DMA) + IRQ (`request_irq`↔задача на
+       `vsys_irq_wait`, start_cap 2) + ISR/NAPI, мост RX/TX ↔ `net-srv` → `ping` через ПОРТИРОВАННЫЙ e1000;
        тот же конвейер закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
