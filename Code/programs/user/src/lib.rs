@@ -54,6 +54,7 @@ const SYS_INSTALL: usize = 30;
 const SYS_MMIO_MAP: usize = 31;
 const SYS_DMA_ALLOC: usize = 32;
 const SYS_IRQ_WAIT: usize = 33;
+const SYS_OBJ_LIST_ROOTS: usize = 34;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -281,6 +282,14 @@ pub fn obj_get_root(store_cap: usize, name: &[u8], id_out: &mut [u8; 32]) -> usi
 /// `SYS_OBJ_DEL_ROOT`: отвязать корень (объект уйдёт в GC, если недостижим). 0/1/MAX.
 pub fn obj_del_root(store_cap: usize, name: &[u8]) -> usize {
     abi::syscall(SYS_OBJ_DEL_ROOT, store_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_OBJ_LIST_ROOTS`: заполнить `buf` текстом «короткий id  имя\n» по каждому СЫРОМУ корню
+/// store (vsh `roots`). Возвращает число записанных байт (0 при отказе/пустом). Нужен store-cap
+/// с READ или WRITE.
+pub fn obj_list_roots(store_cap: usize, buf: &mut [u8]) -> usize {
+    let r = abi::syscall(SYS_OBJ_LIST_ROOTS, store_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
+    if r == usize::MAX { 0 } else { r }
 }
 
 /// `SYS_READ`: прочитать доступный ввод консоли (хотя бы один байт; блокируется до ввода).

@@ -47,6 +47,7 @@ fn print_help(ep: usize) {
     px::write(ep, px::STDOUT, RESET);
     px::write(ep, px::STDOUT, b"\n");
     help_row(ep, b"ls [DIR]", "список файлов (каталога DIR или текущего)");
+    help_row(ep, b"roots", "показать корни store (объекты: bin/*, system/*, …)");
     help_row(ep, b"cd DIR", "сменить каталог (.. — вверх, / — корень)");
     help_row(ep, b"pwd", "показать текущий каталог");
     help_row(ep, b"mkdir DIR", "создать каталог");
@@ -414,6 +415,18 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
                 None => px::write(ep, px::STDOUT,
                     "\x1b[1;31mНе удалось.\x1b[0m Нет AHCI-диска, образа установки или прав.\n".as_bytes()),
             };
+            continue;
+        }
+        if cmd == b"roots" {
+            // Показать СЫРЫЕ корни store (как `ls`, но для объектов store, не файлов posixfs):
+            // короткий content-id + имя на строку. Гейт — store-cap (xcap: store:xw, есть WRITE).
+            let mut rbuf = [0u8; 8192];
+            let n = sys::obj_list_roots(xcap, &mut rbuf);
+            if n == 0 {
+                px::write(ep, px::STDOUT, "нет корней (или нет прав на store)\n".as_bytes());
+            } else {
+                px::write(ep, px::STDOUT, &rbuf[..n]);
+            }
             continue;
         }
         if cmd == b"ls" || cmd.strip_prefix(b"ls ").is_some() {

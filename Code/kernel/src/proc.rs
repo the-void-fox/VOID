@@ -1940,6 +1940,37 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
+        // SYS_OBJ_LIST_ROOTS(store_cap, buf_ptr, buf_len) -> записано байт | MAX: перечислить
+        // СЫРЫЕ корни store текстом («короткий id + имя» на строку) — vsh `roots`, как `ls` для
+        // объектов store. Гейт: store-cap с READ ИЛИ WRITE (любой из привилегированных доступов к
+        // store позволяет узнать имена корней; у shell'а cap store:xw — есть WRITE).
+        34 => {
+            let (scap, bptr, blen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let cap = Cap::from_bits(scap as u64);
+            let allowed = cap::store(dom, cap, Rights::READ).is_ok()
+                || cap::store(dom, cap, Rights::WRITE).is_ok();
+            let result = if !allowed {
+                vprintln!("  [obj] P{} OBJ_LIST_ROOTS отклонён ← нет capability (READ/WRITE) на store", cur);
+                usize::MAX
+            } else if ensure_heap_range(t, cur, bptr, blen) {
+                let text = crate::object::list_roots_text();
+                let bytes = text.as_bytes();
+                let n = bytes.len().min(blen);
+                let dst = unsafe { core::slice::from_raw_parts_mut(bptr as *mut u8, n) };
+                dst.copy_from_slice(&bytes[..n]);
+                vprintln!("  [obj] P{} OBJ_LIST_ROOTS → {} Б ({} корней)", cur, n, text.lines().count());
+                n
+            } else {
+                usize::MAX // куча под буфер не доотобразилась
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);

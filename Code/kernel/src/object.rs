@@ -113,6 +113,22 @@ pub fn del_root(name: &str) -> bool {
     STORE.lock().del_root(name)
 }
 
+/// Текстовый список корней store (для `SYS_OBJ_LIST_ROOTS` / vsh `roots`): «короткий content-id
+/// (первые 6 байт hex) + два пробела + имя», по строке на корень (порядок BTreeMap — по имени).
+/// Показывает СЫРЫЕ корни store (`bin/*`, `system/*`, `.dir`, `.cspace`, …) — как `void-store-import ls`.
+pub fn list_roots_text() -> alloc::string::String {
+    use core::fmt::Write;
+    let store = STORE.lock();
+    let mut out = alloc::string::String::new();
+    for (name, id) in store.roots() {
+        for b in &id.0[..6] {
+            let _ = write!(out, "{:02x}", b);
+        }
+        let _ = write!(out, "  {}\n", name);
+    }
+    out
+}
+
 /// Собрать мусор (mark-sweep от корней; жертвы — надгробиями до уплотнения).
 /// (оставлено, собрано).
 pub fn gc() -> (usize, usize) {
