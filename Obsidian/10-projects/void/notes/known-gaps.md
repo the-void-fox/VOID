@@ -190,10 +190,16 @@ status: active
        TX-движок (TDBAL/TDLEN/TCTL/TIPG вручную — `e1000_configure_tx` static) и передаёт 60-байтовый кадр:
        дескриптор → TDT → карта выносит его DMA'ом, ставит DD-бит. Проверено (x86): `setup_all_tx_resources
        → ring dma=0x13e3000` (реальный физ-адрес), `TX: desc0.status=0x01 DD=1 TDH=1 — OK`. Первое
-       использование DMA-cap портированным Linux-драйвером. Регрессии чисты; ядро не менялось. Дальше — RX-кольцо
-       (`e1000_setup_all_rx_resources`+`alloc_rx_buffers`, skb в DMA) + IRQ (`request_irq`↔задача на
-       `vsys_irq_wait`, start_cap 2) + ISR/NAPI, мост RX/TX ↔ `net-srv` → `ping` через ПОРТИРОВАННЫЙ e1000;
-       тот же конвейер закроет Atheros/EHCI/wifi X54C. ← следующее
+       использование DMA-cap портированным Linux-драйвером. Регрессии чисты; ядро не менялось.
+     - ✅ **Портированный e1000: TX+RX (ARP round-trip)** (Веха 71, [[lx-e1000-rx]]): добавлено RX-кольцо
+       (vendored `e1000_setup_all_rx_resources` на DMA + RX-буферы + `RDBAL/RDLEN/RDT/RCTL` промиск +
+       `RAL0`=наш MAC). Драйвер шлёт **ARP-запрос** шлюзу (TX) и **принимает ARP-ответ** (RX, опрос
+       DD-дескриптора) — двунаправленный реальный трафик через портированный драйвер. Проверено (x86):
+       `TX ARP «who has 10.0.2.2» → DD=1`, `RX: дескриптор 0 DD, 64 Б, ethertype=0806`, `ARP-ОТВЕТ от
+       10.0.2.2: MAC шлюза 52:55:0a:00:02:02 — OK` (штатный SLIRP-шлюз — ответ реально пришёл). Регрессии
+       чисты; ядро не менялось. Дальше — IRQ (`request_irq`↔задача на `vsys_irq_wait`, start_cap 2) + ISR/NAPI
+       (vendored `e1000_intr`/`e1000_clean`), затем мост RX/TX ↔ `net-srv` → **`ping` через ПОРТИРОВАННЫЙ
+       e1000**; тот же конвейер закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.

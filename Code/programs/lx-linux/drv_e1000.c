@@ -1,40 +1,52 @@
-/* drv_e1000.c — портированный e1000 на НАСТОЯЩЕМ QEMU-e1000: MMIO (Веха 69) + DMA-TX (Веха 70).
+/* drv_e1000.c — портированный e1000 на НАСТОЯЩЕМ QEMU-e1000:
+ *   Веха 69 — MMIO (регистры/MAC реальной карты),
+ *   Веха 70 — DMA-TX (передача кадра),
+ *   Веха 71 — DMA-RX + ARP round-trip (шлём ARP-запрос шлюзу, принимаем ARP-ответ).
  *
- * Спавнится init'ом как userspace-драйвер (путь Вех 51–54): start_cap 0 = MMIO-cap на регистры,
- * start_cap 1 = DMA-cap. main() маппит BAR0 (SYS_MMIO_MAP), отдаёт DMA-cap в lx_net.c и запускает
- * планировщик; вся работа с картой — в задаче (vendored msleep уступает, Веха 63).
- *
- * Задача: (1) bring-up неизменённым e1000_hw.c — set_mac_type/reset_hw/init_eeprom/read_mac (Веха 69);
- * (2) TX — vendored `e1000_setup_all_tx_resources` строит кольцо дескрипторов на РЕАЛЬНОМ DMA
- * (dma_alloc_coherent→DMA-cap), затем конфигурируем TX-движок (TDBAL/TDLEN/TCTL/TIPG — вручную, т.к.
- * vendored e1000_configure_tx static) и ПЕРЕДАЁМ кадр: дескриптор → TDT → ждём DD-бит (карта
- * вынесла кадр DMA'ом наружу). RX/IRQ/NAPI и мост к net-srv — следующая веха. x86 (на riscv e1000 нет).
+ * Спавнится init'ом как userspace-драйвер (Вехи 51–54): start_cap 0 = MMIO-cap, 1 = DMA-cap. main()
+ * маппит BAR0, отдаёт DMA-cap в lx_net.c, запускает планировщик; работа с картой — в задаче (vendored
+ * msleep уступает). Кольца дескрипторов строит VENDORED e1000_setup_all_[tx|rx]_resources на РЕАЛЬНОМ
+ * DMA; движки TX/RX конфигурируем регистрами (vendored e1000_configure_[tx|rx] static). x86 (на riscv
+ * e1000 нет). IRQ/NAPI и мост к net-srv — дальше; здесь RX опрашивается (DD-бит дескриптора).
  */
 #include <stdio.h>
 #include <string.h>
 
-#include <syscall.h> /* vsys_start_cap / vsys_mmio_map / vsys_exit / VOID_NO_CAP */
+#include <syscall.h>
 
-#include "e1000.h"    /* vendored: e1000_hw/e1000_adapter/e1000_tx_ring/e1000_tx_desc + функции */
-#include "lx_sched.h" /* кооперативная задача Lx_kit */
+#include "e1000.h"
+#include "lx_sched.h"
 
-extern void lx_net_set_dma_cap(uintptr_t cap); /* отдать DMA-cap в lx_net.c (dma_alloc_coherent) */
+extern void lx_net_set_dma_cap(uintptr_t cap);
 
-#define E1000_BAR0_VA   0x50000000UL
-#define E1000_BAR0_SIZE 0x20000UL
+#define E1000_BAR0_VA 0x50000000UL
 
-static struct e1000_adapter g_adapter;   /* минимально заполненный — под vendored TX-setup */
-static struct e1000_tx_ring g_tx_ring;   /* adapter->tx_ring[0] */
-static struct pci_dev       g_pdev;      /* adapter->pdev (для dma_alloc_coherent(&pdev->dev,…)) */
+/* Наши сетевые параметры (SLIRP: гость 10.0.2.15, шлюз 10.0.2.2). */
+static const u8 OUR_IP[4] = { 10, 0, 2, 15 };
+static const u8 GW_IP[4]  = { 10, 0, 2, 2 };
 
-/* Собрать 60-байтовый широковещательный кадр (содержимое неважно — проверяем сам факт передачи). */
-static unsigned lx_build_frame(u8 *buf, const u8 *src_mac)
+static struct e1000_adapter g_adapter;
+static struct e1000_tx_ring g_tx_ring;
+static struct e1000_rx_ring g_rx_ring;
+static struct pci_dev       g_pdev;
+
+#define RX_AVAIL 4 /* сколько RX-дескрипторов отдаём карте (с буферами) */
+
+/* Собрать ARP-запрос «who has GW_IP» в buf (60 Б). Вернуть длину. */
+static unsigned build_arp_request(u8 *buf, const u8 *our_mac)
 {
 	memset(buf, 0, 60);
-	memset(buf, 0xff, 6);        /* dst = broadcast */
-	memcpy(buf + 6, src_mac, 6); /* src = наш MAC */
-	buf[12] = 0x08; buf[13] = 0x00; /* ethertype IPv4 (заглушка) */
-	buf[14] = 0x45;              /* немного «полезной нагрузки» */
+	memset(buf, 0xff, 6);                 /* eth dst = broadcast */
+	memcpy(buf + 6, our_mac, 6);          /* eth src */
+	buf[12] = 0x08; buf[13] = 0x06;       /* ethertype ARP */
+	buf[14] = 0x00; buf[15] = 0x01;       /* htype ethernet */
+	buf[16] = 0x08; buf[17] = 0x00;       /* ptype IPv4 */
+	buf[18] = 6; buf[19] = 4;             /* hlen/plen */
+	buf[20] = 0x00; buf[21] = 0x01;       /* oper = request */
+	memcpy(buf + 22, our_mac, 6);         /* sha */
+	memcpy(buf + 28, OUR_IP, 4);          /* spa */
+	/* tha = 0 */
+	memcpy(buf + 38, GW_IP, 4);           /* tpa = шлюз */
 	return 60;
 }
 
@@ -42,80 +54,108 @@ static void e1000_bringup(void *arg)
 {
 	struct e1000_hw *hw = &g_adapter.hw;
 	struct e1000_tx_desc *tx;
+	struct e1000_rx_desc *rx;
+	dma_addr_t frame_dma = 0, rxbuf_dma[RX_AVAIL];
+	u8 *frame, *rxbuf[RX_AVAIL];
 	u16 speed = 0, duplex = 0;
-	dma_addr_t frame_dma = 0;
-	u8 *frame;
-	u32 status, tctl;
-	unsigned len, i;
+	u32 status, ral, rah;
+	unsigned len, i, got = -1u;
 	s32 r;
 	(void)arg;
 
-	/* ── (1) bring-up на реальном железе (Веха 69) ── */
+	/* ── (1) bring-up (Веха 69) ── */
 	hw->vendor_id = 0x8086;
-	hw->device_id = E1000_DEV_ID_82540EM; /* QEMU `-device e1000` */
-
-	r = e1000_set_mac_type(hw);
-	status = readl(hw->hw_addr + E1000_STATUS);
-	printf("[e1000] set_mac_type→mac_type=%d; STATUS реального e1000=0x%08x (link %s)\n",
-	       (int)hw->mac_type, status, (status & E1000_STATUS_LU) ? "UP" : "down");
-
+	hw->device_id = E1000_DEV_ID_82540EM;
+	e1000_set_mac_type(hw);
 	e1000_reset_hw(hw);
 	e1000_init_eeprom_params(hw);
-	r = e1000_read_mac_addr(hw);
-	printf("[e1000] MAC из EEPROM: %02x:%02x:%02x:%02x:%02x:%02x (r=%d)\n",
-	       hw->mac_addr[0], hw->mac_addr[1], hw->mac_addr[2],
-	       hw->mac_addr[3], hw->mac_addr[4], hw->mac_addr[5], (int)r);
+	e1000_read_mac_addr(hw);
 	e1000_get_speed_and_duplex(hw, &speed, &duplex);
-	printf("[e1000] speed=%d duplex=%d\n", (int)speed, (int)duplex);
+	status = readl(hw->hw_addr + E1000_STATUS);
+	printf("[e1000] MAC=%02x:%02x:%02x:%02x:%02x:%02x STATUS=0x%08x (link %s) speed=%d\n",
+	       hw->mac_addr[0], hw->mac_addr[1], hw->mac_addr[2], hw->mac_addr[3],
+	       hw->mac_addr[4], hw->mac_addr[5], status, (status & E1000_STATUS_LU) ? "UP" : "down", (int)speed);
 
-	/* ── (2) TX: vendored-кольцо на реальном DMA + передача кадра ── */
-	g_adapter.pdev          = &g_pdev;
-	g_adapter.num_tx_queues = 1;
-	g_adapter.tx_ring       = &g_tx_ring;
-	g_tx_ring.count         = E1000_DEFAULT_TXD; /* 256 дескрипторов = 4 КиБ = 1 DMA-страница */
+	/* ── (2) кольца TX+RX на реальном DMA (VENDORED setup) ── */
+	g_adapter.pdev = &g_pdev;
+	g_adapter.num_tx_queues = 1; g_adapter.tx_ring = &g_tx_ring; g_tx_ring.count = E1000_DEFAULT_TXD;
+	g_adapter.num_rx_queues = 1; g_adapter.rx_ring = &g_rx_ring; g_rx_ring.count = E1000_DEFAULT_RXD;
+	r  = e1000_setup_all_tx_resources(&g_adapter);
+	r |= e1000_setup_all_rx_resources(&g_adapter);
+	printf("[e1000] vendored setup TX/RX-колец на DMA → r=%d (tx dma=0x%llx, rx dma=0x%llx)\n",
+	       (int)r, (unsigned long long)g_tx_ring.dma, (unsigned long long)g_rx_ring.dma);
+	if (r || !g_tx_ring.desc || !g_rx_ring.desc) { printf("[e1000] нет колец — стоп\n"); fflush(stdout); vsys_exit(1); }
 
-	r = e1000_setup_all_tx_resources(&g_adapter); /* VENDORED: кольцо через dma_alloc_coherent */
-	printf("[e1000] e1000_setup_all_tx_resources (vendored, DMA-кольцо) → r=%d, ring dma=0x%llx\n",
-	       (int)r, (unsigned long long)g_tx_ring.dma);
-	if (r || !g_tx_ring.desc) { printf("[e1000] нет TX-кольца — стоп\n"); fflush(stdout); vsys_exit(1); }
-
-	/* Поднять линк + сконфигурировать TX-движок (e1000_configure_tx static — делаем те же записи). */
+	/* Линк вверх + приёмный адрес (RAL0/RAH0) = наш MAC. */
 	ew32(CTRL, er32(CTRL) | E1000_CTRL_SLU);
+	ral = hw->mac_addr[0] | (hw->mac_addr[1] << 8) | (hw->mac_addr[2] << 16) | (hw->mac_addr[3] << 24);
+	rah = hw->mac_addr[4] | (hw->mac_addr[5] << 8) | E1000_RAH_AV;
+	writel(ral, hw->hw_addr + E1000_RA);
+	writel(rah, hw->hw_addr + E1000_RA + 4);
+
+	/* TX-движок. */
 	ew32(TDBAL, (u32)(g_tx_ring.dma & 0xffffffffULL));
 	ew32(TDBAH, (u32)(g_tx_ring.dma >> 32));
 	ew32(TDLEN, g_tx_ring.count * (u32)sizeof(struct e1000_tx_desc));
-	ew32(TDH, 0);
-	ew32(TDT, 0);
-	tctl = E1000_TCTL_EN | E1000_TCTL_PSP | (0x0f << 4) | (0x40 << 12); /* CT=15, COLD=64 (full) */
-	ew32(TCTL, tctl);
+	ew32(TDH, 0); ew32(TDT, 0);
+	ew32(TCTL, E1000_TCTL_EN | E1000_TCTL_PSP | (0x0f << 4) | (0x40 << 12));
 	ew32(TIPG, 0x0060200a);
+
+	/* RX-буферы (по странице на дескриптор) + RX-движок (промиск: примем и уникаст-ответ). */
+	rx = (struct e1000_rx_desc *)g_rx_ring.desc;
+	for (i = 0; i < RX_AVAIL; i++) {
+		rxbuf[i] = dma_alloc_coherent(&g_pdev.dev, 4096, &rxbuf_dma[i], 0);
+		if (!rxbuf[i]) { printf("[e1000] нет RX-буфера %u — стоп\n", i); fflush(stdout); vsys_exit(1); }
+		rx[i].buffer_addr = cpu_to_le64(rxbuf_dma[i]);
+		rx[i].status = 0;
+	}
+	ew32(RDBAL, (u32)(g_rx_ring.dma & 0xffffffffULL));
+	ew32(RDBAH, (u32)(g_rx_ring.dma >> 32));
+	ew32(RDLEN, g_rx_ring.count * (u32)sizeof(struct e1000_rx_desc));
+	ew32(RDH, 0); ew32(RDT, RX_AVAIL); /* карте доступны дескрипторы 0..RX_AVAIL-1 */
+	ew32(RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_SECRC);
 	E1000_WRITE_FLUSH();
 
-	/* Кадр в DMA-память, дескриптор 0, звоним в дверь (TDT=1). */
+	/* ── (3) TX: ARP-запрос шлюзу ── */
 	frame = dma_alloc_coherent(&g_pdev.dev, 4096, &frame_dma, 0);
-	if (!frame) { printf("[e1000] нет DMA-буфера кадра — стоп\n"); fflush(stdout); vsys_exit(1); }
-	len = lx_build_frame(frame, hw->mac_addr);
-
+	if (!frame) { printf("[e1000] нет TX-буфера — стоп\n"); fflush(stdout); vsys_exit(1); }
+	len = build_arp_request(frame, hw->mac_addr);
 	tx = (struct e1000_tx_desc *)g_tx_ring.desc;
 	tx[0].buffer_addr = cpu_to_le64(frame_dma);
 	tx[0].lower.data  = cpu_to_le32(len | E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS);
 	tx[0].upper.data  = 0;
 	E1000_WRITE_FLUSH();
-	ew32(TDT, 1); /* дверной звонок — карта забирает дескриптор 0 */
+	ew32(TDT, 1);
+	for (i = 0; i < 2000; i++) { if (le32_to_cpu(tx[0].upper.data) & E1000_TXD_STAT_DD) break; udelay(50); }
+	printf("[e1000] TX ARP-запрос «who has %d.%d.%d.%d» → DD=%d\n",
+	       GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3],
+	       (le32_to_cpu(tx[0].upper.data) & E1000_TXD_STAT_DD) ? 1 : 0);
 
-	/* Ждём DD (карта вынесла кадр DMA'ом наружу и отписала статус). */
-	for (i = 0; i < 2000; i++) {
-		if (le32_to_cpu(tx[0].upper.data) & E1000_TXD_STAT_DD)
-			break;
-		udelay(50);
+	/* ── (4) RX: ждём ARP-ответ (опрос DD дескрипторов) ── */
+	for (i = 0; i < 4000 && got == -1u; i++) {
+		unsigned d;
+		for (d = 0; d < RX_AVAIL; d++)
+			if (rx[d].status & E1000_RXD_STAT_DD) { got = d; break; }
+		if (got == -1u) msleep(1);
 	}
-	status = le32_to_cpu(tx[0].upper.data);
-	printf("[e1000] TX: desc0.status=0x%02x DD=%d, TDH=%u TDT=%u (кадр %u Б передан по DMA)\n",
-	       (unsigned)(status & 0xff), (status & E1000_TXD_STAT_DD) ? 1 : 0,
-	       (unsigned)er32(TDH), (unsigned)er32(TDT), len);
 
-	printf("[e1000] Результат: НЕИЗМЕНЁННЫЙ e1000 передал кадр на РЕАЛЬНОМ QEMU-e1000 (DMA-cap) — %s\n",
-	       (status & E1000_TXD_STAT_DD) ? "OK" : "FAIL");
+	if (got == -1u) {
+		printf("[e1000] RX: ARP-ответ не пришёл (таймаут)\n");
+		printf("[e1000] Результат: TX ок, RX без ответа — FAIL\n");
+		fflush(stdout); vsys_exit(1);
+	}
+
+	{
+		u8 *p = rxbuf[got];
+		u16 rlen = le16_to_cpu(rx[got].length);
+		int is_arp_reply = (p[12] == 0x08 && p[13] == 0x06 && p[20] == 0x00 && p[21] == 0x02);
+		printf("[e1000] RX: дескриптор %u DD, %u Б, ethertype=%02x%02x\n", got, rlen, p[12], p[13]);
+		if (is_arp_reply)
+			printf("[e1000] ARP-ОТВЕТ от %d.%d.%d.%d: MAC шлюза %02x:%02x:%02x:%02x:%02x:%02x\n",
+			       p[28], p[29], p[30], p[31], p[22], p[23], p[24], p[25], p[26], p[27]);
+		printf("[e1000] Результат: НЕИЗМЕНЁННЫЙ e1000 — TX ARP + RX %s на РЕАЛЬНОМ QEMU-e1000 (DMA-cap) — %s\n",
+		       is_arp_reply ? "ARP-ответ" : "кадр", is_arp_reply ? "OK" : "PARTIAL");
+	}
 	fflush(stdout);
 	vsys_exit(0);
 }
@@ -125,21 +165,12 @@ int main(void)
 	uintptr_t mmio_cap = vsys_start_cap(0);
 	uintptr_t dma_cap  = vsys_start_cap(1);
 
-	printf("== Портированный e1000: MMIO + DMA-TX на РЕАЛЬНОМ QEMU-e1000 (Веха 70) ==\n");
+	printf("== Портированный e1000: TX+RX (ARP round-trip) на РЕАЛЬНОМ QEMU-e1000 (Веха 71) ==\n");
 	fflush(stdout);
-
-	if (mmio_cap == VOID_NO_CAP) {
-		printf("[e1000] нет MMIO-cap (не спавнен init'ом как драйвер) — выход\n");
-		fflush(stdout);
-		return 0;
-	}
-	if (!vsys_mmio_map(mmio_cap, E1000_BAR0_VA)) {
-		printf("[e1000] vsys_mmio_map отказал\n");
-		fflush(stdout);
-		return 1;
-	}
+	if (mmio_cap == VOID_NO_CAP) { printf("[e1000] нет MMIO-cap — выход\n"); fflush(stdout); return 0; }
+	if (!vsys_mmio_map(mmio_cap, E1000_BAR0_VA)) { printf("[e1000] vsys_mmio_map отказал\n"); fflush(stdout); return 1; }
 	g_adapter.hw.hw_addr = (u8 *)(uintptr_t)E1000_BAR0_VA;
-	lx_net_set_dma_cap(dma_cap); /* dma_alloc_coherent в lx_net.c пойдёт по DMA-cap */
+	lx_net_set_dma_cap(dma_cap);
 	printf("[e1000] BAR0 по MMIO-cap → VA 0x%lx; DMA-cap %s\n",
 	       (unsigned long)E1000_BAR0_VA, (dma_cap == VOID_NO_CAP) ? "НЕТ" : "есть");
 	fflush(stdout);
