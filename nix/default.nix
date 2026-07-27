@@ -385,14 +385,16 @@ let
         '';
       };
 
-      # lx_e1000_drv (Веха 69) — тот же НЕИЗМЕНЁННЫЙ e1000, но спавнится init'ом как userspace-драйвер
+      # lx_e1000_drv (Вехи 69–72) — тот же НЕИЗМЕНЁННЫЙ e1000, но спавнится init'ом как userspace-драйвер
       # и ходит к НАСТОЯЩЕМУ QEMU-e1000: main() маппит BAR0 по MMIO-cap (SYS_MMIO_MAP, start_cap 0),
       # кладёт окно в hw->hw_addr, а vendored e1000_hw.c через er32/ew32 сбрасывает карту и читает
-      # MAC/скорость с реального железа. Bring-up — как задача Lx_kit (msleep уступает). syscall.h из
-      # void-libc даёт vsys_*. e1000 в QEMU — только x86; на riscv собирается/импортируется, не спавнится.
+      # MAC/скорость с реального железа (69); TX по DMA (70), RX + ARP round-trip (71); RX по ПРЕРЫВАНИЮ
+      # (72): request_irq↔vsys_irq_wait (IRQ-cap, start_cap 2) — планировщик Lx_kit спит на прерывании.
+      # Bring-up — как задача Lx_kit (msleep уступает). syscall.h из void-libc даёт vsys_*. e1000 в QEMU —
+      # только x86; на riscv собирается/импортируется, не спавнится.
       lx_e1000_drv = stdenv.mkDerivation {
         pname = "lx-e1000-hw";
-        version = "0.69";
+        version = "0.72";
         src = ../Code/programs/lx-linux;
         dontConfigure = true;
         hardeningDisable = [ "all" ];

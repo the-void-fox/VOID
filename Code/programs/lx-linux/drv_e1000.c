@@ -1,13 +1,16 @@
 /* drv_e1000.c — портированный e1000 на НАСТОЯЩЕМ QEMU-e1000:
  *   Веха 69 — MMIO (регистры/MAC реальной карты),
  *   Веха 70 — DMA-TX (передача кадра),
- *   Веха 71 — DMA-RX + ARP round-trip (шлём ARP-запрос шлюзу, принимаем ARP-ответ).
+ *   Веха 71 — DMA-RX + ARP round-trip (шлём ARP-запрос шлюзу, принимаем ARP-ответ, ОПРОСОМ DD),
+ *   Веха 72 — RX по ПРЕРЫВАНИЮ: ISR + request_irq↔vsys_irq_wait (start_cap 2), без опроса.
  *
- * Спавнится init'ом как userspace-драйвер (Вехи 51–54): start_cap 0 = MMIO-cap, 1 = DMA-cap. main()
- * маппит BAR0, отдаёт DMA-cap в lx_net.c, запускает планировщик; работа с картой — в задаче (vendored
- * msleep уступает). Кольца дескрипторов строит VENDORED e1000_setup_all_[tx|rx]_resources на РЕАЛЬНОМ
- * DMA; движки TX/RX конфигурируем регистрами (vendored e1000_configure_[tx|rx] static). x86 (на riscv
- * e1000 нет). IRQ/NAPI и мост к net-srv — дальше; здесь RX опрашивается (DD-бит дескриптора).
+ * Спавнится init'ом как userspace-драйвер (Вехи 51–54): start_cap 0 = MMIO-cap, 1 = DMA-cap,
+ * 2 = IRQ-cap. main() маппит BAR0, отдаёт DMA/IRQ-cap в lx_net.c, запускает планировщик; работа с
+ * картой — в задаче (vendored msleep уступает). Кольца дескрипторов строит VENDORED
+ * e1000_setup_all_[tx|rx]_resources на РЕАЛЬНОМ DMA; движки TX/RX конфигурируем регистрами (vendored
+ * e1000_configure_[tx|rx] static). IRQ: включаем RX-причины в IMS, регистрируем ISR через request_irq
+ * (шим заводит его в планировщике Lx_kit) — планировщик в idle спит на vsys_irq_wait, по прерыванию
+ * карты зовёт ISR, тот будит задачу через completion. x86 (на riscv e1000 нет). Мост к net-srv — дальше.
  */
 #include <stdio.h>
 #include <string.h>
@@ -17,7 +20,11 @@
 #include "e1000.h"
 #include "lx_sched.h"
 
+#include <linux/completion.h> /* completion — ISR будит задачу (Веха 72) */
+#include <linux/interrupt.h>  /* irqreturn_t / IRQ_HANDLED / request_irq */
+
 extern void lx_net_set_dma_cap(uintptr_t cap);
+extern void lx_net_set_irq_cap(uintptr_t cap);
 
 #define E1000_BAR0_VA 0x50000000UL
 
@@ -30,7 +37,28 @@ static struct e1000_tx_ring g_tx_ring;
 static struct e1000_rx_ring g_rx_ring;
 static struct pci_dev       g_pdev;
 
+static struct completion    g_rx_done;   /* ISR будит bring-up-задачу по RX-прерыванию (Веха 72) */
+static volatile u32         g_isr_icr;   /* ICR последнего обслуженного прерывания (для отчёта) */
+static volatile unsigned    g_isr_count; /* сколько прерываний карты обслужили */
+
 #define RX_AVAIL 4 /* сколько RX-дескрипторов отдаём карте (с буферами) */
+
+/* Обработчик прерывания e1000 (Веха 72). Планировщик зовёт его в softirq-контексте
+ * (sched_current == NULL) по возврату из vsys_irq_wait. Чтение ICR (R/clr) гасит причину и снимает
+ * INTx карты; при RX-причине будим задачу через completion. */
+static irqreturn_t e1000_isr(int irq, void *dev)
+{
+	struct e1000_hw *hw = &g_adapter.hw;
+	u32 icr = er32(ICR);
+	(void)irq; (void)dev;
+	if (!icr)
+		return IRQ_NONE;   /* не наше прерывание (INT_ASSERTED сброшен) */
+	g_isr_icr = icr;
+	g_isr_count++;
+	if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXDMT0 | E1000_ICR_RXO))
+		complete(&g_rx_done); /* пришёл кадр — разбудить bring-up-задачу */
+	return IRQ_HANDLED;
+}
 
 /* Собрать ARP-запрос «who has GW_IP» в buf (60 Б). Вернуть длину. */
 static unsigned build_arp_request(u8 *buf, const u8 *our_mac)
@@ -116,6 +144,13 @@ static void e1000_bringup(void *arg)
 	ew32(RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_SECRC);
 	E1000_WRITE_FLUSH();
 
+	/* ── IRQ (Веха 72): регистрируем ISR и включаем RX-причины в IMS. Дальше приём — по прерыванию
+	 * (не опрос DD): планировщик уснёт на vsys_irq_wait, ARP-ответ поднимет RXT0 → INTx → ISR. ─ */
+	init_completion(&g_rx_done);
+	request_irq(0, e1000_isr, 0, "e1000", &g_adapter);
+	ew32(IMS, E1000_IMS_RXT0 | E1000_IMS_RXDMT0 | E1000_IMS_RXO);
+	E1000_WRITE_FLUSH();
+
 	/* ── (3) TX: ARP-запрос шлюзу ── */
 	frame = dma_alloc_coherent(&g_pdev.dev, 4096, &frame_dma, 0);
 	if (!frame) { printf("[e1000] нет TX-буфера — стоп\n"); fflush(stdout); vsys_exit(1); }
@@ -131,19 +166,19 @@ static void e1000_bringup(void *arg)
 	       GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3],
 	       (le32_to_cpu(tx[0].upper.data) & E1000_TXD_STAT_DD) ? 1 : 0);
 
-	/* ── (4) RX: ждём ARP-ответ (опрос DD дескрипторов) ── */
-	for (i = 0; i < 4000 && got == -1u; i++) {
-		unsigned d;
-		for (d = 0; d < RX_AVAIL; d++)
-			if (rx[d].status & E1000_RXD_STAT_DD) { got = d; break; }
-		if (got == -1u) msleep(1);
-	}
-
-	if (got == -1u) {
-		printf("[e1000] RX: ARP-ответ не пришёл (таймаут)\n");
-		printf("[e1000] Результат: TX ок, RX без ответа — FAIL\n");
-		fflush(stdout); vsys_exit(1);
-	}
+	/* ── (4) RX: ждём ARP-ответ по ПРЕРЫВАНИЮ (Веха 72), не опросом ──
+	 * Задача блокируется на completion; планировщик простаивает → спит на vsys_irq_wait(IRQ-cap).
+	 * ARP-ответ от SLIRP поднимает RXT0 на карте → INTx → VEC_USERDRV → e1000_isr → complete.
+	 * Цикл: карта даёт и «пороговое» прерывание (RXDMT0) ДО кадра — ждём в цикле, пока реально не
+	 * появится дескриптор с DD (иначе рассчитывали бы на тайминг). reinit — под следующее прерывание. */
+	do {
+		wait_for_completion(&g_rx_done);
+		reinit_completion(&g_rx_done);
+		for (i = 0; i < RX_AVAIL; i++)
+			if (rx[i].status & E1000_RXD_STAT_DD) { got = i; break; }
+	} while (got == -1u);
+	printf("[e1000] проснулись по ПРЕРЫВАНИЮ карты: обслужено IRQ=%u, ICR=0x%08x\n",
+	       g_isr_count, g_isr_icr);
 
 	{
 		u8 *p = rxbuf[got];
@@ -153,7 +188,7 @@ static void e1000_bringup(void *arg)
 		if (is_arp_reply)
 			printf("[e1000] ARP-ОТВЕТ от %d.%d.%d.%d: MAC шлюза %02x:%02x:%02x:%02x:%02x:%02x\n",
 			       p[28], p[29], p[30], p[31], p[22], p[23], p[24], p[25], p[26], p[27]);
-		printf("[e1000] Результат: НЕИЗМЕНЁННЫЙ e1000 — TX ARP + RX %s на РЕАЛЬНОМ QEMU-e1000 (DMA-cap) — %s\n",
+		printf("[e1000] Результат: НЕИЗМЕНЁННЫЙ e1000 — TX ARP + RX %s ПО ПРЕРЫВАНИЮ на РЕАЛЬНОМ QEMU-e1000 — %s\n",
 		       is_arp_reply ? "ARP-ответ" : "кадр", is_arp_reply ? "OK" : "PARTIAL");
 	}
 	fflush(stdout);
@@ -164,15 +199,18 @@ int main(void)
 {
 	uintptr_t mmio_cap = vsys_start_cap(0);
 	uintptr_t dma_cap  = vsys_start_cap(1);
+	uintptr_t irq_cap  = vsys_start_cap(2);
 
-	printf("== Портированный e1000: TX+RX (ARP round-trip) на РЕАЛЬНОМ QEMU-e1000 (Веха 71) ==\n");
+	printf("== Портированный e1000: TX + RX ПО ПРЕРЫВАНИЮ на РЕАЛЬНОМ QEMU-e1000 (Веха 72) ==\n");
 	fflush(stdout);
 	if (mmio_cap == VOID_NO_CAP) { printf("[e1000] нет MMIO-cap — выход\n"); fflush(stdout); return 0; }
 	if (!vsys_mmio_map(mmio_cap, E1000_BAR0_VA)) { printf("[e1000] vsys_mmio_map отказал\n"); fflush(stdout); return 1; }
 	g_adapter.hw.hw_addr = (u8 *)(uintptr_t)E1000_BAR0_VA;
 	lx_net_set_dma_cap(dma_cap);
-	printf("[e1000] BAR0 по MMIO-cap → VA 0x%lx; DMA-cap %s\n",
-	       (unsigned long)E1000_BAR0_VA, (dma_cap == VOID_NO_CAP) ? "НЕТ" : "есть");
+	lx_net_set_irq_cap(irq_cap);
+	printf("[e1000] BAR0 по MMIO-cap → VA 0x%lx; DMA-cap %s; IRQ-cap %s\n",
+	       (unsigned long)E1000_BAR0_VA, (dma_cap == VOID_NO_CAP) ? "НЕТ" : "есть",
+	       (irq_cap == VOID_NO_CAP) ? "НЕТ" : "есть");
 	fflush(stdout);
 
 	lx_task_create(e1000_bringup, NULL, "e1000drv");

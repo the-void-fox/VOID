@@ -10,6 +10,7 @@
 #define LX_SCHED_H
 
 #include <setjmp.h>
+#include <stdint.h>
 
 enum lx_task_state {
 	LX_INIT,     /* создана, ещё ни разу не запускалась (стек не развёрнут) */
@@ -61,5 +62,15 @@ void lx_sched_wake_type(enum lx_task_type type);
 
 /* Текущая исполняемая задача (NULL вне задачи). */
 struct lx_task *lx_task_self(void);
+
+/* ─ доставка прерываний устройства (Веха 72) ─
+ * Обработчик = int(int irq, void *dev) (irqreturn_t Linux — int-совместим, зовущий кастует). Когда
+ * планировщик простаивает (нет готовых задач и таймеров), он спит на IRQ-cap через vsys_irq_wait
+ * (SYS_IRQ_WAIT, Веха 52 [[irq]]) и по прерыванию карты зовёт handler в softirq-контексте
+ * (sched_current == NULL) — тот будит ждущую задачу (complete/wake_up). Модель Genode: EP спит на
+ * сигнале, просыпается по IRQ, диспетчеризует. Один IRQ на устройство (хватает e1000). */
+typedef int (*lx_irq_handler_t)(int irq, void *dev);
+void lx_irq_register(int irq, uintptr_t cap, lx_irq_handler_t handler, void *dev);
+void lx_irq_unregister(int irq);
 
 #endif /* LX_SCHED_H */

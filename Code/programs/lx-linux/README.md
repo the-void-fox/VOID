@@ -177,6 +177,8 @@ void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя
 Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
 `lx-sched` / `lx-timer` / `lx-wait` / `lx-work` / `lx-driver` / `lx-pci` / **`lx-e1000`** (чистые
 вычислялки, обе арх). `lx-e1000` печатает `mac_type=5 media=0 — OK` — vendored e1000-код исполняется на VOID.
-**`lx-e1000-hw`** (Вехи 69–71) НЕ запускают из vsh — его спавнит init как userspace-драйвер, когда в QEMU
+**`lx-e1000-hw`** (Вехи 69–72) НЕ запускают из vsh — его спавнит init как userspace-драйвер, когда в QEMU
 есть e1000 (x86, `-device e1000`): маппит BAR по MMIO-cap, читает MAC/STATUS с реального железа,
-**передаёт кадр по DMA** и **гоняет ARP round-trip** (TX-запрос → RX-ответ шлюза) через кольца на DMA-cap.
+**передаёт кадр по DMA**, **гоняет ARP round-trip** (TX-запрос → RX-ответ шлюза) через кольца на DMA-cap,
+и **принимает ARP-ответ ПО ПРЕРЫВАНИЮ** (Веха 72: `request_irq`↔`vsys_irq_wait` по IRQ-cap start_cap 2 —
+планировщик Lx_kit спит на прерывании, ISR читает ICR и будит задачу; не опрос DD).

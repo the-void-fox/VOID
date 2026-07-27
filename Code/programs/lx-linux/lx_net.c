@@ -21,6 +21,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "lx_sched.h" /* lx_irq_register — request_irq заводит IRQ в планировщике (Веха 72) */
+
 /* Настоящий DMA поверх DMA-cap VOID (SYS_DMA_ALLOC) — только в сборке драйвера (-DLX_HAVE_SYSCALL,
  * -I${void-libc}/lib). В сборке-«вычислялке» (Веха 68) DMA не зовётся → остаётся куча-версия. */
 #ifdef LX_HAVE_SYSCALL
@@ -28,6 +30,10 @@
 static uintptr_t lx_dma_cap    = VOID_NO_CAP;
 static uintptr_t lx_dma_va_next = 0x58000000UL; /* DMA_BASE, как в lx_emul (Веха 54) */
 void lx_net_set_dma_cap(uintptr_t cap) { lx_dma_cap = cap; }
+
+/* IRQ-cap драйвера (start_cap 2): request_irq регистрирует им обработчик в планировщике. */
+static uintptr_t lx_irq_cap = VOID_NO_CAP;
+void lx_net_set_irq_cap(uintptr_t cap) { lx_irq_cap = cap; }
 #endif
 
 /* ─ состояние системы (e1000 shutdown отличает выключение) ─ */
@@ -208,10 +214,29 @@ void skb_tx_timestamp(struct sk_buff *skb) { (void)skb; }
 void __vlan_hwaccel_put_tag(struct sk_buff *skb, __be16 proto, u16 tci) { (void)skb; (void)proto; (void)tci; }
 void tcp_v6_gso_csum_prep(struct sk_buff *skb) { (void)skb; }
 
-/* ─ IRQ (реальный IRQ — задача на SYS_IRQ_WAIT, следующая веха) ─ */
+/* ─ IRQ: регистрируем обработчик в планировщике (Веха 72). Он спит на IRQ-cap (vsys_irq_wait) в
+ *   idle-пути и по прерыванию карты зовёт handler. Без IRQ-cap («вычислялка» Веха 68 / нет права) —
+ *   no-op, как раньше. irqreturn_t (enum, int-размер) → lx_irq_handler_t (int) кастуем. ─ */
 int  request_irq(unsigned int irq, irq_handler_t h, unsigned long flags, const char *name, void *dev)
-{ (void)irq; (void)h; (void)flags; (void)name; (void)dev; return 0; }
-void free_irq(unsigned int irq, void *dev) { (void)irq; (void)dev; }
+{
+	(void)flags; (void)name;
+#ifdef LX_HAVE_SYSCALL
+	if (lx_irq_cap != VOID_NO_CAP) {
+		lx_irq_register((int)irq, lx_irq_cap, (lx_irq_handler_t)h, dev);
+		return 0;
+	}
+#endif
+	(void)irq; (void)h; (void)dev;
+	return 0;
+}
+void free_irq(unsigned int irq, void *dev)
+{
+	(void)dev;
+#ifdef LX_HAVE_SYSCALL
+	lx_irq_unregister((int)irq);
+#endif
+	(void)irq;
+}
 void disable_irq(unsigned int irq) { (void)irq; }
 void enable_irq(unsigned int irq) { (void)irq; }
 void synchronize_irq(unsigned int irq) { (void)irq; }

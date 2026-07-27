@@ -28,6 +28,10 @@
 
 #include "lx_sched.h" /* кооперативный планировщик (Веха 62) */
 
+#ifdef LX_HAVE_SYSCALL
+#include <syscall.h> /* vsys_irq_wait — доставка IRQ в idle-пути планировщика (Веха 72) */
+#endif
+
 static void lx_jiffies_update(void); /* двигает jiffies по монотонному времени VOID (Веха 63) */
 
 void *kmalloc(size_t size, gfp_t flags)
@@ -965,6 +969,34 @@ struct lx_task *lx_task_self(void)
 	return sched_current;
 }
 
+/* ─── доставка IRQ (Веха 72) ──────────────────────────────────────────────────
+ * Один зарегистрированный обработчик на устройство. Планировщик в idle-пути спит на
+ * vsys_irq_wait(cap) и по прерыванию карты зовёт handler в softirq-контексте. Регистрация живёт и
+ * в сборке-«вычислялке» (Веха 68, без syscall.h) — просто никто не регистрирует IRQ (active=0),
+ * и idle-путь его не трогает; сам vsys_irq_wait компилируется только под LX_HAVE_SYSCALL. */
+static struct {
+	int              irq;
+	uintptr_t        cap;
+	lx_irq_handler_t handler;
+	void            *dev;
+	int              active;
+} lx_the_irq;
+
+void lx_irq_register(int irq, uintptr_t cap, lx_irq_handler_t handler, void *dev)
+{
+	lx_the_irq.irq = irq;
+	lx_the_irq.cap = cap;
+	lx_the_irq.handler = handler;
+	lx_the_irq.dev = dev;
+	lx_the_irq.active = 1;
+}
+
+void lx_irq_unregister(int irq)
+{
+	(void)irq;
+	lx_the_irq.active = 0;
+}
+
 void lx_sched_run(void)
 {
 	struct lx_task *t, *next;
@@ -985,14 +1017,27 @@ void lx_sched_run(void)
 		}
 
 		/* Готовых задач нет: если тикают таймеры — простаиваем по РЕАЛЬНОМУ времени до
-		 * ближайшего срока и идём на новый круг (там он выстрелит и разблокирует задачу);
-		 * если и таймеров нет — работа окончена. */
+		 * ближайшего срока и идём на новый круг (там он выстрелит и разблокирует задачу). */
 		if (lx_timers_next(&next_exp)) {
 			do
 				lx_jiffies_update();
 			while (time_before(jiffies, next_exp)); /* idle-ожидание тика */
 			continue;
 		}
+#ifdef LX_HAVE_SYSCALL
+		/* Таймеров нет, но зарегистрирован IRQ — уснуть на прерывании устройства (SYS_IRQ_WAIT,
+		 * Веха 52): весь процесс блокируется в ядре до реального прерывания карты; по возврату
+		 * зовём handler в softirq-контексте (sched_current == NULL) — он будит ждущую задачу. */
+		if (lx_the_irq.active) {
+			if (!vsys_irq_wait(lx_the_irq.cap)) { /* нет права/ошибка — не крутиться вхолостую */
+				lx_the_irq.active = 0;
+				break;
+			}
+			lx_the_irq.handler(lx_the_irq.irq, lx_the_irq.dev);
+			continue;
+		}
+#endif
+		/* Ни готовых задач, ни таймеров, ни IRQ — работа окончена. */
 		break;
 	}
 
