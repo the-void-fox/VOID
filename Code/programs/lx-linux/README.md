@@ -1,4 +1,4 @@
-# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–68, dde_linux-конвейер)
+# lx-linux — неизменённый код ядра Linux на VOID (Вехи 55–69, dde_linux-конвейер)
 
 Порт реальных `.c` из ядра Linux: неизменённый файл ядра компилируется против рукописных
 шим-заголовков `linux/*.h` («lx_emul-заголовки») + C-рантайма `lx_kit.c` (Lx_kit) и работает на
@@ -38,8 +38,15 @@ VOID. Растёт по мере роста портируемого кода к
   шимов (`netdevice.h`/`skbuff.h`/`etherdevice.h`/`dma-mapping.h`/`ethtool.h`/`mii.h`/`interrupt.h`/… —
   ~25 новых заголовков) + рантайма `lx_kit.c` + сетевых заглушек `lx_net.c` («generated_dummies»).
   0 ошибок/0 предупреждений на обеих арх. Харнесс зовёт ЧИСТУЮ логику `e1000_hw.c`
-  (`set_mac_type`: 0x100E→e1000_82540; `set_media_type`: читает STATUS через `er32`→`readl`). Полный
-  probe/open/TX/RX против настоящего QEMU-e1000 по MMIO/DMA/IRQ-cap — следующая веха.
+  (`set_mac_type`: 0x100E→e1000_82540; `set_media_type`: читает STATUS через `er32`→`readl`).
+- **Веха 69** — **портированный e1000 на НАСТОЯЩЕМ QEMU-e1000 через MMIO-cap** (`lx-e1000-hw`):
+  тот же неизменённый `e1000_hw.c` спавнится init'ом как userspace-драйвер (путь Вех 51–54), маппит
+  BAR0 по MMIO-cap (`vsys_mmio_map`/`SYS_MMIO_MAP`, `start_cap 0`) в `hw->hw_addr` — и через `er32`/`ew32`
+  сбрасывает РЕАЛЬНУЮ карту, читает STATUS, а **MAC — из EEPROM реального e1000** (QEMU эмулирует
+  microwire-EEPROM/PHY сам). Bring-up идёт КАК задача Lx_kit (vendored `msleep` уступает). Проверено
+  (x86, QEMU `-device e1000,mac=…99`): `STATUS=0x80080783 link UP`, `reset_hw` («Issuing a global reset
+  to MAC»), `MAC=52:54:00:12:34:99` (совпал с заданным!), `speed=1000 duplex=full — OK`. riscv-virt
+  e1000 нет → собирается/импортируется, не спавнится (как C-драйвер Вехи 54). DMA/кольца TX-RX/IRQ — дальше.
 
 ## Что здесь
 
@@ -126,7 +133,9 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   **`main_driver.c`** — driver-model (module_init → register → match → probe → remove);
   **`main_pci.c`** — PCI (синтетический 8086:100E → match по id_table → probe читает BAR и конфиг);
   **`main_e1000.c`** — **сам драйвер e1000**: линкует vendored `e1000_*.c` + `lx_kit.c` + `lx_net.c`,
-  зовёт чистую логику `e1000_hw.c` (`set_mac_type` 0x100E→e1000_82540, `set_media_type` через `er32`→`readl`).
+  зовёт чистую логику `e1000_hw.c` (`set_mac_type` 0x100E→e1000_82540, `set_media_type` через `er32`→`readl`);
+  **`drv_e1000.c`** — **тот же e1000 на РЕАЛЬНОМ QEMU-e1000** (Веха 69): спавнится init'ом, маппит BAR0 по
+  MMIO-cap (`syscall.h`/`vsys_mmio_map`), bring-up (reset+EEPROM-MAC+STATUS) vendored-кодом как задача Lx_kit.
 
 Лицензии: vendored-файлы Linux остаются под GPL-2.0 (свои SPDX-заголовки); шимы, рантайм и харнессы —
 код проекта. Хостинг Linux-драйверов по природе смешивает лицензии (портируемые части — GPL).
@@ -148,8 +157,11 @@ nix-build nix -A <arch>.lx_work    # workqueue.h/lx_kit.c (рабочие оче
 nix-build nix -A <arch>.lx_driver  # device.h/module.h/lx_kit.c (driver-model) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_pci     # pci.h/ioport.h/lx_kit.c (шина PCI) + harness → VOID-ELF
 nix-build nix -A <arch>.lx_e1000_port  # vendored e1000_*.c + netdev-шимы + lx_kit.c + lx_net.c → lx-e1000
+nix-build nix -A <arch>.lx_e1000_drv   # + drv_e1000.c (MMIO-cap, syscall.h) → lx-e1000-hw (userspace-драйвер)
 void-store-import void-disk.img put result/bin/lx-<имя> bin/<arch>/lx-<имя>   # для каждого
 ```
 Запуск в vsh: `run bin/lx-sort` / `lx-argv` / `lx-list` / `lx-bits` / `lx-err` / `lx-io` / `lx-delay` /
 `lx-sched` / `lx-timer` / `lx-wait` / `lx-work` / `lx-driver` / `lx-pci` / **`lx-e1000`** (чистые
 вычислялки, обе арх). `lx-e1000` печатает `mac_type=5 media=0 — OK` — vendored e1000-код исполняется на VOID.
+**`lx-e1000-hw`** (Веха 69) НЕ запускают из vsh — его спавнит init как userspace-драйвер, когда в QEMU
+есть e1000 (x86, `-device e1000`): маппит BAR по MMIO-cap и читает MAC/STATUS с реального железа.

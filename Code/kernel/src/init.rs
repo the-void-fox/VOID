@@ -226,9 +226,14 @@ pub fn boot() {
     // `lx_e1000` (Веха 53). Права те же: MMIO-cap на регистры, DMA-cap, IRQ-cap (прерывание карты →
     // VEC_USERDRV). Тихо пропускается, если e1000 нет. (Сырой демо Вех 51–52 — bin/e1000d, образец.)
     if arch::probe_e1000().is_some() {
-        let (driver, started) = match spawn("lx_e1000_c") {
-            Some(pid) => ("lx_e1000_c", Some(pid)),
-            None => ("lx_e1000", spawn("lx_e1000")),
+        // Веха 69 — предпочесть ПОРТИРОВАННЫЙ e1000 (неизменённый e1000_hw.c ядра Linux через
+        // MMIO-cap, `lx-e1000-hw`), если импортирован; иначе C-драйвер Вехи 54, иначе Rust-каркас.
+        let (driver, started) = match spawn("lx-e1000-hw") {
+            Some(pid) => ("lx-e1000-hw", Some(pid)),
+            None => match spawn("lx_e1000_c") {
+                Some(pid) => ("lx_e1000_c", Some(pid)),
+                None => ("lx_e1000", spawn("lx_e1000")),
+            },
         };
         if let Some(pid) = started {
             match (mint_cap(pid, "mmio:e1000", &[]), mint_cap(pid, "dma", &[])) {

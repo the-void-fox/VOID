@@ -44,6 +44,9 @@ let
           cp libvoid.a void.specs void-decls.h $out/lib/
           # заголовок Linux-API шима — драйверам (чистый API, без syscall.h)
           cp lx_emul.h $out/lib/
+          # syscall.h — прямой доступ к vsys_* (start_cap/mmio_map/exit); нужен портированному
+          # e1000-драйверу (Веха 69), который читает caps сам, а не через lx_emul-обёртку
+          cp syscall.h $out/lib/
           cp $linkerScript $out/lib/void.ld
         '';
       };
@@ -379,6 +382,29 @@ let
         installPhase = ''
           mkdir -p $out/bin
           cp lx-e1000 $out/bin/
+        '';
+      };
+
+      # lx_e1000_drv (Веха 69) — тот же НЕИЗМЕНЁННЫЙ e1000, но спавнится init'ом как userspace-драйвер
+      # и ходит к НАСТОЯЩЕМУ QEMU-e1000: main() маппит BAR0 по MMIO-cap (SYS_MMIO_MAP, start_cap 0),
+      # кладёт окно в hw->hw_addr, а vendored e1000_hw.c через er32/ew32 сбрасывает карту и читает
+      # MAC/скорость с реального железа. Bring-up — как задача Lx_kit (msleep уступает). syscall.h из
+      # void-libc даёт vsys_*. e1000 в QEMU — только x86; на riscv собирается/импортируется, не спавнится.
+      lx_e1000_drv = stdenv.mkDerivation {
+        pname = "lx-e1000-hw";
+        version = "0.69";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -Ilinux-src/e1000 -I${void-libc}/lib -DCONFIG_64BIT \
+            -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
+            drv_e1000.c linux-src/e1000/e1000_main.c linux-src/e1000/e1000_hw.c \
+            linux-src/e1000/e1000_param.c lx_kit.c lx_net.c -o lx-e1000-hw
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-e1000-hw $out/bin/
         '';
       };
 

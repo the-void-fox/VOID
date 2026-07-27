@@ -174,9 +174,18 @@ status: active
        bitops) + рантайма `lx_kit.c` + сетевых заглушек `lx_net.c` («generated_dummies»). 0 ошибок/
        0 предупреждений обе арх. Харнесс `main_e1000.c` зовёт ЧИСТУЮ логику `e1000_hw.c`: `set_mac_type`
        (0x100E→e1000_82540), `set_media_type` (читает STATUS через `er32`→`readl`) → `mac_type=5 media=0
-       OK`, обе арх идентично. **Vendored e1000-код исполняется на VOID.** Дальше — оживить: probe/open/
-       TX/RX/ISR против настоящего QEMU-e1000 по MMIO/DMA/IRQ-cap ([[userspace-drivers]], [[irq]]), мост
-       RX/TX ↔ `net-srv` → `ping` через ПОРТИРОВАННЫЙ e1000; тот же конвейер закроет Atheros/EHCI/wifi X54C. ← следующее
+       OK`, обе арх идентично. **Vendored e1000-код исполняется на VOID.**
+     - ✅ **Портированный e1000 читает НАСТОЯЩИЙ QEMU-e1000 через MMIO-cap** (Веха 69, [[lx-e1000-hw]]):
+       тот же неизменённый `e1000_hw.c` спавнится init'ом как userspace-драйвер (путь Вех 51–54), маппит
+       BAR0 по MMIO-cap (`vsys_mmio_map`, start_cap 0) в `hw->hw_addr` — и через `er32`/`ew32` сбрасывает
+       РЕАЛЬНУЮ карту, читает STATUS, а MAC — из EEPROM реального e1000 (QEMU эмулирует microwire/PHY сам).
+       Bring-up идёт как задача Lx_kit (vendored `msleep` уступает). `syscall.h` теперь ставится в void-libc;
+       `init.rs` предпочитает `lx-e1000-hw`. Проверено (x86, `-device e1000,mac=…99`): `STATUS=0x80080783
+       link UP`, `reset_hw`, `MAC=52:54:00:12:34:99` (совпал с заданным!), `speed=1000 duplex=full — OK`.
+       Регрессии чисты (x86 без e1000 — `ping` ок; riscv — не спавнится). **Портированный драйвер трогает
+       реальное железо.** Дальше — DMA-кольца (`dma_alloc_coherent`↔DMA-cap) + IRQ (`request_irq`↔задача на
+       `vsys_irq_wait`) + open/TX/RX/ISR-NAPI, мост RX/TX ↔ `net-srv` → `ping` через ПОРТИРОВАННЫЙ e1000;
+       тот же конвейер закроет Atheros/EHCI/wifi X54C. ← следующее
    - Своими силами ещё: EHCI, NVMe, UEFI-GOP (framebuffer). GPU-3D = порт Linux DRM+Mesa (гора).
    - TCP + DHCP/конфиг (настоящая сеть на реальной LAN, не только QEMU-SLIRP).
    - Без IOMMU dma-cap = «DMA куда угодно» (драйвер доверенный); настоящая изоляция — потом.
