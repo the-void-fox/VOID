@@ -19,6 +19,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use void_user as sys;
@@ -60,6 +61,63 @@ static ALLOC: Bump = Bump;
 
 const DEFAULT_PATH: &[u8] = b"/etc/system/default.vv";
 const CURRENT_ROOT: &[u8] = b"system/current";
+
+// ── текущий каталог сессии (глобальный: процесс однопоточный, гонок нет) ───────
+struct Cwd {
+    buf: UnsafeCell<[u8; 256]>,
+    len: AtomicUsize,
+}
+unsafe impl Sync for Cwd {}
+static CWD: Cwd = Cwd {
+    buf: UnsafeCell::new([b'/'; 256]),
+    len: AtomicUsize::new(1), // "/"
+};
+
+fn cwd_get(out: &mut [u8]) -> usize {
+    let len = CWD.len.load(Ordering::Relaxed);
+    let src = unsafe { &*CWD.buf.get() };
+    let n = len.min(out.len());
+    out[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+fn cwd_set(path: &[u8]) {
+    let dst = unsafe { &mut *CWD.buf.get() };
+    let n = path.len().min(dst.len());
+    dst[..n].copy_from_slice(&path[..n]);
+    CWD.len.store(n, Ordering::Relaxed);
+}
+
+/// Разрешить путь относительно cwd в АБСОЛЮТНЫЙ нормализованный (`.`/`..`/`//` схлопнуты).
+fn resolve(rel: &[u8]) -> Vec<u8> {
+    let mut cwdbuf = [0u8; 256];
+    let cwdn = cwd_get(&mut cwdbuf);
+    let mut comps: Vec<&[u8]> = Vec::new();
+    if rel.first() != Some(&b'/') {
+        for c in cwdbuf[..cwdn].split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            comps.push(c);
+        }
+    }
+    for c in rel.split(|&b| b == b'/') {
+        match c {
+            b"" | b"." => {}
+            b".." => {
+                comps.pop();
+            }
+            _ => comps.push(c),
+        }
+    }
+    let mut out = Vec::new();
+    if comps.is_empty() {
+        out.push(b'/');
+    } else {
+        for c in &comps {
+            out.push(b'/');
+            out.extend_from_slice(c);
+        }
+    }
+    out
+}
 
 // ── программа ───────────────────────────────────────────────────────────────
 #[no_mangle]
@@ -242,10 +300,12 @@ fn cmd_repl() -> ! {
     let loader = vvsh_core::NoLoader;
     let interp = vvsh_core::Interp::new(&loader);
     let env = shell_env(); // ПЕРСИСТЕНТНОЕ окружение сессии (чистые builtins + команды-эффекты)
-    let mut line = [0u8; 512];
+    let mut line = [0u8; LINE_CAP];
+    let mut hist = History::new();
     loop {
-        sys::write("vvsh> ".as_bytes());
-        let len = match read_line(&mut line) {
+        let mut pbuf = [0u8; 300];
+        let plen = build_prompt(&mut pbuf);
+        let len = match read_line(&pbuf[..plen], &mut line, &hist) {
             Some(l) => l,
             None => {
                 sys::write(b"\n");
@@ -256,6 +316,7 @@ fn cmd_repl() -> ! {
         if src.is_empty() {
             continue;
         }
+        hist.push(src);
         if src == b"exit" || src == b"(exit)" || src == b"quit" || src == b"(quit)" {
             break;
         }
@@ -308,7 +369,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
         Err(_) => return sys::write("vvsh: имя команды не UTF-8\n".as_bytes()),
     };
     match env.lookup(head) {
-        Some(v) if is_callable(&v) => match build_command_form(&words) {
+        Some(v) if is_callable(&v) => match build_command_form(&words, env) {
             Ok(form) => match interp.eval(&form, env) {
                 Ok(result) => render(&result), // вывод команды-данных (ls) рендерит хост
                 Err(e) => print_err(&e),
@@ -333,15 +394,31 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
 }
 
 /// Собрать форму применения `(имя "арг"…)` из слов команды (первое — символ, остальные — строки).
-fn build_command_form(words: &[&[u8]]) -> Result<Value, alloc::string::String> {
+/// Аргумент `$name` подставляется значением Lisp-переменной `name` (шелл-переменные = Lisp-переменные;
+/// несвязано → пустая строка, как в bash). Литеральный `$` — экранируй Lisp-режимом.
+fn build_command_form(words: &[&[u8]], env: &Env) -> Result<Value, alloc::string::String> {
     let head = core::str::from_utf8(words[0]).map_err(|_| str_owned("имя команды не UTF-8"))?;
     let mut items = alloc::vec::Vec::with_capacity(words.len());
     items.push(Value::sym(head));
     for w in &words[1..] {
-        let s = core::str::from_utf8(w).map_err(|_| str_owned("аргумент не UTF-8"))?;
-        items.push(Value::str(s));
+        if w.first() == Some(&b'$') && w.len() > 1 {
+            let name = core::str::from_utf8(&w[1..]).map_err(|_| str_owned("$-имя не UTF-8"))?;
+            let val = env.lookup(name).map(|v| arg_string(&v)).unwrap_or_default();
+            items.push(Value::str(&val));
+        } else {
+            let s = core::str::from_utf8(w).map_err(|_| str_owned("аргумент не UTF-8"))?;
+            items.push(Value::str(s));
+        }
     }
     Ok(Value::list(items))
+}
+
+/// Значение → строка-аргумент команды: строка — как есть (без кавычек), прочее — каноничной формой.
+fn arg_string(v: &Value) -> String {
+    match v {
+        Value::Str(s) => String::from(&**s),
+        other => alloc::format!("{}", other),
+    }
 }
 
 /// Спавн программы с NUL-разделёнными строковыми аргументами (наследует права shell'а через exec).
@@ -383,14 +460,19 @@ fn render(v: &Value) {
         Value::List(items) if items.is_empty() => {}
         Value::List(items) => {
             for it in items.iter() {
-                match it {
-                    Value::Str(s) => {
-                        sys::write(s.as_bytes());
-                        sys::write(b"\n");
-                    }
-                    other => sys::write(alloc::format!("{}\n", other).as_bytes()),
-                }
+                render_atom(it);
             }
+        }
+        other => render_atom(other),
+    }
+}
+
+/// Один атом результата: строки — без кавычек (шелл-дружелюбно), прочее — каноничной формой.
+fn render_atom(v: &Value) {
+    match v {
+        Value::Str(s) => {
+            sys::write(s.as_bytes());
+            sys::write(b"\n");
         }
         other => sys::write(alloc::format!("{}\n", other).as_bytes()),
     }
@@ -409,6 +491,8 @@ fn shell_env() -> Env {
         ("echo", sh_echo),
         ("run", sh_run),
         ("grep", sh_grep),
+        ("cd", sh_cd),
+        ("pwd", sh_pwd),
     ];
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
@@ -420,9 +504,9 @@ fn shell_env() -> Env {
 /// печать: так `ls` течёт в конвейер `(| (ls) (grep "vv"))`, а на верхнем уровне REPL сам его рендерит.
 fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
     let ep = sys::start_cap(0);
-    let path: &[u8] = match args.first() {
-        None => b"/",
-        Some(Value::Str(s)) => s.as_bytes(),
+    let path = match args.first() {
+        None => resolve(b""), // текущий каталог
+        Some(Value::Str(s)) => resolve(s.as_bytes()),
         Some(other) => {
             return Err(EvalError::new(alloc::format!(
                 "ls: путь — строка, дано {}",
@@ -431,7 +515,7 @@ fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
         }
     };
     let mut buf = [0u8; 4096];
-    let n = px::readdir(ep, path, &mut buf);
+    let n = px::readdir(ep, &path, &mut buf);
     let mut items = alloc::vec::Vec::new();
     for name in buf[..n].split(|&b| b == b'\n') {
         if name.is_empty() {
@@ -473,14 +557,42 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// `(cd [путь])` — сменить текущий каталог (без пути — в корень). Проверяет, что это каталог.
+fn sh_cd(args: &[Value]) -> Result<Value, EvalError> {
+    let ep = sys::start_cap(0);
+    let target = match args.first() {
+        None => alloc::vec![b'/'],
+        Some(Value::Str(s)) => resolve(s.as_bytes()),
+        Some(_) => return Err(EvalError::new("cd: путь — строка")),
+    };
+    match px::stat(ep, &target) {
+        Some((true, _)) => {
+            cwd_set(&target);
+            Ok(Value::nil())
+        }
+        Some((false, _)) => Err(EvalError::new("cd: не каталог")),
+        None => Err(EvalError::new("cd: нет такого каталога")),
+    }
+}
+
+/// `(pwd)` — вернуть текущий каталог (строкой; хост его отрендерит).
+fn sh_pwd(_args: &[Value]) -> Result<Value, EvalError> {
+    let mut buf = [0u8; 256];
+    let n = cwd_get(&mut buf);
+    match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => Ok(Value::str(s)),
+        Err(_) => Err(EvalError::new("pwd: путь не UTF-8")),
+    }
+}
+
 /// `(cat путь)` — вывести содержимое файла.
 fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
     let ep = sys::start_cap(0);
     let path = match args.first() {
-        Some(Value::Str(s)) => s.as_bytes(),
+        Some(Value::Str(s)) => resolve(s.as_bytes()),
         _ => return Err(EvalError::new("cat: нужен путь-строка")),
     };
-    match read_file(ep, path) {
+    match read_file(ep, &path) {
         Some(bytes) => {
             if !bytes.is_empty() {
                 sys::write(&bytes);
@@ -537,35 +649,231 @@ fn sh_run(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Int(code as i64))
 }
 
-/// Прочитать строку с консоли: эхо набранного + backspace (`\x7f`/`\x08`), конец — `\r`/`\n`.
-/// `None` — EOF (пустой ввод при закрытом stdin). Минимальный редактор; стрелки/история — позже.
-fn read_line(line: &mut [u8]) -> Option<usize> {
-    let mut len = 0usize;
-    loop {
-        let mut b = [0u8; 1];
-        if sys::read_stdin(&mut b) == 0 {
-            return if len == 0 { None } else { Some(len) };
+// ── редактор строки (S2c ч.2): история ↑/↓, курсор ←/→/Home/End, backspace/Delete ──
+// Байт-ориентированный (курсор в колонках=байтах — ASCII точен; многобайтные символы редактируются
+// грубо, но для команд/путей хватает). vsh (спасательный шелл) НЕ трогаем — свой редактор здесь.
+
+const HISTN: usize = 8;
+const LINE_CAP: usize = 256;
+
+struct History {
+    buf: [[u8; LINE_CAP]; HISTN],
+    len: [usize; HISTN],
+    head: usize,  // следующий слот записи
+    count: usize, // сохранено (≤ HISTN)
+}
+
+impl History {
+    fn new() -> Self {
+        History { buf: [[0; LINE_CAP]; HISTN], len: [0; HISTN], head: 0, count: 0 }
+    }
+    fn push(&mut self, line: &[u8]) {
+        if line.is_empty() {
+            return;
         }
-        match b[0] {
-            b'\r' | b'\n' => {
-                sys::write(b"\r\n");
-                return Some(len);
+        if self.count > 0 {
+            let last = (self.head + HISTN - 1) % HISTN;
+            if self.buf[last][..self.len[last]] == *line {
+                return; // не дублировать подряд
             }
-            0x7f | 0x08 => {
-                if len > 0 {
-                    len -= 1;
-                    sys::write(b"\x08 \x08"); // стереть символ на терминале
+        }
+        let n = line.len().min(LINE_CAP);
+        self.buf[self.head][..n].copy_from_slice(&line[..n]);
+        self.len[self.head] = n;
+        self.head = (self.head + 1) % HISTN;
+        if self.count < HISTN {
+            self.count += 1;
+        }
+    }
+    fn get(&self, back: usize) -> Option<&[u8]> {
+        if back == 0 || back > self.count {
+            return None;
+        }
+        let slot = (self.head + HISTN - back) % HISTN;
+        Some(&self.buf[slot][..self.len[slot]])
+    }
+}
+
+/// Прочитать строку с редактированием. `None` — EOF (Ctrl-D на пустой). `hb` — просмотр истории.
+fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
+    let mut llen = 0usize;
+    let mut pos = 0usize;
+    let mut esc = 0u8; // 0 обычный, 1 после ESC, 2 после ESC[
+    let mut hb = 0usize; // индекс истории (0 — свежая строка)
+    let mut inb = [0u8; 16];
+    sys::write(prompt);
+    loop {
+        let n = sys::read_stdin(&mut inb);
+        if n == 0 {
+            return if llen == 0 { None } else { Some(llen) };
+        }
+        for &b in &inb[..n] {
+            match esc {
+                1 => esc = if b == b'[' { 2 } else { 0 },
+                2 => {
+                    if b.is_ascii_digit() || b == b';' {
+                        continue; // параметр CSI — копим до финального байта
+                    }
+                    esc = 0;
+                    match b {
+                        b'C' => {
+                            if pos < llen {
+                                pos += 1;
+                                sys::write(b"\x1b[C");
+                            }
+                        }
+                        b'D' => {
+                            if pos > 0 {
+                                pos -= 1;
+                                sys::write(b"\x1b[D");
+                            }
+                        }
+                        b'H' => {
+                            pos = 0;
+                            redraw(prompt, line, llen, pos);
+                        }
+                        b'F' => {
+                            pos = llen;
+                            redraw(prompt, line, llen, pos);
+                        }
+                        b'A' => {
+                            if hb < hist.count {
+                                hb += 1;
+                                if let Some(h) = hist.get(hb) {
+                                    llen = h.len().min(line.len());
+                                    line[..llen].copy_from_slice(&h[..llen]);
+                                    pos = llen;
+                                    redraw(prompt, line, llen, pos);
+                                }
+                            }
+                        }
+                        b'B' => {
+                            if hb > 1 {
+                                hb -= 1;
+                                if let Some(h) = hist.get(hb) {
+                                    llen = h.len().min(line.len());
+                                    line[..llen].copy_from_slice(&h[..llen]);
+                                }
+                            } else {
+                                hb = 0;
+                                llen = 0;
+                            }
+                            pos = llen;
+                            redraw(prompt, line, llen, pos);
+                        }
+                        b'~' => {
+                            if pos < llen {
+                                line.copy_within(pos + 1..llen, pos);
+                                llen -= 1;
+                                redraw(prompt, line, llen, pos);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            c => {
-                if len < line.len() {
-                    line[len] = c;
-                    len += 1;
-                    sys::write(&b[..1]); // эхо
-                }
+                _ => match b {
+                    b'\r' | b'\n' => {
+                        sys::write(b"\r\n");
+                        return Some(llen);
+                    }
+                    0x1b => esc = 1,
+                    0x7f | 0x08 => {
+                        if pos > 0 {
+                            line.copy_within(pos..llen, pos - 1);
+                            pos -= 1;
+                            llen -= 1;
+                            redraw(prompt, line, llen, pos);
+                        }
+                    }
+                    0x04 => {
+                        if llen == 0 {
+                            return None; // Ctrl-D на пустой строке — EOF
+                        }
+                    }
+                    0x03 => {
+                        sys::write(b"^C\r\n"); // Ctrl-C — отменить строку
+                        return Some(0);
+                    }
+                    c if c >= 0x20 => {
+                        if llen < line.len() {
+                            line.copy_within(pos..llen, pos + 1);
+                            line[pos] = c;
+                            llen += 1;
+                            pos += 1;
+                            if pos == llen {
+                                sys::write(&[c]); // добавление в конец — просто эхо
+                            } else {
+                                redraw(prompt, line, llen, pos);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
             }
         }
     }
+}
+
+/// Перерисовать строку ввода целиком: в начало, приглашение, содержимое, стереть хвост, вернуть курсор.
+fn redraw(prompt: &[u8], line: &[u8], llen: usize, pos: usize) {
+    sys::write(b"\r");
+    sys::write(prompt);
+    sys::write(&line[..llen]);
+    sys::write(b"\x1b[K"); // стереть до конца строки
+    if pos < llen {
+        csi_num(llen - pos, b'D'); // курсор влево на (llen-pos) колонок
+    }
+}
+
+/// Записать управляющую последовательность `ESC[<n><fin>` (например, сдвиг курсора).
+fn csi_num(n: usize, fin: u8) {
+    if n == 0 {
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = 0;
+    buf[i] = 0x1b;
+    i += 1;
+    buf[i] = b'[';
+    i += 1;
+    let mut tmp = [0u8; 10];
+    let mut t = 0;
+    let mut m = n;
+    while m > 0 {
+        tmp[t] = b'0' + (m % 10) as u8;
+        t += 1;
+        m /= 10;
+    }
+    while t > 0 {
+        t -= 1;
+        buf[i] = tmp[t];
+        i += 1;
+    }
+    buf[i] = fin;
+    i += 1;
+    sys::write(&buf[..i]);
+}
+
+/// Собрать приглашение `vvsh:<cwd>> `.
+fn build_prompt(out: &mut [u8]) -> usize {
+    let mut i = 0;
+    for &b in b"vvsh:" {
+        out[i] = b;
+        i += 1;
+    }
+    let mut cwd = [0u8; 256];
+    let n = cwd_get(&mut cwd);
+    for &b in &cwd[..n] {
+        if i < out.len() - 2 {
+            out[i] = b;
+            i += 1;
+        }
+    }
+    out[i] = b'>';
+    i += 1;
+    out[i] = b' ';
+    i += 1;
+    i
 }
 
 // ── помощники store ──────────────────────────────────────────────────────────

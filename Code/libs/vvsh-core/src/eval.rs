@@ -92,6 +92,8 @@ impl<'a> Interp<'a> {
                         "and" => return self.sf_and(items, env),
                         "or" => return self.sf_or(items, env),
                         "|" => return self.sf_pipe(items, env),
+                        "map" => return self.sf_map(items, env),
+                        "filter" => return self.sf_filter(items, env),
                         "import" => return self.sf_import(items, env),
                         _ => {}
                     }
@@ -266,30 +268,64 @@ impl<'a> Interp<'a> {
     /// `(| seed этап…)` — конвейер (thread-last): значение течёт слева направо, вставляясь
     /// ПОСЛЕДНИМ аргументом каждого этапа. `(| (ls) (grep "x") count)` = `(count (grep "x" (ls)))`.
     /// Этап-список `(f a…)` → `(f a… acc)`; этап-символ/выражение `f` → `(f acc)`. Родной конвейер
-    /// на ЗНАЧЕНИЯХ (в VOID нет захвата stdout — течёт Value, а не байты).
+    /// на ЗНАЧЕНИЯХ (в VOID нет захвата stdout — течёт Value, а не байты). Значение «вжимаем» как
+    /// `(quote acc)` и вычисляем ВСЮ форму — так этапом годятся и функции, и спец-формы (`map`/`filter`).
     fn sf_pipe(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
         if items.len() < 2 {
             return Err(EvalError::new("|: (| значение этап…)"));
         }
         let mut acc = self.eval(&items[1], env)?;
         for stage in &items[2..] {
-            acc = match stage {
+            let quoted = Value::list(vec![Value::sym("quote"), acc]);
+            let form = match stage {
                 Value::List(call) if !call.is_empty() => {
-                    let func = self.eval(&call[0], env)?;
-                    let mut args = Vec::with_capacity(call.len());
-                    for a in &call[1..] {
-                        args.push(self.eval(a, env)?);
-                    }
-                    args.push(acc);
-                    self.apply(&func, &args)?
+                    let mut v = call.as_ref().clone();
+                    v.push(quoted);
+                    Value::list(v)
                 }
-                _ => {
-                    let func = self.eval(stage, env)?;
-                    self.apply(&func, &[acc])?
-                }
+                _ => Value::list(vec![stage.clone(), quoted]),
             };
+            acc = self.eval(&form, env)?;
         }
         Ok(acc)
+    }
+
+    /// `(map f список)` — применить `f` к каждому элементу, собрать список результатов.
+    fn sf_map(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() != 3 {
+            return Err(EvalError::new("map: (map функция список)"));
+        }
+        let f = self.eval(&items[1], env)?;
+        let lst = self.eval(&items[2], env)?;
+        let src = match &lst {
+            Value::List(i) => i,
+            _ => return Err(EvalError::new("map: второй аргумент — список")),
+        };
+        let mut out = Vec::with_capacity(src.len());
+        for e in src.iter() {
+            out.push(self.apply(&f, &[e.clone()])?);
+        }
+        Ok(Value::list(out))
+    }
+
+    /// `(filter предикат список)` — оставить элементы, на которых предикат истинен.
+    fn sf_filter(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() != 3 {
+            return Err(EvalError::new("filter: (filter предикат список)"));
+        }
+        let f = self.eval(&items[1], env)?;
+        let lst = self.eval(&items[2], env)?;
+        let src = match &lst {
+            Value::List(i) => i,
+            _ => return Err(EvalError::new("filter: второй аргумент — список")),
+        };
+        let mut out = Vec::new();
+        for e in src.iter() {
+            if self.apply(&f, &[e.clone()])?.truthy() {
+                out.push(e.clone());
+            }
+        }
+        Ok(Value::list(out))
     }
 
     /// `(import "имя")` — прочитать и вычислить модуль в СВЕЖЕМ окружении, вернуть его значение.

@@ -115,6 +115,27 @@ mod tests {
     }
 
     #[test]
+    fn map_and_filter() {
+        assert_eq!(
+            eval_str("(map (lambda (x) (* x x)) (list 1 2 3))"),
+            Value::list(vec![Value::Int(1), Value::Int(4), Value::Int(9)])
+        );
+        assert_eq!(
+            eval_str("(filter (lambda (x) (= x 2)) (list 1 2 3 2))"),
+            Value::list(vec![Value::Int(2), Value::Int(2)])
+        );
+        // спец-формы map/filter текут в конвейере (через (quote acc))
+        assert_eq!(
+            eval_str("(| (list 1 2 3) (map (lambda (x) (* x x))))"),
+            Value::list(vec![Value::Int(1), Value::Int(4), Value::Int(9)])
+        );
+        assert_eq!(
+            eval_str("(| (list 1 2 3 4) (filter (lambda (x) (= x 2))) count)"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
     fn quote_and_atoms() {
         assert_eq!(eval_str("'foo"), Value::sym("foo"));
         assert_eq!(eval_str("\"hi\\nthere\""), Value::str("hi\nthere"));
