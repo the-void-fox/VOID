@@ -83,8 +83,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         cmd_rebuild();
     } else if sub == b"gens" {
         cmd_gens();
+    } else if sub == b"repl" {
+        cmd_repl();
     } else if sub.is_empty() {
         sys::write("vvsh - конфиг/язык VOID (ADR 0006)\n".as_bytes());
+        sys::write("  vvsh repl         интерактивный Lisp-REPL (шелл; (exit) — назад в vsh)\n".as_bytes());
         sys::write("  vvsh eval FILE    вычислить .vv и напечатать нормализованный конфиг\n".as_bytes());
         sys::write("  vvsh init-config  посеять модульный конфиг /etc/system/*.vv\n".as_bytes());
         sys::write("  vvsh rebuild      /etc/system/default.vv → новое поколение (после ребута)\n".as_bytes());
@@ -223,6 +226,102 @@ fn cmd_gens() -> ! {
         sys::write("  (активное поколение не прочитать — нужен store READ)\n".as_bytes());
     }
     sys::exit(0);
+}
+
+/// `repl` (S2a) — интерактивный Lisp-REPL. Окружение ЖИВЁТ между строками (`(define x 5)` → потом
+/// `(+ x 10)` → 15). Пока чисто-вычислительный (без эффектов): доказывает, что язык работает
+/// интерактивно на VOID. Запуск из vsh: `run vvsh repl`; выход — `(exit)`/`exit`/EOF → назад в vsh
+/// (vsh остаётся внешним спасательным шеллом — если vvsh упадёт, он ловит обратно).
+fn cmd_repl() -> ! {
+    sys::write(
+        "vvsh REPL — Lisp VOID (ADR 0006). (exit) или Ctrl-D — назад в vsh.\n".as_bytes(),
+    );
+    let loader = vvsh_core::NoLoader;
+    let interp = vvsh_core::Interp::new(&loader);
+    let env = vvsh_core::root_env(); // ПЕРСИСТЕНТНОЕ окружение сессии
+    let mut line = [0u8; 512];
+    loop {
+        sys::write("vvsh> ".as_bytes());
+        let len = match read_line(&mut line) {
+            Some(l) => l,
+            None => {
+                sys::write(b"\n");
+                break; // EOF (Ctrl-D)
+            }
+        };
+        let src = trim(&line[..len]);
+        if src.is_empty() {
+            continue;
+        }
+        if src == b"exit" || src == b"(exit)" || src == b"quit" || src == b"(quit)" {
+            break;
+        }
+        let text = match core::str::from_utf8(src) {
+            Ok(t) => t,
+            Err(_) => {
+                sys::write("ошибка: ввод не UTF-8\n".as_bytes());
+                continue;
+            }
+        };
+        match vvsh_core::read_all(text) {
+            Ok(forms) => {
+                for f in &forms {
+                    match interp.eval(f, &env) {
+                        Ok(v) => print_value(&v),
+                        Err(e) => {
+                            sys::write("ошибка: ".as_bytes());
+                            sys::write(e.0.as_bytes());
+                            sys::write(b"\n");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                sys::write("ошибка разбора: ".as_bytes());
+                sys::write(e.0.as_bytes());
+                sys::write(b"\n");
+            }
+        }
+    }
+    sys::write("vvsh: выход из REPL — vsh продолжает\n".as_bytes());
+    sys::exit(0);
+}
+
+/// Печать значения-результата (каноничная форма Value).
+fn print_value(v: &vvsh_core::Value) {
+    let s = alloc::format!("{}\n", v);
+    sys::write(s.as_bytes());
+}
+
+/// Прочитать строку с консоли: эхо набранного + backspace (`\x7f`/`\x08`), конец — `\r`/`\n`.
+/// `None` — EOF (пустой ввод при закрытом stdin). Минимальный редактор; стрелки/история — позже.
+fn read_line(line: &mut [u8]) -> Option<usize> {
+    let mut len = 0usize;
+    loop {
+        let mut b = [0u8; 1];
+        if sys::read_stdin(&mut b) == 0 {
+            return if len == 0 { None } else { Some(len) };
+        }
+        match b[0] {
+            b'\r' | b'\n' => {
+                sys::write(b"\r\n");
+                return Some(len);
+            }
+            0x7f | 0x08 => {
+                if len > 0 {
+                    len -= 1;
+                    sys::write(b"\x08 \x08"); // стереть символ на терминале
+                }
+            }
+            c => {
+                if len < line.len() {
+                    line[len] = c;
+                    len += 1;
+                    sys::write(&b[..1]); // эхо
+                }
+            }
+        }
+    }
 }
 
 // ── помощники store ──────────────────────────────────────────────────────────
