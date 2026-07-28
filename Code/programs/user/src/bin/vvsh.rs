@@ -23,6 +23,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use void_user as sys;
 use void_user::posix as px;
+use vvsh_core::{Env, EvalError, Value};
 
 // ── глобальный аллокатор: bump поверх ленивой кучи процесса (heap_map) ──────────
 struct Bump;
@@ -228,17 +229,19 @@ fn cmd_gens() -> ! {
     sys::exit(0);
 }
 
-/// `repl` (S2a) — интерактивный Lisp-REPL. Окружение ЖИВЁТ между строками (`(define x 5)` → потом
-/// `(+ x 10)` → 15). Пока чисто-вычислительный (без эффектов): доказывает, что язык работает
-/// интерактивно на VOID. Запуск из vsh: `run vvsh repl`; выход — `(exit)`/`exit`/EOF → назад в vsh
-/// (vsh остаётся внешним спасательным шеллом — если vvsh упадёт, он ловит обратно).
+/// `repl` (S2a/S2b) — интерактивный шелл-REPL. Окружение ЖИВЁТ между строками (`(define x 5)` →
+/// потом `(* x x)` → 25). Гибридный синтаксис: строка с `(`/`'` — Lisp-выражение (eval + печать
+/// результата); иначе — КОМАНДА (голые слова, `ls /etc` ≡ `(ls "/etc")`; несвязанное имя → спавн
+/// программы, как PATH). Запуск из vsh: `run vvsh repl`; выход — `(exit)`/`exit`/Ctrl-D → назад в
+/// vsh (внешний спасательный шелл — если vvsh упадёт, он ловит обратно).
 fn cmd_repl() -> ! {
     sys::write(
-        "vvsh REPL — Lisp VOID (ADR 0006). (exit) или Ctrl-D — назад в vsh.\n".as_bytes(),
+        "vvsh REPL — Lisp VOID (ADR 0006). `(...)` — Lisp; иначе команда. (exit) — назад в vsh.\n"
+            .as_bytes(),
     );
     let loader = vvsh_core::NoLoader;
     let interp = vvsh_core::Interp::new(&loader);
-    let env = vvsh_core::root_env(); // ПЕРСИСТЕНТНОЕ окружение сессии
+    let env = shell_env(); // ПЕРСИСТЕНТНОЕ окружение сессии (чистые builtins + команды-эффекты)
     let mut line = [0u8; 512];
     loop {
         sys::write("vvsh> ".as_bytes());
@@ -256,41 +259,237 @@ fn cmd_repl() -> ! {
         if src == b"exit" || src == b"(exit)" || src == b"quit" || src == b"(quit)" {
             break;
         }
-        let text = match core::str::from_utf8(src) {
-            Ok(t) => t,
-            Err(_) => {
-                sys::write("ошибка: ввод не UTF-8\n".as_bytes());
-                continue;
-            }
-        };
-        match vvsh_core::read_all(text) {
-            Ok(forms) => {
-                for f in &forms {
-                    match interp.eval(f, &env) {
-                        Ok(v) => print_value(&v),
-                        Err(e) => {
-                            sys::write("ошибка: ".as_bytes());
-                            sys::write(e.0.as_bytes());
-                            sys::write(b"\n");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                sys::write("ошибка разбора: ".as_bytes());
-                sys::write(e.0.as_bytes());
-                sys::write(b"\n");
-            }
+        if src[0] == b'(' || src[0] == b'\'' {
+            expr_line(&interp, &env, src); // Lisp-выражение
+        } else {
+            command_line(&interp, &env, src); // команда (голые слова)
         }
     }
     sys::write("vvsh: выход из REPL — vsh продолжает\n".as_bytes());
     sys::exit(0);
 }
 
+/// Строка-ВЫРАЖЕНИЕ (`(...)`): распарсить, вычислить каждую форму, напечатать непустой результат.
+fn expr_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
+    let text = match core::str::from_utf8(src) {
+        Ok(t) => t,
+        Err(_) => return sys::write("ошибка: ввод не UTF-8\n".as_bytes()),
+    };
+    match vvsh_core::read_all(text) {
+        Ok(forms) => {
+            for f in &forms {
+                match interp.eval(f, env) {
+                    Ok(v) => {
+                        if !is_nil(&v) {
+                            print_value(&v); // () (обычно результат команд) не печатаем
+                        }
+                    }
+                    Err(e) => print_err(&e),
+                }
+            }
+        }
+        Err(e) => {
+            sys::write("ошибка разбора: ".as_bytes());
+            sys::write(e.0.as_bytes());
+            sys::write(b"\n");
+        }
+    }
+}
+
+/// Строка-КОМАНДА (голые слова). Первое слово — имя, остальные — строковые аргументы. Разрешение:
+/// связано с вызываемым (builtin/замыкание) → вызвать (это команда, вывод от неё); связано со
+/// значением и без аргументов → показать (инспекция переменной); не связано → спавн программы (PATH).
+fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
+    let words: alloc::vec::Vec<&[u8]> = src
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return;
+    }
+    let head = match core::str::from_utf8(words[0]) {
+        Ok(s) => s,
+        Err(_) => return sys::write("vvsh: имя команды не UTF-8\n".as_bytes()),
+    };
+    match env.lookup(head) {
+        Some(v) if is_callable(&v) => match build_command_form(&words) {
+            Ok(form) => {
+                if let Err(e) = interp.eval(&form, env) {
+                    print_err(&e);
+                }
+            }
+            Err(m) => {
+                sys::write("vvsh: ".as_bytes());
+                sys::write(m.as_bytes());
+                sys::write(b"\n");
+            }
+        },
+        Some(v) => {
+            if words.len() == 1 {
+                print_value(&v); // инспекция переменной
+            } else {
+                sys::write("vvsh: '".as_bytes());
+                sys::write(words[0]);
+                sys::write("' — значение, а не команда (даны аргументы)\n".as_bytes());
+            }
+        }
+        None => spawn_program(words[0], &words[1..]), // PATH: несвязанное имя → программа
+    }
+}
+
+/// Собрать форму применения `(имя "арг"…)` из слов команды (первое — символ, остальные — строки).
+fn build_command_form(words: &[&[u8]]) -> Result<Value, alloc::string::String> {
+    let head = core::str::from_utf8(words[0]).map_err(|_| str_owned("имя команды не UTF-8"))?;
+    let mut items = alloc::vec::Vec::with_capacity(words.len());
+    items.push(Value::sym(head));
+    for w in &words[1..] {
+        let s = core::str::from_utf8(w).map_err(|_| str_owned("аргумент не UTF-8"))?;
+        items.push(Value::str(s));
+    }
+    Ok(Value::list(items))
+}
+
+/// Спавн программы с NUL-разделёнными строковыми аргументами (наследует права shell'а через exec).
+fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
+    let mut blob = alloc::vec::Vec::new();
+    for w in arg_words {
+        blob.extend_from_slice(w);
+        blob.push(0);
+    }
+    let code = px::spawn_args(sys::start_cap(1), name, &blob);
+    if code == usize::MAX {
+        sys::write("vvsh: команда не найдена: ".as_bytes());
+        sys::write(name);
+        sys::write(b"\n");
+    } else if code != 0 {
+        sys::write(alloc::format!("[код {}]\n", code).as_bytes());
+    }
+}
+
+fn is_callable(v: &Value) -> bool {
+    matches!(v, Value::Builtin(..) | Value::Closure(_))
+}
+
+fn is_nil(v: &Value) -> bool {
+    matches!(v, Value::List(items) if items.is_empty())
+}
+
+fn str_owned(s: &str) -> alloc::string::String {
+    alloc::string::String::from(s)
+}
+
+fn print_err(e: &EvalError) {
+    sys::write("ошибка: ".as_bytes());
+    sys::write(e.0.as_bytes());
+    sys::write(b"\n");
+}
+
 /// Печать значения-результата (каноничная форма Value).
-fn print_value(v: &vvsh_core::Value) {
-    let s = alloc::format!("{}\n", v);
-    sys::write(s.as_bytes());
+fn print_value(v: &Value) {
+    sys::write(alloc::format!("{}\n", v).as_bytes());
+}
+
+// ── команды-эффекты шелла (S2b): builtins в бинаре, дёргают синкаллы напрямую ──
+// vvsh-core остаётся ЧИСТЫМ (конфиг использует `root_env`, эти команды — только в REPL). Caps
+// приходят из `start_cap` (ambient процессу), вывод — `sys::write`; Host-trait не нужен.
+
+/// Окружение шелл-сессии: чистые builtins vvsh-core + команды-эффекты (`ls`/`cat`/`echo`/`run`).
+fn shell_env() -> Env {
+    let env = vvsh_core::root_env();
+    let cmds: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] =
+        &[("ls", sh_ls), ("cat", sh_cat), ("echo", sh_echo), ("run", sh_run)];
+    for (name, f) in cmds {
+        env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
+    }
+    env
+}
+
+/// `(ls [путь])` — список файлов каталога (по умолчанию `/`).
+fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
+    let ep = sys::start_cap(0);
+    let path: &[u8] = match args.first() {
+        None => b"/",
+        Some(Value::Str(s)) => s.as_bytes(),
+        Some(other) => {
+            return Err(EvalError::new(alloc::format!(
+                "ls: путь — строка, дано {}",
+                other.type_name()
+            )))
+        }
+    };
+    let mut buf = [0u8; 4096];
+    let n = px::readdir(ep, path, &mut buf);
+    if n > 0 {
+        sys::write(&buf[..n]);
+        if buf[n - 1] != b'\n' {
+            sys::write(b"\n");
+        }
+    }
+    Ok(Value::nil())
+}
+
+/// `(cat путь)` — вывести содержимое файла.
+fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
+    let ep = sys::start_cap(0);
+    let path = match args.first() {
+        Some(Value::Str(s)) => s.as_bytes(),
+        _ => return Err(EvalError::new("cat: нужен путь-строка")),
+    };
+    match read_file(ep, path) {
+        Some(bytes) => {
+            if !bytes.is_empty() {
+                sys::write(&bytes);
+                if *bytes.last().unwrap() != b'\n' {
+                    sys::write(b"\n");
+                }
+            }
+            Ok(Value::nil())
+        }
+        None => Err(EvalError::new("cat: файл не найден")),
+    }
+}
+
+/// `(echo арг…)` — напечатать аргументы через пробел (строки — как есть, прочее — каноничной формой).
+fn sh_echo(args: &[Value]) -> Result<Value, EvalError> {
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            sys::write(b" ");
+        }
+        match a {
+            Value::Str(s) => sys::write(s.as_bytes()),
+            other => sys::write(alloc::format!("{}", other).as_bytes()),
+        }
+    }
+    sys::write(b"\n");
+    Ok(Value::nil())
+}
+
+/// `(run "имя" "арг"…)` — запустить программу из store, вернуть код выхода (число).
+fn sh_run(args: &[Value]) -> Result<Value, EvalError> {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("run: имя программы — строка")),
+    };
+    let mut blob = alloc::vec::Vec::new();
+    for a in &args[1..] {
+        match a {
+            Value::Str(s) => {
+                blob.extend_from_slice(s.as_bytes());
+                blob.push(0);
+            }
+            other => {
+                return Err(EvalError::new(alloc::format!(
+                    "run: аргумент — строка, дано {}",
+                    other.type_name()
+                )))
+            }
+        }
+    }
+    let code = px::spawn_args(sys::start_cap(1), name.as_bytes(), &blob);
+    if code == usize::MAX {
+        return Err(EvalError::new(alloc::format!("run: '{}' не запустилась", name)));
+    }
+    Ok(Value::Int(code as i64))
 }
 
 /// Прочитать строку с консоли: эхо набранного + backspace (`\x7f`/`\x08`), конец — `\r`/`\n`.
