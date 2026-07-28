@@ -107,6 +107,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("freeze", include_bytes!(env!("PROG_FREEZE"))),
     ("e1000d", include_bytes!(env!("PROG_E1000D"))),
     ("lx_e1000", include_bytes!(env!("PROG_LX_E1000"))),
+    ("install", include_bytes!(env!("PROG_INSTALL"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
@@ -401,7 +402,15 @@ fn mem_report() {
 /// мигрируются: снимаем их, чтобы старые ELF не жили вечно якорями GC.
 fn seed_programs() {
     let (mut fresh, mut sown, mut updated, mut migrated) = (0usize, 0usize, 0usize, 0usize);
+    // `install` — только на install-НОСИТЕЛЕ (есть загрузочный модуль с образом диска). На
+    // установленной системе (загрузка с диска без модуля) сеять НЕ надо — команды установки там
+    // быть не должно; а если корень остался от прежней загрузки — снять его.
+    let install_media = arch::boot_module().is_some();
     for (name, bytes) in PROGRAMS {
+        if *name == "install" && !install_media {
+            object::del_root(&prog_root(name)); // не носитель — install отсутствует
+            continue;
+        }
         let root_name = prog_root(name);
         let id = object::put(bytes);
         match object::root(&root_name) {
@@ -420,12 +429,13 @@ fn seed_programs() {
         }
     }
     println!(
-        "  [seed] программы в store ({} корней bin/{}/*): {} актуально, {} посеяно, {} обновлено",
-        PROGRAMS.len(),
+        "  [seed] программы в store ({} корней bin/{}/*): {} актуально, {} посеяно, {} обновлено{}",
+        fresh + sown + updated,
         arch::ARCH_NAME,
         fresh,
         sown,
         updated,
+        if install_media { " (+install — носитель)" } else { "" },
     );
     if migrated > 0 {
         println!("  [seed] мигрировано со старых корней bin/*: {}", migrated);

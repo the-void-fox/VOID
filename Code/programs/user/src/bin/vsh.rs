@@ -61,7 +61,6 @@ fn print_help(ep: usize) {
     help_row(ep, b"sysdef GEN FILE", "задать поколение из файла-конфига");
     help_row(ep, b"mv OLD NEW", "переименовать файл");
     help_row(ep, b"ping IP", "ICMP-пинг адреса A.B.C.D");
-    help_row(ep, b"install", "поставить VOID на диск (СТИРАЕТ его!)");
     help_row(ep, b"clear", "очистить экран");
     help_row(ep, b"help", "эта справка");
     help_row(ep, b"exit", "завершить сессию VOID");
@@ -405,18 +404,9 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             px::write(ep, px::STDOUT, b"\x1b[2J\x1b[H");
             continue;
         }
-        if cmd == b"install" {
-            // Веха 48: установить VOID на AHCI-диск из загрузочного модуля (образ с USB).
-            // xcap = store:xw (право WRITE есть). ДИСК СТИРАЕТСЯ ЦЕЛИКОМ.
-            px::write(ep, px::STDOUT, "\x1b[1;31mУстановка VOID на диск — диск будет СТЁРТ…\x1b[0m\n".as_bytes());
-            match sys::install(xcap) {
-                Some(_) => px::write(ep, px::STDOUT,
-                    "\x1b[1;32mГотово.\x1b[0m Вынь USB и перезагрузись — VOID стартует с диска.\n".as_bytes()),
-                None => px::write(ep, px::STDOUT,
-                    "\x1b[1;31mНе удалось.\x1b[0m Нет AHCI-диска, образа установки или прав.\n".as_bytes()),
-            };
-            continue;
-        }
+        // Установка — теперь ОТДЕЛЬНАЯ программа `bin/<arch>/install` (Веха 74): `run install`.
+        // init сеет её только на install-носителе, поэтому на установленной системе её просто нет
+        // (раньше `install` был встроен в vsh и присутствовал везде).
         if cmd == b"roots" {
             // Показать СЫРЫЕ корни store (как `ls`, но для объектов store, не файлов posixfs):
             // короткий content-id + имя на строку. Гейт — store-cap (xcap: store:xw, есть WRITE).
