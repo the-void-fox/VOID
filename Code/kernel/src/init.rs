@@ -12,7 +12,7 @@
 //! # комментарий
 //! service posixfs store:rw          # сервер + права a0
 //! service net-srv dev:net:rw
-//! shell   vsh endpoint:posixfs store:xw endpoint:net-srv env
+//! shell   vsh endpoint:posixfs store:rwx endpoint:net-srv env
 //! ```
 //! Токены прав: `store:RWX`, `dev:net:RW`, `dev:block:RW`, `endpoint:ИМЯ[:S]` (по умолчанию SEND),
 //! `env` (передать ARCH/SYSTEM). Буквы прав: `r`=READ `w`=WRITE `x`=EXEC `s`=SEND `g`=GRANT.
@@ -35,7 +35,7 @@ const DEFAULT_GEN1: &str = "\
 # VOID — поколение по умолчанию (полное: файлы + сеть)
 service posixfs store:rw
 service net-srv dev:net:rw
-shell vsh endpoint:posixfs store:xw endpoint:net-srv env
+shell vsh endpoint:posixfs store:rwx endpoint:net-srv env
 ";
 
 /// Второе поколение (`gen2`) — минимальное, БЕЗ сети: витрина отката. Тот же shell, но без
@@ -43,7 +43,7 @@ shell vsh endpoint:posixfs store:xw endpoint:net-srv env
 const DEFAULT_GEN2: &str = "\
 # VOID — минимальное поколение (без сети)
 service posixfs store:rw
-shell vsh endpoint:posixfs store:xw env
+shell vsh endpoint:posixfs store:rwx env
 ";
 
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.

@@ -58,6 +58,8 @@ fn print_help(ep: usize) {
     help_row(ep, b"run NAME [ARGS]", "запустить программу из store");
     help_row(ep, b"thaw NAME", "разморозить процесс из образа");
     help_row(ep, b"switch GEN", "выбрать поколение системы (после ребута)");
+    help_row(ep, b"gens", "показать поколения системы (активно — *)");
+    help_row(ep, b"rebuild", "собрать поколение из /etc/system/*.vv (vvsh)");
     help_row(ep, b"sysdef GEN FILE", "задать поколение из файла-конфига");
     help_row(ep, b"mv OLD NEW", "переименовать файл");
     help_row(ep, b"ping IP", "ICMP-пинг адреса A.B.C.D");
@@ -409,13 +411,28 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
         // (раньше `install` был встроен в vsh и присутствовал везде).
         if cmd == b"roots" {
             // Показать СЫРЫЕ корни store (как `ls`, но для объектов store, не файлов posixfs):
-            // короткий content-id + имя на строку. Гейт — store-cap (xcap: store:xw, есть WRITE).
+            // короткий content-id + имя на строку. Гейт — store-cap (xcap: store:*w*, есть WRITE).
             let mut rbuf = [0u8; 8192];
             let n = sys::obj_list_roots(xcap, &mut rbuf);
             if n == 0 {
                 px::write(ep, px::STDOUT, "нет корней (или нет прав на store)\n".as_bytes());
             } else {
                 px::write(ep, px::STDOUT, &rbuf[..n]);
+            }
+            continue;
+        }
+        // Конфиг vvsh (Веха 77): `rebuild`/`gens` — тонкие обёртки над `run vvsh …` (вся логика в
+        // программе vvsh; ей наследуются права shell'а — posixfs + store). `run vvsh init-config`
+        // сеет /etc/system/*.vv, `switch GEN` переключает поколение (после ребута).
+        if cmd == b"rebuild" {
+            if px::spawn_args(xcap, b"vvsh", b"rebuild\0") == usize::MAX {
+                px::write(ep, px::STDOUT, "vsh: vvsh не запустился\n".as_bytes());
+            }
+            continue;
+        }
+        if cmd == b"gens" {
+            if px::spawn_args(xcap, b"vvsh", b"gens\0") == usize::MAX {
+                px::write(ep, px::STDOUT, "vsh: vvsh не запустился\n".as_bytes());
             }
             continue;
         }

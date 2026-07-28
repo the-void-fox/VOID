@@ -21,7 +21,7 @@ let
   services = [
     { kind = "service"; name = "posixfs"; caps = [ "store:rw" ]; }
     { kind = "service"; name = "net-srv"; caps = [ "dev:net:rw" ]; }
-    { kind = "shell"; name = "vsh"; caps = [ "endpoint:posixfs" "store:xw" "endpoint:net-srv" "env" ]; }
+    { kind = "shell"; name = "vsh"; caps = [ "endpoint:posixfs" "store:rwx" "endpoint:net-srv" "env" ]; }
   ];
 in
 ''

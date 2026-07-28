@@ -66,7 +66,11 @@ status: idea
   gen1/gen2 — host-тесты байт-в-байт; пайплайн — проверен в QEMU на обеих арх.
 - **M1b** ✅ (Веха 76, [[vvsh-lang]]) — `(import "модуль.vv")` через `ModuleLoader` (бинарь — posixfs,
   тесты — карта) + слияние `append`; кэш + детект циклов. В QEMU: `/etc/system/*.vv` → gen1 точно.
-- **M1c** — обвязка `rebuild` (eval → коммит поколения) + загрузка ядром из снимка + `gens`.
+- **M1c** ✅ (Веха 77, [[vvsh-lang]]) — `vvsh rebuild` (eval `/etc/system/default.vv` → коммит
+  `system/gen<N>` + `current`, dedup), `vvsh init-config` (сев `/etc/system/*.vv`), `vvsh gens`. Бут
+  читает снимок (не менялся); шелл получил `store:rwx` (READ для dedup/`gens`, мягкая деградация без
+  READ). QEMU (обе арх): правка `net.vv` → rebuild → **ребут грузит gen4** (без сети). **Фаза КОНФИГА
+  (M1) закрыта — хостовый Nix для системного конфига не нужен.**
 
 Далее (пруф №2) — vvsh как движок ШЕЛЛА (конвейеры/переменные/функции поверх того же языка).
 
