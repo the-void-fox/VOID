@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -103,7 +104,9 @@ fn cmd_eval(path: &[u8]) -> ! {
             sys::exit(1);
         }
     };
-    match vvsh_core::build_config(text) {
+    // `import "модуль.vv"` резолвится относительно КАТАЛОГА этого файла (до последнего '/').
+    let loader = FsLoader { ep, base: dirname(path) };
+    match vvsh_core::build_config_with(text, &loader) {
         Ok(out) => {
             sys::write(out.as_bytes());
             sys::exit(0);
@@ -113,6 +116,40 @@ fn cmd_eval(path: &[u8]) -> ! {
             sys::write(e.as_bytes());
             sys::write(b"\n");
             sys::exit(1);
+        }
+    }
+}
+
+/// Каталог пути (всё до последнего '/', включительно). Без '/' — пусто (относительно корня).
+fn dirname(path: &[u8]) -> Vec<u8> {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => path[..=i].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Загрузчик модулей `import` поверх posixfs (M1b). Имя резолвится относительно `base` (каталога
+/// корневого файла); имя, начинающееся с '/', — абсолютный путь.
+struct FsLoader {
+    ep: usize,
+    base: Vec<u8>,
+}
+
+impl vvsh_core::ModuleLoader for FsLoader {
+    fn load(&self, name: &str) -> Result<String, String> {
+        let nb = name.as_bytes();
+        let mut path = Vec::new();
+        if nb.first() == Some(&b'/') {
+            path.extend_from_slice(nb);
+        } else {
+            path.extend_from_slice(&self.base);
+            path.extend_from_slice(nb);
+        }
+        match read_file(self.ep, &path) {
+            Some(bytes) => {
+                String::from_utf8(bytes).map_err(|_| alloc::format!("модуль '{}' не UTF-8", name))
+            }
+            None => Err(alloc::format!("модуль '{}' не найден", name)),
         }
     }
 }

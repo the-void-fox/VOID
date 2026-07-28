@@ -1,175 +1,320 @@
-//! Вычислитель: метациркулярный eval + спец-формы + встроенные функции.
+//! Вычислитель: метациркулярный eval + спец-формы + встроенные функции + `import` модулей.
 //!
-//! Программа — последовательность форм; `eval_program` вычисляет их по порядку в корневом
-//! окружении (со встроенными), результат — значение ПОСЛЕДНЕЙ формы (так `(define …) (system …)`
-//! отдаёт систему). Спец-формы: `quote if define lambda let cond begin and or`; всё прочее —
-//! применение. Истинность — по Scheme (ложь только `#f`).
+//! Программа — последовательность форм; `Interp::eval_program` вычисляет их по порядку в свежем
+//! корневом окружении (со встроенными), результат — значение ПОСЛЕДНЕЙ формы (так `(define …)
+//! (system …)` отдаёт систему). Спец-формы: `quote if define lambda let cond begin and or import`;
+//! всё прочее — применение. Истинность — по Scheme (ложь только `#f`).
+//!
+//! `import` (M1b) читает и вычисляет ДРУГОЙ `.vv` в СВЕЖЕМ окружении и возвращает его значение —
+//! I/O инъектируется через [`ModuleLoader`] (крейт чистый: бинарь даёт загрузчик поверх posixfs,
+//! тесты — in-memory). Модуль возвращает свой ВКЛАД (обычно список записей), а `default.vv` их
+//! СЛИВАЕТ через `append`. Кэш по имени модуля + стек загрузки для детекта циклов.
 
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
+use crate::reader::read_all;
 use crate::value::{BuiltinFn, Closure, Env, EvalError, Value};
 
-/// Вычислить программу (последовательность форм) в свежем корневом окружении.
-pub fn eval_program(forms: &[Value]) -> Result<Value, EvalError> {
-    let env = root_env();
-    let mut last = Value::nil();
-    for f in forms {
-        last = eval(f, &env)?;
-    }
-    Ok(last)
+/// Источник исходников модулей для `import`. Реализуется потребителем (бинарь `vvsh` — поверх
+/// posixfs; тесты — из карты в памяти). Крейт остаётся без I/O.
+pub trait ModuleLoader {
+    /// Вернуть исходник модуля по имени (как записано в `(import "имя")`), или текст ошибки.
+    fn load(&self, name: &str) -> Result<String, String>;
 }
 
-/// Корневое окружение со всеми встроенными функциями.
-pub fn root_env() -> Env {
-    let env = Env::root();
-    for (name, f) in BUILTINS {
-        env.define(Rc::from(*name), Value::Builtin(name, *f));
+/// Загрузчик-заглушка: любой `import` — ошибка. Для чисто-вычислительных вызовов/тестов.
+pub struct NoLoader;
+
+impl ModuleLoader for NoLoader {
+    fn load(&self, name: &str) -> Result<String, String> {
+        Err(alloc::format!(
+            "import '{}' недоступен: загрузчик модулей не задан",
+            name
+        ))
     }
-    env
 }
 
-/// Вычислить одну форму.
-pub fn eval(expr: &Value, env: &Env) -> Result<Value, EvalError> {
-    match expr {
-        // Самовычислимые.
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Builtin(..) | Value::Closure(_) => {
-            Ok(expr.clone())
+/// Вычислитель с контекстом: загрузчик модулей + кэш импортов + стек загрузки (детект циклов).
+pub struct Interp<'a> {
+    loader: &'a dyn ModuleLoader,
+    cache: RefCell<Vec<(String, Value)>>,
+    loading: RefCell<Vec<String>>,
+}
+
+impl<'a> Interp<'a> {
+    pub fn new(loader: &'a dyn ModuleLoader) -> Self {
+        Interp {
+            loader,
+            cache: RefCell::new(Vec::new()),
+            loading: RefCell::new(Vec::new()),
         }
-        Value::Sym(s) => env
-            .lookup(s)
-            .ok_or_else(|| EvalError::new(alloc::format!("неизвестный символ '{}'", s))),
-        Value::List(items) => {
-            if items.is_empty() {
-                return Ok(expr.clone()); // () → пустой список
-            }
-            if let Value::Sym(head) = &items[0] {
-                match &**head {
-                    "quote" => return special_quote(items),
-                    "if" => return special_if(items, env),
-                    "define" => return special_define(items, env),
-                    "lambda" => return special_lambda(items, env),
-                    "let" => return special_let(items, env),
-                    "cond" => return special_cond(items, env),
-                    "begin" => return eval_body(&items[1..], env),
-                    "and" => return special_and(items, env),
-                    "or" => return special_or(items, env),
-                    _ => {}
+    }
+
+    /// Вычислить программу (последовательность форм) в свежем корневом окружении.
+    pub fn eval_program(&self, forms: &[Value]) -> Result<Value, EvalError> {
+        let env = root_env();
+        let mut last = Value::nil();
+        for f in forms {
+            last = self.eval(f, &env)?;
+        }
+        Ok(last)
+    }
+
+    /// Вычислить одну форму.
+    pub fn eval(&self, expr: &Value, env: &Env) -> Result<Value, EvalError> {
+        match expr {
+            // Самовычислимые.
+            Value::Bool(_)
+            | Value::Int(_)
+            | Value::Str(_)
+            | Value::Builtin(..)
+            | Value::Closure(_) => Ok(expr.clone()),
+            Value::Sym(s) => env
+                .lookup(s)
+                .ok_or_else(|| EvalError::new(alloc::format!("неизвестный символ '{}'", s))),
+            Value::List(items) => {
+                if items.is_empty() {
+                    return Ok(expr.clone()); // () → пустой список
                 }
+                if let Value::Sym(head) = &items[0] {
+                    match &**head {
+                        "quote" => return sf_quote(items),
+                        "if" => return self.sf_if(items, env),
+                        "define" => return self.sf_define(items, env),
+                        "lambda" => return self.sf_lambda(items, env),
+                        "let" => return self.sf_let(items, env),
+                        "cond" => return self.sf_cond(items, env),
+                        "begin" => return self.eval_body(&items[1..], env),
+                        "and" => return self.sf_and(items, env),
+                        "or" => return self.sf_or(items, env),
+                        "import" => return self.sf_import(items, env),
+                        _ => {}
+                    }
+                }
+                // Применение: вычислить голову и аргументы, применить.
+                let func = self.eval(&items[0], env)?;
+                let mut args = Vec::with_capacity(items.len() - 1);
+                for a in &items[1..] {
+                    args.push(self.eval(a, env)?);
+                }
+                self.apply(&func, &args)
             }
-            // Применение: вычислить голову и аргументы, применить.
-            let func = eval(&items[0], env)?;
-            let mut args = Vec::with_capacity(items.len() - 1);
-            for a in &items[1..] {
-                args.push(eval(a, env)?);
-            }
-            apply(&func, &args)
         }
     }
-}
 
-fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
-    match func {
-        Value::Builtin(_, f) => f(args),
-        Value::Closure(c) => {
-            if args.len() != c.params.len() {
+    fn apply(&self, func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+        match func {
+            Value::Builtin(_, f) => f(args),
+            Value::Closure(c) => {
+                if args.len() != c.params.len() {
+                    return Err(EvalError::new(alloc::format!(
+                        "функция: нужно {} арг., дано {}",
+                        c.params.len(),
+                        args.len()
+                    )));
+                }
+                let call_env = Env::child(&c.env);
+                for (p, a) in c.params.iter().zip(args) {
+                    call_env.define(p.clone(), a.clone());
+                }
+                self.eval_body(&c.body, &call_env)
+            }
+            other => Err(EvalError::new(alloc::format!(
+                "нельзя вызвать {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Вычислить последовательность форм, вернуть значение последней (тело функции/`begin`/`let`).
+    fn eval_body(&self, body: &[Value], env: &Env) -> Result<Value, EvalError> {
+        let mut last = Value::nil();
+        for f in body {
+            last = self.eval(f, env)?;
+        }
+        Ok(last)
+    }
+
+    // ── спец-формы ──────────────────────────────────────────────────────────
+
+    fn sf_if(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() != 3 && items.len() != 4 {
+            return Err(EvalError::new("if: (if условие тогда [иначе])"));
+        }
+        if self.eval(&items[1], env)?.truthy() {
+            self.eval(&items[2], env)
+        } else if items.len() == 4 {
+            self.eval(&items[3], env)
+        } else {
+            Ok(Value::nil())
+        }
+    }
+
+    fn sf_define(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() < 3 {
+            return Err(EvalError::new("define: (define имя выражение)"));
+        }
+        match &items[1] {
+            // (define имя выражение)
+            Value::Sym(name) => {
+                if items.len() != 3 {
+                    return Err(EvalError::new("define: (define имя выражение)"));
+                }
+                let v = self.eval(&items[2], env)?;
+                env.define(name.clone(), v.clone());
+                Ok(v)
+            }
+            // Сахар: (define (f a b) тело…) == (define f (lambda (a b) тело…))
+            Value::List(sig) if !sig.is_empty() => {
+                let fname = match &sig[0] {
+                    Value::Sym(s) => s.clone(),
+                    _ => return Err(EvalError::new("define: имя функции — символ")),
+                };
+                let params = parse_params(&sig[1..])?;
+                let clos = Value::Closure(Rc::new(Closure {
+                    params,
+                    body: items[2..].to_vec(),
+                    env: env.clone(),
+                }));
+                env.define(fname, clos.clone());
+                Ok(clos)
+            }
+            _ => Err(EvalError::new("define: цель — символ или (имя параметры…)")),
+        }
+    }
+
+    fn sf_lambda(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() < 3 {
+            return Err(EvalError::new("lambda: (lambda (параметры…) тело…)"));
+        }
+        let params = match &items[1] {
+            Value::List(p) => parse_params(p)?,
+            _ => return Err(EvalError::new("lambda: параметры — список символов")),
+        };
+        Ok(Value::Closure(Rc::new(Closure {
+            params,
+            body: items[2..].to_vec(),
+            env: env.clone(),
+        })))
+    }
+
+    fn sf_let(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        // (let ((имя знач)…) тело…): значения — в ВНЕШНЕМ окружении, тело — в дочернем.
+        if items.len() < 3 {
+            return Err(EvalError::new("let: (let ((имя знач)…) тело…)"));
+        }
+        let binds = match &items[1] {
+            Value::List(b) => b,
+            _ => return Err(EvalError::new("let: список привязок")),
+        };
+        let child = Env::child(env);
+        for b in binds.iter() {
+            let pair = match b {
+                Value::List(p) if p.len() == 2 => p,
+                _ => return Err(EvalError::new("let: привязка — (имя значение)")),
+            };
+            let name = match &pair[0] {
+                Value::Sym(s) => s.clone(),
+                _ => return Err(EvalError::new("let: имя привязки — символ")),
+            };
+            let v = self.eval(&pair[1], env)?;
+            child.define(name, v);
+        }
+        self.eval_body(&items[2..], &child)
+    }
+
+    fn sf_cond(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        for clause in &items[1..] {
+            let c = match clause {
+                Value::List(c) if !c.is_empty() => c,
+                _ => return Err(EvalError::new("cond: ветвь — (тест выражения…)")),
+            };
+            let is_else = matches!(&c[0], Value::Sym(s) if &**s == "else");
+            if is_else || self.eval(&c[0], env)?.truthy() {
+                return self.eval_body(&c[1..], env);
+            }
+        }
+        Ok(Value::nil())
+    }
+
+    fn sf_and(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        let mut last = Value::Bool(true);
+        for e in &items[1..] {
+            last = self.eval(e, env)?;
+            if !last.truthy() {
+                return Ok(Value::Bool(false));
+            }
+        }
+        Ok(last)
+    }
+
+    fn sf_or(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        for e in &items[1..] {
+            let v = self.eval(e, env)?;
+            if v.truthy() {
+                return Ok(v);
+            }
+        }
+        Ok(Value::Bool(false))
+    }
+
+    /// `(import "имя")` — прочитать и вычислить модуль в СВЕЖЕМ окружении, вернуть его значение.
+    /// Кэш по имени (грузим раз), стек загрузки → детект циклов. Аргумент вычисляется (обычно
+    /// строковый литерал, но может быть выражением).
+    fn sf_import(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() != 2 {
+            return Err(EvalError::new("import: (import \"имя\")"));
+        }
+        let name = match self.eval(&items[1], env)? {
+            Value::Str(s) => s,
+            other => {
                 return Err(EvalError::new(alloc::format!(
-                    "функция: нужно {} арг., дано {}",
-                    c.params.len(),
-                    args.len()
-                )));
+                    "import: имя модуля — строка, дано {}",
+                    other.type_name()
+                )))
             }
-            let call_env = Env::child(&c.env);
-            for (p, a) in c.params.iter().zip(args) {
-                call_env.define(p.clone(), a.clone());
-            }
-            eval_body(&c.body, &call_env)
+        };
+        // Кэш: модуль уже вычислен?
+        if let Some(v) = self
+            .cache
+            .borrow()
+            .iter()
+            .find(|(n, _)| n.as_str() == &*name)
+            .map(|(_, v)| v.clone())
+        {
+            return Ok(v);
         }
-        other => Err(EvalError::new(alloc::format!(
-            "нельзя вызвать {}",
-            other.type_name()
-        ))),
+        // Цикл?
+        if self.loading.borrow().iter().any(|n| n.as_str() == &*name) {
+            return Err(EvalError::new(alloc::format!(
+                "import: цикл импорта модуля '{}'",
+                name
+            )));
+        }
+        let src = self.loader.load(&name).map_err(EvalError::new)?;
+        self.loading.borrow_mut().push(String::from(&*name));
+        let result = (|| {
+            let forms = read_all(&src).map_err(|e| EvalError::new(e.0))?;
+            self.eval_program(&forms)
+        })();
+        self.loading.borrow_mut().pop();
+        let val = result?;
+        self.cache
+            .borrow_mut()
+            .push((String::from(&*name), val.clone()));
+        Ok(val)
     }
 }
 
-/// Вычислить последовательность форм, вернуть значение последней (тело функции/`begin`/`let`).
-fn eval_body(body: &[Value], env: &Env) -> Result<Value, EvalError> {
-    let mut last = Value::nil();
-    for f in body {
-        last = eval(f, env)?;
-    }
-    Ok(last)
-}
-
-// ── спец-формы ──────────────────────────────────────────────────────────────
-
-fn special_quote(items: &[Value]) -> Result<Value, EvalError> {
+fn sf_quote(items: &[Value]) -> Result<Value, EvalError> {
     if items.len() != 2 {
         return Err(EvalError::new("quote: нужен ровно 1 аргумент"));
     }
     Ok(items[1].clone())
-}
-
-fn special_if(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    if items.len() != 3 && items.len() != 4 {
-        return Err(EvalError::new("if: (if условие тогда [иначе])"));
-    }
-    if eval(&items[1], env)?.truthy() {
-        eval(&items[2], env)
-    } else if items.len() == 4 {
-        eval(&items[3], env)
-    } else {
-        Ok(Value::nil())
-    }
-}
-
-fn special_define(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    if items.len() < 3 {
-        return Err(EvalError::new("define: (define имя выражение)"));
-    }
-    match &items[1] {
-        // (define имя выражение)
-        Value::Sym(name) => {
-            if items.len() != 3 {
-                return Err(EvalError::new("define: (define имя выражение)"));
-            }
-            let v = eval(&items[2], env)?;
-            env.define(name.clone(), v.clone());
-            Ok(v)
-        }
-        // Сахар: (define (f a b) тело…) == (define f (lambda (a b) тело…))
-        Value::List(sig) if !sig.is_empty() => {
-            let fname = match &sig[0] {
-                Value::Sym(s) => s.clone(),
-                _ => return Err(EvalError::new("define: имя функции — символ")),
-            };
-            let params = parse_params(&sig[1..])?;
-            let clos = Value::Closure(Rc::new(Closure {
-                params,
-                body: items[2..].to_vec(),
-                env: env.clone(),
-            }));
-            env.define(fname, clos.clone());
-            Ok(clos)
-        }
-        _ => Err(EvalError::new("define: цель — символ или (имя параметры…)")),
-    }
-}
-
-fn special_lambda(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    if items.len() < 3 {
-        return Err(EvalError::new("lambda: (lambda (параметры…) тело…)"));
-    }
-    let params = match &items[1] {
-        Value::List(p) => parse_params(p)?,
-        _ => return Err(EvalError::new("lambda: параметры — список символов")),
-    };
-    Ok(Value::Closure(Rc::new(Closure {
-        params,
-        body: items[2..].to_vec(),
-        env: env.clone(),
-    })))
 }
 
 fn parse_params(ps: &[Value]) -> Result<Vec<Rc<str>>, EvalError> {
@@ -183,64 +328,18 @@ fn parse_params(ps: &[Value]) -> Result<Vec<Rc<str>>, EvalError> {
     Ok(out)
 }
 
-fn special_let(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    // (let ((имя знач)…) тело…): значения — в ВНЕШНЕМ окружении, тело — в дочернем.
-    if items.len() < 3 {
-        return Err(EvalError::new("let: (let ((имя знач)…) тело…)"));
+/// Корневое окружение со всеми встроенными функциями.
+pub fn root_env() -> Env {
+    let env = Env::root();
+    for (name, f) in BUILTINS {
+        env.define(Rc::from(*name), Value::Builtin(name, *f));
     }
-    let binds = match &items[1] {
-        Value::List(b) => b,
-        _ => return Err(EvalError::new("let: список привязок")),
-    };
-    let child = Env::child(env);
-    for b in binds.iter() {
-        let pair = match b {
-            Value::List(p) if p.len() == 2 => p,
-            _ => return Err(EvalError::new("let: привязка — (имя значение)")),
-        };
-        let name = match &pair[0] {
-            Value::Sym(s) => s.clone(),
-            _ => return Err(EvalError::new("let: имя привязки — символ")),
-        };
-        let v = eval(&pair[1], env)?;
-        child.define(name, v);
-    }
-    eval_body(&items[2..], &child)
+    env
 }
 
-fn special_cond(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    for clause in &items[1..] {
-        let c = match clause {
-            Value::List(c) if !c.is_empty() => c,
-            _ => return Err(EvalError::new("cond: ветвь — (тест выражения…)")),
-        };
-        let is_else = matches!(&c[0], Value::Sym(s) if &**s == "else");
-        if is_else || eval(&c[0], env)?.truthy() {
-            return eval_body(&c[1..], env);
-        }
-    }
-    Ok(Value::nil())
-}
-
-fn special_and(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    let mut last = Value::Bool(true);
-    for e in &items[1..] {
-        last = eval(e, env)?;
-        if !last.truthy() {
-            return Ok(Value::Bool(false));
-        }
-    }
-    Ok(last)
-}
-
-fn special_or(items: &[Value], env: &Env) -> Result<Value, EvalError> {
-    for e in &items[1..] {
-        let v = eval(e, env)?;
-        if v.truthy() {
-            return Ok(v);
-        }
-    }
-    Ok(Value::Bool(false))
+/// Вычислить программу без загрузчика модулей (любой `import` — ошибка). Для тестов/простых вызовов.
+pub fn eval_program(forms: &[Value]) -> Result<Value, EvalError> {
+    Interp::new(&NoLoader).eval_program(forms)
 }
 
 // ── встроенные функции ──────────────────────────────────────────────────────
@@ -416,9 +515,7 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
                     match it {
                         Value::List(inner) if is_entry(inner) => out.push(it.clone()),
                         _ => {
-                            return Err(EvalError::new(
-                                "system: ожидались записи service/shell",
-                            ))
+                            return Err(EvalError::new("system: ожидались записи service/shell"))
                         }
                     }
                 }

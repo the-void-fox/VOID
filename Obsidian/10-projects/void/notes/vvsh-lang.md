@@ -53,8 +53,32 @@ no-op). `vvsh-core` линкуется ТОЛЬКО в этот бинарь.
 (`normalizes_full_config`, `net_off_matches_gen2`) — без QEMU. Обе арх: 0 предупреждений. Ядро VOID
 не менялось (A2 — язык в userspace).
 
-### Границы M1a (дальше)
-- **M1b** — `(import "networking.vv")` + слияние по `/etc/system/*.vv`.
+## Веха 76 — M1b: `import` + слияние модулей (`/etc/system/*.vv`)
+
+Конфиг стал **модульным**: `default.vv` собирает систему из отдельных `.vv`, каждый возвращает
+свой ВКЛАД, а слияние — обычным `append` (список-конкат). Ровно `imports = [ … ]` NixOS, но нативно.
+
+**Инъекция I/O (ключевое):** `import` читает файлы, а `vvsh-core` — чистый, без I/O. Поэтому ввёл
+trait `ModuleLoader { load(name) -> Result<String,String> }`; `import` — спец-форма, берёт исходник
+у загрузчика. Бинарь `vvsh` даёт `FsLoader` поверх posixfs (имя резолвится относительно каталога
+корневого файла: `import "services.vv"` из `/etc/system/default.vv` → `/etc/system/services.vv`;
+имя с `/` — абсолютно). Host-тесты — `MapLoader` из карты в памяти. Крейт остаётся без I/O.
+
+Рефактор: `eval` и спец-формы стали методами `Interp` (несёт `loader` + кэш импортов по имени +
+стек загрузки). Модуль вычисляется в СВЕЖЕМ окружении (не видит define'ов импортёра) и через тот же
+`Interp` (вложенные import'ы делят кэш). **Кэш** — модуль грузится раз; **стек** — детект циклов.
+API: `build_config_with(src, &loader)` (M1b), `build_config(src)` = без загрузчика (M1a, import→ошибка).
+
+Тесты (13 всего): `imports_and_merges_to_gen1` (четыре `.vv` → gen1 ТОЧНО), `module_can_compute_its_
+contribution` (define/if внутри модуля), `import_is_cached` (2 импорта → 1 загрузка), `import_cycle_
+detected` (a↔b → ошибка, не зависание), `import_missing_errors`, `import_without_loader_errors`.
+
+Проверка (QEMU, x86 + riscv): `/etc/system/{services,networking,shell}.vv` + `default.vv` с тремя
+`import` внутри `(append …)` → `run vvsh eval /etc/system/default.vv` печатает ТОЧНО gen1 (три
+строки), причём `networking.vv` сам вычислил вклад через `define`/`if`. Импорт отсутствующего модуля
+→ `vvsh: ошибка: модуль 'nope.vv' не найден` (код 1). Обе арх 0 предупреждений, ядро не менялось.
+
+### Дальше
 - **M1c** — `rebuild` (eval → коммит поколения), сев `/etc/system/*.vv`, загрузка ядром из снимка,
   команда `gens`. Тогда — полная эквивалентность на устройстве и уход от хостового Nix для конфига.
 - Диалект: макросы/quasiquote — отложены; числовая башня — только i64.
