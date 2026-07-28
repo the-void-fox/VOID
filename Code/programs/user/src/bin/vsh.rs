@@ -60,6 +60,7 @@ fn print_help(ep: usize) {
     help_row(ep, b"switch GEN", "выбрать поколение системы (после ребута)");
     help_row(ep, b"gens", "показать поколения системы (активно — *)");
     help_row(ep, b"rebuild", "собрать поколение из /etc/system/*.vv (vvsh)");
+    help_row(ep, b"log on|off", "подробный трейс ядра ([ipc]/[obj]/…)");
     help_row(ep, b"sysdef GEN FILE", "задать поколение из файла-конфига");
     help_row(ep, b"mv OLD NEW", "переименовать файл");
     help_row(ep, b"ping IP", "ICMP-пинг адреса A.B.C.D");
@@ -258,6 +259,14 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     let mut hlen = [0usize; HISTN];
     let mut hhead = 0usize; // следующий слот записи
     let mut hcount = 0usize; // сколько сохранено (≤ HISTN)
+    // Веха 82: vsh — внешний СПАСАТЕЛЬНЫЙ шелл. Сразу поднимаем vvsh (богатый Lisp-шелл, ADR 0006);
+    // если vvsh выйдет или упадёт — управление вернётся сюда. Снова зайти в него: `run vvsh repl`.
+    px::write(
+        ep,
+        px::STDOUT,
+        "vsh — спасательный шелл VOID. Запускаю vvsh (выход из него вернёт сюда)…\n".as_bytes(),
+    );
+    px::spawn_args(xcap, b"vvsh", b"repl\0");
     print_help(ep);
     loop {
         print_prompt(ep, &cwd[..cwd_len]);
@@ -434,6 +443,11 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             if px::spawn_args(xcap, b"vvsh", b"gens\0") == usize::MAX {
                 px::write(ep, px::STDOUT, "vsh: vvsh не запустился\n".as_bytes());
             }
+            continue;
+        }
+        if let Some(arg) = cmd.strip_prefix(b"log ") {
+            // Веха 82: вкл/выкл подробный трейс ядра ([ipc]/[obj]/[mm]/…) на лету.
+            sys::log(arg == b"on");
             continue;
         }
         if cmd == b"ls" || cmd.strip_prefix(b"ls ").is_some() {

@@ -1971,6 +1971,16 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_LOG(on) -> 0: вкл/выкл подробный трейс ядра (vprintln — [ipc]/[obj]/[mm]/[exec]/…).
+        // Отладочная удобность, не привилегия (гейта нет): по умолчанию интерактивная сессия тихая,
+        // чтобы трейс не сбивал вывод команд; `log on` в шелле включает обратно.
+        35 => {
+            let on = t.procs[cur].frame.arg(0) != 0;
+            set_verbose(on);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(0);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);

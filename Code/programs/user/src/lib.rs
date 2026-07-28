@@ -55,6 +55,7 @@ const SYS_MMIO_MAP: usize = 31;
 const SYS_DMA_ALLOC: usize = 32;
 const SYS_IRQ_WAIT: usize = 33;
 const SYS_OBJ_LIST_ROOTS: usize = 34;
+const SYS_LOG: usize = 35;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -290,6 +291,12 @@ pub fn obj_del_root(store_cap: usize, name: &[u8]) -> usize {
 pub fn obj_list_roots(store_cap: usize, buf: &mut [u8]) -> usize {
     let r = abi::syscall(SYS_OBJ_LIST_ROOTS, store_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
     if r == usize::MAX { 0 } else { r }
+}
+
+/// `SYS_LOG`: вкл/выкл подробный трейс ядра ([ipc]/[obj]/[mm]/…). По умолчанию интерактивная
+/// сессия ТИХАЯ (трейс сбивал вывод команд); включить на лету — `log(true)`.
+pub fn log(on: bool) {
+    abi::syscall(SYS_LOG, on as usize, 0, 0, 0, 0, 0, 0);
 }
 
 /// `SYS_READ`: прочитать доступный ввод консоли (хотя бы один байт; блокируется до ввода).

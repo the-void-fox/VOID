@@ -493,6 +493,7 @@ fn shell_env() -> Env {
         ("grep", sh_grep),
         ("cd", sh_cd),
         ("pwd", sh_pwd),
+        ("log", sh_log),
     ];
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
@@ -583,6 +584,18 @@ fn sh_pwd(_args: &[Value]) -> Result<Value, EvalError> {
         Ok(s) => Ok(Value::str(s)),
         Err(_) => Err(EvalError::new("pwd: путь не UTF-8")),
     }
+}
+
+/// `(log on|off)` — вкл/выкл подробный трейс ядра ([ipc]/[obj]/[mm]/…). По умолчанию выключен.
+fn sh_log(args: &[Value]) -> Result<Value, EvalError> {
+    let on = match args.first() {
+        Some(Value::Str(s)) => matches!(&**s, "on" | "1" | "true" | "#t"),
+        Some(Value::Bool(b)) => *b,
+        None => return Err(EvalError::new("log: (log on) или (log off)")),
+        Some(_) => return Err(EvalError::new("log: on|off")),
+    };
+    sys::log(on);
+    Ok(Value::nil())
 }
 
 /// `(cat путь)` — вывести содержимое файла.
