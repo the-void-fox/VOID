@@ -62,6 +62,12 @@ static ALLOC: Bump = Bump;
 const DEFAULT_PATH: &[u8] = b"/etc/system/default.vv";
 const CURRENT_ROOT: &[u8] = b"system/current";
 
+// Цвета — как в vsh (зелёный жирный префикс, синий каталог, жёлтая команда в справке).
+const C_PROMPT: &[u8] = b"\x1b[1;32m";
+const C_DIR: &[u8] = b"\x1b[1;34m";
+const C_CMD: &[u8] = b"\x1b[1;33m";
+const C_RESET: &[u8] = b"\x1b[0m";
+
 // ── текущий каталог сессии (глобальный: процесс однопоточный, гонок нет) ───────
 struct Cwd {
     buf: UnsafeCell<[u8; 256]>,
@@ -293,17 +299,17 @@ fn cmd_gens() -> ! {
 /// программы, как PATH). Запуск из vsh: `run vvsh repl`; выход — `(exit)`/`exit`/Ctrl-D → назад в
 /// vsh (внешний спасательный шелл — если vvsh упадёт, он ловит обратно).
 fn cmd_repl() -> ! {
-    sys::write(
-        "vvsh REPL — Lisp VOID (ADR 0006). `(...)` — Lisp; иначе команда. (exit) — назад в vsh.\n"
-            .as_bytes(),
-    );
+    sys::write(C_PROMPT);
+    sys::write(b"vvsh");
+    sys::write(C_RESET);
+    sys::write(" — Lisp-шелл VOID (ADR 0006). `(...)` — выражение, иначе команда. `help` — команды, `(exit)` — назад в vsh.\n".as_bytes());
     let loader = vvsh_core::NoLoader;
     let interp = vvsh_core::Interp::new(&loader);
     let env = shell_env(); // ПЕРСИСТЕНТНОЕ окружение сессии (чистые builtins + команды-эффекты)
     let mut line = [0u8; LINE_CAP];
     let mut hist = History::new();
     loop {
-        let mut pbuf = [0u8; 300];
+        let mut pbuf = [0u8; 320];
         let plen = build_prompt(&mut pbuf);
         let len = match read_line(&pbuf[..plen], &mut line, &hist) {
             Some(l) => l,
@@ -494,6 +500,8 @@ fn shell_env() -> Env {
         ("cd", sh_cd),
         ("pwd", sh_pwd),
         ("log", sh_log),
+        ("clear", sh_clear),
+        ("help", sh_help),
     ];
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
@@ -584,6 +592,47 @@ fn sh_pwd(_args: &[Value]) -> Result<Value, EvalError> {
         Ok(s) => Ok(Value::str(s)),
         Err(_) => Err(EvalError::new("pwd: путь не UTF-8")),
     }
+}
+
+/// `(clear)` — очистить экран (ANSI).
+fn sh_clear(_args: &[Value]) -> Result<Value, EvalError> {
+    sys::write(b"\x1b[2J\x1b[H");
+    Ok(Value::nil())
+}
+
+/// Строка справки: жёлтая команда, выравнивание, описание.
+fn help_row(cmd: &[u8], desc: &str) {
+    sys::write(b"  ");
+    sys::write(C_CMD);
+    sys::write(cmd);
+    sys::write(C_RESET);
+    for _ in 0..14usize.saturating_sub(cmd.len()) {
+        sys::write(b" ");
+    }
+    sys::write(desc.as_bytes());
+    sys::write(b"\n");
+}
+
+/// `(help)` — справка по vvsh (команды + краткая Lisp-шпаргалка).
+fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
+    sys::write(C_CMD);
+    sys::write(b"VOID vvsh");
+    sys::write(C_RESET);
+    sys::write(" — Lisp-шелл. Строка с `(` — выражение, иначе команда.\n".as_bytes());
+    help_row(b"ls [DIR]", "список файлов (каталог или текущий)");
+    help_row(b"cat FILE", "показать содержимое файла");
+    help_row(b"cd [DIR]", "сменить каталог (.. вверх, без арг — в корень)");
+    help_row(b"pwd", "текущий каталог");
+    help_row(b"echo TEXT", "напечатать ($x — значение переменной x)");
+    help_row(b"grep SUB L", "фильтр строк списка (для конвейеров)");
+    help_row(b"run NAME", "запустить программу из store (или просто NAME)");
+    help_row(b"log on|off", "подробный трейс ядра ([ipc]/[obj]/…)");
+    help_row(b"clear", "очистить экран");
+    help_row(b"help", "эта справка");
+    help_row(b"exit", "выйти в vsh (спасательный шелл)");
+    sys::write("  Lisp: (define x 5) · (lambda (a) …) · (if c t e) · (map f L) · (filter p L)\n".as_bytes());
+    sys::write("  Конвейер: (| (ls) (grep \"vv\") count)\n".as_bytes());
+    Ok(Value::nil())
 }
 
 /// `(log on|off)` — вкл/выкл подробный трейс ядра ([ipc]/[obj]/[mm]/…). По умолчанию выключен.
@@ -867,25 +916,28 @@ fn csi_num(n: usize, fin: u8) {
     sys::write(&buf[..i]);
 }
 
-/// Собрать приглашение `vvsh:<cwd>> `.
-fn build_prompt(out: &mut [u8]) -> usize {
-    let mut i = 0;
-    for &b in b"vvsh:" {
-        out[i] = b;
-        i += 1;
-    }
-    let mut cwd = [0u8; 256];
-    let n = cwd_get(&mut cwd);
-    for &b in &cwd[..n] {
-        if i < out.len() - 2 {
-            out[i] = b;
-            i += 1;
+fn append(out: &mut [u8], i: &mut usize, bytes: &[u8]) {
+    for &b in bytes {
+        if *i < out.len() {
+            out[*i] = b;
+            *i += 1;
         }
     }
-    out[i] = b'>';
-    i += 1;
-    out[i] = b' ';
-    i += 1;
+}
+
+/// Собрать цветное приглашение `vvsh<cwd>> ` (зелёный `vvsh`, синий каталог) — как у vsh.
+/// ANSI-коды нулевой ширины, потому редактор строки считает колонки верно.
+fn build_prompt(out: &mut [u8]) -> usize {
+    let mut i = 0;
+    append(out, &mut i, C_PROMPT);
+    append(out, &mut i, b"vvsh");
+    append(out, &mut i, C_RESET);
+    append(out, &mut i, C_DIR);
+    let mut cwd = [0u8; 256];
+    let n = cwd_get(&mut cwd);
+    append(out, &mut i, &cwd[..n]);
+    append(out, &mut i, C_RESET);
+    append(out, &mut i, b"> ");
     i
 }
 

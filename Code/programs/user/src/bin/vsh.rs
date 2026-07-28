@@ -267,7 +267,13 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
         "vsh — спасательный шелл VOID. Запускаю vvsh (выход из него вернёт сюда)…\n".as_bytes(),
     );
     px::spawn_args(xcap, b"vvsh", b"repl\0");
-    print_help(ep);
+    // vvsh завершился — мы в vsh (спасатель). Полный help НЕ печатаем (он был бы дампом после выхода);
+    // короткая подсказка, справка — по команде `help`.
+    px::write(
+        ep,
+        px::STDOUT,
+        "vsh (спасательный шелл): `help` — команды, `run vvsh repl` — обратно в vvsh.\n".as_bytes(),
+    );
     loop {
         print_prompt(ep, &cwd[..cwd_len]);
         // ── редактор строки (Веха 45): курсор pos, вставка/удаление в позиции, стрелки, история ──
