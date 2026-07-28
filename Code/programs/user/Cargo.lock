@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "void-user"
 version = "0.0.1"
+dependencies = [
+ "vvsh-core",
+]
+
+[[package]]
+name = "vvsh-core"
+version = "0.0.1"

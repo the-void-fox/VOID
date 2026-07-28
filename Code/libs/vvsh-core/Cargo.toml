@@ -1,0 +1,13 @@
+# vvsh-core — маленький гомоиконный Lisp VOID (ADR 0006): reader S-выражений + значения +
+# вычислитель + нормализатор системного конфига. no_std+alloc, БЕЗ зависимостей.
+#
+# A2 (см. [[vvsh-config-layout]]): ядро крейт НЕ линкует — потребитель это программа
+# `bin/<arch>/vvsh` (path-dep из programs/user). Крейт host-ТЕСТИРУЕМ: `#![cfg_attr(not(test),
+# no_std)]` в lib.rs → под `cargo test` линкуется std, парсер/eval гоняются без QEMU (см.
+# ./.cargo/config.toml — таргет host). Из workspace ядра исключён (см. ../../Cargo.toml).
+[package]
+name = "vvsh-core"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+description = "vvsh — маленький гомоиконный Lisp VOID: reader + значения + вычислитель + нормализатор системного конфига (ADR 0006). no_std+alloc, host-тестируемый."

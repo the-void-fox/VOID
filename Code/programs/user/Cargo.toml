@@ -18,6 +18,11 @@ edition = "2021"
 authors = ["voidfox"]
 description = "Базовый userspace VOID: библиотека syscall-шимов и все программы системы (vsh, posixfs, серверы и демо) как отдельные ELF-бинари, исполняемые из объектного store по content-id."
 
+# vvsh-core (ADR 0006): язык конфига/шелла. Линкуется ТОЛЬКО в бинарь `vvsh` (у него свой
+# global_allocator); прочие бинари его не тянут. Крейт no_std+alloc, стандалон (см. ../../Cargo.toml).
+[dependencies]
+vvsh-core = { path = "../../libs/vvsh-core" }
+
 [profile.release]
 opt-level = "z"
 lto = true

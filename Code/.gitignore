@@ -3,6 +3,10 @@
 /void-disk.img
 # target отдельно собираемых userspace-программ (кроме сборки через kernel/build.rs → OUT_DIR)
 /programs/*/target/
+# target стандалон-библиотек со своим таргетом (vvsh-core host-тесты; не члены workspace ядра)
+/libs/*/target/
+# Cargo.lock стандалон-библиотек без зависимостей (генерится host-тестами; для либ не коммитим)
+/libs/*/Cargo.lock
 # target хост-утилит (Веха 29) — тоже отдельные крейты со своим таргетом
 /tools/*/target/
 # Загрузочный ISO для реального железа (Веха 41). Собрать: boot/mkboot.sh
