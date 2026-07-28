@@ -62,6 +62,30 @@ Store занимал диск **с сектора 0** (там суперблок
   выбор диска, UEFI/GPT — не реализованы.
 - Установка = полное стирание; «обновление на месте» (сохранить старый store) пока нет.
 
+## Веха 74 — install стал отдельной программой (`run install`), которой нет на установленной системе
+
+Изначально (Веха 48) `install` был **встроенной командой vsh** — а значит присутствовал в КАЖДОЙ
+системе, даже уже установленной. «Стереть весь диск» под рукой навсегда — бессмысленно и опасно:
+на рабочей системе команды установки быть не должно вовсе.
+
+Теперь установка — **программа `bin/<arch>/install`**, а не встроенная команда:
+
+- **Сеется только на носителе.** `seed_programs` (`main.rs`) сеет `install` в store ТОЛЬКО когда
+  `arch::boot_module().is_some()` — тот же признак «я установочный носитель» (есть модуль с образом
+  диска), что и раньше отличал ISO от установленной системы. На установленной системе (загрузка с
+  диска, модуля нет) `install` не сеется, а прежний корень снимается (`object::del_root`) → команды
+  установки просто нет. seed печатает «(+install — носитель)», когда сеет её.
+- **Права через `SYS_STARTCAP`, не через аргументы `_start`.** `install` запускается как `run install`
+  — это `SYS_EXEC`-ребёнок vsh; ему по наследству (`cap::endow`, Веха 30) переходят стартовые права
+  shell'а (`endpoint:posixfs store:xw endpoint:net-srv`), но, в отличие от init-спавна, a0/a1
+  ребёнка НЕ несут caps — они лежат в таблице стартовых прав. Поэтому `install.rs` читает store-cap
+  как `start_cap(1)` (slot 1 = `store:xw`, есть WRITE, которого требует `SYS_INSTALL`), а не из
+  аргументов `_start`.
+
+Логика самой установки (`SYS_INSTALL` → `kernel/src/install.rs`) не изменилась — переехал только
+**способ запуска**. Проверено (x86, QEMU): обычная `-kernel`-загрузка — `install` нет ни в `roots`,
+ни в `help`; загрузка с install-ISO — `run install` → «VOID установлен на диск».
+
 ## Файлы
 
 - `kernel/src/ahci.rs` — MBR-парсинг (`base`/`capacity`/`total`), `write_abs`/`read_abs`.
@@ -69,7 +93,8 @@ Store занимал диск **с сектора 0** (там суперблок
 - `kernel/src/object.rs` — `freeze`/`FROZEN` (заморозка записи после установки).
 - `kernel/src/arch/x86_64/mod.rs` — `boot_module` (тег multiboot2 type 3); `frame.rs` — `reserve_boot_module`.
 - `kernel/src/proc.rs` — `SYS_INSTALL` (№30, гейт store WRITE).
-- `programs/user/src/{lib.rs,bin/vsh.rs}` — `sys::install` + команда `install`.
+- `kernel/src/main.rs` — `seed_programs` сеет `install` только при `boot_module` (Веха 74), иначе `del_root`.
+- `programs/user/src/lib.rs` — `sys::install`; `programs/user/src/bin/install.rs` — **программа-установщик** (Веха 74).
 - `Code/boot/mkdisk.sh` (образ диска), `mkboot.sh` (+модуль), `grub.cfg` (+`module2`).
 
 ## Связано
