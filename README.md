@@ -220,6 +220,32 @@ cargo run --target x86_64-unknown-none      # x86_64 (QEMU q35, PVH)
 Выход из QEMU: `Ctrl-A`, затем `X`. Диск один на обе архитектуры — попробуйте
 записать файл в vsh на одной и прочитать на другой.
 
+## Загрузка на реальном железе (USB/ISO)
+
+На x86 VOID грузится через **GRUB + multiboot** — тот же путь на железе и в QEMU.
+`Code/boot/mkboot.sh` собирает загрузочный ISO (он же годится для записи на USB).
+
+```sh
+# 1) собрать ядро (для железа лучше release — меньше и быстрее)
+cd Code && cargo build --release --target x86_64-unknown-none && cd ..
+
+# 2) собрать ISO (нужны grub2, xorriso + util-linux/mtools для вложенного образа установки)
+nix-shell -p grub2 xorriso util-linux mtools --run \
+  'Code/boot/mkboot.sh Code/target/x86_64-unknown-none/release/void-kernel'
+# → Code/boot/void.iso   (без аргумента берётся debug-ядро)
+
+# 3) проверить ИМЕННО этот образ в QEMU (GRUB+multiboot, как на железе)
+qemu-system-x86_64 -machine q35 -m 512M -cdrom Code/boot/void.iso -nographic
+
+# 4) записать на флешку — СОТРЁТ ЕЁ ЦЕЛИКОМ, проверь букву диска (lsblk)!
+sudo dd if=Code/boot/void.iso of=/dev/sdX bs=4M status=progress && sync
+```
+
+ISO — это **live-USB-инсталлятор**: он несёт ещё и образ диска модулем multiboot2, так что
+загрузившись с флешки, `run install` разворачивает VOID на SATA-диск (СТИРАЕТ его целиком),
+и дальше система грузится уже с диска без USB (Веха 48, `install.md`). BIOS — в режиме AHCI;
+на некоторых ноутбуках для USB-клавиатуры нужен Legacy USB (наш ps2-путь).
+
 ## Структура репозитория
 
 ```

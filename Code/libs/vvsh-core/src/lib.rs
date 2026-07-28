@@ -102,6 +102,19 @@ mod tests {
     }
 
     #[test]
+    fn length_and_pipe() {
+        assert_eq!(eval_str("(length (list 1 2 3))"), Value::Int(3));
+        assert_eq!(eval_str("(count (list))"), Value::Int(0));
+        // конвейер (thread-last): значение течёт последним аргументом
+        assert_eq!(eval_str("(| (list 1 2 3) length)"), Value::Int(3));
+        assert_eq!(eval_str("(| (list 1 2) (cons 0) count)"), Value::Int(3));
+        assert_eq!(
+            eval_str("(| (list 1 2) (append (list 9)))"),
+            Value::list(vec![Value::Int(9), Value::Int(1), Value::Int(2)])
+        );
+    }
+
+    #[test]
     fn quote_and_atoms() {
         assert_eq!(eval_str("'foo"), Value::sym("foo"));
         assert_eq!(eval_str("\"hi\\nthere\""), Value::str("hi\nthere"));

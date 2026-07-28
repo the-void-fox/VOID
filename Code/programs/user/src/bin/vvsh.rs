@@ -279,11 +279,7 @@ fn expr_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
         Ok(forms) => {
             for f in &forms {
                 match interp.eval(f, env) {
-                    Ok(v) => {
-                        if !is_nil(&v) {
-                            print_value(&v); // () (обычно результат команд) не печатаем
-                        }
-                    }
+                    Ok(v) => render(&v),
                     Err(e) => print_err(&e),
                 }
             }
@@ -313,11 +309,10 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     };
     match env.lookup(head) {
         Some(v) if is_callable(&v) => match build_command_form(&words) {
-            Ok(form) => {
-                if let Err(e) = interp.eval(&form, env) {
-                    print_err(&e);
-                }
-            }
+            Ok(form) => match interp.eval(&form, env) {
+                Ok(result) => render(&result), // вывод команды-данных (ls) рендерит хост
+                Err(e) => print_err(&e),
+            },
             Err(m) => {
                 sys::write("vvsh: ".as_bytes());
                 sys::write(m.as_bytes());
@@ -326,7 +321,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
         },
         Some(v) => {
             if words.len() == 1 {
-                print_value(&v); // инспекция переменной
+                render(&v); // инспекция переменной
             } else {
                 sys::write("vvsh: '".as_bytes());
                 sys::write(words[0]);
@@ -370,10 +365,6 @@ fn is_callable(v: &Value) -> bool {
     matches!(v, Value::Builtin(..) | Value::Closure(_))
 }
 
-fn is_nil(v: &Value) -> bool {
-    matches!(v, Value::List(items) if items.is_empty())
-}
-
 fn str_owned(s: &str) -> alloc::string::String {
     alloc::string::String::from(s)
 }
@@ -384,9 +375,25 @@ fn print_err(e: &EvalError) {
     sys::write(b"\n");
 }
 
-/// Печать значения-результата (каноничная форма Value).
-fn print_value(v: &Value) {
-    sys::write(alloc::format!("{}\n", v).as_bytes());
+/// Хост-рендеринг результата (модель «команды отдают значения, шелл рендерит на верхнем уровне»):
+/// `()` — ничего (результат команд-«вывода»); список — по элементу на строку (строки без кавычек,
+/// удобно для `ls`/конвейеров); прочее — каноничной формой.
+fn render(v: &Value) {
+    match v {
+        Value::List(items) if items.is_empty() => {}
+        Value::List(items) => {
+            for it in items.iter() {
+                match it {
+                    Value::Str(s) => {
+                        sys::write(s.as_bytes());
+                        sys::write(b"\n");
+                    }
+                    other => sys::write(alloc::format!("{}\n", other).as_bytes()),
+                }
+            }
+        }
+        other => sys::write(alloc::format!("{}\n", other).as_bytes()),
+    }
 }
 
 // ── команды-эффекты шелла (S2b): builtins в бинаре, дёргают синкаллы напрямую ──
@@ -396,15 +403,21 @@ fn print_value(v: &Value) {
 /// Окружение шелл-сессии: чистые builtins vvsh-core + команды-эффекты (`ls`/`cat`/`echo`/`run`).
 fn shell_env() -> Env {
     let env = vvsh_core::root_env();
-    let cmds: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] =
-        &[("ls", sh_ls), ("cat", sh_cat), ("echo", sh_echo), ("run", sh_run)];
+    let cmds: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
+        ("ls", sh_ls),
+        ("cat", sh_cat),
+        ("echo", sh_echo),
+        ("run", sh_run),
+        ("grep", sh_grep),
+    ];
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
     }
     env
 }
 
-/// `(ls [путь])` — список файлов каталога (по умолчанию `/`).
+/// `(ls [путь])` — ВОЗВРАЩАЕТ список имён файлов каталога (по умолчанию `/`). Возврат значения, а не
+/// печать: так `ls` течёт в конвейер `(| (ls) (grep "vv"))`, а на верхнем уровне REPL сам его рендерит.
 fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
     let ep = sys::start_cap(0);
     let path: &[u8] = match args.first() {
@@ -419,13 +432,45 @@ fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
     };
     let mut buf = [0u8; 4096];
     let n = px::readdir(ep, path, &mut buf);
-    if n > 0 {
-        sys::write(&buf[..n]);
-        if buf[n - 1] != b'\n' {
-            sys::write(b"\n");
+    let mut items = alloc::vec::Vec::new();
+    for name in buf[..n].split(|&b| b == b'\n') {
+        if name.is_empty() {
+            continue;
+        }
+        if let Ok(s) = core::str::from_utf8(name) {
+            items.push(Value::str(s));
         }
     }
-    Ok(Value::nil())
+    Ok(Value::list(items))
+}
+
+/// `(grep "подстрока" список)` — оставить строки-элементы, содержащие подстроку. Для конвейеров:
+/// `(| (ls) (grep "vv"))`. Подстрока — последним НЕ является; значение течёт списком-2-м аргументом.
+fn sh_grep(args: &[Value]) -> Result<Value, EvalError> {
+    let sub = match args.first() {
+        Some(Value::Str(s)) => s.as_bytes(),
+        _ => return Err(EvalError::new("grep: (grep \"подстрока\" список)")),
+    };
+    let lst = match args.get(1) {
+        Some(Value::List(items)) => items,
+        _ => return Err(EvalError::new("grep: второй аргумент — список")),
+    };
+    let mut out = alloc::vec::Vec::new();
+    for e in lst.iter() {
+        if let Value::Str(s) = e {
+            if contains(s.as_bytes(), sub) {
+                out.push(e.clone());
+            }
+        }
+    }
+    Ok(Value::list(out))
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// `(cat путь)` — вывести содержимое файла.

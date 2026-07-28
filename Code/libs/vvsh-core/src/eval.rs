@@ -91,6 +91,7 @@ impl<'a> Interp<'a> {
                         "begin" => return self.eval_body(&items[1..], env),
                         "and" => return self.sf_and(items, env),
                         "or" => return self.sf_or(items, env),
+                        "|" => return self.sf_pipe(items, env),
                         "import" => return self.sf_import(items, env),
                         _ => {}
                     }
@@ -262,6 +263,35 @@ impl<'a> Interp<'a> {
         Ok(Value::Bool(false))
     }
 
+    /// `(| seed этап…)` — конвейер (thread-last): значение течёт слева направо, вставляясь
+    /// ПОСЛЕДНИМ аргументом каждого этапа. `(| (ls) (grep "x") count)` = `(count (grep "x" (ls)))`.
+    /// Этап-список `(f a…)` → `(f a… acc)`; этап-символ/выражение `f` → `(f acc)`. Родной конвейер
+    /// на ЗНАЧЕНИЯХ (в VOID нет захвата stdout — течёт Value, а не байты).
+    fn sf_pipe(&self, items: &[Value], env: &Env) -> Result<Value, EvalError> {
+        if items.len() < 2 {
+            return Err(EvalError::new("|: (| значение этап…)"));
+        }
+        let mut acc = self.eval(&items[1], env)?;
+        for stage in &items[2..] {
+            acc = match stage {
+                Value::List(call) if !call.is_empty() => {
+                    let func = self.eval(&call[0], env)?;
+                    let mut args = Vec::with_capacity(call.len());
+                    for a in &call[1..] {
+                        args.push(self.eval(a, env)?);
+                    }
+                    args.push(acc);
+                    self.apply(&func, &args)?
+                }
+                _ => {
+                    let func = self.eval(stage, env)?;
+                    self.apply(&func, &[acc])?
+                }
+            };
+        }
+        Ok(acc)
+    }
+
     /// `(import "имя")` — прочитать и вычислить модуль в СВЕЖЕМ окружении, вернуть его значение.
     /// Кэш по имени (грузим раз), стек загрузки → детект циклов. Аргумент вычисляется (обычно
     /// строковый литерал, но может быть выражением).
@@ -350,6 +380,8 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("cons", b_cons),
     ("car", b_car),
     ("cdr", b_cdr),
+    ("length", b_length),
+    ("count", b_length), // алиас (шелл-дружелюбно: `(| … count)`)
     ("null?", b_null),
     ("not", b_not),
     ("=", b_eq),
@@ -411,6 +443,13 @@ fn b_cdr(args: &[Value]) -> Result<Value, EvalError> {
 
 fn b_null(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Bool(matches!(args.first(), Some(Value::List(i)) if i.is_empty())))
+}
+
+fn b_length(args: &[Value]) -> Result<Value, EvalError> {
+    match args.first() {
+        Some(Value::List(items)) => Ok(Value::Int(items.len() as i64)),
+        _ => Err(EvalError::new("length: нужен список")),
+    }
 }
 
 fn b_not(args: &[Value]) -> Result<Value, EvalError> {
