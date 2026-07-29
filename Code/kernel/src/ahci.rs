@@ -122,7 +122,7 @@ pub fn init() -> bool {
         return false;
     }
     unsafe {
-        let id = buf as *const u16;
+        let id = crate::frame::ptr(buf) as *const u16;
         let lba48 = id.add(100).read_volatile() as u64
             | (id.add(101).read_volatile() as u64) << 16
             | (id.add(102).read_volatile() as u64) << 32
@@ -138,7 +138,7 @@ pub fn init() -> bool {
     //    раздела — store с сектора 0 на весь диск (обратная совместимость с QEMU-образом).
     if dev.command(ATA_READ_DMA_EXT, 0, false) {
         unsafe {
-            let m = buf as *const u8;
+            let m = crate::frame::ptr(buf) as *const u8;
             let sig = m.add(510).read_volatile() == 0x55 && m.add(511).read_volatile() == 0xaa;
             if sig {
                 for i in 0..4 {
@@ -179,7 +179,7 @@ impl Ahci {
             }
 
             // Шапка команды, слот 0: CFL=5 dword (Register H2D FIS = 20 байт), W-бит, PRDTL=1.
-            let ch = self.frame_a as *mut u32;
+            let ch = crate::frame::ptr(self.frame_a) as *mut u32;
             let flags = 5u32 | if write { 1 << 6 } else { 0 } | (1u32 << 16); // PRDTL=1 в [31:16]
             ch.add(0).write_volatile(flags);
             ch.add(1).write_volatile(0); // PRDBC
@@ -187,7 +187,7 @@ impl Ahci {
             ch.add(3).write_volatile(((self.frame_a + OFF_CT) as u64 >> 32) as u32);
 
             // Таблица команд: CFIS (Register H2D FIS).
-            let cfis = (self.frame_a + OFF_CT) as *mut u8;
+            let cfis = crate::frame::ptr(self.frame_a + OFF_CT);
             core::ptr::write_bytes(cfis, 0, 0x40);
             cfis.add(0).write_volatile(0x27); // FIS type: Register H2D
             cfis.add(1).write_volatile(0x80); // C=1 (команда)
@@ -204,7 +204,7 @@ impl Ahci {
             cfis.add(13).write_volatile(0);
 
             // PRDT[0]: адрес буфера + число байт-1, бит I не ставим (опрашиваем).
-            let prdt = (self.frame_a + OFF_PRDT) as *mut u32;
+            let prdt = crate::frame::ptr(self.frame_a + OFF_PRDT) as *mut u32;
             prdt.add(0).write_volatile(self.buf as u32);
             prdt.add(1).write_volatile((self.buf as u64 >> 32) as u32);
             prdt.add(2).write_volatile(0);
@@ -249,7 +249,7 @@ pub fn read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
     if !d.command(ATA_READ_DMA_EXT, d.base + sector, false) {
         return false;
     }
-    unsafe { core::ptr::copy_nonoverlapping(d.buf as *const u8, buf.as_mut_ptr(), SECTOR) };
+    unsafe { core::ptr::copy_nonoverlapping(crate::frame::ptr(d.buf) as *const u8, buf.as_mut_ptr(), SECTOR) };
     true
 }
 
@@ -257,7 +257,7 @@ pub fn read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
 pub fn write(sector: u64, buf: &[u8; SECTOR]) -> bool {
     let g = AHCI.lock();
     let Some(d) = g.as_ref() else { return false };
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), d.buf as *mut u8, SECTOR) };
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::frame::ptr(d.buf), SECTOR) };
     d.command(ATA_WRITE_DMA_EXT, d.base + sector, true)
 }
 
@@ -266,7 +266,7 @@ pub fn write(sector: u64, buf: &[u8; SECTOR]) -> bool {
 pub fn write_abs(sector: u64, buf: &[u8; SECTOR]) -> bool {
     let g = AHCI.lock();
     let Some(d) = g.as_ref() else { return false };
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), d.buf as *mut u8, SECTOR) };
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::frame::ptr(d.buf), SECTOR) };
     d.command(ATA_WRITE_DMA_EXT, sector, true)
 }
 
@@ -277,6 +277,6 @@ pub fn read_abs(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
     if !d.command(ATA_READ_DMA_EXT, sector, false) {
         return false;
     }
-    unsafe { core::ptr::copy_nonoverlapping(d.buf as *const u8, buf.as_mut_ptr(), SECTOR) };
+    unsafe { core::ptr::copy_nonoverlapping(crate::frame::ptr(d.buf) as *const u8, buf.as_mut_ptr(), SECTOR) };
     true
 }

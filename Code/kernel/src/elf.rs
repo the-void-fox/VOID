@@ -162,7 +162,7 @@ pub fn load(root: usize, bytes: &[u8], va_limit: usize) -> Result<usize, ElfErro
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         bytes.as_ptr().add(file_off),
-                        (pa as *mut u8).add(dst_off),
+                        frame::ptr(pa).add(dst_off),
                         n,
                     );
                 }
@@ -288,7 +288,7 @@ pub fn load_pie(root: usize, bytes: &[u8], base: usize, va_limit: usize) -> Resu
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         bytes.as_ptr().add(file_off),
-                        (pa as *mut u8).add(dst_off),
+                        frame::ptr(pa).add(dst_off),
                         n,
                     );
                 }

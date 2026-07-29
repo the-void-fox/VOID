@@ -91,6 +91,13 @@ unsafe impl Send for Xhci {}
 
 static XHCI: SpinLock<Option<Xhci>> = SpinLock::new(None);
 
+/// Веха 87 — доступ к структуре по её ФИЗИЧЕСКОМУ адресу через direct-map. Кольца, контексты и
+/// DMA-буферы xHCI живут по физическим адресам (их читает контроллер), а ядро ходит по ним так.
+#[inline(always)]
+fn dm(pa: usize) -> *mut u8 {
+    crate::frame::ptr(pa)
+}
+
 #[inline]
 unsafe fn rd(a: usize) -> u32 {
     read_volatile(a as *const u32)
@@ -145,7 +152,7 @@ pub fn init() -> bool {
 
         // 4) Кольцо команд: Link TRB в конце заворачивает на начало (Toggle Cycle).
         let Some(cmd_ring) = frame::alloc() else { return false };
-        let link = (cmd_ring + (RING_TRBS - 1) * 16) as *mut u32;
+        let link = dm(cmd_ring + (RING_TRBS - 1) * 16) as *mut u32;
         write_volatile(link as *mut u64, cmd_ring as u64); // указатель назад на старт
         write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1); // тип Link | Toggle | Cycle
         wr64(op + OP_CRCR, cmd_ring as u64 | 1); // RCS=1
@@ -153,8 +160,8 @@ pub fn init() -> bool {
         // 5) Кольцо событий + таблица сегментов (ERST, 1 сегмент).
         let Some(event_ring) = frame::alloc() else { return false };
         let Some(erst) = frame::alloc() else { return false };
-        write_volatile(erst as *mut u64, event_ring as u64); // база сегмента
-        write_volatile((erst + 8) as *mut u32, RING_TRBS as u32); // размер сегмента (TRB)
+        write_volatile(dm(erst) as *mut u64, event_ring as u64); // база сегмента
+        write_volatile(dm(erst + 8) as *mut u32, RING_TRBS as u32); // размер сегмента (TRB)
         wr(rt + 0x20 + IR0_ERSTSZ, 1); // один сегмент
         wr64(rt + 0x20 + IR0_ERDP, event_ring as u64); // указатель извлечения = старт
         wr64(rt + 0x20 + IR0_ERSTBA, erst as u64); // база таблицы (после ERDP — так велит спека)
@@ -243,7 +250,7 @@ impl Xhci {
     /// Поставить TRB в кольцо команд, позвонить в дверной звонок 0, дождаться Command
     /// Completion Event. Возвращает `[param_lo, param_hi, status, control]` события.
     unsafe fn command(&mut self, p_lo: u32, p_hi: u32, control: u32) -> Option<[u32; 4]> {
-        let trb = (self.cmd_ring + self.cmd_enq * 16) as *mut u32;
+        let trb = dm(self.cmd_ring + self.cmd_enq * 16) as *mut u32;
         write_volatile(trb, p_lo);
         write_volatile(trb.add(1), p_hi);
         write_volatile(trb.add(2), 0);
@@ -269,7 +276,7 @@ impl Xhci {
 
     /// Не-блокирующе взять одно событие, если оно готово (совпал cycle bit), продвинуть ERDP.
     unsafe fn try_event(&mut self) -> Option<[u32; 4]> {
-        let ev = (self.event_ring + self.event_deq * 16) as *const u32;
+        let ev = dm(self.event_ring + self.event_deq * 16) as *const u32;
         let ctrl = read_volatile(ev.add(3));
         if ctrl & 1 != self.event_cycle {
             return None;
@@ -314,27 +321,27 @@ impl Xhci {
         else {
             return false;
         };
-        write_volatile((self.dcbaa + slot as usize * 8) as *mut u64, dev_ctx as u64);
+        write_volatile(dm(self.dcbaa + slot as usize * 8) as *mut u64, dev_ctx as u64);
         self.dma_buf = dma;
         // TR-кольцо EP0 с Link-заворотом.
-        let link = (ep0_ring + (RING_TRBS - 1) * 16) as *mut u32;
+        let link = dm(ep0_ring + (RING_TRBS - 1) * 16) as *mut u32;
         write_volatile(link as *mut u64, ep0_ring as u64);
         write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1);
         self.ep0_ring = ep0_ring;
         self.ep0_enq = 0;
         self.ep0_cycle = 1;
         // Input Control Context (0): Add flags A0 (slot) | A1 (EP0).
-        write_volatile((input + 4) as *mut u32, 0b11);
+        write_volatile(dm(input + 4) as *mut u32, 0b11);
         // Slot Context (1): Context Entries=1, Speed; Root Hub Port Number.
         let sc = input + cs;
-        write_volatile(sc as *mut u32, 1 << 27 | speed << 20);
+        write_volatile(dm(sc) as *mut u32, 1 << 27 | speed << 20);
         write_volatile((sc + 4) as *mut u32, port << 16);
         // EP0 Context (2): MPS по скорости, EPType=Control(4), CErr=3; TR dequeue|DCS; avg TRB=8.
         let ep = input + 2 * cs;
         let mps: u32 = match speed { 3 => 64, 4 => 512, _ => 8 };
-        write_volatile((ep + 4) as *mut u32, mps << 16 | 4 << 3 | 3 << 1);
-        write_volatile((ep + 8) as *mut u64, ep0_ring as u64 | 1);
-        write_volatile((ep + 16) as *mut u32, 8);
+        write_volatile(dm(ep + 4) as *mut u32, mps << 16 | 4 << 3 | 3 << 1);
+        write_volatile(dm(ep + 8) as *mut u64, ep0_ring as u64 | 1);
+        write_volatile(dm(ep + 16) as *mut u32, 8);
         compiler_fence(Ordering::SeqCst);
         let ev = self.command(input as u32, (input as u64 >> 32) as u32,
             TRB_ADDR_DEV << 10 | (slot as u32) << 24);
@@ -343,7 +350,7 @@ impl Xhci {
 
     /// Поставить TRB в TR-кольцо EP0 (с заворотом на Link).
     unsafe fn push_ep0(&mut self, p_lo: u32, p_hi: u32, status: u32, control: u32) {
-        let trb = (self.ep0_ring + self.ep0_enq * 16) as *mut u32;
+        let trb = dm(self.ep0_ring + self.ep0_enq * 16) as *mut u32;
         write_volatile(trb, p_lo);
         write_volatile(trb.add(1), p_hi);
         write_volatile(trb.add(2), status);
@@ -385,7 +392,7 @@ impl Xhci {
         if !self.control_in(0x80, 6, value, 0, out.len() as u16) {
             return false;
         }
-        core::ptr::copy_nonoverlapping(self.dma_buf as *const u8, out.as_mut_ptr(), out.len());
+        core::ptr::copy_nonoverlapping(dm(self.dma_buf) as *const u8, out.as_mut_ptr(), out.len());
         true
     }
 
@@ -452,7 +459,7 @@ impl Xhci {
         else {
             return false;
         };
-        let link = (int_ring + (RING_TRBS - 1) * 16) as *mut u32;
+        let link = dm(int_ring + (RING_TRBS - 1) * 16) as *mut u32;
         write_volatile(link as *mut u64, int_ring as u64);
         write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1);
         self.int_ring = int_ring;
@@ -461,15 +468,15 @@ impl Xhci {
         self.int_dci = dci;
         self.int_buf = int_buf;
         // Input Control: A0 (slot) | A(dci). Slot Context: Context Entries = dci.
-        write_volatile((input + 4) as *mut u32, 1 | 1 << dci);
-        write_volatile((input + cs) as *mut u32, dci << 27 | speed << 20);
+        write_volatile(dm(input + 4) as *mut u32, 1 | 1 << dci);
+        write_volatile(dm(input + cs) as *mut u32, dci << 27 | speed << 20);
         // EP Context (индекс dci+1): interval; EPType=Interrupt IN(7), MPS, CErr=3; TR dequeue|DCS.
         let ep = input + (dci as usize + 1) * cs;
         let interval = if speed >= 3 { (ivl.max(1) - 1).min(15) as u32 } else { 7 };
-        write_volatile(ep as *mut u32, interval << 16);
-        write_volatile((ep + 4) as *mut u32, (mps as u32) << 16 | 7 << 3 | 3 << 1);
-        write_volatile((ep + 8) as *mut u64, int_ring as u64 | 1);
-        write_volatile((ep + 16) as *mut u32, mps as u32); // avg TRB length
+        write_volatile(dm(ep) as *mut u32, interval << 16);
+        write_volatile(dm(ep + 4) as *mut u32, (mps as u32) << 16 | 7 << 3 | 3 << 1);
+        write_volatile(dm(ep + 8) as *mut u64, int_ring as u64 | 1);
+        write_volatile(dm(ep + 16) as *mut u32, mps as u32); // avg TRB length
         compiler_fence(Ordering::SeqCst);
         let ev = self.command(input as u32, (input as u64 >> 32) as u32,
             TRB_CONFIG_EP << 10 | (self.slot as u32) << 24);

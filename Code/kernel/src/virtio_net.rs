@@ -147,7 +147,7 @@ struct Queue {
 impl Queue {
     /// Опубликовать дескриптор `head` в avail и увеличить idx (без notify).
     unsafe fn publish(&mut self, head: u16) {
-        let avail = self.avail as *mut Avail;
+        let avail = crate::frame::ptr(self.avail) as *mut Avail;
         write_volatile(&mut (*avail).ring[(self.avail_idx as usize) % QSIZE], head);
         fence(Ordering::SeqCst);
         self.avail_idx = self.avail_idx.wrapping_add(1);
@@ -157,13 +157,13 @@ impl Queue {
 
     /// Есть ли необработанные записи в used.
     unsafe fn has_used(&self) -> bool {
-        let used = self.used as *const Used;
+        let used = crate::frame::ptr(self.used) as *const Used;
         read_volatile(&(*used).idx) != self.used_idx
     }
 
     /// Снять следующую запись used: (id дескриптора, число байт от устройства).
     unsafe fn take_used(&mut self) -> (u16, u32) {
-        let used = self.used as *const Used;
+        let used = crate::frame::ptr(self.used) as *const Used;
         let slot = (self.used_idx as usize) % QSIZE;
         let e = &(*used).ring[slot];
         let (id, len) = (read_volatile(&e.id) as u16, read_volatile(&e.len));
@@ -196,9 +196,11 @@ impl VirtioNet {
         self.tx_buf[NET_HDR..NET_HDR + frame_bytes.len()].copy_from_slice(frame_bytes);
         let total = (NET_HDR + frame_bytes.len()) as u32;
 
-        let desc = self.tx.desc as *mut Desc;
+        let desc = crate::frame::ptr(self.tx.desc) as *mut Desc;
         unsafe {
-            set_desc(desc, 0, self.tx_buf.as_ptr() as u64, total, 0, 0);
+            // Веха 87: буфер лежит в куче ядра — устройству отдаём ФИЗИЧЕСКИЙ адрес.
+            let pa = arch::virt_to_phys(self.tx_buf.as_ptr() as usize) as u64;
+            set_desc(desc, 0, pa, total, 0, 0);
             fence(Ordering::SeqCst);
             self.tx.publish(0);
             self.notify.kick(1);
@@ -387,9 +389,10 @@ fn publish(notify: Notify, rx: Queue, tx: Queue, mac: [u8; 6]) {
 
     // Засеять RX-кольцо: дескриптор i указывает на буфер i (устройство В него ПИШЕТ).
     unsafe {
-        let desc = net.rx.desc as *mut Desc;
+        let desc = crate::frame::ptr(net.rx.desc) as *mut Desc;
         for i in 0..QSIZE {
-            set_desc(desc, i, net.rx_bufs[i].as_ptr() as u64, BUF as u32, DESC_F_WRITE, 0);
+            let pa = arch::virt_to_phys(net.rx_bufs[i].as_ptr() as usize) as u64;
+            set_desc(desc, i, pa, BUF as u32, DESC_F_WRITE, 0);
             net.rx.publish(i as u16);
         }
     }

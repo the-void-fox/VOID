@@ -81,7 +81,7 @@ unsafe fn wr(base: usize, off: usize, v: u32) {
 // Поля дескриптора передачи (16 байт): addr@0(u64), len@8(u16), cso@10, cmd@11, status@12.
 #[inline]
 unsafe fn desc_addr(ring: usize, i: usize) -> usize {
-    read_volatile((ring + i * 16) as *const u64) as usize
+    read_volatile(crate::frame::ptr(ring + i * 16) as *const u64) as usize
 }
 
 /// Прочитать MAC карты: сперва из фильтра RAL/RAH (прошивка/QEMU его прописывают), иначе из EEPROM.
@@ -138,7 +138,7 @@ pub fn init() -> bool {
         // RX: каждому дескриптору — свой буфер-фрейм; кольцо, длина, голова=0, хвост=NRX-1.
         for i in 0..NRX {
             let Some(buf) = frame::alloc() else { return false };
-            let d = (rx_ring + i * 16) as *mut u8;
+            let d = crate::frame::ptr(rx_ring + i * 16);
             write_volatile(d as *mut u64, buf as u64);
             write_volatile(d.add(12), 0u8); // status=0 (карта заполнит)
         }
@@ -152,7 +152,7 @@ pub fn init() -> bool {
         // TX: буферы, кольцо; status=DD (дескриптор свободен), голова=хвост=0.
         for i in 0..NTX {
             let Some(buf) = frame::alloc() else { return false };
-            let d = (tx_ring + i * 16) as *mut u8;
+            let d = crate::frame::ptr(tx_ring + i * 16);
             write_volatile(d as *mut u64, buf as u64);
             write_volatile(d.add(12), DESC_DD);
         }
@@ -178,9 +178,14 @@ impl E1000 {
         }
         unsafe {
             let i = self.tx_cur;
-            let d = (self.tx_ring + i * 16) as *mut u8;
+            let d = crate::frame::ptr(self.tx_ring + i * 16);
             let buf = desc_addr(self.tx_ring, i);
-            core::ptr::copy_nonoverlapping(frame_bytes.as_ptr(), buf as *mut u8, frame_bytes.len());
+            // `buf` — физический адрес буфера кольца (его знает карта): пишем через direct-map.
+            core::ptr::copy_nonoverlapping(
+                frame_bytes.as_ptr(),
+                crate::frame::ptr(buf),
+                frame_bytes.len(),
+            );
             write_volatile(d.add(8) as *mut u16, frame_bytes.len() as u16); // len
             write_volatile(d.add(11), TX_EOP | TX_IFCS | TX_RS); // cmd
             write_volatile(d.add(12), 0u8); // status (карта выставит DD)
@@ -206,7 +211,7 @@ impl E1000 {
             let len = read_volatile(d.add(8) as *const u16) as usize;
             let buf = desc_addr(self.rx_ring, i);
             let n = len.min(out.len());
-            core::ptr::copy_nonoverlapping(buf as *const u8, out.as_mut_ptr(), n);
+            core::ptr::copy_nonoverlapping(crate::frame::ptr(buf) as *const u8, out.as_mut_ptr(), n);
             write_volatile(d.add(12), 0u8); // вернуть дескриптор карте (status=0)
             compiler_fence(Ordering::SeqCst);
             wr(self.base, RDT, i as u32); // хвост = обработанный дескриптор

@@ -68,7 +68,8 @@ pub fn freeze(
     let mut va = lo;
     while va < hi {
         if let Some((pa, fl)) = arch::page_info(root_pa, va) {
-            let bytes = unsafe { core::slice::from_raw_parts(pa as *const u8, PAGE) };
+            // Веха 87: `page_info` отдаёт ФИЗИЧЕСКИЙ адрес страницы — читаем через direct-map.
+        let bytes = unsafe { core::slice::from_raw_parts(crate::frame::ptr(pa) as *const u8, PAGE) };
             let id = object::put(bytes);
             let idx = match children.iter().position(|c| *c == id) {
                 Some(i) => i,
@@ -200,7 +201,7 @@ pub fn thaw(root_name: &str) -> Option<Thawed> {
         let ok = object::with(child, |b| match b {
             Some(bytes) if bytes.len() == PAGE => {
                 unsafe {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), pa as *mut u8, PAGE);
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), crate::frame::ptr(pa), PAGE);
                 }
                 true
             }

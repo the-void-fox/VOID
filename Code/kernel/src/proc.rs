@@ -2036,7 +2036,8 @@ fn is_linux_syscall_insn(t: &Table, cur: usize) -> bool {
     let pc = t.procs[cur].frame.user_pc();
     let root = arch::space_root(t.procs[cur].space);
     let byte = |va: usize| -> Option<u8> {
-        arch::translate(root, va).map(|pa| unsafe { *(pa as *const u8) })
+        // Веха 87: translate отдаёт ФИЗИЧЕСКИЙ адрес — читаем его через direct-map.
+        arch::translate(root, va).map(|pa| unsafe { *(crate::frame::ptr(pa) as *const u8) })
     };
     byte(pc) == Some(0x0f) && byte(pc + 1) == Some(0x05)
 }
@@ -2373,7 +2374,7 @@ fn copy_to_space(root: usize, mut dst_va: usize, src: &[u8]) {
         let Some(pa) = arch::translate(root, dst_va) else { return };
         let page_off = dst_va & (PAGE - 1);
         let n = (src.len() - off).min(PAGE - page_off);
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(off), pa as *mut u8, n) };
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(off), crate::frame::ptr(pa), n) };
         off += n;
         dst_va += n;
     }
@@ -2400,7 +2401,14 @@ fn copy_between_spaces(
         let s_off = src_va & (PAGE - 1);
         let d_off = dst_va & (PAGE - 1);
         let n = (len - off).min(PAGE - s_off).min(PAGE - d_off);
-        unsafe { core::ptr::copy_nonoverlapping(spa as *const u8, dpa as *mut u8, n) };
+        // Оба конца — физические адреса из translate; ходим по ним через direct-map.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                crate::frame::ptr(spa) as *const u8,
+                crate::frame::ptr(dpa),
+                n,
+            )
+        };
         off += n;
         src_va += n;
         dst_va += n;
