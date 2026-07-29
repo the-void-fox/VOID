@@ -6,10 +6,17 @@
 //! exit → SYS_EXIT.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     println!("[hello-std] Привет от НАСТОЯЩЕЙ std на VOID!");
+
+    // Веха 86 — настоящие часы: `SystemTime` больше не идёт от выдуманной базы, а приходит
+    // из ядра (`SYS_TIME`), которое прочитало RTC платформы на загрузке.
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => println!("[hello-std] SystemTime: {} с Unix (часы ядра)", d.as_secs()),
+        Err(_) => println!("[hello-std] SystemTime: раньше эпохи?!"),
+    }
 
     let args: Vec<String> = std::env::args().collect();
     println!("[hello-std] argv: {args:?}");

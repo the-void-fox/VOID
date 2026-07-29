@@ -1,0 +1,74 @@
+//! Веха 86 — время системы: монотонное (с загрузки) и настенное (Unix).
+//!
+//! До этой вехи ядро знало только МОНОТОННЫЙ счётчик (`rdtime`/`rdtsc`), а «настенные часы»
+//! подделывались фиктивной базой в порте std (`SystemTime` = выдуманная дата + uptime). Теперь
+//! платформа отдаёт реальное время ([`arch::wall_clock_unix_ns`]: CMOS RTC на x86, goldfish-rtc
+//! из DTB на riscv), и ядро считает настенное время как **база + uptime**.
+//!
+//! Почему база, а не поход в RTC на каждый запрос: чтение часов идёт через порты/MMIO и стоит
+//! микросекунды, а монотонный счётчик читается одной инструкцией. Часы нужны один раз — узнать,
+//! «который час был, когда мы загрузились».
+//!
+//! Ограничения (честно): точность зависит от таймбазы [`TICK_NS`], откалиброванной под QEMU;
+//! на реальном железе ход часов будет плыть (нормальная плата — синхронизация по NTP или
+//! перечитывание RTC, и то и другое впереди). Часового пояса нет — всё в UTC.
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use crate::arch;
+
+/// Наносекунд в одном тике монотонного счётчика.
+/// riscv: `time` тикает 10 МГц на QEMU virt → 100 нс. x86: `rdtsc` ≈ 1 ГГц в TCG → 1 нс.
+#[cfg(target_arch = "riscv64")]
+pub const TICK_NS: u64 = 100;
+#[cfg(not(target_arch = "riscv64"))]
+pub const TICK_NS: u64 = 1;
+
+/// Unix-время (нс), соответствующее нулю монотонного счётчика. 0 — часов нет.
+static WALL_BASE_NS: AtomicU64 = AtomicU64::new(0);
+/// Удалось ли прочитать настоящие часы (иначе настенное время = uptime от эпохи).
+static HAS_RTC: AtomicBool = AtomicBool::new(false);
+
+/// Прочитать часы платформы и запомнить базу. Зовётся один раз на загрузке, ПОСЛЕ `mm_init`
+/// (на riscv страница RTC отображается там же) и до старта процессов.
+pub fn init() {
+    if let Some(ns) = arch::wall_clock_unix_ns() {
+        // База = «сколько было на часах, когда счётчик был нулём».
+        WALL_BASE_NS.store(ns.saturating_sub(uptime_ns()), Ordering::Relaxed);
+        HAS_RTC.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Есть ли настоящие часы. `false` — RTC не найден: настенное время идёт от эпохи Unix
+/// (то есть «1970 + время с загрузки»), и это ЧЕСТНО видно потребителям.
+pub fn has_rtc() -> bool {
+    HAS_RTC.load(Ordering::Relaxed)
+}
+
+/// Монотонное время с загрузки, наносекунды. Не идёт назад и не зависит от RTC.
+pub fn uptime_ns() -> u64 {
+    arch::now_ticks().wrapping_mul(TICK_NS)
+}
+
+/// Настенное время, наносекунды Unix (UTC).
+pub fn realtime_ns() -> u64 {
+    WALL_BASE_NS.load(Ordering::Relaxed).wrapping_add(uptime_ns())
+}
+
+/// Разложить Unix-секунды в (год, месяц, день, час, минута, секунда) UTC — для печати даты
+/// на загрузке и команды `date` в шелле. Обратная к `days_from_civil` часть — алгоритм Хиннанта.
+pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let z = days + 719468; // сдвиг эпохи к 0000-03-01
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // день эры, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // год эры, [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // день года от 1 марта
+    let mp = (5 * doy + 2) / 153; // месяц со сдвигом (0 = март)
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, (rem / 3600) as u32, (rem % 3600 / 60) as u32, (rem % 60) as u32)
+}

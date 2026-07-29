@@ -32,6 +32,8 @@
 //! - **Устройства**: `probe_virtio_blk() -> Option<BlkDevice>` — найти virtio-blk на шине
 //!   СВОЕЙ архитектуры (virtio-mmio у QEMU virt, virtio-pci у q35) и отдать транспорт
 //!   ([`BlkTransport`]) общему драйверу; маршрутизацию IRQ устройства арх берёт на себя.
+//! - **Часы и случайность** (Веха 86): `wall_clock_unix_ns` — настенное время от прошивки
+//!   (`None`, если часов нет); `hw_random_u64` — аппаратный ГСЧ (`None`, если его нет).
 //! - **Разное**: `ELF_MACHINE` (e_machine загружаемых программ), `ARCH_NAME` (арх-измерение
 //!   корней программ `bin/<arch>/<имя>`), `RAM_LIMIT` (конец RAM платформы — для арены
 //!   фреймов), `USERSPACE_READY` (false на архе в bring-up: kmain пропускает процессные
@@ -68,6 +70,9 @@ pub use imp::{
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла
     is_real_hardware, platform_init, ram_limit, ram_total,
+    // часы и случайность (Веха 86): настенное время от прошивки (CMOS RTC / goldfish-rtc из DTB)
+    // и аппаратный ГСЧ (RDRAND на x86; на riscv его нет — общий код мешает энтропию сам)
+    hw_random_u64, wall_clock_unix_ns,
     // установщик на диск (Веха 48): загрузочный модуль multiboot2 (образ) — x86 отдаёт, riscv None
     boot_module,
 };

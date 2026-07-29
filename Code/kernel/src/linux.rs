@@ -396,14 +396,6 @@ pub fn fill_utsname(buf: &mut [u8]) {
 /// Размер `struct utsname` (6 × 65).
 pub const UTSNAME_SIZE: usize = 6 * 65;
 
-/// Наносекунд на один тик [`crate::arch::now_ticks`] — для `clock_gettime`/`gettimeofday`.
-/// riscv: таймбаза QEMU virt 10 МГц → 100 нс; x86: rdtsc ~1 ГГц в QEMU TCG → 1 нс
-/// (те же множители, что у пользовательской либы, Веха 28).
-#[cfg(target_arch = "riscv64")]
-pub fn tick_ns() -> u64 {
-    100
-}
-#[cfg(target_arch = "x86_64")]
-pub fn tick_ns() -> u64 {
-    1
-}
+// Веха 86: `tick_ns` отсюда убрана — таймбаза живёт в одном месте, [`crate::clock::TICK_NS`],
+// а время для `clock_gettime`/`gettimeofday` берётся у `clock::realtime_ns`/`uptime_ns`
+// (раньше константа была продублирована здесь и разошлась бы при калибровке под железо).

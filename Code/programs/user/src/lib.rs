@@ -56,6 +56,8 @@ const SYS_DMA_ALLOC: usize = 32;
 const SYS_IRQ_WAIT: usize = 33;
 const SYS_OBJ_LIST_ROOTS: usize = 34;
 const SYS_LOG: usize = 35;
+const SYS_TIME: usize = 36;
+const SYS_RANDOM: usize = 37;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -297,6 +299,43 @@ pub fn obj_list_roots(store_cap: usize, buf: &mut [u8]) -> usize {
 /// сессия ТИХАЯ (трейс сбивал вывод команд); включить на лету — `log(true)`.
 pub fn log(on: bool) {
     abi::syscall(SYS_LOG, on as usize, 0, 0, 0, 0, 0, 0);
+}
+
+/// `SYS_TIME(0)` — настенное время, наносекунды Unix (UTC). Веха 86: часы читаются у прошивки
+/// (CMOS RTC на x86, goldfish-rtc на riscv) один раз на загрузке, дальше идут от монотонного
+/// счётчика. Часов нет — время идёт от эпохи Unix, то есть равно uptime (видно по «1970» в дате).
+pub fn time_ns() -> u64 {
+    abi::syscall(SYS_TIME, 0, 0, 0, 0, 0, 0, 0).0 as u64
+}
+
+/// `SYS_TIME(1)` — монотонное время с загрузки, наносекунды. В отличие от [`now`] (сырые тики,
+/// читаются прямо из U-mode) это уже наносекунды, посчитанные ядром по своей таймбазе.
+pub fn monotonic_ns() -> u64 {
+    abi::syscall(SYS_TIME, 1, 0, 0, 0, 0, 0, 0).0 as u64
+}
+
+/// `SYS_RANDOM`: заполнить буфер случайными байтами (аппаратный ГСЧ ядра + пул событий).
+/// Возвращает число заполненных байт (`usize::MAX` — буфер недоступен).
+pub fn random(buf: &mut [u8]) -> usize {
+    abi::syscall(SYS_RANDOM, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
+}
+
+/// Разложить Unix-секунды в (год, месяц, день, час, минута, секунда) UTC — зеркало
+/// `clock::civil_from_unix` в ядре (алгоритм Хиннанта); нужно программам, печатающим дату.
+pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, (rem / 3600) as u32, (rem % 3600 / 60) as u32, (rem % 60) as u32)
 }
 
 /// `SYS_READ`: прочитать доступный ввод консоли (хотя бы один байт; блокируется до ввода).

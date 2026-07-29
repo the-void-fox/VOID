@@ -66,6 +66,7 @@ mod xhci {
     }
 }
 mod checkpoint;
+mod clock;
 mod elf;
 mod executor;
 mod frame;
@@ -74,6 +75,7 @@ mod init;
 mod linux;
 mod object;
 mod proc;
+mod random;
 mod sched;
 mod sync;
 mod timer;
@@ -181,6 +183,15 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("  [vm]   {} включён (direct map + W^X)", arch::MM_NAME);
     heap::init();
     println!("  [heap] куча ядра готова (16 МиБ)");
+    // Веха 86 — часы: спросить у платформы настенное время (CMOS RTC на x86, goldfish-rtc из DTB
+    // на riscv) и запомнить базу. Строго после mm_init: на riscv страница RTC отображается там.
+    clock::init();
+    if clock::has_rtc() {
+        let (y, mo, d, h, mi, s) = clock::civil_from_unix(clock::realtime_ns() / 1_000_000_000);
+        println!("  [time] {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC (RTC)");
+    } else {
+        println!("  [time] часов нет — время идёт от эпохи Unix");
+    }
     println!();
 
     // Веха 7.1/47: подключить диск (нужен для персистентности). Сперва AHCI — так стоит диск

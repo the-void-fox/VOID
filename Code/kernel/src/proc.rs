@@ -491,6 +491,9 @@ fn wait_stdin(saved_sie: usize) -> bool {
     }
     let mut t = TABLE.lock();
     if arch::console_has_input() {
+        // Веха 86: момент пробуждения от ввода — хороший источник джиттера (интервалы между
+        // нажатиями непредсказуемы для программ). Подмешиваем в пул энтропии.
+        crate::random::stir(1);
         for pid in waiting {
             t.procs[pid].state = State::Runnable; // ввод пришёл — будим ждущих READ
         }
@@ -1981,6 +1984,40 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(0);
             f.advance();
         }
+        // SYS_TIME(kind) -> наносекунды (Веха 86). kind: 0 = настенное время Unix (UTC),
+        // 1 = монотонное с загрузки. Гейта прав нет — время не секрет и ничего не меняет
+        // (как SYS_LOG). Наносекунды влезают в usize: обе арх 64-битные (u64 хватит до 2554 года).
+        36 => {
+            let kind = t.procs[cur].frame.arg(0);
+            let ns = match kind {
+                1 => crate::clock::uptime_ns(),
+                _ => crate::clock::realtime_ns(),
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(ns as usize);
+            f.advance();
+        }
+        // SYS_RANDOM(buf, len) -> len | MAX (Веха 86): заполнить буфер процесса случайными
+        // байтами (аппаратный ГСЧ + пул событий, см. [`crate::random`]). Буфер может лежать в
+        // ленивой куче — доотображаем, как в SYS_WRITE.
+        37 => {
+            let (ptr, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let result = if len == 0 {
+                0
+            } else if ensure_heap_range(t, cur, ptr, len) {
+                let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+                crate::random::fill(out);
+                len
+            } else {
+                usize::MAX
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);
@@ -2220,14 +2257,11 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             ret = if lx_put(t, cur, a0, &zero) { 0 } else { linux::err(linux::EFAULT) };
         }
         Some(Lx::Getrandom) => {
+            // Веха 86: был линейный конгруэнтный генератор от счётчика — теперь общий источник
+            // ядра (аппаратный ГСЧ + пул событий, [`crate::random`]), тот же, что у SYS_RANDOM.
             let (buf, len) = (a0, a1);
-            let mut seed = arch::now_ticks() ^ (buf as u64).rotate_left(17);
             let mut tmp = alloc::vec![0u8; len];
-            for chunk in tmp.chunks_mut(8) {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let bytes = seed.to_le_bytes();
-                chunk.copy_from_slice(&bytes[..chunk.len()]);
-            }
+            crate::random::fill(&mut tmp);
             ret = if lx_put(t, cur, buf, &tmp) { len } else { linux::err(linux::EFAULT) };
         }
         Some(Lx::Getcwd) => {
@@ -2235,9 +2269,14 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             ret = if lx_put(t, cur, a0, b"/\0") { 2 } else { linux::err(linux::EFAULT) };
         }
         // ── время ────────────────────────────────────────────────────────────────
+        // Веха 86: часы стали настоящими, поэтому REALTIME и MONOTONIC наконец РАЗНЫЕ.
+        // clockid: 0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC (прочие сводим к монотонному —
+        // BOOTTIME/MONOTONIC_RAW у нас совпадают с ним, а CPU-таймеров процесса нет).
         Some(Lx::ClockGettime) => {
-            let ticks = arch::now_ticks();
-            let ns = ticks.wrapping_mul(crate::linux::tick_ns());
+            let ns = match a0 {
+                0 => crate::clock::realtime_ns(),
+                _ => crate::clock::uptime_ns(),
+            };
             let ts = [(ns / 1_000_000_000), (ns % 1_000_000_000)];
             let mut buf = [0u8; 16];
             buf[0..8].copy_from_slice(&ts[0].to_le_bytes());
@@ -2245,8 +2284,8 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             ret = if lx_put(t, cur, a1, &buf) { 0 } else { linux::err(linux::EFAULT) };
         }
         Some(Lx::Gettimeofday) => {
-            let ticks = arch::now_ticks();
-            let us = ticks.wrapping_mul(crate::linux::tick_ns()) / 1000;
+            // gettimeofday — всегда настенное время (у него нет clockid).
+            let us = crate::clock::realtime_ns() / 1000;
             let tv = [(us / 1_000_000), (us % 1_000_000)];
             let mut buf = [0u8; 16];
             buf[0..8].copy_from_slice(&tv[0].to_le_bytes());

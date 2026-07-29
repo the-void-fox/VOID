@@ -18,6 +18,7 @@ mod lapic;
 mod paging;
 mod pci;
 mod ps2;
+mod rtc;
 mod trap;
 mod vga;
 
@@ -608,6 +609,53 @@ extern "C" {
     /// Сохранить текущий контекст в `*old`, загрузить `*new` и продолжить в нём
     /// (см. switch.s).
     pub fn context_switch(old: *mut Context, new: *const Context);
+}
+
+// ─── часы и случайность (Веха 86) ───────────────────────────────────────────
+
+/// Настенное время от прошивки — CMOS RTC, наносекунды Unix. `None` — часов нет.
+/// Читается ОДИН раз на загрузке ([`crate::clock::init`]): дальше время идёт от монотонного
+/// счётчика, а не от повторных походов в CMOS (они медленные — порты).
+pub fn wall_clock_unix_ns() -> Option<u64> {
+    rtc::unix_seconds().map(|s| s * 1_000_000_000)
+}
+
+/// Аппаратная случайность — `RDRAND` (Ivy Bridge и новее; QEMU TCG её предоставляет).
+/// `None` — инструкции нет или чип не дал числа за отведённые попытки (тогда общий код
+/// [`crate::random`] мешает энтропию сам).
+pub fn hw_random_u64() -> Option<u64> {
+    // CPUID.01H:ECX[30] — поддержка RDRAND. Лист 1 есть на любом x86_64.
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx", "cpuid", "pop rbx",
+            inout("eax") 1u32 => _,
+            out("ecx") ecx,
+            out("edx") _,
+            options(nostack),
+        );
+    }
+    if ecx & (1 << 30) == 0 {
+        return None;
+    }
+    // Спецификация Intel рекомендует до 10 попыток: CF=0 значит «энтропии сейчас нет».
+    for _ in 0..10 {
+        let v: u64;
+        let ok: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdrand {v}",
+                "setc {ok}",
+                v = out(reg) v,
+                ok = out(reg_byte) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok != 0 {
+            return Some(v);
+        }
+    }
+    None
 }
 
 // ─── разное ─────────────────────────────────────────────────────────────────

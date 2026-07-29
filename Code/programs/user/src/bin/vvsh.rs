@@ -522,6 +522,8 @@ fn shell_env() -> Env {
         ("log", sh_log),
         ("clear", sh_clear),
         ("help", sh_help),
+        ("date", sh_date), // Веха 86 — часы системы
+        ("random", sh_random), // Веха 86 — случайные байты от ядра
         // Веха 84 — перенос команд vsh в vvsh: файлы/каталоги, store, сеть, поколения.
         ("roots", sh_roots),
         ("mkdir", sh_mkdir),
@@ -627,6 +629,72 @@ fn sh_pwd(_args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+/// `(date)` — текущее время системы: `ГГГГ-ММ-ДД ЧЧ:ММ:СС UTC` (Веха 86, часы от прошивки).
+/// Возвращает строку — значит годится и в конвейер, и как значение выражения.
+fn sh_date(_args: &[Value]) -> Result<Value, EvalError> {
+    let secs = sys::time_ns() / 1_000_000_000;
+    let (y, mo, d, h, mi, s) = sys::civil_from_unix(secs);
+    let mut buf = [0u8; 32];
+    let mut n = 0;
+    let mut put = |v: i64, width: usize, sep: u8| {
+        let mut tmp = [0u8; 8];
+        let mut len = 0;
+        let mut x = v.max(0) as u64;
+        loop {
+            tmp[len] = b'0' + (x % 10) as u8;
+            len += 1;
+            x /= 10;
+            if x == 0 {
+                break;
+            }
+        }
+        for _ in len..width {
+            buf[n] = b'0';
+            n += 1;
+        }
+        for i in (0..len).rev() {
+            buf[n] = tmp[i];
+            n += 1;
+        }
+        if sep != 0 {
+            buf[n] = sep;
+            n += 1;
+        }
+    };
+    put(y, 4, b'-');
+    put(mo as i64, 2, b'-');
+    put(d as i64, 2, b' ');
+    put(h as i64, 2, b':');
+    put(mi as i64, 2, b':');
+    put(s as i64, 2, 0);
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("?");
+    let mut out = alloc::string::String::from(text);
+    out.push_str(" UTC");
+    Ok(Value::str(&out))
+}
+
+/// `(random [N])` — N случайных байт (по умолчанию 8) шестнадцатеричной строкой (Веха 86).
+/// Источник — ядро: аппаратный ГСЧ (`RDRAND` на x86) плюс пул событий; на riscv аппаратного
+/// источника нет, поэтому там это НЕ криптографическое качество (см. `kernel/src/random.rs`).
+fn sh_random(args: &[Value]) -> Result<Value, EvalError> {
+    let n = match args.first() {
+        None => 8usize,
+        Some(Value::Int(v)) if *v > 0 && *v <= 64 => *v as usize,
+        Some(_) => return Err(EvalError::new("random: нужно число байт 1..64")),
+    };
+    let mut buf = [0u8; 64];
+    if sys::random(&mut buf[..n]) != n {
+        return Err(EvalError::new("random: ядро не дало случайных байт"));
+    }
+    let mut out = alloc::string::String::new();
+    for b in &buf[..n] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    Ok(Value::str(&out))
+}
+
 /// `(clear)` — очистить экран (ANSI).
 fn sh_clear(_args: &[Value]) -> Result<Value, EvalError> {
     sys::write(b"\x1b[2J\x1b[H");
@@ -671,6 +739,8 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"gens", "показать поколения системы (активно — *)");
     help_row(b"switch GEN", "выбрать поколение (после ребута)");
     help_row(b"sysdef GEN F", "задать поколение из файла-конфига");
+    help_row(b"date", "текущее время системы (UTC)");
+    help_row(b"random [N]", "N случайных байт от ядра (hex)");
     help_row(b"log on|off", "подробный трейс ядра ([ipc]/[obj]/…)");
     help_row(b"clear", "очистить экран");
     help_row(b"help", "эта справка");

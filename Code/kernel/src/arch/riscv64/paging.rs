@@ -139,6 +139,12 @@ pub fn init() -> usize {
         // 2) MMIO как RW: UART (иначе пропадёт вывод) + слоты virtio-mmio (для диска) + PLIC.
         map_range(root, MMIO_START, MMIO_END, PTE_R | PTE_W);
         map_range(root, PLIC_START, PLIC_END, PTE_R | PTE_W);
+        // Веха 86 — страница часов (goldfish-rtc, адрес из DTB; лежит НИЖЕ региона virtio-mmio,
+        // поэтому отдельным отображением). 0 — DTB не дал часов, отображать нечего.
+        let rtc = super::rtc_base();
+        if rtc != 0 {
+            map_range(root, rtc, rtc + 0x1000, PTE_R | PTE_W);
+        }
         // 3) W^X: перетираем листовые PTE кода и констант более строгими правами (в 4-КиБ вырезе).
         map_range(root, text_s, text_e, PTE_R | PTE_X);
         map_range(root, ro_s, ro_e, PTE_R);

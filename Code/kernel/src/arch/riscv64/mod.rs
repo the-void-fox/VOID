@@ -288,6 +288,11 @@ pub fn platform_init(_hartid: usize, dtb: usize) {
     if let Some(size) = dtb_ram_size(dtb) {
         RAM_SIZE_CELL.store(size, Ordering::Relaxed);
     }
+    // Веха 86 — часы: адрес RTC берём из того же DTB (у QEMU virt это `google,goldfish-rtc`
+    // по 0x101000). Отобразит страницу `paging::init`, который идёт следом за platform_init.
+    if let Some(base) = dtb_find_compatible(dtb, b"google,goldfish-rtc") {
+        RTC_BASE_CELL.store(base, Ordering::Relaxed);
+    }
 }
 
 // ─── разбор device tree (FDT) — только узел /memory (Веха 85) ────────────────
@@ -365,6 +370,119 @@ fn dtb_ram_size(dtb: usize) -> Option<usize> {
             }
         }
     }
+    None
+}
+
+/// Найти в DTB узел с данным `compatible` и вернуть базовый адрес из его `reg`.
+/// `None` — нет DTB или узла. Обход тот же, что у [`dtb_ram_size`]: узел считается найденным,
+/// когда у ОДНОГО узла встретились и совпавший `compatible`, и `reg` (проверяем на выходе из узла).
+fn dtb_find_compatible(dtb: usize, want: &[u8]) -> Option<usize> {
+    if dtb == 0 {
+        return None;
+    }
+    unsafe {
+        if fdt_be32(dtb) != FDT_MAGIC {
+            return None;
+        }
+        let totalsize = fdt_be32(dtb + 4) as usize;
+        let off_struct = fdt_be32(dtb + 8) as usize;
+        let off_strings = fdt_be32(dtb + 12) as usize;
+        let end = dtb + totalsize;
+        let strings_base = dtb + off_strings;
+        let mut p = dtb + off_struct;
+        // Состояние ТЕКУЩЕГО узла: совпал ли compatible и какой у него reg.
+        let mut matched = false;
+        let mut reg: Option<usize> = None;
+        while p + 4 <= end {
+            let tok = fdt_be32(p);
+            p += 4;
+            match tok {
+                FDT_BEGIN_NODE => {
+                    // Новый узел — состояние прошлого не наследуем (ищем лист с обоими свойствами).
+                    matched = false;
+                    reg = None;
+                    let name_ptr = p;
+                    let mut q = name_ptr;
+                    while q < end && *(q as *const u8) != 0 {
+                        q += 1;
+                    }
+                    p += ((q - name_ptr) + 1 + 3) & !3;
+                }
+                FDT_END_NODE => {
+                    if matched {
+                        if let Some(base) = reg {
+                            return Some(base);
+                        }
+                    }
+                    matched = false;
+                    reg = None;
+                }
+                FDT_PROP => {
+                    let len = fdt_be32(p) as usize;
+                    let nameoff = fdt_be32(p + 4) as usize;
+                    let val = p + 8;
+                    p += 8 + ((len + 3) & !3);
+                    let nptr = strings_base + nameoff;
+                    let mut q = nptr;
+                    while q < end && *(q as *const u8) != 0 {
+                        q += 1;
+                    }
+                    let pname = core::slice::from_raw_parts(nptr as *const u8, q - nptr);
+                    if pname == b"compatible" && len > 0 {
+                        // `compatible` — список строк через '\0'; ищем нужную среди них.
+                        let bytes = core::slice::from_raw_parts(val as *const u8, len);
+                        matched = bytes.split(|b| *b == 0).any(|s| s == want);
+                    } else if pname == b"reg" && len >= 8 {
+                        // #address-cells = 2 у QEMU virt: первые 8 байт — базовый адрес.
+                        let addr = u64::from_be(core::ptr::read_unaligned(val as *const u64));
+                        reg = Some(addr as usize);
+                    }
+                }
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+// ─── часы и случайность (Веха 86) ───────────────────────────────────────────
+
+/// База MMIO часов реального времени (`google,goldfish-rtc` у QEMU virt; 0 — часов нет).
+/// Заполняется в [`platform_init`] из DTB, ДО включения трансляции; страницу отображает
+/// `paging::init` (см. [`rtc_base`]).
+static RTC_BASE_CELL: AtomicUsize = AtomicUsize::new(0);
+
+/// Регистры goldfish-rtc: младшие/старшие 32 бита наносекунд Unix.
+const RTC_TIME_LOW: usize = 0x00;
+const RTC_TIME_HIGH: usize = 0x04;
+
+/// База RTC для отображения MMIO-страницы в `paging::init` (0 — нечего отображать).
+pub fn rtc_base() -> usize {
+    RTC_BASE_CELL.load(Ordering::Relaxed)
+}
+
+/// Настенное время от платформы — goldfish-rtc, наносекунды Unix. `None` — часов нет.
+/// Порядок чтения важен: чтение `TIME_LOW` защёлкивает старшую половину (иначе можно поймать
+/// перенос между двумя чтениями).
+pub fn wall_clock_unix_ns() -> Option<u64> {
+    let base = rtc_base();
+    if base == 0 {
+        return None;
+    }
+    unsafe {
+        let lo = core::ptr::read_volatile((base + RTC_TIME_LOW) as *const u32) as u64;
+        let hi = core::ptr::read_volatile((base + RTC_TIME_HIGH) as *const u32) as u64;
+        let ns = hi << 32 | lo;
+        // 0 — часы есть, но не идут (или мы читаем не то устройство): лучше признать, что часов нет.
+        (ns > 0).then_some(ns)
+    }
+}
+
+/// Аппаратной случайности на QEMU virt нет (расширение Zkr не гарантировано, virtio-rng не
+/// подключён) — общий код [`crate::random`] замешивает энтропию сам.
+pub fn hw_random_u64() -> Option<u64> {
     None
 }
 

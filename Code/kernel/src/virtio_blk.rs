@@ -318,6 +318,9 @@ pub fn on_irq() {
         unsafe { read_volatile(isr as *const u8) }; // чтение = сброс INTx-статуса
     }
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Веха 86 — подмешать джиттер завершения дисковой операции в пул энтропии ядра.
+    // Только атомарные операции: замок в контексте прерывания = дедлок (см. [[known-gaps]]).
+    crate::random::stir(2);
 
     let waker = {
         let mut a = ASYNC.lock();
