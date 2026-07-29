@@ -12,6 +12,8 @@ mod sbi;
 mod trap;
 mod uart;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 // Ассемблерная точка входа `_start`: OpenSBI прыгает на 0x8020_0000 в S-mode → стек → kmain.
 core::arch::global_asm!(include_str!("entry.s"));
 // Вход в U-mode: satp процесса + восстановление регистров из кадра + sret.
@@ -258,23 +260,113 @@ pub const ARCH_NAME: &str = "riscv64";
 /// Процессы/U-mode здесь полностью рабочие с Вехи 10.
 pub const USERSPACE_READY: bool = true;
 
-/// Конец RAM: QEMU virt `-m 128M` — [0x8000_0000, 0x8800_0000).
-const RAM_LIMIT: usize = 0x8000_0000 + 128 * 1024 * 1024;
+/// База RAM на QEMU virt (адрес начала физической памяти).
+pub const RAM_BASE: usize = 0x8000_0000;
 
-/// Веха 41 — граница используемой RAM (адрес конца). На riscv пока константа (QEMU virt
-/// 128 МиБ); разбор `/memory` из device tree (a1) — впереди, как x86-memmap.
+/// Веха 85 — потолок используемой RAM (2 ГиБ). direct-map кладём huge-страницами (2 МиБ), так
+/// что гигабайты стелятся дёшево; 2 ГиБ держит границу ниже MMIO-дыр и внешне-4-ГиБ RAM QEMU virt
+/// (RAM там сплошная от 0x8000_0000, устройства — НИЖЕ базы), избегая карты памяти с дырами.
+const RAM_CAP: usize = 2 * 1024 * 1024 * 1024;
+
+/// Обнаруженный размер RAM (байты). До разбора DTB — дефолт QEMU virt 128 МиБ.
+static RAM_SIZE_CELL: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
+
+/// Веха 85 — граница используемой RAM (адрес конца, exclusive): база + min(обнаружено, потолок).
 pub fn ram_limit() -> usize {
-    RAM_LIMIT
+    RAM_BASE + RAM_SIZE_CELL.load(Ordering::Relaxed).min(RAM_CAP)
 }
 
-/// Полная RAM машины (байты) — для отчёта (на riscv = размер от базы RAM).
+/// Полная обнаруженная RAM машины (байты) — для отчёта.
 pub fn ram_total() -> usize {
-    RAM_LIMIT - 0x8000_0000
+    RAM_SIZE_CELL.load(Ordering::Relaxed)
 }
 
-/// Веха 41 — платформенная инициализация: на x86 разбирает карту памяти загрузчика; на riscv
-/// (QEMU virt) пока no-op — RAM/UART/virtio известны по контракту QEMU (DTB-парсинг впереди).
-pub fn platform_init(_hartid: usize, _dtb: usize) {}
+/// Веха 85 — платформенная инициализация: разобрать `/memory` из device tree (a1 = dtb), чтобы
+/// direct-map и аллокатор фреймов взяли реальный объём RAM (`-m 2G` и т.п.), а не зашитые 128 МиБ.
+/// DTB нет/не разобрать — остаётся дефолт 128 МиБ (контракт QEMU virt по умолчанию).
+pub fn platform_init(_hartid: usize, dtb: usize) {
+    if let Some(size) = dtb_ram_size(dtb) {
+        RAM_SIZE_CELL.store(size, Ordering::Relaxed);
+    }
+}
+
+// ─── разбор device tree (FDT) — только узел /memory (Веха 85) ────────────────
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const FDT_BEGIN_NODE: u32 = 1;
+const FDT_END_NODE: u32 = 2;
+const FDT_PROP: u32 = 3;
+const FDT_NOP: u32 = 4;
+const FDT_END: u32 = 9;
+
+/// Прочитать big-endian u32 по абсолютному адресу (FDT всегда big-endian, даже на LE-хосте).
+unsafe fn fdt_be32(addr: usize) -> u32 {
+    u32::from_be(core::ptr::read_unaligned(addr as *const u32))
+}
+
+/// Разобрать DTB (`dtb` = a1 от OpenSBI) и вернуть размер RAM узла `/memory` (байты). `None` —
+/// нет/битый DTB или узел не найден. Предполагаем #address-cells = #size-cells = 2 (QEMU virt):
+/// `reg` = [адрес(8) размер(8)] big-endian; берём размер. Обход ограничен `totalsize`.
+fn dtb_ram_size(dtb: usize) -> Option<usize> {
+    if dtb == 0 {
+        return None;
+    }
+    unsafe {
+        if fdt_be32(dtb) != FDT_MAGIC {
+            return None;
+        }
+        let totalsize = fdt_be32(dtb + 4) as usize;
+        let off_struct = fdt_be32(dtb + 8) as usize;
+        let off_strings = fdt_be32(dtb + 12) as usize;
+        let end = dtb + totalsize;
+        let strings_base = dtb + off_strings;
+        let mut p = dtb + off_struct;
+        let mut in_memory = false;
+        while p + 4 <= end {
+            let tok = fdt_be32(p);
+            p += 4;
+            match tok {
+                FDT_BEGIN_NODE => {
+                    let name_ptr = p;
+                    let mut q = name_ptr;
+                    while q < end && *(q as *const u8) != 0 {
+                        q += 1;
+                    }
+                    let name = core::slice::from_raw_parts(name_ptr as *const u8, q - name_ptr);
+                    // Узел RAM — «memory» или «memory@<адрес>».
+                    in_memory = name.starts_with(b"memory")
+                        && (name.len() == 6 || name[6] == b'@');
+                    p += ((q - name_ptr) + 1 + 3) & !3; // имя + '\0', выровнено на 4
+                }
+                FDT_END_NODE => in_memory = false,
+                FDT_PROP => {
+                    let len = fdt_be32(p) as usize;
+                    let nameoff = fdt_be32(p + 4) as usize;
+                    let val = p + 8;
+                    p += 8 + ((len + 3) & !3);
+                    if in_memory && len >= 16 {
+                        let nptr = strings_base + nameoff;
+                        let mut q = nptr;
+                        while q < end && *(q as *const u8) != 0 {
+                            q += 1;
+                        }
+                        let pname = core::slice::from_raw_parts(nptr as *const u8, q - nptr);
+                        if pname == b"reg" {
+                            // reg = адрес(2 ячейки=8) размер(2 ячейки=8), big-endian; берём размер.
+                            let size = u64::from_be(core::ptr::read_unaligned(
+                                (val + 8) as *const u64,
+                            ));
+                            return Some(size as usize);
+                        }
+                    }
+                }
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => break, // неизвестный токен — прекращаем разбор
+            }
+        }
+    }
+    None
+}
 
 /// Веха 42 — реальное железо? На riscv у нас пока только QEMU virt (плата VisionFive 2 —
 /// впереди), поэтому всегда `false`: демо на загрузке гоняем, как раньше.

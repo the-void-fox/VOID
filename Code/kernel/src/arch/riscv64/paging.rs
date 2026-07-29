@@ -110,7 +110,9 @@ const MMIO_END: usize = 0x1000_9000;
 const PLIC_START: usize = 0x0c00_0000;
 const PLIC_END: usize = 0x0c20_3000;
 const RAM_START: usize = 0x8000_0000;
-const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
+/// Мегастраница Sv39 — листовой PTE на СРЕДНЕМ уровне (2 МиБ). Веха 85: ею стелем direct-map,
+/// чтобы гигабайты RAM отображались дёшево (одна запись на 2 МиБ вместо 512 листьев по 4 КиБ).
+const MEGA: usize = 2 * 1024 * 1024;
 
 extern "C" {
     static _text_start: u8;
@@ -130,12 +132,14 @@ pub fn init() -> usize {
     let ro_e = &raw const _rodata_end as usize;
 
     unsafe {
-        // 1) direct map всей RAM как RW — база, чтобы всё осталось доступно.
-        map_range(root, RAM_START, RAM_END, PTE_R | PTE_W);
+        // 1) direct map всей (обнаруженной) RAM как RW — база, чтобы всё осталось доступно. Веха 85:
+        //    мегастраницами (2 МиБ), но чанки, накрывающие образ ядра [text_s, ro_e), кладём
+        //    постранично (4 КиБ) — иначе шаг 3 (W^X) не смог бы сузить права страницы кода/констант.
+        map_direct(root, RAM_START, super::ram_limit(), text_s, ro_e);
         // 2) MMIO как RW: UART (иначе пропадёт вывод) + слоты virtio-mmio (для диска) + PLIC.
         map_range(root, MMIO_START, MMIO_END, PTE_R | PTE_W);
         map_range(root, PLIC_START, PLIC_END, PTE_R | PTE_W);
-        // 3) W^X: перетираем листовые PTE кода и констант более строгими правами.
+        // 3) W^X: перетираем листовые PTE кода и констант более строгими правами (в 4-КиБ вырезе).
         map_range(root, text_s, text_e, PTE_R | PTE_X);
         map_range(root, ro_s, ro_e, PTE_R);
         // Флага U нет НИ У ОДНОЙ страницы ядра (Веха 23: секция `.user` похоронена) — код
@@ -143,6 +147,53 @@ pub fn init() -> usize {
     }
     KERNEL_ROOT.store(root, Ordering::Relaxed);
     root
+}
+
+/// Отобразить одну МЕГАСТРАНИЦУ (2 МиБ) `va → pa`: листовой PTE на среднем уровне (level 1). `va`
+/// и `pa` обязаны быть выровнены на 2 МиБ. Промежуточную таблицу верхнего уровня создаёт при нужде.
+///
+/// # Safety
+/// Как [`map`]: `root_pa` валиден, таблицы доступны по VA == PA.
+unsafe fn map_mega(root_pa: usize, va: usize, pa: usize, flags: usize) {
+    // Уровень 2 (верхний) — промежуточный: спускаемся/создаём таблицу уровня 1.
+    let idx2 = (va >> 30) & 0x1ff;
+    let pte2 = (root_pa as *mut usize).add(idx2);
+    let table = if *pte2 & PTE_V == 0 {
+        let next = frame::alloc().expect("нет фрейма под таблицу");
+        *pte2 = ((next >> 12) << 10) | PTE_V; // нелистовой
+        next
+    } else {
+        ((*pte2 >> 10) & PPN_MASK) << 12
+    };
+    // Уровень 1 — ЛИСТ (мегастраница): права живут здесь.
+    let idx1 = (va >> 21) & 0x1ff;
+    let pte1 = (table as *mut usize).add(idx1);
+    *pte1 = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
+}
+
+/// Веха 85 — застелить direct-map [start, end) идентично (VA == PA) мегастраницами RW, но чанки,
+/// перекрывающие защищаемый диапазон [prot_s, prot_e) (образ ядра — под W^X), кладём постранично
+/// (4 КиБ), чтобы затем можно было сузить права отдельных страниц. Хвост < 2 МиБ — тоже постранично.
+unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, prot_e: usize) {
+    let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let prot_s = prot_s & !(PAGE_SIZE - 1);
+    let mut va = start & !(MEGA - 1);
+    while va < end {
+        let chunk_end = va + MEGA;
+        let overlaps_kernel = va < prot_e && chunk_end > prot_s;
+        if chunk_end <= end && !overlaps_kernel {
+            map_mega(root_pa, va, va, PTE_R | PTE_W);
+        } else {
+            // Вырез ядра или хвост меньше мегастраницы — постранично.
+            let mut p = va;
+            let stop = chunk_end.min(end);
+            while p < stop {
+                map(root_pa, p, p, PTE_R | PTE_W);
+                p += PAGE_SIZE;
+            }
+        }
+        va += MEGA;
+    }
 }
 
 /// Включить трансляцию: `satp = Sv39 | PPN(корень)`, затем сбросить TLB.

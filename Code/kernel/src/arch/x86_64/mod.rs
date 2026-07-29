@@ -70,19 +70,95 @@ pub fn is_real_hardware() -> bool {
     BOOT_MAGIC_CELL.load(Ordering::Relaxed) == MULTIBOOT2_MAGIC
 }
 
-/// Веха 41 — разобрать инфо-структуру загрузчика и выставить границы RAM. `magic` — eax при
-/// входе (`0x2BADB002` = multiboot/GRUB), `info` — ebx (указатель на инфо). Direct-map и
-/// аллокатор фреймов зажимаются `RAM_CAP`: VOID не нужны гигабайты, а отображать всю память
-/// 4-КиБ страницами дорого; полную ёмкость печатаем отдельно ради честности отчёта.
+/// Веха 41/85 — разобрать инфо-структуру загрузчика и выставить границы RAM. `magic` — eax при
+/// входе (`0x36D76289` = multiboot2/GRUB), `info` — ebx (указатель на инфо: multiboot2-теги ЛИБО
+/// PVH `hvm_start_info` от QEMU). Полную ёмкость (`total`) печатаем ради честности, а direct-map и
+/// аллокатор фреймов берут `low_end` (конец НИЖНЕЙ сплошной RAM, до 4 ГиБ), зажатый `RAM_CAP`.
+///
+/// Потолок 1 ГиБ — не произвол: direct-map тождественный (VA == PA), а userspace-регион всех
+/// программ прибит линкером к `[0x4000_0000, 0x8000_0000)` (1..2 ГиБ). Значит RAM-отображение
+/// ОБЯЗАНО оканчиваться на 1 ГиБ, иначе налезет на VA процессов. Больше — только higher-half ядро
+/// (перенос direct-map в верхнюю половину) — впереди. riscv свободнее: там RAM с 0x8000_0000, а
+/// user ниже (1..2 ГиБ), потому riscv-потолок 2 ГиБ (см. riscv64::mod).
 ///
 /// # Safety
 /// `info` — валидный указатель инфо-структуры соответствующего типа (гарантирует загрузчик).
 pub fn platform_init(magic: usize, info: usize) {
-    const RAM_CAP: usize = 256 * 1024 * 1024;
+    const RAM_CAP: usize = 1024 * 1024 * 1024; // 1 ГиБ — ниже user-региона [0x4000_0000, …)
     BOOT_MAGIC_CELL.store(magic, Ordering::Relaxed);
-    let total = discover_multiboot(magic, info);
+    let (total, low_end) = discover_ram(magic, info);
     RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
-    RAM_LIMIT_CELL.store(total.min(RAM_CAP), Ordering::Relaxed);
+    RAM_LIMIT_CELL.store(low_end.min(RAM_CAP), Ordering::Relaxed);
+}
+
+/// Magic PVH `hvm_start_info` (по смещению 0): так отличаем QEMU-PVH от multiboot2/мусора.
+const PVH_MAGIC: u32 = 0x336e_c578;
+
+/// Веха 85 — обнаружить RAM: `(total, low_end)` в байтах. `total` — вся RAM (для отчёта), `low_end`
+/// — конец сплошной нижней RAM (адрес, до 4 ГиБ) для тождественного direct-map. Три источника:
+/// multiboot2 (GRUB), PVH-memmap (QEMU), иначе дефолт 128 МиБ.
+fn discover_ram(magic: usize, info: usize) -> (usize, usize) {
+    if magic == MULTIBOOT2_MAGIC && info != 0 {
+        let ram = discover_multiboot(info); // basic meminfo = сплошная нижняя RAM: low_end == total
+        return (ram, ram);
+    }
+    if info != 0 {
+        if let Some(pair) = discover_pvh(info) {
+            return pair;
+        }
+    }
+    (128 * 1024 * 1024, 128 * 1024 * 1024)
+}
+
+/// Веха 85 — разобрать PVH `hvm_start_info` (QEMU `-kernel` direct boot) и его memmap. Возвращает
+/// `(total, low_end)` по записям типа 1 (RAM): `total` — сумма, `low_end` — макс. конец записи с
+/// адресом < 4 ГиБ. `None` — не PVH/нет memmap. Раскладка структуры и записей — из PVH-ABI.
+///
+/// # Safety-примечание: `info` указывает на валидную структуру (гарантия PVH-загрузчика QEMU).
+fn discover_pvh(info: usize) -> Option<(usize, usize)> {
+    unsafe {
+        let rd32 = |off: usize| core::ptr::read_unaligned((info + off) as *const u32);
+        let rd64 = |off: usize| core::ptr::read_unaligned((info + off) as *const u64);
+        if rd32(0) != PVH_MAGIC || rd32(4) < 1 {
+            return None; // не PVH или version < 1 (memmap появился с версии 1)
+        }
+        let memmap = rd64(40) as usize; // memmap_paddr
+        let entries = rd32(48) as usize; // memmap_entries
+        if memmap == 0 || entries == 0 {
+            return None;
+        }
+        let mut total = 0usize;
+        let mut low_end = 0usize;
+        for i in 0..entries {
+            let e = memmap + i * 24; // sizeof(hvm_memmap_table_entry) = 24
+            let addr = rd64_at(e) as usize;
+            let size = rd64_at(e + 8) as usize;
+            let ty = core::ptr::read_unaligned((e + 16) as *const u32);
+            if ty == 1 {
+                // 1 = обычная RAM
+                total = total.saturating_add(size);
+                if addr < 0x1_0000_0000 {
+                    let end = addr.saturating_add(size);
+                    if end > low_end {
+                        low_end = end;
+                    }
+                }
+            }
+        }
+        if total == 0 {
+            None
+        } else {
+            Some((total, low_end))
+        }
+    }
+}
+
+/// Прочитать невыровненный u64 по абсолютному адресу (для записей PVH-memmap).
+///
+/// # Safety
+/// `addr` — читаемый адрес не менее 8 байт (гарантирует вызывающий по контракту PVH).
+unsafe fn rd64_at(addr: usize) -> u64 {
+    core::ptr::read_unaligned(addr as *const u64)
 }
 
 /// Веха 48 — загрузочный модуль multiboot2 (образ установки VOID, [`boot_module`]): база и
@@ -93,11 +169,8 @@ static MODULE_LEN: AtomicUsize = AtomicUsize::new(0);
 /// Разобрать карту памяти multiboot2 (от GRUB) И загрузочный модуль (Веха 48) за один проход.
 /// Инфо — список тегов (`total_size@0`, теги с `@8`): type 4 «basic meminfo» (`mem_upper@+12` —
 /// КиБ выше 1 МиБ) → полная RAM; type 3 «module» (`mod_start@+8`, `mod_end@+12`) → образ установки.
-/// PVH/неизвестно — дефолт 128 МиБ RAM (это QEMU, где RAM известна раннеру), модуля нет.
-fn discover_multiboot(magic: usize, info: usize) -> usize {
-    if magic != MULTIBOOT2_MAGIC || info == 0 {
-        return 128 * 1024 * 1024;
-    }
+/// `magic`/`info` уже проверены вызывающим ([`discover_ram`]). Нет тега RAM — дефолт 128 МиБ.
+fn discover_multiboot(info: usize) -> usize {
     let rd = |off: usize| unsafe { core::ptr::read_volatile((info + off) as *const u32) };
     let mut ram = 128 * 1024 * 1024;
     let mut p = 8usize; // теги начинаются после total_size(u32)+reserved(u32)

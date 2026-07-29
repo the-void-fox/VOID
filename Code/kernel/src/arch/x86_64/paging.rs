@@ -12,9 +12,14 @@ use crate::frame::{self, PAGE_SIZE};
 pub const PTE_P: u64 = 1 << 0; // Present
 pub const PTE_W: u64 = 1 << 1; // Writable
 pub const PTE_U: u64 = 1 << 2; // User
+pub const PTE_PS: u64 = 1 << 7; // Page Size — на PD-записи это ЛИСТ 2 МиБ (huge page, Веха 85)
 pub const PTE_NX: u64 = 1 << 63; // No-eXecute (требует EFER.NXE)
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000; // физ. адрес внутри PTE
+
+/// Размер huge-страницы (2 МиБ) — direct-map стелем ею (Веха 85), чтобы гигабайты RAM отображались
+/// дёшево (одна PD-запись на 2 МиБ вместо 512 листьев по 4 КиБ).
+const HUGE: usize = 2 * 1024 * 1024;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -40,10 +45,12 @@ pub fn init() -> usize {
     let ro_e = &raw const _rodata_end as usize;
 
     unsafe {
-        // 1) direct map всей (используемой) RAM как RW+NX (данные не исполняются). Веха 41:
-        //    граница — обнаруженная `ram_limit()` (зажата CAP'ом), а не зашитая константа.
-        map_range(root, 0, super::ram_limit(), PTE_W | PTE_NX);
-        // 2) W^X: код R+X (без W и без NX), константы R+NX.
+        // 1) direct map всей (используемой) RAM как RW+NX (данные не исполняются). Веха 41/85:
+        //    граница — обнаруженная `ram_limit()` (зажата CAP'ом 1 ГиБ); стелем huge-страницами
+        //    (2 МиБ), но чанки образа ядра [text_s, ro_e) — постранично (4 КиБ), чтобы шаг 2 (W^X)
+        //    смог сузить права страниц кода/констант.
+        map_direct(root, 0, super::ram_limit(), text_s, ro_e);
+        // 2) W^X: код R+X (без W и без NX), константы R+NX (в 4-КиБ вырезе образа ядра).
         map_range(root, text_s, text_e, 0);
         map_range(root, ro_s, ro_e, PTE_NX);
         // 3) MMIO контроллеров прерываний: LAPIC + IOAPIC (BAR'ы PCI отобразит
@@ -122,6 +129,12 @@ unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
         if ktbl != 0 && pte == *k.add(i) {
             continue; // общая с ядром запись
         }
+        // Веха 85: huge-лист (PS) — не спускаться и не освобождать как один 4-КиБ фрейм. В
+        // пространствах процессов huge-страниц не бывает (они только в общем direct-map ядра,
+        // отсекаемом проверкой выше) — это лишь щит от ошибочного спуска.
+        if level > 0 && pte & PTE_PS != 0 {
+            continue;
+        }
         let child = (pte & ADDR_MASK) as usize;
         if level == 0 {
             // Веха 51: лист userspace-драйвера может указывать на MMIO устройства (не RAM) —
@@ -190,6 +203,55 @@ unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: u64) {
     }
 }
 
+/// Веха 85 — отобразить одну HUGE-страницу (2 МиБ) `va → pa`: ЛИСТ на уровне PD (бит PS). `va`/`pa`
+/// выровнены на 2 МиБ. Спускается PML4 → PDPT (создавая их при нужде), затем ставит PD-лист.
+///
+/// # Safety
+/// Как [`map`]: `root_pa` валиден, таблицы доступны по VA == PA.
+unsafe fn map_huge(root_pa: usize, va: usize, pa: usize, flags: u64) {
+    let mut table = root_pa;
+    for level in [3usize, 2] {
+        // PML4 → PDPT, дойти до PD
+        let idx = (va >> (12 + 9 * level)) & 0x1ff;
+        let pte = (table as *mut u64).add(idx);
+        if *pte & PTE_P == 0 {
+            let next = frame::alloc().expect("нет фрейма под таблицу");
+            *pte = next as u64 | PTE_P | PTE_W | PTE_U;
+            table = next;
+        } else {
+            table = (*pte & ADDR_MASK) as usize;
+        }
+    }
+    let idx = (va >> 21) & 0x1ff; // индекс в PD
+    let pte = (table as *mut u64).add(idx);
+    *pte = (pa as u64 & ADDR_MASK) | PTE_P | PTE_PS | flags; // PS → лист 2 МиБ
+}
+
+/// Веха 85 — застелить direct-map [start, end) идентично (VA == PA) huge-страницами (RW+NX), но
+/// чанки, перекрывающие защищаемый диапазон [prot_s, prot_e) (образ ядра — под W^X), кладём
+/// постранично (4 КиБ), чтобы затем сузить права отдельных страниц. Хвост < 2 МиБ — тоже 4 КиБ.
+unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, prot_e: usize) {
+    let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let prot_s = prot_s & !(PAGE_SIZE - 1);
+    let mut va = start & !(HUGE - 1);
+    while va < end {
+        let chunk_end = va + HUGE;
+        let overlaps_kernel = va < prot_e && chunk_end > prot_s;
+        if chunk_end <= end && !overlaps_kernel {
+            map_huge(root_pa, va, va, PTE_W | PTE_NX);
+        } else {
+            // Вырез ядра (для W^X) или хвост меньше huge-страницы — постранично.
+            let mut p = va;
+            let stop = chunk_end.min(end);
+            while p < stop {
+                map(root_pa, p, p, PTE_W | PTE_NX);
+                p += PAGE_SIZE;
+            }
+        }
+        va += HUGE;
+    }
+}
+
 /// Веха 37 — обход VA→(PA страницы, сырой листовой PTE) для чекпойнта процессов:
 /// перевод PTE-битов в арх-нейтральные MAP_* делает обёртка в mod.rs (как у `map`,
 /// только в обратную сторону).
@@ -202,6 +264,12 @@ pub fn page_info(root_pa: usize, va: usize) -> Option<(usize, u64)> {
         pte = unsafe { *(table as *const u64).add(idx) };
         if pte & PTE_P == 0 {
             return None;
+        }
+        // Веха 85: huge-лист (PS на PDPT/PD) — не спускаться в него как в таблицу. В процессах
+        // huge-страниц нет (они лишь в общем direct-map ядра), так что для чекпойнта это лишь щит.
+        if level > 0 && pte & PTE_PS != 0 {
+            let size = 1usize << (12 + 9 * level as usize);
+            return Some(((pte & ADDR_MASK) as usize + (va & (size - 1)), pte));
         }
         table = (pte & ADDR_MASK) as usize;
         level -= 1;
@@ -218,6 +286,11 @@ pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
         let pte = unsafe { *(table as *const u64).add(idx) };
         if pte & PTE_P == 0 {
             return None;
+        }
+        // Веха 85: huge-лист (PS) — вернуть его страницу, а не спускаться в 2-МиБ область как в PT.
+        if level > 0 && pte & PTE_PS != 0 {
+            let size = 1usize << (12 + 9 * level as usize);
+            return Some((pte & ADDR_MASK) as usize + (va & (size - 1)));
         }
         table = (pte & ADDR_MASK) as usize;
         level -= 1;
