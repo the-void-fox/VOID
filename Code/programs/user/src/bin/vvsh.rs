@@ -183,8 +183,15 @@ fn cmd_eval(path: &[u8]) -> ! {
     }
 }
 
-/// `init-config` — посеять модульный конфиг в `/etc/system/` (posixfs, start-cap 0).
+/// `init-config` (подкоманда) — посеять конфиг и выйти. Логика — в [`run_init_config`] (её же
+/// зовёт одноимённая команда REPL, чтобы не дублировать).
 fn cmd_init_config() -> ! {
+    run_init_config();
+    sys::exit(0);
+}
+
+/// Посеять модульный конфиг в `/etc/system/` (posixfs, start-cap 0). Идемпотентно. Печатает итог.
+fn run_init_config() {
     let ep = sys::start_cap(0);
     px::mkdir(ep, b"/etc"); // идемпотентно: если есть — MAX, игнорируем
     px::mkdir(ep, b"/etc/system");
@@ -193,29 +200,38 @@ fn cmd_init_config() -> ! {
     px::echo_to(ep, b"/etc/system/networking.vv", NETWORKING_VV.as_bytes());
     px::echo_to(ep, DEFAULT_PATH, DEFAULT_VV.as_bytes());
     sys::write(
-        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (#t/#f) и `run vvsh rebuild`.\n"
+        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (#t/#f) и `rebuild`.\n"
             .as_bytes(),
     );
+}
+
+/// `rebuild` (подкоманда) — собрать поколение и выйти. Логика — в [`run_rebuild`].
+fn cmd_rebuild() -> ! {
+    run_rebuild();
     sys::exit(0);
 }
 
-/// `rebuild` — вычислить `/etc/system/default.vv` → коммит нового поколения → двинуть `current`.
-fn cmd_rebuild() -> ! {
+/// Вычислить `/etc/system/default.vv` → коммит нового поколения `system/gen<N>` → двинуть
+/// `current`. Печатает итог/ошибку и ВОЗВРАЩАЕТСЯ (не выходит — годится и для REPL).
+fn run_rebuild() {
     let ep = sys::start_cap(0);
     let scap = sys::start_cap(1);
     let text = match read_config_text(ep, DEFAULT_PATH) {
         Ok(t) => t,
         Err(_) => {
-            sys::write(
-                "vvsh: нет /etc/system/default.vv — сначала `run vvsh init-config`\n".as_bytes(),
-            );
-            sys::exit(1);
+            sys::write("vvsh: нет /etc/system/default.vv — сначала `init-config`\n".as_bytes());
+            return;
         }
     };
     let loader = FsLoader { ep, base: dirname(DEFAULT_PATH) };
     let norm = match vvsh_core::build_config_with(&text, &loader) {
         Ok(out) => out,
-        Err(e) => fail(&e),
+        Err(e) => {
+            sys::write("vvsh: ошибка: ".as_bytes());
+            sys::write(e.as_bytes());
+            sys::write(b"\n");
+            return;
+        }
     };
     // Содержимое поколения — нормализованный текст (контент-адресуемо).
     let mut new_id = [0u8; 32];
@@ -229,7 +245,7 @@ fn cmd_rebuild() -> ! {
                 sys::write("vvsh: нет изменений — конфиг уже в поколении ".as_bytes());
                 sys::write(cn);
                 sys::write(b"\n");
-                sys::exit(0);
+                return;
             }
         }
     }
@@ -250,11 +266,16 @@ fn cmd_rebuild() -> ! {
         sys::write(cn);
     }
     sys::write(b"\n");
+}
+
+/// `gens` (подкоманда) — перечислить поколения и выйти. Логика — в [`run_gens`].
+fn cmd_gens() -> ! {
+    run_gens();
     sys::exit(0);
 }
 
-/// `gens` — перечислить поколения `system/gen*` и пометить активное (`*`).
-fn cmd_gens() -> ! {
+/// Перечислить поколения `system/gen*` и пометить активное (`*`). Печатает; ВОЗВРАЩАЕТСЯ.
+fn run_gens() {
     let scap = sys::start_cap(1);
     let cur = read_current_name(scap);
 
@@ -276,7 +297,7 @@ fn cmd_gens() -> ! {
 
     sys::write("поколения системы (активно — *):\n".as_bytes());
     if nums.is_empty() {
-        sys::write("  (нет собранных поколений — `run vvsh rebuild`)\n".as_bytes());
+        sys::write("  (нет собранных поколений — `rebuild`)\n".as_bytes());
     }
     for k in nums {
         let name = alloc::format!("gen{}", k);
@@ -290,7 +311,6 @@ fn cmd_gens() -> ! {
     if cur.is_none() {
         sys::write("  (активное поколение не прочитать — нужен store READ)\n".as_bytes());
     }
-    sys::exit(0);
 }
 
 /// `repl` (S2a/S2b) — интерактивный шелл-REPL. Окружение ЖИВЁТ между строками (`(define x 5)` →
@@ -502,6 +522,19 @@ fn shell_env() -> Env {
         ("log", sh_log),
         ("clear", sh_clear),
         ("help", sh_help),
+        // Веха 84 — перенос команд vsh в vvsh: файлы/каталоги, store, сеть, поколения.
+        ("roots", sh_roots),
+        ("mkdir", sh_mkdir),
+        ("rm", sh_rm),
+        ("tail", sh_tail),
+        ("mv", sh_mv),
+        ("ping", sh_ping),
+        ("thaw", sh_thaw),
+        ("switch", sh_switch),
+        ("sysdef", sh_sysdef),
+        ("rebuild", sh_rebuild),
+        ("gens", sh_gens),
+        ("init-config", sh_init_config),
     ];
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
@@ -621,11 +654,23 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     sys::write(" — Lisp-шелл. Строка с `(` — выражение, иначе команда.\n".as_bytes());
     help_row(b"ls [DIR]", "список файлов (каталог или текущий)");
     help_row(b"cat FILE", "показать содержимое файла");
+    help_row(b"tail FILE", "последние ~32 байта файла");
     help_row(b"cd [DIR]", "сменить каталог (.. вверх, без арг — в корень)");
     help_row(b"pwd", "текущий каталог");
-    help_row(b"echo TEXT", "напечатать ($x — значение переменной x)");
+    help_row(b"mkdir DIR", "создать каталог");
+    help_row(b"rm PATH", "удалить файл (или пустой каталог)");
+    help_row(b"mv OLD NEW", "переименовать файл");
+    help_row(b"echo TEXT", "напечатать ($x — переменная; TEXT > FILE — запись)");
     help_row(b"grep SUB L", "фильтр строк списка (для конвейеров)");
     help_row(b"run NAME", "запустить программу из store (или просто NAME)");
+    help_row(b"thaw NAME", "разморозить процесс из образа");
+    help_row(b"ping IP", "ICMP-пинг адреса A.B.C.D");
+    help_row(b"roots", "сырые корни store (bin/*, system/*, …)");
+    help_row(b"init-config", "посеять /etc/system/*.vv");
+    help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
+    help_row(b"gens", "показать поколения системы (активно — *)");
+    help_row(b"switch GEN", "выбрать поколение (после ребута)");
+    help_row(b"sysdef GEN F", "задать поколение из файла-конфига");
     help_row(b"log on|off", "подробный трейс ядра ([ipc]/[obj]/…)");
     help_row(b"clear", "очистить экран");
     help_row(b"help", "эта справка");
@@ -668,8 +713,29 @@ fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-/// `(echo арг…)` — напечатать аргументы через пробел (строки — как есть, прочее — каноничной формой).
+/// `(echo арг…)` — напечатать аргументы через пробел (строки — как есть, прочее — каноничной
+/// формой). Веха 84: голое слово `>` включает редирект — `echo текст > /файл` пишет в файл (как
+/// в vsh). Записываемый текст — всё до `>`, склеенное пробелами; путь — слово после `>`.
 fn sh_echo(args: &[Value]) -> Result<Value, EvalError> {
+    // Редирект: найти аргумент-строку ">"; после него обязан быть путь.
+    if let Some(i) = args.iter().position(|a| matches!(a, Value::Str(s) if &**s == ">")) {
+        let path = match args.get(i + 1) {
+            Some(Value::Str(p)) => resolve(p.as_bytes()),
+            _ => return Err(EvalError::new("echo: после > нужен путь")),
+        };
+        let mut text = String::new();
+        for (j, a) in args[..i].iter().enumerate() {
+            if j > 0 {
+                text.push(' ');
+            }
+            match a {
+                Value::Str(s) => text.push_str(s),
+                other => text.push_str(&alloc::format!("{}", other)),
+            }
+        }
+        px::echo_to(sys::start_cap(0), &path, text.as_bytes());
+        return Ok(Value::nil());
+    }
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             sys::write(b" ");
@@ -709,6 +775,221 @@ fn sh_run(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::new(alloc::format!("run: '{}' не запустилась", name)));
     }
     Ok(Value::Int(code as i64))
+}
+
+// ── команды vsh, перенесённые в vvsh (Веха 84) ──────────────────────────────────
+// Модель прежняя: builtin дёргает синкаллы напрямую, права — из start_cap (0=posixfs, 1=store,
+// 2=net). Каталожные команды возвращают `nil` (эффект — на экран/ФС), инспекционные — значение.
+
+/// Первый аргумент как путь-строка, разрешённый относительно cwd. Общий помощник команд файлов.
+fn arg_path(args: &[Value], usage: &str) -> Result<Vec<u8>, EvalError> {
+    match args.first() {
+        Some(Value::Str(s)) => Ok(resolve(s.as_bytes())),
+        _ => Err(EvalError::new(alloc::string::String::from(usage))),
+    }
+}
+
+/// `(roots)` — сырые корни store (короткий id + имя на строку). Store — start-cap 1.
+fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
+    let mut buf = [0u8; 16384];
+    let n = sys::obj_list_roots(sys::start_cap(1), &mut buf);
+    if n == 0 {
+        sys::write("нет корней (или нет прав на store)\n".as_bytes());
+    } else {
+        sys::write(&buf[..n]);
+    }
+    Ok(Value::nil())
+}
+
+/// `(mkdir путь)` — создать каталог (относительно cwd).
+fn sh_mkdir(args: &[Value]) -> Result<Value, EvalError> {
+    let path = arg_path(args, "mkdir: (mkdir \"путь\")")?;
+    if px::mkdir(sys::start_cap(0), &path) != 0 {
+        return Err(EvalError::new("mkdir не удался (уже есть? нет родителя?)"));
+    }
+    Ok(Value::nil())
+}
+
+/// `(rm путь)` — удалить файл или пустой каталог (относительно cwd).
+fn sh_rm(args: &[Value]) -> Result<Value, EvalError> {
+    let path = arg_path(args, "rm: (rm \"путь\")")?;
+    if px::unlink(sys::start_cap(0), &path) != 0 {
+        return Err(EvalError::new("rm не удался (нет файла? каталог не пуст?)"));
+    }
+    Ok(Value::nil())
+}
+
+/// `(tail путь)` — последние ~32 байта файла (витрина lseek SEEK_END).
+fn sh_tail(args: &[Value]) -> Result<Value, EvalError> {
+    let ep = sys::start_cap(0);
+    let path = arg_path(args, "tail: (tail \"путь\")")?;
+    // stat до open: у posixfs open(mode 0) создал бы пустышку на опечатке пути.
+    match px::stat(ep, &path) {
+        Some((false, _)) => {}
+        _ => return Err(EvalError::new("tail: нет такого файла")),
+    }
+    let fd = px::open(ep, &path, 0);
+    if fd == usize::MAX {
+        return Err(EvalError::new("tail: нет такого файла"));
+    }
+    px::seek(ep, fd, -32, px::SEEK_END);
+    let mut tb = [0u8; 64];
+    let k = px::read(ep, fd, &mut tb);
+    px::close(ep, fd);
+    sys::write(&tb[..k]);
+    if k == 0 || tb[k - 1] != b'\n' {
+        sys::write(b"\n");
+    }
+    Ok(Value::nil())
+}
+
+/// `(mv старый новый)` — переименовать файл (оба пути — относительно cwd).
+fn sh_mv(args: &[Value]) -> Result<Value, EvalError> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Str(o)), Some(Value::Str(n))) => {
+            let old = resolve(o.as_bytes());
+            let new = resolve(n.as_bytes());
+            if px::rename(sys::start_cap(0), &old, &new) != 0 {
+                return Err(EvalError::new("mv не удался (нет файла?)"));
+            }
+            Ok(Value::nil())
+        }
+        _ => Err(EvalError::new("mv: (mv \"старый\" \"новый\") — два пути")),
+    }
+}
+
+/// `(ping "A.B.C.D")` — ICMP-пинг через сетевой сервер (start-cap 2). Возвращает RTT (мкс).
+fn sh_ping(args: &[Value]) -> Result<Value, EvalError> {
+    let ipstr = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("ping: (ping \"A.B.C.D\")")),
+    };
+    let ip = match parse_ipv4(ipstr.as_bytes()) {
+        Some(x) => x,
+        None => return Err(EvalError::new("ping: неверный IP (нужно A.B.C.D)")),
+    };
+    let netep = sys::start_cap(2);
+    if netep == sys::NO_CAP {
+        return Err(EvalError::new("ping: сети нет (net.vv = #f?)"));
+    }
+    let mut rep = [0u8; 5];
+    let n = sys::call(netep, 0 /* OP_PING */, &ip, &mut rep);
+    if n >= 5 && rep[0] == 0 {
+        let rtt = u32::from_le_bytes([rep[1], rep[2], rep[3], rep[4]]);
+        sys::write(alloc::format!("ответ от {}: {} мкс\n", ipstr, rtt).as_bytes());
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("ping: нет ответа"))
+    }
+}
+
+/// `(thaw "имя")` — разморозить процесс из образа `proc/<arch>/имя` (start-cap 1 несёт EXEC).
+fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("thaw: (thaw \"имя\")")),
+    };
+    let code = sys::restore(sys::start_cap(1), name.as_bytes());
+    if code == usize::MAX {
+        return Err(EvalError::new("thaw не удался (нет образа?)"));
+    }
+    Ok(Value::Int(code as i64))
+}
+
+/// `(switch "gen")` — выбрать поколение системы (запись в корень `system/current`; после ребута).
+fn sh_switch(args: &[Value]) -> Result<Value, EvalError> {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("switch: (switch \"gen\")")),
+    };
+    let scap = sys::start_cap(1);
+    let mut id = [0u8; 32];
+    if sys::obj_put(scap, name.as_bytes(), &mut id) == 0
+        && sys::obj_set_root(scap, CURRENT_ROOT, &id) == 0
+    {
+        sys::write(alloc::format!("поколение выбрано, перезагрузи QEMU: {}\n", name).as_bytes());
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("switch не удался (нет права WRITE на store?)"))
+    }
+}
+
+/// `(sysdef "gen" "файл")` — зарегистрировать содержимое файла как поколение `system/gen`.
+fn sh_sysdef(args: &[Value]) -> Result<Value, EvalError> {
+    let (gname, fname) = match (args.first(), args.get(1)) {
+        (Some(Value::Str(g)), Some(Value::Str(f))) => (g.clone(), f.clone()),
+        _ => return Err(EvalError::new("sysdef: (sysdef \"gen\" \"файл\")")),
+    };
+    let ep = sys::start_cap(0);
+    let scap = sys::start_cap(1);
+    let path = resolve(fname.as_bytes());
+    let data = match read_file(ep, &path) {
+        Some(d) => d,
+        None => return Err(EvalError::new("sysdef: нет такого файла")),
+    };
+    let mut root = Vec::with_capacity(7 + gname.len());
+    root.extend_from_slice(b"system/");
+    root.extend_from_slice(gname.as_bytes());
+    let mut id = [0u8; 32];
+    if sys::obj_put(scap, &data, &mut id) == 0 && sys::obj_set_root(scap, &root, &id) == 0 {
+        sys::write(
+            alloc::format!("поколение записано: {} (switch {}, затем ребут)\n", gname, gname)
+                .as_bytes(),
+        );
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("sysdef не удался"))
+    }
+}
+
+/// `(rebuild)` — собрать поколение из `/etc/system/default.vv` (та же логика, что у подкоманды).
+fn sh_rebuild(_args: &[Value]) -> Result<Value, EvalError> {
+    run_rebuild();
+    Ok(Value::nil())
+}
+
+/// `(gens)` — показать поколения системы.
+fn sh_gens(_args: &[Value]) -> Result<Value, EvalError> {
+    run_gens();
+    Ok(Value::nil())
+}
+
+/// `(init-config)` — посеять `/etc/system/*.vv` (модульный конфиг для правки → `rebuild`).
+fn sh_init_config(_args: &[Value]) -> Result<Value, EvalError> {
+    run_init_config();
+    Ok(Value::nil())
+}
+
+/// Разобрать IPv4 «A.B.C.D» в 4 байта (для `ping`). `None` — не разобрать.
+fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    let mut val: u32 = 0;
+    let mut digits = 0;
+    for &b in s {
+        if b == b'.' {
+            if digits == 0 || idx >= 3 {
+                return None;
+            }
+            octets[idx] = val as u8;
+            idx += 1;
+            val = 0;
+            digits = 0;
+        } else if b.is_ascii_digit() {
+            val = val * 10 + (b - b'0') as u32;
+            if val > 255 {
+                return None;
+            }
+            digits += 1;
+        } else {
+            return None;
+        }
+    }
+    if idx != 3 || digits == 0 {
+        return None;
+    }
+    octets[3] = val as u8;
+    Some(octets)
 }
 
 // ── редактор строки (S2c ч.2): история ↑/↓, курсор ←/→/Home/End, backspace/Delete ──

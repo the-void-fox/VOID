@@ -169,6 +169,22 @@ vsh печатал полный `print_help` в bootpath (виден тольк�
 справка по команде `help`. Стартовое сообщение — приветствие vvsh при его старте (в т.ч. авто-запуск).
 Проверено на обеих арх: цветной промпт, `help`/`clear` (не «команда не найдена»), нет vsh-дампа.
 
+## Веха 84 — перенос всех команд vsh в vvsh
+
+vvsh перестал зависеть от vsh по функционалу: все команды спасательного шелла теперь есть и в vvsh
+(builtins-эффекты, дёргают синкаллы напрямую; права из start_cap 0/1/2 = posixfs/store/net — vvsh
+наследует их при exec от vsh). Добавлены: `roots` (сырые корни store), `mkdir`/`rm`/`tail`/`mv`
+(каталоги/файлы через posixfs), `ping A.B.C.D` (ICMP через net-srv, start-cap 2), `thaw` (разморозка
+образа), `switch`/`sysdef` (поколения), `rebuild`/`gens`/`init-config` (конфиг — прямо в REPL, а не
+только `run vvsh …`). `echo TEXT > FILE` дорос до редиректа (голое слово `>` включает запись в файл,
+как в vsh). Логика `init-config`/`rebuild`/`gens` вынесена в общие `run_*`, которые зовут и
+подкоманды (`sys::exit`), и REPL-builtins (`Ok(nil)`) — без дублирования. `help` обновлён.
+
+Проверено (QEMU, x86 q35 + riscv-virt, свежий диск): `init-config` сеет `/etc/system/*.vv`,
+`ls /etc/system` их показывает; `mkdir /d` → `echo privet > /d/a` → `cat`/`tail` → `mv` → `ls` → `rm`
+проходят; `roots` печатает корни (bin/<arch>/*, system/*, f/etc/system/*); `rebuild` → `gen3`,
+`gens` метит активное `*`; `ping 10.0.2.2` отвечает. Обе арх: 0 предупреждений.
+
 ## Связано
 - [[0006-vvsh-lisp-config-shell]] (ADR) · [[vvsh-lang]] (крейт/язык) · [[vvsh-config-layout]] (конфиг,
   фаза M1) · [[void-no-users-root]] (без root/юзеров) · [[tty]]/[[interactive-shell]] (нынешний vsh).
