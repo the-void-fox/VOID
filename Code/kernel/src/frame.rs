@@ -73,11 +73,12 @@ pub fn alloc() -> Option<usize> {
         if head == 0 {
             break; // список пуст — на bump-путь
         }
-        let next = unsafe { core::ptr::read(head as *const usize) };
+        // Веха 87: `head` — ФИЗИЧЕСКИЙ адрес; читать по нему можно только через direct-map.
+        let next = unsafe { core::ptr::read(ptr(head) as *const usize) };
         if FREE_HEAD.compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             FREE_COUNT.fetch_sub(1, Ordering::Relaxed);
             // Обнулить: вызывающий (новая таблица / bss ELF) ждёт чистый фрейм.
-            unsafe { core::ptr::write_bytes(head as *mut u8, 0, PAGE_SIZE) };
+            unsafe { core::ptr::write_bytes(ptr(head), 0, PAGE_SIZE) };
             return Some(head);
         }
     }
@@ -87,8 +88,16 @@ pub fn alloc() -> Option<usize> {
         return None;
     }
     // Обнулить фрейм: нулевой PTE = невалидный, поэтому новая таблица сразу «пустая».
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE) };
+    unsafe { core::ptr::write_bytes(ptr(pa), 0, PAGE_SIZE) };
     Some(pa)
+}
+
+/// Веха 87 — указатель ядра на физический фрейм (через direct-map, [`crate::arch::phys_to_virt`]).
+/// Единственный законный способ ДОТРОНУТЬСЯ до памяти, адрес которой пришёл из [`alloc`]:
+/// пока direct-map тождественный, это тот же адрес, после переезда ядра — уже другой.
+#[inline(always)]
+pub fn ptr(pa: usize) -> *mut u8 {
+    crate::arch::phys_to_virt(pa) as *mut u8
 }
 
 /// Веха 46 — вернуть фрейм в список свободных. `pa` обязан быть 4 КиБ-выровненным
@@ -97,8 +106,8 @@ pub fn alloc() -> Option<usize> {
 pub fn free(pa: usize) {
     loop {
         let head = FREE_HEAD.load(Ordering::Acquire);
-        // Записать текущую голову в первые 8 байт освобождаемого фрейма.
-        unsafe { core::ptr::write(pa as *mut usize, head) };
+        // Записать текущую голову в первые 8 байт освобождаемого фрейма (через direct-map).
+        unsafe { core::ptr::write(ptr(pa) as *mut usize, head) };
         if FREE_HEAD.compare_exchange_weak(head, pa, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             FREE_COUNT.fetch_add(1, Ordering::Relaxed);
             return;

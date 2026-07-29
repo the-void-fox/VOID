@@ -28,6 +28,12 @@ pub const PTE_U: usize = 1 << 4; // User — страница доступна �
 pub const PTE_A: usize = 1 << 6; // Accessed — выставляем сами, чтобы не словить fault
 pub const PTE_D: usize = 1 << 7; // Dirty    — то же для записи
 
+/// Веха 87 — указатель на таблицу страниц по её ФИЗИЧЕСКОМУ адресу (через direct-map).
+#[inline(always)]
+fn tbl_ptr(pa: usize) -> *mut usize {
+    crate::arch::phys_to_virt(pa) as *mut usize
+}
+
 /// Физический адрес корневой таблицы ЯДРА (сохраняется в [`init`]) — основа для
 /// адресных пространств процессов (см. [`clone_kernel_root`]).
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -41,8 +47,8 @@ pub fn clone_kernel_root() -> usize {
     let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
     let new = frame::alloc().expect("нет фрейма под корень процесса");
     unsafe {
-        let src = kroot as *const usize;
-        let dst = new as *mut usize;
+        let src = tbl_ptr(kroot) as *const usize;
+        let dst = tbl_ptr(new);
         for i in 0..512 {
             *dst.add(i) = *src.add(i);
         }
@@ -72,8 +78,8 @@ pub unsafe fn free_address_space(root_pa: usize) {
 /// параллельная таблица ЯДРА того же уровня (`0` — у ядра её нет): записи, совпадающие с
 /// ядром, — общие, пропускаются; прочие приватны. На уровне 0 записи — листовые страницы.
 unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
-    let t = tbl as *const usize;
-    let k = ktbl as *const usize;
+    let t = tbl_ptr(tbl) as *const usize;
+    let k = tbl_ptr(ktbl) as *const usize;
     for i in 0..512 {
         let pte = *t.add(i);
         if pte & PTE_V == 0 {
@@ -163,7 +169,7 @@ pub fn init() -> usize {
 unsafe fn map_mega(root_pa: usize, va: usize, pa: usize, flags: usize) {
     // Уровень 2 (верхний) — промежуточный: спускаемся/создаём таблицу уровня 1.
     let idx2 = (va >> 30) & 0x1ff;
-    let pte2 = (root_pa as *mut usize).add(idx2);
+    let pte2 = tbl_ptr(root_pa).add(idx2);
     let table = if *pte2 & PTE_V == 0 {
         let next = frame::alloc().expect("нет фрейма под таблицу");
         *pte2 = ((next >> 12) << 10) | PTE_V; // нелистовой
@@ -173,7 +179,7 @@ unsafe fn map_mega(root_pa: usize, va: usize, pa: usize, flags: usize) {
     };
     // Уровень 1 — ЛИСТ (мегастраница): права живут здесь.
     let idx1 = (va >> 21) & 0x1ff;
-    let pte1 = (table as *mut usize).add(idx1);
+    let pte1 = tbl_ptr(table).add(idx1);
     *pte1 = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
 }
 
@@ -230,7 +236,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) {
     let mut level = 2usize;
     while level >= 1 {
         let idx = (va >> (12 + 9 * level)) & 0x1ff;
-        let pte = (table as *mut usize).add(idx);
+        let pte = tbl_ptr(table).add(idx);
         if *pte & PTE_V == 0 {
             // Промежуточной таблицы ещё нет — создаём.
             let next = frame::alloc().expect("нет фрейма под таблицу");
@@ -245,7 +251,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) {
 
     // Уровень 0 — листовой PTE (тут и живут права доступа).
     let idx = (va >> 12) & 0x1ff;
-    let pte = (table as *mut usize).add(idx);
+    let pte = tbl_ptr(table).add(idx);
     *pte = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
 }
 
@@ -269,7 +275,7 @@ pub fn page_info(root_pa: usize, va: usize) -> Option<(usize, usize)> {
     let mut level = 2i32;
     loop {
         let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
-        let pte = unsafe { *(table as *const usize).add(idx) };
+        let pte = unsafe { *tbl_ptr(table).add(idx) };
         if pte & (PTE_R | PTE_X) != 0 || level == 0 {
             return Some((page, pte & (PTE_R | PTE_W | PTE_X | PTE_U)));
         }
@@ -286,7 +292,7 @@ pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
     let mut level = 2i32;
     while level >= 0 {
         let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
-        let pte = unsafe { *(table as *const usize).add(idx) };
+        let pte = unsafe { *tbl_ptr(table).add(idx) };
         if pte & PTE_V == 0 {
             return None; // невалидно — отображения нет
         }

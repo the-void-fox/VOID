@@ -183,11 +183,13 @@ unsafe impl GlobalAlloc for SpinLock<FreeListAllocator> {
 static ALLOCATOR: SpinLock<FreeListAllocator> = SpinLock::new(FreeListAllocator::new());
 
 /// Зарезервировать RAM под кучу и инициализировать аллокатор. Вызывать один раз
-/// после включения paging (арена лежит в идентично отображённой RAM).
+/// после включения paging (арена лежит в отображённой direct-map RAM).
 pub fn init() {
     let size = HEAP_PAGES * PAGE_SIZE;
-    let start = frame::reserve(size).expect("нет RAM под кучу ядра");
-    unsafe { ALLOCATOR.lock().init(start, size) };
+    // Веха 87: `reserve` отдаёт ФИЗИЧЕСКИЙ адрес, а аллокатор раздаёт указатели —
+    // переводим через direct-map ([`crate::arch::phys_to_virt`]).
+    let start_pa = frame::reserve(size).expect("нет RAM под кучу ядра");
+    unsafe { ALLOCATOR.lock().init(frame::ptr(start_pa) as usize, size) };
 }
 
 const fn align_up(x: usize, a: usize) -> usize {

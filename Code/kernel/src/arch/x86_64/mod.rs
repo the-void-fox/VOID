@@ -611,6 +611,28 @@ extern "C" {
     pub fn context_switch(old: *mut Context, new: *const Context);
 }
 
+// ─── direct-map: физический адрес ↔ указатель ядра (Веха 87) ────────────────
+
+/// Веха 87 — смещение direct-map: `VA = PA + KERNEL_OFFSET` ([[0010-address-space-layout]]).
+///
+/// Пока **0**: отображение остаётся тождественным, поведение не меняется. Смысл этапа — развести
+/// «физический адрес» и «указатель, по которому ядро к нему обращается»; когда ядро переедет в
+/// верхнюю половину, поменяется только эта константа и путь загрузки.
+pub const KERNEL_OFFSET: usize = 0;
+
+/// Физический адрес → указатель ядра на него (через direct-map).
+#[inline(always)]
+pub fn phys_to_virt(pa: usize) -> usize {
+    pa.wrapping_add(KERNEL_OFFSET)
+}
+
+/// Указатель ядра в direct-map → физический адрес. Только для адресов ИЗ direct-map:
+/// к образу ядра и MMIO-окнам не применять.
+#[inline(always)]
+pub fn virt_to_phys(va: usize) -> usize {
+    va.wrapping_sub(KERNEL_OFFSET)
+}
+
 // ─── часы и случайность (Веха 86) ───────────────────────────────────────────
 
 /// Настенное время от прошивки — CMOS RTC, наносекунды Unix. `None` — часов нет.

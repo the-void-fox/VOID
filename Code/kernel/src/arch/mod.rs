@@ -19,6 +19,10 @@
 //!   `mark_in_kernel` (инвариант «trap пришёл из ядра» после возврата из сессии).
 //! - **Таймер**: `timer_hw_init` (размаскировать и включить), `timer_arm` (перевзвести квант
 //!   вытеснения; величина кванта — дело арха: таймбазы разные).
+//! - **direct-map** (Веха 87): `KERNEL_OFFSET` — смещение отображения RAM, `phys_to_virt` /
+//!   `virt_to_phys` — перевод «физический адрес ↔ указатель ядра». Всё ядро обращается к
+//!   физической памяти ТОЛЬКО через них, поэтому переезд ядра в верхнюю половину сводится к
+//!   смене константы и пути загрузки ([[0010-address-space-layout]]).
 //! - **Память**: `mm_init() -> корень`, `mm_enable`, `clone_kernel_root`, `map` с флагами
 //!   `MAP_R/W/X/U`, `translate`, `flush_tlb`, токены адресных пространств
 //!   `space_token(корень)`/`space_root(токен)` (на RISC-V токен = значение satp), `MM_NAME`.
@@ -61,7 +65,8 @@ pub use imp::{
     now_ticks, timer_arm, timer_hw_init,
     // память
     clone_kernel_root, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
-    space_root, space_token, translate, MAP_R, MAP_U, MAP_W, MAP_X, MM_NAME,
+    phys_to_virt, space_root, space_token, translate, virt_to_phys, MAP_R, MAP_U, MAP_W, MAP_X,
+    MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
     // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49, IRQ — Веха 52)

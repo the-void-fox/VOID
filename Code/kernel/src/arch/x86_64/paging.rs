@@ -23,6 +23,13 @@ const HUGE: usize = 2 * 1024 * 1024;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Веха 87 — указатель на таблицу страниц по её ФИЗИЧЕСКОМУ адресу (через direct-map).
+/// Обходчики таблиц ходят по физическим адресам из PTE, а трогать их можно только так.
+#[inline(always)]
+fn tbl_ptr(pa: usize) -> *mut u64 {
+    crate::arch::phys_to_virt(pa) as *mut u64
+}
+
 /// Корень таблиц ЯДРА (PML4) — основа адресных пространств процессов.
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -85,13 +92,13 @@ pub fn clone_kernel_root() -> usize {
     let new = frame::alloc().expect("нет фрейма под PML4 процесса");
     let pdpt = frame::alloc().expect("нет фрейма под PDPT процесса");
     unsafe {
-        let src = kroot as *const u64;
-        let dst = new as *mut u64;
+        let src = tbl_ptr(kroot) as *const u64;
+        let dst = tbl_ptr(new);
         for i in 0..512 {
             *dst.add(i) = *src.add(i);
         }
-        let kpdpt = (*src & ADDR_MASK) as *const u64;
-        let dpdpt = pdpt as *mut u64;
+        let kpdpt = tbl_ptr((*src & ADDR_MASK) as usize) as *const u64;
+        let dpdpt = tbl_ptr(pdpt);
         for i in 0..512 {
             *dpdpt.add(i) = *kpdpt.add(i);
         }
@@ -119,8 +126,8 @@ pub unsafe fn free_address_space(root_pa: usize) {
 /// параллельная таблица ЯДРА (`0` — её нет). Записи, совпадающие с ядром, — общие, минуем.
 /// Суперстраниц (PS) мы не используем, поэтому лист — только на уровне 0.
 unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
-    let t = tbl as *const u64;
-    let k = ktbl as *const u64;
+    let t = tbl_ptr(tbl) as *const u64;
+    let k = tbl_ptr(ktbl) as *const u64;
     for i in 0..512 {
         let pte = *t.add(i);
         if pte & PTE_P == 0 {
@@ -178,7 +185,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) {
     let mut level = 3usize; // PML4 → PDPT → PD → PT
     while level >= 1 {
         let idx = (va >> (12 + 9 * level)) & 0x1ff;
-        let pte = (table as *mut u64).add(idx);
+        let pte = tbl_ptr(table).add(idx);
         if *pte & PTE_P == 0 {
             let next = frame::alloc().expect("нет фрейма под таблицу");
             *pte = next as u64 | PTE_P | PTE_W | PTE_U;
@@ -189,7 +196,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) {
         level -= 1;
     }
     let idx = (va >> 12) & 0x1ff;
-    let pte = (table as *mut u64).add(idx);
+    let pte = tbl_ptr(table).add(idx);
     *pte = (pa as u64 & ADDR_MASK) | PTE_P | flags;
 }
 
@@ -213,7 +220,7 @@ unsafe fn map_huge(root_pa: usize, va: usize, pa: usize, flags: u64) {
     for level in [3usize, 2] {
         // PML4 → PDPT, дойти до PD
         let idx = (va >> (12 + 9 * level)) & 0x1ff;
-        let pte = (table as *mut u64).add(idx);
+        let pte = tbl_ptr(table).add(idx);
         if *pte & PTE_P == 0 {
             let next = frame::alloc().expect("нет фрейма под таблицу");
             *pte = next as u64 | PTE_P | PTE_W | PTE_U;
@@ -223,7 +230,7 @@ unsafe fn map_huge(root_pa: usize, va: usize, pa: usize, flags: u64) {
         }
     }
     let idx = (va >> 21) & 0x1ff; // индекс в PD
-    let pte = (table as *mut u64).add(idx);
+    let pte = tbl_ptr(table).add(idx);
     *pte = (pa as u64 & ADDR_MASK) | PTE_P | PTE_PS | flags; // PS → лист 2 МиБ
 }
 
@@ -261,7 +268,7 @@ pub fn page_info(root_pa: usize, va: usize) -> Option<(usize, u64)> {
     let mut pte = 0u64;
     while level >= 0 {
         let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
-        pte = unsafe { *(table as *const u64).add(idx) };
+        pte = unsafe { *tbl_ptr(table).add(idx) };
         if pte & PTE_P == 0 {
             return None;
         }
@@ -283,7 +290,7 @@ pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
     let mut level = 3i32;
     while level >= 0 {
         let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
-        let pte = unsafe { *(table as *const u64).add(idx) };
+        let pte = unsafe { *tbl_ptr(table).add(idx) };
         if pte & PTE_P == 0 {
             return None;
         }

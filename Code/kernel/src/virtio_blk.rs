@@ -200,18 +200,19 @@ impl VirtioBlk {
         };
         let mut status: u8 = 0xff;
 
-        let desc = self.desc as *mut Desc;
-        let avail = self.avail as *mut Avail;
-        let used = self.used as *const Used;
+        // Веха 87: в полях — физические адреса (их знает устройство); ядру нужен direct-map.
+        let desc = frame::ptr(self.desc) as *mut Desc;
+        let avail = frame::ptr(self.avail) as *mut Avail;
+        let used = frame::ptr(self.used) as *const Used;
 
         unsafe {
             // Дескриптор 0 — заголовок (устройство читает).
-            set_desc(desc, 0, &hdr as *const _ as u64, 16, DESC_F_NEXT, 1);
+            set_desc(desc, 0, arch::virt_to_phys(&hdr as *const _ as usize) as u64, 16, DESC_F_NEXT, 1);
             // Дескриптор 1 — данные. Для чтения устройство ПИШЕТ в буфер (DESC_F_WRITE).
             let data_flags = DESC_F_NEXT | if write { 0 } else { DESC_F_WRITE };
-            set_desc(desc, 1, buf as u64, SECTOR_SIZE as u32, data_flags, 2);
+            set_desc(desc, 1, arch::virt_to_phys(buf) as u64, SECTOR_SIZE as u32, data_flags, 2);
             // Дескриптор 2 — байт статуса (устройство пишет).
-            set_desc(desc, 2, &mut status as *mut _ as u64, 1, DESC_F_WRITE, 0);
+            set_desc(desc, 2, arch::virt_to_phys(&mut status as *mut _ as usize) as u64, 1, DESC_F_WRITE, 0);
 
             // Опубликовать голову цепочки (дескриптор 0) в avail.
             fence(Ordering::SeqCst);
@@ -243,8 +244,8 @@ impl VirtioBlk {
     /// Опубликовать цепочку чтения (3 дескриптора) и дёрнуть устройство. НЕ ждёт завершения —
     /// его сообщит прерывание. Адреса hdr/buf/status должны жить до завершения (у future — в Box).
     fn submit_read(&mut self, hdr: u64, buf: u64, status: u64) {
-        let desc = self.desc as *mut Desc;
-        let avail = self.avail as *mut Avail;
+        let desc = frame::ptr(self.desc) as *mut Desc;
+        let avail = frame::ptr(self.avail) as *mut Avail;
         unsafe {
             set_desc(desc, 0, hdr, 16, DESC_F_NEXT, 1);
             set_desc(desc, 1, buf, SECTOR_SIZE as u32, DESC_F_NEXT | DESC_F_WRITE, 2);
