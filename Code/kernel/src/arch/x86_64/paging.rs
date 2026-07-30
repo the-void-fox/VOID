@@ -34,32 +34,55 @@ fn tbl_ptr(pa: usize) -> *mut u64 {
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" {
+    static _kernel_start: u8;
     static _text_start: u8;
     static _text_end: u8;
     static _rodata_start: u8;
     static _rodata_end: u8;
+    static _data_start: u8;
+    static _kernel_end: u8;
 }
 
-/// Построить таблицы ядра: direct map RAM (RW+NX) → W^X кода/констант → окна MMIO.
+/// Построить таблицы ядра: direct map RAM (RW+NX) → окно образа с W^X → окна MMIO.
 /// Возвращает физический адрес PML4.
+///
+/// Веха 87 — три разных вида отображений, и их важно не путать:
+/// - **direct-map** (`phys_to_virt`): вся физическая RAM, RW+NX. Через него ядро трогает
+///   фреймы, таблицы, кучу, страницы процессов;
+/// - **окно образа** (`KIMAGE_BASE`): сам бинарь ядра — единственное место, откуда ядро
+///   ИСПОЛНЯЕТСЯ, и единственное, где есть страницы с правом X;
+/// - **MMIO**: тождественно (VA == PA) — драйверы держат физические адреса регистров.
+///
+/// Образ попадает и в direct-map (он же часть RAM), но там его страницы кладутся ТОЛЬКО
+/// на чтение: иначе рядом с исполняемым кодом жил бы его же пишущий алиас — дыра в W^X.
 pub fn init() -> usize {
     frame::init();
     let root = frame::alloc().expect("нет фрейма под PML4");
 
+    let kimg_s = &raw const _kernel_start as usize;
     let text_s = &raw const _text_start as usize;
     let text_e = &raw const _text_end as usize;
     let ro_s = &raw const _rodata_start as usize;
     let ro_e = &raw const _rodata_end as usize;
+    let data_s = &raw const _data_start as usize;
+    let kimg_e = &raw const _kernel_end as usize;
 
     unsafe {
         // 1) direct map всей (используемой) RAM как RW+NX (данные не исполняются). Веха 41/85:
-        //    граница — обнаруженная `ram_limit()` (зажата CAP'ом 1 ГиБ); стелем huge-страницами
-        //    (2 МиБ), но чанки образа ядра [text_s, ro_e) — постранично (4 КиБ), чтобы шаг 2 (W^X)
-        //    смог сузить права страниц кода/констант.
-        map_direct(root, 0, super::ram_limit(), text_s, ro_e);
-        // 2) W^X: код R+X (без W и без NX), константы R+NX (в 4-КиБ вырезе образа ядра).
-        map_range(root, text_s, text_e, 0);
-        map_range(root, ro_s, ro_e, PTE_NX);
+        //    граница — обнаруженная `ram_limit()`; стелем huge-страницами (2 МиБ), а чанки
+        //    образа ядра — постранично и только на чтение (см. преамбулу).
+        map_direct(
+            root,
+            0,
+            super::ram_limit(),
+            super::virt_to_phys(kimg_s),
+            super::virt_to_phys(kimg_e),
+        );
+        // 2) окно образа ядра — W^X: заголовки и константы R+NX, код R+X, данные RW+NX.
+        map_kimage(root, kimg_s, text_s, PTE_NX);
+        map_kimage(root, text_s, text_e, 0);
+        map_kimage(root, ro_s, ro_e, PTE_NX);
+        map_kimage(root, data_s, kimg_e, PTE_W | PTE_NX);
         // 3) MMIO контроллеров прерываний: LAPIC + IOAPIC (BAR'ы PCI отобразит
         //    map_mmio, когда их найдёт pci::probe_virtio_blk — они известны в рантайме).
         map_range(root, super::lapic::LAPIC_BASE, super::lapic::LAPIC_BASE + PAGE_SIZE, PTE_W | PTE_NX);
@@ -200,12 +223,23 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) {
     *pte = (pa as u64 & ADDR_MASK) | PTE_P | flags;
 }
 
-/// Отобразить диапазон [start, end) идентично (VA == PA), постранично.
+/// Отобразить диапазон [start, end) ТОЖДЕСТВЕННО (VA == PA), постранично — окна MMIO.
 unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: u64) {
     let mut va = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     while va < end {
         map(root_pa, va, va, flags);
+        va += PAGE_SIZE;
+    }
+}
+
+/// Веха 87 — отобразить диапазон ОКНА ОБРАЗА [start, end) на его физику
+/// (`VA → virt_to_phys(VA)`), постранично: так образ получает свои права (W^X).
+unsafe fn map_kimage(root_pa: usize, start: usize, end: usize, flags: u64) {
+    let mut va = start & !(PAGE_SIZE - 1);
+    let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    while va < end {
+        map(root_pa, va, super::virt_to_phys(va), flags);
         va += PAGE_SIZE;
     }
 }
@@ -234,28 +268,31 @@ unsafe fn map_huge(root_pa: usize, va: usize, pa: usize, flags: u64) {
     *pte = (pa as u64 & ADDR_MASK) | PTE_P | PTE_PS | flags; // PS → лист 2 МиБ
 }
 
-/// Веха 85 — застелить direct-map [start, end) идентично (VA == PA) huge-страницами (RW+NX), но
-/// чанки, перекрывающие защищаемый диапазон [prot_s, prot_e) (образ ядра — под W^X), кладём
-/// постранично (4 КиБ), чтобы затем сузить права отдельных страниц. Хвост < 2 МиБ — тоже 4 КиБ.
+/// Веха 85/87 — застелить direct-map физической памяти [start, end) huge-страницами RW+NX по
+/// `VA = phys_to_virt(PA)`. Чанки, перекрывающие образ ядра [prot_s, prot_e) (границы
+/// ФИЗИЧЕСКИЕ), кладём постранично и БЕЗ права записи: исполняется образ из своего окна, а
+/// пишущий алиас рядом с кодом сделал бы W^X фикцией. Хвост < 2 МиБ — тоже постранично.
 unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, prot_e: usize) {
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let prot_s = prot_s & !(PAGE_SIZE - 1);
-    let mut va = start & !(HUGE - 1);
-    while va < end {
-        let chunk_end = va + HUGE;
-        let overlaps_kernel = va < prot_e && chunk_end > prot_s;
+    let mut pa = start & !(HUGE - 1);
+    while pa < end {
+        let chunk_end = pa + HUGE;
+        let overlaps_kernel = pa < prot_e && chunk_end > prot_s;
         if chunk_end <= end && !overlaps_kernel {
-            map_huge(root_pa, va, va, PTE_W | PTE_NX);
+            map_huge(root_pa, super::phys_to_virt(pa), pa, PTE_W | PTE_NX);
         } else {
-            // Вырез ядра (для W^X) или хвост меньше huge-страницы — постранично.
-            let mut p = va;
+            // Вырез образа ядра или хвост меньше huge-страницы — постранично.
+            let mut p = pa;
             let stop = chunk_end.min(end);
             while p < stop {
-                map(root_pa, p, p, PTE_W | PTE_NX);
+                let ro = p >= prot_s && p < prot_e;
+                let flags = if ro { PTE_NX } else { PTE_W | PTE_NX };
+                map(root_pa, super::phys_to_virt(p), p, flags);
                 p += PAGE_SIZE;
             }
         }
-        va += HUGE;
+        pa += HUGE;
     }
 }
 

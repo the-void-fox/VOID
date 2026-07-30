@@ -7,9 +7,19 @@
 #   GDT → PAE → идентичные таблицы (2 МиБ страницы на первые 4 ГиБ) → EFER.LME|NXE →
 #   CR0.PG|WP → далёкий прыжок в 64-битный сегмент → стек → kmain(0, start_info).
 #
-# Идентичные таблицы трамплина — ВРЕМЕННЫЕ (аналог «до paging::init» на RISC-V):
+# Таблицы трамплина — ВРЕМЕННЫЕ (аналог «до paging::init» на RISC-V):
 # kmain строит настоящие (arch::mm_init, W^X) и перещёлкивает CR3 (arch::mm_enable).
 # Синтаксис Intel (по умолчанию для global_asm! на x86_64).
+#
+# Веха 87 — higher-half: ядро СЛИНКОВАНО по высоким адресам (окно образа
+# 0xFFFF_FFFF_8000_0000 + физика, см. linker-x86_64.ld), а 32-битный трамплин
+# исполняется по ФИЗИЧЕСКИМ. В отличие от riscv (medany, всё PC-относительно) x86
+# в 32-битном режиме адресует символы абсолютно, поэтому КАЖДАЯ ссылка на символ
+# до перехода в верхнюю половину пишется как `symbol - KVA` — то есть физически.
+# Таблицы трамплина отображают память ТРИЖДЫ: identity (чтобы пережить включение
+# пейджинга), direct-map с PAGE_OFFSET и окно образа — ровно те три вида адресов,
+# которыми ядро пользуется дальше.
+.set KVA, 0xFFFFFFFF80000000        # окно образа ядра (KIMAGE_BASE в mod.rs)
 
 # ── PVH-нота (читает QEMU при `-kernel`) ──────────────────────────────────────
 .section .note.Xen, "a", @note
@@ -18,7 +28,7 @@
     .long 4                         # descsz = 4 (32-битный адрес входа)
     .long 18                        # XEN_ELFNOTE_PHYS32_ENTRY
     .asciz "Xen"
-    .long _start32
+    .long _start32_phys             # поле 32-битное — только физический адрес (linker-x86_64.ld)
 
 # ── Multiboot2-заголовок (читает GRUB — путь для РЕАЛЬНОГО железа, Веха 41) ─────
 # Одна ELF-сборка грузится и QEMU (PVH-нотой), и GRUB'ом (этим заголовком): на ноутбуке
@@ -51,12 +61,12 @@ mb2_header_end:
 _start32:
     cli
     mov esi, ebx                    # info ptr (PVH start_info | multiboot info) → 2-й арг kmain
-    mov [boot_magic], eax           # magic загрузки → глобал (edi клобберит пейджинг ниже)
+    mov [boot_magic - KVA], eax     # magic загрузки → глобал (edi клобберит пейджинг ниже)
 
     # PVH ABI: esp НЕ определён — свой стек до первого push (retf ниже).
-    mov esp, offset _boot_stack_top
+    mov esp, offset _boot_stack_top - KVA
 
-    lgdt [gdt64_ptr]
+    lgdt [gdt64_ptr - KVA]
 
     # PAE — обязательна для long mode. OSFXSR|OSXMMEXCPT (Веха 36) — SSE для
     # userspace: без них любой SSE-опкод в ring3 даёт #UD (ядро само собрано
@@ -66,14 +76,30 @@ _start32:
     or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
-    # Идентичные таблицы: pml4[0] → pdpt; pdpt[0..3] → 4 PD; PD — 2048 × 2 МиБ = 4 ГиБ.
+    # Таблицы: pdpt[0..3] → 4 PD; PD — 2048 × 2 МиБ = первые 4 ГиБ физической памяти.
     # Верхние половины записей нули: RAM QEMU обнулена, пишем только младшие dword'ы.
-    mov edi, offset boot_pdpt
+    #
+    # Этот же PDPT вешаем в ДВА слота PML4:
+    #   [0]   — identity (VA == PA): без него следующая инструкция после включения CR0.PG
+    #           ушла бы в никуда;
+    #   [256] — direct-map (VA == PA + PAGE_OFFSET = 0xFFFF_8000_0000_0000): слот покрывает
+    #           512 ГиБ с её начала, и те же 4 ГиБ ложатся ровно куда надо.
+    mov edi, offset boot_pdpt - KVA
     or edi, 3                       # P | RW
-    mov [boot_pml4], edi
+    mov [boot_pml4 - KVA], edi              # PML4[0]   — identity
+    mov [boot_pml4 - KVA + 256*8], edi      # PML4[256] — direct-map
 
-    mov edi, offset boot_pdpt
-    mov eax, offset boot_pd
+    # Окно ОБРАЗА ядра (0xFFFF_FFFF_8000_0000 = PML4[511], PDPT[510]) — отдельная ветка,
+    # ведущая на первый PD (физические 0..1 ГиБ): образ ядра лежит там.
+    mov edi, offset boot_pdpt_hi - KVA
+    or edi, 3
+    mov [boot_pml4 - KVA + 511*8], edi
+    mov edi, offset boot_pd - KVA
+    or edi, 3
+    mov [boot_pdpt_hi - KVA + 510*8], edi
+
+    mov edi, offset boot_pdpt - KVA
+    mov eax, offset boot_pd - KVA
     or eax, 3                       # P | RW
     mov ecx, 4
 1:  mov [edi], eax
@@ -81,7 +107,7 @@ _start32:
     add eax, 4096
     loop 1b
 
-    mov edi, offset boot_pd
+    mov edi, offset boot_pd - KVA
     mov eax, 0x83                   # P | RW | PS (2 МиБ)
     mov ecx, 2048
 2:  mov [edi], eax
@@ -89,7 +115,7 @@ _start32:
     add eax, 0x200000
     loop 2b
 
-    mov eax, offset boot_pml4
+    mov eax, offset boot_pml4 - KVA
     mov cr3, eax
 
     # EFER: LME (long mode) + NXE (бит NX в PTE — нужен W^X настоящих таблиц).
@@ -103,15 +129,22 @@ _start32:
     or eax, 0x80010001
     mov cr0, eax
 
-    # Далёкий «прыжок» сменой CS через retf: в стек CS:EIP, far return.
+    # Далёкий «прыжок» сменой CS через retf: в стек CS:EIP, far return. Целевой адрес
+    # 32-битный, поэтому прыгаем в НИЗКИЙ 64-битный огрызок, а он уже уходит наверх.
     # (`push offset …` LLVM собирает 16-битной релокацией — кладём через регистр.)
     push 0x08
-    mov eax, offset _start64
+    mov eax, offset _start64_low - KVA
     push eax
     retf
 
 # ── 64-битный вход ───────────────────────────────────────────────────────────
 .code64
+# Ещё по физическим адресам: единственный способ уйти в верхнюю половину — абсолютный
+# 64-битный адрес (movabs даёт ЛИНКОВОЧНЫЙ, то есть высокий) и косвенный jmp.
+_start64_low:
+    movabs rax, offset _start64
+    jmp rax
+
 _start64:
     mov ax, 0x10
     mov ds, ax
@@ -120,8 +153,9 @@ _start64:
     mov fs, ax
     mov gs, ax
     mov esi, esi                    # обнулить верхнюю половину rsi (после смены режима — мусор)
+    # Дальше PC высокий, и rip-относительная адресация сама даёт высокие адреса.
     lea rsp, [rip + _boot_stack_top]
-    mov edi, [boot_magic]           # 1-й арг kmain = magic загрузки (0x2BADB002 → multiboot)
+    mov edi, [rip + boot_magic]     # 1-й арг kmain = magic загрузки (0x2BADB002 → multiboot)
     call kmain
 3:  hlt
     jmp 3b
@@ -136,7 +170,7 @@ gdt64:
 gdt64_end:
 gdt64_ptr:
     .word gdt64_end - gdt64 - 1
-    .long gdt64                     # 32-битный lgdt: word limit + dword base
+    .long gdt64 - KVA               # 32-битный lgdt: word limit + dword base (физический!)
 
 .section .bss
 .align 8
@@ -146,6 +180,8 @@ boot_magic:                         # magic загрузки (eax при вхо�
 boot_pml4:
     .space 4096
 boot_pdpt:
+    .space 4096
+boot_pdpt_hi:                       # ветка окна образа ядра (PML4[511])
     .space 4096
 boot_pd:
     .space 4 * 4096                 # 4 PD × 512 записей × 2 МиБ = 4 ГиБ

@@ -25,8 +25,8 @@ pub fn run() -> Result<u64, &'static str> {
     if total == 0 {
         return Err("нет AHCI-диска (установка только на SATA)");
     }
-    // Модуль лежит в RAM идентично отображённым (физ. адрес = вирт.).
-    let img = unsafe { core::slice::from_raw_parts(mbase as *const u8, mlen) };
+    // Веха 87: GRUB кладёт модуль в RAM и сообщает ФИЗИЧЕСКИЙ адрес — читаем через direct-map.
+    let img = unsafe { core::slice::from_raw_parts(crate::frame::ptr(mbase), mlen) };
     if img.len() < 512 || img[510] != 0x55 || img[511] != 0xaa {
         return Err("образ без MBR-подписи 0x55AA");
     }

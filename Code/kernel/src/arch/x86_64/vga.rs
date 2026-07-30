@@ -6,10 +6,18 @@
 //! экрана реальной машины) — оба дёшевы. Курсор — статик; вывод строки идёт с выключенными
 //! прерываниями (`_print`), поэтому гонок нет (машина однопроцессорная).
 //!
-//! Экран доступен по 0xB8000 и до, и после `paging::init`: трамплин (entry.s) отображает
-//! первые 4 ГиБ, а прямое отображение ядра покрывает младший мегабайт (там и лежит буфер).
+//! Веха 87 — ядро живёт в верхней половине, поэтому к буферу (он в младшем мегабайте
+//! ФИЗИЧЕСКОЙ памяти) обращаемся через direct-map, [`dm`]. Так экран доступен и до
+//! `paging::init` (трамплин строит direct-map первых 4 ГиБ), и после.
 
+/// Физический адрес VGA-буфера — только как аргумент [`dm`], напрямую разыменовывать нельзя.
 const VGA: usize = 0xB8000;
+
+/// Указатель ядра на физический адрес нижней памяти (direct-map).
+#[inline(always)]
+fn dm(pa: usize) -> usize {
+    crate::arch::phys_to_virt(pa)
+}
 const W: usize = 80;
 const H: usize = 25;
 
@@ -22,7 +30,7 @@ static mut ATTR: u8 = ATTR_DEFAULT;
 
 #[inline]
 unsafe fn put_cell(row: usize, col: usize, ch: u8) {
-    let p = (VGA + (row * W + col) * 2) as *mut u8;
+    let p = (dm(VGA) + (row * W + col) * 2) as *mut u8;
     core::ptr::write_volatile(p, ch);
     core::ptr::write_volatile(p.add(1), ATTR);
 }
@@ -40,8 +48,8 @@ unsafe fn newline() {
 unsafe fn scroll() {
     for row in 1..H {
         for col in 0..W {
-            let src = (VGA + (row * W + col) * 2) as *const u16;
-            let dst = (VGA + ((row - 1) * W + col) * 2) as *mut u16;
+            let src = (dm(VGA) + (row * W + col) * 2) as *const u16;
+            let dst = (dm(VGA) + ((row - 1) * W + col) * 2) as *mut u16;
             core::ptr::write_volatile(dst, core::ptr::read_volatile(src));
         }
     }
@@ -248,7 +256,7 @@ pub fn clear() {
     unsafe {
         let blank = ((ATTR as u16) << 8) | b' ' as u16;
         for i in 0..W * H {
-            core::ptr::write_volatile((VGA + i * 2) as *mut u16, blank);
+            core::ptr::write_volatile((dm(VGA) + i * 2) as *mut u16, blank);
         }
         ROW = 0;
         COL = 0;
@@ -292,7 +300,7 @@ pub fn load_font() {
 
         // ── записать глифы: символ c → 0xA0000 + c*32, 16 байт из font[c*16..] ──
         for c in 0..256 {
-            let dst = (0xA0000 + c * 32) as *mut u8;
+            let dst = (dm(0xA0000) + c * 32) as *mut u8;
             for row in 0..16 {
                 core::ptr::write_volatile(dst.add(row), font[c * 16 + row]);
             }

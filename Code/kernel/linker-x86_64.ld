@@ -1,14 +1,23 @@
 /* Раскладка памяти ядра VOID для x86_64 (Веха 25 — PVH direct boot).
  *
- * QEMU (`-kernel`) грузит ELF64 по физическим адресам сегментов и стартует 32-битный
- * вход из PVH-ноты (см. arch/x86_64/entry.s). База 1 МиБ — ниже только BIOS/EBDA-дыры.
- * Ядро живёт identity-mapped (VA == PA), как на RISC-V: та же модель direct map, те же
- * символы _*_start/_end и _kernel_end для W^X (arch/x86_64/paging.rs) и frame.rs.
- * Higher-half не используется сознательно — см. ADR 0005/0006. */
+ * QEMU (`-kernel`) грузит ELF64 по ФИЗИЧЕСКИМ адресам сегментов (p_paddr) и стартует
+ * 32-битный вход из PVH-ноты (см. arch/x86_64/entry.s); GRUB на металле — так же, по
+ * multiboot2. База 1 МиБ — ниже только BIOS/EBDA-дыры.
+ *
+ * Веха 87 — higher-half: секции линкуются по высоким VMA при физических LMA. Окно
+ * образа — ПОСЛЕДНИЕ 2 ГиБ адресного пространства, потому что `x86_64-unknown-none`
+ * собран с моделью кода `kernel` (знаковая 32-битная адресация от -2 ГиБ): никуда
+ * больше слинковать ядро нельзя, не пересобирая core. Поэтому окон ДВА, как в Linux:
+ * это (`__START_KERNEL_map`) — под сам образ, и direct-map RAM с начала верхней
+ * половины (`PAGE_OFFSET`, arch/x86_64/mod.rs) — под всю физическую память.
+ * См. ADR 0010. */
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(_start32)
+/* Точка входа ELF — ФИЗИЧЕСКИЙ адрес: стартуем в 32-битном режиме без пейджинга. */
+ENTRY(_start32_phys)
 
-BASE_ADDRESS = 0x100000;
+KERNEL_OFFSET = 0xFFFFFFFF80000000;
+PHYS_BASE = 0x100000;
+BASE_ADDRESS = KERNEL_OFFSET + PHYS_BASE;
 
 SECTIONS
 {
@@ -18,17 +27,17 @@ SECTIONS
     /* Multiboot1-заголовок (Веха 41) — САМЫМ ПЕРВЫМ в файле: GRUB ищет magic в первых
      * 8 КиБ файла. .text выровнен на страницу и уезжает за 8 КиБ, поэтому заголовок —
      * в отдельной секции здесь, у самого начала первого PT_LOAD. */
-    .multiboot : ALIGN(4) {
+    .multiboot : AT(ADDR(.multiboot) - KERNEL_OFFSET) ALIGN(4) {
         KEEP(*(.multiboot))
     }
 
     /* PVH-нота — отдельной секцией типа note: LLD сам заведёт под неё PT_NOTE,
      * в котором её ищет QEMU. Прочие ноты игнорируются (/DISCARD/ ниже). */
-    .note : ALIGN(4) {
+    .note : AT(ADDR(.note) - KERNEL_OFFSET) ALIGN(4) {
         *(.note.Xen)
     }
 
-    .text : ALIGN(4K) {
+    .text : AT(ADDR(.text) - KERNEL_OFFSET) ALIGN(4K) {
         _text_start = .;
         *(.text.entry)          /* _start обязан быть первым */
         *(.text .text.*)
@@ -36,20 +45,20 @@ SECTIONS
         _text_end = .;
     }
 
-    .rodata : ALIGN(4K) {
+    .rodata : AT(ADDR(.rodata) - KERNEL_OFFSET) ALIGN(4K) {
         _rodata_start = .;
         *(.rodata .rodata.*)
         . = ALIGN(4K);
         _rodata_end = .;
     }
 
-    .data : ALIGN(4K) {
+    .data : AT(ADDR(.data) - KERNEL_OFFSET) ALIGN(4K) {
         _data_start = .;
         *(.data .data.*)
         *(.got .got.*)
     }
 
-    .bss : ALIGN(8) {
+    .bss : AT(ADDR(.bss) - KERNEL_OFFSET) ALIGN(8) {
         _bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
@@ -59,6 +68,8 @@ SECTIONS
 
     . = ALIGN(4K);
     _kernel_end = .;            /* конец образа; дальше свободная RAM под фреймы */
+
+    _start32_phys = _start32 - KERNEL_OFFSET;   /* см. ENTRY выше и PVH-ноту в entry.s */
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
 }
