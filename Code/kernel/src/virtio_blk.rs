@@ -529,9 +529,11 @@ impl Future for ReadFuture {
         let this = self.get_mut(); // ReadFuture: Unpin (поля — Box/скаляры)
 
         if !this.submitted {
-            let hp = &*this.hdr as *const ReqHeader as u64;
-            let bp = this.buf.as_ptr() as u64;
-            let sp = &*this.status as *const u8 as u64;
+            // Веха 87: устройство читает/пишет по ФИЗИЧЕСКИМ адресам, а `Box` живёт в куче ядра
+            // (в direct-map) — переводим, иначе DMA уйдёт по адресу верхней половины.
+            let hp = arch::virt_to_phys(&*this.hdr as *const ReqHeader as usize) as u64;
+            let bp = arch::virt_to_phys(this.buf.as_ptr() as usize) as u64;
+            let sp = arch::virt_to_phys(&*this.status as *const u8 as usize) as u64;
             let mut g = BLK.lock();
             let Some(blk) = g.as_mut() else {
                 return Poll::Ready(None); // диск не инициализирован

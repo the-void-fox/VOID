@@ -119,6 +119,10 @@ const RAM_START: usize = 0x8000_0000;
 /// Мегастраница Sv39 — листовой PTE на СРЕДНЕМ уровне (2 МиБ). Веха 85: ею стелем direct-map,
 /// чтобы гигабайты RAM отображались дёшево (одна запись на 2 МиБ вместо 512 листьев по 4 КиБ).
 const MEGA: usize = 2 * 1024 * 1024;
+/// Веха 87 — гигастраница Sv39: листовой PTE в КОРНЕВОЙ таблице (1 ГиБ). Поддерживается всегда
+/// (в отличие от x86, где 1-ГиБ страницы — опция процессора). Ею стелется direct-map: десятки
+/// гигабайт RAM — десятки записей корня и ни одной подтаблицы.
+const GIGA: usize = 1024 * 1024 * 1024;
 
 extern "C" {
     static _text_start: u8;
@@ -141,19 +145,30 @@ pub fn init() -> usize {
         // 1) direct map всей (обнаруженной) RAM как RW — база, чтобы всё осталось доступно. Веха 85:
         //    мегастраницами (2 МиБ), но чанки, накрывающие образ ядра [text_s, ro_e), кладём
         //    постранично (4 КиБ) — иначе шаг 3 (W^X) не смог бы сузить права страницы кода/констант.
-        map_direct(root, RAM_START, super::ram_limit(), text_s, ro_e);
+        //    Веха 87: VA = phys_to_virt(PA), образ ядра задан ФИЗИЧЕСКИМИ границами.
+        map_direct(
+            root,
+            RAM_START,
+            super::ram_limit(),
+            super::virt_to_phys(text_s),
+            super::virt_to_phys(ro_e),
+        );
         // 2) MMIO как RW: UART (иначе пропадёт вывод) + слоты virtio-mmio (для диска) + PLIC.
-        map_range(root, MMIO_START, MMIO_END, PTE_R | PTE_W);
-        map_range(root, PLIC_START, PLIC_END, PTE_R | PTE_W);
+        //    Веха 87: регистры устройств остаются ТОЖДЕСТВЕННЫМИ (в нижней половине) — драйверы
+        //    держат физические адреса и говорят с железом по ним. Регион устройств QEMU virt лежит
+        //    ниже RAM и ниже региона процессов (VPN[2]=1), поэтому ничему не мешает.
+        map_range_id(root, MMIO_START, MMIO_END, PTE_R | PTE_W);
+        map_range_id(root, PLIC_START, PLIC_END, PTE_R | PTE_W);
         // Веха 86 — страница часов (goldfish-rtc, адрес из DTB; лежит НИЖЕ региона virtio-mmio,
         // поэтому отдельным отображением). 0 — DTB не дал часов, отображать нечего.
         let rtc = super::rtc_base();
         if rtc != 0 {
-            map_range(root, rtc, rtc + 0x1000, PTE_R | PTE_W);
+            map_range_id(root, rtc, rtc + 0x1000, PTE_R | PTE_W);
         }
         // 3) W^X: перетираем листовые PTE кода и констант более строгими правами (в 4-КиБ вырезе).
-        map_range(root, text_s, text_e, PTE_R | PTE_X);
-        map_range(root, ro_s, ro_e, PTE_R);
+        //    Символы образа — уже высокие VA, их физику даёт virt_to_phys (одно окно).
+        map_range_dm(root, text_s, text_e, PTE_R | PTE_X);
+        map_range_dm(root, ro_s, ro_e, PTE_R);
         // Флага U нет НИ У ОДНОЙ страницы ядра (Веха 23: секция `.user` похоронена) — код
         // U-mode приходит только из ELF-программ store и маппится в elf::load / proc.rs.
     }
@@ -183,28 +198,46 @@ unsafe fn map_mega(root_pa: usize, va: usize, pa: usize, flags: usize) {
     *pte1 = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
 }
 
-/// Веха 85 — застелить direct-map [start, end) идентично (VA == PA) мегастраницами RW, но чанки,
-/// перекрывающие защищаемый диапазон [prot_s, prot_e) (образ ядра — под W^X), кладём постранично
-/// (4 КиБ), чтобы затем можно было сузить права отдельных страниц. Хвост < 2 МиБ — тоже постранично.
+/// Веха 87 — отобразить ГИГАСТРАНИЦУ (1 ГиБ) `va → pa`: листовой PTE прямо в КОРНЕВОЙ таблице
+/// (уровень 2). `va`/`pa` выровнены на 1 ГиБ.
+///
+/// # Safety
+/// Как [`map`]: `root_pa` валиден, таблицы доступны через direct-map.
+unsafe fn map_giga(root_pa: usize, va: usize, pa: usize, flags: usize) {
+    let idx2 = (va >> 30) & 0x1ff;
+    *tbl_ptr(root_pa).add(idx2) = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
+}
+
+/// Веха 85/87 — застелить direct-map физической памяти [start, end) мегастраницами RW по
+/// `VA = phys_to_virt(PA)`, но чанки, перекрывающие защищаемый диапазон [prot_s, prot_e)
+/// (образ ядра — под W^X; границы ФИЗИЧЕСКИЕ), кладём постранично (4 КиБ), чтобы затем можно
+/// было сузить права отдельных страниц. Хвост < 2 МиБ — тоже постранично.
 unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, prot_e: usize) {
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let prot_s = prot_s & !(PAGE_SIZE - 1);
-    let mut va = start & !(MEGA - 1);
-    while va < end {
-        let chunk_end = va + MEGA;
-        let overlaps_kernel = va < prot_e && chunk_end > prot_s;
+    let mut pa = start & !(MEGA - 1);
+    while pa < end {
+        // Целый свободный гигабайт — ОДНОЙ записью корневой таблицы. Образ ядра лежит в первом
+        // гигабайте RAM, поэтому проверяем КАЖДЫЙ кусок, а не прекращаем цикл на первом занятом.
+        if pa & (GIGA - 1) == 0 && pa + GIGA <= end && !(pa < prot_e && pa + GIGA > prot_s) {
+            map_giga(root_pa, super::phys_to_virt(pa), pa, PTE_R | PTE_W);
+            pa += GIGA;
+            continue;
+        }
+        let chunk_end = pa + MEGA;
+        let overlaps_kernel = pa < prot_e && chunk_end > prot_s;
         if chunk_end <= end && !overlaps_kernel {
-            map_mega(root_pa, va, va, PTE_R | PTE_W);
+            map_mega(root_pa, super::phys_to_virt(pa), pa, PTE_R | PTE_W);
         } else {
             // Вырез ядра или хвост меньше мегастраницы — постранично.
-            let mut p = va;
+            let mut p = pa;
             let stop = chunk_end.min(end);
             while p < stop {
-                map(root_pa, p, p, PTE_R | PTE_W);
+                map(root_pa, super::phys_to_virt(p), p, PTE_R | PTE_W);
                 p += PAGE_SIZE;
             }
         }
-        va += MEGA;
+        pa += MEGA;
     }
 }
 
@@ -255,12 +288,24 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) {
     *pte = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
 }
 
-/// Отобразить диапазон [start, end) идентично (VA == PA), постранично.
-unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: usize) {
+/// Отобразить диапазон [start, end) ТОЖДЕСТВЕННО (VA == PA), постранично — окна MMIO.
+unsafe fn map_range_id(root_pa: usize, start: usize, end: usize, flags: usize) {
     let mut va = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     while va < end {
         map(root_pa, va, va, flags);
+        va += PAGE_SIZE;
+    }
+}
+
+/// Веха 87 — переотобразить диапазон ВЫСОКИХ адресов [start, end) на их физику
+/// (`VA → virt_to_phys(VA)`), постранично: так уточняются права образа ядра (W^X) поверх
+/// уже застеленного direct-map.
+unsafe fn map_range_dm(root_pa: usize, start: usize, end: usize, flags: usize) {
+    let mut va = start & !(PAGE_SIZE - 1);
+    let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    while va < end {
+        map(root_pa, va, super::virt_to_phys(va), flags);
         va += PAGE_SIZE;
     }
 }
@@ -297,9 +342,12 @@ pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
             return None; // невалидно — отображения нет
         }
         if pte & (PTE_R | PTE_X) != 0 {
-            // Листовой PTE: дальше не спускаемся.
+            // Листовой PTE: дальше не спускаемся. Лист может быть НЕ 4-КиБ (мегастраница на
+            // уровне 1 — Веха 85, гигастраница на уровне 2 — Веха 87), поэтому смещение внутри
+            // страницы берём по её настоящему размеру, а не по 4 КиБ.
+            let size = 1usize << (12 + 9 * level as usize);
             let page = ((pte >> 10) & PPN_MASK) << 12;
-            return Some(page | (va & (PAGE_SIZE - 1)));
+            return Some(page | (va & (size - 1)));
         }
         // Нелистовой — спускаемся на уровень ниже.
         table = ((pte >> 10) & PPN_MASK) << 12;

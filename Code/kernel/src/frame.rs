@@ -26,6 +26,13 @@ extern "C" {
     static _kernel_end: u8;
 }
 
+/// Веха 87 — ФИЗИЧЕСКИЙ конец образа ядра: с переездом в верхнюю половину символы линкера
+/// стали высокими VA, а аллокатор раздаёт физику, поэтому адрес символа переводится обратно
+/// ([`crate::arch::virt_to_phys`]). До переезда смещение было нулевым, и это был тот же адрес.
+fn kernel_end_pa() -> usize {
+    align_up(crate::arch::virt_to_phys(&raw const _kernel_end as usize), PAGE_SIZE)
+}
+
 /// Конец физической RAM — Веха 41: ОБНАРУЖИВАЕТСЯ (`arch::ram_limit()`) из карты памяти
 /// загрузчика (multiboot/PVH), а не зашитая константа. `platform_init` вызывается ДО `init`.
 fn ram_end() -> usize {
@@ -58,7 +65,7 @@ pub fn reserve_boot_module(end: usize) {
 
 /// Инициализировать аллокатор: начать за образом ядра ИЛИ за зарезервированным модулем (Веха 48).
 pub fn init() {
-    let start = align_up(&raw const _kernel_end as usize, PAGE_SIZE);
+    let start = kernel_end_pa();
     NEXT.store(start.max(RESERVE_END.load(Ordering::Relaxed)), Ordering::Relaxed);
 }
 
@@ -130,8 +137,7 @@ pub fn reserve(bytes: usize) -> Option<usize> {
 /// Сколько байт RAM за образом ядра роздано bump'ом (high-water: пик, который NEXT
 /// когда-либо достигал). Для отчёта потребления памяти (Веха 28).
 pub fn used_bytes() -> usize {
-    let start = align_up(&raw const _kernel_end as usize, PAGE_SIZE);
-    NEXT.load(Ordering::Relaxed).saturating_sub(start)
+    NEXT.load(Ordering::Relaxed).saturating_sub(kernel_end_pa())
 }
 
 /// Веха 46 — сколько байт сейчас в списке свободных (возвращено и ждёт переиспользования).
@@ -145,8 +151,7 @@ pub fn available_bytes() -> usize {
 /// указывающие на MMIO УСТРОЙСТВА (не RAM) — их нельзя класть в список свободных, иначе выдадим
 /// адрес железа как страницу. RAM-фреймы (обычные, DMA, таблицы) — освобождаем; MMIO — минуем.
 pub fn is_ram(pa: usize) -> bool {
-    let start = align_up(&raw const _kernel_end as usize, PAGE_SIZE);
-    pa >= start && pa < ram_end()
+    pa >= kernel_end_pa() && pa < ram_end()
 }
 
 const fn align_up(x: usize, a: usize) -> usize {
