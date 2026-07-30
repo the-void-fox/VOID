@@ -20,6 +20,9 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000; // физ. адрес внутри
 /// Размер huge-страницы (2 МиБ) — direct-map стелем ею (Веха 85), чтобы гигабайты RAM отображались
 /// дёшево (одна PD-запись на 2 МиБ вместо 512 листьев по 4 КиБ).
 const HUGE: usize = 2 * 1024 * 1024;
+/// Веха 87 — гигастраница: лист прямо в PDPT (1 ГиБ). В отличие от Sv39 это ОПЦИЯ процессора
+/// (CPUID-бит PDPE1GB), поэтому перед использованием спрашиваем — см. [`giga_pages_supported`].
+const GIGA: usize = 1024 * 1024 * 1024;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -268,7 +271,43 @@ unsafe fn map_huge(root_pa: usize, va: usize, pa: usize, flags: u64) {
     *pte = (pa as u64 & ADDR_MASK) | PTE_P | PTE_PS | flags; // PS → лист 2 МиБ
 }
 
-/// Веха 85/87 — застелить direct-map физической памяти [start, end) huge-страницами RW+NX по
+/// Веха 87 — отобразить ГИГАСТРАНИЦУ (1 ГиБ) `va → pa`: ЛИСТ прямо в PDPT (бит PS). `va`/`pa`
+/// выровнены на 1 ГиБ. Десятки гигабайт RAM так стелются десятками записей вместо десятков тысяч.
+///
+/// # Safety
+/// Как [`map`]: `root_pa` валиден. CPU обязан поддерживать 1-ГиБ страницы ([`giga_pages_supported`]).
+unsafe fn map_giga(root_pa: usize, va: usize, pa: usize, flags: u64) {
+    let idx4 = (va >> 39) & 0x1ff; // PML4 → PDPT
+    let pte4 = tbl_ptr(root_pa).add(idx4);
+    let pdpt = if *pte4 & PTE_P == 0 {
+        let next = frame::alloc().expect("нет фрейма под PDPT");
+        *pte4 = next as u64 | PTE_P | PTE_W | PTE_U;
+        next
+    } else {
+        (*pte4 & ADDR_MASK) as usize
+    };
+    let idx3 = (va >> 30) & 0x1ff; // индекс в PDPT
+    *tbl_ptr(pdpt).add(idx3) = (pa as u64 & ADDR_MASK) | PTE_P | PTE_PS | flags;
+}
+
+/// Поддерживает ли процессор 1-ГиБ страницы (CPUID.80000001H:EDX[26], «PDPE1GB»)?
+/// Без этого бита лист в PDPT — зарезервированная комбинация, то есть #PF на первом же доступе.
+fn giga_pages_supported() -> bool {
+    let edx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx", "cpuid", "pop rbx",
+            inout("eax") 0x8000_0001u32 => _,
+            out("ecx") _,
+            out("edx") edx,
+            options(nostack),
+        );
+    }
+    edx & (1 << 26) != 0
+}
+
+/// Веха 85/87 — застелить direct-map физической памяти [start, end) гигастраницами там, где
+/// целый гигабайт свободен от образа ядра, иначе huge-страницами RW+NX по
 /// `VA = phys_to_virt(PA)`. Чанки, перекрывающие образ ядра [prot_s, prot_e) (границы
 /// ФИЗИЧЕСКИЕ), кладём постранично и БЕЗ права записи: исполняется образ из своего окна, а
 /// пишущий алиас рядом с кодом сделал бы W^X фикцией. Хвост < 2 МиБ — тоже постранично.
@@ -276,7 +315,19 @@ unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, pr
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let prot_s = prot_s & !(PAGE_SIZE - 1);
     let mut pa = start & !(HUGE - 1);
+    let giga_ok = giga_pages_supported();
     while pa < end {
+        // Целый свободный гигабайт — ОДНОЙ записью PDPT. Образ ядра лежит в первом гигабайте,
+        // поэтому проверяем КАЖДЫЙ кусок отдельно, а не прекращаем цикл на первом занятом.
+        if giga_ok
+            && pa & (GIGA - 1) == 0
+            && pa + GIGA <= end
+            && !(pa < prot_e && pa + GIGA > prot_s)
+        {
+            map_giga(root_pa, super::phys_to_virt(pa), pa, PTE_W | PTE_NX);
+            pa += GIGA;
+            continue;
+        }
         let chunk_end = pa + HUGE;
         let overlaps_kernel = pa < prot_e && chunk_end > prot_s;
         if chunk_end <= end && !overlaps_kernel {
