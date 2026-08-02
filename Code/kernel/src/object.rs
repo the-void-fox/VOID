@@ -64,6 +64,15 @@ impl BlockIo for Disk {
             virtio_blk::write(sector, buf)
         }
     }
+    /// Веха 89 — ёмкость носителя store в секторах: раздел p2 на реальном диске (AHCI сам держит
+    /// смещение раздела) либо весь virtio-диск. 0 — устройства нет, проверок не будет.
+    fn capacity(&mut self) -> u64 {
+        if AHCI_ACTIVE.load(Ordering::Relaxed) {
+            ahci::capacity_sectors()
+        } else {
+            virtio_blk::capacity_sectors()
+        }
+    }
 }
 
 static STORE: SpinLock<Store> = SpinLock::new(Store::new());
@@ -168,7 +177,40 @@ pub fn load() -> bool {
 
 /// Зафиксировать состояние на диск (крах-устойчиво; пустой коммит — no-op).
 pub fn commit() {
-    with_store(|s| s.commit(&mut Disk))
+    with_store(|s| {
+        if !s.commit(&mut Disk) {
+            reclaim_and_retry(s);
+        }
+    })
+}
+
+/// Веха 89 — носитель полон: попробовать освободить место и повторить коммит ОДИН раз.
+/// Мусор в области объектов (старые версии, кадры удалённых GC) — обычно и есть причина, а
+/// [`Store::compact`] именно для этого и существует; просто сдаться, не попытавшись, значило бы
+/// терять данные при живом диске. Не помогло — считаем честно и говорим вслух: дальше это
+/// решение владельца (расширить раздел), а не ядра.
+fn reclaim_and_retry(s: &mut Store) -> bool {
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    let before = s.out_of_space();
+    if before == REPORTED.load(Ordering::Relaxed) {
+        return false; // нового «полно» не случилось — чинить нечего
+    }
+    // `compact` сам умеет отступить, если фаза 1 не влезает (иначе он переписал бы кадры,
+    // на которые ещё указывает активный суперблок) — звать его на полном диске безопасно.
+    s.compact(&mut Disk);
+    let ok = s.commit(&mut Disk);
+    REPORTED.store(s.out_of_space(), Ordering::Relaxed);
+    if ok {
+        println!("  [store] носитель был полон — уплотнение освободило место, коммит прошёл");
+        return true;
+    }
+    let left = s.sectors_left(&mut Disk).unwrap_or(0);
+    println!(
+        "  [store] НОСИТЕЛЬ ПОЛОН: коммит отменён (свободно {} секторов) — на диске прежнее \
+         консистентное поколение, состояние живёт в RAM",
+        left,
+    );
+    false
 }
 
 /// Веха 89 — выполнить операцию над store и СРАЗУ сказать, если носитель соврал. Отчёт обязан
@@ -228,11 +270,15 @@ pub fn commit_if_dirty() {
     if dirty == 0 {
         return;
     }
-    s.commit(&mut Disk);
+    let ok = s.commit(&mut Disk);
+    let ok = ok || reclaim_and_retry(&mut s);
     let generation = s.generation();
     let (bad_r, bad_w) = (s.corrupt_reads(), s.failed_writes());
     drop(s);
     report_integrity(bad_r, bad_w);
+    if !ok {
+        return; // коммит не состоялся — операции остаются грязными до следующей попытки
+    }
     FIRST_DIRTY_TICK.store(0, Ordering::Relaxed);
     println!(
         "  [store] синк при простое: {} операций одним коммитом → поколение {}",
@@ -258,7 +304,10 @@ pub fn maybe_commit() {
         return;
     }
     if dirty >= COMMIT_OPS_MAX || now.saturating_sub(first) >= COMMIT_PERIOD_TICKS {
-        s.commit(&mut Disk);
+        let ok = s.commit(&mut Disk);
+        if !ok && !reclaim_and_retry(&mut s) {
+            return; // носитель полон — операции ждут следующей попытки
+        }
         let generation = s.generation();
         drop(s);
         FIRST_DIRTY_TICK.store(0, Ordering::Relaxed);

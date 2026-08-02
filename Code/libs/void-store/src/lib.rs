@@ -55,6 +55,16 @@ pub const SECTOR: usize = 512;
 pub trait BlockIo {
     fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR]) -> bool;
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool;
+    /// Веха 89 — ёмкость носителя в секторах. `0` — неизвестна, тогда store не проверяет границу
+    /// (поведение до Вехи 89: писать, пока носитель принимает).
+    ///
+    /// До этого трейт размер не сообщал вовсе, а `next_free` рос без оглядки: диск кончался
+    /// МОЛЧА — запись за краем либо отвергалась драйвером, либо (на образе-файле) уходила в
+    /// никуда. Для системы, которая собирается тащить в store мегабайтные пакеты из сети, это
+    /// первый отказ, который случится на практике.
+    fn capacity(&mut self) -> u64 {
+        0
+    }
 }
 
 // ─── раскладка диска ─────────────────────────────────────────────────────────
@@ -144,6 +154,8 @@ pub struct Store {
     /// Веха 89 — сколько записей носитель не принял. Ненулевое значение означает, что коммит
     /// НЕ состоялся целиком, и на диске осталось прежнее консистентное состояние.
     failed_writes: u64,
+    /// Веха 89 — сколько коммитов отменено из-за нехватки места на носителе.
+    out_of_space: u64,
 }
 
 impl Store {
@@ -163,7 +175,27 @@ impl Store {
             bytes_written: 0,
             corrupt_reads: 0,
             failed_writes: 0,
+            out_of_space: 0,
         }
+    }
+
+    /// Веха 89 — сколько коммитов отменено из-за нехватки места (носитель полон).
+    /// Ненулевое значение — сигнал владельцу: уплотнять ([`Store::compact`]) или расширяться.
+    pub fn out_of_space(&self) -> u64 {
+        self.out_of_space
+    }
+
+    /// Веха 89 — сколько секторов носителя ещё свободно под область объектов.
+    /// `None` — ёмкость неизвестна ([`BlockIo::capacity`] вернул 0).
+    pub fn sectors_left(&self, io: &mut impl BlockIo) -> Option<u64> {
+        let cap = io.capacity();
+        (cap != 0).then(|| cap.saturating_sub(self.next_free as u64))
+    }
+
+    /// Хватит ли места под `sectors` секторов, начиная с `next_free`.
+    fn fits(&self, io: &mut impl BlockIo, sectors: u64) -> bool {
+        let cap = io.capacity();
+        cap == 0 || self.next_free as u64 + sectors <= cap
     }
 
     /// Веха 89 — сколько кадров не сошлись со своим content-id (или не прочитались).
@@ -428,23 +460,63 @@ impl Store {
             self.ensure_loaded(io, id);
         }
 
+        // Веха 89 — снимок «где что лежит». Обе фазы сперва объявляют объекты «не на диске»
+        // и только потом пишут; если запись не состоится, без отката store решил бы, что на
+        // диске пусто, хотя данные там.
+        let snapshot: Vec<(ContentId, Option<(u32, u32)>)> =
+            self.objects.iter().map(|(id, o)| (*id, o.disk)).collect();
+        let (saved_next_free, saved_garbage) = (self.next_free, self.garbage);
+        let saved_dead = self.pending_dead.clone();
+
         // Фаза 1: копии живых в конец области + база-индекс + суперблок.
         for o in self.objects.values_mut() {
             o.disk = None;
         }
         self.pending_dead.clear(); // база пишет только живых — надгробия не нужны
         self.need_base = true;
-        self.commit(io);
+        if !self.commit(io) {
+            // Веха 89 — места не хватило даже на копию. **Фазу 2 запускать НЕЛЬЗЯ**: она пишет
+            // с начала области, а активный суперблок всё ещё указывает на исходные кадры именно
+            // там — переписать их значит потерять данные. Откатываем и уходим ни с чем: диск
+            // остался ровно таким, каким был.
+            self.restore(&snapshot, saved_next_free, saved_garbage, saved_dead);
+            return;
+        }
 
         // Фаза 2: то же самое, но с начала области — бывшие сектора живых теперь мусор,
-        // на них не указывает ни активный индекс, ни суперблок.
+        // на них не указывает ни активный индекс, ни суперблок (его переставила фаза 1).
+        let snapshot2: Vec<(ContentId, Option<(u32, u32)>)> =
+            self.objects.iter().map(|(id, o)| (*id, o.disk)).collect();
+        let (nf2, g2) = (self.next_free, self.garbage);
         for o in self.objects.values_mut() {
             o.disk = None;
         }
         self.next_free = OBJ_START as u32;
         self.garbage = 0;
         self.need_base = true;
-        self.commit(io);
+        if !self.commit(io) {
+            // Диск консистентен состоянием фазы 1 — возвращаем учёт к нему же.
+            self.restore(&snapshot2, nf2, g2, Vec::new());
+        }
+    }
+
+    /// Веха 89 — вернуть учёт размещения кадров к снятому снимку (см. [`Store::compact`]).
+    fn restore(
+        &mut self,
+        snapshot: &[(ContentId, Option<(u32, u32)>)],
+        next_free: u32,
+        garbage: u64,
+        dead: Vec<(ContentId, u32)>,
+    ) {
+        for (id, disk) in snapshot {
+            if let Some(o) = self.objects.get_mut(id) {
+                o.disk = *disk;
+            }
+        }
+        self.next_free = next_free;
+        self.garbage = garbage;
+        self.pending_dead = dead;
+        self.need_base = true; // раскладка не та, что на диске — следующий коммит пишет базу
     }
 
     // ─── персистентность ─────────────────────────────────────────────────────
@@ -587,7 +659,10 @@ impl Store {
     /// Зафиксировать состояние на диск (checkpoint). Крах-устойчиво: кадры и индекс
     /// дописываются в свободные секторы, суперблок пишется последним (точка коммита).
     /// Если фиксировать нечего (нет новых объектов/надгробий, корни не менялись) — no-op.
-    pub fn commit(&mut self, io: &mut impl BlockIo) {
+    ///
+    /// Веха 89 — возвращает `false`, если коммит НЕ состоялся: носитель полон или отверг
+    /// запись. В этом случае на диске осталось прежнее консистентное поколение целиком.
+    pub fn commit(&mut self, io: &mut impl BlockIo) -> bool {
         // 0) Сериализовать корни в контент-адресуемый объект (roots-blob) и учесть его.
         let roots_blob = serialize_roots(&self.roots);
         let roots_id = ContentId::hash(&encode(&roots_blob, &[]));
@@ -598,7 +673,7 @@ impl Store {
             && self.objects.values().all(|o| o.disk.is_some())
         {
             self.dirty_ops = 0; // идемпотентные set_root в то же значение и т.п.
-            return;
+            return true;
         }
         self.objects.entry(roots_id).or_insert_with(|| Object {
             data: Some(Loaded { payload: roots_blob, children: Vec::new() }),
@@ -614,6 +689,23 @@ impl Store {
             .map(|(id, _)| *id)
             .collect();
         let mut delta: Vec<(ContentId, u32, u32)> = Vec::with_capacity(to_write.len());
+        // Веха 89 — влезет ли коммит целиком? Считаем ДО первой записи: наполовину записанный
+        // коммит — это осиротевшие кадры и потраченные секторы там, где места и так нет.
+        // Индекс-кадр ещё не построен, поэтому кладём на него запас: заголовок (8 Б) + счётчик
+        // (4 Б) + запись на каждый объект store (база в худшем случае перечисляет все).
+        let need_objects: u64 = to_write
+            .iter()
+            .map(|id| {
+                let d = self.objects[id].data.as_ref().expect("объект без данных и без диска");
+                (encode(&d.payload, &d.children).len().div_ceil(SECTOR)) as u64
+            })
+            .sum();
+        let need_index =
+            (12 + (self.objects.len() + self.pending_dead.len()) * ENTRY_SIZE).div_ceil(SECTOR) as u64;
+        if !self.fits(io, need_objects + need_index) {
+            self.out_of_space += 1;
+            return false;
+        }
         for id in to_write {
             let d = self.objects[&id].data.as_ref().expect("объект без данных и без диска");
             let frame = encode(&d.payload, &d.children);
@@ -624,7 +716,7 @@ impl Store {
             // иначе недописанный объект считался бы зафиксированным и потерялся.
             if !write_object(io, sector, &frame) {
                 self.failed_writes += 1;
-                return;
+                return false;
             }
             self.bytes_written += frame.len().div_ceil(SECTOR) as u64 * SECTOR as u64;
             self.next_free += frame.len().div_ceil(SECTOR) as u32;
@@ -671,7 +763,7 @@ impl Store {
             // останутся в области объектов мусором — его подберёт `compact`.
             self.failed_writes += 1;
             self.rollback_delta(&delta);
-            return;
+            return false;
         }
         self.bytes_written += frame.len().div_ceil(SECTOR) as u64 * SECTOR as u64;
         self.next_free += frame.len().div_ceil(SECTOR) as u32;
@@ -692,7 +784,7 @@ impl Store {
         if !io.write(SB_SECTOR, &sb) {
             self.failed_writes += 1;
             self.rollback_delta(&delta);
-            return;
+            return false;
         }
         self.bytes_written += SECTOR as u64;
 
@@ -703,6 +795,7 @@ impl Store {
         self.pending_dead.clear();
         self.dirty_ops = 0;
         self.need_base = false;
+        true
     }
 
     /// Веха 89 — снять отметки «кадр на диске» с объектов незавершённого коммита: их кадры

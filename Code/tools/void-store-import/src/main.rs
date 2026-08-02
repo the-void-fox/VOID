@@ -61,6 +61,11 @@ impl BlockIo for FileIo {
             && self.file.seek(SeekFrom::Start(sector * SECTOR as u64)).is_ok()
             && self.file.write_all(buf).is_ok()
     }
+    /// Веха 89 — ёмкость образа: store теперь считает место ДО записи и не начинает коммит,
+    /// который не влезет (раньше упирались в отказ `write` уже посреди записи).
+    fn capacity(&mut self) -> u64 {
+        self.sectors
+    }
 }
 
 // ─── NAR: детерминированная сериализация дерева из nix ────────────────────────
