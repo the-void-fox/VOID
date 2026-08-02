@@ -485,7 +485,7 @@ impl Xhci {
 
     /// Поставить Normal-TRB на interrupt-кольцо (приём одного 8-байтного репорта) + звонок.
     unsafe fn queue_report(&mut self) {
-        let trb = (self.int_ring + self.int_enq * 16) as *mut u32;
+        let trb = dm(self.int_ring + self.int_enq * 16) as *mut u32;
         write_volatile(trb as *mut u64, self.int_buf as u64);
         write_volatile(trb.add(2), 8); // длина буфера
         write_volatile(trb.add(3), TRB_NORMAL << 10 | 1 << 5 | 1 << 2 | self.int_cycle); // IOC|ISP

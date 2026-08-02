@@ -204,7 +204,7 @@ impl E1000 {
     fn recv(&mut self, out: &mut [u8]) -> usize {
         unsafe {
             let i = self.rx_cur;
-            let d = (self.rx_ring + i * 16) as *mut u8;
+            let d = crate::frame::ptr(self.rx_ring + i * 16);
             if read_volatile(d.add(12)) & DESC_DD == 0 {
                 return 0; // приёмник пуст
             }

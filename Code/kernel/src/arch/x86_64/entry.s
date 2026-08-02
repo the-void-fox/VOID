@@ -47,6 +47,27 @@ mb2_header:
     .long MB2_ARCH
     .long mb2_header_end - mb2_header
     .long -(MB2_MAGIC + MB2_ARCH + (mb2_header_end - mb2_header))
+
+    # Веха 87: тег АДРЕСОВ (type 2). Без него GRUB грузит ELF по p_vaddr, а у нас они
+    # высокие (higher-half) — ядро уезжало в никуда и машина уходила в ребут. С тегом
+    # GRUB игнорирует ELF-заголовки и кладёт файл СЫРЫМ по физическим адресам ниже.
+    # Образ в файле непрерывен (paddr = file_offset + 0xFF000), поэтому это корректно.
+    .align 8
+    .short 2
+    .short 0
+    .long 24
+    .long mb2_header - KVA          # header_addr: физ. адрес ЭТОГО заголовка
+    .long _kernel_start - KVA       # load_addr: с какого физ. адреса лить файл
+    .long _bss_start - KVA          # load_end_addr: конец «сырых» данных в файле
+    .long _kernel_end - KVA         # bss_end_addr: досюда GRUB обнуляет (.bss)
+
+    # Тег ТОЧКИ ВХОДА (type 3) — тоже физический: ELF entry GRUB здесь уже не смотрит.
+    .align 8
+    .short 3
+    .short 0
+    .long 12
+    .long _start32 - KVA
+
     # обязательный завершающий тег (type 0, size 8)
     .align 8
     .short 0
