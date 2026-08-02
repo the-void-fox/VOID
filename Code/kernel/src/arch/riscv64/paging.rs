@@ -43,9 +43,9 @@ static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 /// процесса), в которую процесс затем добавит СВОИ страницы (код/данные ELF, стек, кучу) в
 /// незанятом ядром регионе VPN[2]=1 (VA 0x4000_0000..0x8000_0000). Копируются только записи
 /// верхнего уровня: ядерные подтаблицы разделяются, а слот VPN[2]=1 у процесса свой.
-pub fn clone_kernel_root() -> usize {
+pub fn clone_kernel_root() -> Option<usize> {
     let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
-    let new = frame::alloc().expect("нет фрейма под корень процесса");
+    let new = frame::alloc()?; // Веха 89: нет памяти — отказ, а не паника ядра
     unsafe {
         let src = tbl_ptr(kroot) as *const usize;
         let dst = tbl_ptr(new);
@@ -53,7 +53,7 @@ pub fn clone_kernel_root() -> usize {
             *dst.add(i) = *src.add(i);
         }
     }
-    new
+    Some(new)
 }
 
 /// Маска PPN внутри PTE — 44 бита.
@@ -238,7 +238,9 @@ unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, pr
             let mut p = pa;
             let stop = chunk_end.min(end);
             while p < stop {
-                map(root_pa, super::phys_to_virt(p), p, PTE_R | PTE_W);
+                // Загрузочный путь: фреймов на таблицы всегда хватает (RAM ещё не роздана),
+                // а если нет — система всё равно нежизнеспособна.
+                assert!(map(root_pa, super::phys_to_virt(p), p, PTE_R | PTE_W), "нет фрейма под таблицу direct-map");
                 p += PAGE_SIZE;
             }
         }
@@ -264,10 +266,15 @@ pub unsafe fn enable(root_pa: usize) {
 /// Отобразить одну 4 КиБ-страницу `va → pa` с флагами, создавая промежуточные
 /// таблицы по пути.
 ///
+/// Веха 89 — `false`, если не хватило фрейма под промежуточную таблицу. Раньше здесь стояла
+/// паника, а зовут это по запросу ПРОЦЕССА (карта памяти, рост кучи, загрузка ELF) — то есть
+/// программа, которой не хватило памяти, роняла ядро вместо себя.
+///
 /// # Safety
 /// `root_pa` — валидная корневая таблица; вызывать до включения paging либо когда
 /// все задействованные таблицы доступны по VA == PA.
-pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) {
+#[must_use]
+pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) -> bool {
     let mut table = root_pa;
 
     // Уровни 2 и 1 — промежуточные (нелистовые).
@@ -277,7 +284,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) {
         let pte = tbl_ptr(table).add(idx);
         if *pte & PTE_V == 0 {
             // Промежуточной таблицы ещё нет — создаём.
-            let next = frame::alloc().expect("нет фрейма под таблицу");
+            let Some(next) = frame::alloc() else { return false };
             *pte = ((next >> 12) << 10) | PTE_V; // нелистовой: R=W=X=0
             table = next;
         } else {
@@ -291,6 +298,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) {
     let idx = (va >> 12) & 0x1ff;
     let pte = tbl_ptr(table).add(idx);
     *pte = ((pa >> 12) << 10) | flags | PTE_V | PTE_A | PTE_D;
+    true
 }
 
 /// Отобразить диапазон [start, end) ТОЖДЕСТВЕННО (VA == PA), постранично — окна MMIO.
@@ -298,7 +306,7 @@ unsafe fn map_range_id(root_pa: usize, start: usize, end: usize, flags: usize) {
     let mut va = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     while va < end {
-        map(root_pa, va, va, flags);
+        assert!(map(root_pa, va, va, flags), "нет фрейма под таблицу MMIO");
         va += PAGE_SIZE;
     }
 }
@@ -310,7 +318,7 @@ unsafe fn map_range_dm(root_pa: usize, start: usize, end: usize, flags: usize) {
     let mut va = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     while va < end {
-        map(root_pa, va, super::virt_to_phys(va), flags);
+        assert!(map(root_pa, va, super::virt_to_phys(va), flags), "нет фрейма под таблицу W^X");
         va += PAGE_SIZE;
     }
 }

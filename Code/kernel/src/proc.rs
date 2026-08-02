@@ -138,6 +138,9 @@ struct Proc {
     /// `usize::MAX` — нет). Проверяется (`GRANT`) при отправке, копируется в домен получателя
     /// при доставке — как `send_buf`, только для прав.
     send_cap: usize,
+    /// Веха 89 — сколько ФРЕЙМОВ куча этой группы реально заняла (лениво, по фолтам).
+    /// Живёт у лидера группы, как и `heap_brk`; сверяется с [`page_quota`].
+    pages: usize,
     /// Веха 22.1: ленивая куча процесса — зарезервированный `SYS_MAP` диапазон
     /// [`USER_HEAP_BASE_VA`, heap_brk). Фолт внутри — выделить страницу; вне — гибель процесса.
     heap_brk: usize,
@@ -237,15 +240,23 @@ fn any_irq_waiting(t: &Table) -> bool {
 /// Новое адресное пространство процесса: клон корня ядра (ядро отображено без флага U — нужно
 /// trap-обработчику при satp процесса) + приватный стек в незанятом регионе VPN[2]=1. Код и
 /// данные добавит [`crate::elf::load`]: с Вехи 23 процессы приходят ТОЛЬКО из ELF в store.
-fn new_address_space() -> usize {
-    let root = arch::clone_kernel_root();
+/// Веха 89 — `None`, если памяти не хватило. Раньше здесь стояла паника: программа, которую
+/// нечем запустить, роняла ЯДРО. Частично построенное пространство сносим целиком, чтобы фреймы
+/// не утекли (`free_address_space` умеет неполные деревья — общие с ядром узлы он пропускает).
+fn new_address_space() -> Option<usize> {
+    let root = arch::clone_kernel_root()?;
     // Приватный стек в VPN[2]=1: несколько страниц из свежих фреймов.
     for i in 1..=USER_STACK_PAGES {
         let va = USER_STACK_TOP_VA - i * PAGE;
-        let pa = frame::alloc().expect("нет фрейма под стек процесса");
-        unsafe { arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
+        let ok = frame::alloc().is_some_and(|pa| unsafe {
+            arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U)
+        });
+        if !ok {
+            unsafe { arch::free_address_space(root) };
+            return None;
+        }
     }
-    root
+    Some(root)
 }
 
 /// Завести запись в таблице процессов: домен защиты (c-space) + стартовый кадр (вход `entry`,
@@ -279,6 +290,7 @@ fn create_process_locked(
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        pages: 0,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
         args: {
             // argv по умолчанию — только имя программы; SYS_EXEC добавит аргументы вызывающего.
@@ -317,6 +329,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        pages: 0, // не используется у нити: учёт ведёт лидер
         heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
         args: Vec::new(),
         env: Vec::new(),
@@ -338,7 +351,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
 /// где-то конкретно, копирует их в свежие фреймы процесса. Отказ парсинга/раскладки ELF не
 /// заводит процесс и не трогает таблицу — вызывающий получает [`elf::ElfError`].
 pub fn spawn_elf(name: &'static str, elf_bytes: &[u8], arg: usize) -> Result<usize, elf::ElfError> {
-    let root = new_address_space();
+    let root = new_address_space().ok_or(elf::ElfError::OutOfMemory)?;
     // Верхняя граница адресов ELF — начало региона кучи (Веха 22): раскладка процесса —
     // код/данные ELF ниже USER_HEAP_BASE_VA, куча над ними, стек у самого верха.
     let entry = elf::load(root, elf_bytes, USER_HEAP_BASE_VA)?;
@@ -581,17 +594,33 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
     // ленив и лежит в куче процесса, так что фолт стека любой нити резолвится отсюда).
     let (heap_brk, space) = (t.procs[t.procs[cur].group].heap_brk, t.procs[cur].space);
     let lazy = va >= USER_HEAP_BASE_VA && va < heap_brk && kind != FaultKind::Exec;
-    if lazy {
+    let leader = t.procs[cur].group;
+    if lazy && t.procs[leader].pages >= page_quota() {
+        // Веха 89: аппетит исчерпал квоту — гибнет ИМЕННО этот процесс, соседи и ядро целы.
+        println!(
+            "  [mm] P{} превысил квоту памяти ({} страниц) — процесс убит (ядро живо)",
+            cur,
+            page_quota(),
+        );
+    } else if lazy {
         if let Some(pa) = frame::alloc() {
             let page_va = va & !(PAGE - 1);
             // SAFETY: пространство процесса сейчас активно — после map сбрасываем TLB,
             // иначе повтор инструкции мог бы увидеть старую (пустую) трансляцию.
-            unsafe { arch::map(arch::space_root(space), page_va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
-            arch::flush_tlb();
-            vprintln!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
-            return; // sepc не тронут — инструкция повторится по замапленной странице
+            let ok = unsafe {
+                arch::map(arch::space_root(space), page_va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U)
+            };
+            if ok {
+                t.procs[leader].pages += 1;
+                arch::flush_tlb();
+                vprintln!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
+                return; // sepc не тронут — инструкция повторится по замапленной странице
+            }
+            // Веха 89: памяти не хватило под ТАБЛИЦУ — фрейм назад и вниз, к общему пути
+            // «процесс убит»: гибнет программа, которой не хватило памяти, а не ядро.
+            frame::free(pa);
         }
-        vprintln!("  [mm] P{} фолт кучи {:#x}: фреймы кончились — процесс убит", cur, va);
+        vprintln!("  [mm] P{} фолт кучи {:#x}: памяти не хватило — процесс убит", cur, va);
     } else {
         vprintln!(
             "  [mm] P{} page fault ({}) @ {:#x} вне кучи — процесс убит (ядро живо)",
@@ -618,14 +647,32 @@ fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
     let mut page = va & !(PAGE - 1);
     while page < va + len {
         if arch::translate(root, page).is_none() {
+            if t.procs[t.procs[pid].group].pages >= page_quota() {
+                return false; // Веха 89: квота исчерпана — шлюз откажет, процесс жив
+            }
             let Some(pa) = frame::alloc() else { return false };
-            unsafe { arch::map(root, page, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) };
+            if !unsafe { arch::map(root, page, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) } {
+                frame::free(pa);
+                return false; // Веха 89: нет памяти под таблицу — шлюз честно откажет
+            }
             arch::flush_tlb();
             vprintln!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
         }
         page += PAGE;
     }
     true
+}
+
+/// Веха 89 — **КВОТА СТРАНИЦ на группу нитей**. Раньше её не было вовсе: программа, которая
+/// в цикле трогает новые страницы кучи, забирала всю RAM машины, и следующим падал не автор
+/// аппетита, а тот, кому не досталось, — вплоть до ядра.
+///
+/// Квота относительная (четверть рабочей RAM, но не меньше 8 МиБ): на 128-МиБ QEMU это 32 МиБ,
+/// на реальной машине с гигабайтами — гигабайты. Абсолютная константа тут врала бы в обе
+/// стороны. Считается один раз: карта памяти после загрузки не меняется.
+fn page_quota() -> usize {
+    const MIN: usize = 8 * 1024 * 1024;
+    (crate::frame::usable_bytes() / 4).max(MIN) / PAGE
 }
 
 /// Лончер: возобновить текущий (первый) процесс.
@@ -1374,7 +1421,12 @@ fn syscall(t: &mut Table, cur: usize) {
                             .and_then(|id| crate::object::with(&id, |b| b.map(Vec::from)));
                         match elf_bytes {
                             Some(bytes) => {
-                                let root = new_address_space();
+                                // Веха 89: памяти под новое пространство нет — отказ вызывающему
+                                // (программа не запустилась), а не паника ядра.
+                                let Some(root) = new_address_space() else {
+                                    t.procs[cur].frame.set_ret(usize::MAX);
+                                    return;
+                                };
                                 // argv ребёнка: имя + доп. аргументы вызывающего (общее для обоих путей).
                                 let mut args = Vec::from(name.as_bytes());
                                 args.push(0);
@@ -1856,15 +1908,23 @@ fn syscall(t: &mut Table, cur: usize) {
                     let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
                     if va >= USER_REGION_START && va + pages * PAGE <= limit && base % PAGE == 0 {
                         let root = arch::space_root(t.procs[cur].space);
+                        let mut ok = true;
                         for i in 0..pages {
-                            unsafe {
+                            ok &= unsafe {
                                 arch::map(root, va + i * PAGE, base + i * PAGE,
-                                    arch::MAP_R | arch::MAP_W | arch::MAP_U);
+                                    arch::MAP_R | arch::MAP_W | arch::MAP_U)
+                            };
+                            if !ok {
+                                break; // Веха 89: нет памяти под таблицы — отказ драйверу
                             }
                         }
                         arch::flush_tlb();
-                        vprintln!("  [drv] P{} SYS_MMIO_MAP {:#x} ({} стр.) → {:#x}", cur, base, pages, va);
-                        0
+                        if !ok {
+                            usize::MAX
+                        } else {
+                            vprintln!("  [drv] P{} SYS_MMIO_MAP {:#x} ({} стр.) → {:#x}", cur, base, pages, va);
+                            0
+                        }
                     } else {
                         usize::MAX
                     }
@@ -1894,11 +1954,16 @@ fn syscall(t: &mut Table, cur: usize) {
                         match frame::alloc() {
                             Some(pa) => {
                                 let root = arch::space_root(t.procs[cur].space);
-                                unsafe {
-                                    arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U);
-                                }
+                                let ok = unsafe {
+                                    arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U)
+                                };
                                 arch::flush_tlb();
-                                pa // физ-адрес фрейма (== va в ядре, но драйверу нужен именно физ.)
+                                if ok {
+                                    pa // физ-адрес фрейма (драйверу нужен именно физический)
+                                } else {
+                                    frame::free(pa); // Веха 89: нет памяти под таблицу — отказ
+                                    usize::MAX
+                                }
                             }
                             None => usize::MAX,
                         }

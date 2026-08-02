@@ -230,11 +230,14 @@ pub unsafe fn mm_enable(root: usize) {
     paging::enable(root)
 }
 
-/// Отобразить страницу `va → pa` с флагами `MAP_*`.
+/// Отобразить страницу `va → pa` с флагами `MAP_*`. Веха 89 — `false`, если не хватило памяти
+/// под промежуточную таблицу: отображение НЕ создано, решать вызывающему (обычно — убить
+/// процесс, который его просил, а не ядро).
 ///
 /// # Safety
 /// См. `paging::map`: валидный корень; таблицы доступны по VA == PA.
-pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) {
+#[must_use]
+pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) -> bool {
     paging::map(root, va, pa, flags)
 }
 

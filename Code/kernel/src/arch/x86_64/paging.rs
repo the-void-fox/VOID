@@ -136,10 +136,14 @@ pub unsafe fn enable(root_pa: usize) {
 /// Поэтому дополнительно копируем PDPT из PML4[0]: его запись [1] (1..2 ГиБ — весь
 /// user: ELF+куча+стек < 0x8000_0000) у ядра пуста, под ней вырастут приватные
 /// таблицы процесса; PD/PT ядра (запись [0], [3]) разделяются как раньше.
-pub fn clone_kernel_root() -> usize {
+pub fn clone_kernel_root() -> Option<usize> {
     let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
-    let new = frame::alloc().expect("нет фрейма под PML4 процесса");
-    let pdpt = frame::alloc().expect("нет фрейма под PDPT процесса");
+    // Веха 89: нет памяти — отказ, а не паника ядра. Первый фрейм вернём, если не дался второй.
+    let new = frame::alloc()?;
+    let Some(pdpt) = frame::alloc() else {
+        frame::free(new);
+        return None;
+    };
     unsafe {
         let src = tbl_ptr(kroot) as *const u64;
         let dst = tbl_ptr(new);
@@ -153,7 +157,7 @@ pub fn clone_kernel_root() -> usize {
         }
         *dst = pdpt as u64 | (*src & !ADDR_MASK); // PML4[0] → приватный PDPT, флаги те же
     }
-    new
+    Some(new)
 }
 
 /// Веха 46 — освободить ВСЕ приватные фреймы адресного пространства процесса (зеркало
@@ -229,14 +233,17 @@ pub unsafe fn map_mmio(pa: usize, len: usize) {
 ///
 /// # Safety
 /// `root_pa` — валидный PML4; таблицы доступны по VA == PA (direct map).
-pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) {
+/// Веха 89 — `false`, если не хватило фрейма под промежуточную таблицу (см. riscv-двойник):
+/// это зовут по запросу ПРОЦЕССА, и паника здесь роняла ядро вместо программы.
+#[must_use]
+pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) -> bool {
     let mut table = root_pa;
     let mut level = 3usize; // PML4 → PDPT → PD → PT
     while level >= 1 {
         let idx = (va >> (12 + 9 * level)) & 0x1ff;
         let pte = tbl_ptr(table).add(idx);
         if *pte & PTE_P == 0 {
-            let next = frame::alloc().expect("нет фрейма под таблицу");
+            let Some(next) = frame::alloc() else { return false };
             *pte = next as u64 | PTE_P | PTE_W | PTE_U;
             table = next;
         } else {
@@ -247,6 +254,7 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) {
     let idx = (va >> 12) & 0x1ff;
     let pte = tbl_ptr(table).add(idx);
     *pte = (pa as u64 & ADDR_MASK) | PTE_P | flags;
+    true
 }
 
 /// Отобразить диапазон [start, end) ТОЖДЕСТВЕННО (VA == PA), постранично — окна MMIO.
@@ -254,7 +262,7 @@ unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: u64) {
     let mut va = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     while va < end {
-        map(root_pa, va, va, flags);
+        assert!(map(root_pa, va, va, flags), "нет фрейма под таблицу MMIO");
         va += PAGE_SIZE;
     }
 }
@@ -265,7 +273,7 @@ unsafe fn map_kimage(root_pa: usize, start: usize, end: usize, flags: u64) {
     let mut va = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     while va < end {
-        map(root_pa, va, super::virt_to_phys(va), flags);
+        assert!(map(root_pa, va, super::virt_to_phys(va), flags), "нет фрейма под таблицу образа");
         va += PAGE_SIZE;
     }
 }
@@ -362,7 +370,7 @@ unsafe fn map_direct(root_pa: usize, start: usize, end: usize, prot_s: usize, pr
             while p < stop {
                 let ro = p >= prot_s && p < prot_e;
                 let flags = if ro { PTE_NX } else { PTE_W | PTE_NX };
-                map(root_pa, super::phys_to_virt(p), p, flags);
+                assert!(map(root_pa, super::phys_to_virt(p), p, flags), "нет фрейма под таблицу direct-map");
                 p += PAGE_SIZE;
             }
         }

@@ -182,7 +182,7 @@ pub fn thaw(root_name: &str) -> Option<Thawed> {
     let env = Vec::from(r.take(elen)?);
     let npages = r.u32()? as usize;
 
-    let root = arch::clone_kernel_root();
+    let root = arch::clone_kernel_root()?; // Веха 89: нет памяти — разморозка не состоялась
     for _ in 0..npages {
         let va = r.u64()? as usize;
         let nf = r.u32()?;
@@ -220,7 +220,11 @@ pub fn thaw(root_name: &str) -> Option<Thawed> {
         if nf & X != 0 {
             fl |= arch::MAP_X;
         }
-        unsafe { arch::map(root, va, pa, fl) };
+        // Веха 89: не хватило памяти под таблицы — разморозка не состоялась (частично
+        // построенное пространство снесёт вызывающий по `None`).
+        if !unsafe { arch::map(root, va, pa, fl) } {
+            return None;
+        }
     }
 
     Some(Thawed { root, frame, heap_brk, args, env, pages: npages })

@@ -168,7 +168,10 @@ pub fn load(root: usize, bytes: &[u8], va_limit: usize) -> Result<usize, ElfErro
                 }
             }
 
-            unsafe { arch::map(root, va, pa, flags) };
+            // Веха 89: не хватило памяти под таблицы — программа не грузится, ядро цело.
+            if !unsafe { arch::map(root, va, pa, flags) } {
+                return Err(ElfError::OutOfMemory);
+            }
             va += PAGE;
         }
     }
@@ -293,7 +296,10 @@ pub fn load_pie(root: usize, bytes: &[u8], base: usize, va_limit: usize) -> Resu
                     );
                 }
             }
-            unsafe { arch::map(root, va, pa, flags) };
+            // Веха 89: не хватило памяти под таблицы — программа не грузится, ядро цело.
+            if !unsafe { arch::map(root, va, pa, flags) } {
+                return Err(ElfError::OutOfMemory);
+            }
             va += PAGE;
         }
     }

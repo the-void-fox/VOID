@@ -471,7 +471,8 @@ pub unsafe fn mm_enable(root: usize) {
 ///
 /// # Safety
 /// См. paging::map.
-pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) {
+#[must_use]
+pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) -> bool {
     let mut pte = 0u64;
     if flags & MAP_W != 0 {
         pte |= paging::PTE_W;
