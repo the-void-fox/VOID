@@ -317,6 +317,9 @@ pub fn platform_init(_hartid: usize, dtb: usize) {
     if let Some(size) = dtb_ram_size(dtb) {
         RAM_SIZE_CELL.store(size, Ordering::Relaxed);
     }
+    // Веха 88 — сообщить карту RAM аллокатору. Пока запись одна (у QEMU virt память сплошная
+    // от RAM_BASE); подрезаем по `ram_limit`, дальше которого не достаёт direct-map.
+    crate::frame::add_region(RAM_BASE, ram_limit());
     // Веха 86 — часы: адрес RTC берём из того же DTB (у QEMU virt это `google,goldfish-rtc`
     // по 0x101000). Отобразит страницу `paging::init`, который идёт следом за platform_init.
     if let Some(base) = dtb_find_compatible(dtb, b"google,goldfish-rtc") {

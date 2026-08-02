@@ -33,14 +33,95 @@ fn kernel_end_pa() -> usize {
     align_up(crate::arch::virt_to_phys(&raw const _kernel_end as usize), PAGE_SIZE)
 }
 
-/// Конец физической RAM — Веха 41: ОБНАРУЖИВАЕТСЯ (`arch::ram_limit()`) из карты памяти
-/// загрузчика (multiboot/PVH), а не зашитая константа. `platform_init` вызывается ДО `init`.
-fn ram_end() -> usize {
-    crate::arch::ram_limit()
+// ─── карта RAM: СПИСОК регионов (Веха 88) ────────────────────────────────────
+//
+// До Вехи 88 аллокатор знал одно число — «конец RAM» (`arch::ram_limit()`), и раздавал
+// ОДИН непрерывный кусок от конца образа ядра до него. На реальной машине это неверно:
+// физическая память дырявая (BIOS/EBDA внизу, PCI-дыра под 4 ГиБ, ACPI-области), а всё,
+// что лежит ВЫШЕ дыры, при таком взгляде просто не существует. Теперь карта — список
+// регионов, который прошивка сообщает через `platform_init` ([`add_region`]).
+
+/// Регион физической RAM: `[start, end)`. Адреса физические и кратны странице.
+#[derive(Clone, Copy)]
+pub struct Region {
+    pub start: usize,
+    pub end: usize,
 }
 
-/// Адрес следующего свободного фрейма (двигается вверх). Пик розданного (high-water).
+/// Сколько регионов помещается в карту. Прошивки отдают единицы ПРИГОДНЫХ областей
+/// (обычно 2–4: до дыры BIOS, до PCI-дыры и хвост выше 4 ГиБ) — 16 с большим запасом.
+const MAX_REGIONS: usize = 16;
+
+/// Карта RAM. Пишется ТОЛЬКО из `platform_init` — до прерываний, до планировщика, в один
+/// поток, — а читается уже после; поэтому без замка, как `TRAP_STACK` в [`crate::proc`].
+static mut REGIONS: [Region; MAX_REGIONS] = [Region { start: 0, end: 0 }; MAX_REGIONS];
+static REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Карта RAM (по возрастанию адреса, без пересечений). Пуста до `platform_init`.
+pub fn regions() -> &'static [Region] {
+    unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(REGIONS) as *const Region,
+            REGION_COUNT.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Добавить в карту пригодный регион RAM. Зовётся из `platform_init` (ДО [`init`]) по одному
+/// разу на запись карты прошивки: E820/multiboot-mmap и PVH-memmap на x86, `/memory` из DTB
+/// на riscv. Границы подрезаются внутрь страницы (лишнего не присвоим), пустые игнорируются.
+///
+/// **Арх обязан подрезать регион по досягаемости direct-map**: аллокатор раздаёт то, что здесь
+/// записано, а трогать фрейм ядро может только через `phys_to_virt`.
+pub fn add_region(start: usize, end: usize) {
+    let start = align_up(start, PAGE_SIZE);
+    let end = end & !(PAGE_SIZE - 1);
+    if end <= start {
+        return;
+    }
+    unsafe {
+        let regs = &mut *core::ptr::addr_of_mut!(REGIONS);
+        let mut n = REGION_COUNT.load(Ordering::Relaxed);
+        // Смежный или пересекающийся с уже известным — слить (карты прошивок иногда дробят
+        // одну область на несколько записей). Каскадного слияния не делаем: для этого записи
+        // должны прийти так, чтобы новая накрыла сразу две — прошивки такого не дают.
+        for r in regs.iter_mut().take(n) {
+            if start <= r.end && end >= r.start {
+                r.start = r.start.min(start);
+                r.end = r.end.max(end);
+                return;
+            }
+        }
+        if n == MAX_REGIONS {
+            return; // карта переполнена — молча игнорируем хвост (лучше меньше RAM, чем каша)
+        }
+        // Вставка с сохранением порядка по возрастанию.
+        let mut i = n;
+        while i > 0 && regs[i - 1].start > start {
+            regs[i] = regs[i - 1];
+            i -= 1;
+        }
+        regs[i] = Region { start, end };
+        n += 1;
+        REGION_COUNT.store(n, Ordering::Relaxed);
+    }
+}
+
+/// Нижняя граница раздачи: ниже неё лежит образ ядра (и, если был, загрузочный модуль).
+/// Регионы целиком ниже неё пропускаются, регион вокруг неё начинается с неё.
+fn alloc_floor() -> usize {
+    kernel_end_pa().max(RESERVE_END.load(Ordering::Relaxed))
+}
+
+/// Курсор bump'а — физический адрес следующего невыданного фрейма (внутри региона [`REGION_IDX`]).
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Индекс региона карты, в котором стоит [`NEXT`]. `>= regions().len()` — RAM исчерпана.
+static REGION_IDX: AtomicUsize = AtomicUsize::new(0);
+
+/// Сколько байт всего роздано bump'ом по всем регионам — для отчёта потребления (Веха 28).
+/// Отдельный счётчик, а не «NEXT − начало»: с дырявой картой такая разность бессмысленна.
+static BUMPED: AtomicUsize = AtomicUsize::new(0);
 
 /// Голова списка свободных фреймов (Веха 46). `0` — список пуст (PA 0 у нас не бывает
 /// валидным фреймом RAM: она начинается заметно выше). В первых 8 байтах свободного
@@ -63,10 +144,43 @@ pub fn reserve_boot_module(end: usize) {
     RESERVE_END.store(align_up(end, PAGE_SIZE), Ordering::Relaxed);
 }
 
-/// Инициализировать аллокатор: начать за образом ядра ИЛИ за зарезервированным модулем (Веха 48).
+/// Инициализировать аллокатор: поставить курсор в первый регион карты, где есть что раздавать
+/// выше образа ядра (и зарезервированного загрузочного модуля, Веха 48).
 pub fn init() {
-    let start = kernel_end_pa();
-    NEXT.store(start.max(RESERVE_END.load(Ordering::Relaxed)), Ordering::Relaxed);
+    let floor = alloc_floor();
+    for (i, r) in regions().iter().enumerate() {
+        if r.start.max(floor) < r.end {
+            REGION_IDX.store(i, Ordering::Relaxed);
+            NEXT.store(r.start.max(floor), Ordering::Relaxed);
+            return;
+        }
+    }
+    REGION_IDX.store(regions().len(), Ordering::Relaxed); // RAM нет — alloc честно вернёт None
+}
+
+/// Отрезать непрерывный кусок `bytes` (кратно странице) из карты RAM, двигая курсор.
+/// `None` — во всех регионах не осталось непрерывного куска такого размера.
+fn bump(bytes: usize) -> Option<usize> {
+    let regs = regions();
+    let floor = alloc_floor();
+    loop {
+        let i = REGION_IDX.load(Ordering::Relaxed);
+        if i >= regs.len() {
+            return None;
+        }
+        let pa = NEXT.load(Ordering::Relaxed);
+        if pa.saturating_add(bytes) <= regs[i].end {
+            NEXT.store(pa + bytes, Ordering::Relaxed);
+            BUMPED.fetch_add(bytes, Ordering::Relaxed);
+            return Some(pa);
+        }
+        // В этом регионе непрерывного куска не осталось — перейти в следующий. Хвост региона
+        // при этом теряется: `reserve` просит крупные куски, и склеивать их через дыру нельзя.
+        REGION_IDX.store(i + 1, Ordering::Relaxed);
+        if i + 1 < regs.len() {
+            NEXT.store(regs[i + 1].start.max(floor), Ordering::Relaxed);
+        }
+    }
 }
 
 /// Выделить один обнулённый фрейм. Возвращает физический адрес (он же
@@ -89,11 +203,8 @@ pub fn alloc() -> Option<usize> {
             return Some(head);
         }
     }
-    // 2) bump — новая RAM за уже роздённой.
-    let pa = NEXT.fetch_add(PAGE_SIZE, Ordering::Relaxed);
-    if pa + PAGE_SIZE > ram_end() {
-        return None;
-    }
+    // 2) bump — новая RAM за уже роздённой (Веха 88: по карте регионов, а не по одному куску).
+    let pa = bump(PAGE_SIZE)?;
     // Обнулить фрейм: нулевой PTE = невалидный, поэтому новая таблица сразу «пустая».
     unsafe { core::ptr::write_bytes(ptr(pa), 0, PAGE_SIZE) };
     Some(pa)
@@ -126,18 +237,13 @@ pub fn free(pa: usize) {
 /// Возвращает физический адрес начала — используется под арену кучи ядра (Веха 4).
 /// В отличие от [`alloc`], блок не обнуляется: кучей управляет её аллокатор.
 pub fn reserve(bytes: usize) -> Option<usize> {
-    let bytes = align_up(bytes, PAGE_SIZE);
-    let start = NEXT.fetch_add(bytes, Ordering::Relaxed);
-    if start + bytes > ram_end() {
-        return None;
-    }
-    Some(start)
+    bump(align_up(bytes, PAGE_SIZE))
 }
 
-/// Сколько байт RAM за образом ядра роздано bump'ом (high-water: пик, который NEXT
-/// когда-либо достигал). Для отчёта потребления памяти (Веха 28).
+/// Сколько байт RAM роздано bump'ом (high-water: пик, который аллокатор когда-либо занимал).
+/// Для отчёта потребления памяти (Веха 28).
 pub fn used_bytes() -> usize {
-    NEXT.load(Ordering::Relaxed).saturating_sub(kernel_end_pa())
+    BUMPED.load(Ordering::Relaxed)
 }
 
 /// Веха 46 — сколько байт сейчас в списке свободных (возвращено и ждёт переиспользования).
@@ -151,7 +257,7 @@ pub fn available_bytes() -> usize {
 /// указывающие на MMIO УСТРОЙСТВА (не RAM) — их нельзя класть в список свободных, иначе выдадим
 /// адрес железа как страницу. RAM-фреймы (обычные, DMA, таблицы) — освобождаем; MMIO — минуем.
 pub fn is_ram(pa: usize) -> bool {
-    pa >= kernel_end_pa() && pa < ram_end()
+    pa >= alloc_floor() && regions().iter().any(|r| pa >= r.start && pa < r.end)
 }
 
 const fn align_up(x: usize, a: usize) -> usize {

@@ -92,6 +92,9 @@ pub fn platform_init(magic: usize, info: usize) {
     let (total, low_end) = discover_ram(magic, info);
     RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
     RAM_LIMIT_CELL.store(low_end, Ordering::Relaxed);
+    // Веха 88 — сообщить карту RAM аллокатору. Пока запись одна (сплошная нижняя RAM до дыры),
+    // ровно то, чем аллокатор пользовался и раньше; регионы выше 4 ГиБ придут следующим этапом.
+    crate::frame::add_region(0, low_end);
 }
 
 /// Magic PVH `hvm_start_info` (по смещению 0): так отличаем QEMU-PVH от multiboot2/мусора.
