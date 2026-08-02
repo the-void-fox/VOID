@@ -165,11 +165,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // GRUB на реальном железе / PVH от QEMU) ДО mm_init: direct-map и аллокатор фреймов возьмут
     // обнаруженную границу RAM, а не зашитые 128 МиБ. `hartid`/`dtb` на x86 = magic/инфо загрузки.
     arch::platform_init(hartid, dtb);
+    // Веха 88: «используем» — сумма пригодных РЕГИОНОВ карты, а не «конец RAM минус база»
+    // (у дырявой карты такая разность ничего не значит); в скобках — из скольких кусков.
     println!(
-        "  [plat] RAM обнаружено: {} МиБ (используем {} МиБ)",
+        "  [plat] RAM обнаружено: {} МиБ (используем {} МиБ в {} региона(х))",
         arch::ram_total() / (1024 * 1024),
-        arch::ram_limit().saturating_sub(if arch::ARCH_NAME == "riscv64" { 0x8000_0000 } else { 0 })
-            / (1024 * 1024),
+        frame::usable_bytes() / (1024 * 1024),
+        frame::regions().len(),
     );
 
     // Вектор trap'ов нужен и для page fault'ов, и для таймера.
@@ -181,6 +183,18 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: таблицы идентично отображают текущие PC/SP/UART.
     unsafe { arch::mm_enable(root) }
     println!("  [vm]   {} включён (direct map + W^X)", arch::MM_NAME);
+    // Веха 88: карта регионов и таблицы обязаны совпадать — раздать фрейм, которого нет в
+    // direct-map, значит получить page fault далеко от причины. Проверяем сразу и вслух.
+    if let Some(bad) = frame::probe_regions() {
+        println!("  [vm]   ВНИМАНИЕ: фрейм {:#x} есть в карте RAM, но не в direct-map", bad);
+    }
+    // Сама карта — одной строкой: на реальной машине это первое, на что смотришь, когда
+    // с памятью что-то не так (дыры и их границы у каждой прошивки свои).
+    print!("  [mm]   карта RAM:");
+    for r in frame::regions() {
+        print!(" {:#x}..{:#x}", r.start, r.end);
+    }
+    println!();
     heap::init();
     println!("  [heap] куча ядра готова (16 МиБ)");
     // Веха 86 — часы: спросить у платформы настенное время (CMOS RTC на x86, goldfish-rtc из DTB

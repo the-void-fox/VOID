@@ -107,6 +107,45 @@ pub fn add_region(start: usize, end: usize) {
     }
 }
 
+/// Сколько всего РАБОЧЕЙ RAM в карте (сумма регионов). Это и есть честный ответ на «сколько
+/// памяти система реально может раздать» — в отличие от «конца RAM», который у дырявой карты
+/// ничего не значит. Для баннера загрузки и отчёта.
+pub fn usable_bytes() -> usize {
+    regions().iter().map(|r| r.end - r.start).sum()
+}
+
+/// Веха 88 — проверить, что direct-map действительно накрывает то, что аллокатор собирается
+/// раздавать. Пробуем ВЕРХНЮЮ страницу каждого региона (её bump ещё не выдал: он идёт снизу
+/// вверх): пишем магию через `phys_to_virt` и читаем обратно. Возвращает адрес первой страницы,
+/// которая не отозвалась, — это значит, что карта регионов и таблицы разошлись, и раздача такой
+/// памяти кончилась бы page fault'ом далеко от причины.
+///
+/// Зовётся ОДИН раз, сразу после `mm_enable`. Стоит две записи на регион — на любых объёмах
+/// это единицы микросекунд.
+pub fn probe_regions() -> Option<usize> {
+    const MAGIC: usize = 0x5601_D1AB_10ED_C0DE;
+    let floor = alloc_floor();
+    let cursor = NEXT.load(Ordering::Relaxed);
+    for r in regions() {
+        let page = r.end - PAGE_SIZE;
+        // Только то, что аллокатор реально может выдать и ещё не выдал.
+        if page < floor || page < cursor {
+            continue;
+        }
+        unsafe {
+            let p = ptr(page) as *mut usize;
+            let saved = core::ptr::read_volatile(p);
+            core::ptr::write_volatile(p, MAGIC);
+            let ok = core::ptr::read_volatile(p) == MAGIC;
+            core::ptr::write_volatile(p, saved);
+            if !ok {
+                return Some(page);
+            }
+        }
+    }
+    None
+}
+
 /// Нижняя граница раздачи: ниже неё лежит образ ядра (и, если был, загрузочный модуль).
 /// Регионы целиком ниже неё пропускаются, регион вокруг неё начинается с неё.
 fn alloc_floor() -> usize {

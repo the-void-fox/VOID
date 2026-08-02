@@ -40,18 +40,10 @@ pub const ARCH_NAME: &str = "x86_64";
 /// Процессы/U-mode работают (Веха 26) — kmain гоняет процессные демо.
 pub const USERSPACE_READY: bool = true;
 
-/// Операционная граница RAM (адрес конца, exclusive) — теперь ОБНАРУЖИВАЕТСЯ (Веха 41), а не
-/// зашита: `platform_init` читает карту памяти загрузчика (multiboot от GRUB / PVH от QEMU) и
-/// зажимает её CAP'ом (direct-map и аллокатор фреймов — этой границей). До discovery — дефолт
-/// QEMU q35 128 МиБ.
-static RAM_LIMIT_CELL: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
-/// Полная обнаруженная ёмкость RAM (для отчёта; операционно ограничена [`ram_limit`]).
+/// Полная обнаруженная ёмкость RAM машины (для отчёта). Что из неё РАБОЧЕЕ — говорит карта
+/// регионов ([`crate::frame::regions`], Веха 88): «граница RAM» одним числом умерла вместе с
+/// предположением, что память сплошная. До discovery — дефолт QEMU q35 128 МиБ.
 static RAM_TOTAL_CELL: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
-
-/// Верхняя граница используемой RAM (адрес конца) — читают `frame`/`paging`.
-pub fn ram_limit() -> usize {
-    RAM_LIMIT_CELL.load(Ordering::Relaxed)
-}
 
 /// Полная обнаруженная RAM машины (байты) — для отчёта памяти.
 pub fn ram_total() -> usize {
@@ -71,17 +63,15 @@ pub fn is_real_hardware() -> bool {
     BOOT_MAGIC_CELL.load(Ordering::Relaxed) == MULTIBOOT2_MAGIC
 }
 
-/// Веха 41/85 — разобрать инфо-структуру загрузчика и выставить границы RAM. `magic` — eax при
+/// Веха 41/85/88 — разобрать инфо-структуру загрузчика и выставить карту RAM. `magic` — eax при
 /// входе (`0x36D76289` = multiboot2/GRUB), `info` — ebx (указатель на инфо: multiboot2-теги ЛИБО
-/// PVH `hvm_start_info` от QEMU). Полную ёмкость (`total`) печатаем ради честности, а direct-map и
-/// аллокатор фреймов берут `low_end` (конец НИЖНЕЙ сплошной RAM, до 4 ГиБ), зажатый `RAM_CAP`.
+/// PVH `hvm_start_info` от QEMU).
 ///
-/// Веха 87 — потолка больше нет. Прежний (1 ГиБ) держался на том, что direct-map был
-/// тождественным (VA == PA) и упирался в userspace-регион `[0x4000_0000, 0x8000_0000)`. Теперь
-/// RAM отображена в верхней половине и не пересекается с процессами ни при каком объёме;
-/// остаётся ровно одно ограничение — `low_end`, конец СПЛОШНОЙ нижней RAM: память выше PCI-дыры
-/// (4 ГиБ) пока не берём, потому что аллокатор фреймов знает одну непрерывную арену. Это
-/// снимает Веха 88 (карта памяти списком регионов).
+/// Веха 87 сняла потолок адресации (RAM живёт в верхней половине и не спорит с процессами), а
+/// Веха 88 снимает последнее ограничение: раньше брали только `low_end` — конец СПЛОШНОЙ нижней
+/// RAM, — потому что аллокатор знал одну непрерывную арену, и всё, что выше PCI-дыры, пропадало.
+/// Теперь каждая пригодная запись карты прошивки уходит в [`crate::frame::add_region`], а дыры
+/// остаются дырами.
 ///
 /// # Safety
 /// `info` — валидный указатель инфо-структуры соответствующего типа (гарантирует загрузчик).
@@ -89,39 +79,39 @@ pub fn platform_init(magic: usize, info: usize) {
     BOOT_MAGIC_CELL.store(magic, Ordering::Relaxed);
     // Веха 87: ebx от загрузчика — ФИЗИЧЕСКИЙ адрес, ядро уже работает в верхней половине.
     let info = if info == 0 { 0 } else { phys_to_virt(info) };
-    let (total, low_end) = discover_ram(magic, info);
-    RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
-    RAM_LIMIT_CELL.store(low_end, Ordering::Relaxed);
-    // Веха 88 — сообщить карту RAM аллокатору. Пока запись одна (сплошная нижняя RAM до дыры),
-    // ровно то, чем аллокатор пользовался и раньше; регионы выше 4 ГиБ придут следующим этапом.
-    crate::frame::add_region(0, low_end);
+    let total = discover_ram(magic, info);
+    // Карта не разобралась (нет инфо/битая) — принять контракт QEMU по умолчанию: 128 МиБ снизу.
+    if crate::frame::regions().is_empty() {
+        crate::frame::add_region(0, 128 * 1024 * 1024);
+    } else {
+        RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
+    }
 }
 
 /// Magic PVH `hvm_start_info` (по смещению 0): так отличаем QEMU-PVH от multiboot2/мусора.
 const PVH_MAGIC: u32 = 0x336e_c578;
 
-/// Веха 85 — обнаружить RAM: `(total, low_end)` в байтах. `total` — вся RAM (для отчёта), `low_end`
-/// — конец сплошной нижней RAM (адрес, до 4 ГиБ) для тождественного direct-map. Три источника:
-/// multiboot2 (GRUB), PVH-memmap (QEMU), иначе дефолт 128 МиБ.
-fn discover_ram(magic: usize, info: usize) -> (usize, usize) {
+/// Веха 85/88 — обнаружить RAM: зарегистрировать пригодные регионы в [`crate::frame`] и вернуть
+/// полную ёмкость (байты, для отчёта). Два источника: multiboot2 (GRUB) и PVH-memmap (QEMU);
+/// если ни один не разобрался, регионы не добавляются и `platform_init` берёт дефолт.
+fn discover_ram(magic: usize, info: usize) -> usize {
     if magic == MULTIBOOT2_MAGIC && info != 0 {
-        let ram = discover_multiboot(info); // basic meminfo = сплошная нижняя RAM: low_end == total
-        return (ram, ram);
+        return discover_multiboot(info);
     }
     if info != 0 {
-        if let Some(pair) = discover_pvh(info) {
-            return pair;
+        if let Some(total) = discover_pvh(info) {
+            return total;
         }
     }
-    (128 * 1024 * 1024, 128 * 1024 * 1024)
+    0
 }
 
-/// Веха 85 — разобрать PVH `hvm_start_info` (QEMU `-kernel` direct boot) и его memmap. Возвращает
-/// `(total, low_end)` по записям типа 1 (RAM): `total` — сумма, `low_end` — макс. конец записи с
-/// адресом < 4 ГиБ. `None` — не PVH/нет memmap. Раскладка структуры и записей — из PVH-ABI.
+/// Веха 85/88 — разобрать PVH `hvm_start_info` (QEMU `-kernel` direct boot) и его memmap: каждая
+/// запись типа 1 (обычная RAM) уходит регионом в [`crate::frame::add_region`]. Возвращает сумму
+/// (для отчёта); `None` — не PVH/нет memmap. Раскладка структуры и записей — из PVH-ABI.
 ///
 /// # Safety-примечание: `info` указывает на валидную структуру (гарантия PVH-загрузчика QEMU).
-fn discover_pvh(info: usize) -> Option<(usize, usize)> {
+fn discover_pvh(info: usize) -> Option<usize> {
     unsafe {
         let rd32 = |off: usize| core::ptr::read_unaligned((info + off) as *const u32);
         let rd64 = |off: usize| core::ptr::read_unaligned((info + off) as *const u64);
@@ -135,28 +125,18 @@ fn discover_pvh(info: usize) -> Option<(usize, usize)> {
         }
         let memmap = phys_to_virt(memmap); // Веха 87: поле физическое, читаем через direct-map
         let mut total = 0usize;
-        let mut low_end = 0usize;
         for i in 0..entries {
             let e = memmap + i * 24; // sizeof(hvm_memmap_table_entry) = 24
             let addr = rd64_at(e) as usize;
             let size = rd64_at(e + 8) as usize;
             let ty = core::ptr::read_unaligned((e + 16) as *const u32);
             if ty == 1 {
-                // 1 = обычная RAM
+                // 1 = обычная RAM; всё остальное (reserved/ACPI/NVS) — не наше
                 total = total.saturating_add(size);
-                if addr < 0x1_0000_0000 {
-                    let end = addr.saturating_add(size);
-                    if end > low_end {
-                        low_end = end;
-                    }
-                }
+                crate::frame::add_region(addr, addr.saturating_add(size));
             }
         }
-        if total == 0 {
-            None
-        } else {
-            Some((total, low_end))
-        }
+        (total != 0).then_some(total)
     }
 }
 
@@ -174,12 +154,15 @@ static MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
 static MODULE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Разобрать карту памяти multiboot2 (от GRUB) И загрузочный модуль (Веха 48) за один проход.
-/// Инфо — список тегов (`total_size@0`, теги с `@8`): type 4 «basic meminfo» (`mem_upper@+12` —
-/// КиБ выше 1 МиБ) → полная RAM; type 3 «module» (`mod_start@+8`, `mod_end@+12`) → образ установки.
-/// `magic`/`info` уже проверены вызывающим ([`discover_ram`]). Нет тега RAM — дефолт 128 МиБ.
+/// Инфо — список тегов (`total_size@0`, теги с `@8`): type 6 «memory map» (E820) → регионы RAM,
+/// type 4 «basic meminfo» (`mem_upper@+12` — КиБ выше 1 МиБ) → запасная ёмкость одним куском,
+/// type 3 «module» (`mod_start@+8`, `mod_end@+12`) → образ установки.
+/// `magic`/`info` уже проверены вызывающим ([`discover_ram`]). Возвращает ёмкость (0 — не нашли).
 fn discover_multiboot(info: usize) -> usize {
     let rd = |off: usize| unsafe { core::ptr::read_volatile((info + off) as *const u32) };
-    let mut ram = 128 * 1024 * 1024;
+    let rd64 = |off: usize| unsafe { core::ptr::read_unaligned((info + off) as *const u64) };
+    let mut basic = 0usize; // ёмкость по тегу 4 — запасной ответ, если карты (тег 6) не дали
+    let mut total = 0usize; // сумма пригодных записей карты
     let mut p = 8usize; // теги начинаются после total_size(u32)+reserved(u32)
     loop {
         let ty = rd(p);
@@ -188,7 +171,26 @@ fn discover_multiboot(info: usize) -> usize {
             break; // завершающий тег или мусор
         }
         match ty {
-            4 => ram = 0x10_0000 + rd(p + 12) as usize * 1024, // basic meminfo: mem_upper (КиБ)
+            4 => basic = 0x10_0000 + rd(p + 12) as usize * 1024, // basic meminfo: mem_upper (КиБ)
+            // Веха 88 — КАРТА ПАМЯТИ (E820 в переводе GRUB). Заголовок тега: type, size,
+            // entry_size@+8, entry_version@+12; дальше записи по entry_size:
+            // base_addr(u64) length(u64) type(u32) reserved(u32). Тип 1 = пригодная RAM.
+            // Раньше этот тег не читался вовсе, и на металле мы жили по одному `mem_upper`.
+            6 => {
+                let esize = rd(p + 8) as usize;
+                if esize >= 24 {
+                    let mut e = p + 16;
+                    while e + esize <= p + size {
+                        let base = rd64(e) as usize;
+                        let len = rd64(e + 8) as usize;
+                        if rd(e + 16) == 1 {
+                            total = total.saturating_add(len);
+                            crate::frame::add_region(base, base.saturating_add(len));
+                        }
+                        e += esize;
+                    }
+                }
+            }
             3 => {
                 let (start, end) = (rd(p + 8) as usize, rd(p + 12) as usize);
                 MODULE_BASE.store(start, Ordering::Relaxed);
@@ -202,7 +204,14 @@ fn discover_multiboot(info: usize) -> usize {
         }
         p += (size + 7) & !7; // следующий тег — с выравниванием на 8
     }
-    ram
+    // Карта разобралась — она и есть истина; иначе откатываемся на `basic` одним регионом.
+    if total > 0 {
+        return total;
+    }
+    if basic > 0 {
+        crate::frame::add_region(0, basic);
+    }
+    basic
 }
 
 /// Веха 48 — загрузочный модуль (образ установки), переданный GRUB через `module2`:

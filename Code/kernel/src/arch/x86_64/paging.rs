@@ -24,6 +24,10 @@ const HUGE: usize = 2 * 1024 * 1024;
 /// (CPUID-бит PDPE1GB), поэтому перед использованием спрашиваем — см. [`giga_pages_supported`].
 const GIGA: usize = 1024 * 1024 * 1024;
 
+/// Веха 88 — граница «низа»: ниже неё дыры карты памяти закрываем отображением (там VGA/BIOS/ACPI,
+/// к которым ядро обращается через direct-map), выше — стелем строго по регионам.
+const FOUR_GIB: usize = 4 * GIGA;
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Веха 87 — указатель на таблицу страниц по её ФИЗИЧЕСКОМУ адресу (через direct-map).
@@ -71,16 +75,35 @@ pub fn init() -> usize {
     let kimg_e = &raw const _kernel_end as usize;
 
     unsafe {
-        // 1) direct map всей (используемой) RAM как RW+NX (данные не исполняются). Веха 41/85:
-        //    граница — обнаруженная `ram_limit()`; стелем huge-страницами (2 МиБ), а чанки
+        // 1) direct map RAM как RW+NX (данные не исполняются): huge/гигастраницами, а чанки
         //    образа ядра — постранично и только на чтение (см. преамбулу).
-        map_direct(
-            root,
-            0,
-            super::ram_limit(),
-            super::virt_to_phys(kimg_s),
-            super::virt_to_phys(kimg_e),
-        );
+        //
+        //    Веха 88 — по КАРТЕ РЕГИОНОВ, но не буквально по ней. Ниже 4 ГиБ дыры карты
+        //    (VGA 0xB8000, BIOS, ACPI) ЗАКРЫВАЕМ сплошным отображением: ядро ходит к ним через
+        //    direct-map, и вырезать их — тот самый triple fault, что ловили в Вехе 87. Раздачи
+        //    это не касается: чего нет в карте, того аллокатор не выдаст. Выше 4 ГиБ — строго по
+        //    регионам: закрывать там нечего, а PCI-дыра может быть огромной.
+        //
+        //    Порядок восхождения важен: пока не сделан `mm_enable`, ядро живёт на таблицах
+        //    трамплина, а те покрывают только первые 4 ГиБ — фреймы под таблицы обязаны
+        //    приходить снизу. Регионы отсортированы, аллокатор идёт снизу вверх — так и есть.
+        let ks = super::virt_to_phys(kimg_s);
+        let ke = super::virt_to_phys(kimg_e);
+        let mut low_end = 0usize;
+        for r in frame::regions() {
+            if r.start < FOUR_GIB {
+                low_end = low_end.max(r.end.min(FOUR_GIB));
+            }
+        }
+        if low_end > 0 {
+            map_direct(root, 0, low_end, ks, ke);
+        }
+        for r in frame::regions() {
+            let start = r.start.max(FOUR_GIB);
+            if start < r.end {
+                map_direct(root, start, r.end, ks, ke);
+            }
+        }
         // 2) окно образа ядра — W^X: заголовки и константы R+NX, код R+X, данные RW+NX.
         map_kimage(root, kimg_s, text_s, PTE_NX);
         map_kimage(root, text_s, text_e, 0);

@@ -296,30 +296,24 @@ const DIRECT_MAP_LIMIT: usize = 256 * 1024 * 1024 * 1024;
 /// Обнаруженный размер RAM (байты). До разбора DTB — дефолт QEMU virt 128 МиБ.
 static RAM_SIZE_CELL: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
 
-/// Граница используемой RAM (адрес конца, exclusive): база + обнаруженное, но не дальше,
-/// чем достаёт direct-map.
-pub fn ram_limit() -> usize {
-    (RAM_BASE + RAM_SIZE_CELL.load(Ordering::Relaxed)).min(DIRECT_MAP_LIMIT)
-}
-
 /// Полная обнаруженная RAM машины (байты) — для отчёта.
 pub fn ram_total() -> usize {
     RAM_SIZE_CELL.load(Ordering::Relaxed)
 }
 
-/// Веха 85 — платформенная инициализация: разобрать `/memory` из device tree (a1 = dtb), чтобы
-/// direct-map и аллокатор фреймов взяли реальный объём RAM (`-m 2G` и т.п.), а не зашитые 128 МиБ.
+/// Веха 85/88 — платформенная инициализация: разобрать `/memory` из device tree (a1 = dtb), чтобы
+/// direct-map и аллокатор фреймов взяли реальную карту RAM, а не зашитые 128 МиБ.
 /// DTB нет/не разобрать — остаётся дефолт 128 МиБ (контракт QEMU virt по умолчанию).
 pub fn platform_init(_hartid: usize, dtb: usize) {
     // Веха 87: a1 от OpenSBI — ФИЗИЧЕСКИЙ адрес блоба, а ядро уже работает в верхней половине
     // (трамплин включил трансляцию) — читаем DTB через direct-map, а не по сырой физике.
     let dtb = if dtb == 0 { 0 } else { phys_to_virt(dtb) };
-    if let Some(size) = dtb_ram_size(dtb) {
-        RAM_SIZE_CELL.store(size, Ordering::Relaxed);
+    let total = dtb_ram_regions(dtb);
+    if total > 0 {
+        RAM_SIZE_CELL.store(total, Ordering::Relaxed);
+    } else {
+        crate::frame::add_region(RAM_BASE, RAM_BASE + RAM_SIZE_CELL.load(Ordering::Relaxed));
     }
-    // Веха 88 — сообщить карту RAM аллокатору. Пока запись одна (у QEMU virt память сплошная
-    // от RAM_BASE); подрезаем по `ram_limit`, дальше которого не достаёт direct-map.
-    crate::frame::add_region(RAM_BASE, ram_limit());
     // Веха 86 — часы: адрес RTC берём из того же DTB (у QEMU virt это `google,goldfish-rtc`
     // по 0x101000). Отобразит страницу `paging::init`, который идёт следом за platform_init.
     if let Some(base) = dtb_find_compatible(dtb, b"google,goldfish-rtc") {
@@ -340,16 +334,19 @@ unsafe fn fdt_be32(addr: usize) -> u32 {
     u32::from_be(core::ptr::read_unaligned(addr as *const u32))
 }
 
-/// Разобрать DTB (`dtb` = a1 от OpenSBI) и вернуть размер RAM узла `/memory` (байты). `None` —
-/// нет/битый DTB или узел не найден. Предполагаем #address-cells = #size-cells = 2 (QEMU virt):
-/// `reg` = [адрес(8) размер(8)] big-endian; берём размер. Обход ограничен `totalsize`.
-fn dtb_ram_size(dtb: usize) -> Option<usize> {
+/// Веха 88 — разобрать DTB (`dtb` = a1 от OpenSBI) и зарегистрировать КАЖДЫЙ банк RAM из узлов
+/// `/memory*` в [`crate::frame::add_region`]. Возвращает суммарный объём (0 — нет/битый DTB или
+/// узла нет). Предполагаем #address-cells = #size-cells = 2 (QEMU virt и типовые riscv-платы):
+/// `reg` = массив пар [адрес(8) размер(8)] big-endian — узлов и пар может быть несколько (у платы
+/// бывает несколько банков). Обход ограничен `totalsize`.
+fn dtb_ram_regions(dtb: usize) -> usize {
     if dtb == 0 {
-        return None;
+        return 0;
     }
+    let mut total = 0usize;
     unsafe {
         if fdt_be32(dtb) != FDT_MAGIC {
-            return None;
+            return 0;
         }
         let totalsize = fdt_be32(dtb + 4) as usize;
         let off_struct = fdt_be32(dtb + 8) as usize;
@@ -388,11 +385,24 @@ fn dtb_ram_size(dtb: usize) -> Option<usize> {
                         }
                         let pname = core::slice::from_raw_parts(nptr as *const u8, q - nptr);
                         if pname == b"reg" {
-                            // reg = адрес(2 ячейки=8) размер(2 ячейки=8), big-endian; берём размер.
-                            let size = u64::from_be(core::ptr::read_unaligned(
-                                (val + 8) as *const u64,
-                            ));
-                            return Some(size as usize);
+                            // reg = массив пар [адрес(2 ячейки=8) размер(2 ячейки=8)], big-endian.
+                            let mut off = 0usize;
+                            while off + 16 <= len {
+                                let base = u64::from_be(core::ptr::read_unaligned(
+                                    (val + off) as *const u64,
+                                )) as usize;
+                                let size = u64::from_be(core::ptr::read_unaligned(
+                                    (val + off + 8) as *const u64,
+                                )) as usize;
+                                total = total.saturating_add(size);
+                                // Подрезать по досягаемости direct-map: раздать можно только то,
+                                // до чего ядро дотянется через `phys_to_virt` (Веха 87).
+                                crate::frame::add_region(
+                                    base,
+                                    base.saturating_add(size).min(DIRECT_MAP_LIMIT),
+                                );
+                                off += 16;
+                            }
                         }
                     }
                 }
@@ -402,7 +412,7 @@ fn dtb_ram_size(dtb: usize) -> Option<usize> {
             }
         }
     }
-    None
+    total
 }
 
 /// Найти в DTB узел с данным `compatible` и вернуть базовый адрес из его `reg`.
