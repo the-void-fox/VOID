@@ -1,6 +1,6 @@
 ---
 title: Вехи 90–92 — стек smoltcp в net-srv, сервер-реактор, DHCP и DNS
-created: 2026-08-01
+created: 2026-08-02
 tags: [project/void, topic/network, topic/microkernel, topic/userspace]
 status: done
 ---
