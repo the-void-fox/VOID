@@ -19,6 +19,20 @@ use crate::sync::SpinLock;
 /// Размер стека одной задачи (берётся из кучи).
 const STACK_SIZE: usize = 32 * 1024;
 
+/// Веха 89 — **сторож стека ядерной задачи**. Настоящую guard-страницу здесь не поставить:
+/// стек берётся из кучи ядра, а она лежит в direct-map, застеленной huge/гигастраницами —
+/// вырезать из неё одну страницу значило бы дробить всё отображение. Поэтому дешёвая замена:
+/// магия в самом низу стека, которую проверяем на КАЖДОМ переключении задач. Переполнение
+/// перестаёт быть «тихой порчей соседа по куче» и становится названным падением с именем
+/// виновной задачи — а это ровно то, что нужно, чтобы такую ошибку вообще можно было найти.
+const STACK_CANARY: usize = 0x5641_4C49_4E41_4359; // "VALINACY"
+
+/// Проверить сторожа стека задачи. `stack` пуст у `main` (она живёт на загрузочном стеке).
+fn canary_ok(stack: &[u8]) -> bool {
+    stack.len() < core::mem::size_of::<usize>()
+        || unsafe { core::ptr::read(stack.as_ptr() as *const usize) } == STACK_CANARY
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum State {
     Runnable,
@@ -84,7 +98,9 @@ pub fn init() {
 
 /// Создать задачу с собственным стеком, которая начнёт с функции `entry`.
 pub fn spawn(name: &'static str, entry: fn()) {
-    let stack = vec![0u8; STACK_SIZE];
+    let mut stack = vec![0u8; STACK_SIZE];
+    // Веха 89: сторож в САМОМ НИЗУ — стек растёт вниз, значит переполнение затрёт его первым.
+    unsafe { core::ptr::write(stack.as_mut_ptr() as *mut usize, STACK_CANARY) };
     // Стек растёт вниз — начинаем с вершины, выровненной по 16 (требование ABI).
     let sp = align_down(stack.as_ptr() as usize + STACK_SIZE, 16);
 
@@ -117,6 +133,12 @@ pub fn yield_now() {
         // контекста. `lock_irq` вернул бы их слишком рано (на `drop` стража).
         let mut sched = SCHED.lock();
         let old = sched.current;
+        // Веха 89: уходящая задача обязана оставить сторожа целым. Одно сравнение на
+        // переключение — дешевле любой отладки «кто затёр соседний Box».
+        assert!(
+            canary_ok(&sched.tasks[old].stack),
+            "переполнение стека ядерной задачи",
+        );
         match sched.pick_next(old) {
             Some(next) if next != old => {
                 sched.current = next;

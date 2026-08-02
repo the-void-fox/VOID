@@ -182,6 +182,11 @@ struct Table {
     current: usize,
     /// Недоставленные запросы IPC: (отправитель, получатель, сообщение).
     mailbox: Vec<(usize, usize, usize)>,
+    /// Веха 89 — номера слотов полностью утилизированных групп, готовые к переиспользованию.
+    /// До этого `procs` только рос: завершённые процессы оставались навсегда, планировщик
+    /// обходил их линейно на каждом переключении, а сотни `exec` (пакетный менеджер — это
+    /// сотни) пухли впустую. Класть сюда слот можно ТОЛЬКО после [`cap::revoke_process`].
+    free_slots: Vec<usize>,
 }
 
 impl Table {
@@ -199,7 +204,7 @@ impl Table {
 }
 
 static TABLE: SpinLock<Table> =
-    SpinLock::new(Table { procs: Vec::new(), current: 0, mailbox: Vec::new() });
+    SpinLock::new(Table { procs: Vec::new(), current: 0, mailbox: Vec::new(), free_slots: Vec::new() });
 
 /// Контекст ядра, в который возвращаемся, когда все процессы завершились.
 static mut RETURN_CTX: Context = Context::EMPTY;
@@ -279,8 +284,10 @@ fn create_process_locked(
 ) -> usize {
     let frame = TrapFrame::new_user(entry, USER_STACK_TOP_VA, arg);
     let domain = cap::create_domain(name);
-    let idx = t.procs.len(); // индекс, который получит новый процесс — он же лидер своей группы
-    t.procs.push(Proc {
+    // Веха 89: занять освободившийся слот, если он есть (права на него уже отозваны при
+    // утилизации группы), иначе вырасти. Индекс — он же лидер собственной группы.
+    let idx = t.free_slots.pop().unwrap_or(t.procs.len());
+    let proc = Proc {
         space: arch::space_token(root),
         frame,
         state: State::Runnable,
@@ -305,7 +312,12 @@ fn create_process_locked(
         futex_addr: 0,
         futex_deadline: None,
         linux: false, // по умолчанию — родная личность VOID; spawn_linux_locked поставит true
-    });
+    };
+    if idx == t.procs.len() {
+        t.procs.push(proc);
+    } else {
+        t.procs[idx] = proc; // переиспользуем освободившийся слот (Веха 89)
+    }
     idx
 }
 
@@ -770,6 +782,14 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
         for i in 0..n {
             if t.procs[i].group == leader {
                 t.procs[i].space = RECLAIMED;
+                // Веха 89 — сперва ОТОЗВАТЬ права, указывающие на этот номер (эндпоинты и
+                // reply), и только потом отдать слот под переиспользование: иначе устаревший
+                // cap начал бы адресовать чужой, новый процесс.
+                cap::revoke_process(i);
+                // Текущий слот не отдаём: `resume` ещё читает из него кадр.
+                if i != t.current {
+                    t.free_slots.push(i);
+                }
             }
         }
     }

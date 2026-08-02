@@ -132,6 +132,30 @@ pub fn create_domain(name: &'static str) -> DomainId {
     cs.domains.len() - 1
 }
 
+/// Веха 89 — **отозвать все права, указывающие на умерший процесс**: эндпоинты и reply-права
+/// эфемерны и живут ровно столько, сколько процесс. Пока слоты процессов не переиспользовались,
+/// устаревший cap просто указывал в мертвеца; с переиспользованием (`proc`, та же веха) он стал
+/// бы указывать на ЧУЖОЙ, НОВЫЙ процесс — то есть право появлялось бы из ниоткуда, ровно то, что
+/// модель обязана исключать.
+///
+/// Поколение слота растёт, поэтому старый дескриптор честно становится `Stale` — тем же
+/// механизмом, что и обычный [`revoke`].
+pub fn revoke_process(pid: usize) {
+    let mut cs = CSPACE.lock();
+    for d in cs.domains.iter_mut() {
+        for s in d.slots.iter_mut() {
+            let hit = matches!(
+                s.entry.as_ref().map(|e| &e.target),
+                Some(Target::Endpoint(p) | Target::Reply(p)) if *p == pid
+            );
+            if hit {
+                s.entry = None;
+                s.generation = s.generation.wrapping_add(1);
+            }
+        }
+    }
+}
+
 /// Имя домена (для вывода/интроспекции).
 pub fn domain_name(dom: DomainId) -> &'static str {
     CSPACE.lock().domains[dom].name
