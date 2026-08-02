@@ -5,6 +5,8 @@
 //! [`TrapFrame`] — снимок всех регистров на момент trap'а. Диспетчер смотрит на
 //! `scause` и решает, что это было: таймер, breakpoint или что-то фатальное.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use super::{csr, plic};
 use crate::arch::{FaultKind, UserTrap};
 use crate::{println, proc, timer};
@@ -153,6 +155,21 @@ pub fn init() {
     csr::write_scounteren(0b111);
 }
 
+/// Идёт ли сейчас проба инструкции, которая может оказаться недоступной, и сработала ли она.
+/// Один поток исполнения на пробе — гонок нет, атомики здесь ради видимости из обработчика.
+static PROBING: AtomicBool = AtomicBool::new(false);
+static TRAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Выполнить `f`, поймав «недопустимую инструкцию» вместо падения. `true` — инструкция
+/// выполнилась; `false` — прошивка её запретила (результат `f` при этом бессмыслен).
+pub fn probe_illegal(f: impl FnOnce()) -> bool {
+    TRAPPED.store(false, Ordering::Relaxed);
+    PROBING.store(true, Ordering::Relaxed);
+    f();
+    PROBING.store(false, Ordering::Relaxed);
+    !TRAPPED.load(Ordering::Relaxed)
+}
+
 /// Rust-сторона обработчика. Вызывается из trap_entry.s; `frame` указывает на
 /// сохранённые регистры на стеке. Менять `frame.sepc` здесь = менять адрес возврата.
 #[no_mangle]
@@ -178,6 +195,15 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
         }
     } else {
         match code {
+            // Проба инструкции, которой может не быть (`rdcycle` под запретом `mcounteren`):
+            // помечаем неудачу и ПЕРЕШАГИВАЕМ инструкцию вместо фатального дампа. Без этого
+            // единственный способ узнать про счётчик тактов — предположить, а предположения
+            // про прошивку — это как раз то, на чём ломается перенос на реальную плату.
+            csr::EXC_ILLEGAL if PROBING.load(Ordering::Relaxed) => {
+                TRAPPED.store(true, Ordering::Relaxed);
+                let insn_lo = unsafe { core::ptr::read(frame.sepc as *const u16) };
+                frame.sepc += if insn_lo & 0b11 == 0b11 { 4 } else { 2 };
+            }
             csr::EXC_BREAKPOINT => {
                 // `ebreak`: сообщаем и перешагиваем инструкцию, иначе зациклимся на ней.
                 // Длина зависит от сжатия (расширение C): 2 байта (c.ebreak) или 4.

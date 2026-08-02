@@ -27,6 +27,10 @@ pub const IRQ_S_TIMER: usize = 5;
 /// Внешнее прерывание S-mode (от PLIC): устройства — диск и т.п.
 pub const IRQ_S_EXTERNAL: usize = 9;
 /// Исключение breakpoint — инструкция `ebreak` (когда INTERRUPT_BIT снят).
+/// Недопустимая инструкция. Нужна не для отладки, а для ПРОБЫ: `rdcycle` доступен из S-mode
+/// только если прошивка разрешила его в `mcounteren`, и узнать это можно лишь попыткой.
+pub const EXC_ILLEGAL: usize = 2;
+
 pub const EXC_BREAKPOINT: usize = 3;
 /// Исключение «environment call from U-mode» — системный вызов из пользовательского режима.
 pub const EXC_ECALL_FROM_U: usize = 8;
@@ -82,6 +86,18 @@ pub fn read_stval() -> usize {
 pub fn read_time() -> u64 {
     let v: u64;
     unsafe { asm!("rdtime {0}", out(reg) v, options(nomem, nostack)) }
+    v
+}
+
+/// Счётчик ТАКТОВ (`cycle`), а не времени. Нужен джиттер-источнику энтропии: `rdtime` на
+/// QEMU virt тикает 10 МГц, то есть 100 нс на отсчёт — разброс задержек памяти в такой сетке
+/// не виден вовсе. `rdcycle` читается из S-mode, когда прошивка разрешила это в `mcounteren.CY`
+/// (OpenSBI разрешает); если нет — инструкция даст illegal instruction, поэтому доступность
+/// проверяется на загрузке, а не предполагается.
+#[inline]
+pub fn read_cycle() -> u64 {
+    let v: u64;
+    unsafe { asm!("rdcycle {0}", out(reg) v, options(nomem, nostack)) }
     v
 }
 

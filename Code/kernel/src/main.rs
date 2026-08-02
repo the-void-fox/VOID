@@ -75,6 +75,7 @@ mod init;
 mod linux;
 mod object;
 mod proc;
+mod jitter;
 mod random;
 mod sched;
 mod sync;
@@ -82,6 +83,15 @@ mod timer;
 mod virtio_blk;
 mod virtio_net;
 mod virtio_rng;
+
+/// Помощник для баннера источников случайности.
+fn yes_no(v: bool) -> &'static str {
+    if v {
+        "есть"
+    } else {
+        "нет"
+    }
+}
 
 /// Веха 23 — ELF-байты ВСЕХ userspace-программ, встроенные в образ ядра как СЕМЕНА. Собраны
 /// `kernel/build.rs` отдельным `cargo build` крейта `programs/user` (свой target-dir в OUT_DIR)
@@ -245,12 +255,18 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // на riscv криптографического источника нет вовсе — только пул джиттера, на котором нельзя
     // строить ключи TLS. Печатаем честно, потому что молчаливо слабая случайность опаснее
     // отсутствующей: с ней система выглядит рабочей.
-    if virtio_rng::init() {
-        println!("  [rng]  virtio-rng: аппаратная энтропия подключена");
-    } else if random::has_strong_source() {
-        println!("  [rng]  virtio-rng нет; источник — аппаратный ГСЧ процессора");
-    } else {
-        println!("  [rng]  ВНИМАНИЕ: криптографического источника нет — только пул джиттера");
+    let vrng = virtio_rng::init();
+    // Джиттер-источник: единственный, который работает БЕЗ гипервизора и без RDRAND, то есть
+    // на реальном железе старше Ivy Bridge. Проверяется санитарными тестами — «не прошёл» здесь
+    // такой же законный исход, как «прошёл», и он должен быть виден.
+    let jit = jitter::init();
+    let hw = arch::hw_random_u64().is_some();
+    println!(
+        "  [rng]  источники: virtio-rng {} · ГСЧ процессора {} · джиттер {}",
+        yes_no(vrng), yes_no(hw), yes_no(jit),
+    );
+    if !random::has_strong_source() {
+        println!("  [rng]  ВНИМАНИЕ: сильного источника нет — ключи здесь генерировать НЕЛЬЗЯ");
     }
 
     // Веха 50: контроллер USB xHCI (часть A — подъём HCD). Печатает свой статус сам; нет xHCI
@@ -284,6 +300,12 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         }
     } else {
         println!("  [store] диск пуст — это ПЕРВЫЙ запуск");
+    }
+
+    // Семя случайности с прошлой загрузки (и сразу свежее — на следующую). Делается СРАЗУ
+    // после подъёма store, до всего, что может попросить случайность.
+    if random::load_seed() {
+        println!("  [rng]  семя прошлой загрузки подмешано в пул");
     }
 
     // Веха 21.3: поднять персистентный c-space из спец-корня `.cspace` — домены со слотами,

@@ -63,7 +63,7 @@ pub use imp::{
     irq_mask_idle, irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel,
     wait_for_interrupt,
     // таймер
-    now_ticks, timer_arm, timer_hw_init,
+    now_cycles, now_ticks, timer_arm, timer_hw_init,
     // память
     clone_kernel_root, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
     phys_to_virt, space_root, space_token, translate, virt_to_phys, MAP_R, MAP_U, MAP_W, MAP_X,

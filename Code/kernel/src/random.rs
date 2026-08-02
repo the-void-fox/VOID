@@ -64,6 +64,14 @@ pub fn fill(buf: &mut [u8]) {
         // ГСЧ у QEMU virt нет вовсе), на x86 — второй независимый рядом с RDRAND. Смешиваем
         // все источники, а не выбираем один: слабость любого из них не портит выход.
         let vrng = crate::virtio_rng::next_u64().unwrap_or(0);
+        // Джиттер стоит тысяч обращений к памяти, поэтому он подмешивается не каждый раз, а
+        // ПЕРЕЗАСЕВАЕТ пул раз в 64 выдачи. Для источника это правильнее, чем дёргать его на
+        // каждый байт: энтропия копится в пуле, а выдача остаётся дешёвой.
+        if c % 64 == 0 {
+            if let Some(j) = crate::jitter::next_u64() {
+                stir(j);
+            }
+        }
         seed[0..8].copy_from_slice(&c.to_le_bytes());
         seed[8..16].copy_from_slice(&pool.to_le_bytes());
         seed[16..24].copy_from_slice(&ticks.to_le_bytes());
@@ -78,9 +86,52 @@ pub fn fill(buf: &mut [u8]) {
     }
 }
 
-/// Есть ли у системы КРИПТОГРАФИЧЕСКИЙ источник (аппаратный ГСЧ или virtio-rng).
-/// `false` — остаётся только пул джиттера, и это надо честно сказать вслух: на такой
-/// энтропии нельзя строить ключи (TLS, Веха 95).
+/// Есть ли у системы источник, на который МОЖНО опереться: аппаратный ГСЧ процессора,
+/// virtio-rng или прошедший санитарные тесты джиттер-источник.
+///
+/// `false` означает буквально «ключи здесь генерировать нельзя» — и это должно быть слышно,
+/// а не выведено читателем из отсутствия сообщений.
 pub fn has_strong_source() -> bool {
-    arch::hw_random_u64().is_some() || crate::virtio_rng::present()
+    arch::hw_random_u64().is_some() || crate::virtio_rng::present() || crate::jitter::healthy()
+}
+
+/// Имя корня, в котором лежит семя, переживающее перезагрузку.
+const SEED_ROOT: &str = "system/random-seed";
+/// Длина семени: 32 байта — блок BLAKE3, больше смысла не имеет.
+const SEED_LEN: usize = 32;
+
+/// Подмешать семя ПРОШЛОЙ загрузки в пул и тут же записать новое.
+///
+/// Это то, что делает любой Unix (`/var/lib/systemd/random-seed`), и у нас оно достаётся почти
+/// даром: store персистентен. Смысл — снять худший случай, «холодная загрузка без энтропии»:
+/// после первой же загрузки система стартует с накопленным состоянием, а не с константы.
+///
+/// Новое семя пишется СРАЗУ после чтения, до того как старое где-либо использовано: иначе
+/// падение до записи заставило бы следующую загрузку повторить ту же случайность.
+pub fn load_seed() -> bool {
+    let had = match crate::object::root(SEED_ROOT) {
+        Some(id) => crate::object::with(&id, |b| match b {
+            Some(bytes) if bytes.len() == SEED_LEN => {
+                // Мешаем семя в пул по слову: `stir` для того и сделан.
+                for chunk in bytes.chunks_exact(8) {
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(chunk);
+                    stir(u64::from_le_bytes(w));
+                }
+                true
+            }
+            _ => false,
+        }),
+        None => false,
+    };
+    save_seed();
+    had
+}
+
+/// Записать свежее семя на следующую загрузку.
+pub fn save_seed() {
+    let mut seed = [0u8; SEED_LEN];
+    fill(&mut seed);
+    let id = crate::object::put(&seed);
+    crate::object::set_root(SEED_ROOT, id);
 }

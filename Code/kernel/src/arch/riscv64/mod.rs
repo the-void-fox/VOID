@@ -214,6 +214,26 @@ pub fn now_ticks() -> u64 {
     csr::read_time()
 }
 
+/// Счётчик ТАКТОВ для джиттер-источника энтропии. `None` — прошивка не дала `rdcycle`
+/// из S-mode (`mcounteren.CY`), и джиттер собирать не на чем: `rdtime` тикает 10 МГц, в такой
+/// сетке разброс задержек памяти не виден. Доступность ПРОВЕРЯЕТСЯ, а не предполагается —
+/// иначе первая же плата с другой прошивкой встретила бы нас фатальным трапом.
+pub fn now_cycles() -> Option<u64> {
+    static AVAILABLE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    use core::sync::atomic::Ordering;
+    // 0 — ещё не пробовали, 1 — есть, 2 — запрещено.
+    match AVAILABLE.load(Ordering::Relaxed) {
+        1 => return Some(csr::read_cycle()),
+        2 => return None,
+        _ => {}
+    }
+    let ok = trap::probe_illegal(|| {
+        core::hint::black_box(csr::read_cycle());
+    });
+    AVAILABLE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    ok.then(csr::read_cycle)
+}
+
 // ─── память (Sv39) ──────────────────────────────────────────────────────────
 
 /// Веха 87 — смещение direct-map: `VA = PA + KERNEL_OFFSET` ([[0010-address-space-layout]]).
