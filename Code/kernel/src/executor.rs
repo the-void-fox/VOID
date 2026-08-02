@@ -55,12 +55,7 @@ static EXECUTOR: SpinLock<Executor> = SpinLock::new(Executor::new());
 /// замок обязан быть irq-safe: иначе IRQ посреди удержания замка → `wake` на том же замке →
 /// взаимоблокировка. (Ср. `with_sched` в [`crate::sched`].)
 fn with_exec<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
-    let sie = crate::arch::irq_save_disable();
-    let mut g = EXECUTOR.lock();
-    let r = f(&mut g);
-    drop(g);
-    crate::arch::irq_restore(sie);
-    r
+    f(&mut EXECUTOR.lock_irq())
 }
 
 /// Waker задачи: разбудить = положить её id обратно в очередь готовых.

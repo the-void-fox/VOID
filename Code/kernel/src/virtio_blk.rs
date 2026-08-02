@@ -324,7 +324,7 @@ pub fn on_irq() {
     crate::random::stir(2);
 
     let waker = {
-        let mut a = ASYNC.lock();
+        let mut a = ASYNC.lock_irq();
         if a.active {
             a.done = true;
             a.waker.take()
@@ -539,25 +539,21 @@ impl Future for ReadFuture {
                 return Poll::Ready(None); // диск не инициализирован
             };
             // Зарегистрировать ожидание ДО notify, чтобы не разминуться с прерыванием.
-            // Замок ASYNC берём с выключенными прерываниями: иначе IRQ посреди удержания
-            // замка → on_irq на том же замке → взаимоблокировка.
-            let sie = arch::irq_save_disable();
+            // Веха 89: `lock_irq` — замок берёт и `on_irq` (см. [[sync]]).
             {
-                let mut a = ASYNC.lock();
+                let mut a = ASYNC.lock_irq();
                 a.active = true;
                 a.done = false;
                 a.waker = Some(cx.waker().clone());
             }
-            arch::irq_restore(sie);
             blk.submit_read(hp, bp, sp);
             this.submitted = true;
             return Poll::Pending;
         }
 
         // Уже отправлено — проверить завершение (флаг выставляет on_irq).
-        let sie = arch::irq_save_disable();
         let done = {
-            let mut a = ASYNC.lock();
+            let mut a = ASYNC.lock_irq();
             if a.done {
                 a.active = false;
                 true
@@ -566,7 +562,6 @@ impl Future for ReadFuture {
                 false
             }
         };
-        arch::irq_restore(sie);
 
         if done {
             if let Some(blk) = BLK.lock().as_mut() {

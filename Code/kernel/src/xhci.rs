@@ -241,7 +241,7 @@ pub fn init() -> bool {
             );
         }
 
-        *XHCI.lock() = Some(x);
+        *XHCI.lock_irq() = Some(x);
     }
     true
 }
@@ -556,7 +556,7 @@ fn hid_to_ascii(k: u8, shift: bool) -> Option<u8> {
 
 /// Опрос USB-клавиатуры — зовётся из `console_drain` (тик/IRQ) наравне с PS/2 и COM1.
 pub fn poll() {
-    if let Some(x) = XHCI.lock().as_mut() {
+    if let Some(x) = XHCI.lock_irq().as_mut() {
         if x.int_ring != 0 {
             unsafe { x.poll_hid() }
         }
@@ -566,5 +566,5 @@ pub fn poll() {
 /// Поднята ли USB-клавиатура. Нужно `irq_mask_stdin`: у USB нет прерывания (опрос), поэтому в
 /// режиме сна-до-ввода таймер держим ВКЛ — иначе на её нажатия ничего не проснётся.
 pub fn has_keyboard() -> bool {
-    XHCI.lock().as_ref().map_or(false, |x| x.int_ring != 0)
+    XHCI.lock_irq().as_ref().map_or(false, |x| x.int_ring != 0)
 }

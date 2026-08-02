@@ -67,12 +67,7 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 /// Выключать прерывания обязательно: иначе таймер вытеснит нас прямо посреди работы
 /// со списком задач, а его обработчик снова полезет в SCHED → взаимоблокировка.
 fn with_sched<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
-    let sie = crate::arch::irq_save_disable();
-    let mut guard = SCHED.lock();
-    let r = f(&mut guard);
-    drop(guard);
-    crate::arch::irq_restore(sie);
-    r
+    f(&mut SCHED.lock_irq())
 }
 
 /// Инициализировать планировщик: сделать текущее исполнение (kmain) задачей «main».
@@ -117,6 +112,9 @@ pub fn yield_now() {
     let sie = crate::arch::irq_save_disable();
 
     let switch = {
+        // Веха 89: здесь именно `lock()`, а не `lock_irq()` — прерывания уже выключены строкой
+        // выше и обязаны оставаться выключенными ПОСЛЕ снятия замка, до самого переключения
+        // контекста. `lock_irq` вернул бы их слишком рано (на `drop` стража).
         let mut sched = SCHED.lock();
         let old = sched.current;
         match sched.pick_next(old) {

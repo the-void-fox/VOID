@@ -159,7 +159,7 @@ impl FreeListAllocator {
 unsafe impl GlobalAlloc for SpinLock<FreeListAllocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let (size, align) = FreeListAllocator::size_align(layout);
-        let mut heap = self.lock();
+        let mut heap = self.lock_irq();
         match heap.find(size, align) {
             Some((region, start)) => {
                 let end = start + size;
@@ -175,7 +175,7 @@ unsafe impl GlobalAlloc for SpinLock<FreeListAllocator> {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let (size, _) = FreeListAllocator::size_align(layout);
-        self.lock().push_free(ptr as usize, size);
+        self.lock_irq().push_free(ptr as usize, size);
     }
 }
 

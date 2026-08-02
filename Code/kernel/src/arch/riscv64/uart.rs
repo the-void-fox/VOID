@@ -82,7 +82,7 @@ pub fn on_irq() {
 /// (SEIE=0, см. [[process-preemption|proc::run]]), и без регулярного вычерпывания FIFO UART
 /// (16 байт) и буфер mux'а QEMU переполняются — набранное на консоли терялось бы.
 pub fn drain_rx() {
-    let mut ring = RING.lock();
+    let mut ring = RING.lock_irq();
     // SAFETY: MMIO-регистры UART0; LSR.DR гарантирует, что RBR держит принятый байт.
     unsafe {
         while core::ptr::read_volatile(UART0_LSR) & LSR_DATA_READY != 0 {
@@ -99,13 +99,13 @@ pub fn drain_rx() {
 
 /// Есть ли непрочитанный ввод.
 pub fn has_input() -> bool {
-    let ring = RING.lock();
+    let ring = RING.lock_irq();
     ring.head != ring.tail
 }
 
 /// Забрать один принятый байт (None — буфер пуст).
 pub fn getc() -> Option<u8> {
-    let mut ring = RING.lock();
+    let mut ring = RING.lock_irq();
     if ring.head == ring.tail {
         return None;
     }
