@@ -21,6 +21,10 @@
 /// Веха 90 — мост smoltcp↔VOID (устройство поверх сырых кадров ядра).
 pub mod net_phy;
 
+/// Веха 93 — протокол `net-srv` (номера операций, коды статуса) и клиентская обёртка:
+/// `tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`. Общий для сервера и его клиентов.
+pub mod net_cli;
+
 pub mod lx_emul;
 
 // ─── номера syscall'ов (ABI v1, см. libs/void-abi и kernel/src/proc.rs) ───────

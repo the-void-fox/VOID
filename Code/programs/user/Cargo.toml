@@ -26,8 +26,8 @@ vvsh-core = { path = "../../libs/vvsh-core" }
 # Веха 90 (Фаза 7, ADR 0008) — сетевой стек. Vendored и версия ПРИБИТА: TCP с нуля не пишем
 # (см. ADR), а сборка обязана оставаться оффлайн — источник заменён на ./vendor
 # (`.cargo/config.toml` рядом). Фичи строго те, что нужны: Ethernet + IPv4 + UDP/ICMP, а с
-# Вехи 92 — DHCPv4 и DNS (адрес и резолвер от роутера); без std, без alloc (буферы
-# статические), без log/defmt. TCP добавится Вехой 93.
+# Вехи 92 — DHCPv4 и DNS (адрес и резолвер от роутера), Вехи 93 — TCP; без std, без alloc
+# (буферы статические), без log/defmt.
 smoltcp = { version = "0.13.1", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
@@ -37,6 +37,7 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
     "socket-dhcpv4",
     "proto-dns",
     "socket-dns",
+    "socket-tcp",
 ] }
 
 [profile.release]

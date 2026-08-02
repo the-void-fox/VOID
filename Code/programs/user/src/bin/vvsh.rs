@@ -627,6 +627,12 @@ fn shell_env() -> Env {
         ("mv", sh_mv),
         ("ping", sh_ping),
         ("resolve", sh_resolve), // Веха 92 — DNS
+        // Веха 93 — TCP. Четыре примитива, из которых складывается обмен: соединиться, послать,
+        // принять, закрыть. Клиент любого протокола пишется поверх них прямо в шелле.
+        ("tcp-connect", sh_tcp_connect),
+        ("tcp-send", sh_tcp_send),
+        ("tcp-recv", sh_tcp_recv),
+        ("tcp-close", sh_tcp_close),
         ("thaw", sh_thaw),
         ("switch", sh_switch),
         ("sysdef", sh_sysdef),
@@ -830,6 +836,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"thaw NAME", "разморозить процесс из образа");
     help_row(b"ping IP", "ICMP-пинг адреса A.B.C.D");
     help_row(b"resolve NAME", "DNS: имя → адрес (возвращает строку)");
+    help_row(b"tcp-connect IP P", "открыть TCP → хэндл (+ tcp-send/recv/close)");
     help_row(b"roots", "сырые корни store (bin/*, system/*, …)");
     help_row(b"init-config", "посеять /etc/system/*.vv");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
@@ -1074,6 +1081,88 @@ fn sh_resolve(args: &[Value]) -> Result<Value, EvalError> {
         1 => Err(EvalError::new("resolve: имя не разрешилось")),
         2 => Err(EvalError::new("resolve: DNS не ответил")),
         _ => Err(EvalError::new("resolve: сети нет")),
+    }
+}
+
+/// Эндпоинт сетевого сервера (start-cap 2) — он же ПРАВО пользоваться сетью.
+fn net_ep(who: &str) -> Result<usize, EvalError> {
+    let ep = sys::start_cap(2);
+    if ep == sys::NO_CAP {
+        return Err(EvalError::new(alloc::format!("{}: сети нет (net.vv = #f?)", who)));
+    }
+    Ok(ep)
+}
+
+/// Расшифровать код статуса сетевого сервера в человеческую ошибку.
+fn net_err(who: &str, st: u8) -> EvalError {
+    use sys::net_cli as p;
+    EvalError::new(alloc::format!(
+        "{}: {}",
+        who,
+        match st {
+            p::ST_ERR => "не удалось (адрес отверг соединение?)",
+            p::ST_TIMEOUT => "не дождались ответа",
+            p::ST_EOF => "соединение закрыто другой стороной",
+            _ => "негодный запрос (хэндл?)",
+        }
+    ))
+}
+
+/// `(tcp-connect "A.B.C.D" порт)` — открыть TCP-соединение, ВЕРНУТЬ хэндл (число).
+/// Вместе с `resolve` складывается сразу: `(tcp-connect (resolve "example.com") 80)`.
+fn sh_tcp_connect(args: &[Value]) -> Result<Value, EvalError> {
+    let (host, port) = match (args.first(), args.get(1)) {
+        (Some(Value::Str(h)), Some(Value::Int(p))) if *p > 0 && *p < 65536 => (h.clone(), *p as u16),
+        _ => return Err(EvalError::new("tcp-connect: (tcp-connect \"A.B.C.D\" порт)")),
+    };
+    let ip = match parse_ipv4(host.as_bytes()) {
+        Some(x) => x,
+        None => return Err(EvalError::new("tcp-connect: нужен адрес A.B.C.D (имя — через resolve)")),
+    };
+    match sys::net_cli::tcp_connect(net_ep("tcp-connect")?, ip, port) {
+        Ok(h) => Ok(Value::Int(h as i64)),
+        Err(st) => Err(net_err("tcp-connect", st)),
+    }
+}
+
+/// `(tcp-send хэндл "данные")` — отправить; возвращает, сколько байт ПРИНЯЛ сервер (может быть
+/// меньше — как `write(2)`; остаток шлёт вызывающий).
+fn sh_tcp_send(args: &[Value]) -> Result<Value, EvalError> {
+    let (h, data) = match (args.first(), args.get(1)) {
+        (Some(Value::Int(h)), Some(Value::Str(d))) => (*h, d.clone()),
+        _ => return Err(EvalError::new("tcp-send: (tcp-send хэндл \"данные\")")),
+    };
+    match sys::net_cli::tcp_send(net_ep("tcp-send")?, h as u8, data.as_bytes()) {
+        Ok(n) => Ok(Value::Int(n as i64)),
+        Err(st) => Err(net_err("tcp-send", st)),
+    }
+}
+
+/// `(tcp-recv хэндл)` — принять очередной кусок, ВЕРНУТЬ строкой. Пустая строка — другая
+/// сторона закрыла соединение (это не ошибка, а конец потока).
+fn sh_tcp_recv(args: &[Value]) -> Result<Value, EvalError> {
+    let h = match args.first() {
+        Some(Value::Int(h)) => *h,
+        _ => return Err(EvalError::new("tcp-recv: (tcp-recv хэндл)")),
+    };
+    let mut buf = [0u8; sys::net_cli::MAX_CHUNK];
+    match sys::net_cli::tcp_recv(net_ep("tcp-recv")?, h as u8, &mut buf) {
+        Ok(n) => Ok(Value::str(&alloc::string::String::from_utf8_lossy(&buf[..n]))),
+        Err(sys::net_cli::ST_EOF) => Ok(Value::str("")),
+        Err(st) => Err(net_err("tcp-recv", st)),
+    }
+}
+
+/// `(tcp-close хэндл)` — закрыть аккуратно (FIN, не сброс).
+fn sh_tcp_close(args: &[Value]) -> Result<Value, EvalError> {
+    let h = match args.first() {
+        Some(Value::Int(h)) => *h,
+        _ => return Err(EvalError::new("tcp-close: (tcp-close хэндл)")),
+    };
+    if sys::net_cli::tcp_close(net_ep("tcp-close")?, h as u8) {
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("tcp-close: негодный хэндл"))
     }
 }
 

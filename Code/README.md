@@ -104,6 +104,11 @@ tools/.../void-store-import void-disk.img put программа bin/<arch>/им
 ```
 vvsh/> ping 10.0.2.2            # RTT в мкс; SLIRP отвечает, не выходя из QEMU
 vvsh/> resolve example.com      # DNS → A-запись (возвращает строку)
+# TCP (Веха 93): соединиться, послать, принять, закрыть
+vvsh/> (define h (tcp-connect (resolve "example.com") 80))
+vvsh/> (tcp-send h "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+vvsh/> (tcp-recv h)             # → HTTP/1.1 200 OK и страница; пустая строка = EOF
+vvsh/> (tcp-close h)
 ```
 Статика — запасной путь, настраивается в `/etc/system/networking.vv` токенами `arg:`
 (`arg:dhcp=off arg:ip=A.B.C.D/NN arg:gw=… arg:dns=…`), затем `rebuild` и ребут.

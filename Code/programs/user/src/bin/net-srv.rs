@@ -30,16 +30,18 @@
 use void_user as sys;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::{dhcpv4, dns, icmp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::storage::PacketMetadata;
-use smoltcp::time::Duration;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr,
 };
 
-const OP_PING: usize = 0;
-const OP_RESOLVE: usize = 1;
+use sys::net_cli::{
+    MAX_CHUNK, OP_PING, OP_RESOLVE, OP_TCP_CLOSE, OP_TCP_CONNECT, OP_TCP_RECV, OP_TCP_SEND, ST_BAD,
+    ST_EOF, ST_ERR, ST_OK, ST_TIMEOUT,
+};
 
 /// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы.
 const PING_IDENT: u16 = 0x1D0;
@@ -60,6 +62,56 @@ const DNS_MS: u64 = 5000;
 /// бюджет БАННЕРА, а не DHCP: сокет остаётся в наборе и продолжает пытаться в рабочем цикле —
 /// поздняя аренда просто применится позже (и заменит статику).
 const DHCP_BOOT_MS: u64 = 6000;
+
+// ── Веха 93: TCP ────────────────────────────────────────────────────────────────────────────
+/// Сколько соединений держим одновременно. Каждое стоит своих буферов (см. ниже), а буферы у нас
+/// статические — поэтому число фиксировано и невелико.
+const MAX_CONN: usize = 4;
+/// Приём должен вмещать заметно больше одного ответа IPC: TCP наливает в буфер по мере прихода
+/// сегментов, а клиент вычерпывает кусками по [`MAX_CHUNK`]. Маленький rx = маленькое окно =
+/// втрое больше round trip'ов на ту же страницу.
+const TCP_RX: usize = 8192;
+const TCP_TX: usize = 2048;
+/// Бюджет рукопожатия. Отвергнутое соединение видно сразу (RST), а вот молчащий адрес — только
+/// по этому сроку.
+const CONNECT_MS: u64 = 10_000;
+/// Бюджет ожидания данных в `recv`. Истёк — отвечаем `ST_TIMEOUT`, соединение живо, клиент может
+/// звать снова. Держать клиента вечно нельзя: он ждёт в `SYS_CALL`, а не в своём цикле.
+const RECV_MS: u64 = 10_000;
+/// Первый эфемерный порт. Растёт по кругу — свежий порт на каждое соединение обязателен, иначе
+/// TIME_WAIT прошлого не даст открыть новое к тому же адресу.
+const EPHEMERAL_BASE: u16 = 49152;
+
+/// Отложенный запрос: сервер УЖЕ принял его, но ответить пока нечем. Держит одноразовый
+/// reply-cap — клиент всё это время стоит в `SYS_CALL`, а цикл сервера продолжает крутиться.
+/// Это и есть то, ради чего Веха 93 переделала сервер: до неё ожидание означало блокирующий
+/// цикл внутри обработчика, то есть «один клиент за раз».
+#[derive(Clone, Copy)]
+struct Pending {
+    op: usize,
+    reply_cap: usize,
+    deadline: Instant,
+    /// Для `OP_TCP_RECV` — сколько байт запросил клиент (больше отдавать нельзя: лишнее
+    /// обрезал бы IPC, и оно пропало бы из потока молча).
+    want: usize,
+}
+
+/// Состояние слота соединения. Сам сокет живёт в `SocketSet`, здесь — то, чего smoltcp не знает.
+#[derive(Clone, Copy)]
+struct Conn {
+    used: bool,
+    /// Клиент попросил закрыть. Слот освободится, когда закрытие доиграет до `Closed` — но
+    /// только по ЭТОМУ флагу: если соединение оборвала другая сторона, слот держим, пока клиент
+    /// не закроет его сам. Иначе `recv` после обрыва вернул бы «негодный хэндл» вместо EOF.
+    closing: bool,
+    /// Байты, принятые от клиента, но ещё не влезшие в передающий буфер сокета.
+    hold_len: usize,
+    pending: Option<Pending>,
+}
+
+impl Conn {
+    const EMPTY: Conn = Conn { used: false, closing: false, hold_len: 0, pending: None };
+}
 
 /// Настройки сервера: значения по умолчанию + то, что переопределил конфиг системы.
 struct Cfg {
@@ -191,12 +243,30 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     // слота стоят копейки и оставляют место повтору, пока прошлый освобождается.
     let mut queries: [Option<dns::DnsQuery>; 2] = [None, None];
     let dns_socket = dns::Socket::new(&[], &mut queries[..]);
+    // Веха 93 — буферы пула TCP. Объявлены ДО `SocketSet`: сокеты одалживают их на всё время
+    // жизни набора, значит буферы обязаны его пережить.
+    let mut tcp_rx = [[0u8; TCP_RX]; MAX_CONN];
+    let mut tcp_tx = [[0u8; TCP_TX]; MAX_CONN];
 
-    let mut storage = [SocketStorage::EMPTY; 4];
+    let mut storage = [SocketStorage::EMPTY; 3 + MAX_CONN];
     let mut sockets = SocketSet::new(&mut storage[..]);
     let icmp_handle = sockets.add(icmp_socket);
     let dns_handle = sockets.add(dns_socket);
     let dhcp_handle = cfg.dhcp.then(|| sockets.add(dhcp_socket));
+    let mut bufs = tcp_rx.iter_mut().zip(tcp_tx.iter_mut());
+    let tcp_handles: [SocketHandle; MAX_CONN] = core::array::from_fn(|_| {
+        let (rx, tx) = bufs.next().expect("буферов ровно MAX_CONN");
+        sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut rx[..]),
+            tcp::SocketBuffer::new(&mut tx[..]),
+        ))
+    });
+    let mut conns = [Conn::EMPTY; MAX_CONN];
+    // Хвост отправки: то, что клиент отдал, а передающий буфер сокета пока не принял (окно
+    // закрыто, другая сторона не подтверждает). Без него пришлось бы отвечать «отправлено 0» и
+    // клиент крутил бы вызовы вхолостую.
+    let mut hold = [[0u8; MAX_CHUNK]; MAX_CONN];
+    let mut next_port: u16 = EPHEMERAL_BASE;
 
     {
         let s = sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -246,7 +316,7 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     // тиками неблокирующим приёмом. До этого сервер стоял в блокирующем `recv`, и стек тикал
     // только внутри `ping` — для ICMP сходило, для TCP (Веха 93) не сойдёт: ретрансмиссии и
     // таймеры требуют, чтобы `poll` звался всегда, а не когда кто-то попросил.
-    let mut req = [0u8; 256];
+    let mut req = [0u8; MAX_CHUNK + 8];
     loop {
         let busy = iface.poll(sys::net_phy::now(), &mut device, &mut sockets);
         // Веха 92: аренда не вечна. Роутер может продлить её с ДРУГИМ адресом или отобрать —
@@ -256,6 +326,9 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
                 apply_dhcp(&mut iface, &mut sockets, dns_handle, ev, &mut leased);
             }
         }
+        // Веха 93: раздать ответы тем, чьи сокеты дошли до нужного состояния, и прибрать
+        // доигравшие закрытия. Это делается ДО сна — иначе клиент ждал бы лишний круг.
+        complete_pending(&mut sockets, &tcp_handles, &mut conns, &mut hold);
         // Веха 91 — СОН ВМЕСТО ОПРОСА. Спим в самом `SYS_RECV` (режим с дедлайном): пока никто
         // не зовёт и стеку нечего делать, процесс не занимает процессор вовсе — он заблокирован
         // ядром, а не крутит цикл. Момент пробуждения называет САМ стек: `poll_at` — это время
@@ -273,6 +346,9 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
                 None => IDLE_CAP_MS,
             }
         };
+        // Веха 93: проспать чужой срок нельзя — иначе клиент, которому вышло время, узна́ет об
+        // этом с опозданием на целый круг сна.
+        let sleep_ms = sleep_ms.min(pending_delay_ms(&conns, sys::net_phy::now()));
         let Some(m) = (if sleep_ms == 0 {
             sys::try_recv(&mut req)
         } else {
@@ -280,36 +356,321 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         }) else {
             continue;
         };
-        let mut rep = [0u8; 5];
+        let body = &req[..m.len.min(req.len())];
         match m.op {
-            OP_PING if m.len >= 4 => {
-                let target = Ipv4Address::new(req[0], req[1], req[2], req[3]);
+            OP_PING if body.len() >= 4 => {
+                let target = Ipv4Address::new(body[0], body[1], body[2], body[3]);
+                let mut rep = [0u8; 5];
                 match ping(&mut iface, &mut device, &mut sockets, icmp_handle, target) {
-                    Ok(rtt) => {
-                        rep[0] = 0;
-                        rep[1..5].copy_from_slice(&(rtt as u32).to_le_bytes());
-                    }
+                    Ok(rtt) => rep[1..5].copy_from_slice(&(rtt as u32).to_le_bytes()),
                     Err(code) => rep[0] = code,
                 }
+                sys::reply(m.reply_cap, &rep);
             }
-            OP_RESOLVE if m.len > 0 && m.len <= req.len() => {
-                match core::str::from_utf8(&req[..m.len]) {
+            OP_RESOLVE if !body.is_empty() => {
+                let mut rep = [0u8; 5];
+                match core::str::from_utf8(body) {
                     Ok(name) => {
                         match resolve(&mut iface, &mut device, &mut sockets, dns_handle, name) {
-                            Ok(addr) => {
-                                rep[0] = 0;
-                                rep[1..5].copy_from_slice(&addr.octets());
-                            }
+                            Ok(addr) => rep[1..5].copy_from_slice(&addr.octets()),
                             Err(code) => rep[0] = code,
                         }
                     }
-                    Err(_) => rep[0] = 3,
+                    Err(_) => rep[0] = ST_BAD,
                 }
+                sys::reply(m.reply_cap, &rep);
             }
-            _ => rep[0] = 3,
+            OP_TCP_CONNECT if body.len() >= 6 => op_connect(
+                &mut iface, &mut sockets, &tcp_handles, &mut conns, &mut next_port, body,
+                m.reply_cap,
+            ),
+            OP_TCP_SEND if body.len() >= 2 => {
+                op_send(&mut sockets, &tcp_handles, &mut conns, &mut hold, body, m.reply_cap)
+            }
+            OP_TCP_RECV if body.len() >= 3 => {
+                op_recv(&mut sockets, &tcp_handles, &mut conns, body, m.reply_cap)
+            }
+            OP_TCP_CLOSE if !body.is_empty() => {
+                op_close(&mut sockets, &tcp_handles, &mut conns, body, m.reply_cap)
+            }
+            _ => {
+                sys::reply(m.reply_cap, &[ST_BAD]);
+            }
         }
-        sys::reply(m.reply_cap, &rep);
     }
+}
+
+// ── Веха 93 — TCP: обработчики запросов и раздача отложенных ответов ────────────────────────
+//
+// Общее правило: обработчик либо отвечает СРАЗУ, либо кладёт запрос в `conns[i].pending` и
+// молчит. Молчание безопасно — reply-cap одноразовый и живёт в c-space сервера, пока `SYS_REPLY`
+// его не исполнит; клиент всё это время стоит в `SYS_CALL`. Именно это и делает сервер
+// многоклиентским без единой нити: ждёт КЛИЕНТ, а не цикл сервера.
+
+/// Ответить одним байтом статуса.
+fn reply_status(reply_cap: usize, st: u8) {
+    sys::reply(reply_cap, &[st]);
+}
+
+/// Проверить хэндл клиента: он же индекс слота. `None` — врёт или слот свободен.
+fn slot(conns: &[Conn; MAX_CONN], h: u8) -> Option<usize> {
+    let i = h as usize;
+    (i < MAX_CONN && conns[i].used).then_some(i)
+}
+
+/// `OP_TCP_CONNECT`: `[ip(4) | port(2 LE)]` → отложенный `[status | хэндл]`.
+fn op_connect(
+    iface: &mut Interface,
+    sockets: &mut SocketSet,
+    handles: &[SocketHandle; MAX_CONN],
+    conns: &mut [Conn; MAX_CONN],
+    next_port: &mut u16,
+    req: &[u8],
+    reply_cap: usize,
+) {
+    let ip = Ipv4Address::new(req[0], req[1], req[2], req[3]);
+    let port = u16::from_le_bytes([req[4], req[5]]);
+    let Some(i) = conns.iter().position(|c| !c.used) else {
+        return reply_status(reply_cap, ST_ERR); // все слоты заняты
+    };
+    // Свежий локальный порт на каждое соединение обязателен: TIME_WAIT прошлого не дал бы
+    // открыть новое к тому же адресу и порту.
+    let local = *next_port;
+    *next_port = if local >= 65000 { EPHEMERAL_BASE } else { local + 1 };
+
+    let cx = iface.context();
+    let s = sockets.get_mut::<tcp::Socket>(handles[i]);
+    if s.connect(cx, (IpAddress::Ipv4(ip), port), local).is_err() {
+        return reply_status(reply_cap, ST_ERR);
+    }
+    conns[i] = Conn {
+        used: true,
+        closing: false,
+        hold_len: 0,
+        pending: Some(Pending {
+            op: OP_TCP_CONNECT,
+            reply_cap,
+            deadline: sys::net_phy::now() + Duration::from_millis(CONNECT_MS),
+            want: 0,
+        }),
+    };
+}
+
+/// `OP_TCP_SEND`: `[хэндл | данные…]` → `[status | принято(2 LE)]`, возможно отложенный.
+fn op_send(
+    sockets: &mut SocketSet,
+    handles: &[SocketHandle; MAX_CONN],
+    conns: &mut [Conn; MAX_CONN],
+    hold: &mut [[u8; MAX_CHUNK]; MAX_CONN],
+    req: &[u8],
+    reply_cap: usize,
+) {
+    let Some(i) = slot(conns, req[0]) else {
+        return reply_status(reply_cap, ST_BAD);
+    };
+    if conns[i].pending.is_some() {
+        return reply_status(reply_cap, ST_BAD); // на слоте уже висит запрос
+    }
+    let data = &req[1..];
+    let n = data.len().min(MAX_CHUNK);
+    hold[i][..n].copy_from_slice(&data[..n]);
+    conns[i].hold_len = n;
+
+    let s = sockets.get_mut::<tcp::Socket>(handles[i]);
+    if !s.may_send() {
+        conns[i].hold_len = 0;
+        return reply_status(reply_cap, ST_EOF); // другая сторона уже не примет
+    }
+    match push_hold(s, &hold[i], &mut conns[i].hold_len) {
+        0 => {
+            // Окно закрыто — ждём, пока другая сторона подтвердит принятое. Клиенту вернуть
+            // «отправлено 0» было бы приглашением крутить вызовы вхолостую.
+            conns[i].pending = Some(Pending {
+                op: OP_TCP_SEND,
+                reply_cap,
+                deadline: sys::net_phy::now() + Duration::from_millis(RECV_MS),
+                want: n,
+            });
+        }
+        sent => {
+            sys::reply(reply_cap, &[ST_OK, sent as u8, (sent >> 8) as u8]);
+        }
+    }
+}
+
+/// Отдать сокету столько хвоста, сколько влезет; вернуть, сколько ушло, и подвинуть остаток.
+fn push_hold(s: &mut tcp::Socket, buf: &[u8; MAX_CHUNK], hold_len: &mut usize) -> usize {
+    if *hold_len == 0 {
+        return 0;
+    }
+    match s.send_slice(&buf[..*hold_len]) {
+        Ok(sent) => {
+            *hold_len -= sent;
+            sent
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `OP_TCP_RECV`: `[хэндл | сколько(2 LE)]` → `[status | данные…]`, возможно отложенный.
+fn op_recv(
+    sockets: &mut SocketSet,
+    handles: &[SocketHandle; MAX_CONN],
+    conns: &mut [Conn; MAX_CONN],
+    req: &[u8],
+    reply_cap: usize,
+) {
+    let Some(i) = slot(conns, req[0]) else {
+        return reply_status(reply_cap, ST_BAD);
+    };
+    if conns[i].pending.is_some() {
+        return reply_status(reply_cap, ST_BAD);
+    }
+    let want = (u16::from_le_bytes([req[1], req[2]]) as usize).min(MAX_CHUNK);
+    if want == 0 {
+        return reply_status(reply_cap, ST_BAD);
+    }
+    let s = sockets.get_mut::<tcp::Socket>(handles[i]);
+    match take_recv(s, want, reply_cap) {
+        Some(()) => {}
+        None => {
+            conns[i].pending = Some(Pending {
+                op: OP_TCP_RECV,
+                reply_cap,
+                deadline: sys::net_phy::now() + Duration::from_millis(RECV_MS),
+                want,
+            });
+        }
+    }
+}
+
+/// Попробовать ответить на `recv` прямо сейчас. `None` — данных пока нет, но соединение живо.
+///
+/// Порядок проверок важен: сперва ДАННЫЕ, потом закрытие. После FIN в буфере может лежать
+/// непрочитанный хвост, и отдать EOF раньше него значило бы потерять байты.
+fn take_recv(s: &mut tcp::Socket, want: usize, reply_cap: usize) -> Option<()> {
+    if s.can_recv() {
+        let mut rep = [0u8; MAX_CHUNK + 1];
+        rep[0] = ST_OK;
+        let n = s.recv_slice(&mut rep[1..1 + want]).unwrap_or(0);
+        sys::reply(reply_cap, &rep[..1 + n]);
+        return Some(());
+    }
+    if !s.may_recv() {
+        reply_status(reply_cap, ST_EOF);
+        return Some(());
+    }
+    None
+}
+
+/// `OP_TCP_CLOSE`: `[хэндл]` → `[status]`. Закрытие аккуратное (FIN); слот освободит
+/// [`complete_pending`], когда состояние дойдёт до `Closed`.
+fn op_close(
+    sockets: &mut SocketSet,
+    handles: &[SocketHandle; MAX_CONN],
+    conns: &mut [Conn; MAX_CONN],
+    req: &[u8],
+    reply_cap: usize,
+) {
+    let Some(i) = slot(conns, req[0]) else {
+        return reply_status(reply_cap, ST_BAD);
+    };
+    // Если на слоте висел чужой отложенный запрос — закрыть его отказом, иначе тот клиент
+    // остался бы в `SYS_CALL` навсегда.
+    if let Some(p) = conns[i].pending.take() {
+        reply_status(p.reply_cap, ST_EOF);
+    }
+    conns[i].closing = true;
+    conns[i].hold_len = 0;
+    sockets.get_mut::<tcp::Socket>(handles[i]).close();
+    reply_status(reply_cap, ST_OK);
+}
+
+/// Раздать ответы отложенным запросам, чьи сокеты дошли до нужного состояния, и прибрать
+/// слоты доигравших закрытий. Зовётся каждый круг реактора.
+fn complete_pending(
+    sockets: &mut SocketSet,
+    handles: &[SocketHandle; MAX_CONN],
+    conns: &mut [Conn; MAX_CONN],
+    hold: &mut [[u8; MAX_CHUNK]; MAX_CONN],
+) {
+    let now = sys::net_phy::now();
+    for i in 0..MAX_CONN {
+        if !conns[i].used {
+            continue;
+        }
+        let s = sockets.get_mut::<tcp::Socket>(handles[i]);
+        let state = s.state();
+
+        if let Some(p) = conns[i].pending {
+            let done = match p.op {
+                OP_TCP_CONNECT => match state {
+                    tcp::State::Established => {
+                        sys::reply(p.reply_cap, &[ST_OK, i as u8]);
+                        true
+                    }
+                    // `connect` сразу переводит сокет в SynSent, поэтому Closed здесь — это
+                    // отказ (RST) или сброс по нашему же таймауту, а не «ещё не начали».
+                    tcp::State::Closed => {
+                        conns[i] = Conn::EMPTY;
+                        reply_status(p.reply_cap, ST_ERR);
+                        true
+                    }
+                    _ if now > p.deadline => {
+                        s.abort();
+                        conns[i] = Conn::EMPTY;
+                        reply_status(p.reply_cap, ST_TIMEOUT);
+                        true
+                    }
+                    _ => false,
+                },
+                OP_TCP_SEND => match push_hold(s, &hold[i], &mut conns[i].hold_len) {
+                    0 if !s.may_send() => {
+                        reply_status(p.reply_cap, ST_EOF);
+                        true
+                    }
+                    0 if now > p.deadline => {
+                        reply_status(p.reply_cap, ST_TIMEOUT);
+                        true
+                    }
+                    0 => false,
+                    sent => {
+                        sys::reply(p.reply_cap, &[ST_OK, sent as u8, (sent >> 8) as u8]);
+                        true
+                    }
+                },
+                OP_TCP_RECV => match take_recv(s, p.want, p.reply_cap) {
+                    Some(()) => true,
+                    None if now > p.deadline => {
+                        reply_status(p.reply_cap, ST_TIMEOUT);
+                        true
+                    }
+                    None => false,
+                },
+                _ => true, // такого быть не может; не держать клиента
+            };
+            if done {
+                conns[i].pending = None;
+            }
+        }
+
+        // Слот отпускаем ТОЛЬКО после закрытия по просьбе клиента (см. `Conn::closing`).
+        if conns[i].closing && conns[i].pending.is_none() && state == tcp::State::Closed {
+            conns[i] = Conn::EMPTY;
+        }
+    }
+}
+
+/// Сколько миллисекунд можно спать, не проспав ближайший отложенный срок.
+fn pending_delay_ms(conns: &[Conn; MAX_CONN], now: Instant) -> u64 {
+    let mut best = u64::MAX;
+    for c in conns {
+        if let Some(p) = c.pending {
+            let left = if p.deadline > now { (p.deadline - now).millis() } else { 0 };
+            best = best.min(left);
+        }
+    }
+    best
 }
 
 /// Аренда DHCP в виде, который переживает снятие заимствования с сокета. `Event` держит
