@@ -59,6 +59,8 @@ pub fn handle_external() {
         crate::virtio_blk::on_irq();
     } else if irq == super::uart::IRQ {
         super::uart::on_irq(); // Веха 20.1: принятые байты → кольцевой буфер
+    } else if irq == crate::virtio_net::irq() {
+        crate::virtio_net::on_irq(); // Веха 91: приехал кадр — разбудить сетевой сервер
     }
     complete(irq);
 }

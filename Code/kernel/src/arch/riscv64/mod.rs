@@ -64,6 +64,14 @@ pub fn irq_mask_stdin(saved: usize) {
     csr::write_sie((saved & !(1 << 5)) | (1 << 9));
 }
 
+/// Веха 91 — политика сна СО СРОКОМ: нужны И устройства (кадр разбудит сетевой сервер), И таймер
+/// (иначе срок некому заметить). Прежние две политики были взаимоисключающими, и это стоило
+/// целого захода: с включённым таймером прерывание карты копилось в PLIC как pending и не
+/// доставлялось никогда — pending-бит стоял, а claim его не видел, потому что SEIE был выключен.
+pub fn irq_mask_idle(saved: usize) {
+    csr::write_sie(saved | (1 << 5) | (1 << 9));
+}
+
 /// Инвариант переключения стеков: в ядре `sscratch` = 0 (trap_entry.s по нему отличает
 /// trap из ядра от trap'а из процесса). Вызвать после возврата из сессии процессов.
 pub fn mark_in_kernel() {
@@ -86,6 +94,15 @@ pub fn init_device_interrupts() {
     }
     uart::init_rx();
     plic::enable(uart::IRQ);
+    // Веха 91 - прерывание приёма сетевой карты: сервер спит до кадра, а не опрашивает.
+    let net = crate::virtio_net::irq();
+    if net != 0 {
+        plic::init(net); // порог контекста мог быть не выставлен, если диска нет
+        plic::enable(net);
+        csr::enable_external_interrupt();
+        // Снять линию, поднятую ещё во время работы опросом, — иначе PLIC не увидит фронта.
+        crate::virtio_net::ack_pending();
+    }
 }
 
 // ─── устройства ─────────────────────────────────────────────────────────────
@@ -151,6 +168,7 @@ pub fn probe_virtio_net() -> Option<crate::arch::NetDevice> {
         if r(0x000) == 0x7472_6976 && r(0x004) == 2 && r(0x008) == 1 {
             return Some(crate::arch::NetDevice {
                 transport: crate::arch::BlkTransport::Mmio { base },
+                irq: slot as u32 + 1, // у QEMU virt источник PLIC = номер слота + 1
             });
         }
     }

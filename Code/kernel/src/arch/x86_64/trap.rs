@@ -24,7 +24,7 @@ core::arch::global_asm!(include_str!("trap_entry.s"));
 extern "C" {
     /// Таблица адресов стабов: [0..=35] — вектора 0–35 (исключения + таймер +
     /// консоль + диск + userspace-драйвер), [36] — spurious (0xFF), [37] — syscall (0x80).
-    static TRAP_STUBS: [usize; 38];
+    static TRAP_STUBS: [usize; 39];
 }
 
 /// Вектор LAPIC-таймера (первый свободный после 32 исключений).
@@ -40,6 +40,10 @@ pub const VEC_BLK: u8 = 34;
 /// Веха 52 — вектор прерываний userspace-драйверов: IOAPIC маршрутизирует IRQ их устройств сюда,
 /// обработчик будит спящего в `SYS_IRQ_WAIT` (через флаг — без замка таблицы процессов).
 pub const VEC_USERDRV: u8 = 35;
+
+/// Веха 91 — вектор прерывания ПРИЁМА сетевой карты (MSI-X virtio-net): сетевой сервер спит,
+/// пока карта молчит, и просыпается ровно от кадра.
+pub const VEC_NET: u8 = 36;
 
 /// Снимок состояния процессора на момент trap'а. Раскладка = порядок push'ей в
 /// trap_entry.s (адреса растут к концу структуры; регистры — в порядке r15..rax).
@@ -262,11 +266,13 @@ struct IdtPtr {
 pub fn init() {
     super::gdt::init();
     unsafe {
-        for v in 0..=35 {
+        // Веха 91: вектор 36 — MSI-X приёма сети. Шлюз ему обязателен: прерывание на вектор
+        // без шлюза не «игнорируется», а убивает машину (в первом заходе — паника и зависание).
+        for v in 0..=36 {
             IDT[v] = IdtEntry::gate(TRAP_STUBS[v]);
         }
-        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[36]);
-        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[37]);
+        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[37]);
+        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[38]);
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
@@ -324,6 +330,11 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
         }
         VEC_BLK => {
             crate::virtio_blk::on_irq();
+            lapic::eoi();
+            return;
+        }
+        VEC_NET => {
+            crate::virtio_net::on_irq(); // Веха 91: приехал кадр — разбудить сетевой сервер
             lapic::eoi();
             return;
         }

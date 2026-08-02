@@ -60,7 +60,8 @@ pub use imp::{
     console_drain, console_getc, console_has_input, console_init, Console, CONSOLE_IRQ,
     // прерывания
     enable_interrupts, init_device_interrupts, irq_mask_preempt, irq_mask_read, irq_mask_stdin,
-    irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel, wait_for_interrupt,
+    irq_mask_idle, irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel,
+    wait_for_interrupt,
     // таймер
     now_ticks, timer_arm, timer_hw_init,
     // память
@@ -153,4 +154,7 @@ pub enum BlkTransport {
 /// колец (прерывания, как синхронный путь blk на загрузке, отложены до потребности).
 pub struct NetDevice {
     pub transport: BlkTransport,
+    /// Веха 91 - прерывание ПРИЁМА в терминах арха (riscv - источник PLIC, x86 - вектор MSI-X);
+    /// `0` - карта без прерывания, драйвер остаётся на опросе.
+    pub irq: u32,
 }

@@ -103,7 +103,10 @@ pub fn probe_virtio_net() -> Option<NetDevice> {
         let id = cfg_r32(dev, 0);
         let (vendor, device) = (id as u16, (id >> 16) as u16);
         if vendor == VENDOR_VIRTIO && (device == DEV_NET_MODERN || device == DEV_NET_TRANSITIONAL) {
-            return setup_transport(dev).map(|t| NetDevice { transport: t });
+            // Веха 91: сети тоже нужен MSI-X. Не вышло взвести - карта остаётся на опросе.
+            let transport = setup_transport(dev)?;
+            let irq = setup_msix(dev, trap::VEC_NET).then_some(trap::VEC_NET as u32).unwrap_or(0);
+            return Some(NetDevice { transport, irq });
         }
     }
     None
@@ -332,7 +335,16 @@ pub fn probe_e1000() -> Option<usize> {
 fn setup(dev: u32) -> Option<BlkDevice> {
     let transport = setup_transport(dev)?;
 
-    // Найти MSI-X capability и адрес его таблицы.
+    if !setup_msix(dev, trap::VEC_BLK) {
+        return None; // без MSI-X диск не поддерживаем: async I/O без прерывания не собрать
+    }
+    Some(BlkDevice { transport, irq: trap::VEC_BLK as u32 })
+}
+
+/// Веха 91 - взвести MSI-X функции `dev` на вектор `vec` (запись 0 таблицы -> LAPIC, dest id 0,
+/// fixed/edge, без маски) и включить MSI-X. `false` - у устройства нет такой capability.
+/// Общее для диска и сети: механика одна, отличается только вектор.
+fn setup_msix(dev: u32, vec: u8) -> bool {
     let (mut msix_ptr, mut msix_table) = (0u32, 0usize);
     let mut ptr = cfg_r8(dev, 0x34) as u32 & !3;
     while ptr != 0 {
@@ -344,21 +356,17 @@ fn setup(dev: u32) -> Option<BlkDevice> {
         ptr = cfg_r8(dev, ptr + 1) as u32 & !3;
     }
     if msix_ptr == 0 {
-        return None; // без MSI-X диск не поддерживаем
+        return false;
     }
-
-    // MSI-X: запись 0 таблицы → LAPIC (физический dest, APIC ID 0), вектор диска,
-    // без маски; затем включить MSI-X на функции (enable=1, function mask=0).
     unsafe {
         paging::map_mmio(msix_table, 16);
         let e = msix_table as *mut u32;
         e.add(0).write_volatile(0xfee0_0000); // message address (LAPIC, dest id 0)
         e.add(1).write_volatile(0);
-        e.add(2).write_volatile(trap::VEC_BLK as u32); // data: fixed, edge, вектор
+        e.add(2).write_volatile(vec as u32); // data: fixed, edge, вектор
         e.add(3).write_volatile(0); // vector control: размаскирован
     }
     let ctrl = cfg_r16(dev, msix_ptr + 2);
     cfg_w16(dev, msix_ptr + 2, (ctrl | 0x8000) & !0x4000);
-
-    Some(BlkDevice { transport, irq: trap::VEC_BLK as u32 })
+    true
 }

@@ -16,7 +16,7 @@
 //! userspace-сервере `net-srv` (микроядерность: стек — не в ядре).
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -39,6 +39,9 @@ const REG_QUEUE_NUM_MAX: usize = 0x034;
 const REG_QUEUE_NUM: usize = 0x038;
 const REG_QUEUE_READY: usize = 0x044;
 const REG_QUEUE_NOTIFY: usize = 0x050;
+/// Веха 91 - статус прерывания и подтверждение (virtio-mmio; смещения те же, что у blk).
+const REG_INTERRUPT_STATUS: usize = 0x060;
+const REG_INTERRUPT_ACK: usize = 0x064;
 const REG_STATUS: usize = 0x070;
 const REG_QUEUE_DESC_LOW: usize = 0x080;
 const REG_QUEUE_DESC_HIGH: usize = 0x084;
@@ -240,18 +243,76 @@ unsafe impl Send for VirtioNet {}
 
 static NET: SpinLock<Option<VirtioNet>> = SpinLock::new(None);
 
+/// Веха 91 - прерывание ПРИЁМА карты (0 - нет, драйвер остаётся на опросе) и адреса, по которым
+/// его подтверждают. Адреса сохраняем заранее: обработчик прерывания не имеет права брать замок
+/// `NET`, который держит обычный код (Веха 89, п.1 - иначе дедлок на одном ядре).
+static IRQ_NUM: AtomicU32 = AtomicU32::new(0);
+static IRQ_ACK_MMIO: AtomicUsize = AtomicUsize::new(0);
+static IRQ_ACK_ISR: AtomicUsize = AtomicUsize::new(0);
+
+/// Номер прерывания приёма в терминах арха. 0 - карта без IRQ.
+/// На x86 вектор известен заранее (MSI-X), поэтому там эту функцию не спрашивают.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub fn irq() -> u32 {
+    IRQ_NUM.load(Ordering::Relaxed)
+}
+
+/// Веха 91 — СНЯТЬ висящее прерывание устройства. Нужно ровно один раз, при включении источника
+/// в контроллере, и это оказалось решающим на riscv: пока драйвер работал опросом, он никогда не
+/// подтверждал `InterruptStatus`, поэтому линия virtio-mmio стояла поднятой с первого же кадра.
+/// PLIC ловит ФРОНТ — при уже поднятой линии нового фронта не будет. Сбрасываем статус, и
+/// следующий кадр даёт честный фронт. На x86 (MSI-X) висящей линии нет — там не зовётся.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub fn ack_pending() {
+    let base = IRQ_ACK_MMIO.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            let is = r32(base, REG_INTERRUPT_STATUS);
+            if is != 0 {
+                w32(base, REG_INTERRUPT_ACK, is);
+            }
+        }
+    }
+}
+
+/// Веха 91 - обработчик прерывания приёма. Работы минимум: подтвердить прерывание устройству и
+/// отметить приход кадра. Разбор - дело сетевого сервера в userspace; ядро лишь будит спящего.
+pub fn on_irq() {
+    let base = IRQ_ACK_MMIO.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            let is = r32(base, REG_INTERRUPT_STATUS);
+            if is != 0 {
+                w32(base, REG_INTERRUPT_ACK, is);
+            }
+        }
+    }
+    let isr = IRQ_ACK_ISR.load(Ordering::Relaxed);
+    if isr != 0 {
+        unsafe { core::ptr::read_volatile(isr as *const u8) }; // чтение = сброс INTx-статуса
+    }
+    crate::proc::on_net_irq();
+}
+
 /// Инициализировать первую найденную virtio-net (через арх). `false` — карты нет.
 pub fn init() -> bool {
     let Some(dev) = arch::probe_virtio_net() else {
         return false;
     };
-    match dev.transport {
-        arch::BlkTransport::Mmio { base } => init_mmio(base),
+    let ok = match dev.transport {
+        arch::BlkTransport::Mmio { base } => {
+            IRQ_ACK_MMIO.store(base, Ordering::Relaxed);
+            init_mmio(base)
+        }
         arch::BlkTransport::Pci { common, notify_base, notify_mult, isr, device } => {
-            let _ = isr; // прерывания не используем (опрос)
+            IRQ_ACK_ISR.store(isr, Ordering::Relaxed);
             init_pci(common, notify_base, notify_mult, device)
         }
+    };
+    if ok {
+        IRQ_NUM.store(dev.irq, Ordering::Relaxed); // Веха 91: карта умеет будить нас кадром
     }
+    ok
 }
 
 /// Настроить одну очередь через mmio: выбрать, задать размер, отдать адреса колец, READY.
@@ -345,7 +406,11 @@ fn init_pci(common: usize, notify_base: usize, notify_mult: u32, device: usize) 
             return false;
         }
         w16p(PCI_QUEUE_SIZE, QSIZE as u16);
-        w16p(PCI_QUEUE_MSIX_VECTOR, PCI_NO_VECTOR); // опрос — вектора нет
+        // Веха 91 - привязать очередь ПРИЁМА (q=0) к записи 0 таблицы MSI-X. Без этого
+        // устройство остаётся с NO_VECTOR и прерываний не шлёт вовсе: ровно этот шаг делает
+        // virtio-blk, и ровно его тут не хватало - сеть поэтому и жила опросом.
+        // Очередь передачи (q=1) вектора не получает: TX-завершения нам не нужны.
+        w16p(PCI_QUEUE_MSIX_VECTOR, if q == 0 { 0 } else { PCI_NO_VECTOR });
         let (desc, avail, used) = alloc_rings();
         w64p(PCI_QUEUE_DESC, desc as u64);
         w64p(PCI_QUEUE_DRIVER, avail as u64);

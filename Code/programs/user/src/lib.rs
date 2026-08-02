@@ -230,6 +230,16 @@ pub fn recv_timeout(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
 }
 
+/// Веха 91 - `SYS_RECV` со сном до дедлайна ИЛИ до прихода СЕТЕВОГО КАДРА. То, ради чего веха:
+/// сетевой сервер спит, ничего не занимая, и просыпается ровно тогда, когда карта что-то
+/// приняла, - а не на ближайшем тике таймера. `None` - проснулись не из-за запроса.
+pub fn recv_net(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
+    let (op, reply_cap, len, cap) = abi::syscall(
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 3, timeout_ticks, 0, 0, 0,
+    );
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
+}
+
 /// `SYS_CALL` с передачей capability: послать `send` эндпоинту `ep`, ждать ответа в `recv`.
 /// Возвращает (байт ответа | MAX, право из ответа | [`NO_CAP`]). На передаваемое право
 /// (`cap` != NO_CAP) нужен `GRANT` — иначе ядро отклонит весь вызов.

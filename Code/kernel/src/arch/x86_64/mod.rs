@@ -397,6 +397,12 @@ pub fn irq_mask_stdin(_saved: usize) {
     lapic::set_timer_masked(!crate::xhci::has_keyboard());
 }
 
+/// Веха 91 — сон СО СРОКОМ: таймер нужен, чтобы заметить срок; прерывания устройств (в т.ч.
+/// MSI-X сети) на x86 идут через LAPIC и отдельной маски не требуют.
+pub fn irq_mask_idle(_saved: usize) {
+    lapic::set_timer_masked(false);
+}
+
 pub fn mark_in_kernel() {}
 
 /// Веха 52 — «взвести» прерывание userspace-драйвера перед сном в `SYS_IRQ_WAIT`: размаскировать

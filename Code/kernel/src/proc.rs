@@ -138,6 +138,9 @@ struct Proc {
     /// `usize::MAX` — нет). Проверяется (`GRANT`) при отправке, копируется в домен получателя
     /// при доставке — как `send_buf`, только для прав.
     send_cap: usize,
+    /// Веха 91 — процесс спит в `SYS_RECV` и просил будить его ещё и ПРИХОДОМ КАДРА
+    /// (режим 3): так сетевой сервер просыпается от карты, а не от таймера.
+    wake_on_net: bool,
     /// Веха 89 — сколько ФРЕЙМОВ куча этой группы реально заняла (лениво, по фолтам).
     /// Живёт у лидера группы, как и `heap_brk`; сверяется с [`page_quota`].
     pages: usize,
@@ -297,6 +300,7 @@ fn create_process_locked(
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        wake_on_net: false,
         pages: 0,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
         args: {
@@ -341,6 +345,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        wake_on_net: false,
         pages: 0, // не используется у нити: учёт ведёт лидер
         heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
         args: Vec::new(),
@@ -497,7 +502,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
         // Веха 91: ближайший дедлайн спящих по времени (SYS_RECV с таймаутом, futex_wait).
         // Без него простой был бы «до ввода с консоли», и проснуться по времени было бы нечем.
         let d = t.procs.iter().filter_map(|p| p.futex_deadline).min();
-        (w, any_irq_waiting(&t), d)
+        (w, any_irq_waiting(&t) || t.procs.iter().any(|p| p.wake_on_net), d)
     };
     if waiting.is_empty() && !irq_waiting && deadline.is_none() {
         return false;
@@ -513,12 +518,14 @@ fn wait_stdin(saved_sie: usize) -> bool {
     // заметить — процесс проспал бы до случайного нажатия клавиши. Это чинит и давний тихий
     // изъян `futex_wait` с таймаутом: на полностью холостой системе он не просыпался вовсе.
     if deadline.is_some() {
-        arch::irq_mask_preempt(saved_sie); // таймер вкл: тик разбудит и вернёт нас в цикл
+        // Веха 91: и таймер (заметить срок), и устройства (кадр разбудит сетевой сервер).
+        arch::irq_mask_idle(saved_sie);
     } else {
         arch::irq_mask_stdin(saved_sie);
     }
     while !arch::console_has_input()
         && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
+        && !NET_IRQ_PENDING.load(Ordering::Relaxed) // Веха 91: кадр разбудит сетевой сервер
         && !deadline.is_some_and(|d| arch::now_ticks() >= d)
     {
         // Спать до прерывания: проснёмся и от PENDING-прерывания при выключенном SIE.
@@ -538,6 +545,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
         }
     }
     drain_userdrv_irq(&mut t); // Веха 52: пришёл IRQ драйвера — будим ждущих SYS_IRQ_WAIT
+    drain_net_irq(&mut t); // Веха 91: приехал кадр — будим сетевой сервер
     wake_futex_timeouts(&mut t); // Веха 91: срок вышел — разбудить спавших по времени
     true
 }
@@ -595,6 +603,35 @@ fn wake_futex(t: &mut Table, space: usize, uaddr: usize, count: usize) -> usize 
 /// Веха 35 — разбудить нити, у которых истёк futex-дедлайн (вернуть им «таймаут» = 1).
 /// Зовётся из [`resume`] на каждом trap'е из U (гранулярность ~ квант вытеснения);
 /// дешёвая проверка при малом числе процессов.
+/// Веха 91 - "приехал сетевой кадр". Ставится ИЗ ОБРАБОТЧИКА ПРЕРЫВАНИЯ, поэтому только атомик:
+/// замок таблицы процессов там брать нельзя (Веха 89, п.1 - прерывание посреди удержания замка
+/// даёт дедлок на одном ядре). Разбирают флаг обычные пути - `resume` и простой.
+static NET_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Отметить приход кадра (зовёт драйвер из обработчика прерывания).
+pub fn on_net_irq() {
+    NET_IRQ_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// Веха 91 - разбудить тех, кто спал в `SYS_RECV`, ожидая кадра. `true`, если кадр приходил.
+fn drain_net_irq(t: &mut Table) -> bool {
+    if !NET_IRQ_PENDING.swap(false, Ordering::Relaxed) {
+        return false;
+    }
+    for i in 0..t.procs.len() {
+        if t.procs[i].state == State::RecvWait && t.procs[i].wake_on_net {
+            let f = &mut t.procs[i].frame;
+            f.set_ret(usize::MAX); // запроса не было - сервер пойдёт качать стек
+            f.set_ret_at(2, 0);
+            f.advance();
+            t.procs[i].state = State::Runnable;
+            t.procs[i].futex_deadline = None;
+            t.procs[i].wake_on_net = false;
+        }
+    }
+    true
+}
+
 fn wake_futex_timeouts(t: &mut Table) {
     let now = arch::now_ticks();
     for i in 0..t.procs.len() {
@@ -834,6 +871,7 @@ fn resume() -> ! {
     wake_futex_timeouts(&mut t);
     // Веха 52: пришёл IRQ userspace-драйвера — разбудить спящих в SYS_IRQ_WAIT.
     drain_userdrv_irq(&mut t);
+    drain_net_irq(&mut t); // Веха 91: приехал кадр — разбудить сетевой сервер
     let c = t.current;
     let chosen = if t.procs[c].state == State::Runnable {
         Some(c)
@@ -960,10 +998,13 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.set_ret_at(2, 0);
                 f.advance();
             } else {
-                // Веха 91: дедлайн живёт в том же поле, что у futex — механика пробуждения по
+                // Веха 91: дедлайн живёт в том же поле, что у futex - механика пробуждения по
                 // времени уже есть (`wake_futex_timeouts`), заводить вторую незачем.
                 t.procs[cur].futex_deadline =
-                    (mode == 2).then(|| arch::now_ticks().wrapping_add(timeout as u64));
+                    (mode >= 2).then(|| arch::now_ticks().wrapping_add(timeout as u64));
+                // Режим 3: разбудить ещё и приходом кадра - тогда сервер реагирует на сеть
+                // мгновенно, а не на ближайшем тике таймера.
+                t.procs[cur].wake_on_net = mode == 3;
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
                 if let Some(n) = t.next_runnable(cur) {
                     t.current = n;
