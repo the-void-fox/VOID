@@ -633,6 +633,10 @@ fn shell_env() -> Env {
         ("tcp-send", sh_tcp_send),
         ("tcp-recv", sh_tcp_recv),
         ("tcp-close", sh_tcp_close),
+        // Веха 94 — HTTP: скачать потоком в store и прочитать скачанное обратно.
+        ("fetch", sh_fetch),
+        ("blob", sh_blob),
+        ("unroot", sh_unroot),
         ("thaw", sh_thaw),
         ("switch", sh_switch),
         ("sysdef", sh_sysdef),
@@ -837,6 +841,9 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"ping IP", "ICMP-пинг адреса A.B.C.D");
     help_row(b"resolve NAME", "DNS: имя → адрес (возвращает строку)");
     help_row(b"tcp-connect IP P", "открыть TCP → хэндл (+ tcp-send/recv/close)");
+    help_row(b"fetch URL [R]", "скачать по HTTP потоком в store (корень R)");
+    help_row(b"blob R [OFF N]", "сводка/кусок скачанного (см. fetch)");
+    help_row(b"unroot NAME", "отвязать сырой корень store");
     help_row(b"roots", "сырые корни store (bin/*, system/*, …)");
     help_row(b"init-config", "посеять /etc/system/*.vv");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
@@ -1163,6 +1170,139 @@ fn sh_tcp_close(args: &[Value]) -> Result<Value, EvalError> {
         Ok(Value::nil())
     } else {
         Err(EvalError::new("tcp-close: негодный хэндл"))
+    }
+}
+
+/// Шестнадцатеричное представление content-id (первые `n` байт) — для показа человеку.
+fn hex_id(id: &[u8; 32], n: usize) -> alloc::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = alloc::string::String::with_capacity(n * 2);
+    for b in id.iter().take(n) {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// `(fetch "http://хост/путь" ["корень"])` — Веха 94: скачать ПОТОКОМ прямо в store.
+/// Тело режется на куски-объекты, узел связывает их; ВОЗВРАЩАЕТ content-id узла строкой —
+/// это Merkle-корень над содержимым, посчитанный самим устройством.
+fn sh_fetch(args: &[Value]) -> Result<Value, EvalError> {
+    let (url, root) = match (args.first(), args.get(1)) {
+        (Some(Value::Str(u)), Some(Value::Str(r))) => (u.clone(), r.clone()),
+        (Some(Value::Str(u)), None) => (u.clone(), alloc::rc::Rc::from("")),
+        _ => return Err(EvalError::new("fetch: (fetch \"http://хост/путь\" [\"корень\"])")),
+    };
+    let netep = net_ep("fetch")?;
+    let scap = sys::start_cap(1);
+    // Буферы даёт вызывающий: у библиотеки нет аллокатора, а у шелла есть. Потолок в 512 кусков
+    // по 16 КиБ = 8 МиБ на файл — этого хватает до пакетов, где понадобится дерево поглубже.
+    let mut chunk = alloc::vec![0u8; sys::http::CHUNK];
+    let mut kids = alloc::vec![[0u8; 32]; 512];
+    let mut sink = sys::http::Sink { chunk: &mut chunk, kids: &mut kids };
+    match sys::http::get(netep, scap, url.as_bytes(), root.as_bytes(), &mut sink) {
+        Ok(f) => {
+            sys::write(
+                alloc::format!(
+                    "скачано {} байт, кусков {}{}\n",
+                    f.bytes,
+                    f.chunks,
+                    if root.is_empty() {
+                        alloc::string::String::new()
+                    } else {
+                        alloc::format!(", корень {}", root)
+                    }
+                )
+                .as_bytes(),
+            );
+            Ok(Value::str(&hex_id(&f.id, 32)))
+        }
+        Err(e) => Err(EvalError::new(alloc::format!("fetch: {}", e))),
+    }
+}
+
+/// `(blob "корень" [смещение длина])` — прочитать скачанное обратно из store.
+/// Без смещения печатает сводку (сколько байт, сколько кусков), со смещением ВОЗВРАЩАЕТ
+/// кусок содержимого строкой — так проверяется, что приехало ровно то, что отдал сервер.
+fn sh_blob(args: &[Value]) -> Result<Value, EvalError> {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("blob: (blob \"корень\" [смещение длина])")),
+    };
+    let scap = sys::start_cap(1);
+    let mut id = [0u8; 32];
+    // `SYS_OBJ_GET_ROOT` отдаёт ЧИСЛО БАЙТ id (32), а не код возврата — 0 значит «нет корня».
+    if sys::obj_get_root(scap, name.as_bytes(), &mut id) != 32 {
+        return Err(EvalError::new("blob: нет такого корня"));
+    }
+    let mut manifest = [0u8; 512];
+    let mlen = sys::obj_get(scap, &id, &mut manifest);
+    if mlen == 0 || mlen == usize::MAX {
+        return Err(EvalError::new("blob: узел не читается"));
+    }
+    let Some((total, nchunks, csize)) = sys::http::blob_info(&manifest[..mlen]) else {
+        return Err(EvalError::new("blob: корень указывает не на блоб"));
+    };
+    let (off, len) = match (args.get(1), args.get(2)) {
+        (Some(Value::Int(o)), Some(Value::Int(l))) if *o >= 0 && *l > 0 => (*o as usize, *l as usize),
+        (None, None) => {
+            sys::write(
+                alloc::format!("{}: {} байт, кусков {}\n", name, total, nchunks).as_bytes(),
+            );
+            return Ok(Value::Int(total as i64));
+        }
+        _ => return Err(EvalError::new("blob: (blob \"корень\" смещение длина)")),
+    };
+
+    let mut kids = alloc::vec![[0u8; 32]; nchunks];
+    if sys::obj_children(scap, &id, &mut kids) != nchunks {
+        return Err(EvalError::new("blob: список кусков не сошёлся"));
+    }
+    // Куски одинаковой длины, кроме последнего, — значит нужный кусок ищется делением.
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = alloc::vec![0u8; csize];
+    let mut pos = off;
+    while out.len() < len && pos < total {
+        let ci = pos / csize;
+        if ci >= nchunks {
+            break;
+        }
+        let n = sys::obj_get(scap, &kids[ci], &mut buf);
+        if n == 0 || n == usize::MAX {
+            return Err(EvalError::new("blob: кусок не читается"));
+        }
+        let inside = pos % csize;
+        if inside >= n {
+            break;
+        }
+        let take = (n - inside).min(len - out.len());
+        out.extend_from_slice(&buf[inside..inside + take]);
+        pos += take;
+    }
+    Ok(Value::str(&alloc::string::String::from_utf8_lossy(&out)))
+}
+
+/// `(unroot "имя")` — отвязать СЫРОЙ корень store (то, что показывает `roots`).
+///
+/// Появилось вместе с `fetch`: тот заводит корни, а убрать их из шелла было нечем — скачанное
+/// держалось бы вечно, ведь GC собирает только НЕдостижимое, а корень и есть достижимость.
+/// Объекты исчезнут на ближайшей сборке, если на них больше никто не ссылается.
+fn sh_unroot(args: &[Value]) -> Result<Value, EvalError> {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("unroot: (unroot \"имя-корня\")")),
+    };
+    // Системные корни через эту команду не трогаем: снести `system/current` или `bin/<arch>/vvsh`
+    // значит остаться без загрузки или без шелла, а откатить это будет уже нечем.
+    for guard in [b"system/".as_slice(), b"bin/".as_slice(), b"proc/".as_slice()] {
+        if name.as_bytes().starts_with(guard) {
+            return Err(EvalError::new("unroot: системные корни (system/, bin/, proc/) не трогаем"));
+        }
+    }
+    if sys::obj_del_root(sys::start_cap(1), name.as_bytes()) == 0 {
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("unroot: нет такого корня (или нет права WRITE)"))
     }
 }
 

@@ -25,6 +25,10 @@ pub mod net_phy;
 /// `tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`. Общий для сервера и его клиентов.
 pub mod net_cli;
 
+/// Веха 94 — HTTP-клиент: GET поверх TCP, тело потоком прямо в объектный store
+/// (куски + узел; content-id узла — Merkle-корень над содержимым).
+pub mod http;
+
 pub mod lx_emul;
 
 // ─── номера syscall'ов (ABI v1, см. libs/void-abi и kernel/src/proc.rs) ───────
@@ -65,6 +69,8 @@ const SYS_OBJ_LIST_ROOTS: usize = 34;
 const SYS_LOG: usize = 35;
 const SYS_TIME: usize = 36;
 const SYS_RANDOM: usize = 37;
+const SYS_OBJ_PUT_NODE: usize = 38;
+const SYS_OBJ_CHILDREN: usize = 39;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -297,6 +303,35 @@ pub fn obj_get(store_cap: usize, id: &[u8; 32], out: &mut [u8]) -> usize {
         SYS_OBJ_GET, store_cap,
         id.as_ptr() as usize,
         out.as_mut_ptr() as usize, out.len(), 0, 0, 0,
+    ).0
+}
+
+/// `SYS_OBJ_PUT_NODE` (Веха 94): положить УЗЕЛ — значение + список исходящих ссылок.
+/// Так кладут то, что не помещается одним слайсом: куски — обычными [`obj_put`], а узел
+/// связывает их в целое (и раздаёт дедуп: одинаковый кусок в двух загрузках — один объект).
+/// `0` — успех, [`usize::MAX`] — отказ (нет права WRITE / не хватило памяти).
+pub fn obj_put_node(
+    store_cap: usize,
+    data: &[u8],
+    children: &[[u8; 32]],
+    id_out: &mut [u8; 32],
+) -> usize {
+    abi::syscall(
+        SYS_OBJ_PUT_NODE, store_cap,
+        data.as_ptr() as usize, data.len(),
+        children.as_ptr() as usize, children.len(),
+        id_out.as_mut_ptr() as usize, 0,
+    ).0
+}
+
+/// `SYS_OBJ_CHILDREN` (Веха 94): выписать ссылки узла в `out` (нужен `READ`). Возвращает ПОЛНОЕ
+/// число детей — может быть больше, чем влезло, иначе не отличить «детей ровно столько» от
+/// «буфер мал». [`usize::MAX`] — отказ.
+pub fn obj_children(store_cap: usize, id: &[u8; 32], out: &mut [[u8; 32]]) -> usize {
+    abi::syscall(
+        SYS_OBJ_CHILDREN, store_cap,
+        id.as_ptr() as usize,
+        out.as_mut_ptr() as usize, out.len() * 32, 0, 0, 0,
     ).0
 }
 

@@ -2204,6 +2204,94 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_OBJ_PUT_NODE(store_cap, buf, len, kids_ptr, nkids, idout) -> 0|MAX (Веха 94):
+        // положить УЗЕЛ — значение плюс список исходящих ссылок (по 32 байта каждая).
+        //
+        // Зачем отдельно от `SYS_OBJ_PUT`: большой файл не кладётся одним слайсом — ни в кучу
+        // процесса, ни в кучу ядра. Он кладётся КУСКАМИ (каждый — обычный объект), а узел
+        // связывает их в целое. Дедуп при этом достаётся даром: одинаковый кусок в двух
+        // загрузках — один объект. GC уже умеет ходить по детям (checkpoint строит такое же
+        // дерево с Вехи 37), так что новой машинерии не появляется — только доступ из userspace.
+        38 => {
+            let (scap, buf, len, kids, nkids, idout) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4), f.arg(5))
+            };
+            let dom = t.procs[cur].domain;
+            let kbytes = nkids.saturating_mul(32);
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) if ensure_heap_range(t, cur, buf, len)
+                    && (nkids == 0 || ensure_heap_range(t, cur, kids, kbytes))
+                    && ensure_heap_range(t, cur, idout, 32) =>
+                {
+                    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+                    let mut children = Vec::with_capacity(nkids);
+                    for i in 0..nkids {
+                        let mut id = [0u8; 32];
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (kids + i * 32) as *const u8, id.as_mut_ptr(), 32,
+                            )
+                        };
+                        children.push(void_abi::ContentId(id));
+                    }
+                    let id = crate::object::put_node(bytes, &children);
+                    let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
+                    out.copy_from_slice(&id.0);
+                    vprintln!(
+                        "  [obj] P{} OBJ_PUT_NODE {} байт + {} детей → content-id (по cap)",
+                        cur, len, nkids,
+                    );
+                    0
+                }
+                Ok(()) => usize::MAX,
+                Err(e) => {
+                    vprintln!("  [obj] P{} OBJ_PUT_NODE отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_OBJ_CHILDREN(store_cap, id_ptr, out_buf, out_cap) -> число детей | MAX (Веха 94):
+        // выписать ссылки узла (по 32 байта). Без этого положенное деревом нельзя прочитать
+        // обратно: `SYS_OBJ_GET` отдаёт только полезную нагрузку узла, а не его детей.
+        39 => {
+            let (scap, idp, obuf, ocap) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(()) if ensure_heap_range(t, cur, idp, 32)
+                    && (ocap == 0 || ensure_heap_range(t, cur, obuf, ocap)) =>
+                {
+                    let mut id = [0u8; 32];
+                    unsafe { core::ptr::copy_nonoverlapping(idp as *const u8, id.as_mut_ptr(), 32) };
+                    let kids = crate::object::children(&void_abi::ContentId(id));
+                    let n = kids.len().min(ocap / 32);
+                    for (i, c) in kids.iter().take(n).enumerate() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                c.0.as_ptr(), (obuf + i * 32) as *mut u8, 32,
+                            )
+                        };
+                    }
+                    // Возвращаем ПОЛНОЕ число детей, а не сколько влезло: иначе вызывающий не
+                    // отличил бы «детей ровно столько» от «буфер мал» и потерял бы хвост.
+                    kids.len()
+                }
+                Ok(()) => usize::MAX,
+                Err(e) => {
+                    vprintln!("  [obj] P{} OBJ_CHILDREN отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         other => {
             let f = &mut t.procs[cur].frame;
             vprintln!("  [proc] неизвестный syscall {}", other);

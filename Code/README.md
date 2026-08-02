@@ -109,7 +109,15 @@ vvsh/> (define h (tcp-connect (resolve "example.com") 80))
 vvsh/> (tcp-send h "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n")
 vvsh/> (tcp-recv h)             # → HTTP/1.1 200 OK и страница; пустая строка = EOF
 vvsh/> (tcp-close h)
+# HTTP (Веха 94): скачать ПОТОКОМ прямо в store, минуя память и posixfs
+vvsh/> (fetch "http://example.com/" "dl/example")   # → байты, куски, content-id узла
+vvsh/> (blob "dl/example")                          # сводка скачанного
+vvsh/> (blob "dl/example" 0 64)                     # кусок содержимого
+vvsh/> (unroot "dl/example")                        # отвязать корень (объекты соберёт GC)
 ```
+Тело режется на куски по 16 КиБ, каждый — объект store, узел связывает их. В памяти живёт
+**один кусок**, одинаковые куски дедуплицируются, а content-id узла — **Merkle-корень**
+содержимого: повторная загрузка даёт тот же id, и он совпадает между riscv и x86.
 Статика — запасной путь, настраивается в `/etc/system/networking.vv` токенами `arg:`
 (`arg:dhcp=off arg:ip=A.B.C.D/NN arg:gw=… arg:dns=…`), затем `rebuild` и ребут.
 
