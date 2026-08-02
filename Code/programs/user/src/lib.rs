@@ -18,6 +18,9 @@
 /// `ioremap`/`kmalloc`/`dma_alloc_coherent`/`request_irq`/`readl`-`writel`/driver-model
 /// поверх [`mmio_map`]/[`dma_alloc`]/[`irq_wait`]/[`thread_spawn`]. Первый шаг к хостингу
 /// Linux-драйверов (Genode `dde_linux`-стиль).
+/// Веха 90 — мост smoltcp↔VOID (устройство поверх сырых кадров ядра).
+pub mod net_phy;
+
 pub mod lx_emul;
 
 // ─── номера syscall'ов (ABI v1, см. libs/void-abi и kernel/src/proc.rs) ───────
