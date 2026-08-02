@@ -210,6 +210,15 @@ pub fn recv(buf: &mut [u8]) -> Message {
     Message { op, reply_cap, len, cap }
 }
 
+/// Веха 90 — `SYS_RECV` БЕЗ блокировки: `None`, если запросов нет прямо сейчас.
+/// Нужен серверам, которым между запросами есть чем заняться, — прежде всего сетевому:
+/// стек обязан тикать (входящие, ретрансмиссии), даже когда клиенты молчат.
+pub fn try_recv(buf: &mut [u8]) -> Option<Message> {
+    let (op, reply_cap, len, cap) =
+        abi::syscall(SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 1, 0, 0, 0, 0);
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
+}
+
 /// `SYS_CALL` с передачей capability: послать `send` эндпоинту `ep`, ждать ответа в `recv`.
 /// Возвращает (байт ответа | MAX, право из ответа | [`NO_CAP`]). На передаваемое право
 /// (`cap` != NO_CAP) нужен `GRANT` — иначе ядро отклонит весь вызов.

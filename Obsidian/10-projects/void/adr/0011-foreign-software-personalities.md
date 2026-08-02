@@ -1,7 +1,13 @@
 ---
-title: 0011. Чужой софт — персоналия и песочница: мир СОБИРАЕТСЯ из ничего, а не вырезается
+title: "0011. Чужой софт — персоналия и песочница: мир СОБИРАЕТСЯ из ничего, а не вырезается"
 created: 2026-08-02
-tags: [adr, project/void, topic/compat, topic/security, topic/personality, topic/os]
+tags:
+  - adr
+  - project/void
+  - topic/compat
+  - topic/security
+  - topic/personality
+  - topic/os
 status: accepted
 ---
 
@@ -41,8 +47,8 @@ status: accepted
 
 Три части:
 
-1. **Врать процессу про права — можно и безопасно.** У VOID [[capabilities|нет root и нет
-   юниксовых юзеров]]: ambient authority отсутствует как явление. Процесс может считать себя
+1. **Врать процессу про права — можно и безопасно.** У VOID [[capabilities|нет root и нет юниксовых юзеров]]: 
+   ambient authority отсутствует как явление. Процесс может считать себя
    `Administrator` с `SeDebugPrivilege` — эта вера ни к чему не подключена, потому что реальные
    полномочия лежат в его cap-таблице, а она пуста, пока туда явно не положили. Ложь безопасна
    именно потому, что правда не утекает.

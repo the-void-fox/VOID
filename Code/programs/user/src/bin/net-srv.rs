@@ -20,22 +20,30 @@
 use void_user as sys;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::socket::icmp;
+use smoltcp::socket::{icmp, udp};
 use smoltcp::storage::PacketMetadata;
 use smoltcp::wire::{
-    EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
 };
 
 const OP_PING: usize = 0;
 
 const OUR_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+/// DNS-сервер SLIRP. Веха 90 использует его как мишень UDP-проверки: он отвечает, не выходя за
+/// пределы QEMU, поэтому демо самодостаточно (полноценный DNS-резолвер — Веха 92).
+const DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 
 /// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы.
 const PING_IDENT: u16 = 0x1D0;
 
-/// Бюджет ожидания ответа, мс.
-const TIMEOUT_MS: i64 = 1000;
+/// Веха 90 — бюджет операции, которой может понадобиться РАЗРЕШИТЬ адрес. Больше секунды не по
+/// прихоти: `NeighborCache` в smoltcp глушит ARP-запросы на 1 с после ЛЮБОГО предыдущего (поле
+/// `silent_until` общее на весь кэш, а не на адрес). Наш самопинг шлюза при загрузке как раз
+/// такой запрос и делает, поэтому следующая операция к НОВОМУ адресу молчит почти всю эту
+/// секунду. Бюджет ровно в 1 с давал ложное «нет ответа» — на диагностику этого ушёл целый заход
+/// с дампом трафика: в дампе не было даже ARP.
+const RESOLVE_MS: i64 = 3000;
 
 #[no_mangle]
 pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
@@ -69,9 +77,18 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
         icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),
     );
+    let mut urx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut urx_data = [0u8; 1024];
+    let mut utx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut utx_data = [0u8; 1024];
+    let udp_socket = udp::Socket::new(
+        udp::PacketBuffer::new(&mut urx_meta[..], &mut urx_data[..]),
+        udp::PacketBuffer::new(&mut utx_meta[..], &mut utx_data[..]),
+    );
     let mut storage = [SocketStorage::EMPTY; 4];
     let mut sockets = SocketSet::new(&mut storage[..]);
     let icmp_handle = sockets.add(icmp_socket);
+    let udp_handle = sockets.add(udp_socket);
 
     {
         let s = sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -92,10 +109,45 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         Err(_) => sys::write("адрес не разрешился\n".as_bytes()),
     }
 
-    // Серверный цикл: обслуживаем OP_PING по IPC.
+    // Веха 90 — проверка UDP: ICMP доказывает, что стек живой, но не что работает транспорт.
+    // Шлём настоящий DNS-запрос A-записи и ждём ответ — это полный путь UDP туда и обратно.
+    sys::write("[net-srv] UDP-проверка (DNS-запрос к 10.0.2.3): ".as_bytes());
+    match udp_probe(&mut iface, &mut device, &mut sockets, udp_handle) {
+        Ok(n) => {
+            sys::write("ответ ".as_bytes());
+            write_dec(n);
+            sys::write(" байт — UDP работает\n".as_bytes());
+        }
+        Err(e) => {
+            sys::write(e.as_bytes());
+            sys::write("\n".as_bytes());
+        }
+    }
+
+    // Серверный цикл (Веха 90 — РЕАКТОР): стек прокачивается постоянно, а IPC разбирается между
+    // тиками неблокирующим приёмом. До этого сервер стоял в блокирующем `recv`, и стек тикал
+    // только внутри `ping` — для ICMP сходило, для TCP (Веха 93) не сойдёт: ретрансмиссии и
+    // таймеры требуют, чтобы `poll` звался всегда, а не когда кто-то попросил.
+    // Опрос временный: ждать СРАЗУ кадра и сообщения научит Веха 91 (пока это жжёт CPU).
     let mut req = [0u8; 64];
     loop {
-        let m = sys::recv(&mut req);
+        let busy = iface.poll(sys::net_phy::now(), &mut device, &mut sockets);
+        let Some(m) = sys::try_recv(&mut req) else {
+            // Веха 90: заняться нечем — ПОСПАТЬ миллисекунду. Просто `yield_now` не спасает:
+            // сам `iface.poll` (с syscall'ом `net_recv` внутри) в плотном цикле съедает машину, и
+            // система становится неотзывчивой — шелл переставал успевать обрабатывать набранную
+            // строку (поймано на прогоне: ввод не отзывался вовсе). Сон опускает частоту опроса
+            // до ~1 кГц: для ICMP/UDP это незаметно, а CPU остаётся остальным.
+            //
+            // Спим через futex с таймаутом: `*IDLE == 0` всегда, поэтому вызов гарантированно
+            // уходит в сон до дедлайна. Настоящее пробуждение ПО СОБЫТИЮ (кадр или IPC) —
+            // Веха 91; тогда опрос исчезнет совсем.
+            if busy == smoltcp::iface::PollResult::None {
+                static IDLE: u32 = 0;
+                sys::futex_wait(&IDLE as *const u32, 0, 1_000_000 / sys::TICK_NS);
+            }
+            continue;
+        };
         let mut rep = [0u8; 5];
         if m.op == OP_PING && m.len >= 4 {
             let target = Ipv4Address::new(req[0], req[1], req[2], req[3]);
@@ -126,7 +178,7 @@ fn ping(
     target: Ipv4Address,
 ) -> Result<usize, u8> {
     let started = sys::now();
-    let deadline = sys::net_phy::now() + smoltcp::time::Duration::from_millis(TIMEOUT_MS as u64);
+    let deadline = sys::net_phy::now() + smoltcp::time::Duration::from_millis(RESOLVE_MS as u64);
 
     // 1) Отправить. `can_send` станет истинным не сразу: smoltcp сперва разрешит адрес по ARP,
     //    а до этого места в очереди нет — поэтому крутим poll до дедлайна.
@@ -158,6 +210,50 @@ fn ping(
         }
     }
     Err(2)
+}
+
+/// Веха 90 — доказать UDP: минимальный DNS-запрос A-записи `example.com` к серверу SLIRP и
+/// ожидание ответа. Возвращает длину ответа либо причину. Полноценного разбора DNS тут нет и не
+/// нужно — проверяется ТРАНСПОРТ (запрос ушёл, ответ пришёл на наш порт); резолвер — Веха 92.
+fn udp_probe(
+    iface: &mut Interface,
+    device: &mut sys::net_phy::VoidDevice,
+    sockets: &mut SocketSet,
+    handle: smoltcp::iface::SocketHandle,
+) -> Result<usize, &'static str> {
+    // Заголовок DNS: id=0x7601, RD=1, 1 вопрос. Дальше QNAME (7"example" 3"com" 0), QTYPE=A,
+    // QCLASS=IN. Собран вручную — ради одной проверки тащить парсер незачем.
+    const QUERY: &[u8] = &[
+        0x76, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        0x00, 0x01, 0x00, 0x01,
+    ];
+    {
+        let s = sockets.get_mut::<udp::Socket>(handle);
+        if s.bind(49152).is_err() {
+            return Err("не удалось занять порт");
+        }
+    }
+    let deadline = sys::net_phy::now() + smoltcp::time::Duration::from_millis(RESOLVE_MS as u64);
+    let target = IpEndpoint::new(IpAddress::Ipv4(DNS), 53);
+    let mut sent = false;
+    while sys::net_phy::now() < deadline {
+        iface.poll(sys::net_phy::now(), device, sockets);
+        let s = sockets.get_mut::<udp::Socket>(handle);
+        if !sent && s.can_send() {
+            match s.send_slice(QUERY, target) {
+                Ok(()) => sent = true,
+                Err(_) => return Err("сокет отказал в отправке")
+            }
+        }
+        if sent && s.can_recv() {
+            let n = s.recv().map(|(data, _)| data.len()).unwrap_or(0);
+            s.close();
+            return Ok(n);
+        }
+    }
+    sockets.get_mut::<udp::Socket>(handle).close();
+    if sent { Err("нет ответа на DNS-запрос") } else { Err("не удалось отправить") }
 }
 
 /// Возможности устройства по контрольным суммам — нужны `Icmpv4Repr::emit`.
