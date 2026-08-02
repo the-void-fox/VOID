@@ -78,6 +78,12 @@ pub fn put_node(bytes: &[u8], children: &[ContentId]) -> ContentId {
     STORE.lock().put_node(bytes, children)
 }
 
+/// Веха 89 — самоизлечение: починить объект этих байтов, если его кадр на диске повреждён.
+/// `true` — была порча и она устранена (кадр перезапишется ближайшим коммитом).
+pub fn repair(bytes: &[u8]) -> bool {
+    with_store(|s| s.repair(&mut Disk, bytes, &[]))
+}
+
 /// Прочитать полезную нагрузку по адресу (ленивая подгрузка с диска при промахе кэша).
 pub fn with<R>(id: &ContentId, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
     with_store(|s| s.with(&mut Disk, id, f))

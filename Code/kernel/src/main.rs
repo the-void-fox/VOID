@@ -478,8 +478,31 @@ fn spawn_prog(name: &str, pname: &'static str, arg: usize) -> usize {
     let root_name = prog_root(name);
     let id = object::root(&root_name)
         .unwrap_or_else(|| panic!("{} не посеян в store", root_name));
-    let bytes = object::with(&id, |b| b.map(|x| x.to_vec()))
-        .unwrap_or_else(|| panic!("объект корня {} недоступен", root_name));
+    let bytes = match object::with(&id, |b| b.map(|x| x.to_vec())) {
+        Some(b) => b,
+        // Веха 89 — САМОИЗЛЕЧЕНИЕ. Сюда попадаем, только если кадр программы на диске не сошёлся
+        // со своим content-id, то есть носитель его испортил. Верные байты всё это время рядом —
+        // в образе ядра ([`PROGRAMS`]), поэтому кладём содержимое заново и читаем ещё раз.
+        // Без этого один бит-флип в кадре `vsh` означал бы систему, которая больше не поднимается.
+        // Чиним ИМЕННО ЗДЕСЬ, а не при севе: store намеренно ленив, и сверять все программы на
+        // каждой загрузке — значит читать их все с диска впустую.
+        None => {
+            let seed = PROGRAMS
+                .iter()
+                .find(|(n, _)| prog_root(n) == root_name)
+                .map(|(_, b)| *b)
+                .unwrap_or_else(|| panic!("объект корня {} недоступен", root_name));
+            if !object::repair(seed) {
+                panic!("объект корня {} недоступен и не восстановим", root_name);
+            }
+            // Коммит явный: корни не менялись (порча кадра их не трогает), значит group-commit
+            // сам бы не сработал и починка осталась бы только в RAM — до следующего сбоя.
+            object::commit();
+            println!("  [seed] САМОИЗЛЕЧЕНИЕ: кадр {} восстановлен из образа ядра", root_name);
+            object::with(&id, |b| b.map(|x| x.to_vec()))
+                .unwrap_or_else(|| panic!("объект корня {} не читается после починки", root_name))
+        }
+    };
     match proc::spawn_elf(pname, &bytes, arg) {
         Ok(pid) => pid,
         Err(e) => panic!("негодный ELF под корнем {}: {:?}", root_name, e),

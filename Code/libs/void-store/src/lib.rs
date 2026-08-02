@@ -301,20 +301,64 @@ impl Store {
         match self.objects.get(id) {
             None => false,
             Some(o) if o.data.is_some() => true,
-            Some(o) => {
-                let (sector, len) = o.disk.expect("объект без данных и без диска");
-                let Some(frame) = read_object(io, sector, len as usize) else {
-                    self.corrupt_reads += 1;
-                    return false;
-                };
-                if ContentId::hash(&frame) != *id {
-                    self.corrupt_reads += 1;
-                    return false;
+            Some(_) => {
+                match self.load_frame(io, id) {
+                    Some(frame) => {
+                        self.objects.get_mut(id).unwrap().data = Some(decode(&frame));
+                        true
+                    }
+                    None => {
+                        self.corrupt_reads += 1;
+                        false
+                    }
                 }
-                self.objects.get_mut(id).unwrap().data = Some(decode(&frame));
-                true
             }
         }
+    }
+
+    /// Прочитать кадр объекта с диска и проверить его хэш. `None` — носитель не отдал сектор
+    /// ЛИБО содержимое не сходится с content-id. Учёт расхождений — на вызывающем: одну и ту же
+    /// порчу могут увидеть и [`Store::ensure_loaded`], и [`Store::repair`], а событие это одно.
+    fn load_frame(&self, io: &mut impl BlockIo, id: &ContentId) -> Option<Vec<u8>> {
+        let (sector, len) = self.objects.get(id)?.disk?;
+        let frame = read_object(io, sector, len as usize)?;
+        (ContentId::hash(&frame) == *id).then_some(frame)
+    }
+
+    /// Веха 89 — **САМОИЗЛЕЧЕНИЕ**: если объект с таким содержимым известен store'у, но его кадр
+    /// на диске не читается или не сходится со своим content-id — заменить содержимое заведомо
+    /// верными байтами. `true` — объект был повреждён и починен.
+    ///
+    /// Работает ровно там, где содержимое можно взять из НАДЁЖНОГО источника: программы-семена
+    /// живут в образе ядра, поэтому их кадры восстановимы полностью. Пользовательские данные
+    /// восстановить неоткуда — их порча только обнаруживается ([`Store::corrupt_reads`]).
+    ///
+    /// Старый кадр не переписывается на месте (append-only): он становится учтённым мусором,
+    /// а свежий допишется ближайшим коммитом — та же механика, что у обычного `put`.
+    pub fn repair(&mut self, io: &mut impl BlockIo, bytes: &[u8], children: &[ContentId]) -> bool {
+        let frame = encode(bytes, children);
+        let id = ContentId::hash(&frame);
+        if !self.objects.contains_key(&id) {
+            return false; // объекта нет вовсе — это не порча, а обычный промах (см. `put_node`)
+        }
+        // Кадр уже в кэше или читается корректно — чинить нечего. Проверяем через `load_frame`,
+        // а не `ensure_loaded`: расхождение здесь — та же порча, которую вызывающий уже учёл.
+        let cached = self.objects.get(&id).is_some_and(|o| o.data.is_some());
+        if cached || self.load_frame(io, &id).is_some() {
+            return false;
+        }
+        let orphan = self.objects.get(&id).and_then(|o| o.disk).map(|(_, len)| len);
+        self.objects.insert(
+            id,
+            Object {
+                data: Some(Loaded { payload: bytes.to_vec(), children: children.to_vec() }),
+                disk: None,
+            },
+        );
+        if let Some(len) = orphan {
+            self.garbage += len as u64; // осиротевший кадр — под нож ближайшему `compact`
+        }
+        true
     }
 
     // ─── сборка мусора и уплотнение (разделены — Веха 33) ────────────────────
