@@ -80,12 +80,12 @@ pub fn put_node(bytes: &[u8], children: &[ContentId]) -> ContentId {
 
 /// Прочитать полезную нагрузку по адресу (ленивая подгрузка с диска при промахе кэша).
 pub fn with<R>(id: &ContentId, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
-    STORE.lock().with(&mut Disk, id, f)
+    with_store(|s| s.with(&mut Disk, id, f))
 }
 
 /// Исходящие ссылки объекта (подгружает при необходимости).
 pub fn children(id: &ContentId) -> Vec<ContentId> {
-    STORE.lock().children(&mut Disk, id)
+    with_store(|s| s.children(&mut Disk, id))
 }
 
 /// Число объектов (известно из индекса даже для неподгруженных).
@@ -132,12 +132,12 @@ pub fn list_roots_text() -> alloc::string::String {
 /// Собрать мусор (mark-sweep от корней; жертвы — надгробиями до уплотнения).
 /// (оставлено, собрано).
 pub fn gc() -> (usize, usize) {
-    STORE.lock().gc(&mut Disk)
+    with_store(|s| s.gc(&mut Disk))
 }
 
 /// Уплотнить область объектов (двухфазно, крах-устойчиво) — зовётся по порогу мусора.
 pub fn compact() {
-    STORE.lock().compact(&mut Disk)
+    with_store(|s| s.compact(&mut Disk))
 }
 
 /// Мусора в области объектов, байт (для порога уплотнения).
@@ -157,12 +157,47 @@ pub fn bytes_written() -> u64 {
 
 /// Загрузить состояние с диска. `true` — были данные; `false` — чистый диск.
 pub fn load() -> bool {
-    STORE.lock().load(&mut Disk)
+    with_store(|s| s.load(&mut Disk))
 }
 
 /// Зафиксировать состояние на диск (крах-устойчиво; пустой коммит — no-op).
 pub fn commit() {
-    STORE.lock().commit(&mut Disk)
+    with_store(|s| s.commit(&mut Disk))
+}
+
+/// Веха 89 — выполнить операцию над store и СРАЗУ сказать, если носитель соврал. Отчёт обязан
+/// стоять здесь, а не только в коммите: расхождение хэша ловится при ЧТЕНИИ, и без этого система
+/// падала бы с «объект недоступен», не сказав, что диск испорчен.
+fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
+    let mut s = STORE.lock();
+    let r = f(&mut s);
+    let (bad_r, bad_w) = (s.corrupt_reads(), s.failed_writes());
+    drop(s); // печатать под замком store нельзя: println берёт консоль
+    report_integrity(bad_r, bad_w);
+    r
+}
+
+/// Веха 89 — сказать вслух, если носитель соврал. Целостность, о которой молчат, бесполезна:
+/// расхождение хэша или отказ записи означают, что диск портит данные, и узнать об этом надо
+/// в момент события, а не когда система не поднимется. Печатаем ОДИН раз на каждое новое
+/// расхождение (счётчики монотонные), чтобы не залить консоль на сыплющемся диске.
+fn report_integrity(corrupt_reads: u64, failed_writes: u64) {
+    static SEEN_R: AtomicU64 = AtomicU64::new(0);
+    static SEEN_W: AtomicU64 = AtomicU64::new(0);
+    if corrupt_reads > SEEN_R.swap(corrupt_reads, Ordering::Relaxed) {
+        println!(
+            "  [store] ЦЕЛОСТНОСТЬ: кадр с диска не сошёлся со своим content-id ({} раз) — \
+             объект считается недоступным, мусор в store не попал",
+            corrupt_reads,
+        );
+    }
+    if failed_writes > SEEN_W.swap(failed_writes, Ordering::Relaxed) {
+        println!(
+            "  [store] ЗАПИСЬ ОТКАЗАНА ({} раз) — коммит не состоялся, на диске прежнее \
+             консистентное поколение",
+            failed_writes,
+        );
+    }
 }
 
 // ─── group commit (Веха 33) ──────────────────────────────────────────────────
@@ -189,7 +224,9 @@ pub fn commit_if_dirty() {
     }
     s.commit(&mut Disk);
     let generation = s.generation();
+    let (bad_r, bad_w) = (s.corrupt_reads(), s.failed_writes());
     drop(s);
+    report_integrity(bad_r, bad_w);
     FIRST_DIRTY_TICK.store(0, Ordering::Relaxed);
     println!(
         "  [store] синк при простое: {} операций одним коммитом → поколение {}",

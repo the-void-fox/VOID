@@ -137,6 +137,13 @@ pub struct Store {
     need_base: bool,
     /// Всего байт записано на носитель за сессию (статистика для честных замеров).
     bytes_written: u64,
+    /// Веха 89 — сколько раз кадр с диска НЕ сошёлся со своим content-id (или носитель не отдал
+    /// сектор). Ненулевое значение = носитель врёт или портит; объект при этом не подменяется
+    /// мусором, а считается недоступным ([`Store::ensure_loaded`]).
+    corrupt_reads: u64,
+    /// Веха 89 — сколько записей носитель не принял. Ненулевое значение означает, что коммит
+    /// НЕ состоялся целиком, и на диске осталось прежнее консистентное состояние.
+    failed_writes: u64,
 }
 
 impl Store {
@@ -154,7 +161,20 @@ impl Store {
             last_roots_id: None,
             need_base: true, // первый коммит пустого/нового store — база
             bytes_written: 0,
+            corrupt_reads: 0,
+            failed_writes: 0,
         }
+    }
+
+    /// Веха 89 — сколько кадров не сошлись со своим content-id (или не прочитались).
+    /// Ноль — носитель отдавал ровно то, что у него просили.
+    pub fn corrupt_reads(&self) -> u64 {
+        self.corrupt_reads
+    }
+
+    /// Веха 89 — сколько записей носитель отверг за сессию.
+    pub fn failed_writes(&self) -> u64 {
+        self.failed_writes
     }
 
     // ─── объектная модель ────────────────────────────────────────────────────
@@ -268,13 +288,29 @@ impl Store {
 
     /// Подгрузить содержимое объекта в RAM, если оно на диске. Возвращает `true`, если объект
     /// существует и данные доступны.
+    /// Веха 89 — **СВЕРКА ХЭША**. Тезис VOID: «адрес объекта = хэш его содержимого». До этой
+    /// вехи он держался на честном слове носителя: кадр читался с диска и принимался как есть,
+    /// поэтому битый сектор молча становился «объектом», а сбой чтения — объектом из нулей.
+    /// Теперь прочитанный кадр хэшируется и сверяется с `id`; не сошлось (или носитель не отдал
+    /// сектор) — объект считается НЕДОСТУПНЫМ (`false`), а не подменяется мусором. Счётчик
+    /// расхождений виден в [`Store::corrupt_reads`].
+    ///
+    /// Цена — один BLAKE3 по кадру на ПЕРВУЮ загрузку объекта (дальше он в кэше). Это ровно то,
+    /// что store и так считает при `put`, так что порядок величины известен.
     fn ensure_loaded(&mut self, io: &mut impl BlockIo, id: &ContentId) -> bool {
         match self.objects.get(id) {
             None => false,
             Some(o) if o.data.is_some() => true,
             Some(o) => {
                 let (sector, len) = o.disk.expect("объект без данных и без диска");
-                let frame = read_object(io, sector, len as usize);
+                let Some(frame) = read_object(io, sector, len as usize) else {
+                    self.corrupt_reads += 1;
+                    return false;
+                };
+                if ContentId::hash(&frame) != *id {
+                    self.corrupt_reads += 1;
+                    return false;
+                }
                 self.objects.get_mut(id).unwrap().data = Some(decode(&frame));
                 true
             }
@@ -392,7 +428,10 @@ impl Store {
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut cur = (get_u32(sb, SB_IDX_SECTOR), get_u32(sb, SB_IDX_LEN));
         while cur.0 != 0 {
-            let frame = read_object(io, cur.0, cur.1 as usize);
+            let Some(frame) = read_object(io, cur.0, cur.1 as usize) else {
+                self.corrupt_reads += 1;
+                break; // носитель не отдал кадр — дальше цепочку не читаем
+            };
             if frame.len() < 12 {
                 break; // повреждённый кадр — дальше цепочку не читаем
             }
@@ -458,7 +497,10 @@ impl Store {
         let sectors = count.div_ceil(ENTRIES_PER_SECTOR_V1);
         for si in 0..sectors {
             let mut buf = [0u8; SECTOR];
-            io.read(idx_start + si as u64, &mut buf);
+            if !io.read(idx_start + si as u64, &mut buf) {
+                self.corrupt_reads += 1;
+                break; // индекс v1 не дочитался — мигрируем тем, что успели разобрать
+            }
             for e in 0..ENTRIES_PER_SECTOR_V1 {
                 let gi = si * ENTRIES_PER_SECTOR_V1 + e;
                 if gi >= count {
@@ -532,11 +574,20 @@ impl Store {
             let d = self.objects[&id].data.as_ref().expect("объект без данных и без диска");
             let frame = encode(&d.payload, &d.children);
             let sector = self.next_free;
-            write_object(io, sector, &frame);
+            // Веха 89: носитель отказал — коммит НЕ состоялся. Выходим до записи суперблока,
+            // значит на диске остаётся прежнее консистентное состояние, а объекты остаются
+            // «не на диске» и уедут следующим коммитом. Отметки `disk` тут не ставим вовсе —
+            // иначе недописанный объект считался бы зафиксированным и потерялся.
+            if !write_object(io, sector, &frame) {
+                self.failed_writes += 1;
+                return;
+            }
             self.bytes_written += frame.len().div_ceil(SECTOR) as u64 * SECTOR as u64;
             self.next_free += frame.len().div_ceil(SECTOR) as u32;
-            self.objects.get_mut(&id).unwrap().disk = Some((sector, frame.len() as u32));
             delta.push((id, sector, frame.len() as u32));
+        }
+        for (id, sector, len) in &delta {
+            self.objects.get_mut(id).unwrap().disk = Some((*sector, *len));
         }
 
         // 2) Индекс-кадр: дельта (новые записи + надгробия) со ссылкой на предыдущий, либо
@@ -560,7 +611,7 @@ impl Store {
             // закончиться «жив» — remove, потом insert.
             let mut v: Vec<(ContentId, u32, u32)> =
                 self.pending_dead.iter().map(|(id, len)| (*id, TOMBSTONE, *len)).collect();
-            v.extend(delta);
+            v.extend(delta.iter().copied());
             v
         };
         frame.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -570,7 +621,14 @@ impl Store {
             frame.extend_from_slice(&len.to_le_bytes());
         }
         let idx_sector = self.next_free;
-        write_object(io, idx_sector, &frame);
+        if !write_object(io, idx_sector, &frame) {
+            // Индекс не лёг — откатить отметки «кадр на диске»: без записи в индексе следующий
+            // коммит обязан записать эти объекты заново, иначе они потеряются. Сами кадры
+            // останутся в области объектов мусором — его подберёт `compact`.
+            self.failed_writes += 1;
+            self.rollback_delta(&delta);
+            return;
+        }
         self.bytes_written += frame.len().div_ceil(SECTOR) as u64 * SECTOR as u64;
         self.next_free += frame.len().div_ceil(SECTOR) as u32;
 
@@ -585,7 +643,13 @@ impl Store {
         put_u64(&mut sb, SB_GARBAGE, self.garbage);
         put_u32(&mut sb, SB_ROOTS_PRESENT, 1);
         sb[SB_ROOTS_ID..SB_ROOTS_ID + 32].copy_from_slice(&roots_id.0);
-        io.write(SB_SECTOR, &sb);
+        // Точка коммита. Не легла — на диске осталось ПРЕЖНЕЕ поколение целиком, поэтому
+        // откатываем ровно то же, что и при сбое индекса.
+        if !io.write(SB_SECTOR, &sb) {
+            self.failed_writes += 1;
+            self.rollback_delta(&delta);
+            return;
+        }
         self.bytes_written += SECTOR as u64;
 
         self.generation = generation;
@@ -595,6 +659,17 @@ impl Store {
         self.pending_dead.clear();
         self.dirty_ops = 0;
         self.need_base = false;
+    }
+
+    /// Веха 89 — снять отметки «кадр на диске» с объектов незавершённого коммита: их кадры
+    /// записаны, но в индекс не попали, значит для формата их нет. Следующий коммит запишет
+    /// заново (кадры-сироты станут мусором и уйдут при `compact`).
+    fn rollback_delta(&mut self, delta: &[(ContentId, u32, u32)]) {
+        for (id, _, _) in delta {
+            if let Some(o) = self.objects.get_mut(id) {
+                o.disk = None;
+            }
+        }
     }
 }
 
@@ -672,28 +747,37 @@ fn deserialize_roots(bytes: &[u8]) -> BTreeMap<String, ContentId> {
 // ─── помощники дисковой (де)сериализации ──────────────────────────────────────
 
 /// Прочитать кадр длиной `len` байт, начиная с сектора `start`.
-fn read_object(io: &mut impl BlockIo, start: u32, len: usize) -> Vec<u8> {
+/// Веха 89: `None` — носитель не отдал хотя бы один сектор. Раньше результат `io.read`
+/// игнорировался, и сбойное чтение молча превращалось в «объект» из мусора или нулей.
+fn read_object(io: &mut impl BlockIo, start: u32, len: usize) -> Option<Vec<u8>> {
     let sectors = len.div_ceil(SECTOR);
     let mut out = Vec::with_capacity(sectors * SECTOR);
     for i in 0..sectors {
         let mut buf = [0u8; SECTOR];
-        io.read(start as u64 + i as u64, &mut buf);
+        if !io.read(start as u64 + i as u64, &mut buf) {
+            return None;
+        }
         out.extend_from_slice(&buf);
     }
     out.truncate(len);
-    out
+    Some(out)
 }
 
 /// Записать кадр, начиная с сектора `start` (последний сектор дополняется нулями).
-fn write_object(io: &mut impl BlockIo, start: u32, bytes: &[u8]) {
+/// Веха 89: `false` — носитель не принял хотя бы один сектор (раньше терялось молча).
+#[must_use]
+fn write_object(io: &mut impl BlockIo, start: u32, bytes: &[u8]) -> bool {
     let sectors = bytes.len().div_ceil(SECTOR);
     for i in 0..sectors {
         let mut buf = [0u8; SECTOR];
         let off = i * SECTOR;
         let end = (off + SECTOR).min(bytes.len());
         buf[..end - off].copy_from_slice(&bytes[off..end]);
-        io.write(start as u64 + i as u64, &buf);
+        if !io.write(start as u64 + i as u64, &buf) {
+            return false;
+        }
     }
+    true
 }
 
 fn put_u32(buf: &mut [u8], off: usize, v: u32) {
