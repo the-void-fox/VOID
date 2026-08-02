@@ -442,6 +442,20 @@ pub fn set_env(pid: usize, env: &[u8]) {
     TABLE.lock().procs[pid].env = Vec::from(env);
 }
 
+/// Веха 92: дописать аргумент в argv процесса до запуска (`SYS_ARGS(0)` его увидит).
+/// Так конфиг системы задаёт сервису НАСТРОЙКИ, а не только права: `arg:ip=10.0.2.15/24`.
+/// `false` — не влез в [`ARGS_MAX`] (вызывающий предупредит; argv остаётся целым).
+pub fn push_arg(pid: usize, arg: &str) -> bool {
+    let mut t = TABLE.lock();
+    let p = &mut t.procs[pid];
+    if p.args.len() + arg.len() + 1 > ARGS_MAX {
+        return false;
+    }
+    p.args.extend_from_slice(arg.as_bytes());
+    p.args.push(0);
+    true
+}
+
 /// Веха 30: добавить стартовый capability (биты дескриптора, уже смещённого В ДОМЕН процесса)
 /// в таблицу преоткрытых прав. Процесс перечисляет её `SYS_STARTCAP(i)`, дети наследуют
 /// копиями при `SYS_EXEC`. Регистры `a0`/`a1` остаются быстрым путём для первых двух прав.

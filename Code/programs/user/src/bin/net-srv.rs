@@ -7,32 +7,39 @@
 //! поэтому стек — **vendored smoltcp** с прибитой версией, а наш код сведён к мосту
 //! ([`sys::net_phy`]) и политике.
 //!
-//! Адреса пока статические (SLIRP QEMU): мы 10.0.2.15/24, шлюз 10.0.2.2, DNS 10.0.2.3.
-//! DHCP придёт Вехой 92, TCP — Вехой 93.
+//! **Веха 92 — адрес больше не зашит.** Сервер поднимается БЕЗ адреса и спрашивает его у сети
+//! (DHCPv4): адрес/маска, шлюз и DNS приходят от роутера. Статика осталась запасным путём и
+//! настраивается в конфиге системы аргументами (`arg:` в `.vv`, см. [[vvsh-config-layout]]):
+//! `dhcp=off`, `ip=A.B.C.D/NN`, `gw=A.B.C.D`, `dns=A.B.C.D`. Значения по умолчанию — под SLIRP
+//! QEMU (10.0.2.15/24, шлюз 10.0.2.2, DNS 10.0.2.3), чтобы демо работало и без DHCP.
 //!
-//! Протокол IPC (клиент → сервер) не менялся — vvsh и `ping` работают как раньше:
-//! op = OP_PING, нагрузка = 4 байта IPv4; ответ 5 байт `[status(1) | rtt_us(u32 LE)]`,
-//! status 0 — ok, 1 — адрес не разрешился, 2 — нет ответа, 3 — карты нет.
+//! Отдельная UDP-проверка Вехи 90 отсюда УБРАНА: сам DHCP — это UDP туда и обратно, причём с
+//! широковещанием и без готового адреса. Если аренда получена, транспорт доказан делом, а не
+//! отдельным зондом.
+//!
+//! Протокол IPC (клиент → сервер), ответ всегда 5 байт `[status(1) | payload(4)]`:
+//! - `OP_PING`  — нагрузка 4 байта IPv4; payload = RTT в мкс. status 0 — ok, 1 — адрес не
+//!   разрешился, 2 — нет ответа, 3 — карты нет.
+//! - `OP_RESOLVE` (Веха 92) — нагрузка = имя (UTF-8, без завершающего NUL); payload = A-запись.
+//!   status 0 — ok, 1 — имя не разрешилось (NXDOMAIN/нет DNS), 2 — нет ответа за отведённое
+//!   время, 3 — карты нет / негодный запрос.
 
 #![no_std]
 #![no_main]
 
 use void_user as sys;
 
-use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::socket::{icmp, udp};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::socket::{dhcpv4, dns, icmp};
 use smoltcp::storage::PacketMetadata;
+use smoltcp::time::Duration;
 use smoltcp::wire::{
-    EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    DnsQueryType, EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    Ipv4Cidr,
 };
 
 const OP_PING: usize = 0;
-
-const OUR_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
-const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
-/// DNS-сервер SLIRP. Веха 90 использует его как мишень UDP-проверки: он отвечает, не выходя за
-/// пределы QEMU, поэтому демо самодостаточно (полноценный DNS-резолвер — Веха 92).
-const DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
+const OP_RESOLVE: usize = 1;
 
 /// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы.
 const PING_IDENT: u16 = 0x1D0;
@@ -43,30 +50,127 @@ const PING_IDENT: u16 = 0x1D0;
 /// такой запрос и делает, поэтому следующая операция к НОВОМУ адресу молчит почти всю эту
 /// секунду. Бюджет ровно в 1 с давал ложное «нет ответа» — на диагностику этого ушёл целый заход
 /// с дампом трафика: в дампе не было даже ARP.
-const RESOLVE_MS: i64 = 3000;
+const RESOLVE_MS: u64 = 3000;
+
+/// Бюджет DNS-запроса: дольше пинга, потому что путь длиннее (запрос уходит за пределы машины)
+/// и smoltcp сам ретранслирует по своему таймеру.
+const DNS_MS: u64 = 5000;
+
+/// Сколько ждать аренду ПРИ ЗАГРУЗКЕ, прежде чем печатать баннер и падать на статику. Это
+/// бюджет БАННЕРА, а не DHCP: сокет остаётся в наборе и продолжает пытаться в рабочем цикле —
+/// поздняя аренда просто применится позже (и заменит статику).
+const DHCP_BOOT_MS: u64 = 6000;
+
+/// Настройки сервера: значения по умолчанию + то, что переопределил конфиг системы.
+struct Cfg {
+    dhcp: bool,
+    cidr: Ipv4Cidr,
+    gw: Option<Ipv4Address>,
+    dns: Option<Ipv4Address>,
+}
+
+impl Cfg {
+    /// Умолчания под SLIRP QEMU — они же запасной путь, если DHCP молчит.
+    fn new() -> Self {
+        Self {
+            dhcp: true,
+            cidr: Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24),
+            gw: Some(Ipv4Address::new(10, 0, 2, 2)),
+            dns: Some(Ipv4Address::new(10, 0, 2, 3)),
+        }
+    }
+
+    /// Разобрать argv (`SYS_ARGS(0)`, записи через NUL; [0] — имя программы).
+    fn from_args() -> Self {
+        let mut cfg = Cfg::new();
+        let mut buf = [0u8; 512];
+        let n = sys::args(&mut buf);
+        for (i, tok) in buf[..n].split(|&b| b == 0).enumerate() {
+            if i == 0 || tok.is_empty() {
+                continue; // argv[0] — имя программы
+            }
+            let Some(eq) = tok.iter().position(|&b| b == b'=') else {
+                warn_arg(tok);
+                continue;
+            };
+            let (key, val) = (&tok[..eq], &tok[eq + 1..]);
+            let ok = match key {
+                b"dhcp" => match val {
+                    b"off" | b"no" => {
+                        cfg.dhcp = false;
+                        true
+                    }
+                    b"on" | b"yes" => {
+                        cfg.dhcp = true;
+                        true
+                    }
+                    _ => false,
+                },
+                b"ip" => match parse_cidr(val) {
+                    Some(c) => {
+                        cfg.cidr = c;
+                        true
+                    }
+                    None => false,
+                },
+                b"gw" if matches!(val, b"none") => {
+                    cfg.gw = None;
+                    true
+                }
+                b"gw" => match parse_ipv4(val) {
+                    Some(a) => {
+                        cfg.gw = Some(a);
+                        true
+                    }
+                    None => false,
+                },
+                b"dns" if matches!(val, b"none") => {
+                    cfg.dns = None;
+                    true
+                }
+                b"dns" => match parse_ipv4(val) {
+                    Some(a) => {
+                        cfg.dns = Some(a);
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            };
+            if !ok {
+                warn_arg(tok);
+            }
+        }
+        cfg
+    }
+}
+
+fn warn_arg(tok: &[u8]) {
+    sys::write("[net-srv] не понял аргумент '".as_bytes());
+    sys::write(tok);
+    sys::write("' (жду dhcp=off|on, ip=A.B.C.D/NN, gw=A.B.C.D, dns=A.B.C.D)\n".as_bytes());
+}
 
 #[no_mangle]
 pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     let mut mac = [0u8; 6];
     if sys::net_mac(dev_cap, &mut mac) != 0 {
-        // Карты нет — сервер всё равно поднимается, ping'и вернут status=3.
+        // Карты нет — сервер всё равно поднимается, запросы вернут status=3.
         sys::write("[net-srv] карты нет — сеть недоступна\n".as_bytes());
         serve_no_device();
     }
+    let cfg = Cfg::from_args();
 
     sys::write("[net-srv] запущен, MAC ".as_bytes());
     write_mac(&mac);
-    sys::write(b" IP 10.0.2.15 (smoltcp)\n");
+    sys::write(" (smoltcp)\n".as_bytes());
 
     let mut device = sys::net_phy::VoidDevice::new(dev_cap);
     let mut config = Config::new(EthernetAddress(mac).into());
-    // Сид для выбора эфемерных портов/ISN. Часов ещё нет смысла спрашивать — берём тики.
+    // Сид для выбора эфемерных портов/ISN и XID у DHCP. Часов ещё нет смысла спрашивать — тики.
     config.random_seed = sys::now() as u64;
+    // Интерфейс поднимается БЕЗ адреса: его либо назовёт DHCP, либо поставим статикой ниже.
     let mut iface = Interface::new(config, &mut device, sys::net_phy::now());
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(OUR_IP), 24));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY);
 
     // Сокеты и их буферы — статические (smoltcp собран без alloc): по одному кадру на сторону.
     let mut rx_meta = [PacketMetadata::EMPTY; 4];
@@ -77,18 +181,22 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
         icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),
     );
-    let mut urx_meta = [udp::PacketMetadata::EMPTY; 4];
-    let mut urx_data = [0u8; 1024];
-    let mut utx_meta = [udp::PacketMetadata::EMPTY; 4];
-    let mut utx_data = [0u8; 1024];
-    let udp_socket = udp::Socket::new(
-        udp::PacketBuffer::new(&mut urx_meta[..], &mut urx_data[..]),
-        udp::PacketBuffer::new(&mut utx_meta[..], &mut utx_data[..]),
-    );
+    let mut dhcp_socket = dhcpv4::Socket::new();
+    // Умолчание smoltcp — повтор DISCOVER раз в 10 с; это дольше нашего бюджета на баннер, и
+    // единственный потерянный пакет стоил бы всей загрузки. Два повтора внутри бюджета честнее.
+    let mut retry = dhcp_socket.get_retry_config();
+    retry.discover_timeout = Duration::from_secs(2);
+    dhcp_socket.set_retry_config(retry);
+    // Слоты DNS-запросов: наш протокол синхронный (один запрос — один ответ клиенту), но два
+    // слота стоят копейки и оставляют место повтору, пока прошлый освобождается.
+    let mut queries: [Option<dns::DnsQuery>; 2] = [None, None];
+    let dns_socket = dns::Socket::new(&[], &mut queries[..]);
+
     let mut storage = [SocketStorage::EMPTY; 4];
     let mut sockets = SocketSet::new(&mut storage[..]);
     let icmp_handle = sockets.add(icmp_socket);
-    let udp_handle = sockets.add(udp_socket);
+    let dns_handle = sockets.add(dns_socket);
+    let dhcp_handle = cfg.dhcp.then(|| sockets.add(dhcp_socket));
 
     {
         let s = sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -97,45 +205,61 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         }
     }
 
-    // Самопроверка на каждой загрузке: пингуем шлюз (SLIRP отвечает, не выходя из QEMU).
-    sys::write("[net-srv] самопинг шлюза 10.0.2.2: ".as_bytes());
-    match ping(&mut iface, &mut device, &mut sockets, icmp_handle, GATEWAY) {
-        Ok(rtt) => {
-            sys::write("ответ за ".as_bytes());
-            write_dec(rtt);
-            sys::write(" мкс\n".as_bytes());
+    // Аренда: крутим стек до бюджета, пока DHCP-сокет не объявит конфигурацию.
+    let mut leased = false;
+    if let Some(dh) = dhcp_handle {
+        sys::write("[net-srv] DHCP: спрашиваю адрес у сети\n".as_bytes());
+        let deadline = sys::net_phy::now() + Duration::from_millis(DHCP_BOOT_MS);
+        while sys::net_phy::now() < deadline && !leased {
+            iface.poll(sys::net_phy::now(), &mut device, &mut sockets);
+            if let Some(ev) = poll_dhcp(&mut sockets, dh) {
+                apply_dhcp(&mut iface, &mut sockets, dns_handle, ev, &mut leased);
+            }
         }
-        Err(2) => sys::write("нет ICMP-ответа\n".as_bytes()),
-        Err(_) => sys::write("адрес не разрешился\n".as_bytes()),
+        if !leased {
+            sys::write("[net-srv] DHCP: никто не ответил — беру статику\n".as_bytes());
+        }
+    }
+    if !leased {
+        apply_static(&mut iface, &mut sockets, dns_handle, &cfg);
     }
 
-    // Веха 90 — проверка UDP: ICMP доказывает, что стек живой, но не что работает транспорт.
-    // Шлём настоящий DNS-запрос A-записи и ждём ответ — это полный путь UDP туда и обратно.
-    sys::write("[net-srv] UDP-проверка (DNS-запрос к 10.0.2.3): ".as_bytes());
-    match udp_probe(&mut iface, &mut device, &mut sockets, udp_handle) {
-        Ok(n) => {
-            sys::write("ответ ".as_bytes());
-            write_dec(n);
-            sys::write(" байт — UDP работает\n".as_bytes());
+    // Самопроверка на каждой загрузке: пингуем шлюз (в QEMU это SLIRP — не выходя за его пределы).
+    if let Some(gw) = default_gateway(&mut iface) {
+        sys::write("[net-srv] самопинг шлюза ".as_bytes());
+        write_ipv4(gw);
+        sys::write(": ".as_bytes());
+        match ping(&mut iface, &mut device, &mut sockets, icmp_handle, gw) {
+            Ok(rtt) => {
+                sys::write("ответ за ".as_bytes());
+                write_dec(rtt);
+                sys::write(" мкс\n".as_bytes());
+            }
+            Err(2) => sys::write("нет ICMP-ответа\n".as_bytes()),
+            Err(_) => sys::write("адрес не разрешился\n".as_bytes()),
         }
-        Err(e) => {
-            sys::write(e.as_bytes());
-            sys::write("\n".as_bytes());
-        }
+    } else {
+        sys::write("[net-srv] шлюза нет — доступна только локальная сеть\n".as_bytes());
     }
 
     // Серверный цикл (Веха 90 — РЕАКТОР): стек прокачивается постоянно, а IPC разбирается между
     // тиками неблокирующим приёмом. До этого сервер стоял в блокирующем `recv`, и стек тикал
     // только внутри `ping` — для ICMP сходило, для TCP (Веха 93) не сойдёт: ретрансмиссии и
     // таймеры требуют, чтобы `poll` звался всегда, а не когда кто-то попросил.
-    // Опрос временный: ждать СРАЗУ кадра и сообщения научит Веха 91 (пока это жжёт CPU).
-    let mut req = [0u8; 64];
+    let mut req = [0u8; 256];
     loop {
         let busy = iface.poll(sys::net_phy::now(), &mut device, &mut sockets);
+        // Веха 92: аренда не вечна. Роутер может продлить её с ДРУГИМ адресом или отобрать —
+        // сокет скажет об этом здесь, и интерфейс переедет на ходу.
+        if let Some(dh) = dhcp_handle {
+            if let Some(ev) = poll_dhcp(&mut sockets, dh) {
+                apply_dhcp(&mut iface, &mut sockets, dns_handle, ev, &mut leased);
+            }
+        }
         // Веха 91 — СОН ВМЕСТО ОПРОСА. Спим в самом `SYS_RECV` (режим с дедлайном): пока никто
         // не зовёт и стеку нечего делать, процесс не занимает процессор вовсе — он заблокирован
         // ядром, а не крутит цикл. Момент пробуждения называет САМ стек: `poll_at` — это время
-        // ближайшего таймера (ретрансмиссия, ARP-повтор); проспать его нельзя, иначе TCP встанет.
+        // ближайшего таймера (ретрансмиссия, ARP-повтор, продление аренды); проспать его нельзя.
         //
         // Веха 91 (часть 2): сон снимают ТРИ события - запрос клиента, приход кадра (прерывание
         // карты) или названный стеком срок. Прежний потолок в 20 мс был нужен лишь потому, что
@@ -157,20 +281,189 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
             continue;
         };
         let mut rep = [0u8; 5];
-        if m.op == OP_PING && m.len >= 4 {
-            let target = Ipv4Address::new(req[0], req[1], req[2], req[3]);
-            match ping(&mut iface, &mut device, &mut sockets, icmp_handle, target) {
-                Ok(rtt) => {
-                    rep[0] = 0;
-                    rep[1..5].copy_from_slice(&(rtt as u32).to_le_bytes());
+        match m.op {
+            OP_PING if m.len >= 4 => {
+                let target = Ipv4Address::new(req[0], req[1], req[2], req[3]);
+                match ping(&mut iface, &mut device, &mut sockets, icmp_handle, target) {
+                    Ok(rtt) => {
+                        rep[0] = 0;
+                        rep[1..5].copy_from_slice(&(rtt as u32).to_le_bytes());
+                    }
+                    Err(code) => rep[0] = code,
                 }
-                Err(code) => rep[0] = code,
             }
-        } else {
-            rep[0] = 3;
+            OP_RESOLVE if m.len > 0 && m.len <= req.len() => {
+                match core::str::from_utf8(&req[..m.len]) {
+                    Ok(name) => {
+                        match resolve(&mut iface, &mut device, &mut sockets, dns_handle, name) {
+                            Ok(addr) => {
+                                rep[0] = 0;
+                                rep[1..5].copy_from_slice(&addr.octets());
+                            }
+                            Err(code) => rep[0] = code,
+                        }
+                    }
+                    Err(_) => rep[0] = 3,
+                }
+            }
+            _ => rep[0] = 3,
         }
         sys::reply(m.reply_cap, &rep);
     }
+}
+
+/// Аренда DHCP в виде, который переживает снятие заимствования с сокета. `Event` держит
+/// `&mut` на сам сокет, а применять конфигурацию надо к интерфейсу и DNS-сокету — то есть
+/// снова к `SocketSet`. Поэтому нужное копируется здесь и заимствование отпускается.
+enum Lease {
+    Lost,
+    Got {
+        cidr: Ipv4Cidr,
+        router: Option<Ipv4Address>,
+        dns: Option<Ipv4Address>,
+    },
+}
+
+fn poll_dhcp(sockets: &mut SocketSet, handle: SocketHandle) -> Option<Lease> {
+    match sockets.get_mut::<dhcpv4::Socket>(handle).poll()? {
+        dhcpv4::Event::Deconfigured => Some(Lease::Lost),
+        dhcpv4::Event::Configured(c) => Some(Lease::Got {
+            cidr: c.address,
+            router: c.router,
+            dns: c.dns_servers.first().copied(),
+        }),
+    }
+}
+
+/// Применить событие DHCP; `have_addr` — держим ли мы сейчас адрес от DHCP.
+///
+/// Флаг нужен не для красоты: только что созданный сокет держит «конфигурация изменилась»
+/// взведённым, поэтому ПЕРВЫЙ же `poll` отдаёт `Deconfigured` — состояние «адреса ещё нет».
+/// Без флага загрузка честной системы начиналась бы со строки «аренда истекла», которой не
+/// было. Сообщать надо о потере, а не о том, что мы ещё не начинали.
+fn apply_dhcp(
+    iface: &mut Interface,
+    sockets: &mut SocketSet,
+    dns_handle: SocketHandle,
+    lease: Lease,
+    have_addr: &mut bool,
+) {
+    match lease {
+        Lease::Lost => {
+            if *have_addr {
+                sys::write("[net-srv] DHCP: аренда истекла — адреса нет\n".as_bytes());
+                iface.update_ip_addrs(|a| a.clear());
+                iface.routes_mut().remove_default_ipv4_route();
+                *have_addr = false;
+            }
+        }
+        Lease::Got { cidr, router, dns } => {
+            set_addr(iface, cidr);
+            match router {
+                Some(r) => {
+                    let _ = iface.routes_mut().add_default_ipv4_route(r);
+                }
+                None => {
+                    iface.routes_mut().remove_default_ipv4_route();
+                }
+            }
+            set_dns(sockets, dns_handle, dns);
+            sys::write("[net-srv] DHCP: адрес ".as_bytes());
+            write_cidr(cidr);
+            if let Some(r) = router {
+                sys::write(", шлюз ".as_bytes());
+                write_ipv4(r);
+            }
+            if let Some(d) = dns {
+                sys::write(", DNS ".as_bytes());
+                write_ipv4(d);
+            }
+            sys::write("\n".as_bytes());
+            *have_addr = true;
+        }
+    }
+}
+
+/// Запасной путь: адрес/шлюз/DNS из конфига системы (или зашитых умолчаний).
+fn apply_static(iface: &mut Interface, sockets: &mut SocketSet, dns_handle: SocketHandle, cfg: &Cfg) {
+    set_addr(iface, cfg.cidr);
+    if let Some(gw) = cfg.gw {
+        let _ = iface.routes_mut().add_default_ipv4_route(gw);
+    }
+    set_dns(sockets, dns_handle, cfg.dns);
+    sys::write("[net-srv] статика: адрес ".as_bytes());
+    write_cidr(cfg.cidr);
+    if let Some(gw) = cfg.gw {
+        sys::write(", шлюз ".as_bytes());
+        write_ipv4(gw);
+    }
+    if let Some(d) = cfg.dns {
+        sys::write(", DNS ".as_bytes());
+        write_ipv4(d);
+    }
+    sys::write("\n".as_bytes());
+}
+
+fn set_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        let _ = addrs.push(IpCidr::Ipv4(cidr));
+    });
+}
+
+fn set_dns(sockets: &mut SocketSet, handle: SocketHandle, server: Option<Ipv4Address>) {
+    let s = sockets.get_mut::<dns::Socket>(handle);
+    match server {
+        Some(a) => s.update_servers(&[IpAddress::Ipv4(a)]),
+        None => s.update_servers(&[]),
+    }
+}
+
+/// Текущий шлюз по умолчанию (для самопинга). Читается из таблицы маршрутов, а не из конфига:
+/// после DHCP он мог смениться.
+fn default_gateway(iface: &mut Interface) -> Option<Ipv4Address> {
+    match iface.routes_mut().get_default_ipv4_route()?.via_router {
+        IpAddress::Ipv4(v4) => Some(v4),
+    }
+}
+
+/// Веха 92 — разрешить имя в A-запись через DNS-сокет smoltcp. Возвращает адрес либо код
+/// (1 — имя не разрешилось / DNS-сервер неизвестен, 2 — не ответил за [`DNS_MS`]).
+///
+/// Запрос асинхронный: `start_query` только заводит слот, а сам обмен делает `iface.poll`.
+/// Поэтому здесь тот же приём, что в `ping` — крутим стек до дедлайна. Клиент всё это время
+/// стоит в `SYS_CALL`, то есть ждёт ровно свой запрос, а не общий цикл сервера.
+fn resolve(
+    iface: &mut Interface,
+    device: &mut sys::net_phy::VoidDevice,
+    sockets: &mut SocketSet,
+    handle: SocketHandle,
+    name: &str,
+) -> Result<Ipv4Address, u8> {
+    let query = {
+        let cx = iface.context();
+        let s = sockets.get_mut::<dns::Socket>(handle);
+        s.start_query(cx, name, DnsQueryType::A).map_err(|_| 1u8)?
+    };
+    let deadline = sys::net_phy::now() + Duration::from_millis(DNS_MS);
+    while sys::net_phy::now() < deadline {
+        iface.poll(sys::net_phy::now(), device, sockets);
+        match sockets.get_mut::<dns::Socket>(handle).get_query_result(query) {
+            // Слот уже освобождён самим `get_query_result` — второй раз его трогать нельзя.
+            Ok(addrs) => {
+                return addrs
+                    .iter()
+                    .find_map(|a| match a {
+                        IpAddress::Ipv4(v4) => Some(*v4),
+                    })
+                    .ok_or(1)
+            }
+            Err(dns::GetQueryResultError::Failed) => return Err(1),
+            Err(dns::GetQueryResultError::Pending) => {}
+        }
+    }
+    sockets.get_mut::<dns::Socket>(handle).cancel_query(query);
+    Err(2)
 }
 
 /// Один echo-запрос с замером RTT. Возвращает микросекунды либо код ошибки
@@ -182,11 +475,11 @@ fn ping(
     iface: &mut Interface,
     device: &mut sys::net_phy::VoidDevice,
     sockets: &mut SocketSet,
-    handle: smoltcp::iface::SocketHandle,
+    handle: SocketHandle,
     target: Ipv4Address,
 ) -> Result<usize, u8> {
     let started = sys::now();
-    let deadline = sys::net_phy::now() + smoltcp::time::Duration::from_millis(RESOLVE_MS as u64);
+    let deadline = sys::net_phy::now() + Duration::from_millis(RESOLVE_MS);
 
     // 1) Отправить. `can_send` станет истинным не сразу: smoltcp сперва разрешит адрес по ARP,
     //    а до этого места в очереди нет — поэтому крутим poll до дедлайна.
@@ -220,50 +513,6 @@ fn ping(
     Err(2)
 }
 
-/// Веха 90 — доказать UDP: минимальный DNS-запрос A-записи `example.com` к серверу SLIRP и
-/// ожидание ответа. Возвращает длину ответа либо причину. Полноценного разбора DNS тут нет и не
-/// нужно — проверяется ТРАНСПОРТ (запрос ушёл, ответ пришёл на наш порт); резолвер — Веха 92.
-fn udp_probe(
-    iface: &mut Interface,
-    device: &mut sys::net_phy::VoidDevice,
-    sockets: &mut SocketSet,
-    handle: smoltcp::iface::SocketHandle,
-) -> Result<usize, &'static str> {
-    // Заголовок DNS: id=0x7601, RD=1, 1 вопрос. Дальше QNAME (7"example" 3"com" 0), QTYPE=A,
-    // QCLASS=IN. Собран вручную — ради одной проверки тащить парсер незачем.
-    const QUERY: &[u8] = &[
-        0x76, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
-        0x00, 0x01, 0x00, 0x01,
-    ];
-    {
-        let s = sockets.get_mut::<udp::Socket>(handle);
-        if s.bind(49152).is_err() {
-            return Err("не удалось занять порт");
-        }
-    }
-    let deadline = sys::net_phy::now() + smoltcp::time::Duration::from_millis(RESOLVE_MS as u64);
-    let target = IpEndpoint::new(IpAddress::Ipv4(DNS), 53);
-    let mut sent = false;
-    while sys::net_phy::now() < deadline {
-        iface.poll(sys::net_phy::now(), device, sockets);
-        let s = sockets.get_mut::<udp::Socket>(handle);
-        if !sent && s.can_send() {
-            match s.send_slice(QUERY, target) {
-                Ok(()) => sent = true,
-                Err(_) => return Err("сокет отказал в отправке")
-            }
-        }
-        if sent && s.can_recv() {
-            let n = s.recv().map(|(data, _)| data.len()).unwrap_or(0);
-            s.close();
-            return Ok(n);
-        }
-    }
-    sockets.get_mut::<udp::Socket>(handle).close();
-    if sent { Err("нет ответа на DNS-запрос") } else { Err("не удалось отправить") }
-}
-
 /// Возможности устройства по контрольным суммам — нужны `Icmpv4Repr::emit`.
 fn device_checksum(
     device: &sys::net_phy::VoidDevice,
@@ -274,11 +523,67 @@ fn device_checksum(
 
 /// Карты нет: обслуживаем IPC, честно отвечая status=3 (система от этого не встаёт).
 fn serve_no_device() -> ! {
-    let mut req = [0u8; 64];
+    let mut req = [0u8; 256];
     loop {
         let m = sys::recv(&mut req);
         sys::reply(m.reply_cap, &[3u8, 0, 0, 0, 0]);
     }
+}
+
+/// Разобрать «A.B.C.D» (ровно четыре октета).
+fn parse_ipv4(s: &[u8]) -> Option<Ipv4Address> {
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    let mut val: u32 = 0;
+    let mut digits = 0;
+    for &b in s {
+        if b == b'.' {
+            if digits == 0 || idx >= 3 {
+                return None;
+            }
+            octets[idx] = val as u8;
+            idx += 1;
+            val = 0;
+            digits = 0;
+        } else if b.is_ascii_digit() {
+            val = val * 10 + (b - b'0') as u32;
+            if val > 255 {
+                return None;
+            }
+            digits += 1;
+        } else {
+            return None;
+        }
+    }
+    if idx != 3 || digits == 0 {
+        return None;
+    }
+    octets[3] = val as u8;
+    Some(Ipv4Address::from(octets))
+}
+
+/// Разобрать «A.B.C.D/NN» (без `/NN` — маска /24, как в домашних сетях).
+fn parse_cidr(s: &[u8]) -> Option<Ipv4Cidr> {
+    let (addr, prefix) = match s.iter().position(|&b| b == b'/') {
+        Some(i) => {
+            let mut n: u32 = 0;
+            if s[i + 1..].is_empty() {
+                return None;
+            }
+            for &b in &s[i + 1..] {
+                if !b.is_ascii_digit() {
+                    return None;
+                }
+                n = n * 10 + (b - b'0') as u32;
+                if n > 32 {
+                    return None;
+                }
+            }
+            (&s[..i], n as u8)
+        }
+        None => (s, 24),
+    };
+    Some(Ipv4Cidr::new(parse_ipv4(addr)?, prefix))
 }
 
 fn write_mac(mac: &[u8; 6]) {
@@ -292,6 +597,21 @@ fn write_mac(mac: &[u8; 6]) {
         }
     }
     sys::write(&out);
+}
+
+fn write_ipv4(a: Ipv4Address) {
+    for (i, o) in a.octets().iter().enumerate() {
+        if i > 0 {
+            sys::write(b".");
+        }
+        write_dec(*o as usize);
+    }
+}
+
+fn write_cidr(c: Ipv4Cidr) {
+    write_ipv4(c.address());
+    sys::write(b"/");
+    write_dec(c.prefix_len() as usize);
 }
 
 fn write_dec(mut v: usize) {

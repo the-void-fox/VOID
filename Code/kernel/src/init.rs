@@ -17,6 +17,8 @@
 //! Токены прав: `store:RWX`, `dev:net:RW`, `dev:block:RW`, `endpoint:ИМЯ[:S]` (по умолчанию SEND),
 //! `env` (передать ARCH/SYSTEM). Буквы прав: `r`=READ `w`=WRITE `x`=EXEC `s`=SEND `g`=GRANT.
 //! Права по порядку → `a0`, `a1`, и все → таблица стартовых capability (как контракт Вехи 30).
+//! Отдельно от прав — `arg:СТРОКА` (Веха 92): настройка сервиса, уходит в его argv
+//! (`service net-srv dev:net:rw arg:dhcp=off arg:ip=10.0.2.15/24`).
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -165,9 +167,19 @@ fn apply(config: &str) {
         // Права по порядку: собрать дескрипторы, разложить в a0/a1 + стартовую таблицу.
         let mut caps: Vec<usize> = Vec::new();
         let mut want_env = false;
+        let mut nargs = 0usize;
         for t in tok {
             if t == "env" {
                 want_env = true;
+            } else if let Some(a) = t.strip_prefix("arg:") {
+                // Веха 92: НЕ capability, а настройка — уходит в argv процесса. Права отвечают
+                // на «что процессу можно», аргументы — на «как ему себя вести»; смешивать их в
+                // одном токене было бы враньём про cap-модель.
+                if proc::push_arg(pid, a) {
+                    nargs += 1;
+                } else {
+                    println!("  [init] arg:{} — argv переполнен (пропуск)", a);
+                }
             } else if let Some(bits) = mint_cap(pid, t, &services) {
                 caps.push(bits);
             }
@@ -185,9 +197,10 @@ fn apply(config: &str) {
             proc::set_env(pid, env.as_bytes());
         }
         println!(
-            "  [init] {} P{} '{}' — прав {}{}",
+            "  [init] {} P{} '{}' — прав {}{}{}",
             kind, pid, name, caps.len(),
             if want_env { " +env" } else { "" },
+            if nargs > 0 { " +args" } else { "" },
         );
         if kind == "service" {
             services.push((name.to_string(), pid));

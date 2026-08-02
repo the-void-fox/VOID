@@ -626,6 +626,7 @@ fn shell_env() -> Env {
         ("tail", sh_tail),
         ("mv", sh_mv),
         ("ping", sh_ping),
+        ("resolve", sh_resolve), // Веха 92 — DNS
         ("thaw", sh_thaw),
         ("switch", sh_switch),
         ("sysdef", sh_sysdef),
@@ -828,6 +829,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"run NAME", "запустить программу из store (или просто NAME)");
     help_row(b"thaw NAME", "разморозить процесс из образа");
     help_row(b"ping IP", "ICMP-пинг адреса A.B.C.D");
+    help_row(b"resolve NAME", "DNS: имя → адрес (возвращает строку)");
     help_row(b"roots", "сырые корни store (bin/*, system/*, …)");
     help_row(b"init-config", "посеять /etc/system/*.vv");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
@@ -1045,6 +1047,33 @@ fn sh_ping(args: &[Value]) -> Result<Value, EvalError> {
         Ok(Value::nil())
     } else {
         Err(EvalError::new("ping: нет ответа"))
+    }
+}
+
+/// `(resolve "имя")` — Веха 92: спросить у DNS A-запись имени. ВОЗВРАЩАЕТ строку «A.B.C.D»,
+/// а не печатает: адрес нужен как значение — `(ping (resolve "example.com"))` работает сразу.
+fn sh_resolve(args: &[Value]) -> Result<Value, EvalError> {
+    let name = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(EvalError::new("resolve: (resolve \"имя\")")),
+    };
+    let netep = sys::start_cap(2);
+    if netep == sys::NO_CAP {
+        return Err(EvalError::new("resolve: сети нет (net.vv = #f?)"));
+    }
+    let mut rep = [0u8; 5];
+    let n = sys::call(netep, 1 /* OP_RESOLVE */, name.as_bytes(), &mut rep);
+    if n < 5 {
+        return Err(EvalError::new("resolve: сервер не ответил"));
+    }
+    match rep[0] {
+        0 => Ok(Value::str(&alloc::format!(
+            "{}.{}.{}.{}",
+            rep[1], rep[2], rep[3], rep[4]
+        ))),
+        1 => Err(EvalError::new("resolve: имя не разрешилось")),
+        2 => Err(EvalError::new("resolve: DNS не ответил")),
+        _ => Err(EvalError::new("resolve: сети нет")),
     }
 }
 

@@ -96,15 +96,22 @@ tools/.../void-store-import void-disk.img put программа bin/<arch>/им
 `Obsidian/10-projects/void/notes/uutils.md`. Доставка мостом:
 `put <elf> bin/<arch>/coreutils`, запуск: `run bin/coreutils ls`.
 
-## Сеть (Веха 34)
-Раннеры в `.cargo/config.toml` уже поднимают virtio-net на QEMU SLIRP
-(`-netdev user`, гость `10.0.2.15`, шлюз/DNS `10.0.2.2`/`.3`). Ядро отдаёт лишь
-сырые кадры (`virtio_net.rs`); стек ARP/IPv4/ICMP echo — в userspace-сервере
-`bin/net-srv`, поднимается на загрузке и сам пингует шлюз. Из vsh:
+## Сеть (Веха 34 → Вехи 90–92: стек smoltcp, DHCP, DNS)
+Раннеры в `.cargo/config.toml` уже поднимают virtio-net на QEMU SLIRP (`-netdev user`).
+Ядро отдаёт лишь сырые кадры (`virtio_net.rs`); весь стек — в userspace-сервере `bin/net-srv`
+на **vendored smoltcp** (`programs/user/vendor/`, сборка оффлайн). Адрес НЕ зашит: сервер
+спрашивает его у сети по DHCP и печатает результат на загрузке. Из vvsh:
 ```
-vsh> ping 10.0.2.2      # RTT в мкс; SLIRP отвечает, не выходя из QEMU
+vvsh/> ping 10.0.2.2            # RTT в мкс; SLIRP отвечает, не выходя из QEMU
+vvsh/> resolve example.com      # DNS → A-запись (возвращает строку)
 ```
-Подробности — `Obsidian/10-projects/void/notes/virtio-net.md`.
+Статика — запасной путь, настраивается в `/etc/system/networking.vv` токенами `arg:`
+(`arg:dhcp=off arg:ip=A.B.C.D/NN arg:gw=… arg:dns=…`), затем `rebuild` и ребут.
+
+Проверить, что адрес действительно приходит от сервера, а не совпал с умолчанием, — задать
+QEMU другой пул: `-netdev user,id=net0,net=10.0.2.0/24,dhcpstart=10.0.2.20`.
+
+Подробности — `Obsidian/10-projects/void/notes/net-stack.md` (и `virtio-net.md` про драйвер).
 
 ## Потоки (Веха 35)
 Ядро планирует НИТИ внутри процесса (общее адресное пространство и домен, свой
