@@ -175,6 +175,22 @@ pub fn probe_virtio_net() -> Option<crate::arch::NetDevice> {
     None
 }
 
+/// Найти virtio-rng (device id **4**) среди слотов virtio-mmio. Закрывает долг Вехи 86:
+/// своего аппаратного ГСЧ у QEMU virt нет (`Zkr` не гарантирован), и без этого устройства
+/// вся энтропия riscv держалась на джиттере прерываний.
+pub fn probe_virtio_rng() -> Option<crate::arch::BlkTransport> {
+    const MMIO_BASE: usize = 0x1000_1000;
+    const MMIO_STRIDE: usize = 0x1000;
+    for slot in 0..8 {
+        let base = MMIO_BASE + slot * MMIO_STRIDE;
+        let r = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+        if r(0x000) == 0x7472_6976 && r(0x004) == 2 && r(0x008) == 4 {
+            return Some(crate::arch::BlkTransport::Mmio { base });
+        }
+    }
+    None
+}
+
 // ─── таймер ─────────────────────────────────────────────────────────────────
 
 /// Квант вытеснения: 200_000 тиков при таймбазе 10 МГц (QEMU virt) = 20 мс.

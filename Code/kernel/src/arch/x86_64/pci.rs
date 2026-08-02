@@ -29,6 +29,10 @@ const DEV_BLK_TRANSITIONAL: u16 = 0x1001;
 const DEV_NET_MODERN: u16 = 0x1041;
 const DEV_NET_TRANSITIONAL: u16 = 0x1000;
 
+/// virtio-rng: источник энтропии. Modern id = 0x1040 + 4, legacy — 0x1005.
+const DEV_RNG_MODERN: u16 = 0x1044;
+const DEV_RNG_TRANSITIONAL: u16 = 0x1005;
+
 #[inline]
 fn outl(port: u16, v: u32) {
     unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack)) }
@@ -107,6 +111,19 @@ pub fn probe_virtio_net() -> Option<NetDevice> {
             let transport = setup_transport(dev)?;
             let irq = setup_msix(dev, trap::VEC_NET).then_some(trap::VEC_NET as u32).unwrap_or(0);
             return Some(NetDevice { transport, irq });
+        }
+    }
+    None
+}
+
+/// Найти virtio-rng на PCI. Прерывания ему не заводим: запросы энтропии редкие и синхронные,
+/// драйвер ждёт завершения в used-кольце.
+pub fn probe_virtio_rng() -> Option<BlkTransport> {
+    for dev in 0..32u32 {
+        let id = cfg_r32(dev, 0);
+        let (vendor, device) = (id as u16, (id >> 16) as u16);
+        if vendor == VENDOR_VIRTIO && (device == DEV_RNG_MODERN || device == DEV_RNG_TRANSITIONAL) {
+            return setup_transport(dev);
         }
     }
     None

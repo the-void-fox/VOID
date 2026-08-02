@@ -71,7 +71,10 @@ pub use imp::{
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
     // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49, IRQ — Веха 52)
-    e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, userdrv_irq_arm,
+    e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net,
+    // virtio-rng (долг Вехи 86, закрыт перед 95): аппаратная энтропия от гипервизора
+    probe_virtio_rng,
+    userdrv_irq_arm,
     // разное
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла
