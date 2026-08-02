@@ -219,6 +219,17 @@ pub fn try_recv(buf: &mut [u8]) -> Option<Message> {
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
 }
 
+/// Веха 91 — `SYS_RECV` со СНОМ до дедлайна: `None`, если за `timeout_ticks` запроса не было.
+/// Это «сон вместо опроса» для серверов-реакторов: пока никто не зовёт и делать нечего, процесс
+/// не занимает процессор вовсе, но просыпается к моменту, который назвал сам (у сетевого стека
+/// это `poll_at` — ближайший таймер ретрансмиссии).
+pub fn recv_timeout(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
+    let (op, reply_cap, len, cap) = abi::syscall(
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 2, timeout_ticks, 0, 0, 0,
+    );
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
+}
+
 /// `SYS_CALL` с передачей capability: послать `send` эндпоинту `ep`, ждать ответа в `recv`.
 /// Возвращает (байт ответа | MAX, право из ответа | [`NO_CAP`]). На передаваемое право
 /// (`cap` != NO_CAP) нужен `GRANT` — иначе ядро отклонит весь вызов.

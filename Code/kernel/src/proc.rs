@@ -491,12 +491,15 @@ pub fn run() {
 /// Здесь `sstatus.SIE = 0`, поэтому «потерянного пробуждения» нет: `wfi` просыпается от
 /// PENDING прерывания независимо от SIE, а сам обработчик мы пускаем коротким окном с SIE=1.
 fn wait_stdin(saved_sie: usize) -> bool {
-    let (waiting, irq_waiting): (Vec<usize>, bool) = {
+    let (waiting, irq_waiting, deadline): (Vec<usize>, bool, Option<u64>) = {
         let t = TABLE.lock();
         let w = (0..t.procs.len()).filter(|&i| t.procs[i].state == State::StdinWait).collect();
-        (w, any_irq_waiting(&t)) // Веха 52: сессия жива, пока драйвер ждёт прерывания
+        // Веха 91: ближайший дедлайн спящих по времени (SYS_RECV с таймаутом, futex_wait).
+        // Без него простой был бы «до ввода с консоли», и проснуться по времени было бы нечем.
+        let d = t.procs.iter().filter_map(|p| p.futex_deadline).min();
+        (w, any_irq_waiting(&t), d)
     };
-    if waiting.is_empty() && !irq_waiting {
+    if waiting.is_empty() && !irq_waiting && deadline.is_none() {
         return false;
     }
     // Веха 33: уход в простой — естественная точка синка group commit. Под нагрузкой
@@ -505,8 +508,19 @@ fn wait_stdin(saved_sie: usize) -> bool {
     crate::object::commit_if_dirty();
     // Только внешние прерывания (SEIE): исполнять некого, таймер (STIE) не нужен. IRQ устройств
     // (консоль, а с Вехи 52 — и userspace-драйвера через IOAPIC) ходят через LAPIC и разбудят HLT.
-    arch::irq_mask_stdin(saved_sie);
-    while !arch::console_has_input() && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed) {
+    //
+    // Веха 91 — ИСКЛЮЧЕНИЕ: если кто-то спит ДО СРОКА, таймер нужен, иначе этот срок некому
+    // заметить — процесс проспал бы до случайного нажатия клавиши. Это чинит и давний тихий
+    // изъян `futex_wait` с таймаутом: на полностью холостой системе он не просыпался вовсе.
+    if deadline.is_some() {
+        arch::irq_mask_preempt(saved_sie); // таймер вкл: тик разбудит и вернёт нас в цикл
+    } else {
+        arch::irq_mask_stdin(saved_sie);
+    }
+    while !arch::console_has_input()
+        && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
+        && !deadline.is_some_and(|d| arch::now_ticks() >= d)
+    {
         // Спать до прерывания: проснёмся и от PENDING-прерывания при выключенном SIE.
         arch::wait_for_interrupt();
         // Короткое окно с прерываниями — принять trap: контроллер → консоль → кольцевой буфер;
@@ -524,6 +538,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
         }
     }
     drain_userdrv_irq(&mut t); // Веха 52: пришёл IRQ драйвера — будим ждущих SYS_IRQ_WAIT
+    wake_futex_timeouts(&mut t); // Веха 91: срок вышел — разбудить спавших по времени
     true
 }
 
@@ -583,17 +598,27 @@ fn wake_futex(t: &mut Table, space: usize, uaddr: usize, count: usize) -> usize 
 fn wake_futex_timeouts(t: &mut Table) {
     let now = arch::now_ticks();
     for i in 0..t.procs.len() {
-        if t.procs[i].state == State::FutexWait {
-            if let Some(deadline) = t.procs[i].futex_deadline {
-                if now >= deadline {
-                    let f = &mut t.procs[i].frame;
-                    f.set_ret(1); // 1 — истёк таймаут (futex_wait вернёт «не разбужен»)
-                    f.advance();
-                    t.procs[i].state = State::Runnable;
-                    t.procs[i].futex_deadline = None;
-                }
-            }
+        let Some(deadline) = t.procs[i].futex_deadline else { continue };
+        if now < deadline {
+            continue;
         }
+        match t.procs[i].state {
+            State::FutexWait => {
+                let f = &mut t.procs[i].frame;
+                f.set_ret(1); // 1 — истёк таймаут (futex_wait вернёт «не разбужен»)
+                f.advance();
+            }
+            // Веха 91: `SYS_RECV` с дедлайном — время вышло, запроса не было.
+            State::RecvWait => {
+                let f = &mut t.procs[i].frame;
+                f.set_ret(usize::MAX);
+                f.set_ret_at(2, 0);
+                f.advance();
+            }
+            _ => continue,
+        }
+        t.procs[i].state = State::Runnable;
+        t.procs[i].futex_deadline = None;
     }
 }
 
@@ -900,9 +925,11 @@ fn syscall(t: &mut Table, cur: usize) {
         // буфера клиента в recv_buf; если клиент передал capability — она уже скопирована в домен
         // сервера (deliver_request), в a3 — её дескриптор.
         //
-        // Нет запроса: при `nonblock == 0` — блокировка (RecvWait), recv_buf/cap сохранены, чтобы
-        // доставка позже скопировала в них. При `nonblock != 0` (Веха 90) — немедленный возврат
-        // с `op == usize::MAX`.
+        // Нет запроса, три режима (arg2): 0 — блокировка (RecvWait), recv_buf/cap сохранены, чтобы
+        // доставка позже скопировала в них; 1 — немедленный возврат с `op == usize::MAX`
+        // (Веха 90); 2 — блокировка ДО ДЕДЛАЙНА (arg3, тики), Веха 91: возврат с `op == MAX`,
+        // когда время вышло. Третий режим и есть «сон вместо опроса» для реактора: он спит,
+        // пока не придёт запрос или не настанет момент, который назвал сам стек (`poll_at`).
         //
         // Зачем неблокирующий приём. Сетевому серверу нужно ОДНОВРЕМЕННО прокачивать стек
         // (входящие кадры, таймеры ретрансмиссии) и отвечать клиентам. Пока `SYS_RECV` умел
@@ -911,9 +938,9 @@ fn syscall(t: &mut Table, cur: usize) {
         // сериализовал бы всё равно всё, добавив лишь способы ошибиться. Один реактор проще и
         // честнее; ждать СРАЗУ кадра и IPC-сообщения (вместо опроса) научит Веха 91.
         4 => {
-            let (rbuf, rcap, nonblock) = {
+            let (rbuf, rcap, mode, timeout) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1), f.arg(2))
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             t.procs[cur].recv_buf = rbuf;
             t.procs[cur].recv_cap = rcap;
@@ -927,12 +954,16 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.set_ret_at(2, n);
                 f.set_ret_at(3, tcap);
                 f.advance();
-            } else if nonblock != 0 {
+            } else if mode == 1 {
                 let f = &mut t.procs[cur].frame;
                 f.set_ret(usize::MAX); // «запросов нет» — вызывающий занимается своими делами
                 f.set_ret_at(2, 0);
                 f.advance();
             } else {
+                // Веха 91: дедлайн живёт в том же поле, что у futex — механика пробуждения по
+                // времени уже есть (`wake_futex_timeouts`), заводить вторую незачем.
+                t.procs[cur].futex_deadline =
+                    (mode == 2).then(|| arch::now_ticks().wrapping_add(timeout as u64));
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
                 if let Some(n) = t.next_runnable(cur) {
                     t.current = n;
