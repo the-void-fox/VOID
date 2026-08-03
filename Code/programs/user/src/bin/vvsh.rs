@@ -102,9 +102,49 @@ fn resolve(rel: &[u8]) -> Vec<u8> {
     out
 }
 
+
+// ── права: по ИМЕНИ, а не по номеру (Веха 99.2) ──────────────────────────────
+//
+// Стартовые права позиционны, и порядок задаёт строка конфига. Это уже стоило сломанной
+// системы: в `gen3` экран стоял первым, `start_cap(0)` вернул фреймбуфер вместо файлового
+// сервера — `ls` роняла шелл, `run` ничего не запускал ([[multiplexer]]).
+//
+// Теперь права ищутся по именам, которые init кладёт в окружение (`CAP_POSIXFS`, `CAP_STORE`,
+// `CAP_NET-SRV`), с откатом на прежние позиции — старые конфиги без имён продолжают работать.
+//
+// Резолвим РОВНО ОДИН РАЗ на старте, а не при каждом обращении: `cap_named` разбирает окружение,
+// и звать его из горячих путей шелла значило бы платить синкаллом за каждую команду.
+static FS_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+static STORE_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+static NET_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Разобрать окружение и запомнить права. Зовётся первой строкой `_start`.
+fn resolve_caps() {
+    let by_name = |name: &str, fallback: usize| {
+        sys::cap_named(name).unwrap_or_else(|| sys::start_cap(fallback))
+    };
+    FS_CAP.store(by_name("POSIXFS", 0), Ordering::Relaxed);
+    STORE_CAP.store(by_name("STORE", 1), Ordering::Relaxed);
+    NET_CAP.store(by_name("NET_SRV", 2), Ordering::Relaxed);
+}
+
+/// Файловый сервер (persona posixfs).
+fn cap_fs() -> usize {
+    FS_CAP.load(Ordering::Relaxed)
+}
+/// Объектный store: чтение/запись объектов и ЗАПУСК программ.
+fn cap_store() -> usize {
+    STORE_CAP.load(Ordering::Relaxed)
+}
+/// Сетевой сервер.
+fn cap_net() -> usize {
+    NET_CAP.load(Ordering::Relaxed)
+}
+
 // ── программа ───────────────────────────────────────────────────────────────
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
+    resolve_caps();
     let mut abuf = [0u8; 256];
     let n = sys::args(&mut abuf).min(abuf.len());
     let mut argv = abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty());
@@ -145,7 +185,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
 /// `eval FILE` — вычислить и напечатать нормализованный конфиг (без коммита).
 fn cmd_eval(path: &[u8]) -> ! {
-    let ep = sys::start_cap(0);
+    let ep = cap_fs();
     let text = match read_config_text(ep, path) {
         Ok(t) => t,
         Err(code) => sys::exit(code),
@@ -169,7 +209,7 @@ fn cmd_init_config() -> ! {
 
 /// Посеять модульный конфиг в `/etc/system/` (posixfs, start-cap 0). Идемпотентно. Печатает итог.
 fn run_init_config() {
-    let ep = sys::start_cap(0);
+    let ep = cap_fs();
     px::mkdir(ep, b"/etc"); // идемпотентно: если есть — MAX, игнорируем
     px::mkdir(ep, b"/etc/system");
     px::echo_to(ep, b"/etc/system/net.vv", NET_VV.as_bytes());
@@ -191,8 +231,8 @@ fn cmd_rebuild() -> ! {
 /// Вычислить `/etc/system/default.vv` → коммит нового поколения `system/gen<N>` → двинуть
 /// `current`. Печатает итог/ошибку и ВОЗВРАЩАЕТСЯ (не выходит — годится и для REPL).
 fn run_rebuild() {
-    let ep = sys::start_cap(0);
-    let scap = sys::start_cap(1);
+    let ep = cap_fs();
+    let scap = cap_store();
     let text = match read_config_text(ep, DEFAULT_PATH) {
         Ok(t) => t,
         Err(_) => {
@@ -253,7 +293,7 @@ fn cmd_gens() -> ! {
 
 /// Перечислить поколения `system/gen*` и пометить активное (`*`). Печатает; ВОЗВРАЩАЕТСЯ.
 fn run_gens() {
-    let scap = sys::start_cap(1);
+    let scap = cap_store();
     let cur = read_current_name(scap);
 
     let mut buf = [0u8; 16384];
@@ -431,7 +471,7 @@ fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
         blob.extend_from_slice(w);
         blob.push(0);
     }
-    let code = px::spawn_args(sys::start_cap(1), name, &blob);
+    let code = px::spawn_args(cap_store(), name, &blob);
     if code == usize::MAX {
         sys::write("vvsh: команда не найдена: ".as_bytes());
         sys::write(name);
@@ -535,7 +575,7 @@ fn shell_env() -> Env {
 /// `(ls [путь])` — ВОЗВРАЩАЕТ список имён файлов каталога (по умолчанию `/`). Возврат значения, а не
 /// печать: так `ls` течёт в конвейер `(| (ls) (grep "vv"))`, а на верхнем уровне REPL сам его рендерит.
 fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
-    let ep = sys::start_cap(0);
+    let ep = cap_fs();
     let path = match args.first() {
         None => resolve(b""), // текущий каталог
         Some(Value::Str(s)) => resolve(s.as_bytes()),
@@ -591,7 +631,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// `(cd [путь])` — сменить текущий каталог (без пути — в корень). Проверяет, что это каталог.
 fn sh_cd(args: &[Value]) -> Result<Value, EvalError> {
-    let ep = sys::start_cap(0);
+    let ep = cap_fs();
     let target = match args.first() {
         None => alloc::vec![b'/'],
         Some(Value::Str(s)) => resolve(s.as_bytes()),
@@ -757,7 +797,7 @@ fn sh_log(args: &[Value]) -> Result<Value, EvalError> {
 
 /// `(cat путь)` — вывести содержимое файла.
 fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
-    let ep = sys::start_cap(0);
+    let ep = cap_fs();
     let path = match args.first() {
         Some(Value::Str(s)) => resolve(s.as_bytes()),
         _ => return Err(EvalError::new("cat: нужен путь-строка")),
@@ -796,7 +836,7 @@ fn sh_echo(args: &[Value]) -> Result<Value, EvalError> {
                 other => text.push_str(&alloc::format!("{}", other)),
             }
         }
-        px::echo_to(sys::start_cap(0), &path, text.as_bytes());
+        px::echo_to(cap_fs(), &path, text.as_bytes());
         return Ok(Value::nil());
     }
     for (i, a) in args.iter().enumerate() {
@@ -833,7 +873,7 @@ fn sh_run(args: &[Value]) -> Result<Value, EvalError> {
             }
         }
     }
-    let code = px::spawn_args(sys::start_cap(1), name.as_bytes(), &blob);
+    let code = px::spawn_args(cap_store(), name.as_bytes(), &blob);
     if code == usize::MAX {
         return Err(EvalError::new(alloc::format!("run: '{}' не запустилась", name)));
     }
@@ -855,7 +895,7 @@ fn arg_path(args: &[Value], usage: &str) -> Result<Vec<u8>, EvalError> {
 /// `(roots)` — сырые корни store (короткий id + имя на строку). Store — start-cap 1.
 fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
     let mut buf = [0u8; 16384];
-    let n = sys::obj_list_roots(sys::start_cap(1), &mut buf);
+    let n = sys::obj_list_roots(cap_store(), &mut buf);
     if n == 0 {
         sys::write("нет корней (или нет прав на store)\n".as_bytes());
     } else {
@@ -867,7 +907,7 @@ fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
 /// `(mkdir путь)` — создать каталог (относительно cwd).
 fn sh_mkdir(args: &[Value]) -> Result<Value, EvalError> {
     let path = arg_path(args, "mkdir: (mkdir \"путь\")")?;
-    if px::mkdir(sys::start_cap(0), &path) != 0 {
+    if px::mkdir(cap_fs(), &path) != 0 {
         return Err(EvalError::new("mkdir не удался (уже есть? нет родителя?)"));
     }
     Ok(Value::nil())
@@ -876,7 +916,7 @@ fn sh_mkdir(args: &[Value]) -> Result<Value, EvalError> {
 /// `(rm путь)` — удалить файл или пустой каталог (относительно cwd).
 fn sh_rm(args: &[Value]) -> Result<Value, EvalError> {
     let path = arg_path(args, "rm: (rm \"путь\")")?;
-    if px::unlink(sys::start_cap(0), &path) != 0 {
+    if px::unlink(cap_fs(), &path) != 0 {
         return Err(EvalError::new("rm не удался (нет файла? каталог не пуст?)"));
     }
     Ok(Value::nil())
@@ -884,7 +924,7 @@ fn sh_rm(args: &[Value]) -> Result<Value, EvalError> {
 
 /// `(tail путь)` — последние ~32 байта файла (витрина lseek SEEK_END).
 fn sh_tail(args: &[Value]) -> Result<Value, EvalError> {
-    let ep = sys::start_cap(0);
+    let ep = cap_fs();
     let path = arg_path(args, "tail: (tail \"путь\")")?;
     // stat до open: у posixfs open(mode 0) создал бы пустышку на опечатке пути.
     match px::stat(ep, &path) {
@@ -912,7 +952,7 @@ fn sh_mv(args: &[Value]) -> Result<Value, EvalError> {
         (Some(Value::Str(o)), Some(Value::Str(n))) => {
             let old = resolve(o.as_bytes());
             let new = resolve(n.as_bytes());
-            if px::rename(sys::start_cap(0), &old, &new) != 0 {
+            if px::rename(cap_fs(), &old, &new) != 0 {
                 return Err(EvalError::new("mv не удался (нет файла?)"));
             }
             Ok(Value::nil())
@@ -931,7 +971,7 @@ fn sh_ping(args: &[Value]) -> Result<Value, EvalError> {
         Some(x) => x,
         None => return Err(EvalError::new("ping: неверный IP (нужно A.B.C.D)")),
     };
-    let netep = sys::start_cap(2);
+    let netep = cap_net();
     if netep == sys::NO_CAP {
         return Err(EvalError::new("ping: сети нет (net.vv = #f?)"));
     }
@@ -953,7 +993,7 @@ fn sh_resolve(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.clone(),
         _ => return Err(EvalError::new("resolve: (resolve \"имя\")")),
     };
-    let netep = sys::start_cap(2);
+    let netep = cap_net();
     if netep == sys::NO_CAP {
         return Err(EvalError::new("resolve: сети нет (net.vv = #f?)"));
     }
@@ -975,7 +1015,7 @@ fn sh_resolve(args: &[Value]) -> Result<Value, EvalError> {
 
 /// Эндпоинт сетевого сервера (start-cap 2) — он же ПРАВО пользоваться сетью.
 fn net_ep(who: &str) -> Result<usize, EvalError> {
-    let ep = sys::start_cap(2);
+    let ep = cap_net();
     if ep == sys::NO_CAP {
         return Err(EvalError::new(alloc::format!("{}: сети нет (net.vv = #f?)", who)));
     }
@@ -1088,21 +1128,21 @@ fn sh_fetch(args: &[Value]) -> Result<Value, EvalError> {
         argv.extend_from_slice(url.as_bytes());
         argv.push(0);
         argv.extend_from_slice(root.as_bytes());
-        let code = sys::exec_args(sys::start_cap(1), b"httpsc", &argv);
+        let code = sys::exec_args(cap_store(), b"httpsc", &argv);
         if code != 0 {
             return Err(EvalError::new("fetch: https не удался"));
         }
         // Итог печатает сам `httpsc`; content-id достаём из корня, чтобы `fetch` возвращал
         // одно и то же и для http, и для https.
         let mut id = [0u8; 32];
-        if sys::obj_get_root(sys::start_cap(1), root.as_bytes(), &mut id) != 32 {
+        if sys::obj_get_root(cap_store(), root.as_bytes(), &mut id) != 32 {
             return Err(EvalError::new("fetch: корень не появился"));
         }
         return Ok(Value::str(&hex_id(&id, 32)));
     }
 
     let netep = net_ep("fetch")?;
-    let scap = sys::start_cap(1);
+    let scap = cap_store();
     // Буферы даёт вызывающий: у библиотеки нет аллокатора, а у шелла есть. Потолок в 512 кусков
     // по 16 КиБ = 8 МиБ на файл — этого хватает до пакетов, где понадобится дерево поглубже.
     let mut chunk = alloc::vec![0u8; sys::http::CHUNK];
@@ -1137,7 +1177,7 @@ fn sh_blob(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.clone(),
         _ => return Err(EvalError::new("blob: (blob \"корень\" [смещение длина])")),
     };
-    let scap = sys::start_cap(1);
+    let scap = cap_store();
     let mut id = [0u8; 32];
     // `SYS_OBJ_GET_ROOT` отдаёт ЧИСЛО БАЙТ id (32), а не код возврата — 0 значит «нет корня».
     if sys::obj_get_root(scap, name.as_bytes(), &mut id) != 32 {
@@ -1207,7 +1247,7 @@ fn sh_unroot(args: &[Value]) -> Result<Value, EvalError> {
             return Err(EvalError::new("unroot: системные корни (system/, bin/, proc/) не трогаем"));
         }
     }
-    if sys::obj_del_root(sys::start_cap(1), name.as_bytes()) == 0 {
+    if sys::obj_del_root(cap_store(), name.as_bytes()) == 0 {
         Ok(Value::nil())
     } else {
         Err(EvalError::new("unroot: нет такого корня (или нет права WRITE)"))
@@ -1220,7 +1260,7 @@ fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.clone(),
         _ => return Err(EvalError::new("thaw: (thaw \"имя\")")),
     };
-    let code = sys::restore(sys::start_cap(1), name.as_bytes());
+    let code = sys::restore(cap_store(), name.as_bytes());
     if code == usize::MAX {
         return Err(EvalError::new("thaw не удался (нет образа?)"));
     }
@@ -1233,7 +1273,7 @@ fn sh_switch(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.clone(),
         _ => return Err(EvalError::new("switch: (switch \"gen\")")),
     };
-    let scap = sys::start_cap(1);
+    let scap = cap_store();
     let mut id = [0u8; 32];
     if sys::obj_put(scap, name.as_bytes(), &mut id) == 0
         && sys::obj_set_root(scap, CURRENT_ROOT, &id) == 0
@@ -1251,8 +1291,8 @@ fn sh_sysdef(args: &[Value]) -> Result<Value, EvalError> {
         (Some(Value::Str(g)), Some(Value::Str(f))) => (g.clone(), f.clone()),
         _ => return Err(EvalError::new("sysdef: (sysdef \"gen\" \"файл\")")),
     };
-    let ep = sys::start_cap(0);
-    let scap = sys::start_cap(1);
+    let ep = cap_fs();
+    let scap = cap_store();
     let path = resolve(fname.as_bytes());
     let data = match read_file(ep, &path) {
         Some(d) => d,
