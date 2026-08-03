@@ -413,29 +413,55 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     let mut oldp = [0u8; PATH_MAX];
                     let mut newp = [0u8; PATH_MAX];
                     let onl = normalize(&req[1..1 + ol], &mut oldp);
-                    let nnl = normalize(&req[1 + ol..len], &mut newp);
+                    let mut nnl = normalize(&req[1 + ol..len], &mut newp);
+                    // Если цель — СУЩЕСТВУЮЩИЙ КАТАЛОГ, POSIX кладёт файл ВНУТРЬ него
+                    // (`mv файл каталог` = `mv файл каталог/файл`). Без этого содержимое файла
+                    // вешалось на корень `f<каталог>` рядом с живым `d<каталог>`: файл
+                    // становился недостижим, то есть `mv` ТЕРЯЛ ДАННЫЕ. Найдено владельцем
+                    // на X54C (Веха 97.1).
+                    {
+                        let mut rd = [0u8; ROOT_MAX];
+                        let rdl = root_name(b'd', &newp[..nnl], &mut rd);
+                        if sys::obj_get_root(store_cap, &rd[..rdl], &mut idb) == 32 {
+                            let name = leaf(&oldp[..onl]);
+                            // `/` уже оканчивается разделителем — второй не нужен.
+                            let mut w = nnl;
+                            if newp[w - 1] != b'/' && w < PATH_MAX {
+                                newp[w] = b'/';
+                                w += 1;
+                            }
+                            let n = name.len().min(PATH_MAX - w);
+                            newp[w..w + n].copy_from_slice(&name[..n]);
+                            nnl = w + n;
+                        }
+                    }
                     let (old, new) = (&oldp[..onl], &newp[..nnl]);
-                    let mut ok = false;
+                    // Переименование в самого себя — успех и НИКАКОЙ работы: иначе ниже мы бы
+                    // сняли корень сразу после того, как его же поставили, и потеряли файл.
+                    let same = old == new;
+                    let mut ok = same;
                     // перевесить файл-корень f<old> → f<new>
                     let mut ro = [0u8; ROOT_MAX];
                     let mut rnw = [0u8; ROOT_MAX];
                     let rlo = root_name(b'f', old, &mut ro);
                     let rln = root_name(b'f', new, &mut rnw);
-                    if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
+                    if !same && sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
                         sys::obj_set_root(store_cap, &rnw[..rln], &idb);
                         sys::obj_del_root(store_cap, &ro[..rlo]);
                         ok = true;
                     }
                     // слот в кэше
                     for i in 0..NFILES {
-                        if fused[i] && &paths[i][..path_len[i]] == old {
+                        if !same && fused[i] && &paths[i][..path_len[i]] == old {
                             paths[i][..nnl].copy_from_slice(new);
                             path_len[i] = nnl;
                             ok = true;
                             break;
                         }
                     }
-                    if ok {
+                    if same {
+                        rep[0] = 0;
+                    } else if ok {
                         // индексы родителей
                         let pold = parent(old);
                         let plen = read_index(store_cap, pold, &mut dir, &mut idb).unwrap_or(2);

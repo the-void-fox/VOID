@@ -51,6 +51,12 @@ pub fn set_verbose(on: bool) {
     VERBOSE.store(on, Ordering::Relaxed);
 }
 
+/// Включена ли трассировка. Нужна СОСЕДНИМ модулям: макрос `vprintln!` ниже текстовый и
+/// виден только внутри этого файла, а глушить отладочный вывод должно всё ядро, а не proc.rs.
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
 /// println! шлюза: печатает только при включённой трассировке.
 macro_rules! vprintln {
     ($($arg:tt)*) => {

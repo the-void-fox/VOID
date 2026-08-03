@@ -40,6 +40,11 @@ unsafe fn wait_write() {
 // ── состояние модификаторов ──────────────────────────────────────────────────
 static mut SHIFT: bool = false;
 static mut CAPS: bool = false;
+/// Веха 97.1 — **Ctrl**. Не отслеживался вовсе, из-за чего на реальном железе не работал НИ ОДИН
+/// управляющий аккорд: Ctrl-C, Ctrl-D, Ctrl-U просто печатали букву. В QEMU это не всплывало —
+/// там ввод идёт через serial, и терминал хоста шлёт готовый управляющий байт. Найдено
+/// владельцем на X54C.
+static mut CTRL: bool = false;
 /// Веха 45 — видели префикс 0xE0 (расширенная клавиша: стрелки/Home/End/Del).
 static mut EXT: bool = false;
 
@@ -61,6 +66,8 @@ static MAP: [(u8, u8); 0x40] = [
 const SC_LSHIFT: u8 = 0x2A;
 const SC_RSHIFT: u8 = 0x36;
 const SC_CAPS: u8 = 0x3A;
+/// Левый Ctrl. Правый приходит как `0xE0 0x1D` — тот же код за префиксом расширенных клавиш.
+const SC_LCTRL: u8 = 0x1D;
 const RELEASE: u8 = 0x80; // старший бит скан-кода набора 1 = отпускание
 
 /// Веха 42 — настроить контроллер 8042: включить порт клавиатуры, разрешить генерацию IRQ1 и
@@ -125,6 +132,11 @@ pub fn drain() {
                 // Веха 45: расширенная клавиша → стандартная ANSI-последовательность (её понимает
                 // и терминал QEMU, и разбор в vga.rs/vsh). Только на НАЖАТИЕ (старший бит = 0).
                 EXT = false;
+                // Правый Ctrl (`0xE0 0x1D`) — такой же модификатор, как левый, и приходит здесь.
+                if sc & !RELEASE == SC_LCTRL {
+                    CTRL = sc & RELEASE == 0;
+                    continue;
+                }
                 if sc & RELEASE == 0 {
                     let seq: &[u8] = match sc {
                         0x48 => b"\x1b[A", // Up
@@ -146,6 +158,7 @@ pub fn drain() {
             let code = sc & !RELEASE;
             match code {
                 SC_LSHIFT | SC_RSHIFT => SHIFT = !released,
+                SC_LCTRL => CTRL = !released,
                 SC_CAPS => {
                     if !released {
                         CAPS = !CAPS;
@@ -157,7 +170,14 @@ pub fn drain() {
                         // Shift даёт верхний вариант; CapsLock влияет ТОЛЬКО на буквы.
                         let is_letter = lo.is_ascii_lowercase();
                         let upper = SHIFT ^ (CAPS && is_letter);
-                        super::rx_push(if upper { up } else { lo });
+                        let ch = if upper { up } else { lo };
+                        // Ctrl+буква → управляющий байт (Ctrl-A = 1 … Ctrl-Z = 26), как это
+                        // делает любой терминал. Прочие сочетания с Ctrl отдаём как есть.
+                        super::rx_push(if CTRL && ch.is_ascii_alphabetic() {
+                            ch.to_ascii_uppercase() - b'@'
+                        } else {
+                            ch
+                        });
                     }
                 }
                 _ => {}
