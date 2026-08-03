@@ -210,12 +210,18 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
         // ── 5. кадр ────────────────────────────────────────────────────────────────────────
         if redraw {
-            let cells = compose(&mut surface, &renderer, &mut cache, &panes, &rects, focus,
-                                cols, rows, palette);
-            let (y0, y1) = dirty_rows(&prev_cells, &cells, cols, rows);
-            if y0 <= y1 {
+            let cells = compose(&panes, &rects, focus, cols, rows);
+            let dirty = dirty_rows(&prev_cells, &cells, cols, rows);
+            if !dirty.is_empty() {
+                // Рисуем И переносим ТОЛЬКО изменившиеся строки. Раньше отрисовка шла по всему
+                // кадру «потому что RAM дешёвая» — оценка оказалась неверной: 116×36 знакомест
+                // по ~2000 пиксельных операций и есть та медлительность, которую видно на
+                // железе (в gen1 консоль ядра красит лишь изменившиеся ячейки — и она мгновенна).
+                renderer.paint_cells_rows(&cells, cols, rows, &mut cache, &mut surface, &dirty);
                 let ch = metrics.height.max(1) as usize;
-                blit_rows(&surface, &info, y0 * ch, ((y1 + 1) * ch).min(info.height));
+                for &y in &dirty {
+                    blit_rows(&surface, &info, y * ch, ((y + 1) * ch).min(info.height));
+                }
             }
             prev_cells = cells;
             redraw = false;
@@ -399,10 +405,8 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
 /// Собрать кадр: панели по своим прямоугольникам + подсветка фокуса + статус-бар.
 #[allow(clippy::too_many_arguments)]
 fn compose(
-    surface: &mut Surface, renderer: &GridRenderer, cache: &mut GlyphCache<TtfFont>,
-    panes: &[Pane], rects: &[PaneRect], focus: usize, cols: usize, rows: usize, palette: Palette,
+    panes: &[Pane], rects: &[PaneRect], focus: usize, cols: usize, rows: usize,
 ) -> Vec<Cell> {
-    surface.clear(palette.background);
     // Общий кадр — мозаика из гридов панелей: у каждой свой, склеиваем по ячейкам.
     let mut cells = vec![Cell::default(); cols * rows];
     for (i, p) in panes.iter().enumerate() {
@@ -422,30 +426,22 @@ fn compose(
         }
     }
     status_bar(&mut cells, panes, focus, cols, rows);
-    // Рисуем в RAM целиком: это дёшево (кэшируемая память). Дорого — переносить на экран,
-    // поэтому туда уедут только изменившиеся строки.
-    renderer.paint_cells(&cells, cols, rows, cache, surface);
     cells
 }
 
-/// Диапазон изменившихся строк грида `[первая, последняя]`; `первая > последняя` — изменений нет.
-/// Диапазоном, а не списком: вывод почти всегда идёт подряд, а один `blit` полосой дешевле, чем
-/// десяток вызовов вразбивку.
-fn dirty_rows(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> (usize, usize) {
+/// СПИСОК изменившихся строк. Списком, а не диапазоном: при выводе меняются одна-две строки, а
+/// диапазон «от первой до последней» захватил бы всё между ними — например строку вывода и
+/// статус-бар внизу, то есть весь экран.
+fn dirty_rows(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> Vec<usize> {
     if prev.len() != now.len() {
-        return (0, rows.saturating_sub(1)); // первый кадр или сменилась геометрия — весь экран
+        return (0..rows).collect(); // первый кадр или сменилась геометрия — весь экран
     }
-    let (mut first, mut last) = (usize::MAX, 0usize);
-    for y in 0..rows {
-        let r = y * cols..(y + 1) * cols;
-        if prev[r.clone()] != now[r] {
-            if first == usize::MAX {
-                first = y;
-            }
-            last = y;
-        }
-    }
-    if first == usize::MAX { (1, 0) } else { (first, last) }
+    (0..rows)
+        .filter(|&y| {
+            let r = y * cols..(y + 1) * cols;
+            prev[r.clone()] != now[r]
+        })
+        .collect()
 }
 
 /// Пометить фокусную панель по краям зазора: сплошную рамку рисовать негде — зазор между
