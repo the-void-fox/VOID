@@ -40,6 +40,25 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
     "socket-tcp",
 ] }
 
+# Веха 95 (ADR 0008) — TLS. Криптография ЧИСТО НА RUST: провайдер `rustls-rustcrypto` вместо
+# `ring`/`aws-lc-rs` (в тех C и asm, а у нас нет ни libc, ни ассемблерных заготовок под VOID).
+# Всё собирается `no_std`+`alloc`; `std`-фичи выключены сознательно — в этом режиме rustls даёт
+# «небуферизованный» API, который и нужен: сокета с `Read`/`Write` у нас нет, есть IPC к net-srv.
+#
+# Оговорка про версии: провайдер прибит к `rustls-webpki ^0.102`, где живёт RUSTSEC-2026-0104
+# (reachable panic при разборе CRL, DoS). Мы CRL не используем вовсе, а проверку цепочки делает
+# webpki 0.103 из самого rustls — но пометка здесь стоит намеренно, чтобы при обновлении это
+# перепроверили, а не открыли заново.
+rustls = { version = "0.23", default-features = false, features = ["tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = [
+    "alloc",
+    "tls12",
+] }
+webpki-roots = { version = "0.26", default-features = false }
+# bare-metal: у `getrandom` нет системного источника, поэтому регистрируем свой —
+# он уходит в `SYS_RANDOM` ядра (Веха 86 + джиттер/virtio-rng).
+getrandom = { version = "0.2", features = ["custom"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

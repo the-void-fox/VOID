@@ -122,6 +122,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("lx_e1000", include_bytes!(env!("PROG_LX_E1000"))),
     ("install", include_bytes!(env!("PROG_INSTALL"))),
     ("vvsh", include_bytes!(env!("PROG_VVSH"))),
+    ("httpsc", include_bytes!(env!("PROG_HTTPSC"))),
 ];
 
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и

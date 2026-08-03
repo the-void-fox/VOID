@@ -2187,10 +2187,20 @@ fn syscall(t: &mut Table, cur: usize) {
         // байтами (аппаратный ГСЧ + пул событий, см. [`crate::random`]). Буфер может лежать в
         // ленивой куче — доотображаем, как в SYS_WRITE.
         37 => {
-            let (ptr, len) = {
+            let (ptr, len, kind) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1))
+                (f.arg(0), f.arg(1), f.arg(2))
             };
+            // Веха 95: `kind == 1` — не выдача байт, а ВОПРОС «есть ли сильный источник».
+            // Нужен TLS: строить ключи на пуле джиттера без подтверждённого источника нельзя,
+            // и решать это должен потребитель, а не молча ядро.
+            if kind == 1 {
+                let strong = crate::random::has_strong_source();
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(strong as usize);
+                f.advance();
+                return;
+            }
             let result = if len == 0 {
                 0
             } else if ensure_heap_range(t, cur, ptr, len) {

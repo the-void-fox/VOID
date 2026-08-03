@@ -27,8 +27,10 @@ Code/
 │       ├── virtio_net.rs # драйвер сети: две очереди RX/TX, опрос, сырые кадры наверх
 │       └── ...           # sched, timer, executor, heap, frame, elf, checkpoint
 ├── programs/
-│   ├── user/             # userspace: либа шимов (ecall / int 0x80) + 17 бинарей
-│   │                     #   (vsh, posixfs, net-srv, threads, mini-sh, hello, драйверы…)
+│   ├── user/             # userspace: либа шимов (ecall / int 0x80) + бинари системы
+│   │                     #   (vvsh, vsh, posixfs, net-srv, httpsc, драйверы…)
+│   │   └── vendor/       # вендоренные зависимости: smoltcp (сеть) + rustls и
+│   │                     #   RustCrypto (TLS) — сборка ОФФЛАЙН, версии прибиты
 │   ├── std-hello/        # std-программы (Веха 31/35): тулчейн void, обычный cargo
 │   ├── std-threads/      #   (std::thread + Arc<Mutex> + thread_local)
 │   ├── wasi-run/         # WASI-раннер (Веха 39): wasmi поверх std-порта — бэкенд C
@@ -96,7 +98,7 @@ tools/.../void-store-import void-disk.img put программа bin/<arch>/им
 `Obsidian/10-projects/void/notes/uutils.md`. Доставка мостом:
 `put <elf> bin/<arch>/coreutils`, запуск: `run bin/coreutils ls`.
 
-## Сеть (Веха 34 → Вехи 90–92: стек smoltcp, DHCP, DNS)
+## Сеть (Веха 34 → Вехи 90–95: smoltcp, DHCP, DNS, TCP, HTTP, HTTPS)
 Раннеры в `.cargo/config.toml` уже поднимают virtio-net на QEMU SLIRP (`-netdev user`).
 Ядро отдаёт лишь сырые кадры (`virtio_net.rs`); весь стек — в userspace-сервере `bin/net-srv`
 на **vendored smoltcp** (`programs/user/vendor/`, сборка оффлайн). Адрес НЕ зашит: сервер
@@ -114,7 +116,12 @@ vvsh/> (fetch "http://example.com/" "dl/example")   # → байты, куски
 vvsh/> (blob "dl/example")                          # сводка скачанного
 vvsh/> (blob "dl/example" 0 64)                     # кусок содержимого
 vvsh/> (unroot "dl/example")                        # отвязать корень (объекты соберёт GC)
+# HTTPS (Веха 95): TLS 1.2/1.3, криптография чисто на Rust, проверка цепочки по webpki-roots
+vvsh/> (fetch "https://cache.nixos.org/nix-cache-info" "dl/ci")
 ```
+Для `https` работу делает ОТДЕЛЬНАЯ программа `httpsc`: 105 крейтов чужого криптокода не должны
+исполняться с полномочиями шелла — ей выдаются ровно сеть и store. Если у системы нет
+подтверждённого источника случайности (строка `[rng]` на загрузке), TLS не начинается вовсе.
 Тело режется на куски по 16 КиБ, каждый — объект store, узел связывает их. В памяти живёт
 **один кусок**, одинаковые куски дедуплицируются, а content-id узла — **Merkle-корень**
 содержимого: повторная загрузка даёт тот же id, и он совпадает между riscv и x86.

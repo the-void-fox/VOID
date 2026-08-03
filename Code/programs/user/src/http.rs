@@ -286,20 +286,9 @@ impl Blob<'_, '_> {
     /// Закрыть блоб: дописать хвост и связать куски узлом-манифестом.
     fn finish(&mut self, root: &[u8]) -> Result<[u8; 32], &'static str> {
         self.flush()?;
-        let mut m = [0u8; MAGIC.len() + 8 + 4 + 4];
-        let mut p = 0;
-        m[p..p + MAGIC.len()].copy_from_slice(MAGIC);
-        p += MAGIC.len();
-        m[p..p + 8].copy_from_slice(&(self.total as u64).to_le_bytes());
-        p += 8;
-        m[p..p + 4].copy_from_slice(&(self.n as u32).to_le_bytes());
-        p += 4;
-        // Размер куска — в манифесте, а не в коде читателя: иначе смена `CHUNK` в будущем
-        // сделала бы уже лежащие в сторе блобы нечитаемыми.
-        m[p..p + 4].copy_from_slice(&(CHUNK as u32).to_le_bytes());
-        p += 4;
+        let m = blob_manifest(self.total, self.n);
         let mut id = [0u8; 32];
-        if sys::obj_put_node(self.store_cap, &m[..p], &self.sink.kids[..self.n], &mut id) != 0 {
+        if sys::obj_put_node(self.store_cap, &m, &self.sink.kids[..self.n], &mut id) != 0 {
             return Err("store не принял узел");
         }
         if !root.is_empty() && sys::obj_set_root(self.store_cap, root, &id) != 0 {
@@ -571,6 +560,25 @@ fn resolve(net_ep: usize, name: &str) -> Result<[u8; 4], &'static str> {
 }
 
 // ── чтение блоба обратно ────────────────────────────────────────────────────────────────────
+
+/// Собрать манифест блоба: magic, общая длина, число кусков, размер куска.
+///
+/// Публичный, потому что тем же форматом пишет HTTPS-клиент (Веха 95, `bin/httpsc`): скачанное
+/// по http и по https обязано быть неотличимо для всего, что дальше с ним работает.
+pub fn blob_manifest(total: usize, chunks: usize) -> [u8; MAGIC.len() + 16] {
+    let mut m = [0u8; MAGIC.len() + 16];
+    let mut p = 0;
+    m[p..p + MAGIC.len()].copy_from_slice(MAGIC);
+    p += MAGIC.len();
+    m[p..p + 8].copy_from_slice(&(total as u64).to_le_bytes());
+    p += 8;
+    m[p..p + 4].copy_from_slice(&(chunks as u32).to_le_bytes());
+    p += 4;
+    // Размер куска — в манифесте, а не в коде читателя: иначе смена `CHUNK` в будущем сделала
+    // бы уже лежащие в сторе блобы нечитаемыми.
+    m[p..p + 4].copy_from_slice(&(CHUNK as u32).to_le_bytes());
+    m
+}
 
 /// Разобрать манифест блоба: (общая длина, число кусков, размер куска). `None` — это не блоб.
 ///

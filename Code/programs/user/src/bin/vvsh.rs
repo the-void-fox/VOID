@@ -18,7 +18,6 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,133 +25,16 @@ use void_user as sys;
 use void_user::posix as px;
 use vvsh_core::{Env, EvalError, Value};
 
-// ── глобальный аллокатор: bump + СВОБОДНЫЙ СПИСОК поверх ленивой кучи процесса ──
+// ── глобальный аллокатор ──────────────────────────────────────────────────────
 //
-// Веха 89. Раньше здесь был чистый bump с пустым `dealloc`: 4-МиБ арена на весь сеанс, память
-// не возвращалась НИКОГДА. Для основного шелла системы, который обязан жить долго, это значит
-// «через N команд аллокация вернёт null» — Lisp-REPL порождает временные значения на каждое
-// выражение. Теперь освобождённые блоки идут в адресно-упорядоченный список со СЛИЯНИЕМ
-// соседей (та же схема, что у кучи ядра): память переиспользуется, фрагментация ограничена.
-struct Heap;
-const ARENA: usize = 4 * 1024 * 1024;
-/// Узел свободного списка живёт ВНУТРИ свободного блока: [size][next]. Отсюда минимальный
-/// размер блока и минимальное выравнивание.
-const NODE: usize = 2 * core::mem::size_of::<usize>();
-static BASE: AtomicUsize = AtomicUsize::new(0);
-static NEXT: AtomicUsize = AtomicUsize::new(0);
-static END: AtomicUsize = AtomicUsize::new(0);
-/// Голова списка свободных блоков (адрес; 0 — список пуст). Список отсортирован по адресу —
-/// это и даёт дешёвое слияние соседей.
-static FREE: AtomicUsize = AtomicUsize::new(0);
-
-#[inline]
-unsafe fn nsize(p: usize) -> usize {
-    *(p as *const usize)
-}
-#[inline]
-unsafe fn nnext(p: usize) -> usize {
-    *((p + core::mem::size_of::<usize>()) as *const usize)
-}
-#[inline]
-unsafe fn nset(p: usize, size: usize, next: usize) {
-    *(p as *mut usize) = size;
-    *((p + core::mem::size_of::<usize>()) as *mut usize) = next;
-}
-
-/// Запрос → (размер, выравнивание), нормализованные под узел списка.
-fn norm(layout: Layout) -> (usize, usize) {
-    let align = layout.align().max(core::mem::align_of::<usize>());
-    let size = ((layout.size() + align - 1) & !(align - 1)).max(NODE);
-    (size, align)
-}
-
-unsafe impl GlobalAlloc for Heap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if BASE.load(Ordering::Relaxed) == 0 {
-            let base = sys::heap_map(ARENA);
-            if base == 0 || base == usize::MAX {
-                return core::ptr::null_mut();
-            }
-            BASE.store(base, Ordering::Relaxed);
-            NEXT.store(base, Ordering::Relaxed);
-            END.store(base + ARENA, Ordering::Relaxed);
-        }
-        let (size, align) = norm(layout);
-
-        // 1) First-fit по свободному списку. Хвост блока возвращаем в список, если в нём
-        //    помещается узел; иначе отдаём блок целиком (остаток был бы потерян навсегда).
-        let (mut prev, mut cur) = (0usize, FREE.load(Ordering::Relaxed));
-        while cur != 0 {
-            let bsize = nsize(cur);
-            let start = (cur + align - 1) & !(align - 1);
-            let head_gap = start - cur; // «хвостик» перед выравненным началом
-            if (head_gap == 0 || head_gap >= NODE) && start + size <= cur + bsize {
-                let next = nnext(cur);
-                let rest = (cur + bsize) - (start + size);
-                // вынуть блок из списка
-                if prev == 0 {
-                    FREE.store(next, Ordering::Relaxed);
-                } else {
-                    nset(prev, nsize(prev), next);
-                }
-                if head_gap >= NODE {
-                    dealloc_raw(cur, head_gap); // «хвостик» слева — обратно в список
-                }
-                if rest >= NODE {
-                    dealloc_raw(start + size, rest); // остаток справа — тоже
-                }
-                return start as *mut u8;
-            }
-            prev = cur;
-            cur = nnext(cur);
-        }
-
-        // 2) Свободного блока нет — отрезать от нетронутой части арены.
-        let aligned = (NEXT.load(Ordering::Relaxed) + align - 1) & !(align - 1);
-        let new_next = aligned + size;
-        if new_next > END.load(Ordering::Relaxed) {
-            return core::ptr::null_mut();
-        }
-        NEXT.store(new_next, Ordering::Relaxed);
-        aligned as *mut u8
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let (size, _) = norm(layout);
-        dealloc_raw(ptr as usize, size);
-    }
-}
-
-/// Вернуть блок `[addr, addr+size)` в список: вставка по адресу + слияние с соседями слева и
-/// справа. Без слияния длинный сеанс шелла раскрошил бы арену в пыль.
-unsafe fn dealloc_raw(addr: usize, size: usize) {
-    let (mut prev, mut cur) = (0usize, FREE.load(Ordering::Relaxed));
-    while cur != 0 && cur < addr {
-        prev = cur;
-        cur = nnext(cur);
-    }
-    let mut size = size;
-    let mut next = cur;
-    // слияние с правым соседом
-    if cur != 0 && addr + size == cur {
-        size += nsize(cur);
-        next = nnext(cur);
-    }
-    // слияние с левым соседом
-    if prev != 0 && prev + nsize(prev) == addr {
-        nset(prev, nsize(prev) + size, next);
-        return;
-    }
-    nset(addr, size, next);
-    if prev == 0 {
-        FREE.store(addr, Ordering::Relaxed);
-    } else {
-        nset(prev, nsize(prev), addr);
-    }
-}
-
+// Реализация вынесена в `void_user::heap` (Веха 95): она понадобилась второй программе —
+// TLS-клиенту, — а копия аллокатора это то место, где расхождение замечают последним и по
+// самым странным симптомам. Здесь остаётся только выбор размера арены.
+//
+// 4 МиБ: Lisp-REPL порождает временные значения на каждое выражение, и без возврата памяти
+// шелл через N команд получил бы null (это и чинила Веха 89 свободным списком со слиянием).
 #[global_allocator]
-static ALLOC: Heap = Heap;
+static ALLOC: sys::heap::Heap<{ 4 * 1024 * 1024 }> = sys::heap::Heap::new();
 
 const DEFAULT_PATH: &[u8] = b"/etc/system/default.vv";
 const CURRENT_ROOT: &[u8] = b"system/current";
@@ -1193,6 +1075,32 @@ fn sh_fetch(args: &[Value]) -> Result<Value, EvalError> {
         (Some(Value::Str(u)), None) => (u.clone(), alloc::rc::Rc::from("")),
         _ => return Err(EvalError::new("fetch: (fetch \"http://хост/путь\" [\"корень\"])")),
     };
+    // Веха 95: https обслуживает ОТДЕЛЬНАЯ программа. TLS — это 105 крейтов чужого кода, и
+    // давать им полномочия шелла незачем: у `httpsc` будут ровно сеть и store. Заодно шелл не
+    // толстеет на полмегабайта криптографии.
+    if url.as_bytes().len() > 8 && url.as_bytes()[..8].eq_ignore_ascii_case(b"https://") {
+        if root.is_empty() {
+            return Err(EvalError::new(
+                "fetch: для https нужен корень — (fetch \"https://…\" \"dl/имя\")",
+            ));
+        }
+        let mut argv = alloc::vec::Vec::new();
+        argv.extend_from_slice(url.as_bytes());
+        argv.push(0);
+        argv.extend_from_slice(root.as_bytes());
+        let code = sys::exec_args(sys::start_cap(1), b"httpsc", &argv);
+        if code != 0 {
+            return Err(EvalError::new("fetch: https не удался"));
+        }
+        // Итог печатает сам `httpsc`; content-id достаём из корня, чтобы `fetch` возвращал
+        // одно и то же и для http, и для https.
+        let mut id = [0u8; 32];
+        if sys::obj_get_root(sys::start_cap(1), root.as_bytes(), &mut id) != 32 {
+            return Err(EvalError::new("fetch: корень не появился"));
+        }
+        return Ok(Value::str(&hex_id(&id, 32)));
+    }
+
     let netep = net_ep("fetch")?;
     let scap = sys::start_cap(1);
     // Буферы даёт вызывающий: у библиотеки нет аллокатора, а у шелла есть. Потолок в 512 кусков
