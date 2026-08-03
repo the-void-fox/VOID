@@ -45,6 +45,16 @@ pub fn video_mode() -> Option<(usize, usize, usize)> {
     None
 }
 
+/// Веха 97 — фреймбуфера нет, отдавать процессу нечего.
+pub fn video_window() -> Option<(usize, usize)> {
+    None
+}
+pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
+    (0, 0, 0, 0, [(0, 0); 3])
+}
+pub fn video_give_to_user() {}
+pub fn video_take_back() {}
+
 // ─── прерывания ─────────────────────────────────────────────────────────────
 
 pub use csr::{enable_interrupts, irq_restore, irq_save_disable};

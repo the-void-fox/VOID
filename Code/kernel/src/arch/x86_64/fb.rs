@@ -129,10 +129,58 @@ pub fn init(base: usize, pitch: usize, width: usize, height: usize, bpp: u8, rgb
     true
 }
 
-/// Есть ли пиксельная консоль (иначе работает текстовый VGA).
+/// Есть ли пиксельный режим (иначе работает текстовый VGA). Отвечает за ГЕОМЕТРИЮ, а не за
+/// право рисовать — см. [`owned_by_user`].
 #[inline]
 pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
+}
+
+/// Веха 97 — экран отдан процессу (тот замапил окно через `SYS_MMIO_MAP`).
+///
+/// **Правило владения экраном.** Пиксели один, а рисовать хотят двое: ядро (`println!`) и
+/// терминал. Делить их нечем — оверлея у нас нет, — поэтому владелец ровно один: как только
+/// процесс получил окно, ядро перестаёт рисовать и уходит в serial. Исключение одно —
+/// **паника забирает экран обратно** ([`take_back`]): замерший терминал без объяснения хуже,
+/// чем испорченная картинка.
+static USER_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Экран у процесса?
+#[inline]
+pub fn owned_by_user() -> bool {
+    USER_OWNED.load(Ordering::Relaxed)
+}
+
+/// Отдать экран процессу (зовётся из `SYS_MMIO_MAP`, когда замаплено окно фреймбуфера).
+pub fn give_to_user() {
+    USER_OWNED.store(true, Ordering::Relaxed);
+}
+
+/// Забрать экран ядру и очистить его — путь паники.
+pub fn take_back() {
+    if present() {
+        USER_OWNED.store(false, Ordering::Relaxed);
+        unsafe { clear(0x07) };
+    }
+}
+
+/// Полное описание режима для программы: `(ширина, высота, шаг строки, бит/пиксель,
+/// [(позиция, ширина маски); R, G, B])`. Отдаётся через `SYS_VIDEO_INFO`.
+pub fn info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
+    let mut rgb = [(0u8, 0u8); 3];
+    for (i, slot) in rgb.iter_mut().enumerate() {
+        *slot = (
+            RGB_POS[i].load(Ordering::Relaxed) as u8,
+            RGB_SIZE[i].load(Ordering::Relaxed) as u8,
+        );
+    }
+    (
+        PIX_W.load(Ordering::Relaxed),
+        PIX_H.load(Ordering::Relaxed),
+        PITCH.load(Ordering::Relaxed),
+        BYTES_PP.load(Ordering::Relaxed) * 8,
+        rgb,
+    )
 }
 
 /// Геометрия консоли в знакоместах.

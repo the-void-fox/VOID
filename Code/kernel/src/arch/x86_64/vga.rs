@@ -49,7 +49,10 @@ static mut ATTR: u8 = ATTR_DEFAULT;
 #[inline]
 unsafe fn put_cell(row: usize, col: usize, ch: u8) {
     if super::fb::present() {
-        super::fb::put_cell(row, col, ch, ATTR);
+        // Веха 97: экран мог уйти процессу — тогда ядро молчит (вывод остаётся в serial).
+        if !super::fb::owned_by_user() {
+            super::fb::put_cell(row, col, ch, ATTR);
+        }
         return;
     }
     let p = (dm(VGA) + (row * W + col) * 2) as *mut u8;
@@ -69,7 +72,9 @@ unsafe fn newline() {
 /// Сдвинуть все строки на одну вверх, очистить последнюю (кольцевого буфера нет — экран мал).
 unsafe fn scroll() {
     if super::fb::present() {
-        super::fb::scroll(ATTR);
+        if !super::fb::owned_by_user() {
+            super::fb::scroll(ATTR);
+        }
         return;
     }
     for row in 1..H {
@@ -281,7 +286,9 @@ pub fn put_char(c: char) {
 pub fn clear() {
     unsafe {
         if super::fb::present() {
-            super::fb::clear(ATTR);
+            if !super::fb::owned_by_user() {
+                super::fb::clear(ATTR);
+            }
         } else {
             let blank = ((ATTR as u16) << 8) | b' ' as u16;
             for i in 0..W * H {
@@ -299,7 +306,9 @@ pub fn sync_cursor() {
     unsafe {
         // Веха 96: в пиксельном режиме аппаратного курсора нет — рисуем свой (подчёркивание).
         if super::fb::present() {
-            super::fb::cursor(ROW, COL);
+            if !super::fb::owned_by_user() {
+                super::fb::cursor(ROW, COL);
+            }
             return;
         }
         let pos = (ROW * W + COL) as u16;

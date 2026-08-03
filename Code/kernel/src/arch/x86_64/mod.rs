@@ -300,6 +300,25 @@ pub fn video_mode() -> Option<(usize, usize, usize)> {
     fb::present().then(fb::geometry)
 }
 
+/// Веха 97 — окно фреймбуфера `(физ. база, длина)` для выдачи процессу под capability
+/// (`mmio:fb` в конфиге init). `None` — пиксельного режима нет.
+pub fn video_window() -> Option<(usize, usize)> {
+    fb::window()
+}
+
+/// Веха 97 — полное описание режима для `SYS_VIDEO_INFO`.
+pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
+    fb::info()
+}
+
+/// Веха 97 — экран отдан процессу / забрать обратно (паника).
+pub fn video_give_to_user() {
+    fb::give_to_user();
+}
+pub fn video_take_back() {
+    fb::take_back();
+}
+
 /// Веха 96 — найти в инфо-тегах multiboot2 тег 8 (framebuffer) и отдать его [`fb::init`].
 /// Раскладка тега: `addr@+8` (u64), `pitch@+16`, `width@+20`, `height@+24`, `bpp@+28` (u8),
 /// `type@+29` (u8), **`reserved@+30` — u16, а не байт** (общая часть тега ровно 32 байта),

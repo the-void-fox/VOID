@@ -957,6 +957,9 @@ fn id_short(id: &void_abi::ContentId) -> alloc::string::String {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Веха 97: экран мог быть отдан терминалу — забираем, иначе паника осталась бы только в
+    // serial, а на машине без COM-порта не увидел бы её никто.
+    arch::video_take_back();
     println!();
     println!("  [PANIC] {}", info);
     loop {

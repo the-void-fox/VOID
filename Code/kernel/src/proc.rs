@@ -2043,6 +2043,13 @@ fn syscall(t: &mut Table, cur: usize) {
                         if !ok {
                             usize::MAX
                         } else {
+                            // Веха 97: замаплен ЭКРАН — ядро уступает его и уходит в serial.
+                            // Единственная точка передачи владения: раньше отдавать нечего
+                            // (окно не отображено), позже — некому.
+                            if arch::video_window() == Some((base, len)) {
+                                arch::video_give_to_user();
+                                println!("  [видео] экран отдан процессу P{} — вывод ядра уходит в serial", cur);
+                            }
                             vprintln!("  [drv] P{} SYS_MMIO_MAP {:#x} ({} стр.) → {:#x}", cur, base, pages, va);
                             0
                         }
@@ -2295,6 +2302,44 @@ fn syscall(t: &mut Table, cur: usize) {
                 Ok(()) => usize::MAX,
                 Err(e) => {
                     vprintln!("  [obj] P{} OBJ_CHILDREN отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_VIDEO_INFO(mmio_cap, out) -> 0 | MAX (Веха 97): описание видеорежима в буфер
+        // процесса — 10 × u32: ширина, высота, шаг строки, бит/пиксель и по паре
+        // (позиция, ширина маски) на R, G, B.
+        //
+        // Права те же, что на само окно: числа сами по себе безобидны, но отдавать их отдельно
+        // от права рисовать незачем — так геометрия неотделима от capability, а не висит
+        // «общедоступной справкой» рядом с ней.
+        40 => {
+            let (mcap, out) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            const N: usize = 10;
+            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::READ) {
+                Ok(_) if ensure_heap_range(t, cur, out, N * 4) => {
+                    let (w, h, pitch, bpp, rgb) = arch::video_info();
+                    let vals: [u32; N] = [
+                        w as u32, h as u32, pitch as u32, bpp as u32,
+                        rgb[0].0 as u32, rgb[0].1 as u32,
+                        rgb[1].0 as u32, rgb[1].1 as u32,
+                        rgb[2].0 as u32, rgb[2].1 as u32,
+                    ];
+                    for (i, v) in vals.iter().enumerate() {
+                        unsafe { core::ptr::write_unaligned((out + i * 4) as *mut u32, *v) };
+                    }
+                    0
+                }
+                Ok(_) => usize::MAX,
+                Err(e) => {
+                    vprintln!("  [видео] P{} VIDEO_INFO отклонён: {:?}", cur, e);
                     usize::MAX
                 }
             };

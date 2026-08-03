@@ -111,6 +111,9 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         // Веха 51 — окно MMIO устройства: найти его на PCI, отдать (физ. база + длина).
         let region = match dev {
             "e1000" => crate::arch::probe_e1000().map(|base| (base, 0x20000usize)),
+            // Веха 97 — ЭКРАН как обычное устройство под capability: терминал получает окно
+            // фреймбуфера и рисует сам. Ядро при этом умолкает (см. fb::give_to_user).
+            "fb" => crate::arch::video_window(),
             _ => None,
         };
         match region {
