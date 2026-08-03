@@ -34,6 +34,9 @@ pub mod http;
 /// это реализация `core::alloc::GlobalAlloc`, поэтому программы без кучи не страдают.
 pub mod heap;
 
+/// Веха 98 — соглашение о чужом stdio (вывод и ввод через IPC к хосту вместо общей консоли).
+pub mod stdio;
+
 // Веха 95 — источник случайности для криптографии. `getrandom` на bare-metal системного
 // источника не имеет, поэтому регистрируем свой: он идёт в `SYS_RANDOM`, за которым стоят
 // virtio-rng, ГСЧ процессора и джиттер-источник ядра, смешанные через BLAKE3.
@@ -99,6 +102,7 @@ const SYS_OBJ_CHILDREN: usize = 39;
 const SYS_VIDEO_INFO: usize = 40;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
+const SYS_SELF_ENDPOINT: usize = 43;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -176,8 +180,21 @@ mod abi {
 
 // ─── базовые syscall'ы ────────────────────────────────────────────────────────
 
-/// `SYS_WRITE`: напечатать байты в консоль (ядро читает буфер процесса напрямую).
+/// Напечатать байты. Если процессу назначен ХОСТ ([`stdio`], Веха 98) — вывод уходит ему по IPC;
+/// иначе, как раньше, в общую консоль ядра (`SYS_WRITE`).
+///
+/// Откат на консоль при неудаче — не перестраховка: молча потерять вывод хуже, чем напечатать
+/// его не туда, а хост может умереть в любой момент.
 pub fn write(buf: &[u8]) {
+    if stdio::write(buf) {
+        return;
+    }
+    abi::syscall(SYS_WRITE, buf.as_ptr() as usize, buf.len(), 0, 0, 0, 0, 0);
+}
+
+/// Напечатать байты СТРОГО в консоль ядра, минуя хост. Нужна самому хосту и путям, где IPC
+/// недоступен или неуместен (паника, отладка транспорта).
+pub fn write_console(buf: &[u8]) {
     abi::syscall(SYS_WRITE, buf.as_ptr() as usize, buf.len(), 0, 0, 0, 0, 0);
 }
 
@@ -447,8 +464,13 @@ pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     (y, m, d, (rem / 3600) as u32, (rem % 3600 / 60) as u32, (rem % 60) as u32)
 }
 
-/// `SYS_READ`: прочитать доступный ввод консоли (хотя бы один байт; блокируется до ввода).
+/// Прочитать ввод. При назначенном хосте ([`stdio`]) запрос уходит ему по IPC — и хост волен
+/// ответить ОТЛОЖЕННО, тогда мы спим в `SYS_CALL` ровно как спали бы в `SYS_READ`. Без хоста —
+/// прежний путь: консоль ядра, блокировка до первого байта.
 pub fn read_stdin(buf: &mut [u8]) -> usize {
+    if let Some(n) = stdio::read(buf) {
+        return n;
+    }
     abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
 }
 
@@ -505,11 +527,26 @@ pub fn mmio_map(mmio_cap: usize, va: usize) -> bool {
 /// работать — на этом стоит любой хост чужих процессов (мультиплексор, супервизор).
 /// `None` — запустить не удалось.
 pub fn spawn(exec_cap: usize, name: &[u8], args: &[u8]) -> Option<usize> {
+    spawn_with_stdio(exec_cap, name, args, NO_CAP)
+}
+
+/// То же, но ребёнок дополнительно получает право `stdio_cap` — обычно эндпоинт родителя
+/// ([`self_endpoint`]). Ядро само назовёт его индекс в окружении ребёнка (`STDIO=<i>`), после
+/// чего весь его вывод и ввод пойдут к нам ([`stdio`]) вместо общей консоли.
+pub fn spawn_with_stdio(
+    exec_cap: usize, name: &[u8], args: &[u8], stdio_cap: usize,
+) -> Option<usize> {
     let r = abi::syscall(
         SYS_SPAWN, exec_cap, name.as_ptr() as usize, name.len(),
-        args.as_ptr() as usize, args.len(), 0, 0,
+        args.as_ptr() as usize, args.len(), stdio_cap, 0,
     ).0;
     (r != NO_CAP).then_some(r)
+}
+
+/// `SYS_SELF_ENDPOINT` (Веха 98): право ВЫЗЫВАТЬ нас, чтобы отдать его детям. Не расширение
+/// полномочий — принимать сообщения процесс может и так; кому раздать право на себя, его дело.
+pub fn self_endpoint() -> usize {
+    abi::syscall(SYS_SELF_ENDPOINT, 0, 0, 0, 0, 0, 0, 0).0
 }
 
 /// Результат [`wait`].

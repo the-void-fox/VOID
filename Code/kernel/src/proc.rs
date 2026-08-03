@@ -1567,6 +1567,9 @@ fn syscall(t: &mut Table, cur: usize) {
                 let f = &t.procs[cur].frame;
                 (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
             };
+            // Веха 98 — 6-й аргумент SPAWN: право, которое родитель ДОПОЛНИТЕЛЬНО отдаёт ребёнку
+            // (обычно свой эндпоинт под stdio). `MAX` — нет такого.
+            let extra_cap = if wait_child { usize::MAX } else { t.procs[cur].frame.arg(5) };
             let dom = t.procs[cur].domain;
             let mut spawned = false;
             match cap::store(dom, Cap::from_bits(scap as u64), Rights::EXEC) {
@@ -1649,6 +1652,27 @@ fn syscall(t: &mut Table, cur: usize) {
                                         if t.procs[child].linux { "linux-abi" } else { "native" },
                                         t.procs[child].env.len(), t.procs[child].start_caps.len(),
                                     );
+                                    // Веха 98 — наделить ребёнка ДОПОЛНИТЕЛЬНЫМ правом и назвать
+                                    // его в окружении. Индекс кладёт ЯДРО, потому что только оно
+                                    // знает, сколько прав ребёнок унаследовал; выдумывать его на
+                                    // стороне родителя значило бы дублировать эту арифметику и
+                                    // разъезжаться с ней при первом же изменении.
+                                    //
+                                    // Ядро при этом НЕ узнаёт, что такое stdio: оно кладёт
+                                    // строку в окружение — ровно как уже кладёт имя программы в
+                                    // argv ([[process-contract]]). Смысл строки — дело userspace.
+                                    if extra_cap != usize::MAX {
+                                        if let Ok(c) =
+                                            cap::endow(dom, Cap::from_bits(extra_cap as u64), cdom)
+                                        {
+                                            let idx = t.procs[child].start_caps.len();
+                                            t.procs[child].start_caps.push(c.bits() as usize);
+                                            let mut line = alloc::format!("STDIO={}\0", idx);
+                                            let env = &mut t.procs[child].env;
+                                            // Окружение — блоб `KEY=VAL\0…`; хвостовой NUL уже есть.
+                                            unsafe { env.append(line.as_mut_vec()) };
+                                        }
+                                    }
                                     if wait_child {
                                         // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
                                         t.procs[cur].state = State::ExecWait(child);
@@ -2401,6 +2425,20 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
+            f.advance();
+        }
+        // SYS_SELF_ENDPOINT() -> cap (Веха 98): право ВЫЗЫВАТЬ этот процесс, чтобы отдать его
+        // детям. Не расширение полномочий: принимать сообщения процесс может и так (`SYS_RECV`),
+        // а кому раздать право на себя — его собственное дело. Без этого хост чужого stdio
+        // невозможен: ребёнку некуда слать вывод, потому что сослаться на родителя нечем.
+        //
+        // Права SEND — только «позвать»; ни принимать за нас, ни раздавать дальше (нет GRANT).
+        43 => {
+            let dom = t.procs[cur].domain;
+            let leader = t.procs[cur].group; // эндпоинт принадлежит ПРОЦЕССУ, не нити
+            let cap = cap::mint(dom, cap::Target::Endpoint(leader), Rights::SEND);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(cap.bits() as usize);
             f.advance();
         }
         // SYS_WAIT(pid, nonblock) -> код выхода | WOULD_BLOCK | MAX (Веха 98): забрать результат

@@ -124,6 +124,7 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("vvsh", include_bytes!(env!("PROG_VVSH"))),
     ("httpsc", include_bytes!(env!("PROG_HTTPSC"))),
     ("spawn-demo", include_bytes!(env!("PROG_SPAWN_DEMO"))),
+    ("stdio-demo", include_bytes!(env!("PROG_STDIO_DEMO"))),
 ];
 
 /// Веха 97 — программы ТОЛЬКО ДЛЯ x86: `term` рисует в пиксельный фреймбуфер, которого на
