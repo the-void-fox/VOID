@@ -21,6 +21,24 @@ fn dm(pa: usize) -> usize {
 const W: usize = 80;
 const H: usize = 25;
 
+// ── Веха 96: тот же слой ANSI поверх ДВУХ задников ───────────────────────────────────────────
+// Разбор escape-кодов, курсор и перевод UTF-8 → CP866 не зависят от того, чем нарисована ячейка,
+// поэтому они остались здесь, а «нарисовать знакоместо» ушло за развилку: текстовый буфер
+// `0xB8000` (этот файл) либо пиксельный фреймбуфер ([`super::fb`], если GRUB дал графический
+// режим). Геометрия из константы стала функцией — у пикселей она своя и известна лишь в рантайме.
+
+/// Ширина консоли в знакоместах.
+#[inline]
+fn w() -> usize {
+    if super::fb::present() { super::fb::cols() } else { W }
+}
+
+/// Высота консоли в знакоместах.
+#[inline]
+fn h() -> usize {
+    if super::fb::present() { super::fb::rows() } else { H }
+}
+
 /// Атрибут по умолчанию: светло-серый на чёрном (как классический текстовый BIOS).
 const ATTR_DEFAULT: u8 = 0x07;
 
@@ -30,6 +48,10 @@ static mut ATTR: u8 = ATTR_DEFAULT;
 
 #[inline]
 unsafe fn put_cell(row: usize, col: usize, ch: u8) {
+    if super::fb::present() {
+        super::fb::put_cell(row, col, ch, ATTR);
+        return;
+    }
     let p = (dm(VGA) + (row * W + col) * 2) as *mut u8;
     core::ptr::write_volatile(p, ch);
     core::ptr::write_volatile(p.add(1), ATTR);
@@ -38,14 +60,18 @@ unsafe fn put_cell(row: usize, col: usize, ch: u8) {
 unsafe fn newline() {
     COL = 0;
     ROW += 1;
-    if ROW >= H {
+    if ROW >= h() {
         scroll();
-        ROW = H - 1;
+        ROW = h() - 1;
     }
 }
 
 /// Сдвинуть все строки на одну вверх, очистить последнюю (кольцевого буфера нет — экран мал).
 unsafe fn scroll() {
+    if super::fb::present() {
+        super::fb::scroll(ATTR);
+        return;
+    }
     for row in 1..H {
         for col in 0..W {
             let src = (dm(VGA) + (row * W + col) * 2) as *const u16;
@@ -72,7 +98,7 @@ unsafe fn emit(byte: u8) {
         _ => {
             put_cell(ROW, COL, byte);
             COL += 1;
-            if COL >= W {
+            if COL >= w() {
                 newline();
             }
         }
@@ -153,7 +179,7 @@ unsafe fn apply_sgr() {
 
 /// Стереть от курсора до конца строки (`ESC[K`).
 unsafe fn erase_line() {
-    for col in COL..W {
+    for col in COL..w() {
         put_cell(ROW, col, b' ');
     }
 }
@@ -239,8 +265,8 @@ pub fn put_char(c: char) {
                         'K' => erase_line(),
                         // Веха 45 — перемещение курсора (для редактирования строки в vsh).
                         'A' => ROW = ROW.saturating_sub(first_param(1)),
-                        'B' => ROW = (ROW + first_param(1)).min(H - 1),
-                        'C' => COL = (COL + first_param(1)).min(W - 1),
+                        'B' => ROW = (ROW + first_param(1)).min(h() - 1),
+                        'C' => COL = (COL + first_param(1)).min(w() - 1),
                         'D' => COL = COL.saturating_sub(first_param(1)),
                         _ => {}
                     }
@@ -254,9 +280,13 @@ pub fn put_char(c: char) {
 /// Очистить экран текущим цветом и увести курсор в начало (для `clear` из vsh — Веха 43).
 pub fn clear() {
     unsafe {
-        let blank = ((ATTR as u16) << 8) | b' ' as u16;
-        for i in 0..W * H {
-            core::ptr::write_volatile((dm(VGA) + i * 2) as *mut u16, blank);
+        if super::fb::present() {
+            super::fb::clear(ATTR);
+        } else {
+            let blank = ((ATTR as u16) << 8) | b' ' as u16;
+            for i in 0..W * H {
+                core::ptr::write_volatile((dm(VGA) + i * 2) as *mut u16, blank);
+            }
         }
         ROW = 0;
         COL = 0;
@@ -267,6 +297,11 @@ pub fn clear() {
 /// после каждой строки — иначе мигающий курсор «висит» там, где его оставил BIOS, а не где пишем.
 pub fn sync_cursor() {
     unsafe {
+        // Веха 96: в пиксельном режиме аппаратного курсора нет — рисуем свой (подчёркивание).
+        if super::fb::present() {
+            super::fb::cursor(ROW, COL);
+            return;
+        }
         let pos = (ROW * W + COL) as u16;
         outb(0x3D4, 0x0F);
         outb(0x3D5, (pos & 0xff) as u8);

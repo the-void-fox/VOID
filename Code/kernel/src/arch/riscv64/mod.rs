@@ -37,7 +37,13 @@ pub use uart::{drain_rx as console_drain, getc as console_getc, has_input as con
 
 /// Веха 41 — ранняя инициализация консоли: на RISC-V консоль — UART (SBI/NS16550), чистить
 /// нечего (no-op; парный x86, где очищается VGA-экран от мусора BIOS).
-pub fn console_init() {}
+pub fn console_init(_a0: usize, _a1: usize) {}
+
+/// Веха 96 — пиксельной консоли на riscv нет (в QEMU `virt` дисплея нет вовсе; понадобится
+/// virtio-gpu или ramfb). Заглушка арх-контракта, парная x86-версии.
+pub fn video_mode() -> Option<(usize, usize, usize)> {
+    None
+}
 
 // ─── прерывания ─────────────────────────────────────────────────────────────
 

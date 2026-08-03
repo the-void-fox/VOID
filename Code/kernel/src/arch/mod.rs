@@ -79,6 +79,8 @@ pub use imp::{
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла
     is_real_hardware, platform_init, ram_total,
+    // Веха 96: режим пиксельной консоли (x86 — фреймбуфер от GRUB; riscv — None)
+    video_mode,
     // часы и случайность (Веха 86): настенное время от прошивки (CMOS RTC / goldfish-rtc из DTB)
     // и аппаратный ГСЧ (RDRAND на x86; на riscv его нет — общий код мешает энтропию сам)
     hw_random_u64, wall_clock_unix_ns,

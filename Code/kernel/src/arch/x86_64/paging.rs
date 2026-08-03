@@ -113,6 +113,14 @@ pub fn init() -> usize {
         //    map_mmio, когда их найдёт pci::probe_virtio_blk — они известны в рантайме).
         map_range(root, super::lapic::LAPIC_BASE, super::lapic::LAPIC_BASE + PAGE_SIZE, PTE_W | PTE_NX);
         map_range(root, super::ioapic::IOAPIC_BASE, super::ioapic::IOAPIC_BASE + PAGE_SIZE, PTE_W | PTE_NX);
+        // 4) Веха 96 — окно ФРЕЙМБУФЕРА, если GRUB дал графический режим. Оно лежит ВЫШЕ карты
+        //    RAM (у QEMU-stdvga 0xFD00_0000), значит direct-map его не покрывает: без этой
+        //    строки первый же println после `mm_enable` ушёл бы в неотображённую память. До сих
+        //    пор консоль жила на таблицах трамплина (первые 4 ГиБ тождественно) — потому и
+        //    печаталась; здесь отображение становится постоянным.
+        if let Some((base, len)) = super::fb::window() {
+            map_range(root, base, base + len, PTE_W | PTE_NX);
+        }
     }
     KERNEL_ROOT.store(root, Ordering::Relaxed);
     root
