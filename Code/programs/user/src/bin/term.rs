@@ -1,28 +1,30 @@
-//! `term` — терминал VOID на крейтах ereb (Веха 97, ADR 0014).
+//! `term` — терминал-мультиплексор VOID на крейтах ereb (Вехи 97 и 99, ADR 0014).
 //!
-//! Первый шаг из потолка 256 глифов: знакогенератор VGA держал ровно столько символов, и любой
-//! символ вне CP866 показать было НЕГДЕ. Здесь экран — пиксели, а глифы растеризуются из
-//! настоящего TrueType, поэтому доступен весь Unicode шрифта, включая иконки Nerd Font.
-//!
-//! **Это ещё не мультиплексор.** Одна панель на весь экран, ни вкладок, ни панелей, ни чужих
-//! процессов: у VOID пока одна общая консоль и блокирующий `SYS_EXEC`, а мультиплексору нужны
-//! приватные потоки байт на каждого ребёнка. Это следующий шаг фазы; здесь модель процессов не
-//! меняется вовсе.
-//!
-//! Что программа делает: получает экран под capability, рисует грид ereb и гоняет в него
-//! клавиатурный ввод через тот же разбор ANSI, что и настоящий терминал.
-//!
-//! ## Устройство
+//! Веха 97 сняла потолок 256 глифов: экран стал пикселями, а глифы — настоящим TrueType.
+//! Веха 99 добавила то, ради чего вся фаза и затевалась: **панели с живыми процессами**.
 //!
 //! ```text
-//!   клавиши → SYS_READ ─→ vte::Parser ─→ ereb_core::Grid ─→ GridRenderer ─→ Surface (RAM)
-//!                                                                              │
-//!                                            фреймбуфер под cap ◀── blit ──────┘
+//!   клавиатура ─→ префикс? ─да→ команда мультиплексора (разбить, перейти, закрыть)
+//!                     └─нет→ отложенный ответ ребёнку ФОКУСНОЙ панели (его read_stdin)
+//!
+//!   ребёнок ──IPC(OP_STDOUT)──→ грид своей панели ──→ общий кадр ──→ фреймбуфер
 //! ```
 //!
-//! Рисуем **в буфер в RAM, а потом переносим кадр**: фреймбуфер — некэшируемая память
-//! устройства, и растеризовать глифы прямо в неё значило бы платить за каждый пиксель
-//! отдельной транзакцией шины. Ядро в своей консоли не читает фреймбуфер по той же причине.
+//! ## Почему это устроено именно так
+//!
+//! - **Хост — обычный IPC-сервер.** Ничего нового: `net-srv` устроен так же, включая отложенные
+//!   ответы. Ребёнок, спящий в `read_stdin`, спит в `SYS_CALL` к нам, и мы отвечаем ему, когда
+//!   приходят клавиши. Никакого «драйвера терминала» в ядре не появилось.
+//! - **Реактор не имеет права уснуть ни на одном источнике.** Клавиатура читается
+//!   неблокирующе ([`sys::read_console_nonblock`], Веха 99), вывод детей — `try_recv`. Сон —
+//!   только когда пусто и то и другое, и только со сроком.
+//! - **Раскладка — `ereb-mux`**: дерево разбиений и навигация уже написаны и покрыты тестами в
+//!   апстриме, своей геометрии не заводим.
+//!
+//! ## Управление
+//!
+//! Префикс — **Ctrl-A** (как в screen), дальше: `|` разбить вертикально · `-` горизонтально ·
+//! `o` следующая панель · `x` закрыть · `q` выйти · Ctrl-A — послать сам Ctrl-A в панель.
 
 #![no_std]
 #![no_main]
@@ -32,185 +34,435 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use ereb_core::Grid;
-use ereb_render::{GlyphCache, GridRenderer, Palette, Rgb, Surface, TtfFont};
+use ereb_core::{Cell, Color, Grid, NamedColor};
+use ereb_mux::{Area, PaneId, PaneRect, SplitDirection, SplitTree};
+use ereb_render::{GlyphCache, GridRenderer, Palette, Surface, TtfFont};
 use void_user as sys;
+use void_user::{stdio, Wait};
 
-/// Куча процесса. Считаем по-крупному: кадр 1280×800 RGBA — 4 МиБ, копия шрифта в куче — 2.6 МиБ,
-/// кэш глифов — сотни килобайт. Арена резервируется лениво (`SYS_MAP`), неиспользованные
-/// страницы ничего не стоят.
+/// Куча: кадр 1280×800 RGBA (4 МиБ), копия шрифта (2.6 МиБ), гриды панелей, кэш глифов.
 #[global_allocator]
-static ALLOC: sys::heap::Heap<{ 32 * 1024 * 1024 }> = sys::heap::Heap::new();
+static ALLOC: sys::heap::Heap<{ 48 * 1024 * 1024 }> = sys::heap::Heap::new();
 
-/// Шрифт вшит в бинарь (см. `fonts/README.md`): так первая версия не упирается в разбиение
-/// больших объектов store на куски. Перенос в store — следующий шаг, тогда шрифт станет
-/// сменяемым без пересборки.
+/// Шрифт вшит в бинарь (см. `fonts/README.md`) — временно, до переноса в store.
 static FONT: &[u8] = include_bytes!("../../fonts/FiraCodeNerdFontMono-Regular.ttf");
 
-/// Окно фреймбуфера в НАШЕМ адресном пространстве: между образом (0x4000_0000) и кучей
-/// (0x6000_0000) — 512 МиБ свободного места, кадру нужно единицы мегабайт.
+/// Окно фреймбуфера в нашем адресном пространстве: между образом и кучей.
 const FB_VA: usize = 0x5000_0000;
-
-/// Кегль в пикселях. 18 даёт ячейку 11×22 на FiraCode — примерно 116×36 знакомест на 1280×800.
 const FONT_PX: u32 = 18;
 
-/// Куда пишет наш собственный вывод (баннер и эхо) — прямо в грид через разбор ANSI, как если бы
-/// это пришло из PTY. Отдельного пути «печатать в терминал» нет намеренно: пусть с первого дня
-/// работает ровно тот тракт, которым потом пойдут настоящие программы.
-struct Screen {
+/// Что запускаем в новой панели и с каким аргументом. Без `repl` vvsh печатает справку и
+/// выходит — панель умирала мгновенно, и выглядело это как «мультиплексор не работает».
+const SHELL: &[u8] = b"bin/vvsh";
+const SHELL_ARGS: &[u8] = b"repl";
+
+/// Префикс команд мультиплексора — Ctrl-A, как в screen.
+const PREFIX: u8 = 0x01;
+
+/// Панель: грид, разбор ANSI, ребёнок и его отложенный запрос ввода.
+struct Pane {
+    id: PaneId,
     grid: Grid,
     parser: vte::Parser,
+    /// Номер процесса-ребёнка (`None` — запустить не удалось либо он уже завершился).
+    child: Option<usize>,
+    /// Ребёнок спит в `read_stdin` и ждёт ответа. Копим клавиши, пока он не спросит, и отвечаем
+    /// сразу, как есть и запрос, и байты, — иначе ввод терялся бы между этими событиями.
+    pending_read: Option<usize>,
+    /// Не отданный ввод этой панели.
+    inbox: Vec<u8>,
 }
 
-impl Screen {
-    fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.grid, bytes);
-    }
-}
-
-/// Точка входа программ VOID ([[process-contract]]): ядро передаёт первые два права в
-/// регистрах, остальные — таблицей `SYS_STARTCAP`.
 #[no_mangle]
-pub extern "C" fn _start(cap0: usize, cap1: usize) -> ! {
-    // ── экран под capability ────────────────────────────────────────────────────────────────
-    // Право приходит стартовым (`mmio:fb` в конфиге init). Без него терминал не работает и не
-    // должен: рисовать некуда, а тихо продолжать — худшее, что можно сделать.
-    let fb_cap = match find_fb_cap(cap0, cap1) {
-        Some(c) => c,
-        None => {
-            sys::write("[term] нет права на экран (mmio:fb в конфиге init) - выхожу\n".as_bytes());
-            sys::exit(1);
-        }
+pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
+    let Some(fb_cap) = find_fb_cap() else {
+        sys::write_console("[term] нет права на экран (mmio:fb в конфиге init)\n".as_bytes());
+        sys::exit(1);
     };
-    let info = match sys::video_info(fb_cap) {
-        Some(i) => i,
-        None => {
-            sys::write("[term] ядро не отдало описание видеорежима - выхожу\n".as_bytes());
-            sys::exit(1);
-        }
+    let Some(info) = sys::video_info(fb_cap) else {
+        sys::write_console("[term] ядро не отдало описание видеорежима\n".as_bytes());
+        sys::exit(1);
     };
     if !sys::mmio_map(fb_cap, FB_VA) {
-        sys::write("[term] не удалось замапить фреймбуфер - выхожу\n".as_bytes());
+        sys::write_console("[term] не удалось замапить фреймбуфер\n".as_bytes());
         sys::exit(1);
     }
-    // С этого момента ЭКРАН НАШ: ядро замолчало и печатает только в serial (см. Веху 97).
 
-    // ── шрифт, грид, рендер ─────────────────────────────────────────────────────────────────
-    let font = match TtfFont::from_vec(FONT.to_vec(), FONT_PX) {
-        Ok(f) => f,
-        Err(_) => {
-            sys::write("[term] шрифт не разобрался - выхожу\n".as_bytes());
-            sys::exit(1);
-        }
+    let Ok(font) = TtfFont::from_vec(FONT.to_vec(), FONT_PX) else {
+        sys::write_console("[term] шрифт не разобрался\n".as_bytes());
+        sys::exit(1);
     };
     let mut cache = GlyphCache::new(font);
     let metrics = cache.metrics();
     let palette = Palette::default();
     let renderer = GridRenderer::new(palette, metrics);
 
-    let cols = (info.width / metrics.width.max(1) as usize).max(1);
-    let rows = (info.height / metrics.height.max(1) as usize).max(1);
+    // Геометрия в знакоместах; последняя строка — статус-бар мультиплексора.
+    let cols = (info.width / metrics.width.max(1) as usize).max(8);
+    let rows = (info.height / metrics.height.max(1) as usize).max(4);
     let (surf_w, surf_h) = renderer.pixel_size(cols, rows);
     let mut surface = Surface::new(surf_w, surf_h, palette.background);
-    let mut screen = Screen {
-        grid: Grid::new(cols, rows),
-        parser: vte::Parser::new(),
-    };
 
-    banner(&mut screen, &info, cols, rows, metrics.width, metrics.height);
+    // Право на ЗАПУСК ищем перебором стартовых прав, а не по фиксированному индексу: порядок
+    // токенов в конфиге init — дело конфига, и он уже менялся. Перебор здесь безопасен: неудачный
+    // `spawn` ничего не делает, а удастся он ровно с тем правом, у которого есть EXEC на store.
+    let me = sys::self_endpoint();
 
-    // ── цикл: нарисовать кадр, дождаться клавиш, повторить ──────────────────────────────────
-    let mut buf = [0u8; 64];
+    let mut tree = SplitTree::leaf(PaneId(0));
+    let mut next_id = 1usize;
+    let mut rects = layout_of(&tree, cols, rows);
+    let mut exec_cap = sys::NO_CAP;
+    let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me)];
+    let mut focus = 0usize;
+
+    let mut prefix_armed = false;
+    let mut keys = [0u8; 64];
+    let mut msg = [0u8; stdio::CHUNK];
+    let mut redraw = true;
+
     loop {
-        renderer.paint(&screen.grid, &mut cache, &mut surface);
-        blit(&surface, &info);
+        let mut worked = false;
 
-        // `SYS_READ` блокирует до ввода — крутить кадры вхолостую незачем, картинка статична,
-        // пока не нажали клавишу.
-        let n = sys::read_stdin(&mut buf);
-        if n == 0 {
-            continue;
-        }
-        for &b in &buf[..n] {
-            match b {
-                // Ctrl-D — выйти. Экран вернётся ядру само: смерть владельца ядро отслеживает.
-                0x04 => {
-                    sys::write("[term] выход по Ctrl-D\n".as_bytes());
-                    sys::exit(0);
+        // ── 1. клавиатура (никогда не блокируемся) ─────────────────────────────────────────
+        let n = sys::read_console_nonblock(&mut keys);
+        if n > 0 {
+            worked = true;
+            for i in 0..n {
+                let k = keys[i];
+                if prefix_armed {
+                    prefix_armed = false;
+                    match k {
+                        b'|' | b'-' => {
+                            let dir = if k == b'|' {
+                                SplitDirection::Vertical
+                            } else {
+                                SplitDirection::Horizontal
+                            };
+                            split(&mut tree, &mut panes, &mut next_id, &mut focus, dir,
+                                  cols, rows, &mut exec_cap, me);
+                            rects = layout_of(&tree, cols, rows);
+                            redraw = true;
+                        }
+                        b'o' => {
+                            focus = (focus + 1) % panes.len().max(1);
+                            redraw = true;
+                        }
+                        b'x' => {
+                            close_pane(&mut tree, &mut panes, &mut focus);
+                            if panes.is_empty() {
+                                sys::write_console("[term] панелей не осталось — выход\n".as_bytes());
+                                sys::exit(0);
+                            }
+                            rects = layout_of(&tree, cols, rows);
+                            resize_all(&mut panes, &rects);
+                            redraw = true;
+                        }
+                        b'q' => {
+                            sys::write_console("[term] выход по Ctrl-A q\n".as_bytes());
+                            sys::exit(0);
+                        }
+                        // Ctrl-A дважды — отдать сам Ctrl-A панели, иначе он был бы недоступен.
+                        PREFIX => push_input(&mut panes, focus, PREFIX),
+                        _ => {}
+                    }
+                } else if k == PREFIX {
+                    prefix_armed = true;
+                } else {
+                    push_input(&mut panes, focus, k);
                 }
-                // Enter приходит как CR (с PS/2-клавиатуры) или как LF (из serial). Грид ждёт
-                // CR+LF: голый LF опускает строку, НЕ сбрасывая колонку, и текст уезжает
-                // лесенкой вправо. В настоящем терминале это делает line discipline, у нас её
-                // нет — переводим здесь.
-                b'\r' | b'\n' => screen.feed(b"\r\n"),
-                // Backspace (0x7F) — стереть символ слева: назад, пробел, назад.
-                0x7f | 0x08 => screen.feed(b"\x08 \x08"),
-                _ => screen.feed(&[b]),
+            }
+        }
+
+        // ── 2. вывод и запросы ввода от детей ──────────────────────────────────────────────
+        while let Some(m) = sys::try_recv(&mut msg) {
+            worked = true;
+            redraw |= handle(&mut panes, &m, &msg);
+        }
+
+        // ── 3. отдать накопленный ввод тем, кто его ждёт ───────────────────────────────────
+        for p in panes.iter_mut() {
+            if p.pending_read.is_some() && !p.inbox.is_empty() {
+                let take = p.inbox.len().min(stdio::CHUNK);
+                sys::reply(p.pending_read.take().unwrap(), &p.inbox[..take]);
+                p.inbox.drain(..take);
+                worked = true;
+            }
+        }
+
+        // ── 4. умершие дети ────────────────────────────────────────────────────────────────
+        for i in 0..panes.len() {
+            if let Some(pid) = panes[i].child {
+                if let Wait::Exited(_) = sys::wait(pid, true) {
+                    let pane = &mut panes[i];
+                    pane.child = None;
+                    let note =
+                        "\r\n\x1b[1;31m[процесс завершился — Ctrl-A x закрыть панель]\x1b[0m\r\n";
+                    pane.parser.advance(&mut pane.grid, note.as_bytes());
+                    redraw = true;
+                    worked = true;
+                }
+            }
+        }
+
+        // ── 5. кадр ────────────────────────────────────────────────────────────────────────
+        if redraw {
+            compose(&mut surface, &renderer, &mut cache, &panes, &rects, focus, cols, rows, palette);
+            blit(&surface, &info);
+            redraw = false;
+        }
+
+        // Спать только когда делать нечего — и коротко: клавиатура нас не разбудит, потому что
+        // ждём мы на IPC. Осознанный компромисс: единого «ждать клавишу ИЛИ сообщение» в ядре
+        // пока нет (записано долгом).
+        if !worked {
+            // Сообщение, пришедшее ВО СНЕ, обязано быть обработано здесь же. Выбросить его
+            // нельзя: вместе с ним теряется одноразовое reply-право, и вызвавший ребёнок висит
+            // навсегда — молча, без единой ошибки. Ровно на этом веха и споткнулась.
+            if let Some(m) = sys::recv_timeout(&mut msg, 2) {
+                redraw |= handle(&mut panes, &m, &msg);
             }
         }
     }
 }
 
-/// Найти стартовое право на экран. Ядро кладёт преоткрытые права подряд ([[process-contract]]);
-/// какое из них — экран, определяем по тому, что `SYS_VIDEO_INFO` его принял. Так программа не
-/// зависит от ПОРЯДКА прав в конфиге init.
-fn find_fb_cap(cap0: usize, cap1: usize) -> Option<usize> {
-    // Пробуем регистры (быстрый путь контракта), затем всю таблицу преоткрытых прав. Право
-    // опознаём по тому, что его ПРИНЯЛ `SYS_VIDEO_INFO`, — так программа не зависит от порядка
-    // токенов в конфиге init и не сломается, если рядом появится ещё одно устройство.
-    let from_regs = [cap0, cap1].into_iter();
-    let from_table = (0..8).map(sys::start_cap);
-    from_regs
-        .chain(from_table)
-        .find(|&c| c != usize::MAX && sys::video_info(c).is_some())
+/// Обработать одно сообщение от ребёнка. Возвращает `true`, если кадр надо перерисовать.
+///
+/// Вынесено отдельно НЕ ради красоты: принимать сообщения приходится в двух местах — в опросе
+/// и при пробуждении из сна, — и разошедшиеся копии этой обработки означали бы потерянные
+/// reply-права и повисших детей.
+fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
+    let who = panes.iter().position(|p| p.child == Some(m.sender));
+    match who {
+        Some(i) if m.op == stdio::OP_STDOUT => {
+            let len = m.len.min(buf.len());
+            let pane = &mut panes[i];
+            pane.parser.advance(&mut pane.grid, &buf[..len]);
+            sys::reply(m.reply_cap, &[]);
+            true
+        }
+        Some(i) if m.op == stdio::OP_STDIN => {
+            // Отложенный ответ: держим право до появления клавиш (как в net-srv).
+            panes[i].pending_read = Some(m.reply_cap);
+            false
+        }
+        // Чужой или непонятный запрос — ответить пусто, а не молчать: молчание повесило бы
+        // вызвавшего навсегда.
+        _ => {
+            sys::reply(m.reply_cap, &[]);
+            false
+        }
+    }
 }
 
-/// Приветствие: показывает ровно то, ради чего веха и делалась.
-fn banner(s: &mut Screen, info: &sys::VideoInfo, cols: usize, rows: usize, cw: u32, ch: u32) {
-    s.feed(b"\x1b[1;36m");
-    s.feed("╔══════════════════════════════════════════════════════╗\r\n".as_bytes());
-    s.feed("║  VOID — терминал на настоящих глифах (Веха 97)        ║\r\n".as_bytes());
-    s.feed("╚══════════════════════════════════════════════════════╝\x1b[0m\r\n\r\n".as_bytes());
-
-    let mut line = alloc::string::String::new();
-    use core::fmt::Write;
-    let _ = write!(
-        line,
-        "  экран  : {}×{}, {} бит/пиксель, шаг строки {} Б\r\n",
-        info.width, info.height, info.bpp, info.pitch
-    );
-    let _ = write!(line, "  ячейка : {}×{} px → грид {}×{} знакомест\r\n", cw, ch, cols, rows);
-    let _ = write!(line, "  шрифт  : FiraCode Nerd Font Mono, {} px, растеризация без C\r\n\r\n", FONT_PX);
-    s.feed(line.as_bytes());
-
-    s.feed("  Кириллица читаема: съешь ещё этих мягких французских булок.\r\n".as_bytes());
-    s.feed("  Рамки: ┌─┬─┐ ├─┼─┤ └─┴─┘ │ █ ▓ ▒ ░\r\n".as_bytes());
-    // Ровно то, чего в текстовом режиме не могло быть НИКОГДА: глифы из Private Use Area.
-    s.feed("  \x1b[1;33mNerd Font\x1b[0m: \u{e0b0}\u{e0b2} \u{f07b}\u{f15b}\u{f121} \u{f09b}\u{e795}\u{f0e7} \u{f023}\u{f0e0}\u{f02b}\r\n".as_bytes());
-    s.feed("\r\n  \x1b[32mЦвета\x1b[0m: ".as_bytes());
-    for c in 31..37 {
-        let mut sgr = alloc::string::String::new();
-        let _ = write!(sgr, "\x1b[{c}m\u{2588}\u{2588}");
-        s.feed(sgr.as_bytes());
+/// Завести панель: грид под её размер плюс запущенный в ней шелл с нашим stdio.
+fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize) -> Pane {
+    let (w, h) = rect_size(rects, id);
+    let child = spawn_shell(exec_cap, me);
+    let mut pane = Pane {
+        id,
+        grid: Grid::new(w, h),
+        parser: vte::Parser::new(),
+        child,
+        pending_read: None,
+        inbox: Vec::new(),
+    };
+    if child.is_none() {
+        let msg = "\x1b[1;31m[не удалось запустить шелл]\x1b[0m\r\n";
+        pane.parser.advance(&mut pane.grid, msg.as_bytes());
     }
-    s.feed(b"\x1b[0m\r\n\r\n");
-    s.feed("  Печатайте — эхо идёт через разбор ANSI. Ctrl-D — выход.\r\n\r\n".as_bytes());
+    pane
+}
+
+/// Запустить шелл, подобрав право на запуск. Найденное запоминается — перебирать на каждую
+/// панель незачем.
+fn spawn_shell(exec_cap: &mut usize, me: usize) -> Option<usize> {
+    if *exec_cap != sys::NO_CAP {
+        return sys::spawn_with_stdio(*exec_cap, SHELL, SHELL_ARGS, me);
+    }
+    for i in 0..8 {
+        let c = sys::start_cap(i);
+        if c == sys::NO_CAP {
+            continue;
+        }
+        if let Some(pid) = sys::spawn_with_stdio(c, SHELL, SHELL_ARGS, me) {
+            *exec_cap = c;
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Разбить фокусную панель и завести в новой половине ещё один шелл.
+#[allow(clippy::too_many_arguments)]
+fn split(
+    tree: &mut SplitTree, panes: &mut Vec<Pane>, next_id: &mut usize, focus: &mut usize,
+    dir: SplitDirection, cols: usize, rows: usize, exec_cap: &mut usize, me: usize,
+) {
+    if panes.is_empty() {
+        return;
+    }
+    let target = panes[*focus].id;
+    let fresh = PaneId(*next_id);
+    if !tree.split(target, dir, 0.5, fresh) {
+        return;
+    }
+    *next_id += 1;
+    let rects = layout_of(tree, cols, rows);
+    resize_all(panes, &rects); // старые панели поменяли размер — грид обязан следовать
+    panes.push(new_pane(fresh, &rects, exec_cap, me));
+    *focus = panes.len() - 1;
+}
+
+/// Закрыть фокусную панель. Ребёнок останется сиротой и заметит это сам — по тому, что его
+/// вызовы перестанут доходить; убивать процессы мы пока не умеем (записано долгом).
+fn close_pane(tree: &mut SplitTree, panes: &mut Vec<Pane>, focus: &mut usize) {
+    if panes.is_empty() {
+        return;
+    }
+    let id = panes[*focus].id;
+    if panes.len() > 1 && !tree.close(id) {
+        return;
+    }
+    panes.remove(*focus);
+    if *focus >= panes.len() {
+        *focus = panes.len().saturating_sub(1);
+    }
+}
+
+/// Подогнать гриды под текущую раскладку.
+fn resize_all(panes: &mut [Pane], rects: &[PaneRect]) {
+    for p in panes.iter_mut() {
+        let (w, h) = rect_size(rects, p.id);
+        // Содержимое при смене размера теряется: перенос истории — отдельная работа.
+        if p.grid.cols() != w || p.grid.rows() != h {
+            p.grid = Grid::new(w, h);
+            p.parser = vte::Parser::new();
+        }
+    }
+}
+
+/// Положить клавишу в ящик фокусной панели. Ответ уйдёт в шаге 3 реактора — там же, где
+/// обслуживаются запросы, пришедшие РАНЬШЕ клавиш.
+fn push_input(panes: &mut [Pane], focus: usize, byte: u8) {
+    if let Some(p) = panes.get_mut(focus) {
+        p.inbox.push(byte);
+    }
+}
+
+/// Раскладка дерева в знакоместах; снизу оставлена строка под статус-бар.
+fn layout_of(tree: &SplitTree, cols: usize, rows: usize) -> Vec<PaneRect> {
+    tree.layout(
+        Area { col: 0, row: 0, cols: cols as u16, rows: (rows - 1) as u16 },
+        1, // зазор в знакоместо: панели должны быть видимо разделены
+    )
+}
+
+/// Размер панели в знакоместах (минимум 1×1 — вырожденную раскладку рендер переживать не обязан).
+fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
+    rects
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| (r.area.cols.max(1) as usize, r.area.rows.max(1) as usize))
+        .unwrap_or((1, 1))
+}
+
+/// Собрать кадр: панели по своим прямоугольникам + подсветка фокуса + статус-бар.
+#[allow(clippy::too_many_arguments)]
+fn compose(
+    surface: &mut Surface, renderer: &GridRenderer, cache: &mut GlyphCache<TtfFont>,
+    panes: &[Pane], rects: &[PaneRect], focus: usize, cols: usize, rows: usize, palette: Palette,
+) {
+    surface.clear(palette.background);
+    // Общий кадр — мозаика из гридов панелей: у каждой свой, склеиваем по ячейкам.
+    let mut cells = vec![Cell::default(); cols * rows];
+    for (i, p) in panes.iter().enumerate() {
+        let Some(r) = rects.iter().find(|r| r.id == p.id) else {
+            continue;
+        };
+        for row in 0..r.area.rows as usize {
+            for col in 0..r.area.cols as usize {
+                let (x, y) = (r.area.col as usize + col, r.area.row as usize + row);
+                if x < cols && y < rows {
+                    cells[y * cols + x] = p.grid.view_cell(col, row, 0);
+                }
+            }
+        }
+        if i == focus {
+            mark_focus(&mut cells, r, cols, rows);
+        }
+    }
+    status_bar(&mut cells, panes, focus, cols, rows);
+    renderer.paint_cells(&cells, cols, rows, cache, surface);
+}
+
+/// Пометить фокусную панель по краям зазора: сплошную рамку рисовать негде — зазор между
+/// панелями ровно одно знакоместо, а внутри панели каждая ячейка занята содержимым.
+fn mark_focus(cells: &mut [Cell], r: &PaneRect, cols: usize, rows: usize) {
+    let mut mark = |x: usize, y: usize, ch: char| {
+        if x < cols && y < rows {
+            let c = &mut cells[y * cols + x];
+            c.ch = ch;
+            c.fg = Color::Named(NamedColor::BrightCyan);
+        }
+    };
+    let (x0, y0) = (r.area.col as usize, r.area.row as usize);
+    let x1 = x0 + r.area.cols.saturating_sub(1) as usize;
+    let y1 = y0 + r.area.rows.saturating_sub(1) as usize;
+    if x0 > 0 {
+        for y in y0..=y1 {
+            mark(x0 - 1, y, '▏');
+        }
+    }
+    if y0 > 0 {
+        for x in x0..=x1 {
+            mark(x, y0 - 1, '▁');
+        }
+    }
+}
+
+/// Статус-бар: сколько панелей, какая в фокусе, жив ли её процесс, подсказка по префиксу.
+fn status_bar(cells: &mut [Cell], panes: &[Pane], focus: usize, cols: usize, rows: usize) {
+    let y = rows - 1;
+    let mut text = alloc::string::String::new();
+    use core::fmt::Write;
+    let _ = write!(text, " VOID · панель {}/{} ", focus + 1, panes.len());
+    if let Some(p) = panes.get(focus) {
+        let _ = write!(text, "· {} ", if p.child.is_some() { "живая" } else { "мертва" });
+    }
+    let _ = write!(text, "· Ctrl-A: | - o x q");
+    let mut i = 0usize;
+    for ch in text.chars() {
+        if i >= cols {
+            break;
+        }
+        let c = &mut cells[y * cols + i];
+        c.ch = ch;
+        c.fg = Color::Named(NamedColor::Black);
+        c.bg = Color::Named(NamedColor::BrightCyan);
+        i += 1;
+    }
+    while i < cols {
+        let c = &mut cells[y * cols + i];
+        c.ch = ' ';
+        c.bg = Color::Named(NamedColor::BrightCyan);
+        i += 1;
+    }
+}
+
+/// Право на экран: опознаём по тому, что его ПРИНЯЛ `SYS_VIDEO_INFO` (проба безобидна).
+fn find_fb_cap() -> Option<usize> {
+    (0..8)
+        .map(sys::start_cap)
+        .find(|&c| c != sys::NO_CAP && sys::video_info(c).is_some())
 }
 
 /// Перенести кадр из RAM в фреймбуфер, упаковав пиксели в формат прошивки.
-///
-/// Формат НЕ зашит: раскладку полей R/G/B сообщает `SYS_VIDEO_INFO`, потому что VBE-режимы
-/// бывают и 16-битными, и с полями не на «канонических» местах. Ядро на этой самой раскладке
-/// один раз обожглось (Веха 96: серый текст выходил бирюзовым), поэтому здесь она читается,
-/// а не предполагается.
 fn blit(surface: &Surface, info: &sys::VideoInfo) {
     let src = surface.data();
     let sw = surface.width() as usize;
-    let sh = surface.height() as usize;
     let bytes_pp = info.bpp / 8;
     let w = sw.min(info.width);
-    let h = sh.min(info.height);
-
+    let h = (surface.height() as usize).min(info.height);
     for y in 0..h {
         let mut dst = FB_VA + y * info.pitch;
         let row = y * sw * 4;
@@ -233,7 +485,7 @@ fn blit(surface: &Surface, info: &sys::VideoInfo) {
     }
 }
 
-/// Упаковать RGB в машинное слово пикселя по раскладке прошивки.
+/// Упаковать RGB по раскладке прошивки (её сообщает `SYS_VIDEO_INFO`; зашивать нельзя — Веха 96).
 #[inline]
 fn pack(info: &sys::VideoInfo, r: u8, g: u8, b: u8) -> u32 {
     let mut out = 0u32;
@@ -243,10 +495,4 @@ fn pack(info: &sys::VideoInfo, r: u8, g: u8, b: u8) -> u32 {
         out |= ((*chan as u32) >> (8 - size)) << pos;
     }
     out
-}
-
-/// Заглушки, чтобы `Vec`/`Rgb` не считались неиспользованными в сборках без части путей.
-#[allow(dead_code)]
-fn _unused(_: Vec<u8>, _: Rgb) {
-    let _ = vec![0u8; 1];
 }

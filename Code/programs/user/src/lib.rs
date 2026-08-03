@@ -135,6 +135,22 @@ mod abi {
         (a0, a1, a2, a3)
     }
 
+    /// riscv64: то же, но забирает ПЯТЫЙ результат (a4). Отдельная функция, а не расширение
+    /// общей: пятый регистр нужен ровно приёму сообщений (там в нём номер отправителя, Веха 99),
+    /// а трогать раскладку на всех остальных путях ради одного случая — лишний риск.
+    #[cfg(target_arch = "riscv64")]
+    #[inline(always)]
+    pub fn syscall5(
+        num: usize, mut a0: usize, mut a1: usize, mut a2: usize, mut a3: usize, mut a4: usize,
+    ) -> (usize, usize, usize, usize, usize) {
+        unsafe {
+            core::arch::asm!("ecall", in("a7") num,
+                inout("a0") a0, inout("a1") a1, inout("a2") a2, inout("a3") a3,
+                inout("a4") a4, options(nostack));
+        }
+        (a0, a1, a2, a3, a4)
+    }
+
     /// riscv64: невозвращающийся syscall (SYS_EXIT).
     #[cfg(target_arch = "riscv64")]
     pub fn syscall_noreturn(num: usize, a0: usize) -> ! {
@@ -166,6 +182,25 @@ mod abi {
             );
         }
         (r0, a0, a1, a2)
+    }
+
+    /// x86_64: то же, но забирает ПЯТЫЙ результат (r10) — см. riscv-двойник.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub fn syscall5(
+        num: usize, mut a0: usize, mut a1: usize, mut a2: usize, mut a3: usize, a4: usize,
+    ) -> (usize, usize, usize, usize, usize) {
+        let r0;
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                inout("rax") num => r0,
+                inout("rdi") a0, inout("rsi") a1, inout("rdx") a2,
+                inout("r10") a3, in("r8") a4,
+                options(nostack),
+            );
+        }
+        (r0, a0, a1, a2, a3)
     }
 
     /// x86_64: невозвращающийся syscall (SYS_EXIT).
@@ -256,22 +291,26 @@ pub struct Message {
     pub reply_cap: usize,
     pub len: usize,
     pub cap: usize,
+    /// Веха 99 — номер процесса-отправителя. Нужен серверу, который ведёт по клиенту СОСТОЯНИЕ:
+    /// мультиплексору — чтобы понять, в какую панель лёг вывод. Reply-право для этого не годится:
+    /// оно одноразовое и у каждого запроса своё.
+    pub sender: usize,
 }
 
 /// `SYS_RECV`: ждать запрос; нагрузка ложится в `buf` (усечённая по его размеру).
 pub fn recv(buf: &mut [u8]) -> Message {
-    let (op, reply_cap, len, cap) =
-        abi::syscall(SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0);
-    Message { op, reply_cap, len, cap }
+    let (op, reply_cap, len, cap, sender) =
+        abi::syscall5(SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0);
+    Message { op, reply_cap, len, cap, sender }
 }
 
 /// Веха 90 — `SYS_RECV` БЕЗ блокировки: `None`, если запросов нет прямо сейчас.
 /// Нужен серверам, которым между запросами есть чем заняться, — прежде всего сетевому:
 /// стек обязан тикать (входящие, ретрансмиссии), даже когда клиенты молчат.
 pub fn try_recv(buf: &mut [u8]) -> Option<Message> {
-    let (op, reply_cap, len, cap) =
-        abi::syscall(SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 1, 0, 0, 0, 0);
-    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
+    let (op, reply_cap, len, cap, sender) =
+        abi::syscall5(SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 1, 0, 0);
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
 
 /// Веха 91 — `SYS_RECV` со СНОМ до дедлайна: `None`, если за `timeout_ticks` запроса не было.
@@ -279,20 +318,20 @@ pub fn try_recv(buf: &mut [u8]) -> Option<Message> {
 /// не занимает процессор вовсе, но просыпается к моменту, который назвал сам (у сетевого стека
 /// это `poll_at` — ближайший таймер ретрансмиссии).
 pub fn recv_timeout(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
-    let (op, reply_cap, len, cap) = abi::syscall(
-        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 2, timeout_ticks, 0, 0, 0,
+    let (op, reply_cap, len, cap, sender) = abi::syscall5(
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 2, timeout_ticks, 0,
     );
-    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
 
 /// Веха 91 - `SYS_RECV` со сном до дедлайна ИЛИ до прихода СЕТЕВОГО КАДРА. То, ради чего веха:
 /// сетевой сервер спит, ничего не занимая, и просыпается ровно тогда, когда карта что-то
 /// приняла, - а не на ближайшем тике таймера. `None` - проснулись не из-за запроса.
 pub fn recv_net(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
-    let (op, reply_cap, len, cap) = abi::syscall(
-        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 3, timeout_ticks, 0, 0, 0,
+    let (op, reply_cap, len, cap, sender) = abi::syscall5(
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 3, timeout_ticks, 0,
     );
-    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap })
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
 
 /// `SYS_CALL` с передачей capability: послать `send` эндпоинту `ep`, ждать ответа в `recv`.
@@ -472,6 +511,13 @@ pub fn read_stdin(buf: &mut [u8]) -> usize {
         return n;
     }
     abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
+}
+
+/// Прочитать ввод КОНСОЛИ, не засыпая: 0 — пока ничего нет (Веха 99). Нужна реактору хоста —
+/// он обязан обслуживать и клавиатуру, и вывод детей, а значит не может уснуть ни на одном.
+/// Мимо соглашения [`stdio`] сознательно: хост читает настоящую клавиатуру, а не чей-то поток.
+pub fn read_console_nonblock(buf: &mut [u8]) -> usize {
+    abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 1, 0, 0, 0, 0).0
 }
 
 /// `SYS_EXEC`: запустить программу из store по имени корня и дождаться завершения

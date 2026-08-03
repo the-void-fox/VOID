@@ -62,6 +62,8 @@ webpki-roots = { version = "0.26", default-features = false }
 ereb-core = { path = "vendor-ereb/ereb-core" }
 ereb-render = { path = "vendor-ereb/ereb-render", default-features = false, features = ["ttf"] }
 ereb-input = { path = "vendor-ereb/ereb-input" }
+# Веха 99 — раскладка панелей мультиплексора: дерево разбиений и навигация.
+ereb-mux = { path = "vendor-ereb/ereb-mux" }
 # Парсер ANSI — тот же, что у ereb-core; нужен в `term` напрямую, чтобы гонять байты в грид.
 vte = { version = "0.15.0", default-features = false }
 

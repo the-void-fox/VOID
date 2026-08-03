@@ -1012,7 +1012,12 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.current = n;
             }
         }
-        // SYS_RECV(recv_buf, recv_cap, nonblock) -> (a0=op, a1=отправитель, a2=длина запроса,
+        // SYS_RECV(recv_buf, recv_cap, nonblock) -> (a0=op, a1=reply-право, a2=длина запроса,
+        // a3=право из сообщения, a4=НОМЕР ОТПРАВИТЕЛЯ — Веха 99). Комментарий выше долго
+        // утверждал, что отправитель в a1, а там всегда было reply-право; теперь отправитель
+        // есть на самом деле. Он нужен серверу, который ведёт по клиенту СОСТОЯНИЕ: мультиплексор
+        // обязан понять, в какую панель лёг вывод, а reply-право для этого не годится — оно
+        // одноразовое и у каждого запроса своё.
         // a3=принятое право|MAX — Веха 21.1). Приняв запрос, копируем его полезную нагрузку из
         // буфера клиента в recv_buf; если клиент передал capability — она уже скопирована в домен
         // сервера (deliver_request), в a3 — её дескриптор.
@@ -1045,6 +1050,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.set_ret_at(1, rc.bits() as usize);
                 f.set_ret_at(2, n);
                 f.set_ret_at(3, tcap);
+                f.set_ret_at(4, from);
                 f.advance();
             } else if mode == 1 {
                 let f = &mut t.procs[cur].frame;
@@ -1109,6 +1115,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         df.set_ret_at(1, rc.bits() as usize);
                         df.set_ret_at(2, n);
                         df.set_ret_at(3, tcap);
+                        df.set_ret_at(4, cur);
                         df.advance();
                         t.procs[dest].state = State::Runnable;
                     } else {
@@ -1510,14 +1517,18 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
-        // SYS_READ(buf, cap) -> n: прочитать доступный ввод консоли (stdin) в буфер процесса —
-        // хотя бы один байт. Ввода нет — процесс блокируется (StdinWait), sepc НЕ двигаем:
-        // когда [`wait_stdin`] разбудит его по прерыванию UART, `ecall` РЕСТАРТУЕТ и на этот
-        // раз заберёт байты из кольцевого буфера (Веха 20.2).
+        // SYS_READ(buf, cap, nonblock) -> n: прочитать доступный ввод консоли (stdin) в буфер
+        // процесса — хотя бы один байт. Ввода нет — процесс блокируется (StdinWait), sepc НЕ
+        // двигаем: когда [`wait_stdin`] разбудит его по прерыванию UART, `ecall` РЕСТАРТУЕТ и на
+        // этот раз заберёт байты из кольцевого буфера (Веха 20.2).
+        //
+        // Веха 99 — третий аргумент `nonblock`: вернуть 0 вместо сна. Нужен РЕАКТОРУ: хост чужих
+        // процессов не может уснуть на клавиатуре, пока дети шлют ему вывод, — он обязан
+        // обслуживать оба источника. Старые вызовы передают 0 и работают как прежде.
         14 => {
-            let (buf, cap_len) = {
+            let (buf, cap_len, nonblock) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1))
+                (f.arg(0), f.arg(1), f.arg(2))
             };
             // Веха 23: приёмный буфер может лежать в ленивой куче — доотобразить до записи ядром.
             if !ensure_heap_range(t, cur, buf, cap_len) {
@@ -1536,6 +1547,11 @@ fn syscall(t: &mut Table, cur: usize) {
             if n > 0 {
                 let f = &mut t.procs[cur].frame;
                 f.set_ret(n);
+                f.advance();
+            } else if nonblock != 0 {
+                // Веха 99: ввода нет — честный ноль, без сна.
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(0);
                 f.advance();
             } else {
                 // Блокировка до ввода с РЕСТАРТОМ: при пробуждении инструкция syscall'а

@@ -339,6 +339,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ereb-mux"
+version = "0.1.0"
+dependencies = [
+ "core_maths",
+]
+
+[[package]]
 name = "ereb-render"
 version = "0.1.0"
 dependencies = [
@@ -1038,6 +1045,7 @@ version = "0.0.1"
 dependencies = [
  "ereb-core",
  "ereb-input",
+ "ereb-mux",
  "ereb-render",
  "getrandom",
  "rustls",
