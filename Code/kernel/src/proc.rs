@@ -862,6 +862,13 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
                 // reply), и только потом отдать слот под переиспользование: иначе устаревший
                 // cap начал бы адресовать чужой, новый процесс.
                 cap::revoke_process(i);
+                // Веха 97 — умер владелец ЭКРАНА: вернуть экран ядру. Без этого терминал,
+                // упавший или вышедший, оставлял бы систему немой — ядро продолжало бы считать
+                // экран занятым и печатать в один serial.
+                if arch::video_owner() == Some(i) {
+                    arch::video_take_back();
+                    println!("  [видео] владелец экрана P{} завершился — экран вернулся ядру", i);
+                }
                 // Текущий слот не отдаём: `resume` ещё читает из него кадр.
                 if i != t.current {
                     t.free_slots.push(i);
@@ -2047,7 +2054,7 @@ fn syscall(t: &mut Table, cur: usize) {
                             // Единственная точка передачи владения: раньше отдавать нечего
                             // (окно не отображено), позже — некому.
                             if arch::video_window() == Some((base, len)) {
-                                arch::video_give_to_user();
+                                arch::video_give_to_user(cur);
                                 println!("  [видео] экран отдан процессу P{} — вывод ядра уходит в serial", cur);
                             }
                             vprintln!("  [drv] P{} SYS_MMIO_MAP {:#x} ({} стр.) → {:#x}", cur, base, pages, va);

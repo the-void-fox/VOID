@@ -13,6 +13,13 @@ const PROGRAMS: &[&str] = &[
     "lx_e1000", "install", "vvsh", "httpsc",
 ];
 
+/// Программы ТОЛЬКО ДЛЯ x86_64 (Веха 97). `term` рисует в пиксельный фреймбуфер, а на riscv его
+/// нет вовсе (в QEMU `virt` нет дисплея) — сеять туда нечего. Дело не только в бесполезности:
+/// с вшитым шрифтом бинарь весит 2.7 МБ, и на riscv его посев ПАДАЛ — куча ядра (16 МиБ) не
+/// давала такой кусок поверх кэша store. Это же и есть довод перенести шрифт в store отдельным
+/// объектом-деревом (Веха 94 умеет), а не носить его в ELF.
+const PROGRAMS_X86: &[&str] = &["term"];
+
 fn main() {
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel
 
@@ -26,7 +33,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{}", linker.display());
     println!("cargo:rerun-if-changed={}", linker.display());
 
-    build_user_programs(&dir, prog_target);
+    build_user_programs(&dir, prog_target, arch == "x86_64");
 }
 
 /// Веха 19.1/23 — собрать userspace-программы (крейт `programs/user`: библиотека шимов + все
@@ -40,7 +47,7 @@ fn main() {
 /// ядра. Если бы программы делили `target/` с ядром, этот дочерний `cargo build` попытался бы
 /// взять тот же файловый лок каталога target, который уже держит ВНЕШНИЙ cargo, собирающий
 /// ядро (мы вызваны из его build-скрипта) — гарантированный deadlock.
-fn build_user_programs(kernel_dir: &PathBuf, target: &str) {
+fn build_user_programs(kernel_dir: &PathBuf, target: &str, x86: bool) {
     let workspace_dir = kernel_dir.parent().expect("kernel/.. должен существовать (Code/)");
     let program_dir = workspace_dir.join("programs").join("user");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -69,7 +76,9 @@ fn build_user_programs(kernel_dir: &PathBuf, target: &str) {
     assert!(status.success(), "сборка programs/user (userspace ELF-программы) провалилась");
 
     let bin_dir = program_target_dir.join(target).join("release");
-    for name in PROGRAMS {
+    // x86-only программы участвуют только в x86-сборке (см. PROGRAMS_X86).
+    let all = PROGRAMS.iter().chain(if x86 { PROGRAMS_X86 } else { &[] });
+    for name in all {
         let elf_path = bin_dir.join(name);
         assert!(elf_path.is_file(), "ожидался готовый ELF по пути {}", elf_path.display());
         // `PROG_MINI_SH=...` и т.п. — имена env-переменных не терпят дефисов.

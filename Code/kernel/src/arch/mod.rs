@@ -82,7 +82,7 @@ pub use imp::{
     // Веха 96: режим пиксельной консоли (x86 — фреймбуфер от GRUB; riscv — None)
     video_mode,
     // Веха 97: экран как ресурс — окно под capability, описание режима, передача владения
-    video_give_to_user, video_info, video_take_back, video_window,
+    video_give_to_user, video_info, video_owner, video_take_back, video_window,
     // часы и случайность (Веха 86): настенное время от прошивки (CMOS RTC / goldfish-rtc из DTB)
     // и аппаратный ГСЧ (RDRAND на x86; на riscv его нет — общий код мешает энтропию сам)
     hw_random_u64, wall_clock_unix_ns,

@@ -1,0 +1,20 @@
+# ВЕНДОРЕННАЯ КОПИЯ из проекта ereb (апстрим — ~/Project/Rust/ereb), ADR 0014 VOID.
+# Закреплена на коммите ereb 2f320ea. Правки вносить ТАМ и переносить сюда осознанно,
+# как со smoltcp и rustls: сборка VOID обязана оставаться оффлайн и воспроизводимой.
+[package]
+name = "ereb-input"
+version = "0.1.0"
+edition = "2024"
+authors = ["VoidFox"]
+license = "MIT"
+
+[dependencies]
+bitflags = "2.11"
+# Декодирование scancode → keysym/UTF-8. Опционально (C-зависимость
+# libxkbcommon): чистая логика биндингов и кодирования в PTY работает и
+# тестируется без него. Бэкенды включают фичу явно.
+xkbcommon = { version = "0.9", optional = true }
+
+[features]
+default = []
+xkbcommon = ["dep:xkbcommon"]

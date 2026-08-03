@@ -1,0 +1,41 @@
+# ВЕНДОРЕННАЯ КОПИЯ из проекта ereb (апстрим — ~/Project/Rust/ereb), ADR 0014 VOID.
+# Закреплена на коммите ereb 2f320ea. Правки вносить ТАМ и переносить сюда осознанно,
+# как со smoltcp и rustls: сборка VOID обязана оставаться оффлайн и воспроизводимой.
+[package]
+name = "ereb-render"
+version = "0.1.0"
+edition = "2024"
+authors = ["VoidFox"]
+license = "MIT"
+
+[dependencies]
+ereb-core = { path = "../ereb-core" }
+# FreeType — реальная растеризация глифов. Опционально: ядро рендера (палитра,
+# compositor, blit, кэш) — чистый Rust и тестируется без C-зависимости через
+# StubRasterizer. Бэкенды включают фичу явно (см. crates.md / goals).
+freetype-rs = { version = "0.38", optional = true }
+# Растеризация БЕЗ C (ADR 0006): ab_glyph = ttf-parser (разбор, метрики, контуры)
+# + ab_glyph_rasterizer (контуры → покрытие). default-features = false даёт no_std
+# на libm — это условие переносимости на VOID, где нет ни libc, ни std.
+ab_glyph = { version = "0.2", default-features = false, features = ["libm"], optional = true }
+# Округления f32 (`round`) живут в std, а не в core: в no_std их даёт трейт-расширение.
+# Крейт уже приходит транзитивно через ab_glyph, отдельной цены нет.
+core_maths = { version = "0.1", optional = true }
+
+[features]
+default = ["std"]
+# Ядро рендера (палитра, compositor, blit, кэш, растеризатор ttf) — alloc-only и собирается
+# без std: это условие переносимости на VOID (ADR 0005). Фича `std` добавляет то, чего там нет
+# и не будет: конструкторы по ПУТИ к файлу и impl'ы std::error::Error.
+std = []
+# FreeType — C-библиотека, без std её всё равно не собрать.
+freetype = ["dep:freetype-rs", "std"]
+ttf = ["dep:ab_glyph", "dep:core_maths"]
+
+[dev-dependencies]
+# Для тестов «байты → grid → пиксели» прогоняем грид через парсер.
+vte = "0.15.0"
+
+[[example]]
+name = "rasterizer_compare"
+required-features = ["freetype", "ttf"]

@@ -55,6 +55,16 @@ rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, feature
     "tls12",
 ] }
 webpki-roots = { version = "0.26", default-features = false }
+# Веха 97 (ADR 0014) — ТЕРМИНАЛ. Крейты проекта ereb закреплённой копией (см. vendor-ereb/README):
+# грид+ANSI, рендер глифов, ввод. Линкуются ТОЛЬКО в бинарь `term`. Все три no_std+alloc;
+# у ereb-render выключен `std` (в VOID нет файловых путей — шрифт приходит байтами) и включён
+# растеризатор `ttf` на чистом Rust: FreeType здесь не собрать, libc нет.
+ereb-core = { path = "vendor-ereb/ereb-core" }
+ereb-render = { path = "vendor-ereb/ereb-render", default-features = false, features = ["ttf"] }
+ereb-input = { path = "vendor-ereb/ereb-input" }
+# Парсер ANSI — тот же, что у ereb-core; нужен в `term` напрямую, чтобы гонять байты в грид.
+vte = { version = "0.15.0", default-features = false }
+
 # bare-metal: у `getrandom` нет системного источника, поэтому регистрируем свой —
 # он уходит в `SYS_RANDOM` ядра (Веха 86 + джиттер/virtio-rng).
 getrandom = { version = "0.2", features = ["custom"] }

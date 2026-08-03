@@ -125,6 +125,14 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("httpsc", include_bytes!(env!("PROG_HTTPSC"))),
 ];
 
+/// Веха 97 — программы ТОЛЬКО ДЛЯ x86: `term` рисует в пиксельный фреймбуфер, которого на
+/// riscv нет (см. `build.rs`, PROGRAMS_X86). Отдельным списком, а не `cfg` внутри общего:
+/// так видно, что список арх-зависим, а не что кто-то забыл убрать программу.
+#[cfg(target_arch = "x86_64")]
+static PROGRAMS_ARCH: &[(&str, &[u8])] = &[("term", include_bytes!(env!("PROG_TERM")))];
+#[cfg(not(target_arch = "x86_64"))]
+static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];
+
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
 /// пользователь vsh говорят «bin/hello», не зная архитектуры; резолвит её ядро — так один
 /// store (и один диск) несёт бинари нескольких архитектур бок о бок.
@@ -488,7 +496,7 @@ fn seed_programs() {
     // установленной системе (загрузка с диска без модуля) сеять НЕ надо — команды установки там
     // быть не должно; а если корень остался от прежней загрузки — снять его.
     let install_media = arch::boot_module().is_some();
-    for (name, bytes) in PROGRAMS {
+    for (name, bytes) in PROGRAMS.iter().chain(PROGRAMS_ARCH) {
         if *name == "install" && !install_media {
             object::del_root(&prog_root(name)); // не носитель — install отсутствует
             continue;

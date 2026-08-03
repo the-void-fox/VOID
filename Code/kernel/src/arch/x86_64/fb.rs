@@ -143,23 +143,33 @@ pub fn present() -> bool {
 /// процесс получил окно, ядро перестаёт рисовать и уходит в serial. Исключение одно —
 /// **паника забирает экран обратно** ([`take_back`]): замерший терминал без объяснения хуже,
 /// чем испорченная картинка.
-static USER_OWNED: AtomicBool = AtomicBool::new(false);
+/// Хранится `pid + 1` (0 = экран у ядра): владельца надо знать поимённо, иначе его смерть
+/// оставила бы экран навсегда занятым — ядро молчало бы в мёртвый терминал.
+static USER_OWNED: AtomicUsize = AtomicUsize::new(0);
 
 /// Экран у процесса?
 #[inline]
 pub fn owned_by_user() -> bool {
-    USER_OWNED.load(Ordering::Relaxed)
+    USER_OWNED.load(Ordering::Relaxed) != 0
+}
+
+/// Кто владеет экраном (`None` — ядро).
+pub fn owner() -> Option<usize> {
+    match USER_OWNED.load(Ordering::Relaxed) {
+        0 => None,
+        n => Some(n - 1),
+    }
 }
 
 /// Отдать экран процессу (зовётся из `SYS_MMIO_MAP`, когда замаплено окно фреймбуфера).
-pub fn give_to_user() {
-    USER_OWNED.store(true, Ordering::Relaxed);
+pub fn give_to_user(pid: usize) {
+    USER_OWNED.store(pid + 1, Ordering::Relaxed);
 }
 
-/// Забрать экран ядру и очистить его — путь паники.
+/// Забрать экран ядру и очистить его: путь паники и путь смерти владельца.
 pub fn take_back() {
     if present() {
-        USER_OWNED.store(false, Ordering::Relaxed);
+        USER_OWNED.store(0, Ordering::Relaxed);
         unsafe { clear(0x07) };
     }
 }

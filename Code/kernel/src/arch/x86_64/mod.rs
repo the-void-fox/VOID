@@ -312,8 +312,13 @@ pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
 }
 
 /// Веха 97 — экран отдан процессу / забрать обратно (паника).
-pub fn video_give_to_user() {
-    fb::give_to_user();
+pub fn video_give_to_user(pid: usize) {
+    fb::give_to_user(pid);
+}
+
+/// Кто сейчас владеет экраном (`None` — ядро).
+pub fn video_owner() -> Option<usize> {
+    fb::owner()
 }
 pub fn video_take_back() {
     fb::take_back();

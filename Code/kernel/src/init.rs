@@ -48,6 +48,18 @@ service posixfs store:rw
 shell vsh endpoint:posixfs store:rwx env
 ";
 
+/// Третье поколение (`gen3`, Веха 97) — **терминал на настоящих глифах** вместо текстового
+/// шелла: `term` получает экран под capability (`mmio:fb`) и рисует сам. Отдельным поколением,
+/// а не заменой gen1, ровно потому, для чего поколения и делались: новое можно попробовать и
+/// откатиться, не потеряв рабочую систему. Пиксельного режима может не быть (загрузка PVH,
+/// riscv) — тогда `term` честно скажет об этом в serial и выйдет.
+const DEFAULT_GEN3: &str = "\
+# VOID — поколение с графическим терминалом (Веха 97)
+service posixfs store:rw
+service net-srv dev:net:rw
+shell term mmio:fb endpoint:posixfs store:rwx env
+";
+
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.
 fn read_text(root: &str) -> Option<String> {
     let id = object::root(root)?;
@@ -219,8 +231,9 @@ pub fn boot() {
     if object::root("system/gen1").is_none() {
         write_text("system/gen1", DEFAULT_GEN1);
         write_text("system/gen2", DEFAULT_GEN2);
+        write_text("system/gen3", DEFAULT_GEN3);
         write_text(CURRENT_ROOT, "gen1");
-        println!("  [init] чистый диск — посеяны поколения gen1 (полное) и gen2 (без сети)");
+        println!("  [init] чистый диск — посеяны поколения gen1 (полное), gen2 (без сети), gen3 (терминал)");
     }
 
     // Активное поколение: system/current → имя → system/<имя> → текст конфига.

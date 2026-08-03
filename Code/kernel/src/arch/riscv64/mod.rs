@@ -52,7 +52,10 @@ pub fn video_window() -> Option<(usize, usize)> {
 pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
     (0, 0, 0, 0, [(0, 0); 3])
 }
-pub fn video_give_to_user() {}
+pub fn video_give_to_user(_pid: usize) {}
+pub fn video_owner() -> Option<usize> {
+    None
+}
 pub fn video_take_back() {}
 
 // ─── прерывания ─────────────────────────────────────────────────────────────

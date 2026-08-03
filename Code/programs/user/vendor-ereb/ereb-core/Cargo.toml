@@ -1,0 +1,15 @@
+# ВЕНДОРЕННАЯ КОПИЯ из проекта ereb (апстрим — ~/Project/Rust/ereb), ADR 0014 VOID.
+# Закреплена на коммите ereb 2f320ea. Правки вносить ТАМ и переносить сюда осознанно,
+# как со smoltcp и rustls: сборка VOID обязана оставаться оффлайн и воспроизводимой.
+[package]
+name = "ereb-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["VoidFox"]
+license = "MIT"
+
+[dependencies]
+# `default-features = false` — vte в std-режиме включает лишь memchr/std (ускорение поиска).
+# Для VOID нужен no_std, а разница в скорости на потоке из PTY незаметна.
+vte = { version = "0.15.0", default-features = false }
+bitflags = "2.11"
