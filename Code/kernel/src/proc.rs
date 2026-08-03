@@ -87,6 +87,10 @@ pub const USER_REGION_START: usize = 0x4000_0000;
 
 /// Веха 30: потолок доп. аргументов `SYS_EXEC` (NUL-разделённый блоб). Столько же, сколько
 /// буфер IPC-запроса, — аргументы длиннее пусть едут объектом store.
+/// Веха 98 — ответ `SYS_WAIT(nonblock)`, когда ребёнок ещё жив. Отличается от `usize::MAX`
+/// («нет такого ребёнка») намеренно: реактору надо различать «подожди» и «ошибка».
+pub const WOULD_BLOCK: usize = usize::MAX - 1;
+
 const ARGS_MAX: usize = 512;
 
 // ─── ядерный trap-стек для trap'ов из U-mode ──────────────────────────────────
@@ -184,6 +188,14 @@ struct Proc {
     /// его `ecall`/`syscall` уходит в трансля́тор [`crate::linux`], а не в ABI VOID. Ставится
     /// при exec'е ET_DYN-образа ([`spawn_linux_locked`]); нити наследуют (у linux их пока нет).
     linux: bool,
+    /// Веха 98 — процесс запущен через `SYS_SPAWN` и его кода выхода ЖДЁТ родитель: слот
+    /// нельзя переиспользовать, пока код не забрали (`SYS_WAIT`). Без этого номер процесса
+    /// достался бы новому запуску, и ожидающий получил бы чужой результат.
+    zombie: bool,
+    /// Веха 98 — кто запустил (для `SYS_WAIT`: ждать чужих детей нельзя). `usize::MAX` — никто.
+    parent: usize,
+    /// Веха 98 — код выхода, сохранённый до `SYS_WAIT`. `None` — процесс ещё жив.
+    exit_code: Option<usize>,
 }
 
 struct Table {
@@ -322,6 +334,11 @@ fn create_process_locked(
         futex_addr: 0,
         futex_deadline: None,
         linux: false, // по умолчанию — родная личность VOID; spawn_linux_locked поставит true
+        // Веха 98: обычный процесс никем не ожидается — слот освободится сразу. `SYS_SPAWN`
+        // пометит своего ребёнка зомби и проставит родителя.
+        zombie: false,
+        parent: usize::MAX,
+        exit_code: None,
     };
     if idx == t.procs.len() {
         t.procs.push(proc);
@@ -362,6 +379,9 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         futex_addr: 0,
         futex_deadline: None,
         linux: t.procs[leader].linux, // нить наследует личность лидера (у linux нитей пока нет)
+        zombie: false, // ждут НИТЬ через THREAD_JOIN, а не через SYS_WAIT — зомби не нужен
+        parent: usize::MAX,
+        exit_code: None,
     });
     idx
 }
@@ -573,6 +593,11 @@ fn wait_stdin(saved_sie: usize) -> bool {
 /// Разбудить процессы, ждущие в `SYS_EXEC` завершения ребёнка `child` (Веха 20.3): вернуть им
 /// код выхода `code`, продвинуть sepc (их ecall завершён) и сделать готовыми.
 fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
+    // Веха 98: код выхода нужен и тем, кто спросит ПОЗЖЕ (`SYS_WAIT` после завершения ребёнка),
+    // поэтому он сохраняется, а не только раздаётся ждущим сейчас.
+    if child < t.procs.len() {
+        t.procs[child].exit_code = Some(code);
+    }
     for i in 0..t.procs.len() {
         if t.procs[i].state == State::ExecWait(child) {
             let f = &mut t.procs[i].frame;
@@ -875,8 +900,10 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
                     arch::video_take_back();
                     println!("  [видео] владелец экрана P{} завершился — экран вернулся ядру", i);
                 }
-                // Текущий слот не отдаём: `resume` ещё читает из него кадр.
-                if i != t.current {
+                // Веха 98 — слот ЗОМБИ придержан: родитель ещё не забрал код выхода
+                // (`SYS_WAIT`). Отдать его сейчас значит подсунуть ожидающему чужой процесс.
+                // Текущий слот не отдаём по другой причине: `resume` ещё читает из него кадр.
+                if i != t.current && !t.procs[i].zombie {
                     t.free_slots.push(i);
                 }
             }
@@ -1530,7 +1557,12 @@ fn syscall(t: &mut Table, cur: usize) {
         // Веха 30 — контракт запуска: `args` (NUL-разделённые записи, ≤ [`ARGS_MAX`]) станут
         // argv ребёнка после имени; env и таблица стартовых capability НАСЛЕДУЮТСЯ от
         // родителя (права — копиями через [`cap::endow`]: наделение потомка, не grant).
-        15 => {
+        // Веха 98 — `SYS_SPAWN` (41) — ТОТ ЖЕ путь запуска, но БЕЗ ожидания: родитель получает
+        // номер ребёнка и продолжает работать. Одна ветка на оба вызова специально: расхождение
+        // между «запустить» и «запустить и подождать» — источник тонких различий в наследовании
+        // прав и окружения, а разница между ними ровно одна строка ниже.
+        15 | 41 => {
+            let wait_child = num == 15;
             let (scap, nptr, nlen, aptr, alen) = {
                 let f = &t.procs[cur].frame;
                 (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
@@ -1617,9 +1649,20 @@ fn syscall(t: &mut Table, cur: usize) {
                                         if t.procs[child].linux { "linux-abi" } else { "native" },
                                         t.procs[child].env.len(), t.procs[child].start_caps.len(),
                                     );
-                                    // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
-                                    t.procs[cur].state = State::ExecWait(child);
-                                    t.current = child;
+                                    if wait_child {
+                                        // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
+                                        t.procs[cur].state = State::ExecWait(child);
+                                        t.current = child;
+                                    } else {
+                                        // Веха 98 — SPAWN: родителю сразу отдаём номер ребёнка и
+                                        // ПРОДОЛЖАЕМ его. Ребёнок помечается зомби — его слот не
+                                        // переиспользуется, пока родитель не заберёт код выхода.
+                                        t.procs[child].zombie = true;
+                                        t.procs[child].parent = cur;
+                                        let f = &mut t.procs[cur].frame;
+                                        f.set_ret(child);
+                                        f.advance();
+                                    }
                                     spawned = true;
                                 }
                             }
@@ -2359,6 +2402,44 @@ fn syscall(t: &mut Table, cur: usize) {
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
             f.advance();
+        }
+        // SYS_WAIT(pid, nonblock) -> код выхода | WOULD_BLOCK | MAX (Веха 98): забрать результат
+        // СВОЕГО ребёнка, запущенного `SYS_SPAWN`. Чужих детей ждать нельзя — иначе один процесс
+        // мог бы наблюдать за жизнью другого, ничего на него не имея.
+        //
+        // `nonblock` — не удобство, а необходимость: реактор мультиплексора не может замереть на
+        // одном ребёнке, пока остальные панели ждут отрисовки.
+        42 => {
+            let (pid, nonblock) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let mine = pid < t.procs.len() && t.procs[pid].parent == cur && t.procs[pid].zombie;
+            let mut blocked = false;
+            let result = if !mine {
+                usize::MAX
+            } else if let Some(code) = t.procs[pid].exit_code {
+                // Ребёнок уже закончил: отдать код и ОТПУСТИТЬ слот — зомби больше не нужен.
+                t.procs[pid].zombie = false;
+                if t.procs[pid].state == State::Finished && pid != t.current {
+                    t.free_slots.push(pid);
+                }
+                code
+            } else if nonblock != 0 {
+                WOULD_BLOCK
+            } else {
+                // Блокирующая форма переиспользует механизм `SYS_EXEC`: пробуждение и доставку
+                // кода уже делает `wake_exec_waiters`, второго такого пути заводить незачем.
+                t.procs[cur].state = State::ExecWait(pid);
+                t.procs[pid].zombie = false; // код придёт напрямую, придерживать слот больше не надо
+                blocked = true;
+                0
+            };
+            if !blocked {
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(result);
+                f.advance();
+            }
         }
         other => {
             let f = &mut t.procs[cur].frame;

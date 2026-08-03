@@ -97,6 +97,8 @@ const SYS_RANDOM: usize = 37;
 const SYS_OBJ_PUT_NODE: usize = 38;
 const SYS_OBJ_CHILDREN: usize = 39;
 const SYS_VIDEO_INFO: usize = 40;
+const SYS_SPAWN: usize = 41;
+const SYS_WAIT: usize = 42;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -496,6 +498,39 @@ pub fn install(store_cap: usize) -> Option<u64> {
 /// адресный простор по `va`. `true` — успех (дальше читать/писать регистры по `va` volatile'ом).
 pub fn mmio_map(mmio_cap: usize, va: usize) -> bool {
     abi::syscall(SYS_MMIO_MAP, mmio_cap, va, 0, 0, 0, 0, 0).0 == 0
+}
+
+/// Веха 98 — `SYS_SPAWN(exec_cap, имя, аргументы)`: запустить программу из store и **сразу
+/// вернуть управление**, отдав номер ребёнка. В отличие от [`exec`], родитель продолжает
+/// работать — на этом стоит любой хост чужих процессов (мультиплексор, супервизор).
+/// `None` — запустить не удалось.
+pub fn spawn(exec_cap: usize, name: &[u8], args: &[u8]) -> Option<usize> {
+    let r = abi::syscall(
+        SYS_SPAWN, exec_cap, name.as_ptr() as usize, name.len(),
+        args.as_ptr() as usize, args.len(), 0, 0,
+    ).0;
+    (r != NO_CAP).then_some(r)
+}
+
+/// Результат [`wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// Ребёнок завершился с этим кодом.
+    Exited(usize),
+    /// Ещё работает (бывает только при `nonblock`).
+    Running,
+    /// Не наш ребёнок либо номер неверен.
+    NoChild,
+}
+
+/// Веха 98 — `SYS_WAIT(pid, nonblock)`: забрать код выхода СВОЕГО ребёнка. Неблокирующая форма
+/// нужна реактору: он не может замереть на одном ребёнке, пока остальные ждут обслуживания.
+pub fn wait(pid: usize, nonblock: bool) -> Wait {
+    match abi::syscall(SYS_WAIT, pid, nonblock as usize, 0, 0, 0, 0, 0).0 {
+        NO_CAP => Wait::NoChild,
+        r if r == NO_CAP - 1 => Wait::Running,
+        code => Wait::Exited(code),
+    }
 }
 
 /// Описание видеорежима (Веха 97): что за экран нам отдали.
