@@ -568,6 +568,48 @@ pub fn mmio_map(mmio_cap: usize, va: usize) -> bool {
     abi::syscall(SYS_MMIO_MAP, mmio_cap, va, 0, 0, 0, 0, 0).0 == 0
 }
 
+/// Веха 99.1 — найти стартовое право ПО ИМЕНИ (`CAP_POSIXFS`, `CAP_STORE`, `CAP_FB`, …).
+///
+/// Имена кладёт init рядом с самими правами ([[declarative-init]]). До этого права были только
+/// позиционными — «файловый сервер нулевой, store первый», — и это выстрелило ровно так, как и
+/// должно было: поменяли порядок токенов в конфиге, и `vvsh` принял фреймбуфер за файловый
+/// сервер. Позиция осталась для совместимости, но полагаться на неё больше не нужно.
+///
+/// `None` — имени нет (старый конфиг или право безымянное); вызывающий откатывается на индекс.
+pub fn cap_named(name: &str) -> Option<usize> {
+    let mut buf = [0u8; 512];
+    let n = env(&mut buf).min(buf.len());
+    let mut key = [0u8; 40];
+    let pre = b"CAP_";
+    if pre.len() + name.len() + 1 > key.len() {
+        return None;
+    }
+    key[..pre.len()].copy_from_slice(pre);
+    key[pre.len()..pre.len() + name.len()].copy_from_slice(name.as_bytes());
+    key[pre.len() + name.len()] = b'=';
+    let klen = pre.len() + name.len() + 1;
+    for entry in buf[..n].split(|&b| b == 0) {
+        if entry.len() > klen && entry[..klen] == key[..klen] {
+            let mut v = 0usize;
+            let mut any = false;
+            for &d in &entry[klen..] {
+                if d.is_ascii_digit() {
+                    v = v * 10 + (d - b'0') as usize;
+                    any = true;
+                } else {
+                    any = false;
+                    break;
+                }
+            }
+            if any {
+                let c = start_cap(v);
+                return (c != NO_CAP).then_some(c);
+            }
+        }
+    }
+    None
+}
+
 /// Веха 98 — `SYS_SPAWN(exec_cap, имя, аргументы)`: запустить программу из store и **сразу
 /// вернуть управление**, отдав номер ребёнка. В отличие от [`exec`], родитель продолжает
 /// работать — на этом стоит любой хост чужих процессов (мультиплексор, супервизор).

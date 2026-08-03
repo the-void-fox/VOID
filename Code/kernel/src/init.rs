@@ -185,6 +185,7 @@ fn apply(config: &str) {
 
         // Права по порядку: собрать дескрипторы, разложить в a0/a1 + стартовую таблицу.
         let mut caps: Vec<usize> = Vec::new();
+        let mut names: Vec<alloc::string::String> = Vec::new();
         let mut want_env = false;
         let mut nargs = 0usize;
         for t in tok {
@@ -200,6 +201,9 @@ fn apply(config: &str) {
                     println!("  [init] arg:{} — argv переполнен (пропуск)", a);
                 }
             } else if let Some(bits) = mint_cap(pid, t, &services) {
+                // Веха 99.1 — запоминаем ИМЯ права вместе с его позицией: ниже они уйдут в
+                // окружение процесса. Позиция сама по себе — плохой контракт (см. ниже).
+                names.push(cap_name(t));
                 caps.push(bits);
             }
         }
@@ -212,8 +216,25 @@ fn apply(config: &str) {
         for &c in &caps {
             proc::push_start_cap(pid, c);
         }
+        // Веха 99.1 — **ИМЕНА ПРАВ В ОКРУЖЕНИИ**. До сих пор стартовые права были только
+        // позиционными: программа знала «файловый сервер — нулевой, store — первый». Это
+        // выстрелило ровно так, как и должно было: в конфиге поменяли порядок токенов, и `vvsh`
+        // принял фреймбуфер за файловый сервер — `ls` роняла панель, `run` не запускал.
+        // Позиция остаётся (совместимость, a0/a1), но теперь рядом есть имя:
+        //   `CAP_POSIXFS=1 CAP_STORE=2 CAP_FB=0`
+        // Тот же приём, что и `STDIO=<i>` для чужого stdio: ядро кладёт СТРОКУ, смысл её —
+        // дело userspace.
+        let mut env_full = alloc::string::String::new();
         if want_env {
-            proc::set_env(pid, env.as_bytes());
+            env_full.push_str(&env);
+        }
+        for (i, n) in names.iter().enumerate() {
+            if !n.is_empty() {
+                env_full.push_str(&alloc::format!("CAP_{}={}\0", n, i));
+            }
+        }
+        if !env_full.is_empty() {
+            proc::set_env(pid, env_full.as_bytes());
         }
         println!(
             "  [init] {} P{} '{}' — прав {}{}{}",
@@ -227,6 +248,29 @@ fn apply(config: &str) {
     }
 }
 
+/// Веха 99.1 — короткое ИМЯ права по токену конфига: `endpoint:posixfs` → `POSIXFS`,
+/// `store:rwx` → `STORE`, `mmio:fb` → `FB`, `dev:net:rw` → `NET`. Пустая строка — имени нет
+/// (право останется только позиционным).
+fn cap_name(token: &str) -> alloc::string::String {
+    let base = if let Some(r) = token.strip_prefix("endpoint:") {
+        r.split(':').next().unwrap_or(r)
+    } else if token.starts_with("store:") {
+        "store"
+    } else if let Some(d) = token.strip_prefix("dev:") {
+        d.split(':').next().unwrap_or(d)
+    } else if let Some(d) = token.strip_prefix("mmio:") {
+        d
+    } else if token == "dma" {
+        "dma"
+    } else {
+        ""
+    };
+    // Имя переменной окружения: верхний регистр, дефисы в подчёркивания.
+    base.chars()
+        .map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() })
+        .collect()
+}
+
 /// Веха 40 — точка входа декларативной загрузки (заменяет зашитый `shell_session`). Читает
 /// активное поколение из `system/current` (сеет два поколения по умолчанию на чистом диске),
 /// исполняет его конфиг и отдаёт управление планировщику до выхода shell'а.
@@ -235,9 +279,22 @@ pub fn boot() {
     if object::root("system/gen1").is_none() {
         write_text("system/gen1", DEFAULT_GEN1);
         write_text("system/gen2", DEFAULT_GEN2);
-        write_text("system/gen3", DEFAULT_GEN3);
         write_text(CURRENT_ROOT, "gen1");
-        println!("  [init] чистый диск — посеяны поколения gen1 (полное), gen2 (без сети), gen3 (терминал)");
+        println!("  [init] чистый диск — посеяны поколения gen1 (полное) и gen2 (без сети)");
+    }
+
+    // Веха 99.1 — `gen3` СИСТЕМНОЕ и переписывается на каждой загрузке, в отличие от gen1/gen2
+    // (те принадлежат владельцу и правятся `rebuild`). Причина конкретная: у поколения был
+    // неверный ПОРЯДОК прав, а стартовые права позиционные — дети наследуют порядок, и `vvsh`
+    // принимал фреймбуфер за файловый сервер (`ls` роняла панель, `run` не запускал). Исправить
+    // это в образе мало: конфиг лежит в СТОРЕ и переживает обновление ядра, поэтому машины,
+    // успевшие попробовать терминал, остались бы сломанными навсегда.
+    //
+    // Общий вывод записан отдельно ([[known-gaps]]): позиционные права — ловушка, и правильное
+    // лечение — искать право ПО ИМЕНИ (`CAP_<ИМЯ>` в окружении, уже отдаётся выше).
+    if read_text("system/gen3").as_deref() != Some(DEFAULT_GEN3) {
+        write_text("system/gen3", DEFAULT_GEN3);
+        println!("  [init] поколение 'gen3' (системное) обновлено из образа ядра");
     }
 
     // Активное поколение: system/current → имя → system/<имя> → текст конфига.

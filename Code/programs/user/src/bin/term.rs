@@ -301,6 +301,14 @@ fn spawn_shell(exec_cap: &mut usize, me: usize) -> Option<usize> {
     if *exec_cap != sys::NO_CAP {
         return sys::spawn_with_stdio(*exec_cap, SHELL, SHELL_ARGS, me);
     }
+    // Веха 99.1: сперва спрашиваем право ПО ИМЕНИ — так порядок токенов в конфиге перестал
+    // что-либо значить. Перебор остался запасным путём для старых конфигов без имён.
+    if let Some(c) = sys::cap_named("STORE") {
+        if let Some(pid) = sys::spawn_with_stdio(c, SHELL, SHELL_ARGS, me) {
+            *exec_cap = c;
+            return Some(pid);
+        }
+    }
     for i in 0..8 {
         let c = sys::start_cap(i);
         if c == sys::NO_CAP {
@@ -496,9 +504,14 @@ fn status_bar(cells: &mut [Cell], panes: &[Pane], focus: usize, cols: usize, row
 
 /// Право на экран: опознаём по тому, что его ПРИНЯЛ `SYS_VIDEO_INFO` (проба безобидна).
 fn find_fb_cap() -> Option<usize> {
-    (0..8)
-        .map(sys::start_cap)
-        .find(|&c| c != sys::NO_CAP && sys::video_info(c).is_some())
+    // По имени (Веха 99.1), иначе перебором: проба безобидна — `SYS_VIDEO_INFO` ничего не меняет.
+    sys::cap_named("FB")
+        .filter(|&c| sys::video_info(c).is_some())
+        .or_else(|| {
+            (0..8)
+                .map(sys::start_cap)
+                .find(|&c| c != sys::NO_CAP && sys::video_info(c).is_some())
+        })
 }
 
 /// Перенести кадр из RAM в фреймбуфер, упаковав пиксели в формат прошивки.
