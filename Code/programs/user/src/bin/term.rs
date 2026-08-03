@@ -23,8 +23,13 @@
 //!
 //! ## Управление
 //!
-//! Префикс — **Ctrl-A** (как в screen), дальше: `|` разбить вертикально · `-` горизонтально ·
-//! `o` следующая панель · `x` закрыть · `q` выйти · Ctrl-A — послать сам Ctrl-A в панель.
+//! **Ctrl-A** переводит в режим ПАНЕЛЕЙ (полоса внизу желтеет), где клавиши значат команды:
+//! `|` разбить вертикально · `-` горизонтально · `h j k l` или стрелки — перейти в соседнюю
+//! панель · `o` следующая по кругу · `x` закрыть · `q` выйти · Ctrl-A — отдать сам Ctrl-A
+//! программе. Любая другая клавиша возвращает в обычный режим.
+//!
+//! Схема живёт не в `if`-ах, а в таблице биндингов `ereb-input` (Веха 99.4) — той же, что на
+//! Linux, — поэтому позже её можно будет задавать конфигом, а не кодом.
 
 #![no_std]
 #![no_main]
@@ -35,7 +40,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use ereb_core::{Cell, Color, Grid, NamedColor};
-use ereb_mux::{Area, PaneId, PaneRect, SplitDirection, SplitTree};
+use ereb_input::{Action, Bindings, KeyEvent, Keysym, ModMask, Mode};
+use ereb_mux::{neighbor, Area, Direction, PaneId, PaneRect, SplitDirection, SplitTree};
 use ereb_render::{GlyphCache, GridRenderer, Palette, Surface, TtfFont};
 use void_user as sys;
 use void_user::{stdio, Wait};
@@ -58,6 +64,141 @@ const SHELL_ARGS: &[u8] = b"repl";
 
 /// Префикс команд мультиплексора — Ctrl-A, как в screen.
 const PREFIX: u8 = 0x01;
+
+
+// ── клавиши: байты консоли → события ereb (Веха 99.4) ────────────────────────
+//
+// Управление раньше было заглушкой: один префикс и пять жёстко зашитых букв. Теперь работает
+// то, что уже написано и покрыто тестами в апстриме ereb: таблица биндингов, режимы и навигация
+// по направлениям (`ereb_input`, `ereb_mux::neighbor`).
+//
+// Промежуточное звено пришлось написать здесь: ereb на Linux получает события от xkbcommon, а
+// нам консоль отдаёт СЫРЫЕ БАЙТЫ. Значит нужен разбор — управляющие коды, ASCII и ANSI-по-
+// следовательности стрелок. Ровно тот же разбор делает любой терминал на своём входе.
+
+/// Конечный автомат разбора: терминал шлёт стрелки как `ESC [ A`, и решить, что это, можно
+/// только увидев следующие байты.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyScan {
+    Ground,
+    Esc,
+    Csi,
+}
+
+/// Разобрать байт. `Some(event)` — клавиша сложилась; `None` — ждём продолжения.
+fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
+    match *state {
+        KeyScan::Ground => match b {
+            0x1b => {
+                *state = KeyScan::Esc;
+                None
+            }
+            // Ctrl+буква приходит управляющим байтом 1..26 — восстанавливаем букву и модификатор.
+            0x01..=0x1a => {
+                let ch = (b'a' + b - 1) as char;
+                Some(KeyEvent::new(Keysym(ch as u32), ModMask::CTRL))
+            }
+            0x7f | 0x08 => Some(KeyEvent::new(Keysym::BACKSPACE, ModMask::empty())),
+            b'\r' | b'\n' => Some(KeyEvent::new(Keysym::RETURN, ModMask::empty())),
+            b'\t' => Some(KeyEvent::new(Keysym::TAB, ModMask::empty())),
+            _ => {
+                // Печатный байт: keysym совпадает с кодом символа (латиница ASCII).
+                let mut k = KeyEvent::new(Keysym(b as u32), ModMask::empty());
+                k.text.push(b as char);
+                Some(k)
+            }
+        },
+        KeyScan::Esc => {
+            if b == b'[' {
+                *state = KeyScan::Csi;
+                None
+            } else {
+                *state = KeyScan::Ground;
+                Some(KeyEvent::new(Keysym::ESCAPE, ModMask::empty()))
+            }
+        }
+        KeyScan::Csi => {
+            *state = KeyScan::Ground;
+            let sym = match b {
+                b'A' => Keysym::UP,
+                b'B' => Keysym::DOWN,
+                b'C' => Keysym::RIGHT,
+                b'D' => Keysym::LEFT,
+                b'H' => Keysym::HOME,
+                b'F' => Keysym::END,
+                // `ESC [ 3 ~` (Delete) и прочие числовые — цифры глотаем, оставаясь в CSI.
+                b'0'..=b'9' | b';' => {
+                    *state = KeyScan::Csi;
+                    return None;
+                }
+                b'~' => Keysym::DELETE,
+                _ => return None,
+            };
+            Some(KeyEvent::new(sym, ModMask::empty()))
+        }
+    }
+}
+
+/// Обратный перевод: событие → байты для программы в панели. Нужен потому, что перехваченными
+/// оказываются НЕ все клавиши, а непойманные обязаны дойти до ребёнка в том же виде, в каком их
+/// ждёт любая программа.
+fn encode(k: &KeyEvent) -> Vec<u8> {
+    if !k.text.is_empty() && !k.mods.contains(ModMask::CTRL) {
+        return k.text.as_bytes().to_vec();
+    }
+    match k.keysym {
+        Keysym::UP => b"\x1b[A".to_vec(),
+        Keysym::DOWN => b"\x1b[B".to_vec(),
+        Keysym::RIGHT => b"\x1b[C".to_vec(),
+        Keysym::LEFT => b"\x1b[D".to_vec(),
+        Keysym::HOME => b"\x1b[H".to_vec(),
+        Keysym::END => b"\x1b[F".to_vec(),
+        Keysym::DELETE => b"\x1b[3~".to_vec(),
+        Keysym::RETURN => vec![b'\r'],
+        Keysym::TAB => vec![b'\t'],
+        Keysym::BACKSPACE => vec![0x7f],
+        Keysym::ESCAPE => vec![0x1b],
+        Keysym(c) if k.mods.contains(ModMask::CTRL) && (b'a' as u32..=b'z' as u32).contains(&c) => {
+            vec![(c as u8 - b'a') + 1]
+        }
+        Keysym(c) if c < 0x80 => vec![c as u8],
+        _ => Vec::new(),
+    }
+}
+
+/// Схема управления. Строится из тех же кирпичей, что и на Linux, поэтому позже её можно будет
+/// задавать конфигом, а не кодом.
+///
+/// Префикс — **Ctrl-A** (как в screen): он переводит в режим `Pane`, где клавиши значат команды
+/// мультиплексора, а не текст. Один режим вместо «префикс + одна клавиша» — потому что так
+/// устроен `ereb_input`, и так можно жать несколько команд подряд, не повторяя префикс.
+fn mux_bindings() -> Bindings {
+    let mut b = Bindings::new();
+    let none = ModMask::empty();
+    b.bind(Mode::Normal, ModMask::CTRL, Keysym(b'a' as u32), Action::EnterMode(Mode::Pane));
+    // В режиме панелей: разбиения, навигация, закрытие, выход.
+    b.bind(Mode::Pane, none, Keysym(b'|' as u32), Action::Custom("split-v".into()));
+    b.bind(Mode::Pane, none, Keysym(b'-' as u32), Action::Custom("split-h".into()));
+    b.bind(Mode::Pane, none, Keysym(b'o' as u32), Action::NextPane);
+    b.bind(Mode::Pane, none, Keysym(b'x' as u32), Action::Custom("close".into()));
+    b.bind(Mode::Pane, none, Keysym(b'q' as u32), Action::Custom("quit".into()));
+    // Навигация по НАПРАВЛЕНИЯМ — то, чего в заглушке не было вовсе.
+    for (sym, name) in [
+        (Keysym::LEFT, "go-left"), (Keysym::RIGHT, "go-right"),
+        (Keysym::UP, "go-up"), (Keysym::DOWN, "go-down"),
+    ] {
+        b.bind(Mode::Pane, none, sym, Action::Custom(name.into()));
+    }
+    for (sym, name) in [
+        (Keysym(b'h' as u32), "go-left"), (Keysym(b'l' as u32), "go-right"),
+        (Keysym(b'k' as u32), "go-up"), (Keysym(b'j' as u32), "go-down"),
+    ] {
+        b.bind(Mode::Pane, none, sym, Action::Custom(name.into()));
+    }
+    // Ctrl-A дважды — отдать сам Ctrl-A программе.
+    b.bind(Mode::Pane, ModMask::CTRL, Keysym(b'a' as u32), Action::Custom("literal-prefix".into()));
+    b
+}
 
 /// Панель: грид, разбор ANSI, ребёнок и его отложенный запрос ввода.
 struct Pane {
@@ -119,7 +260,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Без этого каждый чих перерисовывал весь экран — 4 МиБ записей в некэшируемую память на
     // КАЖДУЮ строку вывода. На железе это выглядело как «семидесятые».
     let mut prev_cells: Vec<Cell> = Vec::new();
-    let mut prefix_armed = false;
+    let bindings = mux_bindings();
+    let mut mode = Mode::Normal;
+    let mut scan = KeyScan::Ground;
     let mut keys = [0u8; 64];
     let mut msg = [0u8; stdio::CHUNK];
     let mut redraw = true;
@@ -132,47 +275,72 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         if n > 0 {
             worked = true;
             for i in 0..n {
-                let k = keys[i];
-                if prefix_armed {
-                    prefix_armed = false;
-                    match k {
-                        b'|' | b'-' => {
-                            let dir = if k == b'|' {
-                                SplitDirection::Vertical
-                            } else {
-                                SplitDirection::Horizontal
-                            };
-                            split(&mut tree, &mut panes, &mut next_id, &mut focus, dir,
-                                  cols, rows, &mut exec_cap, me);
-                            rects = layout_of(&tree, cols, rows);
-                            redraw = true;
-                        }
-                        b'o' => {
-                            focus = (focus + 1) % panes.len().max(1);
-                            redraw = true;
-                        }
-                        b'x' => {
-                            close_pane(&mut tree, &mut panes, &mut focus);
-                            if panes.is_empty() {
-                                sys::write_console("[term] панелей не осталось — выход\n".as_bytes());
+                let Some(key) = decode(&mut scan, keys[i]) else {
+                    continue;
+                };
+                match ereb_input::translate(&key, &bindings, mode) {
+                    Action::EnterMode(m) => {
+                        mode = m;
+                        redraw = true;
+                    }
+                    Action::NextPane => {
+                        focus = (focus + 1) % panes.len().max(1);
+                        mode = Mode::Normal;
+                        redraw = true;
+                    }
+                    Action::Custom(cmd) => {
+                        // Команда мультиплексора. Режим сбрасываем всегда: «залипший» режим —
+                        // худшее, что бывает с модальным управлением.
+                        match cmd.as_str() {
+                            "split-v" | "split-h" => {
+                                let dir = if cmd == "split-v" {
+                                    SplitDirection::Vertical
+                                } else {
+                                    SplitDirection::Horizontal
+                                };
+                                split(&mut tree, &mut panes, &mut next_id, &mut focus, dir,
+                                      cols, rows, &mut exec_cap, me);
+                                rects = layout_of(&tree, cols, rows);
+                            }
+                            "close" => {
+                                close_pane(&mut tree, &mut panes, &mut focus);
+                                if panes.is_empty() {
+                                    sys::write_console("[term] панелей не осталось — выход\n".as_bytes());
+                                    sys::exit(0);
+                                }
+                                rects = layout_of(&tree, cols, rows);
+                                resize_all(&mut panes, &rects);
+                            }
+                            "quit" => {
+                                sys::write_console("[term] выход по Ctrl-A q\n".as_bytes());
                                 sys::exit(0);
                             }
-                            rects = layout_of(&tree, cols, rows);
-                            resize_all(&mut panes, &rects);
-                            redraw = true;
+                            "literal-prefix" => push_input(&mut panes, focus, 0x01),
+                            // Навигация по направлениям — из `ereb_mux`, а не своим перебором:
+                            // «соседняя слева» это геометрия, и она там уже написана.
+                            _ => {
+                                let dir = match cmd.as_str() {
+                                    "go-left" => Direction::Left,
+                                    "go-right" => Direction::Right,
+                                    "go-up" => Direction::Up,
+                                    _ => Direction::Down,
+                                };
+                                if let Some(id) = neighbor(&rects, panes[focus].id, dir) {
+                                    if let Some(i) = panes.iter().position(|p| p.id == id) {
+                                        focus = i;
+                                    }
+                                }
+                            }
                         }
-                        b'q' => {
-                            sys::write_console("[term] выход по Ctrl-A q\n".as_bytes());
-                            sys::exit(0);
-                        }
-                        // Ctrl-A дважды — отдать сам Ctrl-A панели, иначе он был бы недоступен.
-                        PREFIX => push_input(&mut panes, focus, PREFIX),
-                        _ => {}
+                        mode = Mode::Normal;
+                        redraw = true;
                     }
-                } else if k == PREFIX {
-                    prefix_armed = true;
-                } else {
-                    push_input(&mut panes, focus, k);
+                    // Не перехвачено — байты уходят программе в панели как есть.
+                    _ => {
+                        for b in encode(&key) {
+                            push_input(&mut panes, focus, b);
+                        }
+                    }
                 }
             }
         }
@@ -210,7 +378,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
         // ── 5. кадр ────────────────────────────────────────────────────────────────────────
         if redraw {
-            let cells = compose(&panes, &rects, focus, cols, rows);
+            let cells = compose(&panes, &rects, focus, mode, cols, rows);
             let dirty = dirty_rows(&prev_cells, &cells, cols, rows);
             if !dirty.is_empty() {
                 // Рисуем И переносим ТОЛЬКО изменившиеся строки. Раньше отрисовка шла по всему
@@ -414,7 +582,7 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
 /// Собрать кадр: панели по своим прямоугольникам + подсветка фокуса + статус-бар.
 #[allow(clippy::too_many_arguments)]
 fn compose(
-    panes: &[Pane], rects: &[PaneRect], focus: usize, cols: usize, rows: usize,
+    panes: &[Pane], rects: &[PaneRect], focus: usize, mode: Mode, cols: usize, rows: usize,
 ) -> Vec<Cell> {
     // Общий кадр — мозаика из гридов панелей: у каждой свой, склеиваем по ячейкам.
     let mut cells = vec![Cell::default(); cols * rows];
@@ -434,7 +602,7 @@ fn compose(
             mark_focus(&mut cells, r, cols, rows);
         }
     }
-    status_bar(&mut cells, panes, focus, cols, rows);
+    status_bar(&mut cells, panes, focus, mode, cols, rows);
     cells
 }
 
@@ -479,15 +647,24 @@ fn mark_focus(cells: &mut [Cell], r: &PaneRect, cols: usize, rows: usize) {
 }
 
 /// Статус-бар: сколько панелей, какая в фокусе, жив ли её процесс, подсказка по префиксу.
-fn status_bar(cells: &mut [Cell], panes: &[Pane], focus: usize, cols: usize, rows: usize) {
+fn status_bar(
+    cells: &mut [Cell], panes: &[Pane], focus: usize, mode: Mode, cols: usize, rows: usize,
+) {
     let y = rows - 1;
+    // Цветом же: в режиме команд полоса другая, и это видно боковым зрением.
+    let bg = if mode == Mode::Pane { NamedColor::BrightYellow } else { NamedColor::BrightCyan };
     let mut text = alloc::string::String::new();
     use core::fmt::Write;
     let _ = write!(text, " VOID · панель {}/{} ", focus + 1, panes.len());
     if let Some(p) = panes.get(focus) {
         let _ = write!(text, "· {} ", if p.child.is_some() { "живая" } else { "мертва" });
     }
-    let _ = write!(text, "· Ctrl-A: | - o x q");
+    // Режим показывается всегда: модальное управление без индикатора — способ потеряться.
+    if mode == Mode::Pane {
+        let _ = write!(text, "· \u{2b1b} ПАНЕЛИ: | - h j k l / стрелки · x закрыть · q выход");
+    } else {
+        let _ = write!(text, "· Ctrl-A — команды панелей");
+    }
     let mut i = 0usize;
     for ch in text.chars() {
         if i >= cols {
@@ -496,13 +673,13 @@ fn status_bar(cells: &mut [Cell], panes: &[Pane], focus: usize, cols: usize, row
         let c = &mut cells[y * cols + i];
         c.ch = ch;
         c.fg = Color::Named(NamedColor::Black);
-        c.bg = Color::Named(NamedColor::BrightCyan);
+        c.bg = Color::Named(bg);
         i += 1;
     }
     while i < cols {
         let c = &mut cells[y * cols + i];
         c.ch = ' ';
-        c.bg = Color::Named(NamedColor::BrightCyan);
+        c.bg = Color::Named(bg);
         i += 1;
     }
 }
