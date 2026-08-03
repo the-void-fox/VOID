@@ -115,6 +115,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me)];
     let mut focus = 0usize;
 
+    // Прошлый кадр в ЯЧЕЙКАХ: по нему считаем, какие пиксельные строки реально изменились.
+    // Без этого каждый чих перерисовывал весь экран — 4 МиБ записей в некэшируемую память на
+    // КАЖДУЮ строку вывода. На железе это выглядело как «семидесятые».
+    let mut prev_cells: Vec<Cell> = Vec::new();
     let mut prefix_armed = false;
     let mut keys = [0u8; 64];
     let mut msg = [0u8; stdio::CHUNK];
@@ -206,8 +210,14 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
         // ── 5. кадр ────────────────────────────────────────────────────────────────────────
         if redraw {
-            compose(&mut surface, &renderer, &mut cache, &panes, &rects, focus, cols, rows, palette);
-            blit(&surface, &info);
+            let cells = compose(&mut surface, &renderer, &mut cache, &panes, &rects, focus,
+                                cols, rows, palette);
+            let (y0, y1) = dirty_rows(&prev_cells, &cells, cols, rows);
+            if y0 <= y1 {
+                let ch = metrics.height.max(1) as usize;
+                blit_rows(&surface, &info, y0 * ch, ((y1 + 1) * ch).min(info.height));
+            }
+            prev_cells = cells;
             redraw = false;
         }
 
@@ -236,7 +246,19 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
         Some(i) if m.op == stdio::OP_STDOUT => {
             let len = m.len.min(buf.len());
             let pane = &mut panes[i];
-            pane.parser.advance(&mut pane.grid, &buf[..len]);
+            // Перевод строки: программы шлют голый `\n`, а грид (как и любой терминал) ждёт
+            // CR+LF — иначе строка опускается, НЕ возвращая курсор, и вывод идёт лесенкой
+            // вправо. В Unix это делает драйвер tty (ONLCR); у нас драйвера нет, поэтому
+            // трансляция здесь — терминал и есть её законное место.
+            let mut from = 0usize;
+            for at in 0..len {
+                if buf[at] == b'\n' && (at == 0 || buf[at - 1] != b'\r') {
+                    pane.parser.advance(&mut pane.grid, &buf[from..at]);
+                    pane.parser.advance(&mut pane.grid, b"\r\n");
+                    from = at + 1;
+                }
+            }
+            pane.parser.advance(&mut pane.grid, &buf[from..len]);
             sys::reply(m.reply_cap, &[]);
             true
         }
@@ -333,10 +355,10 @@ fn close_pane(tree: &mut SplitTree, panes: &mut Vec<Pane>, focus: &mut usize) {
 fn resize_all(panes: &mut [Pane], rects: &[PaneRect]) {
     for p in panes.iter_mut() {
         let (w, h) = rect_size(rects, p.id);
-        // Содержимое при смене размера теряется: перенос истории — отдельная работа.
         if p.grid.cols() != w || p.grid.rows() != h {
-            p.grid = Grid::new(w, h);
-            p.parser = vte::Parser::new();
+            // `Grid::resize` переносит содержимое; раньше здесь создавался НОВЫЙ грид, и при
+            // каждом разбиении соседние панели чернели — самая заметная ошибка первой версии.
+            p.grid.resize(w, h);
         }
     }
 }
@@ -371,7 +393,7 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
 fn compose(
     surface: &mut Surface, renderer: &GridRenderer, cache: &mut GlyphCache<TtfFont>,
     panes: &[Pane], rects: &[PaneRect], focus: usize, cols: usize, rows: usize, palette: Palette,
-) {
+) -> Vec<Cell> {
     surface.clear(palette.background);
     // Общий кадр — мозаика из гридов панелей: у каждой свой, склеиваем по ячейкам.
     let mut cells = vec![Cell::default(); cols * rows];
@@ -392,7 +414,30 @@ fn compose(
         }
     }
     status_bar(&mut cells, panes, focus, cols, rows);
+    // Рисуем в RAM целиком: это дёшево (кэшируемая память). Дорого — переносить на экран,
+    // поэтому туда уедут только изменившиеся строки.
     renderer.paint_cells(&cells, cols, rows, cache, surface);
+    cells
+}
+
+/// Диапазон изменившихся строк грида `[первая, последняя]`; `первая > последняя` — изменений нет.
+/// Диапазоном, а не списком: вывод почти всегда идёт подряд, а один `blit` полосой дешевле, чем
+/// десяток вызовов вразбивку.
+fn dirty_rows(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> (usize, usize) {
+    if prev.len() != now.len() {
+        return (0, rows.saturating_sub(1)); // первый кадр или сменилась геометрия — весь экран
+    }
+    let (mut first, mut last) = (usize::MAX, 0usize);
+    for y in 0..rows {
+        let r = y * cols..(y + 1) * cols;
+        if prev[r.clone()] != now[r] {
+            if first == usize::MAX {
+                first = y;
+            }
+            last = y;
+        }
+    }
+    if first == usize::MAX { (1, 0) } else { (first, last) }
 }
 
 /// Пометить фокусную панель по краям зазора: сплошную рамку рисовать негде — зазор между
@@ -457,13 +502,13 @@ fn find_fb_cap() -> Option<usize> {
 }
 
 /// Перенести кадр из RAM в фреймбуфер, упаковав пиксели в формат прошивки.
-fn blit(surface: &Surface, info: &sys::VideoInfo) {
+fn blit_rows(surface: &Surface, info: &sys::VideoInfo, y_from: usize, y_to: usize) {
     let src = surface.data();
     let sw = surface.width() as usize;
     let bytes_pp = info.bpp / 8;
     let w = sw.min(info.width);
-    let h = (surface.height() as usize).min(info.height);
-    for y in 0..h {
+    let h = (surface.height() as usize).min(info.height).min(y_to);
+    for y in y_from..h {
         let mut dst = FB_VA + y * info.pitch;
         let row = y * sw * 4;
         for x in 0..w {
