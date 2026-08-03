@@ -340,6 +340,15 @@ fn cmd_repl() -> ! {
     sys::write(b"vvsh");
     sys::write(C_RESET);
     sys::write(" — Lisp-шелл VOID (ADR 0006). `(...)` — выражение, иначе команда. `help` — команды, `(exit)` — назад в vsh.\n".as_bytes());
+    // Веха 99.3 — размер СВОЕГО окна, если мы живём в панели мультиплексора. Аналог TIOCSWINSZ,
+    // только опрашиваемый: сигналов у нас нет, а сходить к хосту программа и так умеет.
+    // Печатаем его в баннере не ради красоты — так сразу видно, что программа знает, куда рисует.
+    if let Some((cols, rows)) = sys::stdio::win_size() {
+        let mut line = alloc::string::String::new();
+        use core::fmt::Write;
+        let _ = write!(line, "окно: {cols}×{rows} знакомест\n");
+        sys::write(line.as_bytes());
+    }
     let loader = vvsh_core::NoLoader;
     let interp = vvsh_core::Interp::new(&loader);
     let env = shell_env(); // ПЕРСИСТЕНТНОЕ окружение сессии (чистые builtins + команды-эффекты)

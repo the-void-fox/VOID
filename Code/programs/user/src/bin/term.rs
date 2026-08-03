@@ -268,6 +268,15 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
             sys::reply(m.reply_cap, &[]);
             true
         }
+        Some(i) if m.op == stdio::OP_WINSIZE => {
+            // Размер панели в знакоместах — программе нужно знать, куда она рисует.
+            let (c, r) = (panes[i].grid.cols() as u16, panes[i].grid.rows() as u16);
+            let mut rep = [0u8; 4];
+            rep[..2].copy_from_slice(&c.to_le_bytes());
+            rep[2..].copy_from_slice(&r.to_le_bytes());
+            sys::reply(m.reply_cap, &rep);
+            false
+        }
         Some(i) if m.op == stdio::OP_STDIN => {
             // Отложенный ответ: держим право до появления клавиш (как в net-srv).
             panes[i].pending_read = Some(m.reply_cap);
