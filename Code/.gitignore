@@ -5,6 +5,9 @@
 /programs/*/target/
 # target стандалон-библиотек со своим таргетом (vvsh-core host-тесты; не члены workspace ядра)
 /libs/*/target/
+# target закреплённых копий чужих крейтов, у которых есть свои host-тесты (Веха 105: lzma-rs)
+/programs/*/vendor-lzma/*/target/
+/programs/*/vendor-lzma/*/Cargo.lock
 # Cargo.lock стандалон-библиотек без зависимостей (генерится host-тестами; для либ не коммитим)
 /libs/*/Cargo.lock
 # target хост-утилит (Веха 29) — тоже отдельные крейты со своим таргетом

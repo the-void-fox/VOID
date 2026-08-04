@@ -1,0 +1,15 @@
+# lzma-rs 0.3.0 — закреплённая копия для VOID (Веха 105, Фаза 8).
+#
+# Отличия от апстрима перечислены в src/lib.rs и ../README.md. Главное для сборки: крейт
+# `no_std` + `alloc` и БЕЗ ЕДИНОЙ зависимости — `std::io`, `byteorder` и `crc` заменены шимами
+# внутри копии (src/io.rs, src/byteorder.rs, src/crc.rs).
+[package]
+name = "lzma-rs"
+version = "0.3.0"
+edition = "2018"
+authors = ["Guillaume Endignoux <ggendx@gmail.com>"]
+description = "A codec for LZMA, LZMA2 and XZ written in pure Rust (декодер, копия для VOID)"
+license = "MIT"
+repository = "https://github.com/gendx/lzma-rs"
+
+[dependencies]

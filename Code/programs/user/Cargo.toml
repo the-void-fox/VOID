@@ -68,6 +68,11 @@ ereb-mux = { path = "vendor-ereb/ereb-mux" }
 # Парсер ANSI — тот же, что у ereb-core; нужен в `term` напрямую, чтобы гонять байты в грид.
 vte = { version = "0.15.0", default-features = false }
 
+# Веха 105 (Фаза 8) — РАСПАКОВКА xz: пакеты бинарного кэша nixpkgs приезжают как `.nar.xz`.
+# Копия lzma-rs 0.3.0, переведённая в no_std и урезанная до декодера (см. vendor-lzma/README.md).
+# Линкуется только в `vvsh` (команда `nar-unpack`).
+lzma-rs = { path = "vendor-lzma/lzma-rs" }
+
 # bare-metal: у `getrandom` нет системного источника, поэтому регистрируем свой —
 # он уходит в `SYS_RANDOM` ядра (Веха 86 + джиттер/virtio-rng).
 getrandom = { version = "0.2", features = ["custom"] }
