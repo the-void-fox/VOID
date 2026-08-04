@@ -151,6 +151,10 @@ struct Proc {
     /// Веха 91 — процесс спит в `SYS_RECV` и просил будить его ещё и ПРИХОДОМ КАДРА
     /// (режим 3): так сетевой сервер просыпается от карты, а не от таймера.
     wake_on_net: bool,
+    /// Веха 103 — тот же приём для КЛАВИАТУРЫ: процесс спит в `SYS_RECV`, но просыпается и от
+    /// ввода с консоли. Без этого реактор терминала обязан был крутиться по таймеру: ждать
+    /// сообщения и клавишу ОДНОВРЕМЕННО было нечем.
+    wake_on_key: bool,
     /// Веха 89 — сколько ФРЕЙМОВ куча этой группы реально заняла (лениво, по фолтам).
     /// Живёт у лидера группы, как и `heap_brk`; сверяется с [`page_quota`].
     pages: usize,
@@ -319,6 +323,7 @@ fn create_process_locked(
         send_len: 0,
         send_cap: usize::MAX,
         wake_on_net: false,
+        wake_on_key: false,
         pages: 0,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
         args: {
@@ -369,6 +374,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         send_len: 0,
         send_cap: usize::MAX,
         wake_on_net: false,
+        wake_on_key: false,
         pages: 0, // не используется у нити: учёт ведёт лидер
         heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
         args: Vec::new(),
@@ -542,7 +548,9 @@ fn wait_stdin(saved_sie: usize) -> bool {
         // Веха 91: ближайший дедлайн спящих по времени (SYS_RECV с таймаутом, futex_wait).
         // Без него простой был бы «до ввода с консоли», и проснуться по времени было бы нечем.
         let d = t.procs.iter().filter_map(|p| p.futex_deadline).min();
-        (w, any_irq_waiting(&t) || t.procs.iter().any(|p| p.wake_on_net), d)
+        let wake = any_irq_waiting(&t)
+            || t.procs.iter().any(|p| p.wake_on_net || p.wake_on_key);
+        (w, wake, d)
     };
     if waiting.is_empty() && !irq_waiting && deadline.is_none() {
         return false;
@@ -582,6 +590,20 @@ fn wait_stdin(saved_sie: usize) -> bool {
         crate::random::stir(1);
         for pid in waiting {
             t.procs[pid].state = State::Runnable; // ввод пришёл — будим ждущих READ
+        }
+        // Веха 103 — и тех, кто спит в `SYS_RECV` с пробуждением по клавише: сообщения не было,
+        // но событие есть. Ответ тот же, что при истёкшем сроке, — «запроса нет», и реактор идёт
+        // читать клавиатуру сам.
+        for i in 0..t.procs.len() {
+            if t.procs[i].state == State::RecvWait && t.procs[i].wake_on_key {
+                let f = &mut t.procs[i].frame;
+                f.set_ret(usize::MAX);
+                f.set_ret_at(2, 0);
+                f.advance();
+                t.procs[i].state = State::Runnable;
+                t.procs[i].futex_deadline = None;
+                t.procs[i].wake_on_key = false;
+            }
         }
     }
     drain_userdrv_irq(&mut t); // Веха 52: пришёл IRQ драйвера — будим ждущих SYS_IRQ_WAIT
@@ -1069,6 +1091,8 @@ fn syscall(t: &mut Table, cur: usize) {
                 // Режим 3: разбудить ещё и приходом кадра - тогда сервер реагирует на сеть
                 // мгновенно, а не на ближайшем тике таймера.
                 t.procs[cur].wake_on_net = mode == 3;
+                // Веха 103 — режим 4: разбудить и по клавише (реактор терминала).
+                t.procs[cur].wake_on_key = mode == 4;
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
                 if let Some(n) = t.next_runnable(cur) {
                     t.current = n;

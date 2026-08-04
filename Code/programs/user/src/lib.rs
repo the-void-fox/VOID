@@ -326,6 +326,17 @@ pub fn recv_timeout(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
 
+/// Веха 103 — `SYS_RECV` со сном до дедлайна ИЛИ до КЛАВИШИ. То, чего не хватало реактору
+/// терминала: он обязан обслуживать два источника — вывод детей и клавиатуру, — а ждать умел
+/// только на одном, поэтому крутился по короткому таймеру. Теперь спит до события.
+/// `None` — проснулись не из-за сообщения (клавиша или срок): читать клавиатуру и повторять.
+pub fn recv_console(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
+    let (op, reply_cap, len, cap, sender) = abi::syscall5(
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 4, timeout_ticks, 0,
+    );
+    (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
+}
+
 /// Веха 91 - `SYS_RECV` со сном до дедлайна ИЛИ до прихода СЕТЕВОГО КАДРА. То, ради чего веха:
 /// сетевой сервер спит, ничего не занимая, и просыпается ровно тогда, когда карта что-то
 /// приняла, - а не на ближайшем тике таймера. `None` - проснулись не из-за запроса.
