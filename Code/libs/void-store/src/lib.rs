@@ -221,10 +221,23 @@ impl Store {
     pub fn put_node(&mut self, bytes: &[u8], children: &[ContentId]) -> ContentId {
         let frame = encode(bytes, children);
         let id = ContentId::hash(&frame);
-        self.objects.entry(id).or_insert_with(|| Object {
-            data: Some(Loaded { payload: bytes.to_vec(), children: children.to_vec() }),
-            disk: None,
+        let mut fresh = false;
+        self.objects.entry(id).or_insert_with(|| {
+            fresh = true;
+            Object {
+                data: Some(Loaded { payload: bytes.to_vec(), children: children.to_vec() }),
+                disk: None,
+            }
         });
+        // Веха 101 — НОВЫЙ объект тоже «грязная операция». Раньше счётчик считал только смену
+        // корней, поэтому программа, льющая объекты подряд (распаковка пакета, загрузка по
+        // сети), не давала политике group commit ни одного повода сработать: несинхронизированное
+        // копилось в куче ядра, пока та не кончалась — а кончалась она ПАНИКОЙ, не отказом.
+        // Замер (`store-probe`): 8 МиБ пачкой проходили, 16 МиБ роняли машину.
+        // Дедуп не считаем: повторный put ничего нового на диск не добавляет.
+        if fresh {
+            self.dirty_ops += 1;
+        }
         id
     }
 

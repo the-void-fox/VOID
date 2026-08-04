@@ -591,6 +591,7 @@ fn shell_env() -> Env {
         ("thaw", sh_thaw),
         ("switch", sh_switch),
         ("poweroff", sh_poweroff),
+        ("store-probe", sh_store_probe),
         ("sysdef", sh_sysdef),
         ("rebuild", sh_rebuild),
         ("gens", sh_gens),
@@ -809,6 +810,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"help", "эта справка");
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
     help_row(b"poweroff", "выключить машину");
+    help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
     sys::write("  Lisp: (define x 5) · (lambda (a) …) · (if c t e) · (map f L) · (filter p L)\n".as_bytes());
     sys::write("  Конвейер: (| (ls) (grep \"vv\") count)\n".as_bytes());
     Ok(Value::nil())
@@ -1177,10 +1179,16 @@ fn sh_fetch(args: &[Value]) -> Result<Value, EvalError> {
 
     let netep = net_ep("fetch")?;
     let scap = cap_store();
-    // Буферы даёт вызывающий: у библиотеки нет аллокатора, а у шелла есть. Потолок в 512 кусков
-    // по 16 КиБ = 8 МиБ на файл — этого хватает до пакетов, где понадобится дерево поглубже.
+    // Буферы даёт вызывающий: у библиотеки нет аллокатора, а у шелла есть.
+    //
+    // Веха 101 — список кусков БОЛЬШЕ не 512 записей. Прежний потолок (512 × 16 КиБ = 8 МиБ на
+    // файл) был выбран «до пакетов», а пакеты как раз и начинаются с замыканий в десятки
+    // мегабайт: `pkg fetch` упёрся бы в него на первом же настоящем пакете. Записей теперь
+    // столько, сколько нужно (32 байта на кусок: 64 МиБ файла — 128 КиБ списка).
+    // Настоящий потолок остался один и он честнее — сколько объектов принимает store за сессию
+    // (см. `store-probe`).
     let mut chunk = alloc::vec![0u8; sys::http::CHUNK];
-    let mut kids = alloc::vec![[0u8; 32]; 512];
+    let mut kids = alloc::vec![[0u8; 32]; 8192];
     let mut sink = sys::http::Sink { chunk: &mut chunk, kids: &mut kids };
     match sys::http::get(netep, scap, url.as_bytes(), root.as_bytes(), &mut sink) {
         Ok(f) => {
@@ -1302,6 +1310,47 @@ fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// `(switch "gen")` — выбрать поколение системы (запись в корень `system/current`; после ребута).
+/// `(store-probe [МиБ])` — сколько store принимает за сессию (Веха 101, замер перед пакетами).
+///
+/// Кладёт объекты по 64 КиБ с РАЗНЫМ содержимым (одинаковые схлопнулись бы дедупом и ничего не
+/// измерили) и считает, сколько удалось. Вопрос практический: NAR настоящего пакета — десятки
+/// мегабайт, а объекты живут в куче ЯДРА (16 МиБ арены), и упереться в это лучше здесь, чем на
+/// середине пакетной фазы. Останавливается на первом отказе или на заданном пределе (по
+/// умолчанию 64 МиБ).
+fn sh_store_probe(args: &[Value]) -> Result<Value, EvalError> {
+    let limit_mib = match args.first() {
+        Some(Value::Int(n)) if *n > 0 => *n as usize,
+        _ => 64,
+    };
+    let scap = cap_store();
+    const PIECE: usize = 64 * 1024;
+    let mut buf = alloc::vec![0u8; PIECE];
+    let mut id = [0u8; 32];
+    let mut done = 0usize;
+    let pieces = limit_mib * 1024 * 1024 / PIECE;
+    for i in 0..pieces {
+        // Уникальная «соль» в начале куска: содержимое обязано отличаться, иначе store честно
+        // вернёт тот же объект и замер покажет бесконечность.
+        buf[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        if sys::obj_put(scap, &buf, &mut id) != 0 {
+            sys::write(
+                alloc::format!(
+                    "store-probe: отказ на {} МиБ ({} объектов по 64 КиБ)\n",
+                    done / (1024 * 1024),
+                    i,
+                )
+                .as_bytes(),
+            );
+            return Ok(Value::Int((done / (1024 * 1024)) as i64));
+        }
+        done += PIECE;
+    }
+    sys::write(
+        alloc::format!("store-probe: принято {} МиБ без отказа\n", done / (1024 * 1024)).as_bytes(),
+    );
+    Ok(Value::Int((done / (1024 * 1024)) as i64))
+}
+
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
 /// одностороннее действие над всей системой, и оно названо правом, а не считается общедоступным.
 fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
