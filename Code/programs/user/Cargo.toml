@@ -22,6 +22,7 @@ description = "Базовый userspace VOID: библиотека syscall-ши�
 # global_allocator); прочие бинари его не тянут. Крейт no_std+alloc, стандалон (см. ../../Cargo.toml).
 [dependencies]
 vvsh-core = { path = "../../libs/vvsh-core" }
+void-nar = { path = "../../libs/void-nar" }
 
 # Веха 90 (Фаза 7, ADR 0008) — сетевой стек. Vendored и версия ПРИБИТА: TCP с нуля не пишем
 # (см. ADR), а сборка обязана оставаться оффлайн — источник заменён на ./vendor

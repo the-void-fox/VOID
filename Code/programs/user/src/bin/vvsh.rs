@@ -598,6 +598,7 @@ fn shell_env() -> Env {
         ("switch", sh_switch),
         ("poweroff", sh_poweroff),
         ("store-probe", sh_store_probe),
+        ("nar-unpack", sh_nar_unpack),
         ("sysdef", sh_sysdef),
         ("rebuild", sh_rebuild),
         ("gens", sh_gens),
@@ -817,6 +818,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
     help_row(b"poweroff", "выключить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
+    help_row(b"nar-unpack", "разложить NAR из корня store в файлы");
     sys::write("  Lisp: (define x 5) · (lambda (a) …) · (if c t e) · (map f L) · (filter p L)\n".as_bytes());
     sys::write("  Конвейер: (| (ls) (grep \"vv\") count)\n".as_bytes());
     Ok(Value::nil())
@@ -1316,6 +1318,81 @@ fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// `(switch "gen")` — выбрать поколение системы (запись в корень `system/current`; после ребута).
+/// `nar-unpack("корень", "/куда")` — разложить NAR из объекта store в файлы (Веха 105).
+///
+/// Первая распаковка пакетного формата НА САМОЙ VOID: архив читается объектом из store, обход
+/// (`void_nar`) отдаёт файлы по одному, и каждый сразу уезжает в персоналию. Держать дерево в
+/// памяти целиком мы не можем и не пытаемся — ради этого у обхода и обратный вызов.
+///
+/// Пишем ЧЕРЕЗ файловый сервер, а не подделываем его корни: раскладка «файл = объект, каталог =
+/// индекс» принадлежит ему, и лезть в неё за его спиной значило бы завести вторую правду.
+fn sh_nar_unpack(args: &[Value]) -> Result<Value, EvalError> {
+    let (root, dest) = match (args.first(), args.get(1)) {
+        (Some(Value::Str(r)), Some(Value::Str(d))) => (r.clone(), d.clone()),
+        _ => return Err(EvalError::new("nar-unpack: (\"корень\", \"/куда\")")),
+    };
+    let scap = cap_store();
+    let ep = cap_fs();
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(scap, root.as_bytes(), &mut id) != 32 {
+        return Err(EvalError::new("nar-unpack: нет такого корня"));
+    }
+    let mut buf = alloc::vec![0u8; 2 * 1024 * 1024];
+    let n = sys::obj_get(scap, &id, &mut buf);
+    if n == 0 || n > buf.len() {
+        return Err(EvalError::new("nar-unpack: объект не читается (или больше 2 МиБ)"));
+    }
+    buf.truncate(n);
+
+    let base = alloc::string::String::from(dest.trim_end_matches('/'));
+    px::mkdir(ep, base.as_bytes());
+    let mut files = 0usize;
+    let mut links = 0usize;
+    let mut bytes = 0usize;
+    let r = void_nar::walk(&buf, |e| {
+        match e {
+            void_nar::Entry::Dir { path } => {
+                if !path.is_empty() {
+                    px::mkdir(ep, alloc::format!("{}/{}", base, path).as_bytes());
+                }
+            }
+            void_nar::Entry::File { path, data, .. } => {
+                let full = if path.is_empty() {
+                    base.clone()
+                } else {
+                    alloc::format!("{}/{}", base, path)
+                };
+                if !px::echo_to(ep, full.as_bytes(), data) {
+                    // Веха 101 научила `echo_to` отвечать честно — грех не воспользоваться:
+                    // недописанный файл обязан остановить распаковку, а не остаться огрызком.
+                    return Err(void_nar::NarError(alloc::format!("не записался {}", full)));
+                }
+                files += 1;
+                bytes += data.len();
+            }
+            // Симлинков в персоналии нет; молчать нельзя — иначе дерево тихо теряет часть себя.
+            void_nar::Entry::Symlink { path, target } => {
+                sys::write(alloc::format!("  ! симлинк {} → {} пропущен\n", path, target).as_bytes());
+                links += 1;
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = r {
+        return Err(EvalError::new(e.0));
+    }
+    sys::write(
+        alloc::format!(
+            "распаковано: файлов {} ({} Б){}\n",
+            files,
+            bytes,
+            if links > 0 { alloc::format!(", симлинков пропущено {}", links) } else { String::new() },
+        )
+        .as_bytes(),
+    );
+    Ok(Value::Int(files as i64))
+}
+
 /// `(store-probe [МиБ])` — сколько store принимает за сессию (Веха 101, замер перед пакетами).
 ///
 /// Кладёт объекты по 64 КиБ с РАЗНЫМ содержимым (одинаковые схлопнулись бы дедупом и ничего не

@@ -1040,6 +1040,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "void-nar"
+version = "0.0.1"
+
+[[package]]
 name = "void-user"
 version = "0.0.1"
 dependencies = [
@@ -1051,6 +1055,7 @@ dependencies = [
  "rustls",
  "rustls-rustcrypto",
  "smoltcp",
+ "void-nar",
  "vte",
  "vvsh-core",
  "webpki-roots 0.26.11",
