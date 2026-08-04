@@ -1333,6 +1333,33 @@ fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
 /// в вопросе «сжато или нет» значило бы верить тому, кто корень завёл.
 const XZ_MAGIC: &[u8] = &[0xFD, b'7', b'z', b'X', b'Z', 0x00];
 
+/// Опознавательный знак `.zst` — магия кадра zstd 0xFD2FB528 (RFC 8878, LE).
+/// Второе сжатие кэша nixpkgs, и с некоторых пор ОСНОВНОЕ: замер по случайной выборке путей
+/// (2026-08-04) дал 15 zstd против 7 xz. Пакетная дорожка без него встала бы на первом же
+/// свежем пакете.
+const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+
+/// Сколько байт хватает, чтобы опознать сжатие (обе магии короче).
+const MAGIC_PROBE: usize = 6;
+
+/// Чем сжат архив — определяется по первым байтам, а не по имени.
+#[derive(Clone, Copy, PartialEq)]
+enum Packing {
+    None,
+    Xz,
+    Zstd,
+}
+
+fn packing_of(head: &[u8]) -> Packing {
+    if head.starts_with(XZ_MAGIC) {
+        Packing::Xz
+    } else if head.starts_with(ZSTD_MAGIC) {
+        Packing::Zstd
+    } else {
+        Packing::None
+    }
+}
+
 /// Читатель поверх БЛОБА store (манифест + куски-дети — так `fetch` кладёт скачанное).
 ///
 /// Нужен ради одного свойства: сжатый архив не материализуется в куче целиком. Распаковщик
@@ -1443,12 +1470,14 @@ fn nar_bytes(scap: usize, id: &[u8; 32]) -> Result<Vec<u8>, EvalError> {
         }
         // Первый кусок нужен дважды — опознать сжатие и потом распаковать, — поэтому читаем
         // блоб с начала в обоих случаях, а не запоминаем прочитанное.
-        let mut probe = alloc::vec![0u8; XZ_MAGIC.len()];
-        let compressed = sys::obj_get(scap, &kids[0], &mut probe) == XZ_MAGIC.len()
-            && probe == XZ_MAGIC;
+        let mut probe = alloc::vec![0u8; MAGIC_PROBE];
+        let plen = sys::obj_get(scap, &kids[0], &mut probe);
+        let packing = if plen <= MAGIC_PROBE { packing_of(&probe[..plen]) } else { Packing::None };
         let mut blob = BlobReader::new(scap, kids, csize);
-        if compressed {
-            return unxz(&mut blob, total);
+        match packing {
+            Packing::Xz => return unxz(&mut blob, total),
+            Packing::Zstd => return unzstd(blob, total),
+            Packing::None => {}
         }
         let mut out = Vec::with_capacity(total);
         let mut chunk = alloc::vec![0u8; csize];
@@ -1464,20 +1493,56 @@ fn nar_bytes(scap: usize, id: &[u8; 32]) -> Result<Vec<u8>, EvalError> {
     }
 
     let buf = read_object(scap, id, 8 * 1024 * 1024)?;
-    if buf.starts_with(XZ_MAGIC) {
-        let packed = buf.len();
-        return unxz(&mut buf.as_slice(), packed);
+    let packed = buf.len();
+    match packing_of(&buf) {
+        Packing::Xz => unxz(&mut buf.as_slice(), packed),
+        Packing::Zstd => unzstd(SliceReader(buf.as_slice()), packed),
+        Packing::None => Ok(buf),
     }
-    Ok(buf)
 }
 
-/// Распаковать `.xz` (Веха 105). Кэш nixpkgs отдаёт пакеты именно так, поэтому распаковщик —
-/// не удобство, а условие входа в пакетную дорожку.
+/// Распаковать `.xz` (Веха 105). Кэш nixpkgs отдаёт часть пакетов именно так.
 fn unxz<R: lzma_rs::io::BufRead>(input: &mut R, packed: usize) -> Result<Vec<u8>, EvalError> {
     let mut out = Vec::new();
     lzma_rs::xz_decompress(input, &mut out)
         .map_err(|e| EvalError::new(alloc::format!("nar-unpack: xz: {}", e)))?;
     sys::write(alloc::format!("  [xz] {} → {} байт\n", packed, out.len()).as_bytes());
+    Ok(out)
+}
+
+/// Читатель по слайсу для `ruzstd` — у него свой трейт `Read`, и чужие реализации в него,
+/// разумеется, не считаются. Обёртка нужна ровно потому, что оба распаковщика описывают ввод
+/// каждый по-своему; общего `std::io` в no_std-мире нет и взяться ему неоткуда.
+struct SliceReader<'a>(&'a [u8]);
+
+impl ruzstd::io::Read for SliceReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, ruzstd::io::Error> {
+        let n = out.len().min(self.0.len());
+        out[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
+}
+
+impl ruzstd::io::Read for BlobReader {
+    fn read(&mut self, out: &mut [u8]) -> Result<usize, ruzstd::io::Error> {
+        lzma_rs::io::Read::read(self, out)
+            .map_err(|_| ruzstd::io::Error::from(ruzstd::io::ErrorKind::Other))
+    }
+}
+
+/// Распаковать `.zst` (Веха 105.2). Кэш nixpkgs перешёл на zstd, и без этого пакетная дорожка
+/// встала бы на первом же свежем пакете.
+///
+/// Поток, а не «весь вход в память»: `StreamingDecoder` тянет байты у источника сам, поэтому
+/// сжатая копия в куче не собирается — то же свойство, что у пути xz.
+fn unzstd<R: ruzstd::io::Read>(input: R, packed: usize) -> Result<Vec<u8>, EvalError> {
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(input)
+        .map_err(|e| EvalError::new(alloc::format!("nar-unpack: zstd: {}", e)))?;
+    let mut out = Vec::new();
+    ruzstd::io::Read::read_to_end(&mut dec, &mut out)
+        .map_err(|e| EvalError::new(alloc::format!("nar-unpack: zstd: {}", e)))?;
+    sys::write(alloc::format!("  [zstd] {} → {} байт\n", packed, out.len()).as_bytes());
     Ok(out)
 }
 
@@ -1530,8 +1595,15 @@ fn sh_nar_unpack(args: &[Value]) -> Result<Value, EvalError> {
                 bytes += data.len();
             }
             // Симлинков в персоналии нет; молчать нельзя — иначе дерево тихо теряет часть себя.
+            // Но и заваливать экран нельзя: настоящий пакет вроде `perl-env` — это сотня-другая
+            // симлинков, за которыми не видно ничего. Первые несколько поимённо, остальные —
+            // числом в итоговой строке.
             void_nar::Entry::Symlink { path, target } => {
-                sys::write(alloc::format!("  ! симлинк {} → {} пропущен\n", path, target).as_bytes());
+                if links < 5 {
+                    sys::write(
+                        alloc::format!("  ! симлинк {} → {} пропущен\n", path, target).as_bytes(),
+                    );
+                }
                 links += 1;
             }
         }
