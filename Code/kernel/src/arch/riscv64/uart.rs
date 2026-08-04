@@ -12,6 +12,7 @@
 //! пока [`has_input`] пуст, и ядро будит его, когда буфер наполнится.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::SpinLock;
 
@@ -28,7 +29,10 @@ pub const IRQ: u32 = 10;
 
 /// Кольцевой буфер принятых байт. 256 — с запасом и для набора с клавиатуры, и для
 /// сценария, поданного через pipe (QEMU дошлёт остальное по мере вычерпывания FIFO).
-const RING_SIZE: usize = 256;
+/// Веха 101 — 1 КиБ, а не 256 Б: столько же, сколько строка команды в шелле. Прежние 256
+/// совпадали со СТАРЫМ пределом строки, и стоило вставить в консоль длинный модуль `.vv`, как
+/// байты пропадали ИЗ СЕРЕДИНЫ (кольцо переполнялось быстрее, чем шелл его вычерпывал).
+const RING_SIZE: usize = 1024;
 
 struct Ring {
     buf: [u8; RING_SIZE],
@@ -37,6 +41,14 @@ struct Ring {
 }
 
 static RING: SpinLock<Ring> = SpinLock::new(Ring { buf: [0; RING_SIZE], head: 0, tail: 0 });
+
+/// Сколько байт ввода потеряно переполнением кольца (забирается и обнуляется [`take_lost`]).
+static LOST: AtomicUsize = AtomicUsize::new(0);
+
+/// Забрать и обнулить счётчик потерянного ввода.
+pub fn take_lost() -> usize {
+    LOST.swap(0, Ordering::Relaxed)
+}
 
 /// Zero-sized хэндл UART0.
 pub struct Uart;
@@ -92,6 +104,11 @@ pub fn drain_rx() {
                 let at = ring.head;
                 ring.buf[at] = b;
                 ring.head = next;
+            } else {
+                // Переполнение больше не молчит: счётчик заберёт и покажет чтение ввода
+                // (`SYS_READ`). Молча терять набранное — худший из вариантов: человек видит
+                // испорченную строку и не знает, он ошибся или система.
+                LOST.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

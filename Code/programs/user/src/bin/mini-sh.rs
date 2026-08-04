@@ -18,7 +18,7 @@ pub extern "C" fn _start(ep: usize, _a1: usize) -> ! {
     px::cat(ep, MOTD);
     // $ echo "..." > motd.txt
     px::write(ep, px::STDOUT, b"[mini-sh] $ echo \"...\" > motd.txt\n");
-    px::echo_to(ep, MOTD, MOTDMSG);
+    let _ = px::echo_to(ep, MOTD, MOTDMSG); // демо: итог виден следующим `cat`
     // $ cat motd.txt   (только что записанное)
     px::write(ep, px::STDOUT, CATLBL);
     px::cat(ep, MOTD);

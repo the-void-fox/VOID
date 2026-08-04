@@ -1044,6 +1044,10 @@ fn syscall(t: &mut Table, cur: usize) {
             if let Some(pos) = t.mailbox.iter().position(|&(_, to, _)| to == cur) {
                 let (from, _to, op) = t.mailbox.remove(pos);
                 let (n, tcap) = deliver_request(t, from, cur);
+                // Веха 101 — сколько байт запроса ДОШЛО, узнаёт отправитель (третье значение его
+                // `SYS_CALL`). Он ещё спит в ReplyWait; ответ выставит a0/a1 и двинет sepc, a2
+                // при этом сохранится.
+                t.procs[from].frame.set_ret_at(2, n);
                 let rc = cap::mint(t.procs[cur].domain, cap::Target::Reply(from), Rights::SEND);
                 let f = &mut t.procs[cur].frame;
                 f.set_ret(op);
@@ -1109,6 +1113,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         // получатель ждёт в RECV — доставить нагрузку в его буфер и разбудить.
                         // Выдать серверу одноразовый reply-cap на этого клиента (см. [[reply-capability]]).
                         let (n, tcap) = deliver_request(t, cur, dest);
+                        t.procs[cur].frame.set_ret_at(2, n); // Веха 101: доставлено байт запроса
                         let rc = cap::mint(t.procs[dest].domain, cap::Target::Reply(cur), Rights::SEND);
                         let df = &mut t.procs[dest].frame;
                         df.set_ret(op);
@@ -1206,6 +1211,10 @@ fn syscall(t: &mut Table, cur: usize) {
                         let df = &mut t.procs[dest].frame;
                         df.set_ret(n); // клиентский CALL вернёт число принятых байт
                         df.set_ret_at(1, tcap); // и дескриптор полученного права (MAX — не было)
+                        // Веха 101 — и сколько байт сервер ХОТЕЛ отдать: иначе «ответ ровно такой»
+                        // и «мой буфер оказался мал» с виду одно и то же (та же слепота, что была
+                        // у запроса). Четвёртым значением, чтобы не трогать прежние два.
+                        df.set_ret_at(3, len);
                         df.advance();
                         t.procs[dest].state = State::Runnable;
                     }
@@ -1543,6 +1552,13 @@ fn syscall(t: &mut Table, cur: usize) {
                 // Пишем в U-память вызывающего напрямую: он current, SUM=1 (как в SYS_WRITE).
                 unsafe { *((buf + n) as *mut u8) = b };
                 n += 1;
+            }
+            // Веха 101 — сказать вслух, если кольцо консоли переполнилось и ввод пропал. Место
+            // выбрано здесь, а не в обработчике прерывания: печатать из него дорого и небезопасно,
+            // а чтение — ровно тот момент, когда человек смотрит на результат набора.
+            let lost = arch::console_take_lost();
+            if lost > 0 {
+                println!("  [tty] потеряно {} байт ввода — кольцо консоли переполнено", lost);
             }
             if n > 0 {
                 let f = &mut t.procs[cur].frame;
@@ -2902,6 +2918,16 @@ fn copy_between_spaces(
 /// Возвращает (скопировано байт, дескриптор права у получателя | MAX).
 fn deliver_request(t: &Table, from: usize, to: usize) -> (usize, usize) {
     let mut n = t.procs[from].send_len.min(t.procs[to].recv_cap);
+    // Веха 101 — усечение по приёмнику остаётся (менять семантику на живой системе дороже, чем
+    // она стоит), но перестаёт быть НЕВИДИМЫМ: доставленную длину получает и лог, и сам
+    // отправитель (третьим значением `SYS_CALL`, см. места вызова). До этого запрос молча
+    // обрезался, а вызов рапортовал успех — так пропала половина сеянного `terminal.vv`.
+    if n < t.procs[from].send_len {
+        vprintln!(
+            "  [ipc] P{} → P{}: запрос УСЕЧЁН {} → {} байт (буфер приёмника мал)",
+            from, to, t.procs[from].send_len, n,
+        );
+    }
     // Веха 23: буферы обеих сторон могут лежать в ленивых кучах — доотобразить, иначе
     // постраничная трансляция молча пропустила бы немапленные страницы.
     if n > 0

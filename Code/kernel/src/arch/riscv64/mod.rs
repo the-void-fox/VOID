@@ -33,7 +33,10 @@ extern "C" {
 /// IRQ консоли в контроллере прерываний (UART0 в PLIC на QEMU virt).
 pub const CONSOLE_IRQ: u32 = uart::IRQ;
 
-pub use uart::{drain_rx as console_drain, getc as console_getc, has_input as console_has_input};
+pub use uart::{
+    drain_rx as console_drain, getc as console_getc, has_input as console_has_input,
+    take_lost as console_take_lost,
+};
 
 /// Веха 41 — ранняя инициализация консоли: на RISC-V консоль — UART (SBI/NS16550), чистить
 /// нечего (no-op; парный x86, где очищается VGA-экран от мусора BIOS).

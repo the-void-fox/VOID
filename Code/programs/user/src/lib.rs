@@ -338,13 +338,33 @@ pub fn recv_net(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
 /// Возвращает (байт ответа | MAX, право из ответа | [`NO_CAP`]). На передаваемое право
 /// (`cap` != NO_CAP) нужен `GRANT` — иначе ядро отклонит весь вызов.
 pub fn call_full(ep: usize, op: usize, send: &[u8], recv: &mut [u8], cap: usize) -> (usize, usize) {
-    let (n, got, _, _) = abi::syscall(
+    let r = call_ex(ep, op, send, recv, cap);
+    (r.reply_len, r.cap)
+}
+
+/// Итог `SYS_CALL` целиком — включая две величины, по которым видно УСЕЧЕНИЕ (Веха 101).
+pub struct Call {
+    /// Байт ответа принято (или [`usize::MAX`] — вызов не состоялся).
+    pub reply_len: usize,
+    /// Право, приехавшее в ответе ([`NO_CAP`] — не было).
+    pub cap: usize,
+    /// Байт ЗАПРОСА доставлено. Меньше отправленного — у сервера маленький приёмный буфер.
+    pub sent: usize,
+    /// Байт ответа сервер ХОТЕЛ отдать. Больше `reply_len` — мал наш буфер.
+    pub reply_want: usize,
+}
+
+/// `SYS_CALL` с полным итогом. Нужен там, где усечение — ошибка, а не норма: ядро режет запрос
+/// по приёмному буферу сервера и ответ по нашему, и до Вехи 101 обе усечки были НЕВИДИМЫ —
+/// вызов возвращал успех, а половина данных исчезала (так пропала часть сеянного `terminal.vv`).
+pub fn call_ex(ep: usize, op: usize, send: &[u8], recv: &mut [u8], cap: usize) -> Call {
+    let (n, got, sent, want) = abi::syscall(
         SYS_CALL, ep, op,
         send.as_ptr() as usize, send.len(),
         recv.as_mut_ptr() as usize, recv.len(),
         cap,
     );
-    (n, got)
+    Call { reply_len: n, cap: got, sent, reply_want: want }
 }
 
 /// `SYS_CALL` без передачи права — обычный вызов сервера. Возвращает байты ответа (или MAX).
@@ -862,10 +882,17 @@ pub mod posix {
             crate::call(ep, op, buf, &mut []);
             return 0;
         }
+        // Возвращаем то, что ДЕЙСТВИТЕЛЬНО доехало (Веха 101): если приёмный буфер сервера
+        // окажется меньше куска, вызывающий узнает об этом по числу, а не по испорченному файлу.
+        let mut done = 0usize;
         for part in buf.chunks(CHUNK) {
-            crate::call(ep, op, part, &mut []);
+            let r = crate::call_ex(ep, op, part, &mut [], crate::NO_CAP);
+            done += r.sent;
+            if r.reply_len == usize::MAX || r.sent < part.len() {
+                break;
+            }
         }
-        buf.len()
+        done
     }
 
     /// `close(fd)` — персоналия при закрытии пишет изменённый файл в store (персистентность).
@@ -972,11 +999,16 @@ pub mod posix {
     }
 
     /// `echo msg > path` — записать строку в файл. Только через shim.
-    pub fn echo_to(ep: usize, path: &[u8], msg: &[u8]) {
+    ///
+    /// Веха 101 — возвращает, записалось ли ВСЁ. Раньше не возвращала ничего, и запись, дошедшая
+    /// наполовину, выглядела как удачная; вызывающему полагается сказать об этом человеку.
+    pub fn echo_to(ep: usize, path: &[u8], msg: &[u8]) -> bool {
         let fd = open(ep, path, O_TRUNC);
-        if fd != usize::MAX {
-            write(ep, fd, msg);
-            close(ep, fd);
+        if fd == usize::MAX {
+            return false;
         }
+        let n = write(ep, fd, msg);
+        close(ep, fd);
+        n == msg.len()
     }
 }

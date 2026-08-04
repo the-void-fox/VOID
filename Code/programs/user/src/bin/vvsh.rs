@@ -212,11 +212,29 @@ fn run_init_config() {
     let ep = cap_fs();
     px::mkdir(ep, b"/etc"); // идемпотентно: если есть — MAX, игнорируем
     px::mkdir(ep, b"/etc/system");
-    px::echo_to(ep, b"/etc/system/net.vv", NET_VV.as_bytes());
-    px::echo_to(ep, b"/etc/system/services.vv", SERVICES_VV.as_bytes());
-    px::echo_to(ep, b"/etc/system/networking.vv", NETWORKING_VV.as_bytes());
-    px::echo_to(ep, b"/etc/system/terminal.vv", TERMINAL_VV.as_bytes());
-    px::echo_to(ep, DEFAULT_PATH, DEFAULT_VV.as_bytes());
+    // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` (1.5 КиБ) однажды доехал
+    // наполовину и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не
+    // бывало; виноватым тогда выглядел конфиг, а не запись.
+    let files: [(&[u8], &str); 5] = [
+        (b"/etc/system/net.vv", NET_VV),
+        (b"/etc/system/services.vv", SERVICES_VV),
+        (b"/etc/system/networking.vv", NETWORKING_VV),
+        (b"/etc/system/terminal.vv", TERMINAL_VV),
+        (DEFAULT_PATH, DEFAULT_VV),
+    ];
+    let mut bad = false;
+    for (path, text) in files {
+        if !px::echo_to(ep, path, text.as_bytes()) {
+            sys::write("vvsh: НЕ УДАЛОСЬ записать ".as_bytes());
+            sys::write(path);
+            sys::write(b"\n");
+            bad = true;
+        }
+    }
+    if bad {
+        sys::write("vvsh: конфиг посеян НЕПОЛНО — чинить до `rebuild`\n".as_bytes());
+        return;
+    }
     sys::write(
         "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (#t/#f),\n\
          terminal.vv (терминал и клавиши) → `rebuild`.\n"
@@ -847,7 +865,10 @@ fn sh_echo(args: &[Value]) -> Result<Value, EvalError> {
                 other => text.push_str(&alloc::format!("{}", other)),
             }
         }
-        px::echo_to(cap_fs(), &path, text.as_bytes());
+        if !px::echo_to(cap_fs(), &path, text.as_bytes()) {
+            // Веха 101: запись «наполовину» обязана быть ошибкой команды, а не тишиной.
+            return Err(EvalError::new("echo: файл записан не полностью"));
+        }
         return Ok(Value::nil());
     }
     for (i, a) in args.iter().enumerate() {
@@ -1379,7 +1400,11 @@ fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
 // грубо, но для команд/путей хватает). vsh (спасательный шелл) НЕ трогаем — свой редактор здесь.
 
 const HISTN: usize = 8;
-const LINE_CAP: usize = 256;
+/// Веха 101 — было 256, и этого не хватало ровно там, где важнее всего: редактора файлов у нас
+/// нет, `.vv` правится командой `echo … > файл`, а модуль конфига в одну строку длиннее 256 байт
+/// запросто (`terminal.vv` — полторы тысячи). Строка обрывалась МОЛЧА. 1 КиБ × 8 записей истории
+/// = 8 КиБ на стеке при 256 КиБ у процесса — запас есть.
+const LINE_CAP: usize = 1024;
 
 struct History {
     buf: [[u8; LINE_CAP]; HISTN],

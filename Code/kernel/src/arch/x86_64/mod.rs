@@ -369,7 +369,10 @@ fn discover_framebuffer(info: usize) {
 // (оба идемпотентны и не пересекаются — прерывания в обработчиках выключены):
 // IRQ4 через IOAPIC (Веха 27 — будит сон до ввода) и опрос на тиках таймера
 // (политика Вехи 20.1 — подбирает байты в сессиях процессов между прерываниями).
-const RX_CAP: usize = 256;
+/// Веха 101 — 1 КиБ, а не 256 Б: столько же, сколько строка команды в шелле. Прежние 256 были
+/// ровно СТАРЫМ пределом строки, и длинный модуль `.vv`, вставленный в консоль, терял байты из
+/// середины — кольцо переполнялось быстрее, чем шелл его вычерпывал.
+const RX_CAP: usize = 1024;
 static mut RX_BUF: [u8; RX_CAP] = [0; RX_CAP];
 static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // писатель (drain)
 static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // читатель (getc)
@@ -382,7 +385,19 @@ pub(super) fn rx_push(b: u8) {
     if head.wrapping_sub(RX_TAIL.load(Ordering::Relaxed)) < RX_CAP {
         unsafe { RX_BUF[head % RX_CAP] = b };
         RX_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
+    } else {
+        // Веха 101 — потеря ввода перестала быть молчаливой: счётчик заберёт и покажет чтение
+        // (`SYS_READ`). Человек, увидевший испорченную строку, должен знать, что виноват не он.
+        RX_LOST.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Сколько байт ввода потеряно переполнением кольца (забирается и обнуляется [`console_take_lost`]).
+static RX_LOST: AtomicUsize = AtomicUsize::new(0);
+
+/// Забрать и обнулить счётчик потерянного ввода.
+pub fn console_take_lost() -> usize {
+    RX_LOST.swap(0, Ordering::Relaxed)
 }
 
 /// Вычерпать приёмные буферы в кольцо: COM1 FIFO (LSR.DR — «данные готовы») И скан-коды

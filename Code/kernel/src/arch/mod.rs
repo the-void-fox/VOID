@@ -57,7 +57,8 @@ mod imp;
 
 pub use imp::{
     // консоль (init приёма — внутри init_device_interrupts)
-    console_drain, console_getc, console_has_input, console_init, Console, CONSOLE_IRQ,
+    console_drain, console_getc, console_has_input, console_init, console_take_lost, Console,
+    CONSOLE_IRQ,
     // прерывания
     enable_interrupts, init_device_interrupts, irq_mask_preempt, irq_mask_read, irq_mask_stdin,
     irq_mask_idle, irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel,

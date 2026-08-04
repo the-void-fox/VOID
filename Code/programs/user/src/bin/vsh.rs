@@ -244,9 +244,14 @@ fn redraw(ep: usize, cwd: &[u8], line: &[u8], llen: usize, pos: usize) {
     }
 }
 
+/// Ёмкость строки команды (и записи истории) — см. комментарий у `line` ниже.
+const LINE_CAP: usize = 1024;
+
 #[no_mangle]
 pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
-    let mut line = [0u8; 128]; // собираемая строка команды
+    // Веха 101: 1 КиБ, а не 128 байт. Спасательный шелл — это место, куда приходят чинить
+    // сломанный конфиг, а модуль `.vv` одной строкой в 128 байт не влезает и обрывается молча.
+    let mut line = [0u8; LINE_CAP]; // собираемая строка команды
     let mut inb = [0u8; 16]; // порция сырого ввода
     let mut out = [0u8; 512]; // ответы персоналии (ls)
     let mut cwd = [0u8; 128]; // Веха 44: текущий каталог (начинаем с корня)
@@ -255,7 +260,7 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
     let mut rp = [0u8; 128]; // буфер разрешённого пути
     // Веха 45: история команд — кольцо последних HISTN (для стрелок ↑/↓).
     const HISTN: usize = 8;
-    let mut hist = [[0u8; 128]; HISTN];
+    let mut hist = [[0u8; LINE_CAP]; HISTN];
     let mut hlen = [0usize; HISTN];
     let mut hhead = 0usize; // следующий слот записи
     let mut hcount = 0usize; // сколько сохранено (≤ HISTN)
@@ -541,7 +546,13 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             }
             if sep != usize::MAX && sep > 0 && sep + 3 < body.len() {
                 let n = resolve(&cwd[..cwd_len], &body[sep + 3..], &mut rp);
-                px::echo_to(ep, &rp[..n], &body[..sep]);
+                if !px::echo_to(ep, &rp[..n], &body[..sep]) {
+                    // Веха 101: половина записанного файла обязана быть видна человеку.
+                    px::write(ep, px::STDOUT, C_ERR);
+                    px::write(ep, px::STDOUT, "файл записан не полностью".as_bytes());
+                    px::write(ep, px::STDOUT, RESET);
+                    px::write(ep, px::STDOUT, b"\n");
+                }
             } else {
                 px::write(ep, px::STDOUT, body);
                 px::write(ep, px::STDOUT, b"\n");
