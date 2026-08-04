@@ -218,6 +218,33 @@ impl Store {
 
     /// Положить узел: значение + исходящие ссылки на другие объекты. Адрес покрывает и то, и
     /// другое (одинаковый узел с одинаковыми детьми → один адрес). Идемпотентно (дедуп).
+    /// Веха 104 — то же, но **без паники при нехватке памяти**: `None` вместо аварии.
+    ///
+    /// Куча ядра конечна, а размеры в пакетной фазе приходят из сети и из чужих архивов, то есть
+    /// не под нашим контролем. Аллокатор Rust на нехватку ПАНИКУЕТ — то есть один оверсайзный
+    /// объект убивал бы систему целиком вместо честного «не влезло». Резервируем заранее через
+    /// `try_reserve`, и большие куски (а это ровно тот случай, что опасен) отказывают мягко.
+    ///
+    /// **Оговорка:** полной устойчивости к нехватке это не даёт — вставка в `BTreeMap` внутри
+    /// по-прежнему может паниковать. Но её узлы малы, а падали мы на полезной нагрузке.
+    pub fn try_put_node(&mut self, bytes: &[u8], children: &[ContentId]) -> Option<ContentId> {
+        let frame = try_encode(bytes, children)?;
+        let id = ContentId::hash(&frame);
+        drop(frame); // кадр нужен был только ради адреса — держать его в памяти незачем
+        if self.objects.contains_key(&id) {
+            return Some(id); // дедуп: ничего не выделяем вовсе
+        }
+        let mut payload: Vec<u8> = Vec::new();
+        payload.try_reserve_exact(bytes.len()).ok()?;
+        payload.extend_from_slice(bytes);
+        let mut kids: Vec<ContentId> = Vec::new();
+        kids.try_reserve_exact(children.len()).ok()?;
+        kids.extend_from_slice(children);
+        self.objects.insert(id, Object { data: Some(Loaded { payload, children: kids }), disk: None });
+        self.dirty_ops += 1;
+        Some(id)
+    }
+
     pub fn put_node(&mut self, bytes: &[u8], children: &[ContentId]) -> ContentId {
         let frame = encode(bytes, children);
         let id = ContentId::hash(&frame);
@@ -848,6 +875,20 @@ impl Default for Store {
 }
 
 // ─── кадр объекта: [ nchildren(u32) | child-id×n | payload ] ───────────────────
+
+/// Веха 104 — тот же кадр, но **без паники при нехватке памяти**: `None` вместо аварии.
+/// Нужен пути из userspace: кадр — самая крупная из выделяемых здесь вещей (полезная нагрузка
+/// целиком), и падать на нём всей системой из-за чужого размера недопустимо.
+fn try_encode(payload: &[u8], children: &[ContentId]) -> Option<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(4 + children.len() * 32 + payload.len()).ok()?;
+    buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
+    for c in children {
+        buf.extend_from_slice(&c.0);
+    }
+    buf.extend_from_slice(payload);
+    Some(buf)
+}
 
 fn encode(payload: &[u8], children: &[ContentId]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + children.len() * 32 + payload.len());

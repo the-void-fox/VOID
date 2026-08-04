@@ -84,6 +84,26 @@ pub fn put(bytes: &[u8]) -> ContentId {
     id
 }
 
+/// Веха 104 — положить лист, **не паникуя при нехватке памяти**: `None` вместо аварии.
+/// Этим путём ходят запросы ИЗ USERSPACE (`SYS_OBJ_PUT`): размеры там задаёт программа, а в
+/// пакетной фазе — вообще сеть и чужой архив, и «упасть целиком» на чужой цифре недопустимо.
+pub fn try_put(bytes: &[u8]) -> Option<ContentId> {
+    let id = STORE.lock().try_put_node(bytes, &[]);
+    if id.is_some() {
+        after_put();
+    }
+    id
+}
+
+/// Веха 104 — узел без паники (см. [`try_put`]).
+pub fn try_put_node(bytes: &[u8], children: &[ContentId]) -> Option<ContentId> {
+    let id = STORE.lock().try_put_node(bytes, children);
+    if id.is_some() {
+        after_put();
+    }
+    id
+}
+
 /// Положить узел: значение + исходящие ссылки. Идемпотентно (дедуп).
 pub fn put_node(bytes: &[u8], children: &[ContentId]) -> ContentId {
     let id = STORE.lock().put_node(bytes, children);

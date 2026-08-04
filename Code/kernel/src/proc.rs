@@ -1300,11 +1300,22 @@ fn syscall(t: &mut Table, cur: usize) {
                 Ok(()) if ensure_heap_range(t, cur, buf, len)
                     && ensure_heap_range(t, cur, idout, 32) => {
                     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-                    let id = crate::object::put(bytes);
-                    let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
-                    out.copy_from_slice(&id.0);
-                    vprintln!("  [obj] P{} OBJ_PUT {} байт → content-id (по cap)", cur, len);
-                    0
+                    // Веха 104 — нехватка памяти ядра здесь ОТКАЗ, а не паника: размер задаёт
+                    // программа (а в пакетной фазе — сеть и чужой архив), и падать всей системой
+                    // на чужой цифре недопустимо.
+                    match crate::object::try_put(bytes) {
+                        Some(id) => {
+                            let out =
+                                unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
+                            out.copy_from_slice(&id.0);
+                            vprintln!("  [obj] P{} OBJ_PUT {} байт → content-id (по cap)", cur, len);
+                            0
+                        }
+                        None => {
+                            println!("  [obj] P{} OBJ_PUT {} байт: НЕ ХВАТИЛО памяти ядра", cur, len);
+                            usize::MAX
+                        }
+                    }
                 }
                 Ok(()) => usize::MAX, // куча есть, а фреймов нет
                 Err(e) => {
@@ -2388,14 +2399,26 @@ fn syscall(t: &mut Table, cur: usize) {
                         };
                         children.push(void_abi::ContentId(id));
                     }
-                    let id = crate::object::put_node(bytes, &children);
-                    let out = unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
-                    out.copy_from_slice(&id.0);
-                    vprintln!(
-                        "  [obj] P{} OBJ_PUT_NODE {} байт + {} детей → content-id (по cap)",
-                        cur, len, nkids,
-                    );
-                    0
+                    // Веха 104 — нехватка памяти ядра: отказ, а не паника (см. OBJ_PUT).
+                    match crate::object::try_put_node(bytes, &children) {
+                        Some(id) => {
+                            let out =
+                                unsafe { core::slice::from_raw_parts_mut(idout as *mut u8, 32) };
+                            out.copy_from_slice(&id.0);
+                            vprintln!(
+                                "  [obj] P{} OBJ_PUT_NODE {} байт + {} детей → content-id (по cap)",
+                                cur, len, nkids,
+                            );
+                            0
+                        }
+                        None => {
+                            println!(
+                                "  [obj] P{} OBJ_PUT_NODE {} байт: НЕ ХВАТИЛО памяти ядра",
+                                cur, len,
+                            );
+                            usize::MAX
+                        }
+                    }
                 }
                 Ok(()) => usize::MAX,
                 Err(e) => {
