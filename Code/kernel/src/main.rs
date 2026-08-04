@@ -125,6 +125,8 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("httpsc", include_bytes!(env!("PROG_HTTPSC"))),
     ("spawn-demo", include_bytes!(env!("PROG_SPAWN_DEMO"))),
     ("stdio-demo", include_bytes!(env!("PROG_STDIO_DEMO"))),
+    // Веха 106 — пакеты из бинарного кэша nixpkgs с проверкой подписи и NarHash.
+    ("pkg", include_bytes!(env!("PROG_PKG"))),
 ];
 
 /// Веха 97 — программы ТОЛЬКО ДЛЯ x86: `term` рисует в пиксельный фреймбуфер, которого на

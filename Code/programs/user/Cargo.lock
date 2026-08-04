@@ -1062,6 +1062,8 @@ version = "0.0.1"
 name = "void-user"
 version = "0.0.1"
 dependencies = [
+ "base64ct",
+ "ed25519-dalek",
  "ereb-core",
  "ereb-input",
  "ereb-mux",
@@ -1071,6 +1073,7 @@ dependencies = [
  "rustls",
  "rustls-rustcrypto",
  "ruzstd",
+ "sha2",
  "smoltcp",
  "void-nar",
  "vte",

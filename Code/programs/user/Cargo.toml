@@ -78,6 +78,16 @@ lzma-rs = { path = "vendor-compress/lzma-rs" }
 # ruzstd менять не пришлось вовсе: он `no_std` сам по себе (см. vendor-compress/README.md).
 ruzstd = { path = "vendor-compress/ruzstd", default-features = false, features = ["hash"] }
 
+# Веха 106 — ПРОВЕРКА того, что приехало из чужого кэша. Обе величины из narinfo:
+# `NarHash` (sha256 содержимого) и подпись кэша (ed25519 по «отпечатку» пути). Крейты те же,
+# что уже стоят под rustls, — просто теперь они нужны прямо, а не транзитивно. `std` выключен
+# у всех троих; у ed25519-dalek оставлены `alloc` и `fast` (таблицы предвычислений — проверка
+# подписи и так делается раз на пакет, но `fast` идёт по умолчанию у curve25519).
+# Линкуются только в `pkg`.
+sha2 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc", "fast"] }
+base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
+
 # bare-metal: у `getrandom` нет системного источника, поэтому регистрируем свой —
 # он уходит в `SYS_RANDOM` ядра (Веха 86 + джиттер/virtio-rng).
 getrandom = { version = "0.2", features = ["custom"] }
