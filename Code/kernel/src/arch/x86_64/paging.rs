@@ -95,8 +95,14 @@ pub fn init() -> usize {
                 low_end = low_end.max(r.end.min(FOUR_GIB));
             }
         }
+        // Веха 101 — дотянуть отображение до таблиц ACPI: они лежат в записях карты, которых
+        // нет в списке пригодной RAM (тип «reclaim»), обычно сразу над ней. Без этого чтение
+        // FADT/DSDT — page fault, а значит и выключить машину нечем. Тянем не дальше 64 МиБ над
+        // RAM: цель — соседние служебные записи, а не вся дыра до 4 ГиБ.
         if low_end > 0 {
-            map_direct(root, 0, low_end, ks, ke);
+            let cap = low_end.saturating_add(64 * 1024 * 1024);
+            let acpi_end = super::phys_low_top().min(cap);
+            map_direct(root, 0, low_end.max(acpi_end), ks, ke);
         }
         for r in frame::regions() {
             let start = r.start.max(FOUR_GIB);

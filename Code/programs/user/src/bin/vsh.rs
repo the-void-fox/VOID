@@ -66,7 +66,8 @@ fn print_help(ep: usize) {
     help_row(ep, b"ping IP", "ICMP-пинг адреса A.B.C.D");
     help_row(ep, b"clear", "очистить экран");
     help_row(ep, b"help", "эта справка");
-    help_row(ep, b"exit", "завершить сессию VOID");
+    help_row(ep, b"exit", "выключить машину (нужно право power)");
+    help_row(ep, b"poweroff", "то же самое, явно");
 }
 
 /// Разобрать IPv4 в точечной записи «A.B.C.D» в 4 байта. `None` — не разобрать.
@@ -414,7 +415,19 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             hcount += 1;
         }
         let cmd = &line[..llen];
-        if cmd == b"exit" {
+        if cmd == b"exit" || cmd == b"poweroff" {
+            // Веха 101 — `exit` из ПОСЛЕДНЕГО шелла выключает машину. Раньше он лишь заканчивал
+            // программу, а система продолжала работать: сессия в нынешнем виде не кончается
+            // никогда — после ухода шелла остаются сервисы, и ядро честно крутит их дальше.
+            // Выключение — под правом `power` из конфига; нет права — просто выходим, как встарь.
+            px::write(ep, px::STDOUT, "выключаю машину…\n".as_bytes());
+            if let Some(pc) = sys::cap_named("POWER") {
+                sys::power_off(pc);
+            }
+            px::write(ep, px::STDOUT, C_ERR);
+            px::write(ep, px::STDOUT, "нет права `power` в конфиге — просто выхожу".as_bytes());
+            px::write(ep, px::STDOUT, RESET);
+            px::write(ep, px::STDOUT, b"\n");
             sys::exit(0);
         }
         if cmd == b"help" {

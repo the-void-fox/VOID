@@ -590,6 +590,7 @@ fn shell_env() -> Env {
         ("unroot", sh_unroot),
         ("thaw", sh_thaw),
         ("switch", sh_switch),
+        ("poweroff", sh_poweroff),
         ("sysdef", sh_sysdef),
         ("rebuild", sh_rebuild),
         ("gens", sh_gens),
@@ -807,6 +808,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"clear", "очистить экран");
     help_row(b"help", "эта справка");
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
+    help_row(b"poweroff", "выключить машину");
     sys::write("  Lisp: (define x 5) · (lambda (a) …) · (if c t e) · (map f L) · (filter p L)\n".as_bytes());
     sys::write("  Конвейер: (| (ls) (grep \"vv\") count)\n".as_bytes());
     Ok(Value::nil())
@@ -1300,6 +1302,16 @@ fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// `(switch "gen")` — выбрать поколение системы (запись в корень `system/current`; после ребута).
+/// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
+/// одностороннее действие над всей системой, и оно названо правом, а не считается общедоступным.
+fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
+    sys::write("выключаю машину…\n".as_bytes());
+    if let Some(pc) = sys::cap_named("POWER") {
+        sys::power_off(pc);
+    }
+    Err(EvalError::new("poweroff: нет права `power` в конфиге поколения"))
+}
+
 fn sh_switch(args: &[Value]) -> Result<Value, EvalError> {
     let name = match args.first() {
         Some(Value::Str(s)) => s.clone(),
@@ -1850,7 +1862,7 @@ const TERMINAL_VV: &str = ";; terminal.vv — терминал VOID: включ�
 \x20   (list (shell \"term\"\n\
 \x20                \"endpoint:posixfs\" \"store:rwx\"\n\
 \x20                (if net \"endpoint:net-srv\" (list))\n\
-\x20                \"mmio:fb\" \"env\"))\n\
+\x20                \"mmio:fb\" \"power\" \"env\"))\n\
 \x20   (list (terminal \"font-size\" 18)\n\
 \x20         (terminal \"shell\" \"bin/vvsh\")\n\
 \x20         (terminal \"shell-args\" \"repl\"))\n\
@@ -1858,7 +1870,7 @@ const TERMINAL_VV: &str = ";; terminal.vv — терминал VOID: включ�
 \x20 (list (shell \"vsh\"\n\
 \x20              \"endpoint:posixfs\" \"store:rwx\"\n\
 \x20              (if net \"endpoint:net-srv\" (list))\n\
-\x20              \"env\")))\n";
+\x20              \"power\" \"env\")))\n";
 
 const DEFAULT_VV: &str = ";; default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
 ;; Собери систему из модулей: сеть — net.vv (#t/#f), терминал и его клавиши — terminal.vv.\n\

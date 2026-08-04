@@ -15,7 +15,7 @@
 //! shell   vsh endpoint:posixfs store:rwx endpoint:net-srv env
 //! ```
 //! Токены прав: `store:RWX`, `dev:net:RW`, `dev:block:RW`, `endpoint:ИМЯ[:S]` (по умолчанию SEND),
-//! `env` (передать ARCH/SYSTEM). Буквы прав: `r`=READ `w`=WRITE `x`=EXEC `s`=SEND `g`=GRANT.
+//! `power` (право выключить машину, Веха 101), `env` (передать ARCH/SYSTEM). Буквы прав: `r`=READ `w`=WRITE `x`=EXEC `s`=SEND `g`=GRANT.
 //! Права по порядку → `a0`, `a1`, и все → таблица стартовых capability (как контракт Вехи 30).
 //! Отдельно от прав — `arg:СТРОКА` (Веха 92): настройка сервиса, уходит в его argv
 //! (`service net-srv dev:net:rw arg:dhcp=off arg:ip=10.0.2.15/24`).
@@ -42,7 +42,7 @@ const DEFAULT_GEN1: &str = "\
 # VOID — поколение по умолчанию (полное: файлы + сеть)
 service posixfs store:rw
 service net-srv dev:net:rw
-shell vsh endpoint:posixfs store:rwx endpoint:net-srv env
+shell vsh endpoint:posixfs store:rwx endpoint:net-srv power env
 ";
 
 /// Второе поколение (`gen2`) — минимальное, БЕЗ сети: витрина отката. Тот же shell, но без
@@ -50,7 +50,7 @@ shell vsh endpoint:posixfs store:rwx endpoint:net-srv env
 const DEFAULT_GEN2: &str = "\
 # VOID — минимальное поколение (без сети)
 service posixfs store:rw
-shell vsh endpoint:posixfs store:rwx env
+shell vsh endpoint:posixfs store:rwx power env
 ";
 
 /// Третье поколение (`gen3`, Веха 97) — **терминал на настоящих глифах** вместо текстового
@@ -66,7 +66,7 @@ const DEFAULT_GEN3: &str = "\
 # VOID — поколение с графическим терминалом (Веха 97)
 service posixfs store:rw
 service net-srv dev:net:rw
-shell term endpoint:posixfs store:rwx mmio:fb env
+shell term endpoint:posixfs store:rwx mmio:fb power env
 ";
 
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.
@@ -125,6 +125,10 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         Some(cap::mint(dom, cap::Target::Device(cap::Device::Net), parse_rights(r)).bits() as usize)
     } else if let Some(r) = token.strip_prefix("dev:block:") {
         Some(cap::mint(dom, cap::Target::Device(cap::Device::Block), parse_rights(r)).bits() as usize)
+    } else if token == "power" {
+        // Веха 101 — право выключить машину. Обычно у шелла: `exit`/`poweroff` должны
+        // действительно снимать питание, а не только закрывать программу.
+        Some(cap::mint(dom, cap::Target::Power, Rights::WRITE).bits() as usize)
     } else if token == "dma" {
         // Веха 51 — право выделять DMA-память (userspace-драйверу под кольца/буферы).
         Some(cap::mint(dom, cap::Target::Dma, Rights::WRITE).bits() as usize)
@@ -274,6 +278,8 @@ fn cap_name(token: &str) -> alloc::string::String {
         d
     } else if token == "dma" {
         "dma"
+    } else if token == "power" {
+        "power"
     } else {
         ""
     };

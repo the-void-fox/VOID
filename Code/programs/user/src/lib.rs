@@ -103,6 +103,7 @@ const SYS_VIDEO_INFO: usize = 40;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
+const SYS_POWEROFF: usize = 44;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -531,6 +532,14 @@ pub fn read_stdin(buf: &mut [u8]) -> usize {
         return n;
     }
     abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
+}
+
+/// `SYS_POWEROFF(cap)` (Веха 101) — выключить машину. Нужно право `power` из конфига
+/// (`cap::Target::Power` + WRITE): выключение — одностороннее действие над всей системой, и
+/// «может любой» здесь было бы дырой ровно того сорта, который capability-модель закрывает.
+/// Возвращается только при ОТКАЗЕ (нет права) — иначе питание уже снято.
+pub fn power_off(cap: usize) -> bool {
+    abi::syscall(SYS_POWEROFF, cap, 0, 0, 0, 0, 0, 0).0 != usize::MAX
 }
 
 /// Прочитать ввод КОНСОЛИ, не засыпая: 0 — пока ничего нет (Веха 99). Нужна реактору хоста —

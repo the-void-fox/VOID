@@ -72,6 +72,11 @@ pub enum Target {
     /// кольца/буферы устройства (userspace программирует железо физ-адресами). Без IOMMU это
     /// ДОВЕРЕННОЕ право (DMA куда угодно) — даётся только драйверам. Эфемерно.
     Dma,
+    /// Веха 101 — право ВЫКЛЮЧИТЬ машину (`SYS_POWEROFF`). Отдельным правом, а не «может любой»:
+    /// выключение — это одностороннее действие над всей системой, ровно то, что модель
+    /// capability обязана называть вслух. Выдаётся токеном `power` в конфиге — обычно шеллу.
+    /// Эфемерно (минтится на каждой загрузке из конфига, как MMIO/DMA).
+    Power,
     /// Веха 52 — прерывание устройства: право ждать IRQ (`SYS_IRQ_WAIT`). `vector` — на который
     /// ядро замаршрутизировало IRQ устройства (IOAPIC → LAPIC). Так userspace-драйвер спит до
     /// прерывания вместо опроса. Эфемерно (маршрутизация ставится на загрузке).
@@ -156,6 +161,16 @@ pub fn revoke_process(pid: usize) {
     }
 }
 
+/// Веха 101 — есть ли у домена право ВЫКЛЮЧИТЬ машину по этому дескриптору (`Power` + WRITE).
+/// Отдельная функция, а не проверка на месте: единственное употребление, зато названо вслух.
+pub fn may_power_off(dom: DomainId, cap: Cap) -> bool {
+    let cs = CSPACE.lock();
+    match resolve(&cs, dom, cap) {
+        Ok(e) => matches!(e.target, Target::Power) && e.rights.contains(Rights::WRITE),
+        Err(_) => false,
+    }
+}
+
 /// Имя домена (для вывода/интроспекции).
 pub fn domain_name(dom: DomainId) -> &'static str {
     CSPACE.lock().domains[dom].name
@@ -218,7 +233,9 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         Target::Root(name) => object::root(name).ok_or(CapError::Dangling)?,
         // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
-        | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } => return Err(CapError::WrongKind),
+        | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power => {
+            return Err(CapError::WrongKind)
+        }
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -238,9 +255,8 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
         match e.target {
             Target::Root(name) => name,
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
-            | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } => {
-                return Err(CapError::WrongKind)
-            }
+            | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
+            | Target::Power => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -453,7 +469,8 @@ pub fn persist() {
                         // Эфемерные (не переживают ребут): reply, эндпоинты, MMIO/DMA-права
                         // драйверов (минтятся заново после PCI-поиска).
                         Target::Endpoint(_) | Target::Reply(_)
-                        | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } => 0,
+                        | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
+                        | Target::Power => 0,
                     },
                     None => 0,
                 };

@@ -12,6 +12,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) mod fb;
+mod acpi;
 mod font;
 mod gdt;
 mod ioapic;
@@ -188,6 +189,16 @@ fn discover_multiboot(info: usize) -> usize {
                         if rd(e + 16) == 1 {
                             total = total.saturating_add(len);
                             crate::frame::add_region(base, base.saturating_add(len));
+                        } else if base < 0x1_0000_0000 {
+                            // Веха 101 — НЕпригодная память тоже нужна: таблицы ACPI лежат
+                            // отдельными записями (тип 3 «reclaim») сразу над обычной RAM, и в
+                            // direct-map они не попадали. Читать их — единственный способ узнать,
+                            // как выключить машину. Раздавать эти страницы никто не будет: в
+                            // аллокатор они не идут, только в отображение (см. paging.rs).
+                            let top = base.saturating_add(len).min(0x1_0000_0000);
+                            if top > PHYS_LOW_TOP.load(Ordering::Relaxed) {
+                                PHYS_LOW_TOP.store(top, Ordering::Relaxed);
+                            }
                         }
                         e += esize;
                     }
@@ -394,6 +405,16 @@ pub(super) fn rx_push(b: u8) {
 
 /// Сколько байт ввода потеряно переполнением кольца (забирается и обнуляется [`console_take_lost`]).
 static RX_LOST: AtomicUsize = AtomicUsize::new(0);
+
+/// Веха 101 — верхняя граница НЕпригодной памяти ниже 4 ГиБ (ACPI reclaim/NVS/reserved из
+/// карты firmware). Нужна одному потребителю — direct-map, чтобы ядро могло ПРОЧИТАТЬ таблицы
+/// ACPI (иначе выключение машины упирается в page fault на первом же указателе).
+static PHYS_LOW_TOP: AtomicUsize = AtomicUsize::new(0);
+
+/// Докуда стоит дотянуть direct-map сверх обычной RAM (см. [`PHYS_LOW_TOP`]).
+pub(super) fn phys_low_top() -> usize {
+    PHYS_LOW_TOP.load(Ordering::Relaxed)
+}
 
 /// Забрать и обнулить счётчик потерянного ввода.
 pub fn console_take_lost() -> usize {
@@ -838,9 +859,12 @@ pub fn hw_random_u64() -> Option<u64> {
 /// под обе архитектуры и сеются под арх-корни `bin/<arch>/<имя>`.
 pub const ELF_MACHINE: u16 = 62;
 
-#[allow(dead_code)]
+/// Веха 101 — выключение по-настоящему: ACPI (`_S5_` из DSDT → порт PM1), затем порты
+/// гипервизоров, и только если ничего не сработало — честная остановка процессора. До этого
+/// здесь был сразу `cli; hlt`, и «выключить» приходилось кнопкой.
 pub fn power_off() -> ! {
-    // isa-debug-exit/ACPI — вместе с автотестами; пока честная остановка.
+    acpi::try_power_off();
+    acpi::try_hypervisor_ports();
     loop {
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
     }
