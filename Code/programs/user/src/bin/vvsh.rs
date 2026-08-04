@@ -23,6 +23,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use void_user as sys;
 use void_user::posix as px;
+
+// Общий с `pkg` код формата архивов — подключён ПО ПУТИ, а не через библиотеку (почему именно
+// так — в шапке самого файла).
+#[path = "../archive.rs"]
+mod archive;
 use vvsh_core::{Env, EvalError, Value};
 
 // ── глобальный аллокатор ──────────────────────────────────────────────────────
@@ -1328,224 +1333,6 @@ fn sh_thaw(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Int(code as i64))
 }
 
-/// Опознавательный знак `.xz` — первые шесть байт контейнера (spec, sect. 2.1.1.1).
-/// Смотрим в СОДЕРЖИМОЕ, а не на имя корня: имя в store — произвольная строка, и верить ей
-/// в вопросе «сжато или нет» значило бы верить тому, кто корень завёл.
-const XZ_MAGIC: &[u8] = &[0xFD, b'7', b'z', b'X', b'Z', 0x00];
-
-/// Опознавательный знак `.zst` — магия кадра zstd 0xFD2FB528 (RFC 8878, LE).
-/// Второе сжатие кэша nixpkgs, и с некоторых пор ОСНОВНОЕ: замер по случайной выборке путей
-/// (2026-08-04) дал 15 zstd против 7 xz. Пакетная дорожка без него встала бы на первом же
-/// свежем пакете.
-const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
-
-/// Сколько байт хватает, чтобы опознать сжатие (обе магии короче).
-const MAGIC_PROBE: usize = 6;
-
-/// Чем сжат архив — определяется по первым байтам, а не по имени.
-#[derive(Clone, Copy, PartialEq)]
-enum Packing {
-    None,
-    Xz,
-    Zstd,
-}
-
-fn packing_of(head: &[u8]) -> Packing {
-    if head.starts_with(XZ_MAGIC) {
-        Packing::Xz
-    } else if head.starts_with(ZSTD_MAGIC) {
-        Packing::Zstd
-    } else {
-        Packing::None
-    }
-}
-
-/// Читатель поверх БЛОБА store (манифест + куски-дети — так `fetch` кладёт скачанное).
-///
-/// Нужен ради одного свойства: сжатый архив не материализуется в куче целиком. Распаковщик
-/// тянет байты кусок за куском, и в памяти живёт ровно один кусок. Для пакета в десятки мегабайт
-/// это разница между «работает» и «не влезло».
-struct BlobReader {
-    scap: usize,
-    kids: Vec<[u8; 32]>,
-    next: usize,
-    buf: Vec<u8>,
-    pos: usize,
-    filled: usize,
-}
-
-impl BlobReader {
-    fn new(scap: usize, kids: Vec<[u8; 32]>, csize: usize) -> Self {
-        BlobReader {
-            scap,
-            kids,
-            next: 0,
-            buf: alloc::vec![0u8; csize],
-            pos: 0,
-            filled: 0,
-        }
-    }
-}
-
-impl lzma_rs::io::Read for BlobReader {
-    fn read(&mut self, out: &mut [u8]) -> lzma_rs::io::Result<usize> {
-        let n = {
-            let src = lzma_rs::io::BufRead::fill_buf(self)?;
-            let n = src.len().min(out.len());
-            out[..n].copy_from_slice(&src[..n]);
-            n
-        };
-        lzma_rs::io::BufRead::consume(self, n);
-        Ok(n)
-    }
-}
-
-impl lzma_rs::io::BufRead for BlobReader {
-    fn fill_buf(&mut self) -> lzma_rs::io::Result<&[u8]> {
-        if self.pos == self.filled {
-            if self.next >= self.kids.len() {
-                return Ok(&[]);
-            }
-            let n = sys::obj_get(self.scap, &self.kids[self.next], &mut self.buf);
-            if n == 0 || n > self.buf.len() {
-                return Err(lzma_rs::io::Error::new(
-                    lzma_rs::io::ErrorKind::InvalidData,
-                    "кусок блоба не читается",
-                ));
-            }
-            self.next += 1;
-            self.pos = 0;
-            self.filled = n;
-        }
-        Ok(&self.buf[self.pos..self.filled])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.pos = (self.pos + amt).min(self.filled);
-    }
-}
-
-/// Прочитать объект store целиком, не зная заранее его длины.
-///
-/// `SYS_OBJ_GET` отдаёт `min(длина, размер буфера)` и НЕ сообщает настоящий размер — то самое
-/// молчаливое обрезание, которое в этой системе ловят поимённо. Пока ядро не научится называть
-/// длину, обходим удвоением: если ответ ровно с буфер, объект мог и не поместиться — просим
-/// вдвое больше и переспрашиваем.
-fn read_object(scap: usize, id: &[u8; 32], limit: usize) -> Result<Vec<u8>, EvalError> {
-    let mut cap = 256 * 1024;
-    loop {
-        let mut buf = alloc::vec![0u8; cap];
-        let n = sys::obj_get(scap, id, &mut buf);
-        if n == 0 || n == usize::MAX {
-            return Err(EvalError::new("nar-unpack: объект не читается"));
-        }
-        if n < buf.len() {
-            buf.truncate(n);
-            return Ok(buf);
-        }
-        if cap >= limit {
-            return Err(EvalError::new(alloc::format!(
-                "nar-unpack: объект больше {} МиБ — такие приезжают блобом (кусками)",
-                limit / (1024 * 1024)
-            )));
-        }
-        cap = (cap * 2).min(limit);
-    }
-}
-
-/// Достать из store байты NAR: развернуть блоб, если это блоб, и распаковать, если это `.xz`.
-fn nar_bytes(scap: usize, id: &[u8; 32]) -> Result<Vec<u8>, EvalError> {
-    // Манифест блоба короткий; обычный объект в эти же 512 байт либо влезет целиком, либо
-    // просто не опознается как блоб — и тогда читается обычным путём.
-    let mut head = [0u8; 512];
-    let hlen = sys::obj_get(scap, id, &mut head);
-    if hlen == 0 || hlen == usize::MAX {
-        return Err(EvalError::new("nar-unpack: объект не читается"));
-    }
-
-    if let Some((total, nchunks, csize)) = sys::http::blob_info(&head[..hlen]) {
-        let mut kids = alloc::vec![[0u8; 32]; nchunks];
-        if sys::obj_children(scap, id, &mut kids) != nchunks {
-            return Err(EvalError::new("nar-unpack: список кусков блоба не сошёлся"));
-        }
-        // Первый кусок нужен дважды — опознать сжатие и потом распаковать, — поэтому читаем
-        // блоб с начала в обоих случаях, а не запоминаем прочитанное.
-        let mut probe = alloc::vec![0u8; MAGIC_PROBE];
-        let plen = sys::obj_get(scap, &kids[0], &mut probe);
-        let packing = if plen <= MAGIC_PROBE { packing_of(&probe[..plen]) } else { Packing::None };
-        let mut blob = BlobReader::new(scap, kids, csize);
-        match packing {
-            Packing::Xz => return unxz(&mut blob, total),
-            Packing::Zstd => return unzstd(blob, total),
-            Packing::None => {}
-        }
-        let mut out = Vec::with_capacity(total);
-        let mut chunk = alloc::vec![0u8; csize];
-        loop {
-            let n = lzma_rs::io::Read::read(&mut blob, &mut chunk)
-                .map_err(|e| EvalError::new(alloc::format!("nar-unpack: {}", e)))?;
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&chunk[..n]);
-        }
-        return Ok(out);
-    }
-
-    let buf = read_object(scap, id, 8 * 1024 * 1024)?;
-    let packed = buf.len();
-    match packing_of(&buf) {
-        Packing::Xz => unxz(&mut buf.as_slice(), packed),
-        Packing::Zstd => unzstd(SliceReader(buf.as_slice()), packed),
-        Packing::None => Ok(buf),
-    }
-}
-
-/// Распаковать `.xz` (Веха 105). Кэш nixpkgs отдаёт часть пакетов именно так.
-fn unxz<R: lzma_rs::io::BufRead>(input: &mut R, packed: usize) -> Result<Vec<u8>, EvalError> {
-    let mut out = Vec::new();
-    lzma_rs::xz_decompress(input, &mut out)
-        .map_err(|e| EvalError::new(alloc::format!("nar-unpack: xz: {}", e)))?;
-    sys::write(alloc::format!("  [xz] {} → {} байт\n", packed, out.len()).as_bytes());
-    Ok(out)
-}
-
-/// Читатель по слайсу для `ruzstd` — у него свой трейт `Read`, и чужие реализации в него,
-/// разумеется, не считаются. Обёртка нужна ровно потому, что оба распаковщика описывают ввод
-/// каждый по-своему; общего `std::io` в no_std-мире нет и взяться ему неоткуда.
-struct SliceReader<'a>(&'a [u8]);
-
-impl ruzstd::io::Read for SliceReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> Result<usize, ruzstd::io::Error> {
-        let n = out.len().min(self.0.len());
-        out[..n].copy_from_slice(&self.0[..n]);
-        self.0 = &self.0[n..];
-        Ok(n)
-    }
-}
-
-impl ruzstd::io::Read for BlobReader {
-    fn read(&mut self, out: &mut [u8]) -> Result<usize, ruzstd::io::Error> {
-        lzma_rs::io::Read::read(self, out)
-            .map_err(|_| ruzstd::io::Error::from(ruzstd::io::ErrorKind::Other))
-    }
-}
-
-/// Распаковать `.zst` (Веха 105.2). Кэш nixpkgs перешёл на zstd, и без этого пакетная дорожка
-/// встала бы на первом же свежем пакете.
-///
-/// Поток, а не «весь вход в память»: `StreamingDecoder` тянет байты у источника сам, поэтому
-/// сжатая копия в куче не собирается — то же свойство, что у пути xz.
-fn unzstd<R: ruzstd::io::Read>(input: R, packed: usize) -> Result<Vec<u8>, EvalError> {
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(input)
-        .map_err(|e| EvalError::new(alloc::format!("nar-unpack: zstd: {}", e)))?;
-    let mut out = Vec::new();
-    ruzstd::io::Read::read_to_end(&mut dec, &mut out)
-        .map_err(|e| EvalError::new(alloc::format!("nar-unpack: zstd: {}", e)))?;
-    sys::write(alloc::format!("  [zstd] {} → {} байт\n", packed, out.len()).as_bytes());
-    Ok(out)
-}
-
 /// `nar-unpack("корень", "/куда")` — разложить NAR из store в файлы (Веха 105).
 ///
 /// Первая распаковка пакетного формата НА САМОЙ VOID. Архив берётся из store тремя видами —
@@ -1566,7 +1353,8 @@ fn sh_nar_unpack(args: &[Value]) -> Result<Value, EvalError> {
     if sys::obj_get_root(scap, root.as_bytes(), &mut id) != 32 {
         return Err(EvalError::new("nar-unpack: нет такого корня"));
     }
-    let buf = nar_bytes(scap, &id)?;
+    let buf = archive::unpacked(scap, &id, true)
+        .map_err(|e| EvalError::new(alloc::format!("nar-unpack: {}", e)))?;
 
     let base = alloc::string::String::from(dest.trim_end_matches('/'));
     px::mkdir(ep, base.as_bytes());
