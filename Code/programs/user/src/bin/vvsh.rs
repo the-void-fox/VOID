@@ -1862,71 +1862,74 @@ impl vvsh_core::ModuleLoader for FsLoader {
 // Модули независимы (каждый вычисляется в своём окружении) и возвращают свой ВКЛАД; default.vv их
 // сливает `append`. Тумблер сети вынесен в net.vv (правишь `#t`/`#f` — короткая правка).
 
-const NET_VV: &str = ";; net.vv — сеть: #t (вкл) или #f (выкл)\n#t\n";
+const NET_VV: &str = "# net.vv — сеть: true (вкл) или false (выкл)\ntrue\n";
 
-const SERVICES_VV: &str = ";; services.vv — базовые сервисы (файлы)\n\
-(list (service \"posixfs\" \"store:rw\"))\n";
+const SERVICES_VV: &str = "# services.vv — базовые сервисы (файлы)\n\
+[service(\"posixfs\", \"store:rw\")]\n";
 
-const NETWORKING_VV: &str = ";; networking.vv — сетевой сервис\n\
-(list (service \"net-srv\" \"dev:net:rw\"))\n";
+const NETWORKING_VV: &str = "# networking.vv — сетевой сервис\n\
+[service(\"net-srv\", \"dev:net:rw\")]\n";
 
 /// Веха 100 — терминал настраивается ТУТ ЖЕ, обычным модулем конфигурации. Модуль решает и
 /// «кто шелл» (пиксельный `term` или текстовый `vsh`), и схему управления: одна вещь — одно
 /// место. Записи `terminal`/`bind` ядру не адресованы, их читает сам `term`.
-const TERMINAL_VV: &str = ";; terminal.vv — терминал VOID: включён ли и чем управлять\n\
-;;\n\
-;; on = #t — мультиплексор `term` на настоящих глифах (нужен пиксельный экран: x86 + GRUB);\n\
-;; on = #f — текстовый шелл `vsh` в консоли ядра (riscv, загрузка без видеорежима).\n\
-(define on #f)\n\
-(define net (import \"net.vv\"))\n\
+const TERMINAL_VV: &str = "# terminal.vv — терминал VOID: включён ли и чем управлять\n\
+#\n\
+# on = true  — мультиплексор `term` на настоящих глифах (нужен пиксельный экран: x86 + GRUB);\n\
+# on = false — текстовый шелл `vsh` в консоли ядра (riscv, загрузка без видеорежима).\n\
+on = false\n\
+net = import(\"net.vv\")\n\
 \n\
-;; Схема управления: (bind РЕЖИМ КЛАВИША ДЕЙСТВИЕ). Пустой список биндингов = схема по\n\
-;; умолчанию, зашитая в term; хоть один bind — схема задаётся ЦЕЛИКОМ отсюда.\n\
-;;   режимы:   normal · pane\n\
-;;   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space\n\
-;;   действия: mode-pane mode-normal literal-prefix split-v split-h next-pane close quit\n\
-;;             reload (перечитать этот конфиг на ходу — после `rebuild`, без перезагрузки)\n\
-;;             go-left go-right go-up go-down\n\
-(define keys\n\
-\x20 (list\n\
-\x20   (bind \"normal\" \"C-a\" \"mode-pane\")\n\
-\x20   (bind \"pane\" \"C-a\" \"literal-prefix\")\n\
-\x20   (bind \"pane\" \"|\" \"split-v\")\n\
-\x20   (bind \"pane\" \"-\" \"split-h\")\n\
-\x20   (bind \"pane\" \"o\" \"next-pane\")\n\
-\x20   (bind \"pane\" \"x\" \"close\")\n\
-\x20   (bind \"pane\" \"q\" \"quit\")\n\
-\x20   (bind \"pane\" \"r\" \"reload\")\n\
-\x20   (bind \"pane\" \"h\" \"go-left\")\n\
-\x20   (bind \"pane\" \"j\" \"go-down\")\n\
-\x20   (bind \"pane\" \"k\" \"go-up\")\n\
-\x20   (bind \"pane\" \"l\" \"go-right\")\n\
-\x20   (bind \"pane\" \"Left\" \"go-left\")\n\
-\x20   (bind \"pane\" \"Down\" \"go-down\")\n\
-\x20   (bind \"pane\" \"Up\" \"go-up\")\n\
-\x20   (bind \"pane\" \"Right\" \"go-right\")))\n\
+# Схема управления: bind(РЕЖИМ, КЛАВИША, ДЕЙСТВИЕ). Пустой список биндингов = схема по\n\
+# умолчанию, зашитая в term; хоть один bind — схема задаётся ЦЕЛИКОМ отсюда.\n\
+#   режимы:   normal · pane\n\
+#   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space\n\
+#   действия: mode-pane mode-normal literal-prefix split-v split-h next-pane close quit\n\
+#             reload (перечитать этот конфиг на ходу — после `rebuild`, без перезагрузки)\n\
+#             go-left go-right go-up go-down\n\
+keys = [\n\
+\x20 bind(\"normal\", \"C-a\", \"mode-pane\"),\n\
+\x20 bind(\"pane\", \"C-a\", \"literal-prefix\"),\n\
+\x20 bind(\"pane\", \"|\", \"split-v\"),\n\
+\x20 bind(\"pane\", \"-\", \"split-h\"),\n\
+\x20 bind(\"pane\", \"o\", \"next-pane\"),\n\
+\x20 bind(\"pane\", \"x\", \"close\"),\n\
+\x20 bind(\"pane\", \"q\", \"quit\"),\n\
+\x20 bind(\"pane\", \"r\", \"reload\"),\n\
+\x20 bind(\"pane\", \"h\", \"go-left\"),\n\
+\x20 bind(\"pane\", \"j\", \"go-down\"),\n\
+\x20 bind(\"pane\", \"k\", \"go-up\"),\n\
+\x20 bind(\"pane\", \"l\", \"go-right\"),\n\
+\x20 bind(\"pane\", \"Left\", \"go-left\"),\n\
+\x20 bind(\"pane\", \"Down\", \"go-down\"),\n\
+\x20 bind(\"pane\", \"Up\", \"go-up\"),\n\
+\x20 bind(\"pane\", \"Right\", \"go-right\"),\n\
+]\n\
 \n\
-(if on\n\
-\x20 (append\n\
-\x20   (list (shell \"term\"\n\
-\x20                \"endpoint:posixfs\" \"store:rwx\"\n\
-\x20                (if net \"endpoint:net-srv\" (list))\n\
-\x20                \"mmio:fb\" \"power\" \"env\"))\n\
-\x20   (list (terminal \"font-size\" 18)\n\
-\x20         (terminal \"shell\" \"bin/vvsh\")\n\
-\x20         (terminal \"shell-args\" \"repl\"))\n\
-\x20   keys)\n\
-\x20 (list (shell \"vsh\"\n\
-\x20              \"endpoint:posixfs\" \"store:rwx\"\n\
-\x20              (if net \"endpoint:net-srv\" (list))\n\
-\x20              \"power\" \"env\")))\n";
+if on {\n\
+\x20 append(\n\
+\x20   [shell(\"term\",\n\
+\x20          \"endpoint:posixfs\", \"store:rwx\",\n\
+\x20          if net { \"endpoint:net-srv\" } else { [] },\n\
+\x20          \"mmio:fb\", \"power\", \"env\")],\n\
+\x20   [terminal(\"font-size\", 18),\n\
+\x20    terminal(\"shell\", \"bin/vvsh\"),\n\
+\x20    terminal(\"shell-args\", \"repl\")],\n\
+\x20   keys,\n\
+\x20 )\n\
+} else {\n\
+\x20 [shell(\"vsh\",\n\
+\x20        \"endpoint:posixfs\", \"store:rwx\",\n\
+\x20        if net { \"endpoint:net-srv\" } else { [] },\n\
+\x20        \"power\", \"env\")]\n\
+}\n";
 
-const DEFAULT_VV: &str = ";; default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
-;; Собери систему из модулей: сеть — net.vv (#t/#f), терминал и его клавиши — terminal.vv.\n\
-;; Затем: run vvsh rebuild\n\
-(define net (import \"net.vv\"))\n\
-(system\n\
-\x20 (append\n\
-\x20   (import \"services.vv\")\n\
-\x20   (if net (import \"networking.vv\") (list))\n\
-\x20   (import \"terminal.vv\")))\n";
+const DEFAULT_VV: &str = "# default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
+# Собери систему из модулей: сеть — net.vv (true/false), терминал и его клавиши — terminal.vv.\n\
+# Затем: run vvsh rebuild\n\
+net = import(\"net.vv\")\n\
+system(\n\
+\x20 import(\"services.vv\"),\n\
+\x20 if net { import(\"networking.vv\") } else { [] },\n\
+\x20 import(\"terminal.vv\"),\n\
+)\n";

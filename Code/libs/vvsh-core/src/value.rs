@@ -95,8 +95,8 @@ impl PartialEq for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Bool(true) => f.write_str("#t"),
-            Value::Bool(false) => f.write_str("#f"),
+            Value::Bool(true) => f.write_str("true"),
+            Value::Bool(false) => f.write_str("false"),
             Value::Int(n) => write!(f, "{}", n),
             Value::Str(s) => {
                 f.write_str("\"")?;
@@ -112,16 +112,9 @@ impl fmt::Display for Value {
                 f.write_str("\"")
             }
             Value::Sym(s) => f.write_str(s),
-            Value::List(items) => {
-                f.write_str("(")?;
-                for (i, it) in items.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(" ")?;
-                    }
-                    write!(f, "{}", it)?;
-                }
-                f.write_str(")")
-            }
+            // Веха 102 — списки печатает НОВЫЙ синтаксис (ADR 0013): вызовы, `[…]`, инфиксные
+            // операторы. Атомы остаются здесь — отсюда и взаимная рекурсия, конечная по дереву.
+            Value::List(_) => f.write_str(&crate::reader::print(self)),
             Value::Builtin(name, _) => write!(f, "#<встроенная {}>", name),
             Value::Closure(_) => f.write_str("#<замыкание>"),
         }

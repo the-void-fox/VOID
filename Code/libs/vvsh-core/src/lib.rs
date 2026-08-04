@@ -56,31 +56,31 @@ mod tests {
 
     #[test]
     fn arithmetic() {
-        assert_eq!(eval_str("(+ 1 2 3)"), Value::Int(6));
-        assert_eq!(eval_str("(- 10 3 2)"), Value::Int(5));
-        assert_eq!(eval_str("(- 5)"), Value::Int(-5));
-        assert_eq!(eval_str("(* 2 3 4)"), Value::Int(24));
-        assert_eq!(eval_str("(+ (* 2 3) (- 10 4))"), Value::Int(12));
+        assert_eq!(eval_str("1 + 2 + 3"), Value::Int(6));
+        assert_eq!(eval_str("10 - 3 - 2"), Value::Int(5));
+        assert_eq!(eval_str("-(5)"), Value::Int(-5));
+        assert_eq!(eval_str("2 * 3 * 4"), Value::Int(24));
+        assert_eq!(eval_str("2 * 3 + (10 - 4)"), Value::Int(12));
     }
 
     #[test]
     fn let_if_cond() {
-        assert_eq!(eval_str("(let ((x 2) (y 3)) (+ x y))"), Value::Int(5));
-        assert_eq!(eval_str("(if #t 1 2)"), Value::Int(1));
-        assert_eq!(eval_str("(if #f 1 2)"), Value::Int(2));
-        assert_eq!(eval_str("(cond (#f 1) (#t 2) (else 3))"), Value::Int(2));
-        assert_eq!(eval_str("(cond (#f 1) (else 3))"), Value::Int(3));
+        assert_eq!(eval_str("let([[x, 2], [y, 3]], x + y)"), Value::Int(5));
+        assert_eq!(eval_str("if true { 1 } else { 2 }"), Value::Int(1));
+        assert_eq!(eval_str("if false { 1 } else { 2 }"), Value::Int(2));
+        assert_eq!(eval_str("cond([false, 1], [true, 2], [else, 3])"), Value::Int(2));
+        assert_eq!(eval_str("cond([false, 1], [else, 3])"), Value::Int(3));
     }
 
     #[test]
     fn closures_and_define() {
-        assert_eq!(eval_str("(define (sq x) (* x x)) (sq 7)"), Value::Int(49));
+        assert_eq!(eval_str("sq = |x| x * x\n sq(7)"), Value::Int(49));
         assert_eq!(
-            eval_str("(define add (lambda (a b) (+ a b))) (add 4 5)"),
+            eval_str("add = |a, b| a + b\n add(4, 5)"),
             Value::Int(9)
         );
         assert_eq!(
-            eval_str("(define (adder n) (lambda (x) (+ x n))) (define inc (adder 1)) (inc 41)"),
+            eval_str("adder = |n| |x| x + n\n inc = adder(1)\n inc(41)"),
             Value::Int(42)
         );
     }
@@ -88,28 +88,28 @@ mod tests {
     #[test]
     fn list_ops() {
         assert_eq!(
-            eval_str("(append (list 1 2) (list 3))"),
+            eval_str("append([1, 2], [3])"),
             Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
-        assert_eq!(eval_str("(car (list 1 2 3))"), Value::Int(1));
+        assert_eq!(eval_str("car([1, 2, 3])"), Value::Int(1));
         assert_eq!(
-            eval_str("(cdr (list 1 2 3))"),
+            eval_str("cdr([1, 2, 3])"),
             Value::list(vec![Value::Int(2), Value::Int(3)])
         );
-        assert_eq!(eval_str("(null? (list))"), Value::Bool(true));
-        assert_eq!(eval_str("(null? (list 1))"), Value::Bool(false));
-        assert_eq!(eval_str("(= 2 (+ 1 1))"), Value::Bool(true));
+        assert_eq!(eval_str("null?([])"), Value::Bool(true));
+        assert_eq!(eval_str("null?([1])"), Value::Bool(false));
+        assert_eq!(eval_str("2 == 1 + 1"), Value::Bool(true));
     }
 
     #[test]
     fn length_and_pipe() {
-        assert_eq!(eval_str("(length (list 1 2 3))"), Value::Int(3));
-        assert_eq!(eval_str("(count (list))"), Value::Int(0));
+        assert_eq!(eval_str("length([1, 2, 3])"), Value::Int(3));
+        assert_eq!(eval_str("count([])"), Value::Int(0));
         // конвейер (thread-last): значение течёт последним аргументом
-        assert_eq!(eval_str("(| (list 1 2 3) length)"), Value::Int(3));
-        assert_eq!(eval_str("(| (list 1 2) (cons 0) count)"), Value::Int(3));
+        assert_eq!(eval_str("[1, 2, 3] |> length"), Value::Int(3));
+        assert_eq!(eval_str("[1, 2] |> cons(0) |> count"), Value::Int(3));
         assert_eq!(
-            eval_str("(| (list 1 2) (append (list 9)))"),
+            eval_str("[1, 2] |> append([9])"),
             Value::list(vec![Value::Int(9), Value::Int(1), Value::Int(2)])
         );
     }
@@ -117,43 +117,43 @@ mod tests {
     #[test]
     fn map_and_filter() {
         assert_eq!(
-            eval_str("(map (lambda (x) (* x x)) (list 1 2 3))"),
+            eval_str("map(|x| x * x, [1, 2, 3])"),
             Value::list(vec![Value::Int(1), Value::Int(4), Value::Int(9)])
         );
         assert_eq!(
-            eval_str("(filter (lambda (x) (= x 2)) (list 1 2 3 2))"),
+            eval_str("filter(|x| x == 2, [1, 2, 3, 2])"),
             Value::list(vec![Value::Int(2), Value::Int(2)])
         );
         // спец-формы map/filter текут в конвейере (через (quote acc))
         assert_eq!(
-            eval_str("(| (list 1 2 3) (map (lambda (x) (* x x))))"),
+            eval_str("[1, 2, 3] |> map(|x| x * x)"),
             Value::list(vec![Value::Int(1), Value::Int(4), Value::Int(9)])
         );
         assert_eq!(
-            eval_str("(| (list 1 2 3 4) (filter (lambda (x) (= x 2))) count)"),
+            eval_str("[1, 2, 3, 4] |> filter(|x| x == 2) |> count"),
             Value::Int(1)
         );
     }
 
     #[test]
     fn quote_and_atoms() {
-        assert_eq!(eval_str("'foo"), Value::sym("foo"));
+        assert_eq!(eval_str("quote(foo)"), Value::sym("foo"));
         assert_eq!(eval_str("\"hi\\nthere\""), Value::str("hi\nthere"));
-        assert_eq!(eval_str("; коммент\n42"), Value::Int(42));
+        assert_eq!(eval_str("# коммент\n42"), Value::Int(42));
     }
 
     /// Конфиг из одного файла (M1a): с `net #t` — те же строки, что нынешний gen1.
     const DEFAULT_VV: &str = r#"
-;; default.vv — конфиг ВЫЧИСЛЯЕТСЯ в те же service/shell-строки, что nix/system.nix
-(define net #t)
-(system
-  (append
-    (list (service "posixfs" "store:rw"))
-    (if net (list (service "net-srv" "dev:net:rw")) (list))
-    (list (shell "vsh"
-                 "endpoint:posixfs" "store:xw"
-                 (if net (list "endpoint:net-srv") (list))
-                 "env"))))
+# default.vv — конфиг ВЫЧИСЛЯЕТСЯ в те же service/shell-строки, что nix/system.nix
+net = true
+system(
+  service("posixfs", "store:rw"),
+  if net { service("net-srv", "dev:net:rw") } else { [] },
+  shell("vsh",
+        "endpoint:posixfs", "store:xw",
+        if net { ["endpoint:net-srv"] } else { [] },
+        "env"),
+)
 "#;
 
     const GEN1: &str = "service posixfs store:rw\n\
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn net_off_matches_gen2() {
-        let src = DEFAULT_VV.replace("(define net #t)", "(define net #f)");
+        let src = DEFAULT_VV.replace("net = true", "net = false");
         assert_eq!(build_config(&src).expect("сборка"), GEN2);
     }
 
@@ -200,16 +200,16 @@ mod tests {
     #[test]
     fn imports_and_merges_to_gen1() {
         let loader = MapLoader::new(vec![
-            ("services.vv", r#"(list (service "posixfs" "store:rw"))"#),
-            ("networking.vv", r#"(list (service "net-srv" "dev:net:rw"))"#),
+            ("services.vv", r#"[service("posixfs", "store:rw")]"#),
+            ("networking.vv", r#"[service("net-srv", "dev:net:rw")]"#),
             (
                 "shell.vv",
-                r#"(list (shell "vsh" "endpoint:posixfs" "store:xw" "endpoint:net-srv" "env"))"#,
+                r#"[shell("vsh", "endpoint:posixfs", "store:xw", "endpoint:net-srv", "env")]"#,
             ),
         ]);
-        let default = r#"(system (append (import "services.vv")
-                                         (import "networking.vv")
-                                         (import "shell.vv")))"#;
+        let default = r#"system(import("services.vv"),
+                                import("networking.vv"),
+                                import("shell.vv"))"#;
         assert_eq!(build_config_with(default, &loader).expect("сборка"), GEN1);
     }
 
@@ -218,9 +218,10 @@ mod tests {
     fn module_can_compute_its_contribution() {
         let loader = MapLoader::new(vec![(
             "net.vv",
-            r#"(define on #t) (if on (list (service "net-srv" "dev:net:rw")) (list))"#,
+            r#"on = true
+               if on { [service("net-srv", "dev:net:rw")] } else { [] }"#,
         )]);
-        let out = build_config_with(r#"(system (import "net.vv"))"#, &loader).expect("сборка");
+        let out = build_config_with(r#"system(import("net.vv"))"#, &loader).expect("сборка");
         assert_eq!(out, "service net-srv dev:net:rw\n");
     }
 
@@ -229,9 +230,9 @@ mod tests {
     fn import_is_cached() {
         let loader = MapLoader::new(vec![(
             "svc.vv",
-            r#"(list (service "posixfs" "store:rw"))"#,
+            r#"[service("posixfs", "store:rw")]"#,
         )]);
-        let default = r#"(system (append (import "svc.vv") (import "svc.vv")))"#;
+        let default = r#"system(import("svc.vv"), import("svc.vv"))"#;
         let out = build_config_with(default, &loader).expect("сборка");
         assert_eq!(out, "service posixfs store:rw\nservice posixfs store:rw\n");
         assert_eq!(loader.loads.get(), 1, "модуль должен грузиться один раз");
@@ -241,10 +242,10 @@ mod tests {
     #[test]
     fn import_cycle_detected() {
         let loader = MapLoader::new(vec![
-            ("a.vv", r#"(import "b.vv")"#),
-            ("b.vv", r#"(import "a.vv")"#),
+            ("a.vv", r#"import("b.vv")"#),
+            ("b.vv", r#"import("a.vv")"#),
         ]);
-        let err = build_config_with(r#"(import "a.vv")"#, &loader).unwrap_err();
+        let err = build_config_with(r#"import("a.vv")"#, &loader).unwrap_err();
         assert!(err.contains("цикл"), "ожидали ошибку цикла, получили: {}", err);
     }
 
@@ -252,14 +253,14 @@ mod tests {
     #[test]
     fn import_missing_errors() {
         let loader = MapLoader::new(vec![]);
-        let err = build_config_with(r#"(system (import "нет.vv"))"#, &loader).unwrap_err();
+        let err = build_config_with(r#"system(import("нет.vv"))"#, &loader).unwrap_err();
         assert!(err.contains("нет модуля"), "получили: {}", err);
     }
 
     /// Без загрузчика `import` — честная ошибка (не паника).
     #[test]
     fn import_without_loader_errors() {
-        let err = build_config(r#"(system (import "x.vv"))"#).unwrap_err();
+        let err = build_config(r#"system(import("x.vv"))"#).unwrap_err();
         assert!(err.contains("загрузчик"), "получили: {}", err);
     }
 
@@ -269,12 +270,13 @@ mod tests {
 
     #[test]
     fn terminal_and_bind_normalize() {
-        let src = r#"(system
-                       (list (service "posixfs" "store:rw")
-                             (shell "term" "endpoint:posixfs" "mmio:fb")
-                             (terminal "font-size" 18)
-                             (bind "normal" "C-a" "mode-pane")
-                             (bind "pane" "|" "split-v")))"#;
+        let src = r#"system(
+                       service("posixfs", "store:rw"),
+                       shell("term", "endpoint:posixfs", "mmio:fb"),
+                       terminal("font-size", 18),
+                       bind("normal", "C-a", "mode-pane"),
+                       bind("pane", "|", "split-v"),
+                     )"#;
         assert_eq!(
             build_config(src).expect("сборка"),
             "service posixfs store:rw\n\
@@ -290,19 +292,21 @@ mod tests {
     fn terminal_module_can_be_off() {
         let loader = MapLoader::new(vec![(
             "terminal.vv",
-            r#"(define on #f)
-               (if on
-                 (list (shell "term" "mmio:fb") (bind "pane" "q" "quit"))
-                 (list (shell "vsh" "endpoint:posixfs")))"#,
+            r#"on = false
+               if on {
+                 [shell("term", "mmio:fb"), bind("pane", "q", "quit")]
+               } else {
+                 [shell("vsh", "endpoint:posixfs")]
+               }"#,
         )]);
-        let out = build_config_with(r#"(system (import "terminal.vv"))"#, &loader).expect("сборка");
+        let out = build_config_with(r#"system(import("terminal.vv"))"#, &loader).expect("сборка");
         assert_eq!(out, "shell vsh endpoint:posixfs\n");
     }
 
     /// Опечатка в биндинге — ошибка СБОРКИ, а не молчаливо пропущенная строка на живой системе.
     #[test]
     fn bind_arity_checked_at_build() {
-        let err = build_config(r#"(system (list (bind "pane" "split-v")))"#).unwrap_err();
+        let err = build_config(r#"system(bind("pane", "split-v"))"#).unwrap_err();
         assert!(err.contains("bind:"), "получили: {}", err);
     }
 }

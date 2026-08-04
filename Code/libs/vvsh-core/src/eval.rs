@@ -214,11 +214,21 @@ impl<'a> Interp<'a> {
             Value::List(b) => b,
             _ => return Err(EvalError::new("let: список привязок")),
         };
+        // Внешний список привязок тоже приходит как `list(...)` (Веха 102: голых пар в новом
+        // синтаксисе не написать), поэтому головной символ `list` пропускаем.
+        let binds: &[Value] = match binds.first() {
+            Some(Value::Sym(s)) if &**s == "list" => &binds[1..],
+            _ => binds,
+        };
         let child = Env::child(env);
         for b in binds.iter() {
-            let pair = match b {
+            // Веха 102 — привязка пишется как `[имя, значение]`, то есть приезжает формой
+            // `(list имя значение)`: пары без головы новый ридер породить не может.
+            let pair: &[Value] = match b {
                 Value::List(p) if p.len() == 2 => p,
-                _ => return Err(EvalError::new("let: привязка — (имя значение)")),
+                Value::List(p) if p.len() == 3
+                    && matches!(p.first(), Some(Value::Sym(s)) if &**s == "list") => &p[1..],
+                _ => return Err(EvalError::new("let: привязка — [имя, значение]")),
             };
             let name = match &pair[0] {
                 Value::Sym(s) => s.clone(),
@@ -234,7 +244,14 @@ impl<'a> Interp<'a> {
         for clause in &items[1..] {
             let c = match clause {
                 Value::List(c) if !c.is_empty() => c,
-                _ => return Err(EvalError::new("cond: ветвь — (тест выражения…)")),
+                _ => return Err(EvalError::new("cond: ветвь — [тест, выражение…]")),
+            };
+            // Веха 102 — ветвь пишется как `[тест, выражение]` и приезжает формой
+            // `(list тест выражение)`: без этого головной `list` сам сходил бы за тест
+            // (символ встроенной функции истинен — и срабатывала ПЕРВАЯ же ветвь).
+            let c: &[Value] = match c.first() {
+                Some(Value::Sym(s)) if &**s == "list" && c.len() > 1 => &c[1..],
+                _ => c,
             };
             let is_else = matches!(&c[0], Value::Sym(s) if &**s == "else");
             if is_else || self.eval(&c[0], env)?.truthy() {
