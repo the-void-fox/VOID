@@ -134,9 +134,19 @@ fn discover_pvh(info: usize) -> Option<usize> {
             let size = rd64_at(e + 8) as usize;
             let ty = core::ptr::read_unaligned((e + 16) as *const u32);
             if ty == 1 {
-                // 1 = обычная RAM; всё остальное (reserved/ACPI/NVS) — не наше
+                // 1 = обычная RAM; всё остальное (reserved/ACPI/NVS) в аллокатор не идёт
                 total = total.saturating_add(size);
                 crate::frame::add_region(addr, addr.saturating_add(size));
+            } else if addr < 0x1_0000_0000 {
+                // Веха 105: ровно та же поправка, что Веха 101 сделала для multiboot, — здесь её
+                // тогда не продублировали, и `poweroff` на PVH-загрузке (`cargo run`) падал в
+                // #PF при чтении таблиц ACPI: они лежат отдельной записью над обычной RAM, а в
+                // direct-map попадала только RAM. Раздавать эти страницы по-прежнему некому —
+                // они идут исключительно в отображение (см. paging.rs).
+                let top = addr.saturating_add(size).min(0x1_0000_0000);
+                if top > PHYS_LOW_TOP.load(Ordering::Relaxed) {
+                    PHYS_LOW_TOP.store(top, Ordering::Relaxed);
+                }
             }
         }
         (total != 0).then_some(total)
