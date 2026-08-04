@@ -426,6 +426,8 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("*", b_mul),
     ("service", b_service),
     ("shell", b_shell),
+    ("terminal", b_terminal),
+    ("bind", b_bind),
     ("system", b_system),
 ];
 
@@ -541,6 +543,8 @@ fn b_sub(args: &[Value]) -> Result<Value, EvalError> {
 
 /// `(service имя право…)` / `(shell имя право…)` → запись `(kind имя право…)`. Права — строки;
 /// аргумент-СПИСОК строк «вливается» (для `(append …)`/`(if … (list …) (list))` из модулей).
+/// Число тоже принимается и становится строкой: в нормализованном конфиге всё равно ТЕКСТ, а
+/// писать `(terminal "font-size" 18)` естественнее, чем `"18"`.
 fn build_entry(kind: &'static str, args: &[Value]) -> Result<Value, EvalError> {
     let name = match args.first() {
         Some(Value::Str(s)) => s.clone(),
@@ -551,10 +555,12 @@ fn build_entry(kind: &'static str, args: &[Value]) -> Result<Value, EvalError> {
     for cap in &args[1..] {
         match cap {
             Value::Str(_) => out.push(cap.clone()),
+            Value::Int(n) => out.push(Value::str(&alloc::format!("{}", n))),
             Value::List(items) => {
                 for it in items.iter() {
                     match it {
                         Value::Str(_) => out.push(it.clone()),
+                        Value::Int(n) => out.push(Value::str(&alloc::format!("{}", n))),
                         _ => return Err(EvalError::new(alloc::format!("{}: право — строка", kind))),
                     }
                 }
@@ -578,6 +584,18 @@ fn b_shell(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("shell", args)
 }
 
+/// `(terminal ключ значение)` — настройка терминала (`term`): `font-size`, `shell`, `shell-args`.
+/// Запись адресована НЕ ядру, а программе; ядро такие строки пропускает (см. `normalize_config`).
+fn b_terminal(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("terminal", args)
+}
+
+/// `(bind режим клавиша действие)` — клавиша терминала: `(bind "pane" "|" "split-v")`.
+/// Та же таблица биндингов, что у ereb на Linux, только записанная на языке конфига VOID.
+fn b_bind(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("bind", args)
+}
+
 /// `(system запись…|список-записей…)` → `(#system запись…)`: верхняя форма конфига. Принимает и
 /// отдельные записи, и списки записей (от `(append …)`) — уплощает.
 fn b_system(args: &[Value]) -> Result<Value, EvalError> {
@@ -590,7 +608,9 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
                     match it {
                         Value::List(inner) if is_entry(inner) => out.push(it.clone()),
                         _ => {
-                            return Err(EvalError::new("system: ожидались записи service/shell"))
+                            return Err(EvalError::new(
+                                "system: ожидались записи service/shell/terminal/bind",
+                            ))
                         }
                     }
                 }
@@ -601,6 +621,9 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::list(out))
 }
 
+/// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал: конфиг
+/// поколения один, читателей несколько, и каждый берёт свои строки.
 fn is_entry(items: &[Value]) -> bool {
-    matches!(items.first(), Some(Value::Sym(s)) if &**s == "service" || &**s == "shell")
+    matches!(items.first(), Some(Value::Sym(s))
+        if matches!(&**s, "service" | "shell" | "terminal" | "bind"))
 }

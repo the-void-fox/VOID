@@ -29,13 +29,33 @@
 //! программе. Любая другая клавиша возвращает в обычный режим.
 //!
 //! Схема живёт не в `if`-ах, а в таблице биндингов `ereb-input` (Веха 99.4) — той же, что на
-//! Linux, — поэтому позже её можно будет задавать конфигом, а не кодом.
+//! Linux.
+//!
+//! ## Настройка (Веха 100)
+//!
+//! Схема и вид **задаются конфигом системы**, а не кодом: `/etc/system/terminal.vv` — обычный
+//! модуль конфигурации VOID, `rebuild` кладёт его результат в поколение, `term` читает активное
+//! поколение из store и берёт свои строки:
+//!
+//! ```text
+//! terminal font-size 18            ← настройка
+//! bind normal C-a mode-pane        ← клавиша
+//! bind pane | split-v
+//! ```
+//!
+//! Конфиг у системы ОДИН (одна история поколений, один откат), читателей несколько: ядро берёт
+//! `service`/`shell`, терминал — `terminal`/`bind`. На Linux ereb настраивается KDL-файлом; тут
+//! незачем заводить второй язык конфигурации, когда у системы уже есть свой.
+//!
+//! Схема по умолчанию записана тем же текстом ([`DEFAULT_CONF`]) и разбирается тем же кодом:
+//! два пути «из конфига» и «зашитый» разъехались бы при первой же правке.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -55,15 +75,33 @@ static FONT: &[u8] = include_bytes!("../../fonts/FiraCodeNerdFontMono-Regular.tt
 
 /// Окно фреймбуфера в нашем адресном пространстве: между образом и кучей.
 const FB_VA: usize = 0x5000_0000;
-const FONT_PX: u32 = 18;
 
-/// Что запускаем в новой панели и с каким аргументом. Без `repl` vvsh печатает справку и
-/// выходит — панель умирала мгновенно, и выглядело это как «мультиплексор не работает».
-const SHELL: &[u8] = b"bin/vvsh";
-const SHELL_ARGS: &[u8] = b"repl";
-
-/// Префикс команд мультиплексора — Ctrl-A, как в screen.
-const PREFIX: u8 = 0x01;
+/// Настройки по умолчанию — тем же текстом, каким их задаёт конфиг поколения. Так «как оно
+/// устроено из коробки» читается глазами, а разбор остаётся ОДИН: две ветки, «зашитая» и
+/// «из конфига», разъехались бы при первой же правке схемы.
+///
+/// Без `repl` vvsh печатает справку и выходит — панель умирала мгновенно, и выглядело это как
+/// «мультиплексор не работает».
+const DEFAULT_CONF: &str = "\
+terminal font-size 18
+terminal shell bin/vvsh
+terminal shell-args repl
+bind normal C-a mode-pane
+bind pane C-a literal-prefix
+bind pane | split-v
+bind pane - split-h
+bind pane o next-pane
+bind pane x close
+bind pane q quit
+bind pane h go-left
+bind pane j go-down
+bind pane k go-up
+bind pane l go-right
+bind pane Left go-left
+bind pane Down go-down
+bind pane Up go-up
+bind pane Right go-right
+";
 
 
 // ── клавиши: байты консоли → события ereb (Веха 99.4) ────────────────────────
@@ -93,14 +131,20 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
                 *state = KeyScan::Esc;
                 None
             }
+            // Клавиши с ИМЕНЕМ — раньше Ctrl+буквы: их байты (0x08, 0x09, 0x0d) лежат внутри
+            // диапазона управляющих, и на байтовой консоли Backspace неотличим от Ctrl-H,
+            // Tab от Ctrl-I, Enter от Ctrl-M. Читаем их как названные клавиши: именно их
+            // человек и нажал. Цена — Ctrl-H/I/M нельзя привязать; это честнее, чем «Enter не
+            // работает, потому что он на самом деле Ctrl-M» (до Вехи 100 так и было — три
+            // ветки ниже были недостижимы, а Enter спасал лишь обратный перевод в [`encode`]).
+            0x7f | 0x08 => Some(KeyEvent::new(Keysym::BACKSPACE, ModMask::empty())),
+            b'\r' | b'\n' => Some(KeyEvent::new(Keysym::RETURN, ModMask::empty())),
+            b'\t' => Some(KeyEvent::new(Keysym::TAB, ModMask::empty())),
             // Ctrl+буква приходит управляющим байтом 1..26 — восстанавливаем букву и модификатор.
             0x01..=0x1a => {
                 let ch = (b'a' + b - 1) as char;
                 Some(KeyEvent::new(Keysym(ch as u32), ModMask::CTRL))
             }
-            0x7f | 0x08 => Some(KeyEvent::new(Keysym::BACKSPACE, ModMask::empty())),
-            b'\r' | b'\n' => Some(KeyEvent::new(Keysym::RETURN, ModMask::empty())),
-            b'\t' => Some(KeyEvent::new(Keysym::TAB, ModMask::empty())),
             _ => {
                 // Печатный байт: keysym совпадает с кодом символа (латиница ASCII).
                 let mut k = KeyEvent::new(Keysym(b as u32), ModMask::empty());
@@ -166,38 +210,213 @@ fn encode(k: &KeyEvent) -> Vec<u8> {
     }
 }
 
-/// Схема управления. Строится из тех же кирпичей, что и на Linux, поэтому позже её можно будет
-/// задавать конфигом, а не кодом.
-///
-/// Префикс — **Ctrl-A** (как в screen): он переводит в режим `Pane`, где клавиши значат команды
-/// мультиплексора, а не текст. Один режим вместо «префикс + одна клавиша» — потому что так
-/// устроен `ereb_input`, и так можно жать несколько команд подряд, не повторяя префикс.
-fn mux_bindings() -> Bindings {
-    let mut b = Bindings::new();
-    let none = ModMask::empty();
-    b.bind(Mode::Normal, ModMask::CTRL, Keysym(b'a' as u32), Action::EnterMode(Mode::Pane));
-    // В режиме панелей: разбиения, навигация, закрытие, выход.
-    b.bind(Mode::Pane, none, Keysym(b'|' as u32), Action::Custom("split-v".into()));
-    b.bind(Mode::Pane, none, Keysym(b'-' as u32), Action::Custom("split-h".into()));
-    b.bind(Mode::Pane, none, Keysym(b'o' as u32), Action::NextPane);
-    b.bind(Mode::Pane, none, Keysym(b'x' as u32), Action::Custom("close".into()));
-    b.bind(Mode::Pane, none, Keysym(b'q' as u32), Action::Custom("quit".into()));
-    // Навигация по НАПРАВЛЕНИЯМ — то, чего в заглушке не было вовсе.
-    for (sym, name) in [
-        (Keysym::LEFT, "go-left"), (Keysym::RIGHT, "go-right"),
-        (Keysym::UP, "go-up"), (Keysym::DOWN, "go-down"),
-    ] {
-        b.bind(Mode::Pane, none, sym, Action::Custom(name.into()));
+// ── настройка: строки конфига системы → схема управления (Веха 100) ──────────
+//
+// Префикс — Ctrl-A (как в screen): он переводит в режим `Pane`, где клавиши значат команды
+// мультиплексора, а не текст. Один режим вместо «префикс + одна клавиша» — потому что так
+// устроен `ereb_input`, и так можно жать несколько команд подряд, не повторяя префикс.
+// Всё это — лишь ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ: и клавиши, и режимы приходят строками конфига.
+
+/// Одна клавиша схемы: разобранное сочетание, ИСХОДНЫЙ текст клавиши (для подсказки в
+/// статус-баре — врущая подсказка хуже отсутствующей) и имя действия.
+struct KeyBind {
+    mode: Mode,
+    mods: ModMask,
+    sym: Keysym,
+    key: String,
+    action: String,
+}
+
+/// Настройки терминала: схема управления плюс то, что нельзя поменять на лету.
+struct Conf {
+    binds: Vec<KeyBind>,
+    table: Bindings,
+    font_px: u32,
+    shell: Vec<u8>,
+    shell_args: Vec<u8>,
+}
+
+impl Conf {
+    /// Собрать настройки: конфиг активного поколения, а чего в нём нет — из [`DEFAULT_CONF`].
+    fn load() -> Conf {
+        let mut c = Conf {
+            binds: Vec::new(),
+            table: Bindings::new(),
+            font_px: 18,
+            shell: b"bin/vvsh".to_vec(),
+            shell_args: b"repl".to_vec(),
+        };
+        if let Some(text) = read_generation() {
+            c.apply(&text);
+        }
+        // Пустая схема — не «терминал без клавиш», а «конфиг про клавиши не говорил».
+        // Схема задаётся ЦЕЛИКОМ: слияние с умолчаниями означало бы, что клавишу нельзя отвязать.
+        if c.binds.is_empty() {
+            c.apply(DEFAULT_CONF);
+        }
+        for b in &c.binds {
+            c.table.bind(b.mode, b.mods, b.sym, action_of(&b.action));
+        }
+        c
     }
-    for (sym, name) in [
-        (Keysym(b'h' as u32), "go-left"), (Keysym(b'l' as u32), "go-right"),
-        (Keysym(b'k' as u32), "go-up"), (Keysym(b'j' as u32), "go-down"),
-    ] {
-        b.bind(Mode::Pane, none, sym, Action::Custom(name.into()));
+
+    /// Разобрать строки конфига. Чужие строки (`service`, `shell`, …) и непонятные пропускаются:
+    /// текст поколения общий, и ругаться на строки соседа терминалу не на что.
+    fn apply(&mut self, text: &str) {
+        for line in text.lines() {
+            let mut w = line.split_whitespace();
+            match w.next() {
+                Some("bind") => {
+                    let (Some(m), Some(k), Some(a)) = (w.next(), w.next(), w.next()) else {
+                        continue;
+                    };
+                    let (Some(mode), Some((mods, sym))) = (parse_mode(m), parse_key(k)) else {
+                        continue;
+                    };
+                    self.binds.push(KeyBind {
+                        mode,
+                        mods,
+                        sym,
+                        key: k.to_string(),
+                        action: a.to_string(),
+                    });
+                }
+                Some("terminal") => {
+                    let (Some(key), Some(val)) = (w.next(), w.next()) else { continue };
+                    match key {
+                        // Кегль ограничен с обеих сторон: слишком мелкий нечитаем, слишком
+                        // крупный оставляет от экрана десяток знакомест.
+                        "font-size" => {
+                            if let Ok(n) = val.parse::<u32>() {
+                                self.font_px = n.clamp(8, 48);
+                            }
+                        }
+                        "shell" => self.shell = val.as_bytes().to_vec(),
+                        "shell-args" => {
+                            let mut args = val.to_string();
+                            for extra in w {
+                                args.push(' ');
+                                args.push_str(extra);
+                            }
+                            self.shell_args = args.into_bytes();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    // Ctrl-A дважды — отдать сам Ctrl-A программе.
-    b.bind(Mode::Pane, ModMask::CTRL, Keysym(b'a' as u32), Action::Custom("literal-prefix".into()));
-    b
+
+    /// Клавиша, которой в режиме `mode` привязано действие `action` (как её написали в конфиге).
+    fn key_for(&self, mode: Mode, action: &str) -> Option<&str> {
+        self.binds
+            .iter()
+            .find(|b| b.mode == mode && b.action == action)
+            .map(|b| b.key.as_str())
+    }
+}
+
+/// Имя действия из конфига → действие ereb. Неизвестное имя остаётся `Custom` и до реактора
+/// доходит как есть — там оно тихо ничего не делает (и режим сбрасывается).
+fn action_of(name: &str) -> Action {
+    match name {
+        "mode-pane" => Action::EnterMode(Mode::Pane),
+        "mode-normal" => Action::EnterMode(Mode::Normal),
+        "mode-tab" => Action::EnterMode(Mode::Tab),
+        "mode-scroll" => Action::EnterMode(Mode::Scroll),
+        "next-pane" => Action::NextPane,
+        other => Action::Custom(other.into()),
+    }
+}
+
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s {
+        "normal" => Some(Mode::Normal),
+        "pane" => Some(Mode::Pane),
+        "tab" => Some(Mode::Tab),
+        "scroll" => Some(Mode::Scroll),
+        _ => None,
+    }
+}
+
+/// `C-a` → (Ctrl, «a»); `|` → сам символ; `Left` → keysym стрелки. Модификаторы префиксами,
+/// как в tmux/emacs: `C-` Ctrl, `A-` Alt, `S-` Shift.
+fn parse_key(tok: &str) -> Option<(ModMask, Keysym)> {
+    let mut mods = ModMask::empty();
+    let mut rest = tok;
+    // Голый `-` — это клавиша «минус», а не хвост модификатора: проверяем длину.
+    while rest.len() > 2 {
+        let (m, tail) = rest.split_at(2);
+        match m {
+            "C-" => mods |= ModMask::CTRL,
+            "A-" => mods |= ModMask::ALT,
+            "S-" => mods |= ModMask::SHIFT,
+            _ => break,
+        }
+        rest = tail;
+    }
+    let sym = match rest {
+        "Left" => Keysym::LEFT,
+        "Right" => Keysym::RIGHT,
+        "Up" => Keysym::UP,
+        "Down" => Keysym::DOWN,
+        "Home" => Keysym::HOME,
+        "End" => Keysym::END,
+        "Delete" => Keysym::DELETE,
+        "Enter" | "Return" => Keysym::RETURN,
+        "Tab" => Keysym::TAB,
+        "Esc" | "Escape" => Keysym::ESCAPE,
+        "Space" => Keysym::SPACE,
+        "Backspace" => Keysym::BACKSPACE,
+        _ => {
+            let mut ch = rest.chars();
+            let c = ch.next()?;
+            if ch.next().is_some() {
+                return None; // не одиночный символ и не известное имя — не клавиша
+            }
+            Keysym(c as u32)
+        }
+    };
+    Some((mods, sym))
+}
+
+/// Текст активного поколения из store: `system/current` → имя → `system/<имя>`. Это ровно тот
+/// текст, по которому ядро подняло систему, — терминал берёт из него свои строки.
+fn read_generation() -> Option<String> {
+    let cap = store_cap()?;
+    let name = read_root(cap, b"system/current")?;
+    let name = core::str::from_utf8(&name).ok()?.trim().to_string();
+    let mut root = b"system/".to_vec();
+    root.extend_from_slice(name.as_bytes());
+    String::from_utf8(read_root(cap, &root)?).ok()
+}
+
+/// Право на store: по имени (Веха 99.1), иначе перебором. Проба безобидна — чтение корня ничего
+/// не меняет, а без права мы просто останемся при умолчаниях.
+fn store_cap() -> Option<usize> {
+    let readable = |c: usize| {
+        let mut id = [0u8; 32];
+        c != sys::NO_CAP && sys::obj_get_root(c, b"system/current", &mut id) == 32
+    };
+    sys::cap_named("STORE")
+        .filter(|&c| readable(c))
+        .or_else(|| (0..8).map(sys::start_cap).find(|&c| readable(c)))
+}
+
+/// Содержимое именованного корня store.
+fn read_root(cap: usize, name: &[u8]) -> Option<Vec<u8>> {
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(cap, name, &mut id) != 32 {
+        return None;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = sys::obj_get(cap, &id, &mut buf);
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    Some(buf)
 }
 
 /// Панель: грид, разбор ANSI, ребёнок и его отложенный запрос ввода.
@@ -216,6 +435,10 @@ struct Pane {
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
+    // Настройки читаются ПЕРВЫМИ: от них зависят и кегль шрифта (а значит вся геометрия), и то,
+    // что запускать в панелях.
+    let conf = Conf::load();
+
     let Some(fb_cap) = find_fb_cap() else {
         sys::write_console("[term] нет права на экран (mmio:fb в конфиге init)\n".as_bytes());
         sys::exit(1);
@@ -229,7 +452,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::exit(1);
     }
 
-    let Ok(font) = TtfFont::from_vec(FONT.to_vec(), FONT_PX) else {
+    let Ok(font) = TtfFont::from_vec(FONT.to_vec(), conf.font_px) else {
         sys::write_console("[term] шрифт не разобрался\n".as_bytes());
         sys::exit(1);
     };
@@ -253,14 +476,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut next_id = 1usize;
     let mut rects = layout_of(&tree, cols, rows);
     let mut exec_cap = sys::NO_CAP;
-    let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me)];
+    let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me, &conf)];
     let mut focus = 0usize;
 
     // Прошлый кадр в ЯЧЕЙКАХ: по нему считаем, какие пиксельные строки реально изменились.
     // Без этого каждый чих перерисовывал весь экран — 4 МиБ записей в некэшируемую память на
     // КАЖДУЮ строку вывода. На железе это выглядело как «семидесятые».
     let mut prev_cells: Vec<Cell> = Vec::new();
-    let bindings = mux_bindings();
     let mut mode = Mode::Normal;
     let mut scan = KeyScan::Ground;
     let mut keys = [0u8; 64];
@@ -278,7 +500,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 let Some(key) = decode(&mut scan, keys[i]) else {
                     continue;
                 };
-                match ereb_input::translate(&key, &bindings, mode) {
+                match ereb_input::translate(&key, &conf.table, mode) {
                     Action::EnterMode(m) => {
                         mode = m;
                         redraw = true;
@@ -299,7 +521,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                     SplitDirection::Horizontal
                                 };
                                 split(&mut tree, &mut panes, &mut next_id, &mut focus, dir,
-                                      cols, rows, &mut exec_cap, me);
+                                      cols, rows, &mut exec_cap, me, &conf);
                                 rects = layout_of(&tree, cols, rows);
                             }
                             "close" => {
@@ -315,10 +537,16 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                 sys::write_console("[term] выход по Ctrl-A q\n".as_bytes());
                                 sys::exit(0);
                             }
-                            "literal-prefix" => push_input(&mut panes, focus, 0x01),
+                            // Сам префикс: отдать его программе (в конфиге — `literal-prefix`).
+                            // Байт берём из клавиши, а не из константы: префикс перенастраиваемый.
+                            "literal-prefix" => {
+                                for b in encode(&key) {
+                                    push_input(&mut panes, focus, b);
+                                }
+                            }
                             // Навигация по направлениям — из `ereb_mux`, а не своим перебором:
                             // «соседняя слева» это геометрия, и она там уже написана.
-                            _ => {
+                            "go-left" | "go-right" | "go-up" | "go-down" => {
                                 let dir = match cmd.as_str() {
                                     "go-left" => Direction::Left,
                                     "go-right" => Direction::Right,
@@ -331,6 +559,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                     }
                                 }
                             }
+                            // Действие из конфига, которого мы не знаем: молча ничего. Ронять
+                            // терминал из-за опечатки в конфиге нельзя, а сама опечатка ловится
+                            // раньше — на сборке поколения (`rebuild` проверяет форму записи).
+                            _ => {}
                         }
                         mode = Mode::Normal;
                         redraw = true;
@@ -378,7 +610,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
         // ── 5. кадр ────────────────────────────────────────────────────────────────────────
         if redraw {
-            let cells = compose(&panes, &rects, focus, mode, cols, rows);
+            let cells = compose(&panes, &rects, focus, mode, cols, rows, &conf);
             let dirty = dirty_rows(&prev_cells, &cells, cols, rows);
             if !dirty.is_empty() {
                 // Рисуем И переносим ТОЛЬКО изменившиеся строки. Раньше отрисовка шла по всему
@@ -460,9 +692,9 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
 }
 
 /// Завести панель: грид под её размер плюс запущенный в ней шелл с нашим stdio.
-fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize) -> Pane {
+fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize, conf: &Conf) -> Pane {
     let (w, h) = rect_size(rects, id);
-    let child = spawn_shell(exec_cap, me);
+    let child = spawn_shell(exec_cap, me, conf);
     let mut pane = Pane {
         id,
         grid: Grid::new(w, h),
@@ -480,14 +712,15 @@ fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize) -> 
 
 /// Запустить шелл, подобрав право на запуск. Найденное запоминается — перебирать на каждую
 /// панель незачем.
-fn spawn_shell(exec_cap: &mut usize, me: usize) -> Option<usize> {
+fn spawn_shell(exec_cap: &mut usize, me: usize, conf: &Conf) -> Option<usize> {
+    let (prog, args) = (&conf.shell[..], &conf.shell_args[..]);
     if *exec_cap != sys::NO_CAP {
-        return sys::spawn_with_stdio(*exec_cap, SHELL, SHELL_ARGS, me);
+        return sys::spawn_with_stdio(*exec_cap, prog, args, me);
     }
     // Веха 99.1: сперва спрашиваем право ПО ИМЕНИ — так порядок токенов в конфиге перестал
     // что-либо значить. Перебор остался запасным путём для старых конфигов без имён.
     if let Some(c) = sys::cap_named("STORE") {
-        if let Some(pid) = sys::spawn_with_stdio(c, SHELL, SHELL_ARGS, me) {
+        if let Some(pid) = sys::spawn_with_stdio(c, prog, args, me) {
             *exec_cap = c;
             return Some(pid);
         }
@@ -497,7 +730,7 @@ fn spawn_shell(exec_cap: &mut usize, me: usize) -> Option<usize> {
         if c == sys::NO_CAP {
             continue;
         }
-        if let Some(pid) = sys::spawn_with_stdio(c, SHELL, SHELL_ARGS, me) {
+        if let Some(pid) = sys::spawn_with_stdio(c, prog, args, me) {
             *exec_cap = c;
             return Some(pid);
         }
@@ -509,7 +742,7 @@ fn spawn_shell(exec_cap: &mut usize, me: usize) -> Option<usize> {
 #[allow(clippy::too_many_arguments)]
 fn split(
     tree: &mut SplitTree, panes: &mut Vec<Pane>, next_id: &mut usize, focus: &mut usize,
-    dir: SplitDirection, cols: usize, rows: usize, exec_cap: &mut usize, me: usize,
+    dir: SplitDirection, cols: usize, rows: usize, exec_cap: &mut usize, me: usize, conf: &Conf,
 ) {
     if panes.is_empty() {
         return;
@@ -522,7 +755,7 @@ fn split(
     *next_id += 1;
     let rects = layout_of(tree, cols, rows);
     resize_all(panes, &rects); // старые панели поменяли размер — грид обязан следовать
-    panes.push(new_pane(fresh, &rects, exec_cap, me));
+    panes.push(new_pane(fresh, &rects, exec_cap, me, conf));
     *focus = panes.len() - 1;
 }
 
@@ -583,6 +816,7 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
 #[allow(clippy::too_many_arguments)]
 fn compose(
     panes: &[Pane], rects: &[PaneRect], focus: usize, mode: Mode, cols: usize, rows: usize,
+    conf: &Conf,
 ) -> Vec<Cell> {
     // Общий кадр — мозаика из гридов панелей: у каждой свой, склеиваем по ячейкам.
     let mut cells = vec![Cell::default(); cols * rows];
@@ -602,7 +836,7 @@ fn compose(
             mark_focus(&mut cells, r, cols, rows);
         }
     }
-    status_bar(&mut cells, panes, focus, mode, cols, rows);
+    status_bar(&mut cells, panes, focus, mode, cols, rows, conf);
     cells
 }
 
@@ -647,24 +881,24 @@ fn mark_focus(cells: &mut [Cell], r: &PaneRect, cols: usize, rows: usize) {
 }
 
 /// Статус-бар: сколько панелей, какая в фокусе, жив ли её процесс, подсказка по префиксу.
+#[allow(clippy::too_many_arguments)]
 fn status_bar(
     cells: &mut [Cell], panes: &[Pane], focus: usize, mode: Mode, cols: usize, rows: usize,
+    conf: &Conf,
 ) {
     let y = rows - 1;
     // Цветом же: в режиме команд полоса другая, и это видно боковым зрением.
     let bg = if mode == Mode::Pane { NamedColor::BrightYellow } else { NamedColor::BrightCyan };
-    let mut text = alloc::string::String::new();
+    let mut text = String::new();
     use core::fmt::Write;
     let _ = write!(text, " VOID · панель {}/{} ", focus + 1, panes.len());
     if let Some(p) = panes.get(focus) {
         let _ = write!(text, "· {} ", if p.child.is_some() { "живая" } else { "мертва" });
     }
     // Режим показывается всегда: модальное управление без индикатора — способ потеряться.
-    if mode == Mode::Pane {
-        let _ = write!(text, "· \u{2b1b} ПАНЕЛИ: | - h j k l / стрелки · x закрыть · q выход");
-    } else {
-        let _ = write!(text, "· Ctrl-A — команды панелей");
-    }
+    // Клавиши в подсказке берутся ИЗ СХЕМЫ: после Вехи 100 их задаёт конфиг, и подсказка,
+    // повторяющая зашитые буквы, врала бы ровно тому, кто схему поменял.
+    let _ = write!(text, "· {}", hint(conf, mode));
     let mut i = 0usize;
     for ch in text.chars() {
         if i >= cols {
@@ -682,6 +916,44 @@ fn status_bar(
         c.bg = Color::Named(bg);
         i += 1;
     }
+}
+
+/// Подсказка по текущему режиму — из действующей схемы, а не из литерала.
+fn hint(conf: &Conf, mode: Mode) -> String {
+    use core::fmt::Write;
+    let mut s = String::new();
+    if mode != Mode::Pane {
+        return match conf.key_for(Mode::Normal, "mode-pane") {
+            Some(k) => {
+                let _ = write!(s, "{} — команды панелей", k);
+                s
+            }
+            None => s,
+        };
+    }
+    // Без значка-«квадратика»: U+2B1B в шрифте нет, и вместо метки режима выходил тофу —
+    // в статус-баре это читается как поломка. Режим и так виден цветом полосы и словом.
+    let _ = write!(s, "ПАНЕЛИ:");
+    for (action, label) in
+        [("split-v", "разбить"), ("split-h", "поперёк"), ("close", "закрыть"), ("quit", "выход")]
+    {
+        if let Some(k) = conf.key_for(Mode::Pane, action) {
+            let _ = write!(s, " {} {} ·", k, label);
+        }
+    }
+    // Переходы — одной группой и не больше четырёх: в схеме по умолчанию их восемь (буквы и
+    // стрелки), и полным списком подсказка вылезала за край полосы, обрываясь на полуслове.
+    let nav: Vec<&str> = conf
+        .binds
+        .iter()
+        .filter(|b| b.mode == Mode::Pane && b.action.starts_with("go-"))
+        .map(|b| b.key.as_str())
+        .collect();
+    if !nav.is_empty() {
+        let shown = nav.len().min(4);
+        let _ = write!(s, " {}{} переход", nav[..shown].join(" "), if nav.len() > shown { " …" } else { "" });
+    }
+    s
 }
 
 /// Право на экран: опознаём по тому, что его ПРИНЯЛ `SYS_VIDEO_INFO` (проба безобидна).

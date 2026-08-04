@@ -845,12 +845,26 @@ pub mod posix {
     }
 
     /// `write(fd, buf) -> len`. `fd`=1/2 → консоль ядра.
+    ///
+    /// Пишем КУСКАМИ: приёмный буфер файлового сервера конечен (512 Б в `bin/posixfs`), а
+    /// хвост, который в него не влез, доставка отрезает — молча, и `write` при этом бодро
+    /// возвращал полную длину. Так пропала половина сеянного `/etc/system/terminal.vv`
+    /// (Веха 100): ушло 1.5 КиБ, дошло 512, текст оборвался посреди буквы, и виноватым
+    /// выглядел конфиг. Чтение кусками умели давно — запись просто забыли.
     pub fn write(ep: usize, fd: usize, buf: &[u8]) -> usize {
         if fd < FD_BASE {
             crate::write(buf);
             return buf.len();
         }
-        crate::call(ep, OP_WRITE | ((fd - FD_BASE) << 8), buf, &mut []);
+        const CHUNK: usize = 512; // = размер `req` в bin/posixfs; больше не доедет
+        let op = OP_WRITE | ((fd - FD_BASE) << 8);
+        if buf.is_empty() {
+            crate::call(ep, op, buf, &mut []);
+            return 0;
+        }
+        for part in buf.chunks(CHUNK) {
+            crate::call(ep, op, part, &mut []);
+        }
         buf.len()
     }
 

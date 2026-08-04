@@ -262,4 +262,47 @@ mod tests {
         let err = build_config(r#"(system (import "x.vv"))"#).unwrap_err();
         assert!(err.contains("загрузчик"), "получили: {}", err);
     }
+
+    // ── настройки терминала в том же конфиге ─────────────────────────────────
+    // `terminal`/`bind` — строки НЕ ядру, а `bin/term`. Конфиг поколения один: у системы одна
+    // история и один откат, а кто какие строки читает — дело читателя.
+
+    #[test]
+    fn terminal_and_bind_normalize() {
+        let src = r#"(system
+                       (list (service "posixfs" "store:rw")
+                             (shell "term" "endpoint:posixfs" "mmio:fb")
+                             (terminal "font-size" 18)
+                             (bind "normal" "C-a" "mode-pane")
+                             (bind "pane" "|" "split-v")))"#;
+        assert_eq!(
+            build_config(src).expect("сборка"),
+            "service posixfs store:rw\n\
+             shell term endpoint:posixfs mmio:fb\n\
+             terminal font-size 18\n\
+             bind normal C-a mode-pane\n\
+             bind pane | split-v\n"
+        );
+    }
+
+    /// Терминал живёт отдельным модулем и может целиком выключаться (как net.vv).
+    #[test]
+    fn terminal_module_can_be_off() {
+        let loader = MapLoader::new(vec![(
+            "terminal.vv",
+            r#"(define on #f)
+               (if on
+                 (list (shell "term" "mmio:fb") (bind "pane" "q" "quit"))
+                 (list (shell "vsh" "endpoint:posixfs")))"#,
+        )]);
+        let out = build_config_with(r#"(system (import "terminal.vv"))"#, &loader).expect("сборка");
+        assert_eq!(out, "shell vsh endpoint:posixfs\n");
+    }
+
+    /// Опечатка в биндинге — ошибка СБОРКИ, а не молчаливо пропущенная строка на живой системе.
+    #[test]
+    fn bind_arity_checked_at_build() {
+        let err = build_config(r#"(system (list (bind "pane" "split-v")))"#).unwrap_err();
+        assert!(err.contains("bind:"), "получили: {}", err);
+    }
 }

@@ -79,7 +79,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 /// Отчёт без alloc — кучи у этой программы нет.
 fn report(out: &mut [u8], caught: usize, code: usize) -> usize {
     let mut n = 0;
-    let mut put = |s: &[u8], out: &mut [u8], n: &mut usize| {
+    let put = |s: &[u8], out: &mut [u8], n: &mut usize| {
         for &b in s {
             if *n < out.len() {
                 out[*n] = b;

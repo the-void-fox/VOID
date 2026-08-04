@@ -215,9 +215,11 @@ fn run_init_config() {
     px::echo_to(ep, b"/etc/system/net.vv", NET_VV.as_bytes());
     px::echo_to(ep, b"/etc/system/services.vv", SERVICES_VV.as_bytes());
     px::echo_to(ep, b"/etc/system/networking.vv", NETWORKING_VV.as_bytes());
+    px::echo_to(ep, b"/etc/system/terminal.vv", TERMINAL_VV.as_bytes());
     px::echo_to(ep, DEFAULT_PATH, DEFAULT_VV.as_bytes());
     sys::write(
-        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (#t/#f) и `rebuild`.\n"
+        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (#t/#f),\n\
+         terminal.vv (терминал и клавиши) → `rebuild`.\n"
             .as_bytes(),
     );
 }
@@ -1782,14 +1784,61 @@ const SERVICES_VV: &str = ";; services.vv — базовые сервисы (ф�
 const NETWORKING_VV: &str = ";; networking.vv — сетевой сервис\n\
 (list (service \"net-srv\" \"dev:net:rw\"))\n";
 
+/// Веха 100 — терминал настраивается ТУТ ЖЕ, обычным модулем конфигурации. Модуль решает и
+/// «кто шелл» (пиксельный `term` или текстовый `vsh`), и схему управления: одна вещь — одно
+/// место. Записи `terminal`/`bind` ядру не адресованы, их читает сам `term`.
+const TERMINAL_VV: &str = ";; terminal.vv — терминал VOID: включён ли и чем управлять\n\
+;;\n\
+;; on = #t — мультиплексор `term` на настоящих глифах (нужен пиксельный экран: x86 + GRUB);\n\
+;; on = #f — текстовый шелл `vsh` в консоли ядра (riscv, загрузка без видеорежима).\n\
+(define on #f)\n\
+(define net (import \"net.vv\"))\n\
+\n\
+;; Схема управления: (bind РЕЖИМ КЛАВИША ДЕЙСТВИЕ). Пустой список биндингов = схема по\n\
+;; умолчанию, зашитая в term; хоть один bind — схема задаётся ЦЕЛИКОМ отсюда.\n\
+;;   режимы:   normal · pane\n\
+;;   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space\n\
+;;   действия: mode-pane mode-normal literal-prefix split-v split-h next-pane close quit\n\
+;;             go-left go-right go-up go-down\n\
+(define keys\n\
+\x20 (list\n\
+\x20   (bind \"normal\" \"C-a\" \"mode-pane\")\n\
+\x20   (bind \"pane\" \"C-a\" \"literal-prefix\")\n\
+\x20   (bind \"pane\" \"|\" \"split-v\")\n\
+\x20   (bind \"pane\" \"-\" \"split-h\")\n\
+\x20   (bind \"pane\" \"o\" \"next-pane\")\n\
+\x20   (bind \"pane\" \"x\" \"close\")\n\
+\x20   (bind \"pane\" \"q\" \"quit\")\n\
+\x20   (bind \"pane\" \"h\" \"go-left\")\n\
+\x20   (bind \"pane\" \"j\" \"go-down\")\n\
+\x20   (bind \"pane\" \"k\" \"go-up\")\n\
+\x20   (bind \"pane\" \"l\" \"go-right\")\n\
+\x20   (bind \"pane\" \"Left\" \"go-left\")\n\
+\x20   (bind \"pane\" \"Down\" \"go-down\")\n\
+\x20   (bind \"pane\" \"Up\" \"go-up\")\n\
+\x20   (bind \"pane\" \"Right\" \"go-right\")))\n\
+\n\
+(if on\n\
+\x20 (append\n\
+\x20   (list (shell \"term\"\n\
+\x20                \"endpoint:posixfs\" \"store:rwx\"\n\
+\x20                (if net \"endpoint:net-srv\" (list))\n\
+\x20                \"mmio:fb\" \"env\"))\n\
+\x20   (list (terminal \"font-size\" 18)\n\
+\x20         (terminal \"shell\" \"bin/vvsh\")\n\
+\x20         (terminal \"shell-args\" \"repl\"))\n\
+\x20   keys)\n\
+\x20 (list (shell \"vsh\"\n\
+\x20              \"endpoint:posixfs\" \"store:rwx\"\n\
+\x20              (if net \"endpoint:net-srv\" (list))\n\
+\x20              \"env\")))\n";
+
 const DEFAULT_VV: &str = ";; default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
-;; Собери систему из модулей. Тумблер сети — в net.vv (#t/#f). Затем: run vvsh rebuild\n\
+;; Собери систему из модулей: сеть — net.vv (#t/#f), терминал и его клавиши — terminal.vv.\n\
+;; Затем: run vvsh rebuild\n\
 (define net (import \"net.vv\"))\n\
 (system\n\
 \x20 (append\n\
 \x20   (import \"services.vv\")\n\
 \x20   (if net (import \"networking.vv\") (list))\n\
-\x20   (list (shell \"vsh\"\n\
-\x20                \"endpoint:posixfs\" \"store:rwx\"\n\
-\x20                (if net \"endpoint:net-srv\" (list))\n\
-\x20                \"env\"))))\n";
+\x20   (import \"terminal.vv\")))\n";
