@@ -172,7 +172,11 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     let mut fd_used = [false; NFILES];
 
     let mut req = [0u8; 512];
-    let mut rep = [0u8; 512];
+    // Ответ — с индекс каталога (Веха 105). Был 512 байт, и список из полусотни имён обрывался
+    // на 510-м байте МОЛЧА: `ls` каталога с распакованным пакетом показывал первые 18 файлов из
+    // 57 и ничем не выдавал, что показал не всё. Больше индекса каталога ответ быть не может,
+    // поэтому DIR_MAX здесь — не запас «на всякий случай», а точная граница.
+    let mut rep = [0u8; DIR_MAX];
     let mut idb = [0u8; 32];
     let mut dir = [0u8; DIR_MAX]; // рабочий буфер индекса каталога
     let mut pbuf = [0u8; PATH_MAX]; // нормализованный путь запроса
@@ -258,7 +262,21 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         }
                     }
                     if fidx == usize::MAX {
-                        if let Some(j) = (0..NFILES).find(|&j| !fused[j]) {
+                        // Слот занимается НАВСЕГДА, если его не вытеснять: `close` освобождает
+                        // дескриптор, но не слот. До Вехи 105 это значило потолок в 16 РАЗНЫХ
+                        // файлов за сессию — распаковка настоящего пакета спотыкалась на
+                        // семнадцатом (и говорила лишь «не записался», без причины).
+                        //
+                        // Вытесняем чистый слот, который никем не открыт: его содержимое уже в
+                        // store (там его оставил `close`), и следующий `open` прочитает файл
+                        // обратно по корню `f<путь>`. Грязный не трогаем — это потеря данных.
+                        let free = (0..NFILES).find(|&j| !fused[j]);
+                        let victim = free.or_else(|| {
+                            (0..NFILES).find(|&j| {
+                                !dirty[j] && !(0..NFILES).any(|d| fd_used[d] && fd_file[d] == j)
+                            })
+                        });
+                        if let Some(j) = victim {
                             fidx = j;
                             fused[j] = true;
                             dirty[j] = false;
@@ -497,17 +515,19 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         if off + 2 + nl > dlen {
                             break;
                         }
+                        // Границы считаются от буфера, а не зашиты числом: зашитые 510/511
+                        // пережили увеличение `rep` бы молча, и обрыв остался бы на месте.
                         for k in 0..nl {
-                            if reply_len < 510 {
+                            if reply_len + 2 < rep.len() {
                                 rep[reply_len] = dir[off + 2 + k];
                                 reply_len += 1;
                             }
                         }
-                        if ty == 1 && reply_len < 511 {
+                        if ty == 1 && reply_len + 1 < rep.len() {
                             rep[reply_len] = b'/';
                             reply_len += 1;
                         }
-                        if reply_len < 511 {
+                        if reply_len < rep.len() {
                             rep[reply_len] = b'\n';
                             reply_len += 1;
                         }
