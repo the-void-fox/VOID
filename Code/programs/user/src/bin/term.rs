@@ -49,6 +49,12 @@
 //!
 //! Схема по умолчанию записана тем же текстом ([`DEFAULT_CONF`]) и разбирается тем же кодом:
 //! два пути «из конфига» и «зашитый» разъехались бы при первой же правке.
+//!
+//! **Перечитать на ходу** — команда `reload` (по умолчанию `r` в режиме панелей, Веха 101):
+//! `rebuild` в любой панели, затем `reload` — новые клавиши и кегль действуют сразу, без
+//! перезагрузки. Живые панели и их процессы не трогаются: меняется вид и таблица клавиш. Это
+//! первый шаг «switch без ребута», и он целиком в userspace — поколение уже лежит в store, а
+//! терминал умеет его читать.
 
 #![no_std]
 #![no_main]
@@ -93,6 +99,7 @@ bind pane - split-h
 bind pane o next-pane
 bind pane x close
 bind pane q quit
+bind pane r reload
 bind pane h go-left
 bind pane j go-down
 bind pane k go-up
@@ -419,6 +426,39 @@ fn read_root(cap: usize, name: &[u8]) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Всё, что зависит от КЕГЛЯ: шрифт, кэш глифов, рендер, поверхность кадра и геометрия экрана
+/// в знакоместах. Отдельной структурой ровно потому, что настройки перечитываются на ходу
+/// (Веха 101): смена `font-size` меняет и размер ячейки, и число колонок/строк, и размер кадра —
+/// то есть всё это разом, а не по кусочку.
+struct View {
+    cache: GlyphCache<TtfFont>,
+    renderer: GridRenderer,
+    surface: Surface,
+    cols: usize,
+    rows: usize,
+}
+
+impl View {
+    fn build(conf: &Conf, info: &sys::VideoInfo) -> Option<View> {
+        let font = TtfFont::from_vec(FONT.to_vec(), conf.font_px).ok()?;
+        let cache = GlyphCache::new(font);
+        let metrics = cache.metrics();
+        let palette = Palette::default();
+        let renderer = GridRenderer::new(palette, metrics);
+        // Геометрия в знакоместах; последняя строка — статус-бар мультиплексора.
+        let cols = (info.width / metrics.width.max(1) as usize).max(8);
+        let rows = (info.height / metrics.height.max(1) as usize).max(4);
+        let (w, h) = renderer.pixel_size(cols, rows);
+        let surface = Surface::new(w, h, palette.background);
+        Some(View { cache, renderer, surface, cols, rows })
+    }
+
+    /// Высота знакоместа в пикселях (шаг переноса строк на экран).
+    fn cell_h(&self) -> usize {
+        self.renderer.metrics().height.max(1) as usize
+    }
+}
+
 /// Панель: грид, разбор ANSI, ребёнок и его отложенный запрос ввода.
 struct Pane {
     id: PaneId,
@@ -429,6 +469,10 @@ struct Pane {
     /// Ребёнок спит в `read_stdin` и ждёт ответа. Копим клавиши, пока он не спросит, и отвечаем
     /// сразу, как есть и запрос, и байты, — иначе ввод терялся бы между этими событиями.
     pending_read: Option<usize>,
+    /// Сколько байт ребёнок готов принять в этом чтении (Веха 101). Отвечать больше нельзя:
+    /// лишнее ядро отрежет по его буферу, а из нашей очереди мы бы его уже удалили — так
+    /// терялись куски строки, набранной быстрее, чем её забирают.
+    pending_want: usize,
     /// Не отданный ввод этой панели.
     inbox: Vec<u8>,
 }
@@ -437,7 +481,7 @@ struct Pane {
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Настройки читаются ПЕРВЫМИ: от них зависят и кегль шрифта (а значит вся геометрия), и то,
     // что запускать в панелях.
-    let conf = Conf::load();
+    let mut conf = Conf::load();
 
     let Some(fb_cap) = find_fb_cap() else {
         sys::write_console("[term] нет права на экран (mmio:fb в конфиге init)\n".as_bytes());
@@ -452,20 +496,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::exit(1);
     }
 
-    let Ok(font) = TtfFont::from_vec(FONT.to_vec(), conf.font_px) else {
+    let Some(mut view) = View::build(&conf, &info) else {
         sys::write_console("[term] шрифт не разобрался\n".as_bytes());
         sys::exit(1);
     };
-    let mut cache = GlyphCache::new(font);
-    let metrics = cache.metrics();
-    let palette = Palette::default();
-    let renderer = GridRenderer::new(palette, metrics);
-
-    // Геометрия в знакоместах; последняя строка — статус-бар мультиплексора.
-    let cols = (info.width / metrics.width.max(1) as usize).max(8);
-    let rows = (info.height / metrics.height.max(1) as usize).max(4);
-    let (surf_w, surf_h) = renderer.pixel_size(cols, rows);
-    let mut surface = Surface::new(surf_w, surf_h, palette.background);
 
     // Право на ЗАПУСК ищем перебором стартовых прав, а не по фиксированному индексу: порядок
     // токенов в конфиге init — дело конфига, и он уже менялся. Перебор здесь безопасен: неудачный
@@ -474,7 +508,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     let mut tree = SplitTree::leaf(PaneId(0));
     let mut next_id = 1usize;
-    let mut rects = layout_of(&tree, cols, rows);
+    let mut rects = layout_of(&tree, view.cols, view.rows);
     let mut exec_cap = sys::NO_CAP;
     let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me, &conf)];
     let mut focus = 0usize;
@@ -521,8 +555,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                     SplitDirection::Horizontal
                                 };
                                 split(&mut tree, &mut panes, &mut next_id, &mut focus, dir,
-                                      cols, rows, &mut exec_cap, me, &conf);
-                                rects = layout_of(&tree, cols, rows);
+                                      view.cols, view.rows, &mut exec_cap, me, &conf);
+                                rects = layout_of(&tree, view.cols, view.rows);
                             }
                             "close" => {
                                 close_pane(&mut tree, &mut panes, &mut focus);
@@ -530,12 +564,36 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                     sys::write_console("[term] панелей не осталось — выход\n".as_bytes());
                                     sys::exit(0);
                                 }
-                                rects = layout_of(&tree, cols, rows);
+                                rects = layout_of(&tree, view.cols, view.rows);
                                 resize_all(&mut panes, &rects);
                             }
                             "quit" => {
-                                sys::write_console("[term] выход по Ctrl-A q\n".as_bytes());
+                                sys::write_console("[term] выход по команде панелей\n".as_bytes());
                                 sys::exit(0);
+                            }
+                            // Веха 101 — перечитать конфиг НА ХОДУ. Первый шаг к `switch` без
+                            // перезагрузки, и он оказался целиком в userspace: поколение уже
+                            // лежит в store, а term умеет его читать. Клавиши и кегль меняются
+                            // без ребута; живые панели и их процессы при этом не трогаются.
+                            "reload" => {
+                                conf = Conf::load();
+                                match View::build(&conf, &info) {
+                                    Some(v) => {
+                                        view = v;
+                                        // Кегль мог измениться — значит изменилось ВСЁ, что от
+                                        // него зависит: раскладка, гриды панелей, размер кадра.
+                                        rects = layout_of(&tree, view.cols, view.rows);
+                                        resize_all(&mut panes, &rects);
+                                        prev_cells.clear(); // кадр несравним со старым — весь заново
+                                    }
+                                    // Шрифт не собрался (кегль из конфига негоден) — остаёмся на
+                                    // прежнем виде: терминал, погасший из-за опечатки в конфиге,
+                                    // нечем было бы починить.
+                                    None => sys::write_console(
+                                        "[term] конфиг перечитан, но шрифт не построился — вид прежний\n"
+                                            .as_bytes(),
+                                    ),
+                                }
                             }
                             // Сам префикс: отдать его программе (в конфиге — `literal-prefix`).
                             // Байт берём из клавиши, а не из константы: префикс перенастраиваемый.
@@ -586,7 +644,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         // ── 3. отдать накопленный ввод тем, кто его ждёт ───────────────────────────────────
         for p in panes.iter_mut() {
             if p.pending_read.is_some() && !p.inbox.is_empty() {
-                let take = p.inbox.len().min(stdio::CHUNK);
+                let take = p.inbox.len().min(p.pending_want.max(1));
                 sys::reply(p.pending_read.take().unwrap(), &p.inbox[..take]);
                 p.inbox.drain(..take);
                 worked = true;
@@ -610,17 +668,19 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
         // ── 5. кадр ────────────────────────────────────────────────────────────────────────
         if redraw {
-            let cells = compose(&panes, &rects, focus, mode, cols, rows, &conf);
-            let dirty = dirty_rows(&prev_cells, &cells, cols, rows);
+            let cells = compose(&panes, &rects, focus, mode, view.cols, view.rows, &conf);
+            let dirty = dirty_rows(&prev_cells, &cells, view.cols, view.rows);
             if !dirty.is_empty() {
                 // Рисуем И переносим ТОЛЬКО изменившиеся строки. Раньше отрисовка шла по всему
                 // кадру «потому что RAM дешёвая» — оценка оказалась неверной: 116×36 знакомест
                 // по ~2000 пиксельных операций и есть та медлительность, которую видно на
                 // железе (в gen1 консоль ядра красит лишь изменившиеся ячейки — и она мгновенна).
-                renderer.paint_cells_rows(&cells, cols, rows, &mut cache, &mut surface, &dirty);
-                let ch = metrics.height.max(1) as usize;
+                view.renderer.paint_cells_rows(
+                    &cells, view.cols, view.rows, &mut view.cache, &mut view.surface, &dirty,
+                );
+                let ch = view.cell_h();
                 for &y in &dirty {
-                    blit_rows(&surface, &info, y * ch, ((y + 1) * ch).min(info.height));
+                    blit_rows(&view.surface, &info, y * ch, ((y + 1) * ch).min(info.height));
                 }
             }
             prev_cells = cells;
@@ -680,6 +740,13 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
         Some(i) if m.op == stdio::OP_STDIN => {
             // Отложенный ответ: держим право до появления клавиш (как в net-srv).
             panes[i].pending_read = Some(m.reply_cap);
+            // Сколько ребёнок может принять — из запроса; пустой запрос значит старого клиента.
+            let want = if m.len >= 4 {
+                u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize
+            } else {
+                stdio::CHUNK
+            };
+            panes[i].pending_want = want.clamp(1, stdio::CHUNK);
             false
         }
         // Чужой или непонятный запрос — ответить пусто, а не молчать: молчание повесило бы
@@ -701,6 +768,7 @@ fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize, con
         parser: vte::Parser::new(),
         child,
         pending_read: None,
+        pending_want: 0,
         inbox: Vec::new(),
     };
     if child.is_none() {

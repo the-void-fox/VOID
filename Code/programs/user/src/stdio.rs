@@ -32,6 +32,11 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub const OP_STDOUT: usize = 1;
 /// Запрос ввода. Хост отвечает байтами; ответ может быть ОТЛОЖЕННЫМ — тогда ребёнок спит в
 /// `SYS_CALL` ровно так же, как спал бы в `SYS_READ`.
+///
+/// **В запросе — сколько байт клиент готов принять** (u32 LE, Веха 101). Без этого хост отвечал
+/// «сколько накопилось», ядро резало ответ по буферу клиента, а ОСТАТОК ХОСТ УЖЕ ВЫБРОСИЛ из
+/// своей очереди: строка, набранная быстрее, чем её забирают (вставка в консоль), теряла куски
+/// из середины. Пустой запрос — старый клиент, отвечаем не больше [`CHUNK`].
 pub const OP_STDIN: usize = 2;
 
 /// Спросить размер своего окна в знакоместах. Ответ — 4 байта: `cols` и `rows` (u16 LE).
@@ -102,8 +107,11 @@ pub fn write(bytes: &[u8]) -> bool {
     };
     let mut rep = [0u8; 8];
     for part in bytes.chunks(CHUNK) {
-        if super::call(ep, OP_STDOUT, part, &mut rep) == super::NO_CAP {
-            return false; // хост умер или отказал — дальше слать бессмысленно
+        let r = super::call_ex(ep, OP_STDOUT, part, &mut rep, super::NO_CAP);
+        // Веха 101 — доехало меньше отправленного (у хоста буфер меньше нашего куска): это
+        // потеря вывода, и молчать о ней нельзя. Вызывающий откатится на консоль ядра.
+        if r.reply_len == super::NO_CAP || r.sent < part.len() {
+            return false;
         }
     }
     true
@@ -126,7 +134,9 @@ pub fn win_size() -> Option<(u16, u16)> {
 /// Запросить ввод у хоста. `None` — эндпоинта нет; иначе число прочитанных байт (0 — конец ввода).
 pub fn read(buf: &mut [u8]) -> Option<usize> {
     let ep = endpoint()?;
-    match super::call(ep, OP_STDIN, &[], buf) {
+    // Сколько влезет — В ЗАПРОСЕ: хост обязан отдать не больше и остальное СОХРАНИТЬ у себя.
+    let want = (buf.len().min(CHUNK) as u32).to_le_bytes();
+    match super::call(ep, OP_STDIN, &want, buf) {
         n if n == super::NO_CAP => None,
         n => Some(n.min(buf.len())),
     }

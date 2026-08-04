@@ -1824,6 +1824,7 @@ const TERMINAL_VV: &str = ";; terminal.vv — терминал VOID: включ�
 ;;   режимы:   normal · pane\n\
 ;;   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space\n\
 ;;   действия: mode-pane mode-normal literal-prefix split-v split-h next-pane close quit\n\
+;;             reload (перечитать этот конфиг на ходу — после `rebuild`, без перезагрузки)\n\
 ;;             go-left go-right go-up go-down\n\
 (define keys\n\
 \x20 (list\n\
@@ -1834,6 +1835,7 @@ const TERMINAL_VV: &str = ";; terminal.vv — терминал VOID: включ�
 \x20   (bind \"pane\" \"o\" \"next-pane\")\n\
 \x20   (bind \"pane\" \"x\" \"close\")\n\
 \x20   (bind \"pane\" \"q\" \"quit\")\n\
+\x20   (bind \"pane\" \"r\" \"reload\")\n\
 \x20   (bind \"pane\" \"h\" \"go-left\")\n\
 \x20   (bind \"pane\" \"j\" \"go-down\")\n\
 \x20   (bind \"pane\" \"k\" \"go-up\")\n\
