@@ -834,8 +834,11 @@ fn split(
     *focus = panes.len() - 1;
 }
 
-/// Закрыть фокусную панель. Ребёнок останется сиротой и заметит это сам — по тому, что его
-/// вызовы перестанут доходить; убивать процессы мы пока не умеем (записано долгом).
+/// Закрыть фокусную панель — вместе с процессом, который в ней жил (Веха 103).
+///
+/// До этого ребёнок оставался сиротой: панели нет, а процесс живёт и ждёт ввода, которого больше
+/// никто не пришлёт. Теперь его завершает `SYS_KILL` — право на это у нас есть по родительству,
+/// мы его и запускали.
 fn close_pane(tree: &mut SplitTree, panes: &mut Vec<Pane>, focus: &mut usize) {
     if panes.is_empty() {
         return;
@@ -843,6 +846,9 @@ fn close_pane(tree: &mut SplitTree, panes: &mut Vec<Pane>, focus: &mut usize) {
     let id = panes[*focus].id;
     if panes.len() > 1 && !tree.close(id) {
         return;
+    }
+    if let Some(pid) = panes[*focus].child {
+        sys::kill(pid);
     }
     panes.remove(*focus);
     if *focus >= panes.len() {

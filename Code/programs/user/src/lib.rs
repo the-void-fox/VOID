@@ -104,6 +104,7 @@ const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
 const SYS_POWEROFF: usize = 44;
+const SYS_KILL: usize = 45;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -532,6 +533,13 @@ pub fn read_stdin(buf: &mut [u8]) -> usize {
         return n;
     }
     abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
+}
+
+/// `SYS_KILL(pid)` (Веха 103) — завершить СВОЕГО ребёнка (запущенного [`spawn`]). `false` —
+/// отказ: чужой процесс, свой собственный номер или уже завершившийся. Право — из родительства,
+/// как у [`wait`]: кто процесс создал, тот им и распоряжается.
+pub fn kill(pid: usize) -> bool {
+    abi::syscall(SYS_KILL, pid, 0, 0, 0, 0, 0, 0).0 != usize::MAX
 }
 
 /// `SYS_POWEROFF(cap)` (Веха 101) — выключить машину. Нужно право `power` из конфига

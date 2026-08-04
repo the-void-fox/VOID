@@ -2473,6 +2473,41 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(cap.bits() as usize);
             f.advance();
         }
+        // SYS_KILL(pid) (Веха 103) — завершить СВОЕГО ребёнка, запущенного `SYS_SPAWN`.
+        //
+        // Право берётся оттуда же, откуда его берёт `SYS_WAIT`: из РОДИТЕЛЬСТВА. Отдельной
+        // capability заводить не стали — она бы дублировала уже существующее отношение: кто
+        // процесс создал, тот им и распоряжается, чужого не тронуть. Ровно этого не хватало,
+        // чтобы закрытая панель мультиплексора не оставляла сироту ([[multiplexer]]).
+        //
+        // Код выхода — 137 (128+9), как принято для «убит», чтобы родитель отличал его от
+        // обычного возврата.
+        45 => {
+            let pid = t.procs[cur].frame.arg(0);
+            let ok = pid < t.procs.len()
+                && pid != cur
+                && t.procs[pid].parent == cur
+                && t.procs[pid].state != State::Finished;
+            if !ok {
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(usize::MAX);
+                f.advance();
+                return;
+            }
+            let leader = t.procs[pid].group;
+            vprintln!("  [proc] P{} SYS_KILL P{} (свой ребёнок)", cur, leader);
+            for i in 0..t.procs.len() {
+                if t.procs[i].group == leader {
+                    t.procs[i].state = State::Finished;
+                }
+            }
+            // Ждущие узнают код выхода тем же путём, что и при обычном завершении; права на
+            // мертвеца отзовёт `reclaim_dead_spaces` (Веха 89), когда освободит его слот.
+            wake_exec_waiters(t, leader, 137);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(0);
+            f.advance();
+        }
         // SYS_POWEROFF(cap) (Веха 101) — выключить машину. Право отдельное (`Target::Power`,
         // токен `power` в конфиге): выключение — одностороннее действие над ВСЕЙ системой, и
         // «может любой процесс» здесь было бы дырой ровно того сорта, который capability-модель
