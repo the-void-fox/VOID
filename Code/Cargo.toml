@@ -6,6 +6,7 @@ members = [
     "kernel",
     "libs/void-abi",
     "libs/void-store",
+    "libs/void-nar",
 ]
 # Веха 19.1/23: userspace-программы — ОТДЕЛЬНЫЙ крейт, не член этого workspace (у него свой
 # линкер-скрипт на базу региона процессов и свой release-профиль под жёсткий размер — см.

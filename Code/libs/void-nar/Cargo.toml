@@ -1,0 +1,8 @@
+# void-nar — разбор NAR (Nix ARchive) как ОБЩИЙ крейт (Веха 105, Фаза 8).
+# no_std + alloc: одна реализация формата на всех потребителей — хост-мост
+# (tools/void-store-import) и сама VOID (`pkg`), ровно как это сделано с void-store.
+[package]
+name = "void-nar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true

@@ -68,39 +68,10 @@ impl BlockIo for FileIo {
     }
 }
 
-// ─── NAR: детерминированная сериализация дерева из nix ────────────────────────
-// Токен = длина(u64 LE) + байты + выравнивание нулями до 8. Грамматика узла:
-//   "(" "type" ( "regular" ["executable" ""] "contents" <данные>
-//              | "symlink" "target" <цель>
-//              | "directory" { "entry" "(" "name" <имя> "node" <узел> ")" } ) ")"
-
-struct Nar<'a> {
-    b: &'a [u8],
-    off: usize,
-}
-
-impl<'a> Nar<'a> {
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
-        if self.off + 8 > self.b.len() {
-            return Err("NAR обрезан (нет длины токена)".into());
-        }
-        let len = u64::from_le_bytes(self.b[self.off..self.off + 8].try_into().unwrap()) as usize;
-        self.off += 8;
-        if self.off + len > self.b.len() {
-            return Err("NAR обрезан (нет тела токена)".into());
-        }
-        let s = &self.b[self.off..self.off + len];
-        self.off += len + (8 - len % 8) % 8;
-        Ok(s)
-    }
-    fn tok(&mut self) -> Result<&'a str, String> {
-        std::str::from_utf8(self.bytes()?).map_err(|_| "NAR: токен не UTF-8".into())
-    }
-    fn expect(&mut self, want: &str) -> Result<(), String> {
-        let got = self.tok()?;
-        if got == want { Ok(()) } else { Err(format!("NAR: ожидал «{want}», увидел «{got}»")) }
-    }
-}
+// ─── NAR: разбор вынесен в общий крейт (Веха 105) ─────────────────────────────
+// Формат живёт в `libs/void-nar` — по той же причине, что и сам store: одна реализация на
+// всех потребителей. Мост здесь только СОБИРАЕТ результат обхода: на хосте держать дерево
+// в памяти безобидно, а на VOID тот же обход кладёт файлы в store по одному.
 
 /// Файл из NAR: путь внутри архива, содержимое, исполняемость.
 struct NarFile {
@@ -109,56 +80,23 @@ struct NarFile {
     exec: bool,
 }
 
-fn nar_walk(nar: &mut Nar, path: String, out: &mut Vec<NarFile>) -> Result<(), String> {
-    nar.expect("(")?;
-    nar.expect("type")?;
-    match nar.tok()? {
-        "regular" => {
-            let mut exec = false;
-            let mut t = nar.tok()?;
-            if t == "executable" {
-                nar.expect("")?;
-                exec = true;
-                t = nar.tok()?;
-            }
-            if t != "contents" {
-                return Err(format!("NAR: ожидал «contents», увидел «{t}»"));
-            }
-            let data = nar.bytes()?.to_vec();
-            nar.expect(")")?;
-            out.push(NarFile { path, data, exec });
-        }
-        "symlink" => {
-            nar.expect("target")?;
-            let target = nar.tok()?;
-            eprintln!("  ! симлинк {path} → {target} пропущен (симлинков в store пока нет)");
-            nar.expect(")")?;
-        }
-        "directory" => loop {
-            match nar.tok()? {
-                ")" => break,
-                "entry" => {
-                    nar.expect("(")?;
-                    nar.expect("name")?;
-                    let name = nar.tok()?.to_owned();
-                    nar.expect("node")?;
-                    let sub = if path.is_empty() { name } else { format!("{path}/{name}") };
-                    nar_walk(nar, sub, out)?;
-                    nar.expect(")")?;
-                }
-                t => return Err(format!("NAR: неожиданный токен «{t}» в каталоге")),
-            }
-        },
-        t => return Err(format!("NAR: неизвестный тип узла «{t}»")),
-    }
-    Ok(())
-}
-
 fn parse_nar(bytes: &[u8]) -> Result<Vec<NarFile>, String> {
-    let mut nar = Nar { b: bytes, off: 0 };
-    nar.expect("nix-archive-1")?;
     let mut out = Vec::new();
-    nar_walk(&mut nar, String::new(), &mut out)?;
+    void_nar::walk(bytes, |e| {
+        match e {
+            void_nar::Entry::File { path, data, exec } => out.push(NarFile {
+                path: path.to_owned(),
+                data: data.to_vec(),
+                exec,
+            }),
+            void_nar::Entry::Symlink { path, target } => {
+                eprintln!("  ! симлинк {path} → {target} пропущен (симлинков в store пока нет)");
+            }
+            void_nar::Entry::Dir { .. } => {}
+        }
+        Ok(())
+    })
+    .map_err(|e| e.0)?;
     Ok(out)
 }
 

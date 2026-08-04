@@ -93,6 +93,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "void-nar"
+version = "0.0.1"
+
+[[package]]
 name = "void-store"
 version = "0.0.1"
 dependencies = [

@@ -11,3 +11,4 @@ description = "Импорт файлов и NAR-архивов в образ д�
 [dependencies]
 void-abi = { path = "../../libs/void-abi" }
 void-store = { path = "../../libs/void-store" }
+void-nar = { path = "../../libs/void-nar" }
