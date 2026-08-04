@@ -69,9 +69,14 @@ ereb-mux = { path = "vendor-ereb/ereb-mux" }
 vte = { version = "0.15.0", default-features = false }
 
 # Веха 105 (Фаза 8) — РАСПАКОВКА xz: пакеты бинарного кэша nixpkgs приезжают как `.nar.xz`.
-# Копия lzma-rs 0.3.0, переведённая в no_std и урезанная до декодера (см. vendor-lzma/README.md).
+# Копия lzma-rs 0.3.0, переведённая в no_std и урезанная до декодера (см. vendor-compress/README.md).
 # Линкуется только в `vvsh` (команда `nar-unpack`).
-lzma-rs = { path = "vendor-lzma/lzma-rs" }
+lzma-rs = { path = "vendor-compress/lzma-rs" }
+
+# Веха 105.2 — второе сжатие кэша nixpkgs: zstd. Замер показал, что кэш на него уже перешёл
+# (15 путей из 22 случайных — zstd, 7 — xz), так что одного xz для пакетов мало.
+# ruzstd менять не пришлось вовсе: он `no_std` сам по себе (см. vendor-compress/README.md).
+ruzstd = { path = "vendor-compress/ruzstd", default-features = false, features = ["hash"] }
 
 # bare-metal: у `getrandom` нет системного источника, поэтому регистрируем свой —
 # он уходит в `SYS_RANDOM` ядра (Веха 86 + джиттер/virtio-rng).

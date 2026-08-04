@@ -1,0 +1,42 @@
+# twox-hash 2.1.3 — закреплённая копия для VOID (Веха 105.2, Фаза 8).
+#
+# Нужен ровно за одним: XXH64, которым zstd проверяет контрольную сумму кадра (см. ruzstd рядом).
+# ИСХОДНИКИ НЕ ТРОНУТЫ: с `default-features = false` крейт уже `no_std` и без зависимостей.
+# Из манифеста убраны фичи, которых у нас всё равно нет (`std`, `random`, `serialize`) вместе с
+# их зависимостями (rand, serde), и оставлен только `xxhash64` — остальные варианты XXH3/XXH32
+# в дереве VOID никем не вызываются.
+[package]
+name = "twox-hash"
+version = "2.1.3"
+edition = "2021"
+rust-version = "1.81"
+authors = ["Jake Goulding <jake.goulding@gmail.com>"]
+description = "A Rust implementation of the XXHash and XXH3 algorithms (копия для VOID)"
+license = "MIT"
+repository = "https://github.com/shepmaster/twox-hash"
+
+[lib]
+name = "twox_hash"
+path = "src/lib.rs"
+
+[features]
+default = []
+alloc = []
+xxhash32 = []
+xxhash64 = []
+xxhash3_64 = []
+xxhash3_128 = []
+# См. соседний ruzstd: пустые объявления — против «unexpected cfg» на нетронутом чужом коде.
+std = ["alloc"]
+random = []
+serialize = []
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(_internal_xxhash3_force_scalar)",
+    "cfg(_internal_xxhash3_force_neon)",
+    "cfg(_internal_xxhash3_force_sse2)",
+    "cfg(_internal_xxhash3_force_avx2)",
+]

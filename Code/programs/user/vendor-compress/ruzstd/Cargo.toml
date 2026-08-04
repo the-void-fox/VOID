@@ -1,0 +1,52 @@
+# ruzstd 0.8.3 — закреплённая копия для VOID (Веха 105.2, Фаза 8).
+#
+# ИСХОДНИКИ НЕ ТРОНУТЫ ВОВСЕ: крейт объявлен `#![no_std]` сам по себе и носит собственный
+# io-шим (`src/io_nostd.rs`), поэтому переводить его, как lzma-rs, было нечего. Изменён только
+# этот манифест, и ровно в двух местах:
+#
+#   1. фичи `std`, `dict_builder`, `fuzz_exports`, `rustc-dep-of-std` и их зависимости
+#      (fastrand, rustc-std-workspace-*) выброшены — в VOID их не на чем включать;
+#   2. twox-hash подключён path-зависимостью на соседнюю копию, а не по версии из crates.io.
+#
+# Фича `hash` ОСТАВЛЕНА включённой: она даёт проверку контрольной суммы кадра zstd. Архив
+# приезжает из чужого кэша по сети — «расползлось молча» здесь недопустимо (та же причина, по
+# которой в копии lzma-rs оставлен CRC).
+[package]
+name = "ruzstd"
+version = "0.8.3"
+edition = "2018"
+rust-version = "1.87"
+authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
+description = "A decoder for the zstd compression format (копия для VOID)"
+license = "MIT"
+repository = "https://github.com/KillingSpark/zstd-rs"
+
+[lib]
+name = "ruzstd"
+path = "src/lib.rs"
+
+[features]
+default = ["hash"]
+hash = ["dep:twox-hash"]
+# Фичи апстрима, которые в VOID включать не на чем, объявлены пустыми НАРОЧНО: без объявления
+# компилятор сыплет «unexpected cfg» на чужой код под ними, а править чужой код ради тишины —
+# ровно то, чего эта копия избегает. `dict_builder` и `rustc-dep-of-std` не объявлены совсем:
+# они тянут зависимости, которых здесь нет.
+std = []
+fuzz_exports = []
+
+[dependencies.twox-hash]
+path = "../twox-hash"
+default-features = false
+features = ["xxhash64"]
+optional = true
+
+# `dict_builder` и `rustc-dep-of-std` объявить нечем (они тянут fastrand и rustc-std-workspace-*),
+# но код апстрима под ними остаётся — гасим предупреждение здесь, а не правкой чужих файлов.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(feature, values(\"dict_builder\"))",
+    "cfg(feature, values(\"rustc-dep-of-std\"))",
+]
