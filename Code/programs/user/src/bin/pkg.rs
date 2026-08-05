@@ -62,6 +62,9 @@ mod archive;
 mod roots;
 // Формат дерева пакета в store — общий крейт: его читают и posixfs, и персоналия Linux.
 use void_tree as tree;
+// Профиль (поколения и их содержимое) — общий с шеллом: ему он нужен для PATH (Веха 109).
+#[path = "../profile.rs"]
+mod profile;
 
 // Куча (Веха 108): от размера пакета она БОЛЬШЕ НЕ ЗАВИСИТ — байты идут потоком, и целиком в
 // памяти не живёт ни архив, ни NAR, ни файл. Определяет её теперь окно распаковщика: у zstd оно
@@ -88,13 +91,8 @@ const NIX32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 /// Длина хэша пути store в символах.
 const HASH_LEN: usize = 32;
 
-/// Имя профиля. Профиль пока один; множественность — это ровно другой префикс корня, поэтому
-/// имя вынесено в константу, а не размазано по коду.
-const PROFILE: &str = "default";
-
-/// Заголовок значения поколения профиля — версия формата, чтобы будущий разбор мог отличить
-/// своё от чужого, а не гадать по первой строке.
-const GEN_MAGIC: &str = "void-profile 1";
+/// Имя профиля и формат поколения живут в общем модуле [`profile`].
+use profile::{GEN_MAGIC, PROFILE};
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
@@ -118,6 +116,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         (Some(b"list"), _) => done(cmd_list()),
         (Some(b"gens"), _) => done(cmd_gens()),
         (Some(b"rollback"), _) => done(cmd_rollback()),
+        (Some(b"gc"), what) => done(cmd_gc(what == Some(b"all"))),
         _ => {
             usage();
             2
@@ -147,6 +146,7 @@ fn usage() {
     sys::write("  list                          что в активном поколении профиля\n".as_bytes());
     sys::write("  gens                          поколения профиля (активное — *)\n".as_bytes());
     sys::write("  rollback                      вернуть предыдущее поколение\n".as_bytes());
+    sys::write("  gc [all]                      убрать лишние пути (`all` — и старые поколения)\n".as_bytes());
 }
 
 // ── narinfo: разбор, отпечаток, подпись ─────────────────────────────────────────────────────
@@ -280,16 +280,6 @@ fn download(url: &str, root: &str) -> Result<[u8; 32], String> {
         return Err(String::from("корень не появился после загрузки"));
     }
     Ok(id)
-}
-
-/// Content-id именованного корня, если он есть.
-fn root_id(scap: usize, name: &str) -> Option<[u8; 32]> {
-    let mut id = [0u8; 32];
-    if sys::obj_get_root(scap, name.as_bytes(), &mut id) == 32 {
-        Some(id)
-    } else {
-        None
-    }
 }
 
 /// Размер куска, которым содержимое файла уезжает в store. Тот же, что у загрузчика: одинаковые
@@ -723,40 +713,7 @@ fn path_hash(arg: &[u8]) -> Result<&str, String> {
 
 // ── профиль ─────────────────────────────────────────────────────────────────────────────────
 
-fn gen_root(n: u32) -> String {
-    format!("pkg/profile/{}/gen{}", PROFILE, n)
-}
-
-fn current_root() -> String {
-    format!("pkg/profile/{}/current", PROFILE)
-}
-
-/// Номер активного поколения профиля. `None` — профиля ещё нет.
-fn read_current(scap: usize) -> Option<u32> {
-    let id = root_id(scap, &current_root())?;
-    let mut buf = [0u8; 64];
-    let n = sys::obj_get(scap, &id, &mut buf);
-    if n == 0 || n > buf.len() {
-        return None;
-    }
-    let s = core::str::from_utf8(&buf[..n]).ok()?;
-    roots::number(s.trim().strip_prefix("gen")?.as_bytes())
-}
-
-/// Сделать поколение активным: значение корня-указателя — ИМЯ поколения, а не его адрес.
-/// Так же устроен `system/current` ([[declarative-init]]): указатель на имя переживает то, что
-/// содержимое поколения переехало, и читается человеком в `roots`.
-fn set_current(scap: usize, n: u32) -> Result<(), String> {
-    let name = format!("gen{}", n);
-    let mut id = [0u8; 32];
-    if sys::obj_put(scap, name.as_bytes(), &mut id) != 0 {
-        return Err(String::from("имя поколения не влезло в store"));
-    }
-    if sys::obj_set_root(scap, current_root().as_bytes(), &id) != 0 {
-        return Err(String::from("указатель профиля не переключился"));
-    }
-    Ok(())
-}
+use profile::{current as read_current, gen_root, root_id, set_current};
 
 /// Номера существующих поколений профиля, по возрастанию.
 fn gen_numbers(scap: usize) -> Result<Vec<u32>, String> {
@@ -781,29 +738,7 @@ fn gen_text(paths: &[Entry]) -> String {
     s
 }
 
-/// Разобрать значение поколения: `(верхний уровень, имя пути, размер)`.
-fn parse_gen(text: &str) -> Result<Vec<(bool, String, usize)>, String> {
-    let mut lines = text.lines();
-    if lines.next() != Some(GEN_MAGIC) {
-        return Err(String::from("поколение профиля незнакомого формата"));
-    }
-    let mut out = Vec::new();
-    for line in lines {
-        let mut it = line.split_whitespace();
-        let (Some(kind), Some(base)) = (it.next(), it.next()) else { continue };
-        let size = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-        out.push((kind == "top", base.to_string(), size));
-    }
-    Ok(out)
-}
-
-/// Прочитать поколение по номеру.
-fn read_gen(scap: usize, n: u32) -> Result<Vec<(bool, String, usize)>, String> {
-    let id = root_id(scap, &gen_root(n)).ok_or_else(|| format!("нет поколения gen{}", n))?;
-    let bytes = archive::read_object(scap, &id, 1024 * 1024)?;
-    let text = core::str::from_utf8(&bytes).map_err(|_| "поколение профиля не UTF-8")?;
-    parse_gen(text)
-}
+use profile::read as read_gen;
 
 /// Записать новое поколение и сделать его активным. `false` во втором поле — содержимое совпало с
 /// активным поколением, нового не завели (та же защита от пустых поколений, что у `rebuild`).
@@ -833,7 +768,7 @@ fn write_gen(scap: usize, c: &Closure) -> Result<(u32, bool), String> {
 /// Пути верхнего уровня активного поколения (пусто, если профиля ещё нет).
 fn current_tops(scap: usize) -> Result<Vec<String>, String> {
     let Some(cur) = read_current(scap) else { return Ok(Vec::new()) };
-    Ok(read_gen(scap, cur)?.into_iter().filter(|(top, _, _)| *top).map(|(_, b, _)| b).collect())
+    Ok(read_gen(scap, cur)?.into_iter().filter(|i| i.top).map(|i| i.base).collect())
 }
 
 /// «1 путь», «2 пути», «5 путей». Мелочь, но эти строки читает человек, а не грепалка.
@@ -964,13 +899,12 @@ fn cmd_list() -> Result<(), String> {
         return Ok(());
     };
     let paths = read_gen(scap, cur)?;
-    let total: usize = paths.iter().map(|(_, _, s)| *s).sum();
+    let total: usize = paths.iter().map(|i| i.size).sum();
     sys::write(format!("профиль {} — поколение gen{}\n", PROFILE, cur).as_bytes());
-    for (top, base, _) in paths.iter().filter(|(t, _, _)| *t) {
-        let _ = top;
-        sys::write(format!("  {}\n", base).as_bytes());
+    for i in paths.iter().filter(|i| i.top) {
+        sys::write(format!("  {}\n", i.base).as_bytes());
     }
-    let deps: Vec<&String> = paths.iter().filter(|(t, _, _)| !*t).map(|(_, b, _)| b).collect();
+    let deps: Vec<&String> = paths.iter().filter(|i| !i.top).map(|i| &i.base).collect();
     if !deps.is_empty() {
         sys::write(format!("  зависимости ({}):\n", deps.len()).as_bytes());
         for d in deps {
@@ -1057,6 +991,70 @@ fn cmd_gens() -> Result<(), String> {
             .as_bytes(),
         );
     }
+    Ok(())
+}
+
+/// `pkg gc` — снять корни путей, которых нет НИ В ОДНОМ поколении профиля, и собрать мусор.
+///
+/// Модель та же, что у nix: корни — только у профилей, всё прочее рано или поздно уходит.
+/// Поколения при этом неприкосновенны: пока живо старое поколение, живы и его пути — иначе
+/// откат перестал бы работать, а он и есть главное свойство профиля.
+fn cmd_gc(drop_old: bool) -> Result<(), String> {
+    let scap = sys::start_cap(1);
+
+    // `all` — снести все поколения, кроме активного. Отдельной командой и по явной просьбе:
+    // после этого ОТКАТЫВАТЬСЯ НЕКУДА, а откат — главное свойство профиля.
+    if drop_old {
+        let active = read_current(scap);
+        for n in gen_numbers(scap)? {
+            if Some(n) == active {
+                continue;
+            }
+            sys::obj_del_root(scap, gen_root(n).as_bytes());
+            sys::write(format!("  поколение gen{} снято\n", n).as_bytes());
+        }
+    }
+
+    // Что держат ВСЕ оставшиеся поколения (не только активное).
+    let mut keep: Vec<String> = Vec::new();
+    for n in gen_numbers(scap)? {
+        for item in read_gen(scap, n).unwrap_or_default() {
+            let h = hash_of(&item.base).to_string();
+            if !keep.contains(&h) {
+                keep.push(h);
+            }
+        }
+    }
+
+    // Что лежит в сторе.
+    let text = roots::text(scap).ok_or("список корней store не прочитать целиком")?;
+    let mut dropped = 0usize;
+    for suffix in roots::suffixes(&text, b"pkg/tree/") {
+        let Ok(hash) = core::str::from_utf8(suffix) else { continue };
+        if hash.len() != HASH_LEN || keep.iter().any(|k| k == hash) {
+            continue;
+        }
+        sys::obj_del_root(scap, format!("pkg/tree/{}", hash).as_bytes());
+        // Метаданные пути больше не нужны: без дерева они ничего не описывают.
+        sys::obj_del_root(scap, format!("pkg/narinfo/{}", hash).as_bytes());
+        sys::write(format!("  снят {}\n", hash).as_bytes());
+        dropped += 1;
+    }
+
+    // Снятый корень сам по себе места не возвращает — по графу должен кто-то пройти.
+    let collected = sys::obj_gc(scap);
+    if collected == usize::MAX {
+        return Err(String::from("сборка мусора отклонена (нужен store WRITE)"));
+    }
+    sys::write(
+        format!(
+            "снято путей: {}, собрано объектов: {} (в поколениях осталось {})\n",
+            dropped,
+            collected,
+            keep.len()
+        )
+        .as_bytes(),
+    );
     Ok(())
 }
 

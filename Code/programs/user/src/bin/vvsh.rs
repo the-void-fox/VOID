@@ -32,6 +32,10 @@ mod archive;
 // Общий с `pkg` разбор списка корней store — по тому же доводу (Веха 107).
 #[path = "../roots.rs"]
 mod roots;
+// Профиль пакетов — ради PATH: голое слово ищется и среди установленного (Веха 109).
+#[allow(dead_code)] // писательская половина профиля нужна `pkg`, шеллу — чтение
+#[path = "../profile.rs"]
+mod profile;
 use vvsh_core::{Env, EvalError, Value};
 
 // ── глобальный аллокатор ──────────────────────────────────────────────────────
@@ -507,13 +511,28 @@ fn arg_string(v: &Value) -> String {
 }
 
 /// Спавн программы с NUL-разделёнными строковыми аргументами (наследует права shell'а через exec).
+///
+/// Порядок поиска (Веха 109) — сперва программы САМОЙ системы (корень store `bin/<имя>`), потом
+/// **профиль**: `<пакет>/bin/<имя>` у каждого установленного пакета верхнего уровня. Свои раньше
+/// чужих намеренно: пакет из nixpkgs не должен молча заслонять `vvsh` или `pkg`.
 fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
     let mut blob = alloc::vec::Vec::new();
     for w in arg_words {
         blob.extend_from_slice(w);
         blob.push(0);
     }
-    let code = px::spawn_args(cap_store(), name, &blob);
+    let mut code = px::spawn_args(cap_store(), name, &blob);
+    if code == usize::MAX {
+        // Кандидатов перебираем ВСЕХ по очереди, а не берём первого: в одном сторе спокойно
+        // живут пакеты разных архитектур (у нас там и x86-, и riscv-glibc), и `bin/getconf`
+        // есть у обоих — но запустится ровно свой.
+        for path in path_candidates(name) {
+            code = px::spawn_args(cap_store(), path.as_bytes(), &blob);
+            if code != usize::MAX {
+                break;
+            }
+        }
+    }
     if code == usize::MAX {
         sys::write("vvsh: команда не найдена: ".as_bytes());
         sys::write(name);
@@ -521,6 +540,28 @@ fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
     } else if code != 0 {
         sys::write(alloc::format!("[код {}]\n", code).as_bytes());
     }
+}
+
+/// Где в профиле может лежать программа `name`: `/nix/store/<пакет>/bin/<имя>` (Веха 109 — PATH).
+///
+/// Ищем только среди пакетов ВЕРХНЕГО УРОВНЯ: зависимости человек не устанавливал, и их `bin/` —
+/// не его PATH (у nix ровно та же граница: профиль ссылается лишь на то, что просили).
+fn path_candidates(name: &[u8]) -> alloc::vec::Vec<alloc::string::String> {
+    let ep = cap_fs();
+    let mut out = alloc::vec::Vec::new();
+    let Ok(name) = core::str::from_utf8(name) else { return out };
+    for item in profile::active(cap_store()) {
+        if !item.top {
+            continue;
+        }
+        let path = alloc::format!("/nix/store/{}/bin/{}", item.base, name);
+        if let Some((is_dir, _)) = px::stat(ep, path.as_bytes()) {
+            if !is_dir {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 fn is_callable(v: &Value) -> bool {
@@ -823,6 +864,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"unroot NAME", "отвязать сырой корень store");
     help_row(b"roots", "сырые корни store (bin/*, system/*, …)");
     help_row(b"init-config", "посеять /etc/system/*.vv");
+    help_row(b"pkg", "пакеты nixpkgs: install/list/remove/rollback/gc (программа)");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
     help_row(b"gens", "показать поколения системы (активно — *)");
     help_row(b"switch GEN", "выбрать поколение (после ребута)");

@@ -1713,10 +1713,18 @@ fn syscall(t: &mut Table, cur: usize) {
                     if let Ok(name) = core::str::from_utf8(name_bytes) {
                         // Веха 26: `bin/<имя>` расширяется в арх-корень `bin/<arch>/<имя>` —
                         // процессы говорят «bin/hello», не зная архитектуры под собой.
-                        let full = crate::prog_root(name);
-                        // Байты ELF копируем из store и сразу отпускаем его замок.
-                        let elf_bytes = crate::object::root(&full)
-                            .and_then(|id| crate::object::with(&id, |b| b.map(Vec::from)));
+                        // Веха 109 — АБСОЛЮТНЫЙ путь запускается из дерева пакета: так работает
+                        // PATH профиля (`/nix/store/<путь>/bin/<имя>`). Всё прочее — по-прежнему
+                        // корень store `bin/<arch>/<имя>`.
+                        let elf_bytes = if name.starts_with('/') {
+                            crate::lxfs::lookup(name.as_bytes())
+                                .and_then(|m| crate::lxfs::read_all(&m))
+                        } else {
+                            let full = crate::prog_root(name);
+                            // Байты ELF копируем из store и сразу отпускаем его замок.
+                            crate::object::root(&full)
+                                .and_then(|id| crate::object::with(&id, |b| b.map(Vec::from)))
+                        };
                         match elf_bytes {
                             Some(bytes) => {
                                 // Веха 89: памяти под новое пространство нет — отказ вызывающему
@@ -2382,6 +2390,33 @@ fn syscall(t: &mut Table, cur: usize) {
                 bytes.len()
             } else {
                 usize::MAX // куча под буфер не доотобразилась
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_OBJ_GC(store_cap) -> собрано объектов | MAX: сборка мусора store по достижимости
+        // от корней (Веха 109). Нужен store-cap с WRITE: это операция, меняющая store.
+        //
+        // Наружу она понадобилась пакетам: `pkg gc` снимает корни путей, выпавших из всех
+        // поколений профиля, — но пока никто не пройдёт по графу, место занято по-прежнему.
+        // Раньше сборка случалась только на загрузке, то есть «удалил — перезагрузись».
+        46 => {
+            let scap = t.procs[cur].frame.arg(0);
+            let dom = t.procs[cur].domain;
+            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) => {
+                    let (kept, collected) = crate::object::gc();
+                    println!(
+                        "  [gc] P{} по запросу: достижимо {}, собрано {}",
+                        cur, kept, collected
+                    );
+                    collected
+                }
+                Err(e) => {
+                    vprintln!("  [obj] P{} SYS_OBJ_GC отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);

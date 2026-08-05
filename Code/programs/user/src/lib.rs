@@ -106,6 +106,8 @@ const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
 const SYS_POWEROFF: usize = 44;
 const SYS_KILL: usize = 45;
+/// Веха 109 — сборка мусора store по требованию (нужна `pkg gc`).
+const SYS_OBJ_GC: usize = 46;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -497,6 +499,16 @@ pub fn obj_list_roots_ex(store_cap: usize, buf: &mut [u8]) -> Option<(usize, usi
 /// То же, но только «сколько байт доехало» — для тех, кому хватает одного буфера.
 pub fn obj_list_roots(store_cap: usize, buf: &mut [u8]) -> usize {
     obj_list_roots_ex(store_cap, buf).map_or(0, |(got, _)| got)
+}
+
+/// `SYS_OBJ_GC`: собрать мусор store — объекты, недостижимые от корней (Веха 109). Возвращает
+/// число собранных (`usize::MAX` — отказ: нужен store-cap с WRITE).
+///
+/// Снятый корень сам по себе места не возвращает: пока никто не прошёл по графу достижимости,
+/// объекты лежат как лежали. До этой операции сборка случалась только на загрузке — то есть
+/// «удалил пакет — перезагрузись».
+pub fn obj_gc(store_cap: usize) -> usize {
+    abi::syscall(SYS_OBJ_GC, store_cap, 0, 0, 0, 0, 0, 0).0
 }
 
 /// `SYS_LOG`: вкл/выкл подробный трейс ядра ([ipc]/[obj]/[mm]/…). По умолчанию интерактивная
