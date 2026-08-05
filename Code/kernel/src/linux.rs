@@ -91,7 +91,9 @@ pub enum Lx {
     /// Веха 108.3 — ЛЕГАСИ-варианты x86-64 без `dirfd`: путь лежит в ПЕРВОМ аргументе. На riscv
     /// их не существует вовсе (generic ABI знает только `*at`), а musl на x86 предпочитает
     /// именно их — из-за чего файловый мост там сперва отвечал ENOSYS на всё подряд.
+    Futex,
     Open,
+    Pread64,
     Stat,
     Lstat,
     Access,
@@ -112,6 +114,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         3 => Lx::Close,
         4 => Lx::Stat,   // legacy: (path, buf)
         6 => Lx::Lstat,  // legacy: как stat — ссылки мы и так не разыменовываем
+        17 => Lx::Pread64,
         21 => Lx::Access,
         5 => Lx::Fstat,
         8 => Lx::Lseek,
@@ -144,6 +147,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         108 => Lx::Getegid,
         116 => Lx::Setgroups,
         158 => Lx::ArchPrctl,
+        202 => Lx::Futex,
         186 => Lx::Gettid,
         217 => Lx::Getdents64,
         218 => Lx::SetTidAddress,
@@ -180,6 +184,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         62 => Lx::Lseek,
         63 => Lx::Read,
         64 => Lx::Write,
+        67 => Lx::Pread64,
         65 => Lx::Readv,
         66 => Lx::Writev,
         73 => Lx::Ppoll,
@@ -209,6 +214,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         159 => Lx::Setgroups,
         178 => Lx::Gettid,
         179 => Lx::Sysinfo,
+        98 => Lx::Futex,
         214 => Lx::Brk,
         215 => Lx::Munmap,
         216 => Lx::Mremap,
@@ -273,6 +279,7 @@ pub fn build_init_stack(
     env: &[u8],
     pie: &PieImage,
     random: [u8; 16],
+    interp_base: usize,
 ) -> (Vec<u8>, usize) {
     let argv = split_blob(args);
     let envp = split_blob(env);
@@ -300,7 +307,9 @@ pub fn build_init_stack(
         (AT_PHENT, pie.phentsize as u64),
         (AT_PHNUM, pie.phnum as u64),
         (AT_PAGESZ, PAGE as u64),
-        (AT_BASE, 0),
+        // Веха 108.4: база, по которой лёг ИНТЕРПРЕТАТОР (`ld.so`). Он находит по ней сам себя
+        // — без неё динамический бинарь не стартует вовсе. 0 — интерпретатора нет (static-PIE).
+        (AT_BASE, interp_base as u64),
         (AT_FLAGS, 0),
         (AT_ENTRY, pie.entry as u64),
         (AT_UID, 0),
@@ -385,10 +394,17 @@ pub fn fill_stat_chr(buf: &mut [u8]) {
 /// размер. Смещения те же, что у [`fill_stat_chr`]; заполняем ровно то, на что смотрят musl и
 /// `ld.so`: `st_mode` (регулярный/каталог/ссылка + исполняемый бит), `st_size`, `st_blksize`.
 ///
-/// `ty` — тип записи дерева пакета ([`void_tree`]); нули в прочих полях законны: времён у нас нет
-/// (пакет неизменяем, и врать про mtime хуже, чем показать эпоху), inode тоже (content-адрес не
-/// сводится к 64 битам осмысленно).
-pub fn fill_stat_file(buf: &mut [u8], size: u64, ty: u8) {
+/// `ty` — тип записи дерева пакета ([`void_tree`]), `ino` — **номер инода**.
+///
+/// Инод здесь не формальность, и это выяснилось дорого (Веха 108.4). `ld.so` считает объект уже
+/// загруженным, если пара `(st_dev, st_ino)` совпала с чем-то в списке загруженного, — а мы
+/// отдавали нули ВСЕМ файлам. Значит `libc.so.6` совпадала с самим бинарём: загрузчик закрывал
+/// её, не отобразив, и падал на «undefined symbol: __libc_start_main». Инод берётся из
+/// content-id: у одинакового содержимого он один и тот же — что как раз ВЕРНО, это один объект.
+///
+/// Времена остаются нулевыми намеренно: у пакета их нет, и врать про `mtime` хуже, чем показать
+/// эпоху.
+pub fn fill_stat_file(buf: &mut [u8], size: u64, ty: u8, ino: u64) {
     const S_IFREG: u32 = 0o0100000;
     const S_IFDIR: u32 = 0o0040000;
     const S_IFLNK: u32 = 0o0120000;
@@ -406,10 +422,20 @@ pub fn fill_stat_file(buf: &mut [u8], size: u64, ty: u8) {
     for b in buf.iter_mut() {
         *b = 0;
     }
+    // Раскладка `struct stat` у арх разная: у x86-64 после ino идёт nlink(8), у riscv64
+    // (generic) — mode(4)+nlink(4).
     #[cfg(target_arch = "x86_64")]
-    let (mode_off, size_off) = (24usize, 48usize);
+    let (mode_off, size_off, nlink_off, nlink_len) = (24usize, 48usize, 16usize, 8usize);
     #[cfg(target_arch = "riscv64")]
-    let (mode_off, size_off) = (16usize, 48usize);
+    let (mode_off, size_off, nlink_off, nlink_len) = (16usize, 48usize, 20usize, 4usize);
+    // st_dev — любой ненулевой: важна лишь пара (dev, ino) как признак «тот же файл».
+    if buf.len() >= 16 {
+        buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+        buf[8..16].copy_from_slice(&ino.to_le_bytes());
+    }
+    if buf.len() >= nlink_off + nlink_len {
+        buf[nlink_off..nlink_off + nlink_len].copy_from_slice(&1u64.to_le_bytes()[..nlink_len]);
+    }
     if buf.len() >= mode_off + 4 {
         buf[mode_off..mode_off + 4].copy_from_slice(&mode.to_le_bytes());
     }

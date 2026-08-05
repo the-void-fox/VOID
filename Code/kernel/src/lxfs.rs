@@ -90,8 +90,80 @@ fn tree_lookup(rel: &[u8]) -> Option<Meta> {
     }
 }
 
-/// Найти путь: сперва дерево пакета, затем обычный файл иерархии `posixfs` (корень `f<путь>`).
+/// Найти путь, **разыменовывая символические ссылки** — в том числе промежуточные (Веха 108.4).
+///
+/// Нужно это `ld.so`: в пакетах nixpkgs половина имён библиотек — ссылки (`libc.so.6` рядом с
+/// `libc.so.6.x`, `lib64 → lib`), и без разыменования загрузчик спотыкается на первой же.
+/// Потолок в 8 переходов — против петель, которые чужой пакет может завести и случайно.
 pub fn lookup(path: &[u8]) -> Option<Meta> {
+    let mut work: Vec<u8> = path.to_vec();
+    let mut hops = 0usize;
+    'restart: loop {
+        let n = work.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
+        for i in 1..=n {
+            // Префикс из первых `i` компонент — ищем ссылку как можно раньше.
+            let mut prefix: Vec<u8> = Vec::new();
+            for c in work.split(|&b| b == b'/').filter(|c| !c.is_empty()).take(i) {
+                prefix.push(b'/');
+                prefix.extend_from_slice(c);
+            }
+            let m = lookup_nofollow(&prefix)?;
+            if void_tree::is_link(m.ty) {
+                hops += 1;
+                if hops > 8 {
+                    return None;
+                }
+                let target = readlink(&m)?;
+                let mut next: Vec<u8> = Vec::new();
+                if target.first() == Some(&b'/') {
+                    next.extend_from_slice(&target);
+                } else {
+                    // Относительная цель — от каталога самой ссылки.
+                    let cut = prefix.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                    next.extend_from_slice(&prefix[..cut]);
+                    next.push(b'/');
+                    next.extend_from_slice(&target);
+                }
+                for c in work.split(|&b| b == b'/').filter(|c| !c.is_empty()).skip(i) {
+                    next.push(b'/');
+                    next.extend_from_slice(c);
+                }
+                work = next;
+                continue 'restart;
+            }
+            if i == n {
+                return Some(m);
+            }
+        }
+        return lookup_nofollow(&work); // путь без компонент — корень
+    }
+}
+
+/// Прочитать файл целиком (ядру это нужно ровно для одного: загрузить образ `ld.so`).
+pub fn read_all(meta: &Meta) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(meta.size as usize);
+    let mut off = 0u64;
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    while off < meta.size {
+        let n = read_at(meta, off, &mut buf);
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        off += n as u64;
+    }
+    (out.len() as u64 == meta.size).then_some(out)
+}
+
+/// Найти путь БЕЗ разыменования ссылок: сперва дерево пакета, затем обычный файл иерархии
+/// `posixfs` (корень `f<путь>`).
+pub fn lookup_nofollow(path: &[u8]) -> Option<Meta> {
+    // Родители точки монтирования синтетические: своего `/nix` в персоналии нет, но разбор пути
+    // обязан пройти сквозь него — иначе спотыкается сам поиск `ld.so`, чей путь начинается
+    // именно с него. (Ровно так же их показывает posixfs.)
+    if path == b"/" || path == b"/nix" {
+        return Some(Meta { id: ContentId([0u8; 32]), size: 0, ty: void_tree::K_DIR });
+    }
     if let Some(rel) = under_mount(path) {
         if rel.is_empty() {
             // Сам /nix/store — каталог, но у него нет узла: перечисление живёт в `store_roots`.
@@ -199,6 +271,12 @@ pub fn dir_entries(path: &[u8], meta: &Meta) -> Vec<(u8, String)> {
         }
     });
     out
+}
+
+/// Номер инода файла — первые 8 байт его content-id. Уникальность даётся содержимым: два файла
+/// с одинаковыми байтами и правда один объект, и `ld.so`, посчитав их одним, будет прав.
+pub fn ino(meta: &Meta) -> u64 {
+    u64::from_le_bytes(meta.id.0[..8].try_into().unwrap_or([0; 8]))
 }
 
 /// Цель символической ссылки.

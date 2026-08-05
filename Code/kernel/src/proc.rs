@@ -85,6 +85,11 @@ const USER_HEAP_BASE_VA: usize = 0x6000_0000;
 /// `programs/*/linker.ld`; [`crate::elf::load`] отвергает сегменты ниже этого адреса.
 pub const USER_REGION_START: usize = 0x4000_0000;
 
+/// Веха 108.4 — база, по которой ложится ДИНАМИЧЕСКИЙ ЗАГРУЗЧИК (`ld.so`) linux-процесса.
+/// Ровно посередине между образом программы ([`USER_REGION_START`]) и кучей: и тот и другая
+/// заведомо меньше 256 МиБ, так что пересечься им негде.
+const INTERP_BASE_VA: usize = 0x5000_0000;
+
 /// Веха 30: потолок доп. аргументов `SYS_EXEC` (NUL-разделённый блоб). Столько же, сколько
 /// буфер IPC-запроса, — аргументы длиннее пусть едут объектом store.
 /// Веха 98 — ответ `SYS_WAIT(nonblock)`, когда ребёнок ещё жив. Отличается от `usize::MAX`
@@ -447,6 +452,39 @@ fn spawn_linux_locked(
             return None;
         }
     };
+
+    // Веха 108.4 — ДИНАМИЧЕСКИЙ бинарь: у него в `PT_INTERP` записан абсолютный путь загрузчика
+    // (`/nix/store/…/ld-linux-…so`), то есть ровно в тот пакет, который мы уже умеем прочитать.
+    // Грузим загрузчик вторым образом и передаём управление ЕМУ: релокации, поиск библиотек и
+    // их отображение он делает сам — ядру остаётся дать ему mmap файлов и верный auxv.
+    let mut interp_base = 0usize;
+    let mut entry = pie.entry;
+    if let Some(ipath) = elf::interp_path(bytes) {
+        let Some(meta) = crate::lxfs::lookup(ipath) else {
+            println!("  [linux] загрузчик не найден: {}", core::str::from_utf8(ipath).unwrap_or("?"));
+            return None;
+        };
+        let Some(idata) = crate::lxfs::read_all(&meta) else {
+            println!("  [linux] загрузчик не читается");
+            return None;
+        };
+        match elf::load_pie(root, &idata, INTERP_BASE_VA, USER_HEAP_BASE_VA) {
+            Ok(ip) => {
+                interp_base = INTERP_BASE_VA;
+                entry = ip.entry;
+                vprintln!(
+                    "  [linux] загрузчик {} → база {:#x}, вход {:#x}",
+                    core::str::from_utf8(ipath).unwrap_or("?"),
+                    INTERP_BASE_VA,
+                    entry
+                );
+            }
+            Err(e) => {
+                println!("  [linux] загрузчик негоден: {:?}", e);
+                return None;
+            }
+        }
+    }
     // Минимальное окружение Linux — musl это устраивает (PATH/TERM/HOME на будущее для busybox).
     let env: &[u8] = b"PATH=/bin:/usr/bin\0TERM=linux\0HOME=/\0";
     // 16 байт AT_RANDOM (канарейка/ГПСЧ musl) — из счётчика тиков через splitmix64.
@@ -457,12 +495,13 @@ fn spawn_linux_locked(
         let bytes = seed.to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
-    let (block, sp) = crate::linux::build_init_stack(USER_STACK_TOP_VA, &args_blob, env, &pie, rnd);
+    let (block, sp) =
+        crate::linux::build_init_stack(USER_STACK_TOP_VA, &args_blob, env, &pie, rnd, interp_base);
 
-    let child = create_process_locked(t, pname, root, pie.entry, 0);
+    let child = create_process_locked(t, pname, root, entry, 0);
     // Стартовый кадр: вход = pie.entry, sp = вершина построенного стека (там argc). Аргументы
     // Linux читает со стека, а не из регистров — a0/rdi обнулены (musl `_start` их игнорирует).
-    t.procs[child].frame = TrapFrame::new_user(pie.entry, sp, 0);
+    t.procs[child].frame = TrapFrame::new_user(entry, sp, 0);
     t.procs[child].linux = true;
     t.procs[child].args = args_blob;
     t.procs[child].env = Vec::from(env);
@@ -891,7 +930,11 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                 if t.procs[cur].linux && is_linux_syscall_insn(&t, cur) {
                     linux_syscall(&mut t, cur);
                 } else {
-                    vprintln!("  [proc] неожиданный trap из U (код {:#x}) — процесс завершён", code);
+                    println!(
+                        "  [proc] неожиданный trap из U (код {:#x}) @ pc={:#x} — процесс завершён",
+                        code,
+                        t.procs[cur].frame.user_pc()
+                    );
                     t.procs[cur].state = State::Finished;
                     wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
                     if let Some(n) = t.next_runnable(cur) {
@@ -2734,6 +2777,69 @@ fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>
 /// Первый номер файлового дескриптора Linux-процесса: 0/1/2 заняты консолью.
 const LX_FD_BASE: usize = 3;
 
+/// Права страницы из `prot` линуксового `mmap`/`mprotect` (PROT_READ=1, WRITE=2, EXEC=4).
+///
+/// `PROT_NONE` мы отображаем как «читаемо»: ld.so резервирует им дыры между сегментами и потом
+/// перекрывает их FIXED-отображениями. Настоящая защита от чтения потребовала бы отдельного
+/// состояния «страница есть, но недоступна», а пользы для запуска бинаря не даёт.
+fn lx_page_flags(prot: usize) -> usize {
+    let mut f = arch::MAP_U | arch::MAP_R;
+    if prot & 2 != 0 {
+        f |= arch::MAP_W;
+    }
+    if prot & 4 != 0 {
+        f |= arch::MAP_X;
+    }
+    f
+}
+
+/// Материализовать диапазон страниц процесса с правами на ЗАПИСЬ (в них ещё предстоит копировать).
+/// `false` — не хватило памяти или квоты.
+fn lx_map_range(t: &mut Table, cur: usize, start: usize, size: usize, _prot: usize) -> bool {
+    let leader = t.procs[cur].group;
+    let root = arch::space_root(t.procs[cur].space);
+    let mut va = start;
+    while va < start + size {
+        // Страница могла остаться от ПРЕДЫДУЩЕГО отображения этого же диапазона (ld.so сперва
+        // резервирует весь файл, потом кладёт в него сегменты) — и остаться без права записи.
+        // Копировать в такую нечем, поэтому права возвращаем на запись независимо от того,
+        // была она отображена или нет.
+        if let Some(pa) = arch::translate(root, va) {
+            let _ = unsafe {
+                arch::map(root, va, pa & !(PAGE - 1), arch::MAP_R | arch::MAP_W | arch::MAP_U)
+            };
+        }
+        if arch::translate(root, va).is_none() {
+            if t.procs[leader].pages >= page_quota() {
+                return false;
+            }
+            let Some(pa) = frame::alloc() else { return false };
+            if !unsafe { arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U) } {
+                frame::free(pa);
+                return false;
+            }
+            t.procs[leader].pages += 1;
+        }
+        va += PAGE;
+    }
+    arch::flush_tlb();
+    true
+}
+
+/// Поставить диапазону страниц права `prot` (уже отображённым — не трогая их содержимого).
+fn lx_protect_range(t: &mut Table, cur: usize, start: usize, size: usize, prot: usize) {
+    let root = arch::space_root(t.procs[cur].space);
+    let flags = lx_page_flags(prot);
+    let mut va = start;
+    while va < start + size {
+        if let Some(pa) = arch::translate(root, va) {
+            let _ = unsafe { arch::map(root, va, pa & !(PAGE - 1), flags) };
+        }
+        va += PAGE;
+    }
+    arch::flush_tlb();
+}
+
 /// Веха 38 — трансля́тор Linux-syscall'ов для процессов личности `linux` ([`crate::linux`]).
 /// Зеркало VOID-диспетчера [`syscall`], но номера/семантика — Linux; завершённый вызов
 /// перешагивает свою инструкцию `skip_syscall_insn` (на riscv это sepc+4, на x86 rip+2),
@@ -2843,6 +2949,22 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
+        Some(Lx::Pread64) => {
+            // pread64(fd, buf, len, off) — им `ld.so` читает заголовки ELF, не двигая позицию.
+            let (fd, buf, len, off) = (a0, a1, a2, a(t, 3));
+            let slot = fd
+                .checked_sub(LX_FD_BASE)
+                .and_then(|i| t.procs[cur].lx_fds.get(i).cloned())
+                .flatten();
+            ret = match slot {
+                None => linux::err(linux::EBADF),
+                Some(f) => {
+                    let mut tmp = alloc::vec![0u8; len.min(64 * 1024)];
+                    let n = crate::lxfs::read_at(&f.meta, off as u64, &mut tmp);
+                    if lx_put(t, cur, buf, &tmp[..n]) { n } else { linux::err(linux::EFAULT) }
+                }
+            };
+        }
         Some(Lx::Readv) => {
             // Для stdin достаточно наполнить первый непустой iov (короткое чтение допустимо).
             let (fd, iov, iovcnt) = (a0, a1, a2);
@@ -2887,27 +3009,110 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             };
         }
         Some(Lx::Mmap) => {
-            // Только анонимные отображения (MAP_ANONYMOUS=0x20): отдаём под них хвост кучи,
-            // страницы приходят по фолту. Файловые (fd != -1) — пока ENOSYS.
-            let (len, flags, fd) = (a1, a2, a(t, 4) as isize);
+            // Веха 108.4 — три случая, и все три нужны динамическому загрузчику:
+            //   1) анонимное без адреса — хвост ленивой кучи (страницы придут по фолту);
+            //   2) MAP_FIXED — материализовать страницы ПО ЗАДАННОМУ адресу с правами `prot`
+            //      (ld.so сперва резервирует диапазон, потом кладёт в него сегменты);
+            //   3) файловое — то же плюс копирование содержимого из store.
+            let (addr, len, prot, flags, fd, off) =
+                (a0, a1, a2, a(t, 3), a(t, 4) as isize, a(t, 5));
             const MAP_ANONYMOUS: usize = 0x20;
-            if flags & MAP_ANONYMOUS == 0 && fd != -1 {
-                ret = linux::err(linux::ENOSYS);
+            const MAP_FIXED: usize = 0x10;
+            let anon = flags & MAP_ANONYMOUS != 0 || fd < 0;
+            let leader = t.procs[cur].group;
+            let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+            let size = (len + PAGE - 1) & !(PAGE - 1);
+
+            // Куда ложимся: заданный адрес (MAP_FIXED) либо хвост кучи.
+            let start = if flags & MAP_FIXED != 0 { addr & !(PAGE - 1) } else { t.procs[leader].heap_brk };
+            let end = start.saturating_add(size);
+            if len == 0 || end > limit || start < USER_HEAP_BASE_VA {
+                ret = linux::err(linux::ENOMEM);
             } else {
-                let leader = t.procs[cur].group;
-                let start = t.procs[leader].heap_brk;
-                let end = start.saturating_add((len + PAGE - 1) & !(PAGE - 1));
-                let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
-                if len == 0 || end > limit {
-                    ret = linux::err(linux::ENOMEM);
-                } else {
+                // Диапазон обязан числиться кучей: по нему пойдут фолты и проверки шлюзов.
+                if end > t.procs[leader].heap_brk {
                     t.procs[leader].heap_brk = end;
+                }
+                let need_data = !anon;
+                // Анонимное без FIXED оставляем ленивым (так было и раньше — дёшево); всё
+                // остальное материализуем сразу: под копирование содержимого страницы нужны.
+                let ok = if !need_data && flags & MAP_FIXED == 0 {
+                    true
+                } else {
+                    lx_map_range(t, cur, start, size, prot)
+                };
+                if !ok {
+                    ret = linux::err(linux::ENOMEM);
+                } else if anon && flags & MAP_FIXED != 0 {
+                    // MAP_ANONYMOUS обязано быть НУЛЯМИ, а страницы тут — не обязательно свежие:
+                    // ld.so сперва отображает файлом ВЕСЬ образ библиотеки (включая будущий bss),
+                    // и только потом накрывает хвост анонимным отображением. Без этого зануления
+                    // в bss оставались байты файла — glibc видел там «занятый» замок и вставал
+                    // намертво в futex, а printf брал оттуда указатель и падал в #GP.
+                    let zero = alloc::vec![0u8; PAGE];
+                    let mut done = 0usize;
+                    while done < size {
+                        let n = (size - done).min(PAGE);
+                        if !lx_put(t, cur, start + done, &zero[..n]) {
+                            break;
+                        }
+                        done += n;
+                    }
+                    lx_protect_range(t, cur, start, size, prot);
+                    vprintln!("  [linux] P{} mmap анонимно {:#x}+{:#x} — обнулено", cur, start, size);
+                    ret = start;
+                } else if need_data {
+                    let slot = fd
+                        .try_into()
+                        .ok()
+                        .and_then(|f: usize| f.checked_sub(LX_FD_BASE))
+                        .and_then(|i| t.procs[cur].lx_fds.get(i).cloned())
+                        .flatten();
+                    match slot {
+                        None => ret = linux::err(linux::EBADF),
+                        Some(f) => {
+                            // Копируем файловую часть; хвост до конца страниц остаётся нулевым
+                            // (фреймы приходят обнулёнными) — это и есть .bss сегмента.
+                            let mut done = 0usize;
+                            let mut buf = alloc::vec![0u8; 64 * 1024];
+                            while done < len {
+                                let take = (len - done).min(buf.len());
+                                let n = crate::lxfs::read_at(
+                                    &f.meta,
+                                    (off + done) as u64,
+                                    &mut buf[..take],
+                                );
+                                if n == 0 {
+                                    break;
+                                }
+                                if !lx_put(t, cur, start + done, &buf[..n]) {
+                                    break;
+                                }
+                                done += n;
+                            }
+                            // Права ставим ПОСЛЕ копирования: сегмент кода приходит без W, а
+                            // писать в него нам было надо.
+                            lx_protect_range(t, cur, start, size, prot);
+                            vprintln!(
+                                "  [linux] P{} mmap файла fd{} off={:#x} len={:#x} → {:#x} prot={} скопировано {:#x}",
+                                cur, fd, off, len, start, prot, done
+                            );
+                            ret = start;
+                        }
+                    }
+                } else {
                     ret = start;
                 }
             }
         }
         Some(Lx::Munmap) => ret = 0, // bump-куча не освобождает — утечка допустима (демо)
-        Some(Lx::Mprotect) => ret = 0, // W^X задан при загрузке; RELRO→RO чтим как no-op
+        Some(Lx::Mprotect) => {
+            // Веха 108.4 — теперь по-настоящему: ld.so переводит RELRO в read-only и ставит
+            // права сегментам, а страницы у нас появляются с правами из mmap.
+            let (addr, len, prot) = (a0, a1, a2);
+            lx_protect_range(t, cur, addr & !(PAGE - 1), (len + PAGE - 1) & !(PAGE - 1), prot);
+            ret = 0;
+        }
         Some(Lx::Madvise) => ret = 0,
         Some(Lx::Mremap) => ret = linux::err(linux::ENOSYS),
         // ── TLS и потоковые заглушки ────────────────────────────────────────────
@@ -2919,6 +3124,48 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 ret = 0;
             } else {
                 ret = linux::err(linux::EINVAL);
+            }
+        }
+        Some(Lx::Futex) => {
+            // Веха 108.4 — futex(uaddr, op, val, …). glibc берёт его на КАЖДЫЙ внутренний
+            // замок, и без него запуск обрывался на «The futex facility returned an unexpected
+            // error code» — то есть на ENOSYS, а не на самой блокировке.
+            //
+            // Кладём на механизм Вехи 35, которым живут нити VOID: FUTEX_WAIT засыпает, если
+            // слово ещё то самое, FUTEX_WAKE будит. Флаг PRIVATE (128) нам безразличен — futex
+            // и так живёт в адресном пространстве процесса, а CLOCK_REALTIME (256) значим лишь
+            // для таймаутов, которых мы пока не различаем.
+            const FUTEX_WAIT: usize = 0;
+            const FUTEX_WAKE: usize = 1;
+            let (uaddr, op, val) = (a0, a1 & 0x7f, a2);
+            match op {
+                FUTEX_WAIT => {
+                    let read = if ensure_heap_range(t, cur, uaddr, 4) {
+                        Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
+                    } else {
+                        None
+                    };
+                    match read {
+                        Some(v) if v == val as u32 => {
+                            // Ждём бессрочно: единственная нить linux-процесса разбудить себя не
+                            // может, но и попасть сюда при своей же незанятой блокировке — тоже.
+                            t.procs[cur].state = State::FutexWait;
+                            t.procs[cur].futex_addr = uaddr;
+                            t.procs[cur].futex_deadline = None;
+                            if let Some(n) = t.next_runnable(cur) {
+                                t.current = n;
+                            }
+                            done = false; // спим: кадр и PC не трогаем (проснёмся — повторим)
+                        }
+                        // Значение уже иное — EAGAIN, как и положено futex'у.
+                        _ => ret = linux::err(11),
+                    }
+                }
+                FUTEX_WAKE => {
+                    let space = t.procs[cur].space;
+                    ret = wake_futex(t, space, uaddr, val);
+                }
+                _ => ret = linux::err(linux::ENOSYS),
             }
         }
         Some(Lx::SetTidAddress) => ret = cur + 1, // «tid» = индекс процесса + 1
@@ -3132,7 +3379,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 None => linux::err(linux::EBADF),
                 Some(f) => {
                     let mut st = alloc::vec![0u8; linux::STAT_SIZE];
-                    linux::fill_stat_file(&mut st, f.meta.size, f.meta.ty);
+                    linux::fill_stat_file(&mut st, f.meta.size, f.meta.ty, crate::lxfs::ino(&f.meta));
                     if lx_put(t, cur, buf, &st) {
                         0
                     } else {
@@ -3161,7 +3408,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 Some(p) => match crate::lxfs::lookup(&p) {
                     Some(meta) => {
                         let mut st = alloc::vec![0u8; linux::STAT_SIZE];
-                        linux::fill_stat_file(&mut st, meta.size, meta.ty);
+                        linux::fill_stat_file(&mut st, meta.size, meta.ty, crate::lxfs::ino(&meta));
                         if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) }
                     }
                     None => linux::err(linux::ENOENT),
@@ -3186,7 +3433,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     None => linux::err(linux::EBADF),
                     Some(f) => {
                         let mut st = alloc::vec![0u8; linux::STAT_SIZE];
-                        linux::fill_stat_file(&mut st, f.meta.size, f.meta.ty);
+                        linux::fill_stat_file(&mut st, f.meta.size, f.meta.ty, crate::lxfs::ino(&f.meta));
                         if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) }
                     }
                 };
@@ -3198,7 +3445,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     Some(p) => match crate::lxfs::lookup(&p) {
                         Some(meta) => {
                             let mut st = alloc::vec![0u8; linux::STAT_SIZE];
-                            linux::fill_stat_file(&mut st, meta.size, meta.ty);
+                            linux::fill_stat_file(&mut st, meta.size, meta.ty, crate::lxfs::ino(&meta));
                             if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) }
                         }
                         None => linux::err(linux::ENOENT),

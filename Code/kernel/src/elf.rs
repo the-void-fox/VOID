@@ -50,6 +50,8 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
+/// Веха 108.4 — путь ИНТЕРПРЕТАТОРА (`ld.so`) у динамического бинаря.
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
 const PF_R: u32 = 1 << 2;
@@ -310,6 +312,39 @@ pub fn load_pie(root: usize, bytes: &[u8], base: usize, va_limit: usize) -> Resu
         phentsize: e_phentsize,
         phnum: e_phnum,
     })
+}
+
+/// Веха 108.4 — путь динамического загрузчика (`PT_INTERP`), если бинарь динамический.
+///
+/// У nixpkgs он абсолютный и указывает прямо в /nix/store — то есть в тот самый пакет, который
+/// мы уже умеем разложить и прочитать. Это и делает связку возможной: ничего искать не нужно,
+/// адрес загрузчика записан в самом бинаре.
+pub fn interp_path(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < EHDR_SIZE || &bytes[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let e_phoff = u64_at(bytes, 32) as usize;
+    let e_phentsize = u16_at(bytes, 54) as usize;
+    let e_phnum = u16_at(bytes, 56) as usize;
+    if e_phentsize == 0 || e_phoff.checked_add(e_phnum * e_phentsize)? > bytes.len() {
+        return None;
+    }
+    for i in 0..e_phnum {
+        let ph = e_phoff + i * e_phentsize;
+        if u32_at(bytes, ph) != PT_INTERP {
+            continue;
+        }
+        let off = u64_at(bytes, ph + 8) as usize;
+        let len = u64_at(bytes, ph + 32) as usize;
+        let end = off.checked_add(len)?;
+        if end > bytes.len() || len == 0 {
+            return None;
+        }
+        // Строка с завершающим нулём — отдаём без него.
+        let s = &bytes[off..end];
+        return Some(s.strip_suffix(b"\0").unwrap_or(s));
+    }
+    None
 }
 
 /// Веха 38 — тип ELF-объекта для выбора пути запуска: наш ET_EXEC ([`load`]) или
