@@ -55,18 +55,24 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::write("httpsc: нужно два аргумента — URL и имя корня store\n".as_bytes());
         sys::exit(2);
     };
+    // `-q` — молчать при успехе (Веха 107). Нужно тому, кто зовёт нас в цикле: `pkg` тянет
+    // замыкание из десятка путей, и отчёт о каждой загрузке тонул бы посреди отчёта о пакете.
+    // Об ошибке говорим ВСЕГДА: молчать о ней — совсем другое дело.
+    let quiet = it.next() == Some(b"-q");
 
     match run(url, root) {
         Ok((bytes, chunks, id)) => {
-            sys::write("скачано ".as_bytes());
-            write_dec(bytes);
-            sys::write(" байт, кусков ".as_bytes());
-            write_dec(chunks);
-            sys::write(", корень ".as_bytes());
-            sys::write(root);
-            sys::write(b"\n");
-            write_hex(&id);
-            sys::write(b"\n");
+            if !quiet {
+                sys::write("скачано ".as_bytes());
+                write_dec(bytes);
+                sys::write(" байт, кусков ".as_bytes());
+                write_dec(chunks);
+                sys::write(", корень ".as_bytes());
+                sys::write(root);
+                sys::write(b"\n");
+                write_hex(&id);
+                sys::write(b"\n");
+            }
             sys::exit(0);
         }
         Err(e) => {
