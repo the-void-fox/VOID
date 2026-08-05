@@ -319,7 +319,9 @@ fn put_node(scap: usize, data: &[u8], kids: &[[u8; 32]]) -> Result<[u8; 32], Str
 /// Каталог, который сейчас собирается: его индекс и ссылки на уже уложенное содержимое.
 struct DirFrame {
     name: String,
-    idx: tree::Index,
+    /// Тело индекса (заголовок допишется, когда станет известно число записей) и счётчик.
+    body: Vec<u8>,
+    count: u32,
     kids: Vec<[u8; 32]>,
 }
 
@@ -358,7 +360,8 @@ impl Builder {
     fn attach(&mut self, ty: u8, name: &str, size: u64, id: [u8; 32]) {
         match self.stack.last_mut() {
             Some(top) => {
-                top.idx.add(ty, name, size);
+                tree::push(&mut top.body, ty, name.as_bytes(), size);
+                top.count += 1;
                 top.kids.push(id);
             }
             None => self.root = Some((ty, id, size)),
@@ -371,16 +374,19 @@ impl Builder {
             Event::Dir { path } => {
                 self.stack.push(DirFrame {
                     name: leaf(path).to_string(),
-                    idx: tree::Index::new(),
+                    body: Vec::new(),
+                    count: 0,
                     kids: Vec::new(),
                 });
                 Ok(())
             }
             Event::DirEnd { .. } => (|| {
                 let f = self.stack.pop().ok_or_else(|| String::from("каталог закрылся дважды"))?;
-                let count = f.idx.len() as u64;
-                let id = put_node(self.scap, &f.idx.finish(), &f.kids)?;
-                self.attach(tree::K_DIR, &f.name, count, id);
+                let mut data = Vec::with_capacity(tree::HEAD + f.body.len());
+                data.extend_from_slice(&tree::head(f.count));
+                data.extend_from_slice(&f.body);
+                let id = put_node(self.scap, &data, &f.kids)?;
+                self.attach(tree::K_DIR, &f.name, f.count as u64, id);
                 Ok(())
             })(),
             Event::Symlink { path, target } => (|| {
@@ -461,9 +467,9 @@ fn unpack_tree(scap: usize, dl_id: &[u8; 32], base: &str) -> Result<([u8; 32], u
     // Корень пакета — индекс из ОДНОЙ записи с именем пути store. Так у пакета есть имя и тип
     // ровно там же, где у любой другой записи, а каталог `/nix/store` потом собирается склейкой
     // таких записей — без особого случая для верхнего уровня.
-    let mut idx = tree::Index::new();
-    idx.add(ty, base, size);
-    let root = put_node(scap, &idx.finish(), &[id])?;
+    let mut data = Vec::from(tree::head(1));
+    tree::push(&mut data, ty, base.as_bytes(), size);
+    let root = put_node(scap, &data, &[id])?;
 
     let digest: [u8; 32] = hasher.finalize().into();
     Ok((root, nbytes, nix_hash32(&digest)))
@@ -541,10 +547,26 @@ fn realize_one(scap: usize, hash: &str) -> Result<(NarInfo, [u8; 32], Option<Tim
 
 // ── чтение дерева пакета ────────────────────────────────────────────────────────────────────
 
-/// Прочитать узел-каталог: его индекс и content-id детей (по порядку записей).
-fn read_dir(scap: usize, id: &[u8; 32]) -> Result<(Vec<tree::Rec>, Vec<[u8; 32]>), String> {
+/// Одна запись каталога в собственной памяти — итератор `tree` отдаёт ломти чужого буфера,
+/// а буфер здесь живёт до конца вызова.
+#[derive(Clone)]
+struct Ent {
+    ty: u8,
+    name: String,
+    size: u64,
+}
+
+/// Прочитать узел-каталог: его записи и content-id детей (по порядку записей).
+fn read_dir(scap: usize, id: &[u8; 32]) -> Result<(Vec<Ent>, Vec<[u8; 32]>), String> {
     let data = archive::read_object(scap, id, 8 * 1024 * 1024)?;
-    let recs = tree::parse(&data).ok_or("это не каталог пакета")?;
+    let it = tree::iter(&data).ok_or("это не каталог пакета")?;
+    let recs: Vec<Ent> = it
+        .map(|r| Ent {
+            ty: r.ty,
+            name: String::from_utf8_lossy(r.name).into_owned(),
+            size: r.size,
+        })
+        .collect();
     let mut kids = vec![[0u8; 32]; recs.len()];
     if !recs.is_empty() && sys::obj_children(scap, id, &mut kids) != recs.len() {
         return Err(String::from("число ссылок каталога не сошлось с индексом"));
@@ -553,7 +575,7 @@ fn read_dir(scap: usize, id: &[u8; 32]) -> Result<(Vec<tree::Rec>, Vec<[u8; 32]>
 }
 
 /// Найти узел по пути внутри пакета: `(имя пакета, запись, id)`. Пустой путь — сам пакет.
-fn resolve(scap: usize, hash: &str, sub: &str) -> Result<(String, tree::Rec, [u8; 32]), String> {
+fn resolve(scap: usize, hash: &str, sub: &str) -> Result<(String, Ent, [u8; 32]), String> {
     let root = root_id(scap, &format!("pkg/tree/{}", hash))
         .ok_or("пакета нет в store — сначала `pkg fetch`")?;
     // Корень — индекс из одной записи: сам путь store.
@@ -582,7 +604,7 @@ fn resolve(scap: usize, hash: &str, sub: &str) -> Result<(String, tree::Rec, [u8
 /// Выдать содержимое файла кусками (`sink`) — целиком в память он не собирается.
 fn read_file<F: FnMut(&[u8])>(
     scap: usize,
-    rec: &tree::Rec,
+    rec: &Ent,
     id: &[u8; 32],
     mut sink: F,
 ) -> Result<(), String> {
@@ -825,6 +847,21 @@ fn paths_word(n: usize) -> &'static str {
         "пути"
     } else {
         "путей"
+    }
+}
+
+impl Ent {
+    fn is_dir(&self) -> bool {
+        tree::is_dir(self.ty)
+    }
+    fn is_link(&self) -> bool {
+        tree::is_link(self.ty)
+    }
+    fn is_exec(&self) -> bool {
+        tree::is_exec(self.ty)
+    }
+    fn is_blob(&self) -> bool {
+        tree::is_blob(self.ty)
     }
 }
 

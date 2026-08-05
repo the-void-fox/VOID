@@ -586,6 +586,7 @@ fn shell_env() -> Env {
         // Веха 84 — перенос команд vsh в vvsh: файлы/каталоги, store, сеть, поколения.
         ("roots", sh_roots),
         ("mkdir", sh_mkdir),
+        ("readlink", sh_readlink), // Веха 108.2 — симлинки есть только в дереве пакета
         ("rm", sh_rm),
         ("tail", sh_tail),
         ("mv", sh_mv),
@@ -631,7 +632,9 @@ fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
             )))
         }
     };
-    let mut buf = [0u8; 4096];
+    // Буфер в куче и с запасом (Веха 108.2): каталог ПАКЕТА бывает в сотни имён — у glibc в
+    // `lib/gconv` их 255, и на стековых 4 КиБ список снова начал бы упираться.
+    let mut buf = alloc::vec![0u8; 64 * 1024];
     let (n, want) = px::readdir_ex(ep, &path, &mut buf);
     if want > n {
         // Молчаливое обрезание списка — ровно то, на чём эта система уже обжигалась (запись,
@@ -959,6 +962,21 @@ fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
         None => sys::write("нет корней (или нет прав на store)\n".as_bytes()),
     }
     Ok(Value::nil())
+}
+
+/// `(readlink путь)` — цель символической ссылки. Ссылки в VOID пока живут только в дереве
+/// пакета под `/nix/store`: своих персоналия не заводит, а у настоящих пакетов их половина.
+fn sh_readlink(args: &[Value]) -> Result<Value, EvalError> {
+    let path = arg_path(args, "readlink: (readlink \"путь\")")?;
+    let mut buf = [0u8; 1024];
+    let n = px::readlink(cap_fs(), &path, &mut buf);
+    if n == 0 {
+        return Err(EvalError::new("не символическая ссылка (или нет такого пути)"));
+    }
+    match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => Ok(Value::str(s)),
+        Err(_) => Err(EvalError::new("цель ссылки не UTF-8")),
+    }
 }
 
 /// `(mkdir путь)` — создать каталог (относительно cwd).

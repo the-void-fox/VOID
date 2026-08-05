@@ -870,6 +870,16 @@ pub mod posix {
     pub const OP_RENAME: usize = 8;
     /// mkdir(path): создать каталог (Веха 44)
     pub const OP_MKDIR: usize = 9;
+    /// readlink(path) -> цель ссылки (пусто — не ссылка). Веха 108.2: симлинки есть только в
+    /// дереве пакета под `/nix/store` — своих персоналия по-прежнему не заводит.
+    pub const OP_READLINK: usize = 10;
+
+    /// Тип записи в ответе `stat` (7-й байт, Веха 108.2) — тот же, что в индексе дерева пакета.
+    pub const T_FILE: u8 = 0;
+    pub const T_DIR: u8 = 1;
+    pub const T_LINK: u8 = 2;
+    /// Исполняемый бит поверх типа.
+    pub const T_EXEC: u8 = 0x08;
 
     pub const SEEK_SET: usize = 0;
     pub const SEEK_CUR: usize = 1;
@@ -978,13 +988,30 @@ pub mod posix {
 
     /// `stat(path) -> Some((каталог?, размер)) | None` (Веха 44): для `cd`/проверок существования.
     pub fn stat(ep: usize, path: &[u8]) -> Option<(bool, usize)> {
-        let mut r = [0u8; 6];
+        stat_ex(ep, path).map(|(d, sz, _)| (d, sz))
+    }
+
+    /// То же плюс ТИП записи (Веха 108.2): по нему видно симлинк и исполняемый бит — в дереве
+    /// пакета это единственный способ их различить, а `ls` без этого показывал бы ссылку файлом.
+    pub fn stat_ex(ep: usize, path: &[u8]) -> Option<(bool, usize, u8)> {
+        let mut r = [0u8; 7];
         let n = crate::call(ep, OP_STAT, path, &mut r);
         if n < 6 || r[0] == 0 {
             return None;
         }
         let size = u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as usize;
-        Some((r[5] != 0, size))
+        let ty = if n >= 7 { r[6] } else { r[5] }; // старый сервер: только «каталог?»
+        Some((r[5] != 0, size, ty))
+    }
+
+    /// `readlink(path, buf) -> длина цели` (0 — не ссылка либо нет такой). Веха 108.2.
+    pub fn readlink(ep: usize, path: &[u8], buf: &mut [u8]) -> usize {
+        let n = crate::call(ep, OP_READLINK, path, buf);
+        if n == usize::MAX {
+            0
+        } else {
+            n
+        }
     }
 
     /// `spawn(name) -> код выхода` (аналог `posix_spawn`+`wait`): запустить программу из store

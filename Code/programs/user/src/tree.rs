@@ -1,4 +1,4 @@
-//! Дерево пакета в объектном store: формат каталога-узла (Веха 108).
+//! Дерево пакета в объектном store: формат каталога-узла (Вехи 108.1–108.2).
 //!
 //! Распакованный пакет ложится в store **как есть, деревом объектов**, а не файлами в posixfs:
 //!
@@ -11,8 +11,8 @@
 //! другие свойства. Он **неизменяем**, он **общий** между поколениями и профилями, и он большой.
 //! Content-адресация даёт на этом ровно то, что нужно, — дедуп одинаковых файлов между пакетами,
 //! достижимость вместо «списка не удалять», а GC подберёт то, на что перестали ссылаться. У
-//! posixfs же потолки его собственной задачи (путь 128 байт, файл 128 КиБ, индекс каталога 4 КиБ)
-//! — они разумны для конфигов и мешают пакетам. Показывать это дерево файловым API будет он же,
+//! posixfs же потолки его собственной задачи (путь, размер файла, индекс каталога) — они разумны
+//! для конфигов и мешают пакетам. Показывает это дерево файловым API он же (Веха 108.2),
 //! **читая тот же формат** через этот модуль: раскладка остаётся одной на всех.
 //!
 //! ## Формат индекса каталога
@@ -24,12 +24,17 @@
 //! `size` — размер файла в байтах (у каталога — число записей, у симлинка — длина цели): чтобы
 //! `stat` и `ls` не читали каждый объект ради одного числа. Порядок записей = порядок исходящих
 //! ссылок узла: i-я запись описывает i-го ребёнка.
-
-use alloc::string::String;
-use alloc::vec::Vec;
+//!
+//! **Модуль без `alloc` намеренно.** Его читает `posixfs`, живущий вообще без кучи, поэтому
+//! запись идёт в чужой буфер (`Extend<u8>` из `core`), а чтение — итератором по ломтям, без
+//! единой копии. Иначе формат пришлось бы разложить на две реализации — ровно то, ради чего его
+//! сюда и выносили.
 
 /// Заголовок индекса — чтобы разбор мог отличить своё от чужого, а не гадать по первым байтам.
 pub const MAGIC: &[u8; 4] = b"vt1\0";
+
+/// Длина заголовка: магия + счётчик записей.
+pub const HEAD: usize = 8;
 
 /// Вид записи (младшие три бита типа).
 pub const K_FILE: u8 = 0;
@@ -46,94 +51,114 @@ pub fn kind(ty: u8) -> u8 {
     ty & 0x07
 }
 
-/// Одна запись каталога.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Rec {
+pub fn is_dir(ty: u8) -> bool {
+    kind(ty) == K_DIR
+}
+
+pub fn is_link(ty: u8) -> bool {
+    kind(ty) == K_LINK
+}
+
+pub fn is_exec(ty: u8) -> bool {
+    ty & F_EXEC != 0
+}
+
+pub fn is_blob(ty: u8) -> bool {
+    ty & F_BLOB != 0
+}
+
+/// Заголовок индекса на `count` записей — пишется перед телом, когда оно уже собрано.
+pub fn head(count: u32) -> [u8; HEAD] {
+    let mut h = [0u8; HEAD];
+    h[..4].copy_from_slice(MAGIC);
+    h[4..].copy_from_slice(&count.to_le_bytes());
+    h
+}
+
+/// Дописать запись в тело индекса.
+///
+/// Имена в NAR отсортированы, и порядок сохраняется как есть: он часть содержимого (от него
+/// зависит content-id), и переупорядочивать его значило бы получать разные адреса для одного и
+/// того же дерева.
+pub fn push<E: Extend<u8>>(out: &mut E, ty: u8, name: &[u8], size: u64) {
+    let n = name.len().min(255);
+    out.extend([ty, n as u8]);
+    out.extend(name[..n].iter().copied());
+    out.extend(size.to_le_bytes());
+}
+
+/// Одна запись каталога — ломтями исходного буфера, без копий.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rec<'a> {
     pub ty: u8,
-    pub name: String,
+    pub name: &'a [u8],
     pub size: u64,
 }
 
-impl Rec {
+impl Rec<'_> {
     pub fn is_dir(&self) -> bool {
-        kind(self.ty) == K_DIR
+        is_dir(self.ty)
     }
     pub fn is_link(&self) -> bool {
-        kind(self.ty) == K_LINK
+        is_link(self.ty)
     }
     pub fn is_exec(&self) -> bool {
-        self.ty & F_EXEC != 0
+        is_exec(self.ty)
     }
     pub fn is_blob(&self) -> bool {
-        self.ty & F_BLOB != 0
+        is_blob(self.ty)
     }
 }
 
-/// Сборщик индекса каталога.
-#[derive(Default)]
-pub struct Index {
-    buf: Vec<u8>,
-    count: u32,
-}
-
-impl Index {
-    pub fn new() -> Self {
-        Index { buf: Vec::new(), count: 0 }
-    }
-
-    /// Добавить запись. Имена в NAR отсортированы, и мы сохраняем их порядок как есть: он часть
-    /// содержимого (от него зависит content-id), и переупорядочивать его значило бы получать
-    /// разные адреса для одного и того же дерева.
-    pub fn add(&mut self, ty: u8, name: &str, size: u64) {
-        self.buf.push(ty);
-        self.buf.push(name.len().min(255) as u8);
-        self.buf.extend_from_slice(&name.as_bytes()[..name.len().min(255)]);
-        self.buf.extend_from_slice(&size.to_le_bytes());
-        self.count += 1;
-    }
-
-    pub fn len(&self) -> u32 {
-        self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// Готовое значение узла-каталога.
-    pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + self.buf.len());
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&self.count.to_le_bytes());
-        out.extend_from_slice(&self.buf);
-        out
-    }
-}
-
-/// Разобрать индекс каталога. `None` — это не индекс (чужое значение либо обрезанное).
-pub fn parse(buf: &[u8]) -> Option<Vec<Rec>> {
-    if buf.len() < 8 || &buf[..4] != MAGIC {
+/// Обход записей индекса. `None` — это не индекс каталога (чужое значение либо обрезанное).
+pub fn iter(buf: &[u8]) -> Option<Iter<'_>> {
+    if buf.len() < HEAD || &buf[..4] != MAGIC {
         return None;
     }
-    let count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-    let mut out = Vec::with_capacity(count.min(4096));
-    let mut off = 8usize;
-    for _ in 0..count {
-        if off + 2 > buf.len() {
+    let count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    Some(Iter { buf, off: HEAD, left: count })
+}
+
+/// Сколько записей объявлено в индексе (без обхода).
+pub fn count(buf: &[u8]) -> Option<u32> {
+    iter(buf).map(|i| i.left)
+}
+
+pub struct Iter<'a> {
+    buf: &'a [u8],
+    off: usize,
+    left: u32,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = Rec<'a>;
+
+    fn next(&mut self) -> Option<Rec<'a>> {
+        if self.left == 0 {
             return None;
         }
-        let ty = buf[off];
-        let nlen = buf[off + 1] as usize;
-        off += 2;
-        if off + nlen + 8 > buf.len() {
+        let b = self.buf;
+        if self.off + 2 > b.len() {
+            self.left = 0;
             return None;
         }
-        let name = core::str::from_utf8(&buf[off..off + nlen]).ok()?;
-        off += nlen;
+        let ty = b[self.off];
+        let nlen = b[self.off + 1] as usize;
+        let name_at = self.off + 2;
+        if name_at + nlen + 8 > b.len() {
+            self.left = 0; // индекс обрезан — молча отдавать половину нельзя
+            return None;
+        }
+        let name = &b[name_at..name_at + nlen];
         let mut sz = [0u8; 8];
-        sz.copy_from_slice(&buf[off..off + 8]);
-        off += 8;
-        out.push(Rec { ty, name: String::from(name), size: u64::from_le_bytes(sz) });
+        sz.copy_from_slice(&b[name_at + nlen..name_at + nlen + 8]);
+        self.off = name_at + nlen + 8;
+        self.left -= 1;
+        Some(Rec { ty, name, size: u64::from_le_bytes(sz) })
     }
-    Some(out)
+}
+
+/// Найти запись по имени: `(порядковый номер, запись)`. Номер — это и номер исходящей ссылки узла.
+pub fn find<'a>(buf: &'a [u8], name: &[u8]) -> Option<(usize, Rec<'a>)> {
+    iter(buf)?.enumerate().find(|(_, r)| r.name == name)
 }

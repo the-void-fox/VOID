@@ -16,19 +16,160 @@
 
 use void_user as sys;
 use void_user::posix::{
-    OP_CLOSE, OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_RENAME, OP_SEEK, OP_STAT, OP_UNLINK,
-    OP_WRITE,
+    OP_CLOSE, OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_READLINK, OP_RENAME, OP_SEEK, OP_STAT,
+    OP_UNLINK, OP_WRITE,
 };
 use void_user::posix::{O_APPEND, O_TRUNC};
 
+// Формат дерева пакета — тот же модуль, которым его ПИШЕТ `pkg` (Веха 108.1). Он намеренно без
+// `alloc`: здесь кучи нет вовсе, поэтому индекс читается итератором по чужому буферу.
+#[allow(dead_code)] // писательская половина формата нужна `pkg`, не нам
+#[path = "../tree.rs"]
+mod tree;
+
 const NFILES: usize = 16;
-const PATH_MAX: usize = 128;
+/// Путь (Веха 108.2: было 128 — не хватало даже на `/nix/store/<хэш>-<имя>/lib/...`).
+const PATH_MAX: usize = 512;
 /// Веха 39: файл ≤ 128 КиБ (wasm-модули проходят через персоналию). Буферы — в ленивой куче.
+/// Для файлов ПАКЕТА этот потолок не действует: они читаются прямо из дерева store, кусками.
 const DATA_MAX: usize = 128 * 1024;
 /// Индекс каталога — на СТЕКЕ, свой скромный потолок (не DATA_MAX): count(u16) + записи.
 const DIR_MAX: usize = 4096;
 /// Имя корня = префикс `f`/`d` + абсолютный путь.
 const ROOT_MAX: usize = 1 + PATH_MAX;
+
+/// Точка монтирования дерева пакетов (Веха 108.2). Всё под ней — ЧТЕНИЕ: пакет неизменяем, и
+/// «записать в /nix/store» означало бы завести вторую правду о его содержимом.
+const MOUNT: &[u8] = b"/nix/store";
+
+/// Префикс корня store, под которым `pkg` держит распакованные деревья.
+const TREE_ROOT: &[u8] = b"pkg/tree/";
+
+/// Длина хэша пути nix.
+const HASH_LEN: usize = 32;
+
+/// Сколько исходящих ссылок узла мы готовы выписать за раз. Потолок осмысленный: столько записей
+/// в каталоге и столько кусков у файла (при куске 16 КиБ — файл до 64 МиБ).
+const KIDS_MAX: usize = 4096;
+
+/// Путь относительно точки монтирования — либо `None`, если он не под ней. Пустой ломоть значит
+/// сам каталог `/nix/store`. Проверка на `/` обязательна: `/nix/storage` — не наш путь.
+fn under_mount(path: &[u8]) -> Option<&[u8]> {
+    if path == MOUNT {
+        return Some(b"");
+    }
+    let rest = path.strip_prefix(MOUNT)?;
+    if rest.first() == Some(&b'/') {
+        Some(&rest[1..])
+    } else {
+        None
+    }
+}
+
+/// Найденный узел дерева пакета.
+#[derive(Clone, Copy)]
+struct Node {
+    ty: u8,
+    size: u64,
+    id: [u8; 32],
+}
+
+/// Спуститься по пути внутри `/nix/store` до узла. `ibuf` — рабочий буфер под индекс каталога,
+/// `kbuf` — под исходящие ссылки узла.
+fn tree_find(
+    scap: usize,
+    rel: &[u8],
+    ibuf: &mut [u8],
+    kbuf: &mut [[u8; 32]],
+) -> Option<Node> {
+    let mut parts = rel.split(|&b| b == b'/').filter(|c| !c.is_empty());
+    let base = parts.next()?;
+    if base.len() < HASH_LEN {
+        return None;
+    }
+    let mut rn = [0u8; 64];
+    let rl = TREE_ROOT.len() + HASH_LEN;
+    rn[..TREE_ROOT.len()].copy_from_slice(TREE_ROOT);
+    rn[TREE_ROOT.len()..rl].copy_from_slice(&base[..HASH_LEN]);
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(scap, &rn[..rl], &mut id) != 32 {
+        return None;
+    }
+
+    // Корень пакета — индекс из одной записи с полным именем пути: имя сверяется целиком, а не
+    // по хэшу, иначе `/nix/store/<хэш>-что-угодно` открывал бы чужой пакет.
+    let mut cur = Node { ty: tree::K_DIR, size: 0, id };
+    let mut name: &[u8] = base;
+    loop {
+        let n = sys::obj_get(scap, &cur.id, ibuf);
+        if n == 0 || n > ibuf.len() {
+            return None;
+        }
+        let (i, ty, size) = {
+            let (i, r) = tree::find(&ibuf[..n], name)?;
+            (i, r.ty, r.size)
+        };
+        if i >= kbuf.len() || sys::obj_children(scap, &cur.id, &mut kbuf[..i + 1]) < i + 1 {
+            return None;
+        }
+        cur = Node { ty, size, id: kbuf[i] };
+        match parts.next() {
+            Some(next) => {
+                if !tree::is_dir(cur.ty) {
+                    return None; // спуск сквозь файл или симлинк
+                }
+                name = next;
+            }
+            None => return Some(cur),
+        }
+    }
+}
+
+/// Прочитать кусок файла из дерева пакета: с `off` и сколько влезет в `out` (но не дальше конца
+/// текущего куска блоба — короткое чтение законно, клиент дочитает следующим вызовом).
+fn tree_read(
+    scap: usize,
+    node: &Node,
+    off: usize,
+    out: &mut [u8],
+    ibuf: &mut [u8],
+    kbuf: &mut [[u8; 32]],
+) -> usize {
+    if !tree::is_blob(node.ty) {
+        let n = sys::obj_get(scap, &node.id, ibuf);
+        if n == 0 || n > ibuf.len() || off >= n {
+            return 0;
+        }
+        let k = (n - off).min(out.len());
+        out[..k].copy_from_slice(&ibuf[off..off + k]);
+        return k;
+    }
+    let m = sys::obj_get(scap, &node.id, ibuf);
+    if m == 0 || m > ibuf.len() {
+        return 0;
+    }
+    let Some((total, nchunks, csize)) = sys::http::blob_info(&ibuf[..m]) else {
+        return 0;
+    };
+    if off >= total || csize == 0 {
+        return 0;
+    }
+    let ci = off / csize;
+    if ci >= nchunks || ci >= kbuf.len() {
+        return 0;
+    }
+    if sys::obj_children(scap, &node.id, &mut kbuf[..ci + 1]) < ci + 1 {
+        return 0;
+    }
+    let n = sys::obj_get(scap, &kbuf[ci], ibuf);
+    let within = off % csize;
+    if n == 0 || n > ibuf.len() || within >= n {
+        return 0;
+    }
+    let k = (n - within).min(out.len());
+    out[..k].copy_from_slice(&ibuf[within..within + k]);
+    k
+}
 
 // ─── пути ──────────────────────────────────────────────────────────────────────
 /// Нормализовать запрос в абсолютный путь в `out`, вернуть длину. Пусто/`.`/`/` → корень `/`;
@@ -154,12 +295,24 @@ fn idx_empty(dir: &[u8], len: usize) -> bool {
 #[no_mangle]
 pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     // Данные открытых файлов — в ленивой куче: NFILES страничных диапазонов, физпамять по факту.
-    let heap = sys::heap_map((NFILES + 1) * DATA_MAX);
+    // Веха 108.2 — ещё три области под дерево пакетов: индекс каталога/кусок файла (`ibuf`),
+    // исходящие ссылки узла (`kids`) и ОТВЕТ. Ответ переехал со стека, потому что каталог пакета
+    // бывает в сотни имён (у glibc `lib/gconv` — 255), и на 4 КиБ список снова начал бы упираться.
+    const AREAS: usize = NFILES + 3;
+    let kids_bytes = KIDS_MAX * 32;
+    let total = AREAS * DATA_MAX + kids_bytes;
+    let heap = sys::heap_map(total);
     if heap == usize::MAX {
         sys::exit(1);
     }
-    let all = unsafe { core::slice::from_raw_parts_mut(heap as *mut u8, (NFILES + 1) * DATA_MAX) };
-    let (files, scratch) = all.split_at_mut(NFILES * DATA_MAX);
+    let all = unsafe { core::slice::from_raw_parts_mut(heap as *mut u8, total) };
+    let (files, rest) = all.split_at_mut(NFILES * DATA_MAX);
+    let (scratch, rest) = rest.split_at_mut(DATA_MAX);
+    let (ibuf, rest) = rest.split_at_mut(DATA_MAX);
+    let (repbuf, kidsb) = rest.split_at_mut(DATA_MAX);
+    let kids = unsafe {
+        core::slice::from_raw_parts_mut(kidsb.as_mut_ptr() as *mut [u8; 32], KIDS_MAX)
+    };
 
     // Метаданные слотов файлов (кэш открытых) и таблица дескрипторов.
     let mut paths = [[0u8; PATH_MAX]; NFILES]; // абсолютный путь файла в слоте
@@ -170,13 +323,17 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     let mut fd_file = [0usize; NFILES];
     let mut fd_off = [0usize; NFILES];
     let mut fd_used = [false; NFILES];
+    // Слот файла ПАКЕТА: данные не копируются в `files` вовсе (libc.so.6 — 2.4 МБ), читается он
+    // прямо из дерева store по узлу.
+    let mut tnode = [Node { ty: 0, size: 0, id: [0u8; 32] }; NFILES];
+    let mut is_tree = [false; NFILES];
 
     let mut req = [0u8; 512];
-    // Ответ — с индекс каталога (Веха 105). Был 512 байт, и список из полусотни имён обрывался
-    // на 510-м байте МОЛЧА: `ls` каталога с распакованным пакетом показывал первые 18 файлов из
-    // 57 и ничем не выдавал, что показал не всё. Больше индекса каталога ответ быть не может,
-    // поэтому DIR_MAX здесь — не запас «на всякий случай», а точная граница.
-    let mut rep = [0u8; DIR_MAX];
+    // Ответ — размером с область в куче (Веха 108.2). Был 512 байт, и список из полусотни имён
+    // обрывался на 510-м байте МОЛЧА: `ls` каталога с распакованным пакетом показывал первые 18
+    // файлов из 57 и ничем не выдавал, что показал не всё (Веха 105 подняла его до индекса
+    // каталога). С пакетами и этого мало: у glibc в `lib/gconv` 255 записей.
+    let rep = repbuf;
     let mut idb = [0u8; 32];
     let mut dir = [0u8; DIR_MAX]; // рабочий буфер индекса каталога
     let mut pbuf = [0u8; PATH_MAX]; // нормализованный путь запроса
@@ -227,6 +384,11 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let pl = normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
+                // Пакет неизменяем: под точкой монтирования любая запись — отказ (Веха 108.2).
+                if under_mount(path).is_some() {
+                    sys::reply(m.reply_cap, &rep[..1]);
+                    continue;
+                }
                 if pl > 1 {
                     // родитель должен существовать (или это корень)
                     let par = parent(path);
@@ -250,6 +412,39 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 // req — путь; открыть/создать файл, вернуть [fd] (0xff — ошибка).
                 let pl = normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
+                // Файл ПАКЕТА (Веха 108.2): в слот кладётся узел дерева, а не содержимое —
+                // копировать libc.so.6 в буфер на 128 КиБ и незачем, и некуда.
+                if let Some(rel) = under_mount(path) {
+                    let mut nfd = usize::MAX;
+                    if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
+                        if !tree::is_dir(node.ty) && !tree::is_link(node.ty) {
+                            let free = (0..NFILES).find(|&j| !fused[j]).or_else(|| {
+                                (0..NFILES).find(|&j| {
+                                    !dirty[j] && !(0..NFILES).any(|d| fd_used[d] && fd_file[d] == j)
+                                })
+                            });
+                            if let Some(j) = free {
+                                fused[j] = true;
+                                dirty[j] = false;
+                                is_tree[j] = true;
+                                tnode[j] = node;
+                                size[j] = node.size as usize;
+                                let n = pl.min(PATH_MAX);
+                                path_len[j] = n;
+                                paths[j][..n].copy_from_slice(&path[..n]);
+                                if let Some(d) = (0..NFILES).find(|&d| !fd_used[d]) {
+                                    nfd = d;
+                                    fd_used[d] = true;
+                                    fd_file[d] = j;
+                                    fd_off[d] = 0;
+                                }
+                            }
+                        }
+                    }
+                    rep[0] = if nfd == usize::MAX { 0xff } else { nfd as u8 };
+                    sys::reply(m.reply_cap, &rep[..1]);
+                    continue;
+                }
                 // нельзя открыть каталог как файл
                 let is_dir = read_index(store_cap, path, &mut dir, &mut idb).is_some();
                 let mut fidx = usize::MAX;
@@ -280,6 +475,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             fidx = j;
                             fused[j] = true;
                             dirty[j] = false;
+                            is_tree[j] = false;
                             path_len[j] = pl;
                             paths[j][..pl].copy_from_slice(path);
                             let mut rn = [0u8; ROOT_MAX];
@@ -311,7 +507,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 reply_len = 1;
             }
             OP_WRITE => {
-                if fd < NFILES && fd_used[fd] {
+                if fd < NFILES && fd_used[fd] && !is_tree[fd_file[fd]] {
                     let fi = fd_file[fd];
                     let w = fd_off[fd];
                     let n = len.min(DATA_MAX - w);
@@ -327,18 +523,56 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 if fd < NFILES && fd_used[fd] {
                     let fi = fd_file[fd];
                     let r = fd_off[fd];
-                    let n = size[fi].saturating_sub(r).min(rep.len());
-                    rep[..n].copy_from_slice(&files[fi * DATA_MAX + r..fi * DATA_MAX + r + n]);
-                    fd_off[fd] = r + n;
-                    reply_len = n;
+                    if is_tree[fi] {
+                        // Чтение файла пакета — прямо из дерева store; ответ не длиннее куска
+                        // блоба (короткое чтение законно, клиент дочитает следующим вызовом).
+                        let n = tree_read(store_cap, &tnode[fi], r, rep, ibuf, kids);
+                        fd_off[fd] = r + n;
+                        reply_len = n;
+                    } else {
+                        let n = size[fi].saturating_sub(r).min(rep.len());
+                        rep[..n].copy_from_slice(&files[fi * DATA_MAX + r..fi * DATA_MAX + r + n]);
+                        fd_off[fd] = r + n;
+                        reply_len = n;
+                    }
                 }
             }
             OP_STAT => {
-                // req — путь. rep = [есть:1 | размер:4 LE | каталог:1].
+                // req — путь. rep = [есть:1 | размер:4 LE | каталог:1 | тип записи:1].
+                // Седьмой байт (Веха 108.2) несёт ТИП дерева пакета — по нему видно симлинк и
+                // исполняемый бит; старые клиенты читают первые шесть и не замечают разницы.
                 let pl = normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 let mut sz = usize::MAX;
                 let mut is_dir = false;
+                let mut ty = 0u8;
+                if path == b"/nix" && read_index(store_cap, path, &mut dir, &mut idb).is_none() {
+                    rep[0] = 1;
+                    rep[1..5].copy_from_slice(&0u32.to_le_bytes());
+                    rep[5] = 1;
+                    rep[6] = tree::K_DIR;
+                    sys::reply(m.reply_cap, &rep[..7]);
+                    continue;
+                }
+                if let Some(rel) = under_mount(path) {
+                    if rel.is_empty() {
+                        // Сам /nix/store — каталог, который есть всегда: он состоит из корней.
+                        is_dir = true;
+                        sz = 0;
+                        ty = tree::K_DIR;
+                    } else if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
+                        is_dir = tree::is_dir(node.ty);
+                        sz = node.size as usize;
+                        ty = node.ty;
+                    }
+                    rep[0] = (sz != usize::MAX) as u8;
+                    let szv = if sz == usize::MAX { 0 } else { sz } as u32;
+                    rep[1..5].copy_from_slice(&szv.to_le_bytes());
+                    rep[5] = is_dir as u8;
+                    rep[6] = ty;
+                    sys::reply(m.reply_cap, &rep[..7]);
+                    continue;
+                }
                 if read_index(store_cap, path, &mut dir, &mut idb).is_some() {
                     is_dir = true;
                     sz = 0;
@@ -361,7 +595,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let szv = if sz == usize::MAX { 0 } else { sz } as u32;
                 rep[1..5].copy_from_slice(&szv.to_le_bytes());
                 rep[5] = is_dir as u8;
-                reply_len = 6;
+                rep[6] = if is_dir { tree::K_DIR } else { tree::K_FILE };
+                reply_len = 7;
             }
             OP_UNLINK => {
                 // req — путь. Файл: снять корень `f<path>` + убрать из родителя. Каталог: только
@@ -369,6 +604,10 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let pl = normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
+                if under_mount(path).is_some() {
+                    sys::reply(m.reply_cap, &rep[..1]);
+                    continue;
+                }
                 if pl > 1 {
                     let par = parent(path);
                     if let Some(dlen) = read_index(store_cap, path, &mut dir, &mut idb) {
@@ -432,6 +671,10 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     let mut newp = [0u8; PATH_MAX];
                     let onl = normalize(&req[1..1 + ol], &mut oldp);
                     let mut nnl = normalize(&req[1 + ol..len], &mut newp);
+                    if under_mount(&oldp[..onl]).is_some() || under_mount(&newp[..nnl]).is_some() {
+                        sys::reply(m.reply_cap, &rep[..1]);
+                        continue;
+                    }
                     // Если цель — СУЩЕСТВУЮЩИЙ КАТАЛОГ, POSIX кладёт файл ВНУТРЬ него
                     // (`mv файл каталог` = `mv файл каталог/файл`). Без этого содержимое файла
                     // вешалось на корень `f<каталог>` рядом с живым `d<каталог>`: файл
@@ -494,11 +737,113 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 }
                 reply_len = 1;
             }
+            OP_READLINK => {
+                // req — путь. Ответ: цель ссылки (пусто — не ссылка либо нет такой).
+                // Симлинки есть только в дереве пакета: своих в персоналии по-прежнему нет.
+                let pl = normalize(&req[..len], &mut pbuf);
+                let path = &pbuf[..pl];
+                if let Some(rel) = under_mount(path) {
+                    if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
+                        if tree::is_link(node.ty) {
+                            reply_len = sys::obj_get(store_cap, &node.id, rep).min(rep.len());
+                        }
+                    }
+                }
+            }
             OP_READDIR => {
                 // req — путь каталога (пусто/`.`/`/` → корень). Ответ: имена через '\n',
                 // у каталогов — с хвостовым '/'.
                 let pl = normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
+                // Дерево пакетов (Веха 108.2). Сам `/nix/store` — не индекс, а СПИСОК КОРНЕЙ
+                // `pkg/tree/*`: пакет виден ровно тогда, когда он в сторе, и отдельного каталога
+                // для этого заводить не нужно.
+                if let Some(rel) = under_mount(path) {
+                    if rel.is_empty() {
+                        let (got, want) = sys::obj_list_roots_ex(store_cap, ibuf).unwrap_or((0, 0));
+                        if want > got {
+                            // Молча показать часть — ровно та беда, которую в этой системе ловят
+                            // поимённо; лучше отдать пусто, чем «пакетов нет, наверное».
+                            reply_len = 0;
+                        } else {
+                            let mut off = 0usize;
+                            // Каждая строка списка: 12 hex короткого id + два пробела + имя.
+                            for line in ibuf[..got].split(|&b| b == b'\n') {
+                                if line.len() <= 14 {
+                                    continue;
+                                }
+                                let Some(h) = line[14..].strip_prefix(TREE_ROOT) else { continue };
+                                if h.len() < HASH_LEN {
+                                    continue;
+                                }
+                                // Имя пакета лежит в его же корневом индексе — там оно полное.
+                                let mut rn = [0u8; 64];
+                                let rl = TREE_ROOT.len() + HASH_LEN;
+                                rn[..TREE_ROOT.len()].copy_from_slice(TREE_ROOT);
+                                rn[TREE_ROOT.len()..rl].copy_from_slice(&h[..HASH_LEN]);
+                                let mut tid = [0u8; 32];
+                                if sys::obj_get_root(store_cap, &rn[..rl], &mut tid) != 32 {
+                                    continue;
+                                }
+                                let n = sys::obj_get(store_cap, &tid, scratch);
+                                let Some(mut it) = tree::iter(&scratch[..n.min(scratch.len())])
+                                else {
+                                    continue;
+                                };
+                                let Some(r) = it.next() else { continue };
+                                for &b in r.name {
+                                    if off + 2 < rep.len() {
+                                        rep[off] = b;
+                                        off += 1;
+                                    }
+                                }
+                                if r.is_dir() && off + 1 < rep.len() {
+                                    rep[off] = b'/';
+                                    off += 1;
+                                }
+                                if off < rep.len() {
+                                    rep[off] = b'\n';
+                                    off += 1;
+                                }
+                            }
+                            reply_len = off;
+                        }
+                    } else if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
+                        if tree::is_dir(node.ty) {
+                            let n = sys::obj_get(store_cap, &node.id, ibuf);
+                            if let Some(it) = tree::iter(&ibuf[..n.min(ibuf.len())]) {
+                                let mut off = 0usize;
+                                for r in it {
+                                    for &b in r.name {
+                                        if off + 2 < rep.len() {
+                                            rep[off] = b;
+                                            off += 1;
+                                        }
+                                    }
+                                    if r.is_dir() && off + 1 < rep.len() {
+                                        rep[off] = b'/';
+                                        off += 1;
+                                    }
+                                    if off < rep.len() {
+                                        rep[off] = b'\n';
+                                        off += 1;
+                                    }
+                                }
+                                reply_len = off;
+                            }
+                        }
+                    }
+                    sys::reply(m.reply_cap, &rep[..reply_len]);
+                    continue;
+                }
+                // Родитель точки монтирования: `/nix` показывает `store/`, даже если своего
+                // каталога `/nix` в персоналии нет.
+                if path == b"/nix" && read_index(store_cap, path, &mut dir, &mut idb).is_none() {
+                    rep[..6].copy_from_slice(b"store/");
+                    rep[6] = b'\n';
+                    sys::reply(m.reply_cap, &rep[..7]);
+                    continue;
+                }
                 if let Some(dlen) = read_index(store_cap, path, &mut dir, &mut idb) {
                     let cnt = if dlen >= 2 {
                         u16::from_le_bytes([dir[0], dir[1]]) as usize
