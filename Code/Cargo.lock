@@ -90,6 +90,7 @@ version = "0.0.1"
 dependencies = [
  "void-abi",
  "void-store",
+ "void-tree",
 ]
 
 [[package]]
@@ -102,3 +103,7 @@ version = "0.0.1"
 dependencies = [
  "void-abi",
 ]
+
+[[package]]
+name = "void-tree"
+version = "0.0.1"

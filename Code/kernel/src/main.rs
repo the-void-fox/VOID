@@ -73,6 +73,8 @@ mod frame;
 mod heap;
 mod init;
 mod linux;
+/// Веха 108.3 — файлы для персоналии Linux: чтение прямо из объектного store.
+mod lxfs;
 mod object;
 mod proc;
 mod jitter;

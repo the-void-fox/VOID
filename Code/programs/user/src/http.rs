@@ -29,7 +29,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_STALLS: usize = 3;
 
 /// Заголовок манифеста блоба. Версия в имени — чтобы будущий формат не спутали с этим.
-const MAGIC: &[u8; 9] = b"VOIDBLOB1";
+use void_tree::blob::MAGIC;
 
 /// Рабочие буферы, которые даёт вызывающий: у него есть куча, у библиотеки — нет.
 pub struct Sink<'a> {
@@ -564,37 +564,17 @@ fn resolve(net_ep: usize, name: &str) -> Result<[u8; 4], &'static str> {
 /// Собрать манифест блоба: magic, общая длина, число кусков, размер куска.
 ///
 /// Публичный, потому что тем же форматом пишет HTTPS-клиент (Веха 95, `bin/httpsc`): скачанное
-/// по http и по https обязано быть неотличимо для всего, что дальше с ним работает.
+/// по http и по https обязано быть неотличимо для всего, что дальше с ним работает. Сама
+/// раскладка с Вехи 108.3 живёт в `void_tree::blob` — её читают ещё posixfs и ядро.
 pub fn blob_manifest(total: usize, chunks: usize) -> [u8; MAGIC.len() + 16] {
-    let mut m = [0u8; MAGIC.len() + 16];
-    let mut p = 0;
-    m[p..p + MAGIC.len()].copy_from_slice(MAGIC);
-    p += MAGIC.len();
-    m[p..p + 8].copy_from_slice(&(total as u64).to_le_bytes());
-    p += 8;
-    m[p..p + 4].copy_from_slice(&(chunks as u32).to_le_bytes());
-    p += 4;
-    // Размер куска — в манифесте, а не в коде читателя: иначе смена `CHUNK` в будущем сделала
-    // бы уже лежащие в сторе блобы нечитаемыми.
-    m[p..p + 4].copy_from_slice(&(CHUNK as u32).to_le_bytes());
-    m
+    void_tree::blob::manifest(total, chunks, CHUNK)
 }
 
 /// Разобрать манифест блоба: (общая длина, число кусков, размер куска). `None` — это не блоб.
 ///
 /// Размер куска берётся из манифеста, а не из константы: блобы, лежащие в сторе, должны
-/// читаться и после того, как [`CHUNK`] в коде поменяется.
+/// читаться и после того, как [`CHUNK`] в коде поменяется. (Блобы Вехи 94 первого вида несли
+/// вместо этого поля длину ПЕРВОГО куска — для полного куска это одно и то же.)
 pub fn blob_info(manifest: &[u8]) -> Option<(usize, usize, usize)> {
-    if manifest.len() < MAGIC.len() + 12 || &manifest[..MAGIC.len()] != MAGIC {
-        return None;
-    }
-    let total = u64::from_le_bytes(manifest[MAGIC.len()..MAGIC.len() + 8].try_into().ok()?);
-    let n = u32::from_le_bytes(manifest[MAGIC.len() + 8..MAGIC.len() + 12].try_into().ok()?);
-    // Блобы Вехи 94 первого вида несли вместо этого поля длины кусков — у них здесь длина
-    // ПЕРВОГО куска, что для полного куска совпадает с его размером.
-    let chunk = manifest
-        .get(MAGIC.len() + 12..MAGIC.len() + 16)
-        .and_then(|s| s.try_into().ok())
-        .map_or(CHUNK, |b| u32::from_le_bytes(b) as usize);
-    Some((total as usize, n as usize, if chunk == 0 { CHUNK } else { chunk }))
+    void_tree::blob::info(manifest, CHUNK)
 }

@@ -25,6 +25,9 @@ pub const EINVAL: isize = 22;
 pub const ENOSYS: isize = 38;
 pub const ENOTTY: isize = 25;
 pub const ESPIPE: isize = 29;
+/// Веха 108.3 — файловая система только для чтения: пакет неизменяем, и врать «нет файла» на
+/// попытку записи было бы хуже, чем сказать правду.
+pub const EROFS: isize = 30;
 
 /// Обёрнутый в usize код ошибки (`-errno` в дополнительном коде — как возвращает ядро Linux).
 pub fn err(e: isize) -> usize {
@@ -85,6 +88,14 @@ pub enum Lx {
     Ppoll,
     Faccessat,
     Readlinkat,
+    /// Веха 108.3 — ЛЕГАСИ-варианты x86-64 без `dirfd`: путь лежит в ПЕРВОМ аргументе. На riscv
+    /// их не существует вовсе (generic ABI знает только `*at`), а musl на x86 предпочитает
+    /// именно их — из-за чего файловый мост там сперва отвечал ENOSYS на всё подряд.
+    Open,
+    Stat,
+    Lstat,
+    Access,
+    Readlink,
     Dup,
     Dup3,
     ExitGroup,
@@ -97,7 +108,11 @@ pub fn decode(nr: usize) -> Option<Lx> {
     Some(match nr {
         0 => Lx::Read,
         1 => Lx::Write,
+        2 => Lx::Open,   // legacy: musl на x86-64 предпочитает его openat'у
         3 => Lx::Close,
+        4 => Lx::Stat,   // legacy: (path, buf)
+        6 => Lx::Lstat,  // legacy: как stat — ссылки мы и так не разыменовываем
+        21 => Lx::Access,
         5 => Lx::Fstat,
         8 => Lx::Lseek,
         9 => Lx::Mmap,
@@ -118,7 +133,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         63 => Lx::Uname,
         72 => Lx::Fcntl,
         79 => Lx::Getcwd,
-        89 => Lx::Readlinkat, // readlink(x86) → трактуем как readlinkat
+        89 => Lx::Readlink, // legacy: (path, buf, size) — БЕЗ dirfd
         96 => Lx::Gettimeofday,
         99 => Lx::Sysinfo,
         102 => Lx::Getuid,
@@ -363,6 +378,52 @@ pub fn fill_stat_chr(buf: &mut [u8]) {
     let blksz_off = 56usize;
     if buf.len() >= blksz_off + 8 {
         buf[blksz_off..blksz_off + 8].copy_from_slice(&4096u64.to_le_bytes());
+    }
+}
+
+/// Веха 108.3 — заполнить linux `struct stat` для ФАЙЛА из объектного store: тип, права и
+/// размер. Смещения те же, что у [`fill_stat_chr`]; заполняем ровно то, на что смотрят musl и
+/// `ld.so`: `st_mode` (регулярный/каталог/ссылка + исполняемый бит), `st_size`, `st_blksize`.
+///
+/// `ty` — тип записи дерева пакета ([`void_tree`]); нули в прочих полях законны: времён у нас нет
+/// (пакет неизменяем, и врать про mtime хуже, чем показать эпоху), inode тоже (content-адрес не
+/// сводится к 64 битам осмысленно).
+pub fn fill_stat_file(buf: &mut [u8], size: u64, ty: u8) {
+    const S_IFREG: u32 = 0o0100000;
+    const S_IFDIR: u32 = 0o0040000;
+    const S_IFLNK: u32 = 0o0120000;
+    let kind = if void_tree::is_dir(ty) {
+        S_IFDIR
+    } else if void_tree::is_link(ty) {
+        S_IFLNK
+    } else {
+        S_IFREG
+    };
+    // Права: читать всем; исполнять — если бит стоял в NAR (у `ld.so` и `libc.so.6` он стоит,
+    // и `ld.so` на него смотрит, решая, можно ли отобразить сегмент исполняемым).
+    let perm: u32 = if void_tree::is_exec(ty) || void_tree::is_dir(ty) { 0o555 } else { 0o444 };
+    let mode = kind | perm;
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let (mode_off, size_off) = (24usize, 48usize);
+    #[cfg(target_arch = "riscv64")]
+    let (mode_off, size_off) = (16usize, 48usize);
+    if buf.len() >= mode_off + 4 {
+        buf[mode_off..mode_off + 4].copy_from_slice(&mode.to_le_bytes());
+    }
+    if buf.len() >= size_off + 8 {
+        buf[size_off..size_off + 8].copy_from_slice(&size.to_le_bytes());
+    }
+    let blksz_off = 56usize;
+    if buf.len() >= blksz_off + 8 {
+        buf[blksz_off..blksz_off + 8].copy_from_slice(&4096u64.to_le_bytes());
+    }
+    // st_blocks (512-байтные блоки) — сразу за st_blksize; `du` и часть проверок смотрят туда.
+    let blocks_off = 64usize;
+    if buf.len() >= blocks_off + 8 {
+        buf[blocks_off..blocks_off + 8].copy_from_slice(&size.div_ceil(512).to_le_bytes());
     }
 }
 

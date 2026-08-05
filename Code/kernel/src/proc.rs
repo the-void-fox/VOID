@@ -200,6 +200,23 @@ struct Proc {
     parent: usize,
     /// Веха 98 — код выхода, сохранённый до `SYS_WAIT`. `None` — процесс ещё жив.
     exit_code: Option<usize>,
+    /// Веха 108.3 — открытые файлы личности Linux (дескрипторы с 3; 0/1/2 — консоль). Читаются
+    /// прямо из объектного store ([`crate::lxfs`]), потому что ходить из syscall'а по IPC к
+    /// файловому серверу нечем. Пусто у всех, кроме linux-процессов.
+    lx_fds: Vec<Option<LxFd>>,
+}
+
+/// Открытый файл личности Linux: что читать, откуда и где мы в нём находимся.
+#[derive(Clone)]
+struct LxFd {
+    meta: crate::lxfs::Meta,
+    /// Позиция чтения (`lseek`/`read`).
+    off: u64,
+    /// Путь — нужен `getdents64` (перечисление `/nix/store` идёт по корням, а не по узлу) и
+    /// диагностике.
+    path: Vec<u8>,
+    /// Сколько записей каталога уже отдано `getdents64`.
+    dpos: usize,
 }
 
 struct Table {
@@ -344,6 +361,7 @@ fn create_process_locked(
         zombie: false,
         parent: usize::MAX,
         exit_code: None,
+        lx_fds: Vec::new(),
     };
     if idx == t.procs.len() {
         t.procs.push(proc);
@@ -388,6 +406,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         zombie: false, // ждут НИТЬ через THREAD_JOIN, а не через SYS_WAIT — зомби не нужен
         parent: usize::MAX,
         exit_code: None,
+        lx_fds: Vec::new(),
     });
     idx
 }
@@ -2681,6 +2700,40 @@ fn lx_get<'a>(t: &mut Table, cur: usize, va: usize, len: usize) -> Option<&'a [u
     Some(unsafe { core::slice::from_raw_parts(va as *const u8, len) })
 }
 
+/// Веха 108.3 — прочитать NUL-терминированную строку (путь) из памяти процесса. Потолок стоит
+/// затем, что длину задаёт чужая программа, а искать нуль до конца адресного пространства нельзя.
+fn lx_cstr(t: &mut Table, cur: usize, va: usize, max: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for i in 0..max {
+        let b = lx_get(t, cur, va + i, 1)?[0];
+        if b == 0 {
+            return Some(out);
+        }
+        out.push(b);
+    }
+    None
+}
+
+/// Открыть найденный узел: занять слот в таблице дескрипторов процесса, вернуть номер fd.
+fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>) -> usize {
+    let fd = LxFd { meta, off: 0, path, dpos: 0 };
+    let tbl = &mut t.procs[cur].lx_fds;
+    let i = match tbl.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            tbl[i] = Some(fd);
+            i
+        }
+        None => {
+            tbl.push(Some(fd));
+            tbl.len() - 1
+        }
+    };
+    i + LX_FD_BASE
+}
+
+/// Первый номер файлового дескриптора Linux-процесса: 0/1/2 заняты консолью.
+const LX_FD_BASE: usize = 3;
+
 /// Веха 38 — трансля́тор Linux-syscall'ов для процессов личности `linux` ([`crate::linux`]).
 /// Зеркало VOID-диспетчера [`syscall`], но номера/семантика — Linux; завершённый вызов
 /// перешагивает свою инструкцию `skip_syscall_insn` (на riscv это sepc+4, на x86 rip+2),
@@ -2748,7 +2801,26 @@ fn linux_syscall(t: &mut Table, cur: usize) {
         // ── ввод (stdin с консоли, блокирующе) ──────────────────────────────────
         Some(Lx::Read) => {
             let (fd, buf, len) = (a0, a1, a2);
-            if fd != 0 {
+            if fd >= LX_FD_BASE {
+                // Файл из store (Веха 108.3). Чтение короткое: за раз отдаём не больше остатка
+                // текущего куска блоба — так же ведёт себя `read` на трубе, и musl дочитает.
+                let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
+                ret = match slot {
+                    None => linux::err(linux::EBADF),
+                    Some(f) => {
+                        let mut tmp = alloc::vec![0u8; len.min(64 * 1024)];
+                        let n = crate::lxfs::read_at(&f.meta, f.off, &mut tmp);
+                        if lx_put(t, cur, buf, &tmp[..n]) {
+                            if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                                sl.off += n as u64;
+                            }
+                            n
+                        } else {
+                            linux::err(linux::EFAULT)
+                        }
+                    }
+                };
+            } else if fd != 0 {
                 ret = linux::err(linux::EBADF);
             } else if !ensure_heap_range(t, cur, buf, len) {
                 ret = linux::err(linux::EFAULT);
@@ -2915,14 +2987,160 @@ fn linux_syscall(t: &mut Table, cur: usize) {
         // ── файловые (пока без ФС: заглушки, что не роняют однопоточный CLI) ─────
         Some(Lx::Ioctl) => ret = linux::err(linux::ENOTTY), // isatty/TIOCGWINSZ → «не терминал»
         Some(Lx::Fcntl) => ret = 0,
-        Some(Lx::Close) => ret = 0, // fd 0/1/2 — «закрыты», реальных ресурсов нет
-        Some(Lx::Openat) => ret = linux::err(linux::ENOENT), // ФС ещё нет (Веха 38.x)
-        Some(Lx::Faccessat) => ret = linux::err(linux::ENOENT),
-        Some(Lx::Readlinkat) => ret = linux::err(linux::ENOENT),
-        Some(Lx::Getdents64) => ret = linux::err(linux::ENOSYS),
-        Some(Lx::Lseek) => ret = linux::err(linux::ESPIPE), // консоль не позиционируется
+        Some(Lx::Close) => {
+            // fd 0/1/2 — «закрыты», реальных ресурсов нет; файловые — освободить слот.
+            if a0 >= LX_FD_BASE {
+                if let Some(sl) = t.procs[cur].lx_fds.get_mut(a0 - LX_FD_BASE) {
+                    *sl = None;
+                }
+            }
+            ret = 0;
+        }
+        // ── файлы (Веха 108.3): читаются ПРЯМО ИЗ STORE, см. [`crate::lxfs`] ──────
+        Some(Lx::Openat) | Some(Lx::Open) => {
+            // openat(dirfd, path, flags, mode) либо legacy open(path, flags, mode) — разница
+            // только в том, где лежит путь. Относительных путей у нас нет: cwd Linux-процесса
+            // всегда `/`, а пакеты адресуются абсолютно — этого хватает и ld.so, и applet'ам.
+            const O_WRONLY: usize = 0o1;
+            const O_RDWR: usize = 0o2;
+            const O_CREAT: usize = 0o100;
+            let legacy = decoded == Some(Lx::Open);
+            let (path_va, flags) = if legacy { (a0, a1) } else { (a1, a2) };
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                None => linux::err(linux::EFAULT),
+                Some(path) if flags & (O_WRONLY | O_RDWR | O_CREAT) != 0 => {
+                    // Только чтение — и сказать об этом надо честно, а не «нет файла».
+                    vprintln!("  [linux] P{} openat на запись — EROFS", cur);
+                    let _ = path;
+                    linux::err(linux::EROFS)
+                }
+                Some(path) => match crate::lxfs::lookup(&path) {
+                    Some(meta) => {
+                        let fd = lx_fd_alloc(t, cur, meta, path);
+                        vprintln!("  [linux] P{} openat → fd {}", cur, fd);
+                        fd
+                    }
+                    None => linux::err(linux::ENOENT),
+                },
+            };
+        }
+        Some(Lx::Faccessat) | Some(Lx::Access) => {
+            let path_va = if decoded == Some(Lx::Access) { a0 } else { a1 };
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                Some(path) if crate::lxfs::lookup(&path).is_some() => 0,
+                Some(_) => linux::err(linux::ENOENT),
+                None => linux::err(linux::EFAULT),
+            };
+        }
+        Some(Lx::Readlinkat) | Some(Lx::Readlink) => {
+            // legacy readlink(path, buf, size) — путь в ПЕРВОМ аргументе, dirfd'а нет.
+            let (path_va, buf, len) = if decoded == Some(Lx::Readlink) {
+                (a0, a1, a2)
+            } else {
+                (a1, a2, a(t, 3))
+            };
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                None => linux::err(linux::EFAULT),
+                Some(path) => match crate::lxfs::lookup(&path).and_then(|m| crate::lxfs::readlink(&m))
+                {
+                    Some(target) => {
+                        let n = target.len().min(len);
+                        // readlink НЕ дописывает нуль — так в Linux, и musl на это рассчитывает.
+                        if lx_put(t, cur, buf, &target[..n]) {
+                            n
+                        } else {
+                            linux::err(linux::EFAULT)
+                        }
+                    }
+                    None => linux::err(linux::EINVAL), // не ссылка либо нет пути
+                },
+            };
+        }
+        Some(Lx::Getdents64) => {
+            // Записи каталога в linux-формате: d_ino(8) d_off(8) d_reclen(2) d_type(1) имя+NUL.
+            let (fd, buf, len) = (a0, a1, a2);
+            let slot = fd.checked_sub(LX_FD_BASE).and_then(|i| t.procs[cur].lx_fds.get(i).cloned());
+            match slot.flatten() {
+                None => ret = linux::err(linux::EBADF),
+                Some(f) => {
+                    let entries = crate::lxfs::dir_entries(&f.path, &f.meta);
+                    let mut out: Vec<u8> = Vec::new();
+                    let mut pos = f.dpos;
+                    while pos < entries.len() {
+                        let (ty, name) = &entries[pos];
+                        let reclen = (19 + name.len() + 1 + 7) & !7; // выравнивание на 8
+                        if out.len() + reclen > len {
+                            break;
+                        }
+                        // d_ino/d_off — не несут смысла в content-адресуемом сторе; ставим номер
+                        // записи: musl требует лишь монотонности и ненулевого d_ino.
+                        out.extend_from_slice(&((pos as u64) + 1).to_le_bytes());
+                        out.extend_from_slice(&((pos as u64) + 1).to_le_bytes());
+                        out.extend_from_slice(&(reclen as u16).to_le_bytes());
+                        out.push(if void_tree::is_dir(*ty) {
+                            4 // DT_DIR
+                        } else if void_tree::is_link(*ty) {
+                            10 // DT_LNK
+                        } else {
+                            8 // DT_REG
+                        });
+                        out.extend_from_slice(name.as_bytes());
+                        out.push(0);
+                        while out.len() % 8 != 0 {
+                            out.push(0);
+                        }
+                        pos += 1;
+                    }
+                    if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                        sl.dpos = pos;
+                    }
+                    ret = if lx_put(t, cur, buf, &out) {
+                        out.len()
+                    } else {
+                        linux::err(linux::EFAULT)
+                    };
+                }
+            }
+        }
+        Some(Lx::Lseek) => {
+            let (fd, off, whence) = (a0, a1 as i64, a2);
+            if fd < LX_FD_BASE {
+                ret = linux::err(linux::ESPIPE); // консоль не позиционируется
+            } else {
+                match t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE).and_then(|s| s.as_mut()) {
+                    None => ret = linux::err(linux::EBADF),
+                    Some(f) => {
+                        let base = match whence {
+                            1 => f.off as i64,
+                            2 => f.meta.size as i64,
+                            _ => 0,
+                        };
+                        let p = (base + off).clamp(0, f.meta.size as i64) as u64;
+                        f.off = p;
+                        ret = p as usize;
+                    }
+                }
+            }
+        }
         Some(Lx::Dup) | Some(Lx::Dup3) => ret = linux::err(linux::ENOSYS),
         Some(Lx::Ppoll) => ret = linux::err(linux::ENOSYS),
+        Some(Lx::Fstat) if a0 >= LX_FD_BASE => {
+            // fstat файла из store: тип и размер знает узел дерева.
+            let (fd, buf) = (a0, a1);
+            let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
+            ret = match slot {
+                None => linux::err(linux::EBADF),
+                Some(f) => {
+                    let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+                    linux::fill_stat_file(&mut st, f.meta.size, f.meta.ty);
+                    if lx_put(t, cur, buf, &st) {
+                        0
+                    } else {
+                        linux::err(linux::EFAULT)
+                    }
+                }
+            };
+        }
         Some(Lx::Fstat) => {
             // fstat(fd, buf): только символьные устройства stdin/out/err (fd 0/1/2).
             let (fd, buf) = (a0 as isize, a1);
@@ -2933,6 +3151,22 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             } else {
                 ret = linux::err(linux::EBADF);
             }
+        }
+        Some(Lx::Stat) | Some(Lx::Lstat) => {
+            // legacy stat(path, buf) / lstat(path, buf). Разницы между ними у нас нет: путь мы и
+            // так не разыменовываем, а тип записи отдаём настоящий (см. долги вехи).
+            let (path_va, buf) = (a0, a1);
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                None => linux::err(linux::EFAULT),
+                Some(p) => match crate::lxfs::lookup(&p) {
+                    Some(meta) => {
+                        let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+                        linux::fill_stat_file(&mut st, meta.size, meta.ty);
+                        if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) }
+                    }
+                    None => linux::err(linux::ENOENT),
+                },
+            };
         }
         Some(Lx::Newfstatat) => {
             // newfstatat(dirfd, path, buf, flags): без пути (AT_EMPTY_PATH) и fd 0/1/2 —
@@ -2945,8 +3179,31 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 let mut st = alloc::vec![0u8; linux::STAT_SIZE];
                 linux::fill_stat_chr(&mut st);
                 ret = if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) };
+            } else if empty_path && dirfd >= LX_FD_BASE as isize {
+                // AT_EMPTY_PATH на открытом файле = fstat.
+                let slot = t.procs[cur].lx_fds.get(dirfd as usize - LX_FD_BASE).cloned().flatten();
+                ret = match slot {
+                    None => linux::err(linux::EBADF),
+                    Some(f) => {
+                        let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+                        linux::fill_stat_file(&mut st, f.meta.size, f.meta.ty);
+                        if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) }
+                    }
+                };
             } else {
-                ret = linux::err(linux::ENOENT);
+                // Веха 108.3 — путь ищется в store. AT_SYMLINK_NOFOLLOW нам безразличен: путь
+                // и так не разыменовывается (см. долги вехи), а тип записи мы отдаём настоящий.
+                ret = match lx_cstr(t, cur, path, 4096) {
+                    None => linux::err(linux::EFAULT),
+                    Some(p) => match crate::lxfs::lookup(&p) {
+                        Some(meta) => {
+                            let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+                            linux::fill_stat_file(&mut st, meta.size, meta.ty);
+                            if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) }
+                        }
+                        None => linux::err(linux::ENOENT),
+                    },
+                };
             }
         }
         // ── завершение ────────────────────────────────────────────────────────────

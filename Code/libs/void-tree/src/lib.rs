@@ -1,4 +1,6 @@
-//! Дерево пакета в объектном store: формат каталога-узла (Вехи 108.1–108.2).
+#![cfg_attr(not(test), no_std)]
+
+//! Дерево пакета в объектном store: формат каталога-узла (Вехи 108.1–108.3).
 //!
 //! Распакованный пакет ложится в store **как есть, деревом объектов**, а не файлами в posixfs:
 //!
@@ -161,4 +163,89 @@ impl<'a> Iterator for Iter<'a> {
 /// Найти запись по имени: `(порядковый номер, запись)`. Номер — это и номер исходящей ссылки узла.
 pub fn find<'a>(buf: &'a [u8], name: &[u8]) -> Option<(usize, Rec<'a>)> {
     iter(buf)?.enumerate().find(|(_, r)| r.name == name)
+}
+
+/// Формат БЛОБА — содержимого, которое не влезло одним объектом: узел-манифест плюс куски
+/// обычными объектами.
+///
+/// Живёт здесь, рядом с деревом, потому что читателей у него ровно те же трое и по той же
+/// причине: так им кладёт скачанное загрузчик (Веха 94), так же `pkg` кладёт крупные файлы
+/// пакета, и так же их читают `posixfs` и персоналия Linux в ядре. Разойтись двум копиям этой
+/// раскладки — значит однажды прочитать чужие байты как свои.
+pub mod blob {
+    /// Опознавательный знак манифеста.
+    pub const MAGIC: &[u8; 9] = b"VOIDBLOB1";
+
+    /// Собрать манифест: magic, общая длина, число кусков, размер куска.
+    pub fn manifest(total: usize, chunks: usize, chunk: usize) -> [u8; MAGIC.len() + 16] {
+        let mut m = [0u8; MAGIC.len() + 16];
+        let mut p = 0;
+        m[p..p + MAGIC.len()].copy_from_slice(MAGIC);
+        p += MAGIC.len();
+        m[p..p + 8].copy_from_slice(&(total as u64).to_le_bytes());
+        p += 8;
+        m[p..p + 4].copy_from_slice(&(chunks as u32).to_le_bytes());
+        p += 4;
+        // Размер куска — в манифесте, а не в коде читателя: иначе смена константы в будущем
+        // сделала бы уже лежащие в сторе блобы нечитаемыми.
+        m[p..p + 4].copy_from_slice(&(chunk as u32).to_le_bytes());
+        m
+    }
+
+    /// Разобрать манифест: `(общая длина, число кусков, размер куска)`. `None` — это не блоб.
+    ///
+    /// `default_chunk` подставляется блобам ПЕРВОГО вида (Веха 94): там на месте размера куска
+    /// стояла длина первого куска, что для полного куска с ним совпадает.
+    pub fn info(manifest: &[u8], default_chunk: usize) -> Option<(usize, usize, usize)> {
+        if manifest.len() < MAGIC.len() + 12 || &manifest[..MAGIC.len()] != MAGIC {
+            return None;
+        }
+        let total = u64::from_le_bytes(manifest[MAGIC.len()..MAGIC.len() + 8].try_into().ok()?);
+        let n = u32::from_le_bytes(manifest[MAGIC.len() + 8..MAGIC.len() + 12].try_into().ok()?);
+        let chunk = manifest
+            .get(MAGIC.len() + 12..MAGIC.len() + 16)
+            .and_then(|s| s.try_into().ok())
+            .map_or(default_chunk, |b| u32::from_le_bytes(b) as usize);
+        Some((total as usize, n as usize, if chunk == 0 { default_chunk } else { chunk }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate alloc;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn roundtrip() {
+        let mut body: Vec<u8> = Vec::new();
+        push(&mut body, K_DIR, b"lib", 48);
+        push(&mut body, K_LINK, b"lib64", 3);
+        push(&mut body, K_FILE | F_EXEC | F_BLOB, b"libc.so.6", 2413096);
+        let mut idx = Vec::from(head(3));
+        idx.extend_from_slice(&body);
+
+        let recs: Vec<Rec> = iter(&idx).expect("это индекс").collect();
+        assert_eq!(recs.len(), 3);
+        assert!(recs[0].is_dir() && recs[0].size == 48);
+        assert!(recs[1].is_link() && recs[1].name == b"lib64");
+        assert!(recs[2].is_exec() && recs[2].is_blob() && recs[2].size == 2413096);
+
+        let (i, r) = find(&idx, b"libc.so.6").expect("найдено");
+        assert_eq!(i, 2);
+        assert_eq!(r.size, 2413096);
+        assert!(find(&idx, "нет такого".as_bytes()).is_none());
+    }
+
+    /// Чужое значение индексом не притворяется, а обрезанное не отдаёт половину.
+    #[test]
+    fn foreign_and_truncated() {
+        assert!(iter(b"nix-archive-1").is_none());
+        let mut idx = Vec::from(head(2));
+        push(&mut idx, K_FILE, "есть".as_bytes(), 1);
+        push(&mut idx, K_FILE, "обрежется".as_bytes(), 2);
+        idx.truncate(idx.len() - 4);
+        let recs: Vec<Rec> = iter(&idx).unwrap().collect();
+        assert_eq!(recs.len(), 1, "вторая запись обрезана — её не должно быть");
+    }
 }

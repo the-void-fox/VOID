@@ -8,3 +8,5 @@ description = "Микроядро VOID (bare-metal RISC-V, S-mode)."
 [dependencies]
 void-abi = { path = "../libs/void-abi" }
 void-store = { path = "../libs/void-store" }
+# Веха 108.3 — формат дерева пакета: персоналия Linux читает файлы прямо из store.
+void-tree = { path = "../libs/void-tree" }

@@ -1059,6 +1059,10 @@ name = "void-nar"
 version = "0.0.1"
 
 [[package]]
+name = "void-tree"
+version = "0.0.1"
+
+[[package]]
 name = "void-user"
 version = "0.0.1"
 dependencies = [
@@ -1076,6 +1080,7 @@ dependencies = [
  "sha2",
  "smoltcp",
  "void-nar",
+ "void-tree",
  "vte",
  "vvsh-core",
  "webpki-roots 0.26.11",
