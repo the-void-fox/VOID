@@ -130,10 +130,141 @@ impl ruzstd::io::Read for SliceReader<'_> {
     }
 }
 
+impl lzma_rs::io::Read for SliceReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> lzma_rs::io::Result<usize> {
+        let n = out.len().min(self.0.len());
+        out[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
+}
+
+impl lzma_rs::io::BufRead for SliceReader<'_> {
+    fn fill_buf(&mut self) -> lzma_rs::io::Result<&[u8]> {
+        Ok(self.0)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.0 = &self.0[amt.min(self.0.len())..];
+    }
+}
+
 impl ruzstd::io::Read for BlobReader {
     fn read(&mut self, out: &mut [u8]) -> Result<usize, ruzstd::io::Error> {
         lzma_rs::io::Read::read(self, out)
             .map_err(|_| ruzstd::io::Error::from(ruzstd::io::ErrorKind::Other))
+    }
+}
+
+/// Сток распакованных байт для [`stream`]: сюда они уходят кусками и нигде не копятся.
+///
+/// Своего трейта здесь ровно потому, что оба распаковщика описывают вывод по-разному (`lzma-rs`
+/// пишет в свой `Write`, `ruzstd` даёт `Read`), а потребителю нужен один вид.
+pub trait Sink {
+    fn put(&mut self, data: &[u8]) -> Result<(), String>;
+}
+
+impl<F: FnMut(&[u8]) -> Result<(), String>> Sink for F {
+    fn put(&mut self, data: &[u8]) -> Result<(), String> {
+        self(data)
+    }
+}
+
+/// Мостик «сток → `lzma_rs::io::Write`»: xz умеет только ТОЛКАТЬ вывод, и это единственная
+/// причина, по которой у распаковки вообще есть подающий интерфейс (см. шапку `void_nar`).
+struct SinkWriter<'a, S: Sink> {
+    sink: &'a mut S,
+    err: Option<String>,
+}
+
+impl<S: Sink> lzma_rs::io::Write for SinkWriter<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> lzma_rs::io::Result<usize> {
+        match self.sink.put(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(e) => {
+                // Чужой ошибке негде проехать через io::Error — придерживаем текст у себя и
+                // отдаём его вызывающему, иначе «store не принял кусок» стало бы «ошибка xz».
+                self.err = Some(e);
+                Err(lzma_rs::io::Error::new(
+                    lzma_rs::io::ErrorKind::Other,
+                    "потребитель распаковки отказал",
+                ))
+            }
+        }
+    }
+}
+
+/// Размер порции, которой распакованные байты уходят в сток.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Прогнать содержимое объекта (или блоба) через распаковку, **отдавая байты кусками**.
+///
+/// Веха 108. Отличие от [`unpacked`] одно, но решающее: результат нигде не собирается целиком.
+/// NAR настоящего пакета — десятки мегабайт (у glibc 35), и «сначала распакуем, потом разберём»
+/// упиралось не в удобство, а в кучу процесса.
+pub fn stream<S: Sink>(scap: usize, id: &[u8; 32], sink: &mut S) -> Result<(), String> {
+    let mut head = [0u8; 512];
+    let hlen = sys::obj_get(scap, id, &mut head);
+    if hlen == 0 || hlen == usize::MAX {
+        return Err(String::from("объект не читается"));
+    }
+
+    if let Some((_total, nchunks, csize)) = sys::http::blob_info(&head[..hlen]) {
+        let mut kids = vec![[0u8; 32]; nchunks];
+        if sys::obj_children(scap, id, &mut kids) != nchunks {
+            return Err(String::from("список кусков блоба не сошёлся"));
+        }
+        let mut probe = vec![0u8; MAGIC_PROBE];
+        let plen = sys::obj_get(scap, &kids[0], &mut probe);
+        let packing = if plen <= MAGIC_PROBE { packing_of(&probe[..plen]) } else { Packing::None };
+        let blob = BlobReader::new(scap, kids, csize);
+        return unpack_reader(blob, packing, sink);
+    }
+
+    let buf = read_object(scap, id, 8 * 1024 * 1024)?;
+    let packing = packing_of(&buf);
+    unpack_reader(SliceReader(buf.as_slice()), packing, sink)
+}
+
+/// Общая часть [`stream`]: источник уже выбран, осталось развернуть его сжатие.
+fn unpack_reader<R, S>(mut input: R, packing: Packing, sink: &mut S) -> Result<(), String>
+where
+    R: lzma_rs::io::BufRead + ruzstd::io::Read,
+    S: Sink,
+{
+    match packing {
+        Packing::Xz => {
+            let mut w = SinkWriter { sink, err: None };
+            let r = lzma_rs::xz_decompress(&mut input, &mut w);
+            if let Some(e) = w.err.take() {
+                return Err(e); // беда потребителя важнее нашей обёртки над ней
+            }
+            r.map_err(|e| alloc::format!("xz: {}", e))
+        }
+        Packing::Zstd => {
+            let mut dec = ruzstd::decoding::StreamingDecoder::new(input)
+                .map_err(|e| alloc::format!("zstd: {}", e))?;
+            let mut buf = vec![0u8; STREAM_CHUNK];
+            loop {
+                let n = ruzstd::io::Read::read(&mut dec, &mut buf)
+                    .map_err(|e| alloc::format!("zstd: {}", e))?;
+                if n == 0 {
+                    return Ok(());
+                }
+                sink.put(&buf[..n])?;
+            }
+        }
+        Packing::None => {
+            let mut buf = vec![0u8; STREAM_CHUNK];
+            loop {
+                let n = lzma_rs::io::Read::read(&mut input, &mut buf)
+                    .map_err(|e| alloc::format!("{}", e))?;
+                if n == 0 {
+                    return Ok(());
+                }
+                sink.put(&buf[..n])?;
+            }
+        }
     }
 }
 

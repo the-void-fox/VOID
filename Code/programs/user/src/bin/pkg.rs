@@ -46,6 +46,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 
 use base64ct::{Base64, Encoding};
@@ -59,11 +60,17 @@ use void_user as sys;
 mod archive;
 #[path = "../roots.rs"]
 mod roots;
+// Формат дерева пакета в store — его же будет читать posixfs, показывая /nix/store.
+#[allow(dead_code)] // часть разбора формата нужна читателю (posixfs), а не писателю
+#[path = "../tree.rs"]
+mod tree;
 
-// Куча: распакованный NAR целиком плюс окно словаря распаковщика. Арена ленивая (`SYS_MAP`),
-// неиспользованные страницы не стоят ничего.
+// Куча (Веха 108): от размера пакета она БОЛЬШЕ НЕ ЗАВИСИТ — байты идут потоком, и целиком в
+// памяти не живёт ни архив, ни NAR, ни файл. Определяет её теперь окно распаковщика: у zstd оно
+// до 8 МиБ, и меньше этого ставить нельзя (замер: с 4 МиБ падает ещё до первого файла). Арена
+// ленивая (`SYS_MAP`), неиспользованные страницы не стоят ничего.
 #[global_allocator]
-static ALLOC: sys::heap::Heap<{ 32 * 1024 * 1024 }> = sys::heap::Heap::new();
+static ALLOC: sys::heap::Heap<{ 16 * 1024 * 1024 }> = sys::heap::Heap::new();
 
 /// Кэш по умолчанию. Хост зашит намеренно: пока нет конфига подстановщиков, «откуда берём» —
 /// решение системы, а не аргумент командной строки.
@@ -96,12 +103,20 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut argbuf = [0u8; 512];
     let n = sys::args(&mut argbuf);
     let mut it = argbuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1);
-    let (cmd, rest) = (it.next(), it.next());
+    let (cmd, rest, third) = (it.next(), it.next(), it.next());
 
     let code = match (cmd, rest) {
         (Some(b"fetch"), Some(what)) => done(cmd_fetch(what)),
         (Some(b"install"), Some(what)) => done(cmd_install(what)),
         (Some(b"remove"), Some(what)) => done(cmd_remove(what)),
+        (Some(b"tree"), Some(what)) => done(cmd_tree(what, third.unwrap_or(b""))),
+        (Some(b"cat"), Some(what)) => match third {
+            Some(sub) => done(cmd_cat(what, sub)),
+            None => {
+                sys::write("pkg cat <путь> <подпуть внутри пакета>\n".as_bytes());
+                2
+            }
+        },
         (Some(b"list"), _) => done(cmd_list()),
         (Some(b"gens"), _) => done(cmd_gens()),
         (Some(b"rollback"), _) => done(cmd_rollback()),
@@ -129,6 +144,8 @@ fn usage() {
     sys::write("  fetch <хэш|/nix/store/путь>   скачать замыкание (путь и все зависимости)\n".as_bytes());
     sys::write("  install <хэш|путь>            скачать и внести в профиль (новое поколение)\n".as_bytes());
     sys::write("  remove <имя|хэш>              убрать из профиля (новое поколение)\n".as_bytes());
+    sys::write("  tree <путь> [подпуть]         что лежит внутри распакованного пакета\n".as_bytes());
+    sys::write("  cat <путь> <подпуть>          содержимое файла из пакета\n".as_bytes());
     sys::write("  list                          что в активном поколении профиля\n".as_bytes());
     sys::write("  gens                          поколения профиля (активное — *)\n".as_bytes());
     sys::write("  rollback                      вернуть предыдущее поколение\n".as_bytes());
@@ -277,27 +294,179 @@ fn root_id(scap: usize, name: &str) -> Option<[u8; 32]> {
     }
 }
 
-/// Положить NAR в store **блобом**: куски по `http::CHUNK` плюс узел-манифест, ровно тем же
-/// форматом, каким пишет загрузчик ([`sys::http`]).
-///
-/// Одним объектом нельзя: NAR настоящего пакета — десятки мегабайт, а объект целиком живёт в
-/// куче ЯДРА. Заодно достаётся дедуп кусков между пакетами: одинаковые страницы данных в двух
-/// путях становятся одним объектом.
-fn put_nar(scap: usize, data: &[u8]) -> Result<[u8; 32], String> {
-    let mut kids: Vec<[u8; 32]> = Vec::new();
-    for part in data.chunks(sys::http::CHUNK) {
-        let mut id = [0u8; 32];
-        if sys::obj_put(scap, part, &mut id) != 0 {
-            return Err(String::from("кусок NAR не влез в store"));
-        }
-        kids.push(id);
-    }
-    let man = sys::http::blob_manifest(data.len(), kids.len());
+/// Размер куска, которым содержимое файла уезжает в store. Тот же, что у загрузчика: одинаковые
+/// байты в двух пакетах должны давать одинаковые объекты, иначе дедуп не сработает.
+const FILE_CHUNK: usize = sys::http::CHUNK;
+
+/// Положить значение объектом, вернуть его content-id.
+fn put(scap: usize, data: &[u8]) -> Result<[u8; 32], String> {
     let mut id = [0u8; 32];
-    if sys::obj_put_node(scap, &man, &kids, &mut id) != 0 {
-        return Err(String::from("узел NAR не влез в store"));
+    if sys::obj_put(scap, data, &mut id) != 0 {
+        return Err(String::from("объект не влез в store"));
     }
     Ok(id)
+}
+
+/// Положить узел (значение + исходящие ссылки).
+fn put_node(scap: usize, data: &[u8], kids: &[[u8; 32]]) -> Result<[u8; 32], String> {
+    let mut id = [0u8; 32];
+    if sys::obj_put_node(scap, data, kids, &mut id) != 0 {
+        return Err(String::from("узел не влез в store"));
+    }
+    Ok(id)
+}
+
+/// Каталог, который сейчас собирается: его индекс и ссылки на уже уложенное содержимое.
+struct DirFrame {
+    name: String,
+    idx: tree::Index,
+    kids: Vec<[u8; 32]>,
+}
+
+/// Строитель дерева пакета: события разбора NAR → объекты store ([`tree`]).
+///
+/// Ничего не копит сверх одного куска файла и индексов открытых каталогов, поэтому размер пакета
+/// перестаёт упираться в кучу процесса — ради этого потоковый разбор и затевался.
+struct Builder {
+    scap: usize,
+    stack: Vec<DirFrame>,
+    /// Текущий файл: имя, флаг исполняемости, накопитель куска и уже уложенные куски.
+    fname: String,
+    fexec: bool,
+    fbuf: Vec<u8>,
+    fkids: Vec<[u8; 32]>,
+    fsize: u64,
+    /// Корень дерева: (тип, id, размер) — заполняется, когда закрылся самый внешний узел.
+    root: Option<(u8, [u8; 32], u64)>,
+}
+
+impl Builder {
+    fn new(scap: usize) -> Self {
+        Builder {
+            scap,
+            stack: Vec::new(),
+            fname: String::new(),
+            fexec: false,
+            fbuf: Vec::with_capacity(FILE_CHUNK),
+            fkids: Vec::new(),
+            fsize: 0,
+            root: None,
+        }
+    }
+
+    /// Приписать готовый узел к родителю — или объявить его корнем, если родителя нет.
+    fn attach(&mut self, ty: u8, name: &str, size: u64, id: [u8; 32]) {
+        match self.stack.last_mut() {
+            Some(top) => {
+                top.idx.add(ty, name, size);
+                top.kids.push(id);
+            }
+            None => self.root = Some((ty, id, size)),
+        }
+    }
+
+    fn on(&mut self, e: void_nar::Event<'_>) -> Result<(), void_nar::NarError> {
+        use void_nar::Event;
+        let r = match e {
+            Event::Dir { path } => {
+                self.stack.push(DirFrame {
+                    name: leaf(path).to_string(),
+                    idx: tree::Index::new(),
+                    kids: Vec::new(),
+                });
+                Ok(())
+            }
+            Event::DirEnd { .. } => (|| {
+                let f = self.stack.pop().ok_or_else(|| String::from("каталог закрылся дважды"))?;
+                let count = f.idx.len() as u64;
+                let id = put_node(self.scap, &f.idx.finish(), &f.kids)?;
+                self.attach(tree::K_DIR, &f.name, count, id);
+                Ok(())
+            })(),
+            Event::Symlink { path, target } => (|| {
+                let id = put(self.scap, target.as_bytes())?;
+                self.attach(tree::K_LINK, leaf(path), target.len() as u64, id);
+                Ok(())
+            })(),
+            Event::FileStart { path, size, exec } => {
+                self.fname = leaf(path).to_string();
+                self.fexec = exec;
+                self.fsize = size;
+                self.fbuf.clear();
+                self.fkids.clear();
+                Ok(())
+            }
+            Event::FileData { data } => (|| {
+                self.fbuf.extend_from_slice(data);
+                while self.fbuf.len() >= FILE_CHUNK {
+                    let id = put(self.scap, &self.fbuf[..FILE_CHUNK])?;
+                    self.fkids.push(id);
+                    self.fbuf.drain(..FILE_CHUNK);
+                }
+                Ok(())
+            })(),
+            Event::FileEnd => (|| {
+                let mut ty = tree::K_FILE;
+                if self.fexec {
+                    ty |= tree::F_EXEC;
+                }
+                // Мелкий файл — обычный объект: у блоба есть постоянная цена в манифесте и
+                // лишнем объекте, а таких файлов в пакете тысячи.
+                let id = if self.fkids.is_empty() {
+                    put(self.scap, &self.fbuf)?
+                } else {
+                    if !self.fbuf.is_empty() {
+                        let id = put(self.scap, &self.fbuf)?;
+                        self.fkids.push(id);
+                    }
+                    ty |= tree::F_BLOB;
+                    let man = sys::http::blob_manifest(self.fsize as usize, self.fkids.len());
+                    put_node(self.scap, &man, &self.fkids)?
+                };
+                self.fbuf.clear();
+                self.fkids.clear();
+                let (ty, name, size) = (ty, core::mem::take(&mut self.fname), self.fsize);
+                self.attach(ty, &name, size, id);
+                Ok(())
+            })(),
+        };
+        r.map_err(void_nar::NarError)
+    }
+}
+
+/// Последний компонент пути внутри архива (у корня — пусто).
+fn leaf(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Скачанный архив → дерево в store. Возвращает (корень дерева, размер NAR, его sha256).
+///
+/// Байты идут одним потоком: блоб из store → распаковщик → разбор NAR → объекты store. Нигде
+/// целиком не собирается ни архив, ни NAR, ни файл — только текущий кусок. Хэш считается по
+/// дороге, потому что второго прохода по этим байтам не будет.
+fn unpack_tree(scap: usize, dl_id: &[u8; 32], base: &str) -> Result<([u8; 32], usize, String), String> {
+    let mut b = Builder::new(scap);
+    let mut parser = void_nar::Parser::new();
+    let mut hasher = Sha256::new();
+    let mut nbytes = 0usize;
+
+    archive::stream(scap, dl_id, &mut |chunk: &[u8]| {
+        hasher.update(chunk);
+        nbytes += chunk.len();
+        parser.push(chunk, &mut |e| b.on(e)).map_err(|e| e.0)
+    })?;
+    parser.finish().map_err(|e| e.0)?;
+
+    let (ty, id, size) = b.root.ok_or("в архиве нет корневого узла")?;
+    // Корень пакета — индекс из ОДНОЙ записи с именем пути store. Так у пакета есть имя и тип
+    // ровно там же, где у любой другой записи, а каталог `/nix/store` потом собирается склейкой
+    // таких записей — без особого случая для верхнего уровня.
+    let mut idx = tree::Index::new();
+    idx.add(ty, base, size);
+    let root = put_node(scap, &idx.finish(), &[id])?;
+
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok((root, nbytes, nix_hash32(&digest)))
 }
 
 /// Метаданные пути: из своего кэша (`pkg/narinfo/<хэш>`), а если их там нет — из сети.
@@ -325,41 +494,119 @@ fn narinfo(scap: usize, hash: &str) -> Result<NarInfo, String> {
     Ok(ni)
 }
 
+/// Сколько времени заняли сеть и распаковка одного пути (секунды). Печатается рядом с путём:
+/// на устройстве полезно видеть, во что упирается установка, — в канал или в свой же store.
+struct Timing {
+    net: u64,
+    unpack: u64,
+}
+
 /// Один путь: метаданные → (если содержимого ещё нет) архив → распаковка → сверка NarHash → store.
-/// `true` во втором поле — содержимое скачано сейчас, `false` — уже лежало.
-fn realize_one(scap: usize, hash: &str) -> Result<(NarInfo, [u8; 32], bool), String> {
+/// `Some(...)` во втором поле — содержимое скачано сейчас, `None` — уже лежало.
+fn realize_one(scap: usize, hash: &str) -> Result<(NarInfo, [u8; 32], Option<Timing>), String> {
     let ni = narinfo(scap, hash)?;
 
-    let nar_root = format!("pkg/nar/{}", hash);
-    if let Some(id) = root_id(scap, &nar_root) {
-        return Ok((ni, id, false));
+    let tree_root = format!("pkg/tree/{}", hash);
+    if let Some(id) = root_id(scap, &tree_root) {
+        return Ok((ni, id, None));
     }
 
     let dl_root = format!("pkg/dl/{}", hash);
+    let t0 = sys::monotonic_ns();
     let dl_id = download(&format!("{}/{}", CACHE, ni.url), &dl_root)?;
+    let t1 = sys::monotonic_ns();
 
-    let nar = archive::unpacked(scap, &dl_id, false)?;
-    if nar.len() != ni.nar_size {
-        return Err(format!(
-            "размер NAR не сошёлся: обещано {}, получено {}",
-            ni.nar_size,
-            nar.len()
-        ));
+    // Распаковка сразу в дерево store (Веха 108). Объекты при этом уже написаны, но НИ ОДИН
+    // корень на них не указывает: пока хэш не сошёлся, дерева для системы не существует, а
+    // недостижимые объекты подберёт GC. Порядок «проверить, потом показать» сохранён — просто
+    // проверка теперь идёт по дороге, а не по второй копии в памяти.
+    let (tree_id, size, got) = unpack_tree(scap, &dl_id, ni.base())?;
+    if size != ni.nar_size {
+        return Err(format!("размер NAR не сошёлся: обещано {}, получено {}", ni.nar_size, size));
     }
-    let digest: [u8; 32] = Sha256::digest(&nar).into();
-    let got = nix_hash32(&digest);
     if got != ni.nar_hash {
         return Err(format!("NarHash не сошёлся: обещано {}, получено {}", ni.nar_hash, got));
     }
 
-    // Готовый NAR — в store. Скачанный сжатый архив больше не нужен: он лишь транспорт, а
-    // хранить транспорт рядом с содержимым значит платить за него местом дважды.
-    let id = put_nar(scap, &nar)?;
-    if sys::obj_set_root(scap, nar_root.as_bytes(), &id) != 0 {
-        return Err(String::from("корень NAR не завёлся"));
+    if sys::obj_set_root(scap, tree_root.as_bytes(), &tree_id) != 0 {
+        return Err(String::from("корень дерева не завёлся"));
     }
+    // Скачанный сжатый архив больше не нужен: он лишь транспорт, а хранить транспорт рядом с
+    // содержимым значит платить за него местом дважды.
     sys::obj_del_root(scap, dl_root.as_bytes());
-    Ok((ni, id, true))
+    let t2 = sys::monotonic_ns();
+    let timing = Timing { net: (t1 - t0) / 1_000_000_000, unpack: (t2 - t1) / 1_000_000_000 };
+    Ok((ni, tree_id, Some(timing)))
+}
+
+// ── чтение дерева пакета ────────────────────────────────────────────────────────────────────
+
+/// Прочитать узел-каталог: его индекс и content-id детей (по порядку записей).
+fn read_dir(scap: usize, id: &[u8; 32]) -> Result<(Vec<tree::Rec>, Vec<[u8; 32]>), String> {
+    let data = archive::read_object(scap, id, 8 * 1024 * 1024)?;
+    let recs = tree::parse(&data).ok_or("это не каталог пакета")?;
+    let mut kids = vec![[0u8; 32]; recs.len()];
+    if !recs.is_empty() && sys::obj_children(scap, id, &mut kids) != recs.len() {
+        return Err(String::from("число ссылок каталога не сошлось с индексом"));
+    }
+    Ok((recs, kids))
+}
+
+/// Найти узел по пути внутри пакета: `(имя пакета, запись, id)`. Пустой путь — сам пакет.
+fn resolve(scap: usize, hash: &str, sub: &str) -> Result<(String, tree::Rec, [u8; 32]), String> {
+    let root = root_id(scap, &format!("pkg/tree/{}", hash))
+        .ok_or("пакета нет в store — сначала `pkg fetch`")?;
+    // Корень — индекс из одной записи: сам путь store.
+    let (recs, kids) = read_dir(scap, &root)?;
+    let (mut rec, mut id) = (
+        recs.into_iter().next().ok_or("пустой корень пакета")?,
+        *kids.first().ok_or("пустой корень пакета")?,
+    );
+    let base = rec.name.clone();
+
+    for part in sub.split('/').filter(|p| !p.is_empty() && *p != ".") {
+        if !rec.is_dir() {
+            return Err(format!("{} — не каталог", rec.name));
+        }
+        let (recs, kids) = read_dir(scap, &id)?;
+        let i = recs
+            .iter()
+            .position(|r| r.name == part)
+            .ok_or_else(|| format!("нет такого пути: {}", part))?;
+        rec = recs[i].clone();
+        id = kids[i];
+    }
+    Ok((base, rec, id))
+}
+
+/// Выдать содержимое файла кусками (`sink`) — целиком в память он не собирается.
+fn read_file<F: FnMut(&[u8])>(
+    scap: usize,
+    rec: &tree::Rec,
+    id: &[u8; 32],
+    mut sink: F,
+) -> Result<(), String> {
+    if !rec.is_blob() {
+        sink(&archive::read_object(scap, id, 8 * 1024 * 1024)?);
+        return Ok(());
+    }
+    let mut head = [0u8; 512];
+    let n = sys::obj_get(scap, id, &mut head);
+    let (_, nchunks, csize) =
+        sys::http::blob_info(&head[..n.min(head.len())]).ok_or("испорченный манифест файла")?;
+    let mut kids = vec![[0u8; 32]; nchunks];
+    if sys::obj_children(scap, id, &mut kids) != nchunks {
+        return Err(String::from("список кусков файла не сошёлся"));
+    }
+    let mut buf = vec![0u8; csize];
+    for k in &kids {
+        let n = sys::obj_get(scap, k, &mut buf);
+        if n == 0 || n > buf.len() {
+            return Err(String::from("кусок файла не читается"));
+        }
+        sink(&buf[..n]);
+    }
+    Ok(())
 }
 
 // ── замыкание ───────────────────────────────────────────────────────────────────────────────
@@ -408,16 +655,14 @@ fn realize(scap: usize, tops: &[String]) -> Result<Closure, String> {
 
         let (ni, id, fresh) = realize_one(scap, &hash)?;
         let base = ni.base().to_string();
+        let tail = match &fresh {
+            Some(t) => format!("{} Б  (сеть {} с, распаковка {} с)", ni.nar_size, t.net, t.unpack),
+            None => String::from("уже есть"),
+        };
         sys::write(
-            format!(
-                "  {} {}  {}\n",
-                if fresh { "↓" } else { "·" },
-                base,
-                if fresh { format!("{} Б", ni.nar_size) } else { String::from("уже есть") }
-            )
-            .as_bytes(),
+            format!("  {} {}  {}\n", if fresh.is_some() { "↓" } else { "·" }, base, tail).as_bytes(),
         );
-        if fresh {
+        if fresh.is_some() {
             fetched += 1;
         }
         bytes += ni.nar_size;
@@ -583,6 +828,18 @@ fn paths_word(n: usize) -> &'static str {
     }
 }
 
+/// «1 запись», «2 записи», «5 записей».
+fn recs_word(n: usize) -> &'static str {
+    let (ones, tens) = (n % 10, n % 100);
+    if ones == 1 && tens != 11 {
+        "запись"
+    } else if (2..=4).contains(&ones) && !(12..=14).contains(&tens) {
+        "записи"
+    } else {
+        "записей"
+    }
+}
+
 /// Совпадает ли путь с тем, что назвал человек: полное имя, хэш или просто имя пакета.
 fn matches(base: &str, what: &str) -> bool {
     base == what
@@ -687,6 +944,61 @@ fn cmd_list() -> Result<(), String> {
     }
     sys::write(format!("  всего {} {}, {} Б\n", paths.len(), paths_word(paths.len()), total).as_bytes());
     Ok(())
+}
+
+/// `pkg tree <путь> [подпуть]` — что лежит внутри распакованного пакета.
+fn cmd_tree(what: &[u8], sub: &[u8]) -> Result<(), String> {
+    let scap = sys::start_cap(1);
+    let hash = path_hash(what)?;
+    let sub = core::str::from_utf8(sub).map_err(|_| "подпуть не UTF-8")?;
+    let (base, rec, id) = resolve(scap, hash, sub)?;
+
+    if !rec.is_dir() {
+        let what = if rec.is_link() { "симлинк" } else { "файл" };
+        sys::write(format!("{} — {}, {} Б\n", rec.name, what, rec.size).as_bytes());
+        if rec.is_link() {
+            let target = archive::read_object(scap, &id, 64 * 1024)?;
+            sys::write(format!("  → {}\n", String::from_utf8_lossy(&target)).as_bytes());
+        }
+        return Ok(());
+    }
+
+    let (recs, _) = read_dir(scap, &id)?;
+    let sep = if sub.is_empty() { "" } else { "/" };
+    sys::write(
+        format!(
+            "{}/{}{}{} — {} {}\n",
+            STORE_DIR, base, sep, sub, recs.len(), recs_word(recs.len())
+        )
+        .as_bytes(),
+    );
+    for r in &recs {
+        // Пометка вида слева — как в `ls -F`, только явным столбцом: тип у нас лежит в записи
+        // каталога, а не угадывается по имени.
+        let mark = if r.is_dir() {
+            "кат "
+        } else if r.is_link() {
+            "лнк "
+        } else if r.is_exec() {
+            "исп "
+        } else {
+            "фйл "
+        };
+        sys::write(format!("  {}{:>10}  {}\n", mark, r.size, r.name).as_bytes());
+    }
+    Ok(())
+}
+
+/// `pkg cat <путь> <подпуть>` — содержимое файла из пакета.
+fn cmd_cat(what: &[u8], sub: &[u8]) -> Result<(), String> {
+    let scap = sys::start_cap(1);
+    let hash = path_hash(what)?;
+    let sub = core::str::from_utf8(sub).map_err(|_| "подпуть не UTF-8")?;
+    let (_, rec, id) = resolve(scap, hash, sub)?;
+    if rec.is_dir() {
+        return Err(format!("{} — каталог", rec.name));
+    }
+    read_file(scap, &rec, &id, |part| sys::write(part))
 }
 
 fn cmd_gens() -> Result<(), String> {
