@@ -446,11 +446,16 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
             // Показать СЫРЫЕ корни store (как `ls`, но для объектов store, не файлов posixfs):
             // короткий content-id + имя на строку. Гейт — store-cap (xcap: store:*w*, есть WRITE).
             let mut rbuf = [0u8; 8192];
-            let n = sys::obj_list_roots(xcap, &mut rbuf);
+            let (n, want) = sys::obj_list_roots_ex(xcap, &mut rbuf).unwrap_or((0, 0));
             if n == 0 {
                 px::write(ep, px::STDOUT, "нет корней (или нет прав на store)\n".as_bytes());
             } else {
                 px::write(ep, px::STDOUT, &rbuf[..n]);
+                // Кучи у спасательного шелла нет — буфер не растянуть; но молчать об обрезании
+                // нельзя (Веха 107): корней с пакетами стало много.
+                if want > n {
+                    px::write(ep, px::STDOUT, "vsh: список корней обрезан — `run vvsh repl`, там `roots`\n".as_bytes());
+                }
             }
             continue;
         }

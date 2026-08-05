@@ -2283,10 +2283,18 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        // SYS_OBJ_LIST_ROOTS(store_cap, buf_ptr, buf_len) -> записано байт | MAX: перечислить
-        // СЫРЫЕ корни store текстом («короткий id + имя» на строку) — vsh `roots`, как `ls` для
-        // объектов store. Гейт: store-cap с READ ИЛИ WRITE (любой из привилегированных доступов к
-        // store позволяет узнать имена корней; у shell'а cap store:xw — есть WRITE).
+        // SYS_OBJ_LIST_ROOTS(store_cap, buf_ptr, buf_len) -> ПОЛНАЯ длина текста | MAX:
+        // перечислить СЫРЫЕ корни store текстом («короткий id + имя» на строку) — vsh `roots`,
+        // как `ls` для объектов store. Гейт: store-cap с READ ИЛИ WRITE (любой из
+        // привилегированных доступов к store позволяет узнать имена корней; у shell'а cap
+        // store:xw — есть WRITE).
+        //
+        // Веха 107: возвращается длина ВСЕГО текста, а не записанного. Раньше отдавалось
+        // `min(длина, буфер)` — и «корней ровно столько» было не отличить от «буфер мал», причём
+        // обрезание приходилось на середину строки: имя корня доезжало покалеченным. На этом
+        // стоит нумерация поколений (`system/gen<N>`, `pkg/profile/*/gen<N>`), а `pkg` заводит
+        // по два корня на каждый путь замыкания — недосчитаться поколения значило бы ЗАТЕРЕТЬ
+        // существующее. Соглашение то же, что у SYS_OBJ_CHILDREN и readdir персоналии.
         34 => {
             let (scap, bptr, blen) = {
                 let f = &t.procs[cur].frame;
@@ -2305,8 +2313,11 @@ fn syscall(t: &mut Table, cur: usize) {
                 let n = bytes.len().min(blen);
                 let dst = unsafe { core::slice::from_raw_parts_mut(bptr as *mut u8, n) };
                 dst.copy_from_slice(&bytes[..n]);
-                vprintln!("  [obj] P{} OBJ_LIST_ROOTS → {} Б ({} корней)", cur, n, text.lines().count());
-                n
+                vprintln!(
+                    "  [obj] P{} OBJ_LIST_ROOTS → {} Б из {} ({} корней)",
+                    cur, n, bytes.len(), text.lines().count()
+                );
+                bytes.len()
             } else {
                 usize::MAX // куча под буфер не доотобразилась
             };

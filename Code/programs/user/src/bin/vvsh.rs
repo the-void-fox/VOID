@@ -28,6 +28,9 @@ use void_user::posix as px;
 // так — в шапке самого файла).
 #[path = "../archive.rs"]
 mod archive;
+// Общий с `pkg` разбор списка корней store — по тому же доводу (Веха 107).
+#[path = "../roots.rs"]
+mod roots;
 use vvsh_core::{Env, EvalError, Value};
 
 // ── глобальный аллокатор ──────────────────────────────────────────────────────
@@ -297,7 +300,11 @@ fn run_rebuild() {
     }
 
     // Новое поколение gen<N> (N = max существующих + 1) + активировать (current).
-    let name = alloc::format!("gen{}", next_gen_number(scap));
+    let Some(num) = next_gen_number(scap) else {
+        sys::write("vvsh: список корней store не читается целиком — номер поколения не выдумываем\n".as_bytes());
+        return;
+    };
+    let name = alloc::format!("gen{}", num);
     let root = alloc::format!("system/{}", name);
     sys::obj_set_root(scap, root.as_bytes(), &new_id);
     let mut nm_id = [0u8; 32];
@@ -325,21 +332,11 @@ fn run_gens() {
     let scap = cap_store();
     let cur = read_current_name(scap);
 
-    let mut buf = [0u8; 16384];
-    let n = sys::obj_list_roots(scap, &mut buf);
-    let mut nums: Vec<u32> = Vec::new();
-    for line in buf[..n].split(|&b| b == b'\n') {
-        if line.len() <= 14 {
-            continue; // "hex(12)  имя": имя с 14-го байта
-        }
-        if let Some(rest) = line[14..].strip_prefix(b"system/gen") {
-            if let Some(k) = parse_u32(rest) {
-                nums.push(k);
-            }
-        }
-    }
-    nums.sort_unstable();
-    nums.dedup();
+    let Some(text) = roots::text(scap) else {
+        sys::write("vvsh: список корней store не прочитать (нужен store READ/WRITE)\n".as_bytes());
+        return;
+    };
+    let nums = roots::gen_numbers(&text, b"system/gen");
 
     sys::write("поколения системы (активно — *):\n".as_bytes());
     if nums.is_empty() {
@@ -954,12 +951,11 @@ fn arg_path(args: &[Value], usage: &str) -> Result<Vec<u8>, EvalError> {
 
 /// `(roots)` — сырые корни store (короткий id + имя на строку). Store — start-cap 1.
 fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
-    let mut buf = [0u8; 16384];
-    let n = sys::obj_list_roots(cap_store(), &mut buf);
-    if n == 0 {
-        sys::write("нет корней (или нет прав на store)\n".as_bytes());
-    } else {
-        sys::write(&buf[..n]);
+    // Список читается ЦЕЛИКОМ (Веха 107): с пакетами корней стало много — по два на каждый путь
+    // замыкания, — и фиксированный буфер молча резал вывод посреди строки.
+    match roots::text(cap_store()) {
+        Some(text) => sys::write(&text),
+        None => sys::write("нет корней (или нет прав на store)\n".as_bytes()),
     }
     Ok(Value::nil())
 }
@@ -1822,37 +1818,12 @@ fn gen_content_id(scap: usize, gen: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Максимальный N среди корней `system/gen<N>` + 1 (нумерация поколений). LIST_ROOTS — по WRITE.
-fn next_gen_number(scap: usize) -> u32 {
-    let mut buf = [0u8; 16384];
-    let n = sys::obj_list_roots(scap, &mut buf);
-    let mut max = 0u32;
-    for line in buf[..n].split(|&b| b == b'\n') {
-        if line.len() <= 14 {
-            continue;
-        }
-        if let Some(rest) = line[14..].strip_prefix(b"system/gen") {
-            if let Some(k) = parse_u32(rest) {
-                if k > max {
-                    max = k;
-                }
-            }
-        }
-    }
-    max + 1
-}
-
-fn parse_u32(bytes: &[u8]) -> Option<u32> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut n: u32 = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
-    }
-    Some(n)
+///
+/// `None` — список корней не прочитан целиком: номер тогда НЕ выдумывается. Иначе «не увидели
+/// gen3» стало бы «собираем gen3 заново», то есть затиранием существующего поколения.
+fn next_gen_number(scap: usize) -> Option<u32> {
+    let text = roots::text(scap)?;
+    Some(roots::gen_numbers(&text, b"system/gen").last().copied().unwrap_or(0) + 1)
 }
 
 fn trim(mut s: &[u8]) -> &[u8] {

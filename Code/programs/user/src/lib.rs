@@ -478,11 +478,25 @@ pub fn obj_del_root(store_cap: usize, name: &[u8]) -> usize {
 }
 
 /// `SYS_OBJ_LIST_ROOTS`: заполнить `buf` текстом «короткий id  имя\n» по каждому СЫРОМУ корню
-/// store (vsh `roots`). Возвращает число записанных байт (0 при отказе/пустом). Нужен store-cap
-/// с READ или WRITE.
-pub fn obj_list_roots(store_cap: usize, buf: &mut [u8]) -> usize {
+/// store (vsh `roots`). Возвращает `(доехало, хотел отдать)` в байтах — второе больше первого,
+/// если буфер мал. Нужен store-cap с READ или WRITE; при отказе — `(0, 0)`.
+///
+/// Веха 107: длина ВСЕГО списка возвращается отдельно по той же причине, по которой её отдаёт
+/// `readdir` персоналии, — иначе «корней ровно столько» не отличить от «буфер мал», а обрезание
+/// приходится на середину строки и даёт покалеченное имя корня. На списке корней стоит
+/// нумерация поколений: недосчитаться — значит затереть существующее поколение.
+pub fn obj_list_roots_ex(store_cap: usize, buf: &mut [u8]) -> Option<(usize, usize)> {
     let r = abi::syscall(SYS_OBJ_LIST_ROOTS, store_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
-    if r == usize::MAX { 0 } else { r }
+    if r == usize::MAX {
+        None // отказ по правам — это НЕ то же самое, что «корней нет»
+    } else {
+        Some((r.min(buf.len()), r))
+    }
+}
+
+/// То же, но только «сколько байт доехало» — для тех, кому хватает одного буфера.
+pub fn obj_list_roots(store_cap: usize, buf: &mut [u8]) -> usize {
+    obj_list_roots_ex(store_cap, buf).map_or(0, |(got, _)| got)
 }
 
 /// `SYS_LOG`: вкл/выкл подробный трейс ядра ([ipc]/[obj]/[mm]/…). По умолчанию интерактивная
