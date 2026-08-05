@@ -145,6 +145,10 @@ pub struct Store {
     last_roots_id: Option<ContentId>,
     /// Следующий коммит обязан писать полную базу индекса (миграция v1 / после compact).
     need_base: bool,
+    /// Веха 110 — режим ПЕРЕСЕЛЕНИЯ: коммит пишет ВСЕ объекты на новые места, подгружая каждый
+    /// прямо перед записью и отпуская сразу после. Нужен уплотнению: держать всё живое в памяти
+    /// на сторе крупнее кучи ядра нельзя (замер: пакеты дают десятки мегабайт при куче 16 МиБ).
+    relocate: bool,
     /// Всего байт записано на носитель за сессию (статистика для честных замеров).
     bytes_written: u64,
     /// Веха 89 — сколько раз кадр с диска НЕ сошёлся со своим content-id (или носитель не отдал
@@ -172,6 +176,7 @@ impl Store {
             dirty_ops: 0,
             last_roots_id: None,
             need_base: true, // первый коммит пустого/нового store — база
+            relocate: false,
             bytes_written: 0,
             corrupt_reads: 0,
             failed_writes: 0,
@@ -511,32 +516,27 @@ impl Store {
     /// Обрыв в любой точке оставляет консистентное состояние: до суперблока фазы — старое,
     /// после — новое. Наивная перезапись начала «на месте» ломала бы старый индекс.
     pub fn compact(&mut self, io: &mut impl BlockIo) {
-        // ВНИМАНИЕ (Веха 108): здесь всё живое обязано оказаться в RAM — фазы объявляют кадры
-        // «не на диске», а коммит пишет только то, чей payload у него в руках. На сторе крупнее
-        // кучи ядра это упрётся так же, как упирался обход gc, только позже: уплотнение зовут по
-        // порогу мусора, а не на каждой загрузке. Настоящее лечение — научить коммит писать
-        // объект, подгружая его прямо перед записью и отпуская сразу после; записано в
-        // known-gaps, чтобы это не всплыло опять как «непонятная нехватка памяти».
-        let ids: Vec<ContentId> = self.objects.keys().copied().collect();
-        for id in &ids {
-            self.ensure_loaded(io, id);
-        }
-
-        // Веха 89 — снимок «где что лежит». Обе фазы сперва объявляют объекты «не на диске»
-        // и только потом пишут; если запись не состоится, без отката store решил бы, что на
-        // диске пусто, хотя данные там.
+        // Веха 110 — уплотнение больше НЕ ТРЕБУЕТ всего живого в памяти: коммит в режиме
+        // переселения подгружает каждый объект прямо перед записью и отпускает сразу после.
+        // До этого здесь стоял цикл `ensure_loaded` по всем объектам, и на сторе крупнее кучи
+        // ядра он гарантированно ронял систему — причём не в момент установки пакета, а при
+        // следующей загрузке, где порог мусора и зовёт уплотнение.
+        //
+        // Читаем при этом по СТАРЫМ адресам, пишем по новым, поэтому важно, чтобы области не
+        // пересеклись. Для фазы 1 это верно по построению (пишем за `next_free`, читаем до него);
+        // для фазы 2 проверяется явно ниже.
         let snapshot: Vec<(ContentId, Option<(u32, u32)>)> =
             self.objects.iter().map(|(id, o)| (*id, o.disk)).collect();
         let (saved_next_free, saved_garbage) = (self.next_free, self.garbage);
         let saved_dead = self.pending_dead.clone();
 
         // Фаза 1: копии живых в конец области + база-индекс + суперблок.
-        for o in self.objects.values_mut() {
-            o.disk = None;
-        }
         self.pending_dead.clear(); // база пишет только живых — надгробия не нужны
         self.need_base = true;
-        if !self.commit(io) {
+        self.relocate = true;
+        let ok = self.commit(io);
+        self.relocate = false;
+        if !ok {
             // Веха 89 — места не хватило даже на копию. **Фазу 2 запускать НЕЛЬЗЯ**: она пишет
             // с начала области, а активный суперблок всё ещё указывает на исходные кадры именно
             // там — переписать их значит потерять данные. Откатываем и уходим ни с чем: диск
@@ -545,18 +545,34 @@ impl Store {
             return;
         }
 
+        // Сколько места займёт фаза 2 (кадры считаем по индексу — их длины там записаны).
+        let live_sectors: u64 = self
+            .objects
+            .values()
+            .map(|o| o.disk.map_or(0, |(_, len)| (len as usize).div_ceil(SECTOR) as u64))
+            .sum();
+        let index_sectors =
+            (12 + self.objects.len() * ENTRY_SIZE).div_ceil(SECTOR) as u64;
+        if OBJ_START + live_sectors + index_sectors > saved_next_free as u64 {
+            // Фаза 2 дошла бы до копий фазы 1 и читала бы уже переписанное. Уплотнение
+            // состоялось наполовину: данные лежат в конце области, диск консистентен, мусор
+            // соберётся в следующий раз. Молчать об этом не будем — это редкий случай.
+            self.need_base = true;
+            return;
+        }
+
         // Фаза 2: то же самое, но с начала области — бывшие сектора живых теперь мусор,
         // на них не указывает ни активный индекс, ни суперблок (его переставила фаза 1).
         let snapshot2: Vec<(ContentId, Option<(u32, u32)>)> =
             self.objects.iter().map(|(id, o)| (*id, o.disk)).collect();
         let (nf2, g2) = (self.next_free, self.garbage);
-        for o in self.objects.values_mut() {
-            o.disk = None;
-        }
         self.next_free = OBJ_START as u32;
         self.garbage = 0;
         self.need_base = true;
-        if !self.commit(io) {
+        self.relocate = true;
+        let ok2 = self.commit(io);
+        self.relocate = false;
+        if !ok2 {
             // Диск консистентен состоянием фазы 1 — возвращаем учёт к нему же.
             self.restore(&snapshot2, nf2, g2, Vec::new());
         }
@@ -747,7 +763,7 @@ impl Store {
         let to_write: Vec<ContentId> = self
             .objects
             .iter()
-            .filter(|(_, o)| o.disk.is_none())
+            .filter(|(_, o)| self.relocate || o.disk.is_none())
             .map(|(id, _)| *id)
             .collect();
         let mut delta: Vec<(ContentId, u32, u32)> = Vec::with_capacity(to_write.len());
@@ -755,11 +771,17 @@ impl Store {
         // коммит — это осиротевшие кадры и потраченные секторы там, где места и так нет.
         // Индекс-кадр ещё не построен, поэтому кладём на него запас: заголовок (8 Б) + счётчик
         // (4 Б) + запись на каждый объект store (база в худшем случае перечисляет все).
+        // В режиме переселения payload'ов в памяти нет, и считать по ним нельзя — берём длину
+        // кадра из индекса (она там записана, кадр не меняется от переезда).
         let need_objects: u64 = to_write
             .iter()
             .map(|id| {
-                let d = self.objects[id].data.as_ref().expect("объект без данных и без диска");
-                (encode(&d.payload, &d.children).len().div_ceil(SECTOR)) as u64
+                let o = &self.objects[id];
+                match (&o.data, o.disk) {
+                    (Some(d), _) => encode(&d.payload, &d.children).len().div_ceil(SECTOR) as u64,
+                    (None, Some((_, len))) => (len as usize).div_ceil(SECTOR) as u64,
+                    (None, None) => 0,
+                }
             })
             .sum();
         let need_index =
@@ -769,8 +791,21 @@ impl Store {
             return false;
         }
         for id in to_write {
+            // Веха 110 — подгружаем ПРЯМО ПЕРЕД записью и отпускаем сразу после: так уплотнение
+            // перестало требовать всё живое в памяти. Читается объект по СТАРОМУ месту (`disk`
+            // ещё не тронут), пишется на новое — потому дельта и применяется только в конце.
+            let borrowed = self.objects[&id].data.is_none();
+            if borrowed && !self.ensure_loaded(io, &id) {
+                self.failed_writes += 1;
+                return false;
+            }
             let d = self.objects[&id].data.as_ref().expect("объект без данных и без диска");
             let frame = encode(&d.payload, &d.children);
+            if borrowed {
+                if let Some(o) = self.objects.get_mut(&id) {
+                    o.data = None; // кадр уже собран — вторая копия в куче не нужна
+                }
+            }
             let sector = self.next_free;
             // Веха 89: носитель отказал — коммит НЕ состоялся. Выходим до записи суперблока,
             // значит на диске остаётся прежнее консистентное состояние, а объекты остаются
