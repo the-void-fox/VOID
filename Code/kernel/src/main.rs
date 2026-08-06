@@ -787,6 +787,11 @@ fn proc_demo() {
     let client = spawn_prog("blk-cli", "blk-cli", 0);
     let ep = cap::mint(proc::domain(client), cap::Target::Endpoint(server), Rights::SEND);
     proc::set_arg(client, ep.bits() as usize);
+    // Сектор для опытов выдаёт тот, кто владеет носителем: store резервирует хвост и называет
+    // сектор сам (Веха 111 — см. `void_store::TAIL_RESERVED`). Ноль означает «места нет», и
+    // демо тогда просто не пишет.
+    let scratch = void_store::scratch_sector(object::disk_capacity_sectors()).unwrap_or(0);
+    proc::set_arg2(client, scratch as usize);
     println!(
         "    P{} '{}' ← cap на эндпоинт P{} [{}]",
         client, cap::domain_name(proc::domain(client)), server, cap::rights_str(Rights::SEND),

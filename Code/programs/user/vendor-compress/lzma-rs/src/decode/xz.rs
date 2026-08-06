@@ -212,6 +212,8 @@ where
     let mut digest = CRC32.digest();
     digest.update(&[header_size]);
     let header_size = ((header_size as u64) << 2) - 1;
+    // Контрольная сумма блока, посчитанная ПО ХОДУ распаковки (заполняется при одном фильтре).
+    let mut block_check: Option<BlockCheck> = None;
 
     let block_header = {
         let mut taken = count_input.take(header_size);
@@ -228,34 +230,62 @@ where
         )));
     }
 
-    let mut tmpbuf: Vec<u8> = Vec::new();
+    // ОДИН фильтр (а это все xz, что нам встречаются: `.nar.xz` кэша и индекс канала — чистый
+    // LZMA2) распаковывается ПРЯМО В СТОК, без временного буфера на весь блок. Цепочка фильтров
+    // по-прежнему идёт через буфер: там выход одного фильтра — вход другого, и потоком это не
+    // сделать, не переписав всё вокруг.
+    //
+    // Цена решения названа честно: байты уходят потребителю ДО того, как сверена контрольная
+    // сумма блока. Иначе потоковой распаковки не бывает вообще (так же ведёт себя `xz -dc`).
+    // Для VOID это безопасно, потому что ни один потребитель не делает распакованное видимым до
+    // конца: `pkg` привязывает корень дерева только после сверки NarHash, а индекс канала — уже
+    // после `finish()`; ошибка на любом шаге означает, что корень просто не заведётся, а
+    // недостижимые объекты подберёт сборка мусора.
     let filters = block_header.filters;
-    for (i, filter) in filters.iter().enumerate() {
-        if i == 0 {
-            // TODO: use SubBufRead on input if packed_size is known?
-            let packed_size = decode_filter(count_input, &mut tmpbuf, filter)?;
-            if let Some(expected_packed_size) = block_header.packed_size {
-                if (packed_size as u64) != expected_packed_size {
-                    return Err(error::Error::XzError(format!(
-                        "Invalid compressed size: expected {} but got {}",
-                        expected_packed_size, packed_size
-                    )));
-                }
-            }
-        } else {
-            let mut newbuf: Vec<u8> = Vec::new();
-            decode_filter(
-                &mut io::BufReader::new(tmpbuf.as_slice()),
-                &mut newbuf,
-                filter,
-            )?;
-            // TODO: does this move or copy?
-            tmpbuf = newbuf;
-        }
-    }
+    let single = filters.len() == 1;
 
-    let unpacked_size = tmpbuf.len();
-    lzma_info!("XZ block decompressed to {} byte(s)", tmpbuf.len());
+    let mut tmpbuf: Vec<u8> = Vec::new();
+    let unpacked_size = if single {
+        let mut sink = BlockSink::new(output, check_method);
+        let packed_size = decode_filter(count_input, &mut sink, &filters[0])?;
+        if let Some(expected_packed_size) = block_header.packed_size {
+            if (packed_size as u64) != expected_packed_size {
+                return Err(error::Error::XzError(format!(
+                    "Invalid compressed size: expected {} but got {}",
+                    expected_packed_size, packed_size
+                )));
+            }
+        }
+        let (count, check) = sink.done();
+        block_check = Some(check);
+        count
+    } else {
+        for (i, filter) in filters.iter().enumerate() {
+            if i == 0 {
+                // TODO: use SubBufRead on input if packed_size is known?
+                let packed_size = decode_filter(count_input, &mut tmpbuf, filter)?;
+                if let Some(expected_packed_size) = block_header.packed_size {
+                    if (packed_size as u64) != expected_packed_size {
+                        return Err(error::Error::XzError(format!(
+                            "Invalid compressed size: expected {} but got {}",
+                            expected_packed_size, packed_size
+                        )));
+                    }
+                }
+            } else {
+                let mut newbuf: Vec<u8> = Vec::new();
+                decode_filter(
+                    &mut io::BufReader::new(tmpbuf.as_slice()),
+                    &mut newbuf,
+                    filter,
+                )?;
+                // TODO: does this move or copy?
+                tmpbuf = newbuf;
+            }
+        }
+        tmpbuf.len()
+    };
+    lzma_info!("XZ block decompressed to {} byte(s)", unpacked_size);
 
     if let Some(expected_unpacked_size) = block_header.unpacked_size {
         if (unpacked_size as u64) != expected_unpacked_size {
@@ -282,9 +312,14 @@ where
             ));
         }
     }
-    validate_block_check(count_input, tmpbuf.as_slice(), check_method)?;
-
-    output.write_all(tmpbuf.as_slice())?;
+    match block_check {
+        // Потоковый путь: сумма уже посчитана по дороге, буфера с блоком нет.
+        Some(check) => validate_block_check_streamed(count_input, check)?,
+        None => {
+            validate_block_check(count_input, tmpbuf.as_slice(), check_method)?;
+            output.write_all(tmpbuf.as_slice())?;
+        }
+    }
     records.push(Record {
         unpadded_size: (count_input.count() - padding_size) as u64,
         unpacked_size: unpacked_size as u64,
@@ -292,6 +327,96 @@ where
 
     let finished = false;
     Ok(finished)
+}
+
+/// Контрольная сумма блока, досчитанная до конца (VOID, Веха 111).
+enum BlockCheck {
+    None,
+    Crc32(u32),
+    Crc64(u64),
+    Unsupported,
+}
+
+/// Сток блока: отдаёт байты дальше, считает их и ведёт контрольную сумму — всё за один проход,
+/// потому что второго прохода по этим байтам не будет: они уже ушли потребителю.
+struct BlockSink<'a, W: io::Write> {
+    out: &'a mut W,
+    count: usize,
+    crc32: Option<crate::crc::Digest<'static, u32>>,
+    crc64: Option<crate::crc::Digest<'static, u64>>,
+    unsupported: bool,
+}
+
+impl<'a, W: io::Write> BlockSink<'a, W> {
+    fn new(out: &'a mut W, method: CheckMethod) -> Self {
+        Self {
+            out,
+            count: 0,
+            crc32: matches!(method, CheckMethod::Crc32).then(|| CRC32.digest()),
+            crc64: matches!(method, CheckMethod::Crc64).then(|| CRC64.digest()),
+            unsupported: matches!(method, CheckMethod::Sha256),
+        }
+    }
+
+    fn done(self) -> (usize, BlockCheck) {
+        let check = if self.unsupported {
+            BlockCheck::Unsupported
+        } else if let Some(d) = self.crc32 {
+            BlockCheck::Crc32(d.finalize())
+        } else if let Some(d) = self.crc64 {
+            BlockCheck::Crc64(d.finalize())
+        } else {
+            BlockCheck::None
+        };
+        (self.count, check)
+    }
+}
+
+impl<W: io::Write> io::Write for BlockSink<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(d) = self.crc32.as_mut() {
+            d.update(buf);
+        }
+        if let Some(d) = self.crc64.as_mut() {
+            d.update(buf);
+        }
+        self.count += buf.len();
+        self.out.write_all(buf)?;
+        Ok(buf.len())
+    }
+}
+
+/// Сверить посчитанную по дороге сумму с полем «Block Check».
+fn validate_block_check_streamed<R>(input: &mut R, check: BlockCheck) -> error::Result<()>
+where
+    R: io::BufRead,
+{
+    match check {
+        BlockCheck::None => Ok(()),
+        BlockCheck::Crc32(got) => {
+            let want = input.read_u32::<LittleEndian>()?;
+            if want != got {
+                return Err(error::Error::XzError(format!(
+                    "Invalid block CRC32, expected 0x{:08x} but got 0x{:08x}",
+                    want, got
+                )));
+            }
+            Ok(())
+        }
+        BlockCheck::Crc64(got) => {
+            let want = input.read_u64::<LittleEndian>()?;
+            if want != got {
+                return Err(error::Error::XzError(format!(
+                    "Invalid block CRC64, expected 0x{:016x} but got 0x{:016x}",
+                    want, got
+                )));
+            }
+            Ok(())
+        }
+        BlockCheck::Unsupported => Err(error::Error::XzError(
+            "Unsupported SHA-256 checksum (not yet implemented)".to_string(),
+        )),
+    }
 }
 
 /// Verify block checksum against the "Block Check" field.
@@ -337,6 +462,22 @@ where
     Ok(())
 }
 
+/// Размер словаря LZMA2 из байта свойств фильтра (xz spec, 5.3.1):
+/// биты 0–5 несут показатель, `dict = (2 | (v & 1)) << (v / 2 + 11)`, а `v = 40` — это 4 ГиБ−1.
+///
+/// Значение только РАСТЁТ с `v`, поэтому непонятное (v > 40) безопаснее трактовать как «держать
+/// всё»: лишняя память хуже, чем неверный ответ, но неверный ответ здесь — порча данных.
+fn lzma2_dict_size(props: u8) -> usize {
+    let v = (props & 0x3F) as u32;
+    if v > 40 {
+        return usize::MAX;
+    }
+    if v == 40 {
+        return u32::MAX as usize;
+    }
+    ((2 | (v & 1)) as usize) << (v / 2 + 11)
+}
+
 fn decode_filter<R, W>(input: &mut R, output: &mut W, filter: &Filter) -> error::Result<usize>
 where
     R: io::BufRead,
@@ -351,8 +492,15 @@ where
                     filter.filter_id
                 )));
             }
-            // TODO: properties??
-            Lzma2Decoder::new().decompress(&mut count_input, output)?;
+            // Свойство фильтра LZMA2 — один байт с размером СЛОВАРЯ (xz spec, 5.3.1). Апстрим
+            // его игнорировал («TODO: properties??»), потому что копил весь вывод в памяти и
+            // словарь ему был не нужен. Нам он нужен ровно затем, чтобы НЕ копить: столько
+            // байт мы обязаны держать, остальное уходит в сток по дороге (Веха 111).
+            Lzma2Decoder::new().decompress_window(
+                &mut count_input,
+                output,
+                lzma2_dict_size(filter.props[0]),
+            )?;
             Ok(count_input.count())
         }
     }

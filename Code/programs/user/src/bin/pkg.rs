@@ -1,8 +1,10 @@
 //! `pkg` — пакеты из бинарного кэша nixpkgs (Вехи 106–107, Фаза 8, [[0009-ondevice-packages]]).
 //!
 //! ```text
-//! pkg fetch <путь>     скачать ЗАМЫКАНИЕ пути (сам путь и все зависимости)
-//! pkg install <путь>   то же + новое поколение профиля с этим пакетом
+//! pkg update           скачать индекс имён канала (иначе имена не работают)
+//! pkg search <строка>  какие имена в индексе на неё похожи
+//! pkg fetch <путь|имя> скачать ЗАМЫКАНИЕ пути (сам путь и все зависимости)
+//! pkg install <п|имя>  то же + новое поколение профиля с этим пакетом
 //! pkg remove <имя>     новое поколение профиля без пакета
 //! pkg list             что стоит в активном поколении профиля
 //! pkg gens             поколения профиля (активное — *)
@@ -31,6 +33,25 @@
 //! `pkg/profile/<профиль>/current` — корень-указатель, чьё значение = имя активного поколения.
 //! Отсюда всё остальное следует само: установка и удаление — это НОВОЕ поколение (пересборка
 //! замыкания из списка верхнего уровня), а откат — смена одного указателя, без единой загрузки.
+//!
+//! ## Имя — это подсказка, а не полномочие (Веха 111)
+//!
+//! Путь store адресуется хэшем, и по-другому быть не может: имя `hello` ничего не удостоверяет.
+//! Но набирать хэш руками — не работа для человека, поэтому появился ИНДЕКС КАНАЛА
+//! (`store-paths.xz` с channels.nixos.org): текстовый список всех путей, которые канал собрал.
+//!
+//! Индекс **не подписан**, и это не оплошность, а следствие устройства: он ничего не решает.
+//! Всё, что он может, — назвать хэш; дальше начинается обычная дорога с подписью кэша и
+//! NarHash ([[pkg-fetch]]). Единственная выдумка, доступная подменённому индексу, — подсунуть
+//! на имя `hello` хэш другого пакета, и **та проверяется отдельно**: имя пути, которое вернул
+//! подписанный narinfo, обязано совпасть с тем, что обещал индекс, — и совпасть ДО загрузки
+//! содержимого. Итого подменённый индекс способен лишь дать вам не тот `hello` из nixpkgs, а
+//! не чужой код: содержимое всё равно подписано ключом кэша.
+//!
+//! Второе следствие того же: **имя не однозначно**. В одном канале живут 63 пути `stdenv-linux`
+//! и два разных `hello-2.12.3`. Значение имён знает вычисление nixpkgs (Фаза 9), а индекс знает
+//! только строки, — поэтому выбор делается объявленным правилом (свой выход, старшая версия,
+//! дальше порядок индекса) и **говорится вслух**, вместе с числом отвергнутых кандидатов.
 //!
 //! ## Почему отдельная программа
 //!
@@ -65,6 +86,11 @@ use void_tree as tree;
 // Профиль (поколения и их содержимое) — общий с шеллом: ему он нужен для PATH (Веха 109).
 #[path = "../profile.rs"]
 mod profile;
+// Правила именования nix (имя/версия/выход и сравнение версий). Отдельным файлом ради хостовой
+// проверки против настоящего nix — см. его шапку.
+#[path = "../nixname.rs"]
+mod nixname;
+use nixname::{parts, HASH_LEN};
 
 // Куча (Веха 108): от размера пакета она БОЛЬШЕ НЕ ЗАВИСИТ — байты идут потоком, и целиком в
 // памяти не живёт ни архив, ни NAR, ни файл. Определяет её теперь окно распаковщика: у zstd оно
@@ -88,9 +114,6 @@ const KEY_B64: &str = "6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
 /// Алфавит nix-base32 — свой, не RFC: выброшены `e`, `o`, `u`, `t`.
 const NIX32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-/// Длина хэша пути store в символах.
-const HASH_LEN: usize = 32;
-
 /// Имя профиля и формат поколения живут в общем модуле [`profile`].
 use profile::{GEN_MAGIC, PROFILE};
 
@@ -102,6 +125,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let (cmd, rest, third) = (it.next(), it.next(), it.next());
 
     let code = match (cmd, rest) {
+        (Some(b"update"), _) => done(cmd_update()),
+        (Some(b"search"), Some(what)) => done(cmd_search(what)),
         (Some(b"fetch"), Some(what)) => done(cmd_fetch(what)),
         (Some(b"install"), Some(what)) => done(cmd_install(what)),
         (Some(b"remove"), Some(what)) => done(cmd_remove(what)),
@@ -138,8 +163,10 @@ fn done(r: Result<(), String>) -> usize {
 
 fn usage() {
     sys::write("pkg — пакеты из бинарного кэша nixpkgs\n".as_bytes());
-    sys::write("  fetch <хэш|/nix/store/путь>   скачать замыкание (путь и все зависимости)\n".as_bytes());
-    sys::write("  install <хэш|путь>            скачать и внести в профиль (новое поколение)\n".as_bytes());
+    sys::write("  update                        скачать индекс имён канала\n".as_bytes());
+    sys::write("  search <строка>               какие имена в индексе на неё похожи\n".as_bytes());
+    sys::write("  fetch <хэш|путь|имя>          скачать замыкание (путь и все зависимости)\n".as_bytes());
+    sys::write("  install <хэш|путь|имя>        скачать и внести в профиль (новое поколение)\n".as_bytes());
     sys::write("  remove <имя|хэш>              убрать из профиля (новое поколение)\n".as_bytes());
     sys::write("  tree <путь> [подпуть]         что лежит внутри распакованного пакета\n".as_bytes());
     sys::write("  cat <путь> <подпуть>          содержимое файла из пакета\n".as_bytes());
@@ -619,6 +646,355 @@ fn read_file<F: FnMut(&[u8])>(
     Ok(())
 }
 
+// ── индекс имён канала (Веха 111) ───────────────────────────────────────────────────────────
+
+/// Индекс путей канала: текст по строке на путь, `/nix/store/<хэш>-<имя>`. Публикуется Hydra
+/// рядом с самим каналом и перечисляет ровно то, что канал собрал, — то есть то, что лежит в
+/// кэше и до чего мы вообще можем дотянуться.
+///
+/// Канал зашит по той же причине, что и хост кэша: «откуда система берёт софт» — решение
+/// системы, а не аргумент команды. Сменить его — задача конфига, а не командной строки.
+const INDEX_URL: &str = "https://channels.nixos.org/nixos-unstable/store-paths.xz";
+
+/// Корень, под которым индекс живёт. Блобом, а не объектом: распакованного текста 15 МиБ, и
+/// целиком в памяти он не бывает — ни при записи, ни при поиске.
+const INDEX_ROOT: &str = "pkg/index/paths";
+
+/// Копилка кусков: распакованные байты уходят в store порциями [`FILE_CHUNK`], а в памяти
+/// живёт ровно одна порция. Тот же приём, что у распаковки пакета ([`Builder`]).
+struct ChunkWriter {
+    scap: usize,
+    buf: Vec<u8>,
+    kids: Vec<[u8; 32]>,
+    total: usize,
+    lines: usize,
+    told: usize,
+}
+
+impl ChunkWriter {
+    fn new(scap: usize) -> Self {
+        ChunkWriter { scap, buf: Vec::with_capacity(FILE_CHUNK), kids: Vec::new(), total: 0, lines: 0, told: 0 }
+    }
+
+    fn put(&mut self, mut data: &[u8]) -> Result<(), String> {
+        self.total += data.len();
+        self.lines += data.iter().filter(|&&b| b == b'\n').count();
+
+        // Порция от распаковщика бывает В МЕГАБАЙТАХ (xz отдаёт всё, что вышло за словарь), и
+        // складывать её целиком к себе значило бы вернуть ту самую память, ради экономии которой
+        // распаковка и делалась потоковой. Поэтому полные куски берутся ПРЯМО ИЗ ПОРЦИИ, а у нас
+        // задерживается только хвост короче куска.
+        if !self.buf.is_empty() {
+            let take = (FILE_CHUNK - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == FILE_CHUNK {
+                let id = put(self.scap, &self.buf)?;
+                self.kids.push(id);
+                self.buf.clear();
+            }
+        }
+        while data.len() >= FILE_CHUNK {
+            let id = put(self.scap, &data[..FILE_CHUNK])?;
+            self.kids.push(id);
+            data = &data[FILE_CHUNK..];
+        }
+        self.buf.extend_from_slice(data);
+        // Распаковка индекса небыстрая, а молчащая программа неотличима от повисшей.
+        let mib = self.total / (4 * 1024 * 1024);
+        if mib != self.told {
+            self.told = mib;
+            sys::write(format!("  … {} МиБ\n", mib * 4).as_bytes());
+        }
+        Ok(())
+    }
+
+    /// Дописать остаток и связать куски манифестом блоба.
+    fn finish(mut self) -> Result<([u8; 32], usize, usize), String> {
+        if !self.buf.is_empty() {
+            let id = put(self.scap, &self.buf)?;
+            self.kids.push(id);
+        }
+        let man = sys::http::blob_manifest(self.total, self.kids.len());
+        let id = put_node(self.scap, &man, &self.kids)?;
+        Ok((id, self.total, self.lines))
+    }
+}
+
+/// Пройти по индексу, отдавая строки по одной. Читается кусками блоба, склейка разрезанных на
+/// границе строк — через `carry`; целиком индекс в памяти не собирается никогда.
+fn index_scan<F: FnMut(&str)>(scap: usize, mut f: F) -> Result<usize, String> {
+    let id = root_id(scap, INDEX_ROOT).ok_or("индекса имён нет — сначала `pkg update`")?;
+    let mut head = [0u8; 512];
+    let n = sys::obj_get(scap, &id, &mut head);
+    let (_, nchunks, csize) = sys::http::blob_info(&head[..n.min(head.len())])
+        .ok_or("индекс имён не похож на блоб — перекачайте его `pkg update`")?;
+    let mut kids = vec![[0u8; 32]; nchunks];
+    if sys::obj_children(scap, &id, &mut kids) != nchunks {
+        return Err(String::from("список кусков индекса не сошёлся"));
+    }
+
+    let mut buf = vec![0u8; csize];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut lines = 0usize;
+    for k in &kids {
+        let n = sys::obj_get(scap, k, &mut buf);
+        if n == 0 || n > buf.len() {
+            return Err(String::from("кусок индекса не читается"));
+        }
+        let mut rest = &buf[..n];
+        while let Some(p) = rest.iter().position(|&b| b == b'\n') {
+            let (line, tail) = rest.split_at(p);
+            rest = &tail[1..];
+            if carry.is_empty() {
+                if let Ok(s) = core::str::from_utf8(line) {
+                    f(s);
+                    lines += 1;
+                }
+            } else {
+                carry.extend_from_slice(line);
+                if let Ok(s) = core::str::from_utf8(&carry) {
+                    f(s);
+                    lines += 1;
+                }
+                carry.clear();
+            }
+        }
+        carry.extend_from_slice(rest);
+    }
+    if !carry.is_empty() {
+        if let Ok(s) = core::str::from_utf8(&carry) {
+            f(s);
+            lines += 1;
+        }
+    }
+    Ok(lines)
+}
+
+/// Сколько кандидатов на одно имя мы готовы держать в памяти. `stdenv-linux` в канале
+/// встречается 63 раза, так что запас нужен, но не безграничный.
+const CANDS_MAX: usize = 512;
+
+/// Все пути канала с данным именем пакета — в порядке предпочтения ([`nixname::cmp_pref`]).
+fn candidates(scap: usize, query: &str) -> Result<Vec<String>, String> {
+    let mut cands: Vec<String> = Vec::new();
+    let mut over = false;
+    index_scan(scap, |line| {
+        let Some(base) = line.strip_prefix("/nix/store/") else { return };
+        if base.as_bytes().get(HASH_LEN) != Some(&b'-') {
+            return;
+        }
+        if parts(base).0 != query {
+            return;
+        }
+        if cands.len() < CANDS_MAX {
+            cands.push(base.to_string());
+        } else {
+            over = true;
+        }
+    })?;
+
+    if over {
+        return Err(format!("у имени {} больше {} путей — назовите путь хэшем", query, CANDS_MAX));
+    }
+    // Устойчивая сортировка: равные кандидаты остаются в порядке индекса.
+    cands.sort_by(|a, b| nixname::cmp_pref(a, b));
+    Ok(cands)
+}
+
+/// Найти путь по имени пакета.
+///
+/// Порядок отбора: сперва **своя архитектура** (по якорю, см. [`probe_arch`]) — это не
+/// предпочтение, а условие пригодности; затем **свой выход важнее чужого** (`hello-2.12.3`
+/// вместо `hello-2.12.3-doc`), **старшая версия важнее младшей** (сравнением nix), при полном
+/// равенстве — **первый в индексе** (он отсортирован по хэшу, значит выбор воспроизводим, а не
+/// «какой попался»). Сколько кандидатов отвергнуто — печатается, а не замалчивается.
+fn resolve_name(scap: usize, query: &str) -> Result<Pick, String> {
+    let cands = candidates(scap, query)?;
+    if cands.is_empty() {
+        return Err(format!(
+            "в индексе канала нет пакета {} — посмотрите `pkg search {}`",
+            query, query
+        ));
+    }
+
+    let anchor = read_anchor(scap);
+    if anchor.as_deref() == Some(NO_ARCH) {
+        return Err(format!(
+            "канал не собирает под нашу архитектуру — имена не работают, ставьте по хэшу ({} путей у имени {})",
+            cands.len(), query
+        ));
+    }
+
+    // Отбор по архитектуре. Кандидаты перебираются в порядке предпочтения и берётся ПЕРВЫЙ
+    // свой — поэтому в обычном случае это одна-две загрузки narinfo (2–3 КиБ), а не десяток.
+    if let Some(libc) = &anchor {
+        if cands.len() > 1 {
+            for c in &cands {
+                let ni = narinfo(scap, hash_of(c))?;
+                if ni.references.iter().any(|r| r == libc) {
+                    return Ok(Pick { base: c.clone(), total: cands.len(), arch: Arch::Ours });
+                }
+            }
+            // Ни один не сослался на нашу libc. Так бывает у пакетов без libc вообще
+            // (данные, статические сборки) — и тогда архитектура ни при чём.
+            return Ok(Pick { base: cands[0].clone(), total: cands.len(), arch: Arch::NoLibc });
+        }
+    }
+
+    let arch = if anchor.is_some() { Arch::Ours } else { Arch::Unknown };
+    Ok(Pick { base: cands[0].clone(), total: cands.len(), arch })
+}
+
+/// Что известно про архитектуру выбранного пути.
+enum Arch {
+    /// Он сослался на нашу libc (или кандидат был один).
+    Ours,
+    /// Никто из кандидатов не ссылается на libc вообще — архитектура ни при чём.
+    NoLibc,
+    /// Якоря нет: `pkg update` не проверял архитектуру.
+    Unknown,
+}
+
+/// Что выбрано по имени и из чего.
+struct Pick {
+    /// `<хэш>-<имя>` выбранного пути.
+    base: String,
+    /// Сколько всего путей у этого имени пакета было в канале.
+    total: usize,
+    arch: Arch,
+}
+
+// ── архитектура: якорь вместо гадания ───────────────────────────────────────────────────────
+
+/// Корень, где лежит «наша libc» — путь, по ссылке на который узнаётся своя сборка.
+const LIBC_ROOT: &str = "pkg/index/libc";
+
+/// Значение [`LIBC_ROOT`], когда своей сборки в канале НЕТ (например, riscv64 в nixos-unstable).
+/// Отдельное значение, а не отсутствие корня: «проверяли и не нашли» и «не проверяли» — разные
+/// вещи, и вторая не должна выглядеть как первая.
+const NO_ARCH: &str = "-";
+
+/// Пробник, которым система узнаёт свою сборку: GNU hello — самая маленькая настоящая программа
+/// канала (294 КиБ NAR, 77 КиБ сжато) и при этом обычный динамический ELF со ссылкой на libc.
+/// Ровно то, что нужно: дёшево скачать, есть что посмотреть внутри, есть за что зацепиться.
+const PROBE: &str = "hello";
+const PROBE_BIN: &str = "bin/hello";
+
+/// `e_machine` нашей архитектуры (ELF spec): признак, который **нельзя подделать именем пути**.
+#[cfg(target_arch = "riscv64")]
+const OUR_MACHINE: u16 = 0xF3;
+#[cfg(target_arch = "x86_64")]
+const OUR_MACHINE: u16 = 0x3E;
+
+/// Прочитать якорь: путь нашей libc, [`NO_ARCH`] или `None` (не проверяли).
+fn read_anchor(scap: usize) -> Option<String> {
+    let id = root_id(scap, LIBC_ROOT)?;
+    let bytes = archive::read_object(scap, &id, 64 * 1024).ok()?;
+    core::str::from_utf8(&bytes).ok().map(|s| s.trim().to_string())
+}
+
+/// `e_machine` из ELF-заголовка файла внутри пакета — или `None`, если это не 64-битный ELF.
+fn elf_machine(scap: usize, hash: &str, sub: &str) -> Result<Option<u16>, String> {
+    let (_, rec, id) = resolve(scap, hash, sub)?;
+    if rec.is_dir() || rec.is_link() {
+        return Ok(None);
+    }
+    let mut head = [0u8; 20];
+    let mut got = 0usize;
+    read_file(scap, &rec, &id, |part| {
+        let n = part.len().min(head.len() - got);
+        head[got..got + n].copy_from_slice(&part[..n]);
+        got += n;
+    })?;
+    if got < 20 || &head[..4] != b"\x7fELF" || head[4] != 2 {
+        return Ok(None);
+    }
+    Ok(Some(u16::from_le_bytes([head[18], head[19]])))
+}
+
+/// Узнать, какая сборка в канале — наша, и запомнить её libc.
+///
+/// Зачем это вообще нужно. Индекс канала перечисляет пути ВСЕХ архитектур вперемешку
+/// (`nixos-unstable` — это x86_64 и aarch64), а имя пути про архитектуру не говорит ничего:
+/// `hello-2.12.3` там ровно два, и различить их по строке нельзя. Проверено: на запрос `hello`
+/// правило «свой выход, старшая версия, порядок индекса» выбирает `4z8ys…` — сборку под
+/// aarch64, тогда как канал под x86_64 собрал `lxra5…`.
+///
+/// Врать про архитектуру нельзя, а спросить — некого: `.drv`, где стоит `system`, бинарный кэш
+/// не хранит (404). Зато архитектуру видно в самом файле — в `e_machine`. Поэтому она узнаётся
+/// ОДИН РАЗ, содержимым: качается пробник (77 КиБ), смотрится его ELF-заголовок, и запоминается
+/// не «архитектура», а ссылка победителя на libc — по ней дальше отличается своя сборка любого
+/// пакета, уже без единой загрузки содержимого.
+fn probe_arch(scap: usize) -> Result<Option<String>, String> {
+    let cands = candidates(scap, PROBE)?;
+    if cands.is_empty() {
+        return Err(format!("в индексе нет пробника {} — архитектуру не проверить", PROBE));
+    }
+
+    for c in &cands {
+        let hash = hash_of(c);
+        let (ni, _, _) = realize_one(scap, hash)?;
+        let machine = elf_machine(scap, hash, PROBE_BIN)?;
+        if machine == Some(OUR_MACHINE) {
+            // Якорь — единственная ссылка пробника, кроме него самого.
+            let libc = ni.references.iter().find(|r| hash_of(r) != hash).cloned();
+            sys::write(format!("  {} — наша сборка (e_machine {:#x})\n", c, OUR_MACHINE).as_bytes());
+            return Ok(libc);
+        }
+        // Чужую сборку не оставляем занимать место: корень снят — GC подберёт.
+        sys::obj_del_root(scap, format!("pkg/tree/{}", hash).as_bytes());
+        let m = machine.map(|m| format!("{:#x}", m)).unwrap_or_else(|| String::from("не ELF"));
+        sys::write(format!("  {} — чужая сборка ({})\n", c, m).as_bytes());
+    }
+    Ok(None)
+}
+
+/// Куда указывает аргумент: `(хэш пути, чего мы ждём от кэша)`.
+///
+/// Хэш узнаётся по виду, всё прочее считается именем и ищется в индексе. Разбор по виду, а не
+/// по флагу, потому что человеку не должно быть важно, что он скопировал; спутать имя с хэшем
+/// можно лишь имея имя из 32 знаков без `e`, `o`, `u` и `t`.
+fn target(scap: usize, arg: &[u8]) -> Result<(String, Option<String>), String> {
+    if let Ok(h) = path_hash(arg) {
+        return Ok((h.to_string(), None));
+    }
+    let q = core::str::from_utf8(arg).map_err(|_| "аргумент не UTF-8")?;
+    let pick = resolve_name(scap, q)?;
+    sys::write(format!("{} → {}/{}\n", q, STORE_DIR, pick.base).as_bytes());
+    if pick.total > 1 {
+        let how = match pick.arch {
+            Arch::Ours => "первый своей архитектуры",
+            Arch::NoLibc => "ни один не ссылается на libc — архитектура ни при чём",
+            Arch::Unknown => "архитектура НЕ ПРОВЕРЕНА: нет якоря, сделайте `pkg update`",
+        };
+        sys::write(
+            format!("  (кандидатов в канале: {}; {})\n", pick.total, how).as_bytes(),
+        );
+    }
+    let hash = hash_of(&pick.base).to_string();
+    Ok((hash, Some(pick.base)))
+}
+
+/// Спросить у кэша метаданные пути и убедиться, что индекс не соврал. Возвращает имя пути,
+/// **как его называет подписанный narinfo**, — дальше по коду верить надо этому имени.
+///
+/// Проверка стоит до единого байта содержимого: если индекс подменён, узнать об этом надо
+/// раньше, чем начнётся загрузка, а не после неё.
+fn confirm(scap: usize, hash: &str, expect: Option<&str>) -> Result<String, String> {
+    let ni = narinfo(scap, hash)?;
+    if let Some(exp) = expect {
+        if ni.base() != exp {
+            return Err(format!(
+                "индекс обещал {}, а подписанный кэш зовёт этот путь {} — индекс не от этого кэша",
+                exp,
+                ni.base()
+            ));
+        }
+    }
+    Ok(ni.base().to_string())
+}
+
 // ── замыкание ───────────────────────────────────────────────────────────────────────────────
 
 /// Один путь замыкания: как он называется, где его содержимое и просил ли его человек сам.
@@ -819,9 +1195,122 @@ fn matches(base: &str, what: &str) -> bool {
 
 // ── команды ─────────────────────────────────────────────────────────────────────────────────
 
+/// `pkg update` — забрать индекс имён канала.
+///
+/// Скачанное сжатое уезжает сразу в распаковку и в куски store, минуя память: 5,4 МиБ архива
+/// разворачиваются в 14,7 МиБ текста, и «сначала в буфер, потом разберём» здесь не помещается
+/// ни на одной из наших машин.
+fn cmd_update() -> Result<(), String> {
+    let scap = sys::start_cap(1);
+    let dl_root = "pkg/dl/index";
+
+    sys::write(format!("индекс канала: {}\n", INDEX_URL).as_bytes());
+    let t0 = sys::monotonic_ns();
+    let dl_id = download(INDEX_URL, dl_root)?;
+    let t1 = sys::monotonic_ns();
+
+    let (id, total, lines) = {
+        let mut w = ChunkWriter::new(scap);
+        archive::stream(scap, &dl_id, &mut |chunk: &[u8]| w.put(chunk))?;
+        w.finish()?
+    };
+    let t2 = sys::monotonic_ns();
+
+    if sys::obj_set_root(scap, INDEX_ROOT.as_bytes(), &id) != 0 {
+        return Err(String::from("корень индекса не завёлся"));
+    }
+    // Сжатый архив — транспорт, и хранить его рядом с распакованным незачем.
+    sys::obj_del_root(scap, dl_root.as_bytes());
+
+    sys::write(
+        format!(
+            "индекс: {} {}, {} Б (сеть {} с, распаковка {} с)\n",
+            lines,
+            paths_word(lines),
+            total,
+            (t1 - t0) / 1_000_000_000,
+            (t2 - t1) / 1_000_000_000
+        )
+        .as_bytes(),
+    );
+
+    // Индекс перечисляет пути всех архитектур вперемешку, а имя про архитектуру молчит. Пока
+    // не выяснено, какая сборка наша, имена бесполезны — поэтому проверка идёт здесь же, а не
+    // откладывается до первой установки (см. [`probe_arch`]).
+    sys::write("архитектура (пробник hello):\n".as_bytes());
+    let anchor = probe_arch(scap)?;
+    let value = match &anchor {
+        Some(libc) => libc.clone(),
+        None => String::from(NO_ARCH),
+    };
+    let aid = put(scap, value.as_bytes())?;
+    if sys::obj_set_root(scap, LIBC_ROOT.as_bytes(), &aid) != 0 {
+        return Err(String::from("корень якоря не завёлся"));
+    }
+    match &anchor {
+        Some(libc) => sys::write(format!("  своя libc: {}\n", libc).as_bytes()),
+        None => sys::write(
+            "  своей сборки в канале НЕТ — имена работать не будут, только хэши\n".as_bytes(),
+        ),
+    }
+    Ok(())
+}
+
+/// Сколько имён печатает `pkg search`, прежде чем сдаться: на `python` их тысячи, а экран один.
+const SEARCH_MAX: usize = 40;
+
+/// `pkg search <строка>` — какие имена индекса на неё похожи.
+///
+/// Печатается хэш, а не только имя: строку из вывода должно быть можно скормить `pkg install`
+/// как есть — в том числе когда выбор по имени не тот, который нужен человеку.
+fn cmd_search(what: &[u8]) -> Result<(), String> {
+    let scap = sys::start_cap(1);
+    let q = core::str::from_utf8(what).map_err(|_| "аргумент не UTF-8")?;
+
+    // (имя, хэш первого пути, сколько путей) — по одной строке на ИМЯ, а не на путь: в канале
+    // 214 тысяч путей на 104 тысячи имён, и повторы имени человеку ничего не говорят.
+    let mut hits: Vec<(String, String, usize)> = Vec::new();
+    let mut total = 0usize;
+    index_scan(scap, |line| {
+        let Some(base) = line.strip_prefix("/nix/store/") else { return };
+        let Some(name) = base.get(HASH_LEN + 1..) else { return };
+        if !name.contains(q) {
+            return;
+        }
+        total += 1;
+        match hits.iter_mut().find(|(n, _, _)| n == name) {
+            Some(h) => h.2 += 1,
+            None => {
+                if hits.len() < SEARCH_MAX * 8 {
+                    hits.push((name.to_string(), hash_of(base).to_string(), 1));
+                }
+            }
+        }
+    })?;
+
+    if hits.is_empty() {
+        sys::write(format!("в индексе канала ничего похожего на {}\n", q).as_bytes());
+        return Ok(());
+    }
+    hits.sort_unstable();
+
+    sys::write(
+        format!("{}: {} {} на {} имён\n", q, total, paths_word(total), hits.len()).as_bytes(),
+    );
+    for (name, hash, n) in hits.iter().take(SEARCH_MAX) {
+        let more = if *n > 1 { format!("  (+{})", n - 1) } else { String::new() };
+        sys::write(format!("  {}  {}{}\n", hash, name, more).as_bytes());
+    }
+    if hits.len() > SEARCH_MAX {
+        sys::write(format!("  … и ещё {} имён\n", hits.len() - SEARCH_MAX).as_bytes());
+    }
+    Ok(())
+}
+
 fn cmd_fetch(what: &[u8]) -> Result<(), String> {
     let scap = sys::start_cap(1);
-    let hash = path_hash(what)?.to_string();
+    let (hash, expect) = target(scap, what)?;
+    confirm(scap, &hash, expect.as_deref())?;
     let c = realize(scap, &[hash])?;
     report(&c);
     Ok(())
@@ -842,14 +1331,32 @@ fn report(c: &Closure) {
 
 fn cmd_install(what: &[u8]) -> Result<(), String> {
     let scap = sys::start_cap(1);
-    let hash = path_hash(what)?.to_string();
+    let (hash, expect) = target(scap, what)?;
+    // Имя пути берём у подписанного narinfo, а не у индекса и не у аргумента: дальше по нему
+    // решается, что из профиля вытеснить, — а такое решение нельзя принимать по чужому слову.
+    let base = confirm(scap, &hash, expect.as_deref())?;
+    let pname = parts(&base).0.to_string();
 
     // Поколение — это всегда замыкание СПИСКА ВЕРХНЕГО УРОВНЯ, а не «прошлое поколение плюс
     // новое». Отсюда симметрия: установка и удаление — одна и та же пересборка, разница лишь в
     // том, что делает со списком.
     let mut tops = current_tops(scap)?;
+    // Пакет с тем же ИМЕНЕМ вытесняется, а не встаёт рядом (Веха 111): иначе `pkg install hello`
+    // после смены канала оставил бы в PATH два `hello` разных версий, и какой из них запустится,
+    // зависело бы от порядка перебора. Ровно так же поступает `nix-env`.
+    let mut replaced: Option<String> = None;
+    tops.retain(|t| {
+        if hash_of(t) == hash || parts(t).0 != pname {
+            return true;
+        }
+        replaced = Some(t.clone());
+        false
+    });
     if !tops.iter().any(|t| hash_of(t) == hash) {
-        tops.push(hash);
+        tops.push(base);
+    }
+    if let Some(old) = &replaced {
+        sys::write(format!("вытеснен {}\n", old).as_bytes());
     }
 
     let c = realize(scap, &tops)?;

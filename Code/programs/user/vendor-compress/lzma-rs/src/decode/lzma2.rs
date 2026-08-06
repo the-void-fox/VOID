@@ -36,7 +36,29 @@ impl Lzma2Decoder {
         input: &mut R,
         output: &mut W,
     ) -> error::Result<()> {
+        // `usize::MAX` — окно «не сливать никогда», то есть прежнее поведение апстрима.
+        self.decompress_window(input, output, usize::MAX)
+    }
+
+    /// То же, но с ОКНОМ: держать в памяти лишь последние `window` байт, остальное отдавать в
+    /// сток по ходу дела (VOID, Веха 111 — см. `LzAccumBuffer::flush_keeping`).
+    ///
+    /// `window` — размер словаря из свойств фильтра LZMA2; меньше него держать нельзя, больше
+    /// незачем.
+    pub fn decompress_window<W: io::Write, R: io::BufRead>(
+        &mut self,
+        input: &mut R,
+        output: &mut W,
+        window: usize,
+    ) -> error::Result<()> {
         let mut accum = lzbuffer::LzAccumBuffer::from_stream(output, usize::MAX);
+        // Место под окно занимается не сразу, а когда поток покажет, что он большой. Причина —
+        // `xz -9` ставит в заголовок словарь 64 МиБ даже для килобайтного файла: резервируй мы
+        // по заголовку, распаковка мелочи требовала бы 66 МиБ кучи на ровном месте. До порога
+        // буфер растёт обычным удвоением (там счёт на килобайты и переезды дёшевы), после —
+        // расширяется ОДИН раз до окна плюс кусок LZMA2 (его размер — 16 бит + 1, ≤ 2 МиБ).
+        const BIG: usize = 1 << 20;
+        let mut reserved = window == usize::MAX;
 
         loop {
             let status = input.read_u8().map_err(|e| {
@@ -57,6 +79,14 @@ impl Lzma2Decoder {
             } else {
                 self.parse_lzma(&mut accum, input, status)?;
             }
+            if !reserved && accum.len() > BIG {
+                accum.reserve_total(window.saturating_add(1 << 21));
+                reserved = true;
+            }
+            // Кусок разобран — всё, что уже вне досягаемости словаря, можно отдать дальше.
+            accum.flush_keeping(window).map_err(|e| {
+                error::Error::LzmaError(format!("LZMA2 flush failed: {}", e))
+            })?;
         }
 
         accum.finish()?;

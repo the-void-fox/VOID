@@ -75,6 +75,12 @@ impl BlockIo for Disk {
     }
 }
 
+/// Ёмкость носителя store в секторах — тем же способом, каким её видит сам store.
+/// Нужна снаружи затем, чтобы спросить у store, какой сектор отдан под опыты (Веха 111).
+pub fn disk_capacity_sectors() -> u64 {
+    Disk.capacity()
+}
+
 static STORE: SpinLock<Store> = SpinLock::new(Store::new());
 
 /// Положить лист (значение без исходящих ссылок), получить контент-адрес.

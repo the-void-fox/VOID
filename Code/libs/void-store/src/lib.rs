@@ -78,6 +78,33 @@ const IDX_B: u64 = IDX_A + IDX_SECTORS;
 /// секторы 1..33 в v2 просто зарезервированы.
 const OBJ_START: u64 = IDX_B + IDX_SECTORS;
 
+/// Хвост носителя, который store НЕ ЗАНИМАЕТ НИКОГДА (Веха 111).
+///
+/// Появился по случаю, стоившему дня разбирательств. Демо `blk-cli` (Веха 17) доказывает, что
+/// userspace-драйвер умеет писать, и писало она в сектор 20000 с комментарием «заведомо
+/// свободный: store использует низкие». Пока store жил на сотнях килобайт, так и было. Когда в
+/// него приехал индекс канала nixpkgs, область объектов перевалила за 10 МиБ — и очередная
+/// загрузка молча затёрла живой кадр ровно на 512 байт. Проявилось это «кадр с диска не сошёлся
+/// со своим content-id» посреди распаковки, то есть максимально далеко от причины.
+///
+/// Вывод, ради которого константа и заведена: **«вероятно свободный сектор» — не бывает**.
+/// Носителем владеет store, и место для опытов он должен ВЫДЕЛЯТЬ, а не оставлять угадывать.
+/// Хвост, а не голова: область объектов растёт снизу вверх, и хвост — единственное место,
+/// которое не сдвинется при любом росте.
+pub const TAIL_RESERVED: u64 = 8;
+
+/// Сколько секторов носителя store вправе занять под свои кадры.
+fn usable(capacity: u64) -> u64 {
+    capacity.saturating_sub(TAIL_RESERVED)
+}
+
+/// Сектор для опытов поверх сырого блочного устройства — или `None`, если носитель слишком мал
+/// (или его ёмкость неизвестна). Единственный законный ответ на вопрос «куда можно писать
+/// мимо store».
+pub fn scratch_sector(capacity: u64) -> Option<u64> {
+    (capacity > OBJ_START + TAIL_RESERVED).then(|| capacity - TAIL_RESERVED)
+}
+
 /// v1: 64 Б на запись A/B-индекса (8 в секторе). Нужен только загрузчику v1.
 const ENTRY_SIZE_V1: usize = 64;
 const ENTRIES_PER_SECTOR_V1: usize = SECTOR / ENTRY_SIZE_V1;
@@ -89,6 +116,11 @@ const TOMBSTONE: u32 = u32::MAX;
 /// Длиннее этой цепочка дельт не растёт — следующий коммит пишет полную базу
 /// (иначе загрузка после тысяч коммитов читала бы тысячи кадров).
 const CHAIN_MAX: u32 = 64;
+
+/// Потолок кэша содержимого, подгруженного С ДИСКА (Веха 111, см. `evict_loaded_except`).
+/// Четверть кучи ядра: больше — и обычное чтение большого объекта не оставляет места на то,
+/// ради чего его читают.
+const CACHE_BUDGET: usize = 4 * 1024 * 1024;
 
 // смещения полей суперблока v2
 const SB_MAGIC: usize = 0;
@@ -137,6 +169,8 @@ pub struct Store {
     chain_len: u32,
     /// Мусор в области объектов, байт (кадры, чьи объекты удалены GC).
     garbage: u64,
+    /// Байт содержимого, подгруженного с диска и не отпущенного (потолок — `CACHE_BUDGET`).
+    loaded_bytes: usize,
     /// Надгробия, ожидающие фиксации: (id, длина кадра погибшего).
     pending_dead: Vec<(ContentId, u32)>,
     /// Операций над корнями с последнего коммита (политика group commit — у владельца).
@@ -179,6 +213,7 @@ impl Store {
             relocate: false,
             bytes_written: 0,
             corrupt_reads: 0,
+            loaded_bytes: 0,
             failed_writes: 0,
             out_of_space: 0,
         }
@@ -193,14 +228,14 @@ impl Store {
     /// Веха 89 — сколько секторов носителя ещё свободно под область объектов.
     /// `None` — ёмкость неизвестна ([`BlockIo::capacity`] вернул 0).
     pub fn sectors_left(&self, io: &mut impl BlockIo) -> Option<u64> {
-        let cap = io.capacity();
+        let cap = usable(io.capacity());
         (cap != 0).then(|| cap.saturating_sub(self.next_free as u64))
     }
 
     /// Хватит ли места под `sectors` секторов, начиная с `next_free`.
     fn fits(&self, io: &mut impl BlockIo, sectors: u64) -> bool {
         let cap = io.capacity();
-        cap == 0 || self.next_free as u64 + sectors <= cap
+        cap == 0 || self.next_free as u64 + sectors <= usable(cap)
     }
 
     /// Веха 89 — сколько кадров не сошлись со своим content-id (или не прочитались).
@@ -381,7 +416,12 @@ impl Store {
             Some(_) => {
                 match self.load_frame(io, id) {
                     Some(frame) => {
+                        let n = frame.len();
                         self.objects.get_mut(id).unwrap().data = Some(decode(&frame));
+                        self.loaded_bytes += n;
+                        if self.loaded_bytes > CACHE_BUDGET {
+                            self.evict_loaded_except(id);
+                        }
                         true
                     }
                     None => {
@@ -391,6 +431,36 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Отпустить всё подгруженное с диска, кроме одного объекта (Веха 111).
+    ///
+    /// Кэш store до этой вехи рос только вверх, а отпускал лишь коммит ([`evict_committed`]).
+    /// Пока «большим» считался ELF в пару мегабайт, это сходило с рук. Индекс канала nixpkgs —
+    /// это 941 кусок по 16 КиБ, и **простое чтение** его насквозь (`pkg search`) затягивало в
+    /// кучу ядра все 15 МиБ: система падала не на записи и не на распаковке, а на попытке
+    /// запустить следующую программу — ей не осталось места.
+    ///
+    /// Отсюда потолок [`CACHE_BUDGET`]. Выкидывать безопасно только то, что лежит на диске:
+    /// объект без `disk` существует лишь в RAM, и отпустить его значило бы потерять.
+    fn evict_loaded_except(&mut self, keep: &ContentId) {
+        let mut left = 0usize;
+        for (id, o) in self.objects.iter_mut() {
+            if o.disk.is_none() {
+                continue;
+            }
+            if id == keep {
+                left = o.data.as_ref().map_or(0, |d| d.payload.len());
+                continue;
+            }
+            o.data = None;
+        }
+        self.loaded_bytes = left;
+    }
+
+    /// Сколько байт содержимого подгружено с диска и держится в кэше.
+    pub fn cached_bytes(&self) -> usize {
+        self.loaded_bytes
     }
 
     /// Прочитать кадр объекта с диска и проверить его хэш. `None` — носитель не отдал сектор
@@ -911,6 +981,7 @@ impl Store {
                 o.data = None;
             }
         }
+        self.loaded_bytes = 0;
     }
 
     /// Веха 89 — снять отметки «кадр на диске» с объектов незавершённого коммита: их кадры

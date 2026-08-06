@@ -60,7 +60,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Об ошибке говорим ВСЕГДА: молчать о ней — совсем другое дело.
     let quiet = it.next() == Some(b"-q");
 
-    match run(url, root) {
+    match run(url, root, quiet) {
         Ok((bytes, chunks, id)) => {
             if !quiet {
                 sys::write("скачано ".as_bytes());
@@ -99,31 +99,90 @@ impl TimeProvider for SystemTime {
     }
 }
 
-fn run(url: &[u8], root: &[u8]) -> Result<(usize, usize, [u8; 32]), &'static str> {
+/// Сколько раз готовы пойти за `Location`. Кольцо редиректов иначе крутилось бы вечно.
+const MAX_REDIRECTS: usize = 5;
+
+/// Чем кончился один обмен: телом или указанием идти в другое место.
+enum Step {
+    Done(usize, usize, [u8; 32]),
+    Redirect(Vec<u8>),
+}
+
+fn run(url: &[u8], root: &[u8], quiet: bool) -> Result<(usize, usize, [u8; 32]), &'static str> {
     // Без сильного источника случайности ключи сеанса предсказуемы, а TLS превращается в театр.
     // Ядро знает, что у него есть; спрашиваем прямо и отказываемся, а не «работаем как-нибудь».
     if !sys::random_is_strong() {
         return Err("нет криптографического источника случайности — TLS отказано");
     }
 
-    let (host, port, path) = parse_url(url)?;
     let net_ep = sys::start_cap(2);
     if net_ep == sys::NO_CAP {
         return Err("сети нет (net.vv = #f?)");
     }
     let store_cap = sys::start_cap(1);
 
-    let host_str = core::str::from_utf8(host).map_err(|_| "имя хоста не UTF-8")?;
-    let ip = match parse_ipv4(host) {
-        Some(ip) => ip,
-        None => resolve(net_ep, host_str)?,
-    };
+    // Веха 111: за `Location` приходится ходить, потому что иначе не достать канал —
+    // `channels.nixos.org/…/store-paths.xz` отвечает 302 на `releases.nixos.org`, и зашить
+    // конечный адрес нельзя: он меняется с каждым обновлением канала, в этом весь смысл
+    // перенаправления. Каждый переход — НОВОЕ рукопожатие TLS: хост меняется, а значит меняется
+    // и то, чей сертификат мы обязаны проверить. Переиспользовать соединение здесь было бы не
+    // оптимизацией, а дырой.
+    let mut current: Vec<u8> = url.to_vec();
+    for _ in 0..MAX_REDIRECTS {
+        // Копии: `parse_url` смотрит внутрь `current`, а мы его тут же меняем.
+        let (host, port, path) = {
+            let (h, p, pa) = parse_url(&current)?;
+            (h.to_vec(), p, pa.to_vec())
+        };
 
-    let mut conn = new_connection(host_str)?;
-    let h = net_cli::tcp_connect(net_ep, ip, port).map_err(|_| "не удалось соединиться")?;
-    let r = session(&mut conn, net_ep, store_cap, h, host, path, root);
-    net_cli::tcp_close(net_ep, h);
-    r
+        let host_str = core::str::from_utf8(&host).map_err(|_| "имя хоста не UTF-8")?;
+        let ip = match parse_ipv4(&host) {
+            Some(ip) => ip,
+            None => resolve(net_ep, host_str)?,
+        };
+
+        let mut conn = new_connection(host_str)?;
+        let h = net_cli::tcp_connect(net_ep, ip, port).map_err(|_| "не удалось соединиться")?;
+        let r = session(&mut conn, net_ep, store_cap, h, &host, &path, root);
+        net_cli::tcp_close(net_ep, h);
+
+        match r? {
+            Step::Done(bytes, chunks, id) => return Ok((bytes, chunks, id)),
+            Step::Redirect(loc) => {
+                current = redirect_url(&current, &loc)?;
+                if !quiet {
+                    sys::write("  → ".as_bytes());
+                    sys::write(&current);
+                    sys::write(b"\n");
+                }
+            }
+        }
+    }
+    Err("слишком много перенаправлений")
+}
+
+/// Куда ведёт `Location`: абсолютный адрес заменяет всё, начинающийся с `/` — только путь.
+///
+/// Переход с https на http отвергается: иначе сервер (или тот, кто им притворился) мог бы одним
+/// заголовком увести загрузку в открытый канал, и вся проверка сертификата оказалась бы
+/// потрачена впустую.
+fn redirect_url(current: &[u8], loc: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if strip_ci(loc, b"https://").is_some() {
+        return Ok(loc.to_vec());
+    }
+    if strip_ci(loc, b"http://").is_some() {
+        return Err("перенаправление уводит с https на http — отказ");
+    }
+    if loc.first() == Some(&b'/') {
+        let rest = strip_ci(current, b"https://").ok_or("нужен адрес вида https://хост/путь")?;
+        let slash = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
+        let mut u = Vec::with_capacity(8 + slash + loc.len());
+        u.extend_from_slice(b"https://");
+        u.extend_from_slice(&rest[..slash]); // хост вместе с портом, если он был
+        u.extend_from_slice(loc);
+        return Ok(u);
+    }
+    Err("относительный Location не поддержан")
 }
 
 /// Собрать клиентскую конфигурацию: корни `webpki-roots`, провайдер RustCrypto, наши часы.
@@ -158,7 +217,7 @@ fn session(
     host: &[u8],
     path: &[u8],
     root: &[u8],
-) -> Result<(usize, usize, [u8; 32]), &'static str> {
+) -> Result<Step, &'static str> {
     let mut outgoing = vec![0u8; OUT_CAP];
     let mut incoming: Vec<u8> = Vec::with_capacity(8192);
     let mut request_sent = false;
@@ -217,11 +276,16 @@ fn session(
     if !http.saw_status {
         return Err("сервер закрыл соединение без ответа");
     }
+    // Перенаправление — не ошибка и не тело: корень store не заводится, накопленные куски
+    // остаются недостижимыми и уйдут со сборкой мусора.
+    if matches!(http.status, 301 | 302 | 303 | 307 | 308) && !http.location.is_empty() {
+        return Ok(Step::Redirect(http.location));
+    }
     if http.status != 200 {
         return Err(http_status_text(http.status));
     }
     let id = body.finish()?;
-    Ok((body.total, body.n, id))
+    Ok(Step::Done(body.total, body.n, id))
 }
 
 /// Дочитать ещё немного зашифрованных байт в буфер входящих.
@@ -306,6 +370,8 @@ struct HttpParse {
     line: Vec<u8>,
     saw_status: bool,
     status: u16,
+    /// Значение `Location` — нужно только при перенаправлении (Веха 111).
+    location: Vec<u8>,
     in_body: bool,
     chunked: bool,
     content_len: Option<usize>,
@@ -321,6 +387,7 @@ impl HttpParse {
             line: Vec::new(),
             saw_status: false,
             status: 0,
+            location: Vec::new(),
             in_body: false,
             chunked: false,
             content_len: None,
@@ -359,6 +426,8 @@ impl HttpParse {
                         self.content_len = Some(parse_dec(value)?);
                     } else if eq_ci(name, b"transfer-encoding") && contains_ci(value, b"chunked") {
                         self.chunked = true;
+                    } else if eq_ci(name, b"location") {
+                        self.location = value.to_vec();
                     }
                 }
                 self.line.clear();
@@ -530,7 +599,8 @@ fn parse_status(line: &[u8]) -> Result<u16, &'static str> {
 
 fn http_status_text(status: u16) -> &'static str {
     match status {
-        301 | 302 | 303 | 307 | 308 => "сервер отвечает редиректом (для https он пока не сделан)",
+        // Сюда попадают только перенаправления БЕЗ `Location` — идти по ним некуда.
+        301 | 302 | 303 | 307 | 308 => "перенаправление без заголовка Location",
         404 => "не найдено (404)",
         400..=499 => "сервер отказал (4xx)",
         500..=599 => "ошибка на сервере (5xx)",
