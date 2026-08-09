@@ -123,6 +123,12 @@ bind pane Left go-left
 bind pane Down go-down
 bind pane Up go-up
 bind pane Right go-right
+bind pane PageUp scroll-up
+bind pane PageDown scroll-down
+bind pane Home scroll-top
+bind pane End scroll-bottom
+bind normal S-PageUp scroll-up
+bind normal S-PageDown scroll-down
 ";
 
 
@@ -142,7 +148,16 @@ bind pane Right go-right
 enum KeyScan {
     Ground,
     Esc,
-    Csi,
+    /// Внутри `ESC [ …`: копим числовые параметры. До Вехи 116 они просто ГЛОТАЛИСЬ, и любая
+    /// последовательность вида `ESC [ N ~` считалась Delete — то есть PageUp работал как
+    /// Delete, а прокрутки не было в принципе.
+    Csi {
+        num: u16,
+        /// Второй параметр (`ESC [ 5 ; 2 ~`) — модификатор xterm: 2 = Shift, 5 = Ctrl.
+        modn: u16,
+        /// Видели `;` — цифры идут во второй параметр.
+        after_semi: bool,
+    },
 }
 
 /// Разобрать байт. `Some(event)` — клавиша сложилась; `None` — ждём продолжения.
@@ -176,15 +191,36 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
         },
         KeyScan::Esc => {
             if b == b'[' {
-                *state = KeyScan::Csi;
+                *state = KeyScan::Csi { num: 0, modn: 0, after_semi: false };
                 None
             } else {
                 *state = KeyScan::Ground;
                 Some(KeyEvent::new(Keysym::ESCAPE, ModMask::empty()))
             }
         }
-        KeyScan::Csi => {
+        KeyScan::Csi { num, modn, after_semi } => {
+            // Цифры и `;` копим, не выходя из состояния: параметр — это и есть смысл клавиши.
+            if b.is_ascii_digit() {
+                let d = (b - b'0') as u16;
+                *state = if after_semi {
+                    KeyScan::Csi { num, modn: modn.saturating_mul(10) + d, after_semi }
+                } else {
+                    KeyScan::Csi { num: num.saturating_mul(10) + d, modn, after_semi: false }
+                };
+                return None;
+            }
+            if b == b';' {
+                *state = KeyScan::Csi { num, modn, after_semi: true };
+                return None;
+            }
             *state = KeyScan::Ground;
+            // Модификатор xterm приходит как «значение + 1»: 2 = Shift, 3 = Alt, 5 = Ctrl.
+            let mods = match modn {
+                2 => ModMask::SHIFT,
+                3 => ModMask::ALT,
+                5 => ModMask::CTRL,
+                _ => ModMask::empty(),
+            };
             let sym = match b {
                 b'A' => Keysym::UP,
                 b'B' => Keysym::DOWN,
@@ -192,15 +228,17 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
                 b'D' => Keysym::LEFT,
                 b'H' => Keysym::HOME,
                 b'F' => Keysym::END,
-                // `ESC [ 3 ~` (Delete) и прочие числовые — цифры глотаем, оставаясь в CSI.
-                b'0'..=b'9' | b';' => {
-                    *state = KeyScan::Csi;
-                    return None;
-                }
-                b'~' => Keysym::DELETE,
+                b'~' => match num {
+                    1 | 7 => Keysym::HOME,
+                    3 => Keysym::DELETE,
+                    4 | 8 => Keysym::END,
+                    5 => Keysym::PAGE_UP,
+                    6 => Keysym::PAGE_DOWN,
+                    _ => return None,
+                },
                 _ => return None,
             };
-            Some(KeyEvent::new(sym, ModMask::empty()))
+            Some(KeyEvent::new(sym, mods))
         }
     }
 }
@@ -392,6 +430,8 @@ fn parse_key(tok: &str) -> Option<(ModMask, Keysym)> {
         "Up" => Keysym::UP,
         "Down" => Keysym::DOWN,
         "Home" => Keysym::HOME,
+        "PageUp" | "PgUp" => Keysym::PAGE_UP,
+        "PageDown" | "PgDn" => Keysym::PAGE_DOWN,
         "End" => Keysym::END,
         "Delete" => Keysym::DELETE,
         "Enter" | "Return" => Keysym::RETURN,
@@ -685,6 +725,9 @@ struct Pane {
     pending_want: usize,
     /// Не отданный ввод этой панели.
     inbox: Vec<u8>,
+    /// На сколько строк вьюпорт поднят в историю (0 — «внизу», как обычно). Веха 116:
+    /// у грида scrollback был с самого начала, но смотреть в него было нечем.
+    scroll: usize,
 }
 
 #[no_mangle]
@@ -806,6 +849,22 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                         // Команда мультиплексора. Режим сбрасываем всегда: «залипший» режим —
                         // худшее, что бывает с модальным управлением.
                         match cmd.as_str() {
+                            // Веха 116 — прокрутка вывода. Шаг в полэкрана: так глаз не теряет
+                            // место, а «страница целиком» на длинном выводе перескакивает мимо
+                            // нужного. Потолок — длина истории самого грида.
+                            "scroll-up" | "scroll-down" | "scroll-top" | "scroll-bottom" => {
+                                if let Some(p) = panes.get_mut(focus) {
+                                    let page = (view.rows / 2).max(1);
+                                    let max = p.grid.scrollback_len();
+                                    p.scroll = match cmd.as_str() {
+                                        "scroll-up" => (p.scroll + page).min(max),
+                                        "scroll-down" => p.scroll.saturating_sub(page),
+                                        "scroll-top" => max,
+                                        _ => 0,
+                                    };
+                                    redraw = true;
+                                }
+                            }
                             "split-v" | "split-h" => {
                                 let dir = if cmd == "split-v" {
                                     SplitDirection::Vertical
@@ -986,6 +1045,10 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
         Some(i) if m.op == stdio::OP_STDOUT => {
             let len = m.len.min(buf.len());
             let pane = &mut panes[i];
+            // Сколько истории было ДО вывода: если человек листает, вьюпорт обязан остаться на
+            // месте, а не уезжать под новыми строками. Классическое поведение терминала —
+            // и единственное, при котором чтение длинного лога вообще возможно.
+            let before = pane.grid.scrollback_len();
             // Перевод строки: программы шлют голый `\n`, а грид (как и любой терминал) ждёт
             // CR+LF — иначе строка опускается, НЕ возвращая курсор, и вывод идёт лесенкой
             // вправо. В Unix это делает драйвер tty (ONLCR); у нас драйвера нет, поэтому
@@ -999,6 +1062,10 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
                 }
             }
             pane.parser.advance(&mut pane.grid, &buf[from..len]);
+            if pane.scroll > 0 {
+                let grown = pane.grid.scrollback_len().saturating_sub(before);
+                pane.scroll = (pane.scroll + grown).min(pane.grid.scrollback_len());
+            }
             sys::reply(m.reply_cap, &[]);
             true
         }
@@ -1064,6 +1131,7 @@ fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize, con
         pending_read: None,
         pending_want: 0,
         inbox: Vec::new(),
+        scroll: 0,
     };
     if child.is_none() {
         let msg = "\x1b[1;31m[не удалось запустить шелл]\x1b[0m\r\n";
@@ -1159,6 +1227,9 @@ fn resize_all(panes: &mut [Pane], rects: &[PaneRect]) {
 /// обслуживаются запросы, пришедшие РАНЬШЕ клавиш.
 fn push_input(panes: &mut [Pane], focus: usize, byte: u8) {
     if let Some(p) = panes.get_mut(focus) {
+        // Набрал что-то — вернулись вниз. Так ведут себя все терминалы, и по делу: человек,
+        // который начал печатать, хочет видеть, что печатает, а не то место, куда листал.
+        p.scroll = 0;
         p.inbox.push(byte);
     }
 }
@@ -1196,7 +1267,7 @@ fn compose(
             for col in 0..r.area.cols as usize {
                 let (x, y) = (r.area.col as usize + col, r.area.row as usize + row);
                 if x < cols && y < rows {
-                    cells[y * cols + x] = p.grid.view_cell(col, row, 0);
+                    cells[y * cols + x] = p.grid.view_cell(col, row, p.scroll);
                 }
             }
         }
@@ -1279,6 +1350,12 @@ fn status_bar(
     let _ = write!(text, " VOID · панель {}/{} ", focus + 1, panes.len());
     if let Some(p) = panes.get(focus) {
         let _ = write!(text, "· {} ", if p.child.is_some() { "живая" } else { "мертва" });
+        // Прокрутка показывается ТОЛЬКО когда она есть: строка состояния, в которой всегда
+        // написано «0 строк», перестаёт читаться. Зато когда вьюпорт поднят — это видно сразу,
+        // и «почему не появляется новый вывод» перестаёт быть загадкой.
+        if p.scroll > 0 {
+            let _ = write!(text, "· ↑{} из {} ", p.scroll, p.grid.scrollback_len());
+        }
     }
     // Режим показывается всегда: модальное управление без индикатора — способ потеряться.
     // Клавиши в подсказке берутся ИЗ СХЕМЫ: после Вехи 100 их задаёт конфиг, и подсказка,

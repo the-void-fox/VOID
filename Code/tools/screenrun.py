@@ -18,6 +18,7 @@
 Строки сценария:
     sleep <сек>        — подождать
     key <строка>       — послать строку в консоль гостя (serial, с переводом строки)
+    raw <байты>        — то же БЕЗ перевода строки; \e = Esc (для CSI: raw \e[5;2~)
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
@@ -112,6 +113,9 @@ try:
             time.sleep(float(arg))
         elif cmd == "key":
             p.stdin.write((arg + "\n").encode())
+            p.stdin.flush()
+        elif cmd == "raw":
+            p.stdin.write(arg.replace("\\e", "\x1b").encode())
             p.stdin.flush()
         elif cmd == "mouse":
             dx, dy = arg.split()

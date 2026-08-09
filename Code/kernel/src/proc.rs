@@ -39,7 +39,7 @@ use void_abi::{Cap, ContentId, Rights};
 
 use crate::arch::{self, Context, FaultKind, TrapFrame, UserTrap};
 use crate::sync::SpinLock;
-use crate::{cap, elf, frame, println, timer};
+use crate::{cap, elf, frame, klog, println, timer};
 
 /// Болтливость шлюзов syscall'ов ([ipc]/[obj]/[blk]/[mm]/[exec]-строки на каждый вызов).
 /// Демо живут этой трассировкой, но бенчи (Веха 28) она бы утопила — и в шуме, и в
@@ -2549,6 +2549,30 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
+            f.advance();
+        }
+        // SYS_KLOG(buf, len) -> байт (Веха 116): отдать журнал ядра — то, что оно печатало.
+        //
+        // Гейта прав нет, как у `SYS_LOG` и `SYS_TIME`: журнал — это то, что и так шло на экран,
+        // а на машине без COM-порта он единственный способ ПЕРЕЧИТАТЬ увиденное. Секретов ядро
+        // в него не кладёт; если однажды положит — гейт появится вместе с ними, а не заранее.
+        //
+        // Если буфер меньше журнала, отдаются ПОСЛЕДНИЕ байты: при разборе неполадки ценнее
+        // свежее. Сколько потеряно кольцом, читатель узнаёт вторым значением.
+        50 => {
+            let (buf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let (n, lost) = if !ensure_heap_range(t, cur, buf, len) {
+                (usize::MAX, 0)
+            } else {
+                let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+                (klog::read(out), klog::lost())
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(n);
+            f.set_ret_at(1, lost);
             f.advance();
         }
         // SYS_LOG(on) -> 0: вкл/выкл подробный трейс ядра (vprintln — [ipc]/[obj]/[mm]/[exec]/…).

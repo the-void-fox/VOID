@@ -2069,6 +2069,14 @@ keys = [\n\
 \x20 bind(\"pane\", \"Down\", \"go-down\"),\n\
 \x20 bind(\"pane\", \"Up\", \"go-up\"),\n\
 \x20 bind(\"pane\", \"Right\", \"go-right\"),\n\
+\x20 # Веха 116 — прокрутка вывода: Shift+PageUp/PageDown прямо в обычном режиме\n\
+\x20 # (голый PageUp остаётся программе), а в режиме панелей — просто PageUp.\n\
+\x20 bind(\"normal\", \"S-PageUp\", \"scroll-up\"),\n\
+\x20 bind(\"normal\", \"S-PageDown\", \"scroll-down\"),\n\
+\x20 bind(\"pane\", \"PageUp\", \"scroll-up\"),\n\
+\x20 bind(\"pane\", \"PageDown\", \"scroll-down\"),\n\
+\x20 bind(\"pane\", \"Home\", \"scroll-top\"),\n\
+\x20 bind(\"pane\", \"End\", \"scroll-bottom\"),\n\
 ]\n\
 \n\
 if on {\n\

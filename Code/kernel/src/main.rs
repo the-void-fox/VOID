@@ -71,6 +71,7 @@ mod elf;
 mod executor;
 mod frame;
 mod heap;
+mod klog;
 mod init;
 mod linux;
 /// Веха 108.3 — файлы для персоналии Linux: чтение прямо из объектного store.
@@ -129,6 +130,8 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("stdio-demo", include_bytes!(env!("PROG_STDIO_DEMO"))),
     // Веха 106 — пакеты из бинарного кэша nixpkgs с проверкой подписи и NarHash.
     ("pkg", include_bytes!(env!("PROG_PKG"))),
+    // Веха 116 — журнал ядра: то, что было на экране до терминала, можно перечитать.
+    ("klog", include_bytes!(env!("PROG_KLOG"))),
 ];
 
 /// Веха 97 — программы ТОЛЬКО ДЛЯ x86: `term` рисует в пиксельный фреймбуфер, которого на
@@ -156,6 +159,9 @@ use core::panic::PanicInfo;
 pub fn _print(args: core::fmt::Arguments) {
     let sie = arch::irq_save_disable();
     let _ = arch::Console.write_fmt(args);
+    // Веха 116 — то же самое уходит в кольцо журнала. Иначе на машине без COM-порта вывод ядра
+    // живёт ровно до того мгновения, пока его не затрёт первый кадр терминала.
+    let _ = klog::Tee.write_fmt(args);
     arch::irq_restore(sie);
 }
 

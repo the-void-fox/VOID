@@ -213,14 +213,24 @@ pub fn drain() {
                     continue;
                 }
                 if sc & RELEASE == 0 {
-                    let seq: &[u8] = match sc {
-                        0x48 => b"\x1b[A", // Up
-                        0x50 => b"\x1b[B", // Down
-                        0x4D => b"\x1b[C", // Right
-                        0x4B => b"\x1b[D", // Left
-                        0x47 => b"\x1b[H", // Home
-                        0x4F => b"\x1b[F", // End
-                        0x53 => b"\x1b[3~", // Delete
+                    // Веха 116 — PageUp/PageDown появились здесь же: без них листать вывод
+                    // на реальной машине было нечем (на QEMU они приходят из serial готовой
+                    // последовательностью, поэтому пробел не замечался).
+                    let seq: &[u8] = match (sc, SHIFT) {
+                        (0x48, _) => b"\x1b[A",  // Up
+                        (0x50, _) => b"\x1b[B",  // Down
+                        (0x4D, _) => b"\x1b[C",  // Right
+                        (0x4B, _) => b"\x1b[D",  // Left
+                        (0x47, _) => b"\x1b[H",  // Home
+                        (0x4F, _) => b"\x1b[F",  // End
+                        (0x53, _) => b"\x1b[3~", // Delete
+                        // Shift несём отдельным параметром (`;2`) — так же, как это делают
+                        // xterm-совместимые терминалы: Shift+PageUp принято отдавать
+                        // ТЕРМИНАЛУ (прокрутка), а голый PageUp — программе.
+                        (0x49, false) => b"\x1b[5~",
+                        (0x49, true) => b"\x1b[5;2~",
+                        (0x51, false) => b"\x1b[6~",
+                        (0x51, true) => b"\x1b[6;2~",
                         _ => b"",
                     };
                     for &b in seq {

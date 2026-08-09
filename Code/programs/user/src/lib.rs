@@ -111,6 +111,7 @@ const SYS_OBJ_GC: usize = 46;
 const SYS_SLEEP: usize = 47;
 const SYS_PARENT: usize = 48;
 const SYS_MOUSE_READ: usize = 49;
+const SYS_KLOG: usize = 50;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -773,6 +774,19 @@ pub fn mouse_read(out: &mut [MouseEvent]) -> usize {
         };
     }
     count
+}
+
+/// `SYS_KLOG` (Веха 116) — забрать журнал ядра. Возвращает `(байт, потеряно кольцом)`.
+///
+/// Нужен там, где увиденное нельзя перечитать: на машине без COM-порта вывод ядра живёт до
+/// первого кадра терминала, а потом исчезает навсегда. Если буфер меньше журнала, приезжают
+/// ПОСЛЕДНИЕ байты — при разборе неполадки свежее ценнее.
+pub fn klog(out: &mut [u8]) -> (usize, usize) {
+    let r = abi::syscall(SYS_KLOG, out.as_mut_ptr() as usize, out.len(), 0, 0, 0, 0, 0);
+    if r.0 == NO_CAP {
+        return (0, 0);
+    }
+    (r.0, r.1)
 }
 
 /// `SYS_PARENT(pid)` (Веха 114): чей это ребёнок. `None` — родителя нет или номер неверен.
