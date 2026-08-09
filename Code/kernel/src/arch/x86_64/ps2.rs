@@ -106,6 +106,76 @@ static mut CAPS: bool = false;
 static mut CTRL: bool = false;
 /// Веха 45 — видели префикс 0xE0 (расширенная клавиша: стрелки/Home/End/Del).
 static mut EXT: bool = false;
+/// Веха 119 — **Alt и Super**. До неё их не существовало вовсе: драйвер знал Shift и Ctrl,
+/// потому что от него требовались только печатные байты. Оконному менеджеру нужны аккорды, а
+/// `Super+L` без Super — это просто `l`.
+static mut ALT: bool = false;
+static mut SUPER: bool = false;
+
+/// Биты маски модификаторов в событии (userspace знает их по тем же номерам).
+const M_SHIFT: u8 = 1;
+const M_CTRL: u8 = 2;
+const M_ALT: u8 = 4;
+const M_SUPER: u8 = 8;
+
+/// Скан-коды модификаторов, которых раньше не разбирали.
+const SC_LALT: u8 = 0x38;
+const SC_LSUPER: u8 = 0x5B; // приходит с префиксом 0xE0
+const SC_RSUPER: u8 = 0x5C;
+
+/// Текущая маска модификаторов.
+unsafe fn mods() -> u8 {
+    let mut m = 0;
+    if SHIFT { m |= M_SHIFT }
+    if CTRL { m |= M_CTRL }
+    if ALT { m |= M_ALT }
+    if SUPER { m |= M_SUPER }
+    m
+}
+
+/// Скан-код набора 1 → код клавиши VOID. Печатные нумеруются своим ASCII (в НЕсдвинутом виде),
+/// прочие — числами выше 0x100. Так строка конфига `"Super+L"` и буква `l` — про одно и то же.
+fn keysym(sc: u8, ext: bool) -> u16 {
+    if ext {
+        return match sc {
+            0x48 => 0x112, // Up
+            0x50 => 0x113, // Down
+            0x4D => 0x111, // Right
+            0x4B => 0x110, // Left
+            0x47 => 0x114, // Home
+            0x4F => 0x115, // End
+            0x49 => 0x116, // PageUp
+            0x51 => 0x117, // PageDown
+            0x53 => 0x105, // Delete
+            0x52 => 0x106, // Insert
+            0x1C => 0x101, // Enter на цифровой части
+            SC_LSUPER | SC_RSUPER => 0x133,
+            SC_LALT => 0x132,
+            SC_LCTRL => 0x131,
+            _ => 0,
+        };
+    }
+    match sc {
+        0x01 => 0x102, // Esc
+        0x0E => 0x104, // Backspace
+        0x0F => 0x103, // Tab
+        0x1C => 0x101, // Enter
+        0x2A | 0x36 => 0x130,
+        SC_LCTRL => 0x131,
+        SC_LALT => 0x132,
+        0x3B..=0x44 => 0x120 + (sc - 0x3B) as u16, // F1..F10
+        0x57 => 0x12A,                             // F11
+        0x58 => 0x12B,                             // F12
+        _ => {
+            let i = sc as usize;
+            if i < MAP.len() && MAP[i].0 != 0 {
+                MAP[i].0 as u16 // печатная клавиша — её НЕсдвинутый символ
+            } else {
+                0
+            }
+        }
+    }
+}
 
 // ── скан-код набора 1 → ASCII (US-раскладка) ─────────────────────────────────
 // Индекс — скан-код нажатия (0x00..0x3A). Пара (обычный, с Shift). 0 — нет символа.
@@ -210,6 +280,18 @@ pub fn drain() {
                 // Правый Ctrl (`0xE0 0x1D`) — такой же модификатор, как левый, и приходит здесь.
                 if sc & !RELEASE == SC_LCTRL {
                     CTRL = sc & RELEASE == 0;
+                    super::key_push(0x131, mods(), CTRL, 0);
+                    continue;
+                }
+                // Веха 119 — Super (клавиша с логотипом) и правый Alt приходят тем же префиксом.
+                if sc & !RELEASE == SC_LSUPER || sc & !RELEASE == SC_RSUPER {
+                    SUPER = sc & RELEASE == 0;
+                    super::key_push(0x133, mods(), SUPER, 0);
+                    continue;
+                }
+                if sc & !RELEASE == SC_LALT {
+                    ALT = sc & RELEASE == 0;
+                    super::key_push(0x132, mods(), ALT, 0);
                     continue;
                 }
                 if sc & RELEASE == 0 {
@@ -237,6 +319,7 @@ pub fn drain() {
                         super::rx_push(b);
                     }
                 }
+                super::key_push(keysym(sc & !RELEASE, true), mods(), sc & RELEASE == 0, 0);
                 continue;
             }
             let released = sc & RELEASE != 0;
@@ -244,28 +327,37 @@ pub fn drain() {
             match code {
                 SC_LSHIFT | SC_RSHIFT => SHIFT = !released,
                 SC_LCTRL => CTRL = !released,
+                SC_LALT => ALT = !released,
                 SC_CAPS => {
                     if !released {
                         CAPS = !CAPS;
                     }
                 }
-                _ if !released && (code as usize) < MAP.len() => {
-                    let (lo, up) = MAP[code as usize];
-                    if lo != 0 {
-                        // Shift даёт верхний вариант; CapsLock влияет ТОЛЬКО на буквы.
-                        let is_letter = lo.is_ascii_lowercase();
-                        let upper = SHIFT ^ (CAPS && is_letter);
-                        let ch = if upper { up } else { lo };
-                        // Ctrl+буква → управляющий байт (Ctrl-A = 1 … Ctrl-Z = 26), как это
-                        // делает любой терминал. Прочие сочетания с Ctrl отдаём как есть.
-                        super::rx_push(if CTRL && ch.is_ascii_alphabetic() {
-                            ch.to_ascii_uppercase() - b'@'
-                        } else {
-                            ch
-                        });
-                    }
-                }
                 _ => {}
+            }
+            // Веха 119 — СОБЫТИЕ выдаётся на любую клавишу, включая модификаторы и отпускания:
+            // оконному менеджеру нужно знать состояние, а не только напечатанное. ASCII считается
+            // тут же и едет в событии, чтобы раскладка осталась в одном месте.
+            let mut ascii = 0u8;
+            if (code as usize) < MAP.len() {
+                let (lo, up) = MAP[code as usize];
+                if lo != 0 {
+                    // Shift даёт верхний вариант; CapsLock влияет ТОЛЬКО на буквы.
+                    let is_letter = lo.is_ascii_lowercase();
+                    let upper = SHIFT ^ (CAPS && is_letter);
+                    let ch = if upper { up } else { lo };
+                    // Ctrl+буква → управляющий байт (Ctrl-A = 1 … Ctrl-Z = 26), как это делает
+                    // любой терминал. Прочие сочетания с Ctrl отдаём как есть.
+                    ascii = if CTRL && ch.is_ascii_alphabetic() {
+                        ch.to_ascii_uppercase() - b'@'
+                    } else {
+                        ch
+                    };
+                }
+            }
+            super::key_push(keysym(code, false), mods(), !released, ascii);
+            if !released && ascii != 0 {
+                super::rx_push(ascii);
             }
         }
     }

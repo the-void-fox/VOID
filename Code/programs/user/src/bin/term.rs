@@ -882,6 +882,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     sys::win::Event::Key(k) => keys_from_win.push(k),
                     sys::win::Event::Close => {
                         sys::write_console("[term] окно закрыто — выходим\n".as_bytes());
+                        win.destroy();
                         sys::exit(0);
                     }
                     _ => {}

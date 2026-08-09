@@ -62,6 +62,120 @@ const C_TEXT: (u8, u8, u8) = (0xc9, 0xd1, 0xd9);
 const TITLE_H: i32 = 22;
 const BORDER: i32 = 1;
 
+// ── раскладка (Веха 119, [[wm-keys]]) ────────────────────────────────────────
+//
+// Умолчания взяты из рабочего конфига владельца (niri): те же клавиши, те же смыслы. Схема
+// живёт в КОНФИГЕ поколения строками `bind wm <клавиши> <действие>` — как у терминала с Вехи
+// 100; зашитая здесь нужна ровно затем, чтобы система поднималась на пустом конфиге.
+//
+// Крестика закрытия нет и не будет: окно закрывает `Super+Q` (решение владельца).
+const DEFAULT_BINDS: &str = "\
+bind wm Super+Return spawn-term
+bind wm Super+Q close-window
+bind wm Super+L focus-next
+bind wm Super+H focus-prev
+bind wm Super+Tab focus-next
+bind wm Super+Shift+Q quit
+";
+
+/// Разобранная строка раскладки.
+struct Bind {
+    sym: u16,
+    mods: u8,
+    action: String,
+}
+
+/// `"Super+Shift+Q"` → (код клавиши, маска). Имена модификаторов — как в конфиге niri.
+fn parse_combo(tok: &str) -> Option<(u16, u8)> {
+    let mut mods = 0u8;
+    let mut last = tok;
+    for part in tok.split('+') {
+        match part {
+            "Super" | "Mod" => mods |= 8,
+            "Shift" => mods |= 1,
+            "Ctrl" | "Control" => mods |= 2,
+            "Alt" => mods |= 4,
+            other => last = other,
+        }
+    }
+    let sym = match last {
+        "Return" | "Enter" => 0x101,
+        "Escape" | "Esc" => 0x102,
+        "Tab" => 0x103,
+        "Backspace" => 0x104,
+        "Delete" => 0x105,
+        "Left" => 0x110,
+        "Right" => 0x111,
+        "Up" => 0x112,
+        "Down" => 0x113,
+        "Home" => 0x114,
+        "End" => 0x115,
+        "PageUp" => 0x116,
+        "PageDown" => 0x117,
+        "Space" => b' ' as u16,
+        s => {
+            let c = s.chars().next()?;
+            if s.chars().count() != 1 {
+                return None;
+            }
+            // Клавиша именуется своим НЕсдвинутым символом: `Super+L` и буква `l` — про одну и
+            // ту же клавишу, и различать их регистром значило бы завести две раскладки.
+            (c.to_ascii_lowercase() as u32) as u16
+        }
+    };
+    Some((sym, mods))
+}
+
+/// Собрать раскладку: строки `bind wm …` из конфига поколения, иначе умолчания.
+fn load_binds(scap: usize) -> Vec<Bind> {
+    let text = read_generation(scap).unwrap_or_default();
+    let mut out = parse_binds(&text);
+    if out.is_empty() {
+        out = parse_binds(DEFAULT_BINDS);
+    }
+    out
+}
+
+fn parse_binds(text: &str) -> Vec<Bind> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut w = line.split_whitespace();
+        if w.next() != Some("bind") || w.next() != Some("wm") {
+            continue;
+        }
+        let (Some(combo), Some(action)) = (w.next(), w.next()) else { continue };
+        if let Some((sym, mods)) = parse_combo(combo) {
+            out.push(Bind { sym, mods, action: String::from(action) });
+        }
+    }
+    out
+}
+
+/// Активное поколение конфига — тем же способом, каким его читает терминал.
+fn read_generation(scap: usize) -> Option<String> {
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(scap, b"system/current", &mut id) != 32 {
+        return None;
+    }
+    let mut name = [0u8; 64];
+    let n = sys::obj_get(scap, &id, &mut name);
+    if n == 0 || n > name.len() {
+        return None;
+    }
+    let mut root = alloc::vec::Vec::from(&b"system/"[..]);
+    root.extend_from_slice(&name[..n]);
+    if sys::obj_get_root(scap, &root, &mut id) != 32 {
+        return None;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = sys::obj_get(scap, &id, &mut buf);
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    String::from_utf8(buf).ok()
+}
+
 fn main_loop() -> ! {
     let Some(fb_cap) = find_fb_cap() else {
         sys::write_console("[wm] нет права на экран (mmio:fb в конфиге)\n".as_bytes());
@@ -119,6 +233,9 @@ fn main_loop() -> ! {
         sys::write_console("[wm] клиентов нет — пустой рабочий стол\n".as_bytes());
     }
 
+    let binds = load_binds(store);
+    sys::write_console(alloc::format!("[wm] раскладка: {} сочетаний\n", binds.len()).as_bytes());
+
     let mut msg = [0u8; 1024];
     let mut mouse = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0 }; 32];
     loop {
@@ -133,15 +250,21 @@ fn main_loop() -> ! {
             }
         }
 
-        // ── клавиши: целиком уходят окну в фокусе ──────────────────────────────────────
-        let mut keys = [0u8; 32];
-        let kn = sys::read_console_nonblock(&mut keys);
+        // ── клавиши: сперва АККОРДЫ, потом обычный ввод окну в фокусе ──────────────────
+        let mut kev = [sys::KeyEvent { sym: 0, mods: 0, down: false, ascii: 0 }; 32];
+        let kn = sys::key_read(&mut kev);
         if kn > 0 {
             worked = true;
-            for &k in &keys[..kn] {
-                wm.key(k);
+            for e in &kev[..kn] {
+                wm.key_event(e, &binds, store, me, &mut font);
             }
         }
+
+        // ── ушедшие клиенты ────────────────────────────────────────────────────────────
+        // Окно живёт, пока жив его хозяин. Полагаться на прощание нельзя: программа может
+        // упасть, и тогда её рамка осталась бы на экране навсегда — с картинкой, за которой
+        // никого нет. Спрашиваем ядро, а не верим на слово.
+        wm.reap(&mut font);
 
         // ── запросы клиентов ───────────────────────────────────────────────────────────
         // Спим только когда делать нечего — и просыпаемся по клавише ИЛИ движению мыши
@@ -433,10 +556,91 @@ impl Wm {
         }
     }
 
-    fn key(&mut self, k: u8) {
+    /// Клавиша: сперва ищем АККОРД в раскладке, и только если его нет — отдаём символ окну.
+    ///
+    /// Порядок принципиален: `Super+Q` не должен доехать до программы буквой `q`. Отпускания
+    /// клавиш окну не отдаём вовсе — программам нужен текст, а не состояние клавиатуры.
+    fn key_event(
+        &mut self, e: &sys::KeyEvent, binds: &[Bind], store: usize, me: usize,
+        font: &mut BitmapFont,
+    ) {
+        if !e.down {
+            return;
+        }
+        if let Some(b) = binds.iter().find(|b| b.sym == e.sym && b.mods == e.mods) {
+            self.action(&b.action.clone(), store, me, font);
+            return;
+        }
+        // Аккорд с Super, которому не нашлось действия, программе не отдаём: иначе промах по
+        // раскладке печатал бы букву посреди текста.
+        if e.mods & 8 != 0 || e.ascii == 0 {
+            return;
+        }
         let Some(id) = self.focus else { return };
         let Some(i) = self.wins.iter().position(|w| w.id == id) else { return };
-        self.send(i, [win::EV_KEY, k, 0, 0, 0, 0, 0, 0], 2);
+        self.send(i, [win::EV_KEY, e.ascii, 0, 0, 0, 0, 0, 0], 2);
+    }
+
+    /// Выполнить действие раскладки.
+    fn action(&mut self, name: &str, store: usize, me: usize, font: &mut BitmapFont) {
+        match name {
+            "spawn-term" => {
+                if sys::spawn_with_endpoint(store, b"term", &[], me, b"WM\0").is_none() {
+                    sys::write_console("[wm] терминал не запустился\n".as_bytes());
+                }
+            }
+            "close-window" => {
+                // Закрываем ОКНО, а не процесс: клиенту говорят «закройся», и он решает сам.
+                // Убить его силой мы могли бы (он наш ребёнок), но тогда несохранённое пропадёт
+                // молча — а это ровно то, чего порядочная система не делает.
+                if let Some(id) = self.focus {
+                    if let Some(i) = self.wins.iter().position(|w| w.id == id) {
+                        self.send(i, [win::EV_CLOSE, 0, 0, 0, 0, 0, 0, 0], 1);
+                    }
+                }
+            }
+            "focus-next" | "focus-prev" => {
+                if self.wins.is_empty() {
+                    return;
+                }
+                let cur = self
+                    .focus
+                    .and_then(|id| self.wins.iter().position(|w| w.id == id))
+                    .unwrap_or(0);
+                let n = self.wins.len();
+                let next = if name == "focus-next" { (cur + 1) % n } else { (cur + n - 1) % n };
+                let lost = self.focus;
+                self.focus = Some(self.wins[next].id);
+                self.raise(next, font);
+                self.unfocus_repaint(font, lost, self.focus);
+            }
+            "quit" => {
+                sys::write_console("[wm] выход по запросу\n".as_bytes());
+                sys::exit(0);
+            }
+            other => {
+                sys::write_console(alloc::format!("[wm] нет такого действия: {}\n", other).as_bytes());
+            }
+        }
+    }
+
+    /// Убрать окна процессов, которых больше нет.
+    fn reap(&mut self, font: &mut BitmapFont) {
+        let mut i = 0;
+        while i < self.wins.len() {
+            let dead = matches!(sys::wait(self.wins[i].owner, true), sys::Wait::Exited(_));
+            if !dead {
+                i += 1;
+                continue;
+            }
+            let rect = self.wins[i].frame();
+            let id = self.wins[i].id;
+            self.wins.remove(i);
+            if self.focus == Some(id) {
+                self.focus = self.wins.last().map(|w| w.id);
+            }
+            self.repaint(font, rect.0, rect.1, rect.2, rect.3);
+        }
     }
 
     /// Перерисовать окно, потерявшее фокус (его рамка обязана погаснуть).

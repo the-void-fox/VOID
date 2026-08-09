@@ -115,6 +115,7 @@ const SYS_SLEEP: usize = 47;
 const SYS_PARENT: usize = 48;
 const SYS_MOUSE_READ: usize = 49;
 const SYS_KLOG: usize = 50;
+const SYS_KEY_READ: usize = 51;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -803,6 +804,50 @@ pub fn klog(out: &mut [u8]) -> (usize, usize) {
         return (0, 0);
     }
     (r.0, r.1)
+}
+
+/// Событие клавиатуры (Веха 119): что нажали, с какими модификаторами и какой это символ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyEvent {
+    /// Код клавиши: печатные — их НЕсдвинутый ASCII, прочие — числа выше 0x100.
+    pub sym: u16,
+    /// Биты: 1 Shift, 2 Ctrl, 4 Alt, 8 Super.
+    pub mods: u8,
+    pub down: bool,
+    /// Готовый символ (0 — клавиша непечатная). Раскладку знает ядро, и знает в одном месте.
+    pub ascii: u8,
+}
+
+impl KeyEvent {
+    pub fn shift(&self) -> bool { self.mods & 1 != 0 }
+    pub fn ctrl(&self) -> bool { self.mods & 2 != 0 }
+    pub fn alt(&self) -> bool { self.mods & 4 != 0 }
+    pub fn super_key(&self) -> bool { self.mods & 8 != 0 }
+}
+
+/// `SYS_KEY_READ` (Веха 119) — забрать события клавиатуры. Право — ВЛАДЕНИЕ ЭКРАНОМ, как у мыши.
+///
+/// Байтовый поток консоли никуда не делся: он нужен всем, кто читает «текст», а события нужны
+/// тому, кто разбирает АККОРДЫ. Из байта аккорд не восстановить — `Super+L` и `l` это один байт.
+pub fn key_read(out: &mut [KeyEvent]) -> usize {
+    const REC: usize = 6;
+    let mut raw = [0u8; 64 * REC];
+    let cap = out.len().min(raw.len() / REC) * REC;
+    let n = abi::syscall(SYS_KEY_READ, raw.as_mut_ptr() as usize, cap, 0, 0, 0, 0, 0).0;
+    if n == NO_CAP || n == 0 {
+        return 0;
+    }
+    let count = n / REC;
+    for (i, e) in out.iter_mut().enumerate().take(count) {
+        let b = &raw[i * REC..];
+        *e = KeyEvent {
+            sym: u16::from_le_bytes([b[0], b[1]]),
+            mods: b[2],
+            down: b[3] != 0,
+            ascii: b[4],
+        };
+    }
+    count
 }
 
 /// `SYS_PARENT(pid)` (Веха 114): чей это ребёнок. `None` — родителя нет или номер неверен.

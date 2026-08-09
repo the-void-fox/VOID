@@ -61,6 +61,8 @@ pub use imp::{
     CONSOLE_IRQ,
     // мышь (Веха 115): события с провода, позицию курсора ведёт владелец экрана
     mouse_pending, mouse_pop, mouse_present, mouse_take_lost,
+    // клавиатура событиями (Веха 119): код клавиши + маска модификаторов + готовый ASCII
+    key_pending, key_pop,
     // прерывания
     enable_interrupts, init_device_interrupts, irq_mask_preempt, irq_mask_read, irq_mask_stdin,
     irq_mask_idle, irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel,

@@ -413,6 +413,19 @@ pub(super) fn rx_push(b: u8) {
     }
 }
 
+/// Код клавиши для байта, пришедшего без скан-кода (serial). Печатные символы нумеруются
+/// самим ASCII — так `bind("wm", "Super+L", …)` и обычная буква говорят на одном языке.
+fn keysym_of_ascii(b: u8) -> u16 {
+    match b {
+        b'\r' | b'\n' => 0x101,
+        27 => 0x102,
+        b'\t' => 0x103,
+        8 | 0x7f => 0x104,
+        c if c.is_ascii_uppercase() => c.to_ascii_lowercase() as u16,
+        c => c as u16,
+    }
+}
+
 /// Сколько байт ввода потеряно переполнением кольца (забирается и обнуляется [`console_take_lost`]).
 static RX_LOST: AtomicUsize = AtomicUsize::new(0);
 
@@ -469,6 +482,54 @@ pub fn mouse_pending() -> bool {
     MOUSE_TAIL.load(Ordering::Relaxed) != MOUSE_HEAD.load(Ordering::Relaxed)
 }
 
+// ── события клавиатуры (Веха 119) ────────────────────────────────────────────
+//
+// Кольцо СОБЫТИЙ рядом с кольцом ASCII-байт, а не вместо него. Довод: байты нужны всем, кто
+// читает «текст с клавиатуры» (vsh, панели терминала, ввод через serial), а события нужны тому,
+// кто разбирает АККОРДЫ — оконному менеджеру. Из байта аккорд не восстановить: `Super+L` и `l`
+// это один и тот же байт, а Super в ASCII не выражается вовсе.
+
+/// Одно событие: код клавиши, маска модификаторов, нажатие/отпускание и готовый ASCII-байт.
+///
+/// ASCII кладётся СЮДА ЖЕ намеренно: раскладку знает ядро (таблица скан-кодов), и заставлять
+/// оконный менеджер собирать букву заново значило бы завести вторую раскладку, которая разойдётся
+/// с первой.
+#[derive(Clone, Copy)]
+pub struct KeyEvent {
+    pub sym: u16,
+    pub mods: u8,
+    pub down: bool,
+    pub ascii: u8,
+}
+
+const KEY_CAP: usize = 128;
+static mut KEY_BUF: [KeyEvent; KEY_CAP] =
+    [KeyEvent { sym: 0, mods: 0, down: false, ascii: 0 }; KEY_CAP];
+static KEY_HEAD: AtomicUsize = AtomicUsize::new(0);
+static KEY_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn key_push(sym: u16, mods: u8, down: bool, ascii: u8) {
+    let head = KEY_HEAD.load(Ordering::Relaxed);
+    if head.wrapping_sub(KEY_TAIL.load(Ordering::Relaxed)) < KEY_CAP {
+        unsafe { KEY_BUF[head % KEY_CAP] = KeyEvent { sym, mods, down, ascii } };
+        KEY_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
+    }
+}
+
+pub fn key_pop() -> Option<KeyEvent> {
+    let tail = KEY_TAIL.load(Ordering::Relaxed);
+    if tail == KEY_HEAD.load(Ordering::Relaxed) {
+        return None;
+    }
+    let e = unsafe { KEY_BUF[tail % KEY_CAP] };
+    KEY_TAIL.store(tail.wrapping_add(1), Ordering::Relaxed);
+    Some(e)
+}
+
+pub fn key_pending() -> bool {
+    KEY_TAIL.load(Ordering::Relaxed) != KEY_HEAD.load(Ordering::Relaxed)
+}
+
 /// Есть ли рабочая PS/2-мышь (ответила на команды включения).
 pub fn mouse_present() -> bool {
     ps2::mouse_present()
@@ -510,7 +571,12 @@ pub fn console_drain() {
         if lsr == 0xff || lsr & 1 == 0 || n >= RX_CAP {
             break;
         }
-        rx_push(inb(COM1));
+        // Веха 119 — байт из serial становится и СОБЫТИЕМ: у него нет модификаторов (взять их
+        // неоткуда), поэтому аккорды по serial невыразимы — но печатать в окно можно, и это
+        // важнее. Клавиатура PS/2 кладёт события сама, с настоящей маской.
+        let b = inb(COM1);
+        rx_push(b);
+        key_push(keysym_of_ascii(b), 0, true, b);
         n += 1;
     }
     ps2::drain();

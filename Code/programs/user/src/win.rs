@@ -222,6 +222,11 @@ impl Window {
         self.event(OP_POLL)
     }
 
+    /// Сказать композитору, что окна больше не будет.
+    pub fn destroy(&self) {
+        crate::call(self.ep, OP_DESTROY, &self.id.to_le_bytes(), &mut []);
+    }
+
     fn event(&self, op: usize) -> Option<Event> {
         let mut rep = [0u8; 16];
         let n = crate::call(self.ep, op, &self.id.to_le_bytes(), &mut rep);

@@ -55,12 +55,17 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 window.present(store, &pixels);
             }
             Some(Event::Key(k)) => {
-                // Ctrl-C или 'q' — уйти. Окно исчезнет вместе с процессом.
+                // Ctrl-C или 'q' — уйти. Прощаемся с композитором, а не просто умираем:
+                // окно должно исчезнуть в тот же миг, а не когда нас заметят мёртвыми.
                 if k == 3 || k == b'q' {
+                    window.destroy();
                     sys::exit(0);
                 }
             }
-            Some(Event::Close) => sys::exit(0),
+            Some(Event::Close) => {
+                window.destroy();
+                sys::exit(0);
+            }
             _ => {}
         }
     }

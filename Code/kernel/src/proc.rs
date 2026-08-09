@@ -635,6 +635,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
     }
     while !arch::console_has_input()
         && !arch::mouse_pending() // Веха 115: движение мыши — тоже повод проснуться
+        && !arch::key_pending() // Веха 119: и событие клавиатуры
         && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
         && !NET_IRQ_PENDING.load(Ordering::Relaxed) // Веха 91: кадр разбудит сетевой сервер
         && !deadline.is_some_and(|d| arch::now_ticks() >= d)
@@ -649,7 +650,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
     let mut t = TABLE.lock();
     // Веха 115 — движение мыши будит тех же, кого будит клавиша: для реактора терминала это
     // такое же событие ввода, и спать сквозь него значило бы двигать курсор рывками по таймеру.
-    if arch::mouse_pending() {
+    if arch::mouse_pending() || arch::key_pending() {
         for i in 0..t.procs.len() {
             if t.procs[i].state == State::RecvWait && t.procs[i].wake_on_key {
                 let f = &mut t.procs[i].frame;
@@ -2571,6 +2572,38 @@ fn syscall(t: &mut Table, cur: usize) {
                 let lost = arch::mouse_take_lost();
                 if lost > 0 {
                     println!("  [мышь] потеряно событий: {} (владелец не успевает читать)", lost);
+                }
+                off
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_KEY_READ(buf, len) -> байт (Веха 119): события клавиатуры для владельца экрана.
+        //
+        // Событие — 6 байт: код клавиши (u16 LE), маска модификаторов, флаги (бит0 — нажата),
+        // готовый ASCII-байт и запас. Право то же, что у мыши: ВЛАДЕНИЕ ЭКРАНОМ. Довод тот же и
+        // он же закрывает подслушивание — пока окнами занят один процесс, чужой не прочитает,
+        // что человек печатает.
+        51 => {
+            let (buf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let result = if arch::video_owner() != Some(cur) || !ensure_heap_range(t, cur, buf, len)
+            {
+                usize::MAX
+            } else {
+                let mut off = 0usize;
+                while off + 6 <= len {
+                    let Some(e) = arch::key_pop() else { break };
+                    let b = [
+                        e.sym.to_le_bytes()[0], e.sym.to_le_bytes()[1],
+                        e.mods, e.down as u8, e.ascii, 0,
+                    ];
+                    let dst = unsafe { core::slice::from_raw_parts_mut((buf + off) as *mut u8, 6) };
+                    dst.copy_from_slice(&b);
+                    off += 6;
                 }
                 off
             };

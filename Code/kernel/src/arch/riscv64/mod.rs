@@ -78,6 +78,23 @@ pub fn mouse_take_lost() -> usize {
 pub fn mouse_present() -> bool {
     false
 }
+
+/// Веха 119 — события клавиатуры. На riscv клавиатура приходит по UART байтами, аккордов
+/// (Super/Alt) там нет физически, поэтому событий нет тоже — честная заглушка.
+#[derive(Clone, Copy)]
+pub struct KeyEvent {
+    pub sym: u16,
+    pub mods: u8,
+    pub down: bool,
+    pub ascii: u8,
+}
+
+pub fn key_pop() -> Option<KeyEvent> {
+    None
+}
+pub fn key_pending() -> bool {
+    false
+}
 pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
     (0, 0, 0, 0, [(0, 0); 3])
 }

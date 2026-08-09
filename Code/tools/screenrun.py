@@ -22,6 +22,7 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
+    hotkey <аккорд>    — аккорд клавиатуры PS/2, например: hotkey Super+Return
     shot <имя>         — снять кадр в <каталог-выхода>/<имя>.png
 """
 import json, os, socket, struct, subprocess, sys, time, zlib
@@ -83,6 +84,27 @@ def rel(axis, value):
     return {"type": "rel", "data": {"axis": axis, "value": value}}
 
 
+# Имена модификаторов и особых клавиш → qcode QEMU. Печатные буквы совпадают сами с собой.
+QCODE = {
+    "Super": "meta_l", "Mod": "meta_l", "Shift": "shift", "Ctrl": "ctrl", "Alt": "alt",
+    "Return": "ret", "Enter": "ret", "Tab": "tab", "Escape": "esc", "Space": "spc",
+    "Left": "left", "Right": "right", "Up": "up", "Down": "down",
+    "PageUp": "pgup", "PageDown": "pgdn", "Home": "home", "End": "end",
+}
+
+
+def hotkey(combo):
+    """Аккорд как настоящая клавиатура: модификаторы зажимаются и отпускаются вокруг клавиши."""
+    parts = combo.split("+")
+    mods = [QCODE[p] for p in parts[:-1]]
+    last = parts[-1]
+    key = QCODE.get(last, last.lower())
+    ev = lambda k, d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": k}}}
+    events = [ev(m, True) for m in mods] + [ev(key, True), ev(key, False)]
+    events += [ev(m, False) for m in reversed(mods)]
+    call("input-send-event", events=events)
+
+
 def ppm_to_png(src, dst):
     raw = open(src, "rb").read()
     h = raw.split(maxsplit=4)
@@ -130,6 +152,8 @@ try:
             call("input-send-event",
                  events=[{"type": "btn",
                           "data": {"down": state.strip() == "down", "button": btn}}])
+        elif cmd == "hotkey":
+            hotkey(arg.strip())
         elif cmd == "shot":
             ppm = os.path.join(outdir, arg + ".ppm")
             call("screendump", filename=ppm)
