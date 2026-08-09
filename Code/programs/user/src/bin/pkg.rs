@@ -304,6 +304,18 @@ fn nix_hash32(digest: &[u8; 32]) -> String {
 // ── загрузка одного пути ────────────────────────────────────────────────────────────────────
 
 /// Скачать URL в корень store через `httpsc` (TLS живёт в своём процессе, см. шапку).
+/// Сколько раз пробовать загрузку, прежде чем признать её несостоявшейся.
+const DOWNLOAD_TRIES: usize = 3;
+
+/// Подождать, уступая процессор. Своего таймера у программы нет, а занимать им ядро на секунды
+/// незачем: `yield_now` отдаёт время тем, кто работает, — в том числе сетевому серверу.
+fn pause_ns(ns: u64) {
+    let until = sys::monotonic_ns() + ns;
+    while sys::monotonic_ns() < until {
+        sys::yield_now();
+    }
+}
+
 fn download(url: &str, root: &str) -> Result<[u8; 32], String> {
     let mut argv = Vec::new();
     argv.extend_from_slice(url.as_bytes());
@@ -314,8 +326,24 @@ fn download(url: &str, root: &str) -> Result<[u8; 32], String> {
     // печатает по-прежнему.
     argv.push(0);
     argv.extend_from_slice(b"-q");
-    if sys::exec_args(sys::start_cap(1), b"httpsc", &argv) != 0 {
-        return Err(format!("не скачалось: {}", url));
+    // Загрузка ПОВТОРЯЕТСЯ (Веха 113). Сеть отказывает не только насовсем: при десятке загрузок
+    // подряд (замыкание пакета, перебор кандидатов пробником) очередное соединение с кэшем
+    // срывается — замечено дважды, и оба раза следующая попытка проходила. Сдаваться с первого
+    // раза значит ронять `rebuild` из-за одного пакета, который лежит на месте.
+    //
+    // Пауза между попытками растёт, и ждём мы не бездельем, а `yield_now`: ядру всё равно есть
+    // что делать (сетевой сервер как раз доводит свои дела), а таймера-усыпителя у программы нет.
+    let mut attempt = 0;
+    loop {
+        if sys::exec_args(sys::start_cap(1), b"httpsc", &argv) == 0 {
+            break;
+        }
+        attempt += 1;
+        if attempt >= DOWNLOAD_TRIES {
+            return Err(format!("не скачалось ({} попытки): {}", DOWNLOAD_TRIES, url));
+        }
+        sys::write(format!("  сеть отказала — попытка {} из {}\n", attempt + 1, DOWNLOAD_TRIES).as_bytes());
+        pause_ns(attempt as u64 * 2_000_000_000);
     }
     let mut id = [0u8; 32];
     if sys::obj_get_root(sys::start_cap(1), root.as_bytes(), &mut id) != 32 {
@@ -667,13 +695,47 @@ fn read_file<F: FnMut(&[u8])>(
 /// рядом с самим каналом и перечисляет ровно то, что канал собрал, — то есть то, что лежит в
 /// кэше и до чего мы вообще можем дотянуться.
 ///
-/// Канал зашит по той же причине, что и хост кэша: «откуда система берёт софт» — решение
-/// системы, а не аргумент команды. Сменить его — задача конфига, а не командной строки.
-const INDEX_URL: &str = "https://channels.nixos.org/nixos-unstable/store-paths.xz";
+/// Канал по умолчанию. «Откуда система берёт софт» — решение СИСТЕМЫ, а не аргумент команды,
+/// поэтому командной строкой его сменить нельзя; с Вехи 113 его называет конфиг — строкой
+/// `channel <url>` рядом с `packages` ([`channel`]).
+const CHANNEL: &str = "https://channels.nixos.org/nixos-unstable";
+
+/// Файл индекса внутри канала — часть его раскладки, а не настройка: канал, у которого этого
+/// файла нет, каналом для нас не является.
+const INDEX_FILE: &str = "store-paths.xz";
 
 /// Корень, под которым индекс живёт. Блобом, а не объектом: распакованного текста 15 МиБ, и
 /// целиком в памяти он не бывает — ни при записи, ни при поиске.
 const INDEX_ROOT: &str = "pkg/index/paths";
+
+/// Канал, ИЗ КОТОРОГО скачан лежащий индекс. Хранится рядом с ним, потому что индекс без этого
+/// знания — просто список строк неизвестного происхождения: сменив канал в конфиге, человек
+/// обязан узнать, что имена всё ещё резолвятся по старому.
+const INDEX_CHANNEL_ROOT: &str = "pkg/index/channel";
+
+/// Канал этой системы: что сказал конфиг активного поколения, иначе [`CHANNEL`].
+fn channel(scap: usize) -> String {
+    config_word(scap, "channel").unwrap_or_else(|| String::from(CHANNEL))
+}
+
+/// Первое слово строки `<вид> …` из конфига активного поколения системы.
+///
+/// Читать конфиг умеет и `vvsh`, но нести сюда его вычислитель незачем: поколение — уже
+/// НОРМАЛИЗОВАННЫЙ текст, строки в нём разобраны, и `pkg` берёт свои две (`channel`,
+/// `packages`) тем же способом, каким ядро берёт свои.
+fn config_word(scap: usize, kind: &str) -> Option<String> {
+    let gen = profile::system_current(scap)?;
+    let text = system_config(scap, &gen).ok()?;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() == Some(kind) {
+            if let Some(w) = it.next() {
+                return Some(w.to_string());
+            }
+        }
+    }
+    None
+}
 
 /// Копилка кусков: распакованные байты уходят в store порциями [`FILE_CHUNK`], а в памяти
 /// живёт ровно одна порция. Тот же приём, что у распаковки пакета ([`Builder`]).
@@ -740,6 +802,7 @@ impl ChunkWriter {
 /// границе строк — через `carry`; целиком индекс в памяти не собирается никогда.
 fn index_scan<F: FnMut(&str)>(scap: usize, mut f: F) -> Result<usize, String> {
     let id = root_id(scap, INDEX_ROOT).ok_or("индекса имён нет — сначала `pkg update`")?;
+    warn_stale_channel(scap);
     let mut head = [0u8; 512];
     let n = sys::obj_get(scap, &id, &mut head);
     let (_, nchunks, csize) = sys::http::blob_info(&head[..n.min(head.len())])
@@ -784,6 +847,28 @@ fn index_scan<F: FnMut(&str)>(scap: usize, mut f: F) -> Result<usize, String> {
         }
     }
     Ok(lines)
+}
+
+/// Сказать вслух, если лежащий индекс скачан НЕ ИЗ ТОГО канала, который назвал конфиг.
+///
+/// Не ошибка: старый индекс — рабочий список имён, по нему всё установится и проверится
+/// подписью. Но это уже не тот софт, который система объявила, и знать об этом человек обязан
+/// раньше, чем удивится версии.
+fn warn_stale_channel(scap: usize) {
+    let want = channel(scap);
+    let have = root_id(scap, INDEX_CHANNEL_ROOT)
+        .and_then(|id| archive::read_object(scap, &id, 64 * 1024).ok())
+        .and_then(|b| String::from_utf8(b).ok());
+    match have {
+        Some(h) if h.trim() == want => {}
+        Some(h) => sys::write(
+            format!("  индекс скачан из {} — конфиг называет {} (`pkg update`)\n", h.trim(), want)
+                .as_bytes(),
+        ),
+        // Индекс от Вехи 111: канал тогда не записывался. Молчим — сказать нечего, а гадать
+        // «наверняка тот самый» значило бы выдумать факт.
+        None => {}
+    }
 }
 
 /// Сколько кандидатов на одно имя мы готовы держать в памяти. `stdenv-linux` в канале
@@ -854,7 +939,11 @@ fn pick_from(scap: usize, query: &str, cands: Vec<String>) -> Result<Pick, Strin
         ));
     }
 
-    let anchor = read_anchor(scap);
+    // Якоря может не быть: индекс скачан другой архитектурой (диск у них общий), или он от
+    // Вехи 111, когда корень был один на всех. Тогда проверяем СЕЙЧАС — это дешевле, чем
+    // выглядит: пробник обычно уже лежит в store, а платить за чужую ошибку молчаливым
+    // «архитектура не проверена» неправильно.
+    let anchor = ensure_anchor(scap)?;
     if anchor.as_deref() == Some(NO_ARCH) {
         return Err(format!(
             "канал не собирает под нашу архитектуру — имена не работают, ставьте по хэшу ({} путей у имени {})",
@@ -903,10 +992,24 @@ struct Pick {
 
 // ── архитектура: якорь вместо гадания ───────────────────────────────────────────────────────
 
-/// Корень, где лежит «наша libc» — путь, по ссылке на который узнаётся своя сборка.
-const LIBC_ROOT: &str = "pkg/index/libc";
+/// Имя своей архитектуры — часть имени корня якоря (см. [`libc_root`]).
+#[cfg(target_arch = "riscv64")]
+const ARCH: &str = "riscv64";
+#[cfg(target_arch = "x86_64")]
+const ARCH: &str = "x86_64";
 
-/// Значение [`LIBC_ROOT`], когда своей сборки в канале НЕТ (например, riscv64 в nixos-unstable).
+/// Корень, где лежит «наша libc» — путь, по ссылке на который узнаётся своя сборка.
+///
+/// Имя корня **арх-именовано** (Веха 113), и это не аккуратность. Диск у архитектур один
+/// (программы разведены как `bin/<arch>/*`), а якорь собирает `pkg update` на конкретной машине:
+/// с общим корнем riscv-система читала якорь, снятый под x86, и печатала «первый своей
+/// архитектуры», сверившись с чужой libc. Установку это не ломало (подпись и NarHash на месте,
+/// чужой ELF просто не стартовал), но сообщение врало — а этого достаточно.
+fn libc_root() -> String {
+    format!("pkg/index/libc/{}", ARCH)
+}
+
+/// Значение якоря, когда своей сборки в канале НЕТ (например, riscv64 в nixos-unstable).
 /// Отдельное значение, а не отсутствие корня: «проверяли и не нашли» и «не проверяли» — разные
 /// вещи, и вторая не должна выглядеть как первая.
 const NO_ARCH: &str = "-";
@@ -925,9 +1028,39 @@ const OUR_MACHINE: u16 = 0x3E;
 
 /// Прочитать якорь: путь нашей libc, [`NO_ARCH`] или `None` (не проверяли).
 fn read_anchor(scap: usize) -> Option<String> {
-    let id = root_id(scap, LIBC_ROOT)?;
+    let id = root_id(scap, &libc_root())?;
     let bytes = archive::read_object(scap, &id, 64 * 1024).ok()?;
     core::str::from_utf8(&bytes).ok().map(|s| s.trim().to_string())
+}
+
+/// Якорь СВОЕЙ архитектуры: прочитать, а если его нет — выяснить пробником и записать.
+fn ensure_anchor(scap: usize) -> Result<Option<String>, String> {
+    if let Some(a) = read_anchor(scap) {
+        return Ok(Some(a));
+    }
+    sys::write(format!("якорь архитектуры {} не снят — проверяю пробником {}:\n", ARCH, PROBE).as_bytes());
+    let anchor = probe_arch(scap)?;
+    write_anchor(scap, &anchor)?;
+    Ok(Some(anchor.unwrap_or_else(|| String::from(NO_ARCH))))
+}
+
+/// Записать якорь (или [`NO_ARCH`]) и сказать, что вышло.
+fn write_anchor(scap: usize, anchor: &Option<String>) -> Result<(), String> {
+    let value = anchor.clone().unwrap_or_else(|| String::from(NO_ARCH));
+    let aid = put(scap, value.as_bytes())?;
+    if sys::obj_set_root(scap, libc_root().as_bytes(), &aid) != 0 {
+        return Err(String::from("корень якоря не завёлся"));
+    }
+    // Якорь Вехи 111 был один на все архитектуры. Снимаем его, а не оставляем «на всякий»:
+    // корень, которому нельзя верить, хуже отсутствующего — по нему однажды кто-нибудь ответит.
+    sys::obj_del_root(scap, b"pkg/index/libc");
+    match anchor {
+        Some(libc) => sys::write(format!("  своя libc: {}\n", libc).as_bytes()),
+        None => sys::write(
+            "  своей сборки в канале НЕТ — имена работать не будут, только хэши\n".as_bytes(),
+        ),
+    }
+    Ok(())
 }
 
 /// `e_machine` из ELF-заголовка файла внутри пакета — или `None`, если это не 64-битный ELF.
@@ -971,7 +1104,15 @@ fn probe_arch(scap: usize) -> Result<Option<String>, String> {
     for c in &cands {
         let hash = hash_of(c);
         let (ni, _, _) = realize_one(scap, hash)?;
-        let machine = elf_machine(scap, hash, PROBE_BIN)?;
+        // Внутри может не оказаться `bin/hello` вовсе: у имени `hello` в канале есть выходы
+        // `-doc`/`-man`, и это не ошибка — просто не пробник. Раньше такой кандидат ронял всю
+        // проверку архитектуры; на своей арх до него не доходили (свой находился вторым), а на
+        // чужой — доходили сразу.
+        let (machine, why) = match elf_machine(scap, hash, PROBE_BIN) {
+            Ok(Some(m)) => (Some(m), format!("{:#x}", m)),
+            Ok(None) => (None, String::from("не ELF")),
+            Err(_) => (None, format!("нет {}", PROBE_BIN)),
+        };
         if machine == Some(OUR_MACHINE) {
             // Якорь — единственная ссылка пробника, кроме него самого.
             let libc = ni.references.iter().find(|r| hash_of(r) != hash).cloned();
@@ -980,8 +1121,7 @@ fn probe_arch(scap: usize) -> Result<Option<String>, String> {
         }
         // Чужую сборку не оставляем занимать место: корень снят — GC подберёт.
         sys::obj_del_root(scap, format!("pkg/tree/{}", hash).as_bytes());
-        let m = machine.map(|m| format!("{:#x}", m)).unwrap_or_else(|| String::from("не ELF"));
-        sys::write(format!("  {} — чужая сборка ({})\n", c, m).as_bytes());
+        sys::write(format!("  {} — не наша сборка ({})\n", c, why).as_bytes());
     }
     Ok(None)
 }
@@ -1265,10 +1405,12 @@ fn matches(base: &str, what: &str) -> bool {
 fn cmd_update() -> Result<(), String> {
     let scap = sys::start_cap(1);
     let dl_root = "pkg/dl/index";
+    let chan = channel(scap);
+    let url = format!("{}/{}", chan.trim_end_matches('/'), INDEX_FILE);
 
-    sys::write(format!("индекс канала: {}\n", INDEX_URL).as_bytes());
+    sys::write(format!("индекс канала: {}\n", url).as_bytes());
     let t0 = sys::monotonic_ns();
-    let dl_id = download(INDEX_URL, dl_root)?;
+    let dl_id = download(&url, dl_root)?;
     let t1 = sys::monotonic_ns();
 
     let (id, total, lines) = {
@@ -1280,6 +1422,12 @@ fn cmd_update() -> Result<(), String> {
 
     if sys::obj_set_root(scap, INDEX_ROOT.as_bytes(), &id) != 0 {
         return Err(String::from("корень индекса не завёлся"));
+    }
+    // Откуда он — записывается ВМЕСТЕ с ним: иначе после смены канала в конфиге система резолвит
+    // имена по старому индексу и молчит об этом.
+    let cid = put(scap, chan.as_bytes())?;
+    if sys::obj_set_root(scap, INDEX_CHANNEL_ROOT.as_bytes(), &cid) != 0 {
+        return Err(String::from("корень канала не завёлся"));
     }
     // Сжатый архив — транспорт, и хранить его рядом с распакованным незачем.
     sys::obj_del_root(scap, dl_root.as_bytes());
@@ -1299,23 +1447,9 @@ fn cmd_update() -> Result<(), String> {
     // Индекс перечисляет пути всех архитектур вперемешку, а имя про архитектуру молчит. Пока
     // не выяснено, какая сборка наша, имена бесполезны — поэтому проверка идёт здесь же, а не
     // откладывается до первой установки (см. [`probe_arch`]).
-    sys::write("архитектура (пробник hello):\n".as_bytes());
+    sys::write(format!("архитектура {} (пробник {}):\n", ARCH, PROBE).as_bytes());
     let anchor = probe_arch(scap)?;
-    let value = match &anchor {
-        Some(libc) => libc.clone(),
-        None => String::from(NO_ARCH),
-    };
-    let aid = put(scap, value.as_bytes())?;
-    if sys::obj_set_root(scap, LIBC_ROOT.as_bytes(), &aid) != 0 {
-        return Err(String::from("корень якоря не завёлся"));
-    }
-    match &anchor {
-        Some(libc) => sys::write(format!("  своя libc: {}\n", libc).as_bytes()),
-        None => sys::write(
-            "  своей сборки в канале НЕТ — имена работать не будут, только хэши\n".as_bytes(),
-        ),
-    }
-    Ok(())
+    write_anchor(scap, &anchor)
 }
 
 /// Сколько имён печатает `pkg search`, прежде чем сдаться: на `python` их тысячи, а экран один.

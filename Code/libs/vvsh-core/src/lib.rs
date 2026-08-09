@@ -345,4 +345,41 @@ system(
         let err = build_config(r#"system(packages())"#).unwrap_err();
         assert!(err.contains("packages:"), "получили: {}", err);
     }
+
+    /// Канал — часть конфига (Веха 113): «откуда система берёт софт» объявляется, а не зашито.
+    #[test]
+    fn channel_normalizes_and_is_single() {
+        let src = r#"system(channel("https://channels.nixos.org/nixos-unstable"),
+                            packages("hello"))"#;
+        assert_eq!(
+            build_config(src).expect("сборка"),
+            "channel https://channels.nixos.org/nixos-unstable\npackages hello\n"
+        );
+        let err = build_config(r#"system(channel("a", "b"))"#).unwrap_err();
+        assert!(err.contains("channel:"), "получили: {}", err);
+    }
+
+    /// Сеянный `packages.vv` собирается — и с пустым списком, и с именами. Проверка ровно того
+    /// текста, который пишет `init-config`: он длиннее прочих модулей, и опечатка в нём
+    /// проявилась бы только на живой машине.
+    #[test]
+    fn seeded_packages_module_shape() {
+        let module = |want: &str| {
+            alloc::format!(
+                "want = {}\n\nsource = \"https://ch/nixos-unstable\"\n\n\
+                 append(\n  [channel(source)],\n  if null?(want) {{ [] }} else {{ [packages(want)] }},\n)\n",
+                want
+            )
+        };
+        let loader = MapLoader::new(vec![("packages.vv", module("[]").leak() as &str)]);
+        assert_eq!(
+            build_config_with(r#"system(import("packages.vv"))"#, &loader).expect("пусто"),
+            "channel https://ch/nixos-unstable\n"
+        );
+        let loader = MapLoader::new(vec![("packages.vv", module(r#"["hello", "which"]"#).leak() as &str)]);
+        assert_eq!(
+            build_config_with(r#"system(import("packages.vv"))"#, &loader).expect("с именами"),
+            "channel https://ch/nixos-unstable\npackages hello which\n"
+        );
+    }
 }

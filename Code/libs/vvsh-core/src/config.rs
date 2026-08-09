@@ -5,7 +5,8 @@
 //! `apply()`. Это выход этапа «сборки» (`rebuild`): его коммитят поколением, ядро грузит на буте.
 //!
 //! **Читателей у одного текста несколько.** `service`/`shell` — ядру, `terminal`/`bind` —
-//! терминалу (`bin/term` читает поколение из store сам), `packages` — `pkg sync` (Веха 112).
+//! терминалу (`bin/term` читает поколение из store сам), `packages`/`channel` — `pkg`
+//! (Вехи 112–113).
 //! Разделять их на два объекта не за что: конфигурация системы — ОДНА вещь, у неё одна история
 //! поколений и один откат; кто какие строки берёт — дело читателя, а не хранилища.
 
@@ -43,6 +44,8 @@ pub fn normalize_config(v: &Value) -> Result<String, EvalError> {
             ("terminal", n) if n != 3 => {
                 return Err(EvalError::new("terminal: (terminal ключ значение)"))
             }
+            // Канал один: «откуда система берёт софт» — решение, а не список предпочтений.
+            ("channel", n) if n != 2 => return Err(EvalError::new("channel: (channel url)")),
             _ => {}
         }
         let name = match &entry[1] {

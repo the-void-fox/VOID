@@ -446,6 +446,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("terminal", b_terminal),
     ("bind", b_bind),
     ("packages", b_packages),
+    ("channel", b_channel),
     ("system", b_system),
 ];
 
@@ -646,6 +647,12 @@ fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::list(out))
 }
 
+/// `(channel url)` — откуда система берёт имена и версии пакетов (Веха 113). Читает `pkg`.
+/// Запись одна на систему: «откуда софт» — не список предпочтений, а решение.
+fn b_channel(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("channel", args)
+}
+
 /// `(system запись…|список-записей…)` → `(#system запись…)`: верхняя форма конфига. Принимает и
 /// отдельные записи, и списки записей (от `(append …)`) — уплощает.
 fn b_system(args: &[Value]) -> Result<Value, EvalError> {
@@ -659,7 +666,7 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
                         Value::List(inner) if is_entry(inner) => out.push(it.clone()),
                         _ => {
                             return Err(EvalError::new(
-                                "system: ожидались записи service/shell/terminal/bind/packages",
+                                "system: ожидались записи service/shell/terminal/bind/packages/channel",
                             ))
                         }
                     }
@@ -672,9 +679,9 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
-/// `packages` — `pkg sync`: конфиг поколения один, читателей несколько, и каждый берёт свои
+/// `packages`/`channel` — `pkg`: конфиг поколения один, читателей несколько, и каждый берёт свои
 /// строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
-        if matches!(&**s, "service" | "shell" | "terminal" | "bind" | "packages"))
+        if matches!(&**s, "service" | "shell" | "terminal" | "bind" | "packages" | "channel"))
 }
