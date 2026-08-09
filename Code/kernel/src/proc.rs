@@ -129,6 +129,10 @@ enum State {
     /// Веха 52: userspace-драйвер заблокирован в SYS_IRQ_WAIT — ждёт прерывания своего устройства;
     /// будит [`drain_userdrv_irq`] по флагу [`USERDRV_IRQ_PENDING`], выставленному обработчиком IRQ.
     IrqWait,
+    /// Веха 114: заблокирован в SYS_SLEEP до срока в `futex_deadline`. Отдельное состояние, а не
+    /// `FutexWait` с выдуманным адресом: спящий по времени НЕ должен просыпаться от чужого
+    /// `FUTEX_WAKE`, случайно назвавшего тот же адрес.
+    Sleeping,
     Finished,
 }
 
@@ -777,6 +781,12 @@ fn wake_futex_timeouts(t: &mut Table) {
                 f.set_ret_at(2, 0);
                 f.advance();
             }
+            // Веха 114: `SYS_SLEEP` — срок вышел, это и есть успех.
+            State::Sleeping => {
+                let f = &mut t.procs[i].frame;
+                f.set_ret(0);
+                f.advance();
+            }
             _ => continue,
         }
         t.procs[i].state = State::Runnable;
@@ -1391,13 +1401,19 @@ fn syscall(t: &mut Table, cur: usize) {
         }
         // SYS_OBJ_GET(store_cap, id_ptr, out_buf, out_cap) -> длина (0 — нет; MAX — отказ):
         // прочитать значение по 32-байтному content-id (нужен cap на store с правом READ).
+        //
+        // Веха 114 — ВТОРЫМ значением возвращается НАСТОЯЩАЯ длина объекта. Без неё «объект ровно
+        // с буфер» и «объект не влез» выглядели одинаково, и читатели росли удвоением буфера,
+        // перечитывая объект по нескольку раз. Второе значение прежних читателей не задевает
+        // (они берут только первое) — та же уловка, которой Веха 101 добавила «сколько хотели
+        // отдать» к IPC.
         9 => {
             let (scap, idp, obuf, ocap) = {
                 let f = &t.procs[cur].frame;
                 (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
             };
             let dom = t.procs[cur].domain;
-            let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
+            let (result, whole) = match cap::store(dom, Cap::from_bits(scap as u64), Rights::READ) {
                 // Веха 22.2: приёмный буфер (и id_ptr — Веха 23) может лежать в ленивой куче —
                 // доотобразить до записи ядром (весь ocap: лениво он выделился бы всё равно).
                 Ok(()) if ensure_heap_range(t, cur, obuf, ocap)
@@ -1405,26 +1421,27 @@ fn syscall(t: &mut Table, cur: usize) {
                     let mut id = [0u8; 32];
                     let src = unsafe { core::slice::from_raw_parts(idp as *const u8, 32) };
                     id.copy_from_slice(src);
-                    let n = crate::object::with(&ContentId(id), |b| match b {
+                    let (n, whole) = crate::object::with(&ContentId(id), |b| match b {
                         Some(bytes) => {
                             let m = bytes.len().min(ocap);
                             let out = unsafe { core::slice::from_raw_parts_mut(obuf as *mut u8, m) };
                             out.copy_from_slice(&bytes[..m]);
-                            m
+                            (m, bytes.len())
                         }
-                        None => 0,
+                        None => (0, 0),
                     });
-                    vprintln!("  [obj] P{} OBJ_GET → {} байт (по cap)", cur, n);
-                    n
+                    vprintln!("  [obj] P{} OBJ_GET → {} байт из {} (по cap)", cur, n, whole);
+                    (n, whole)
                 }
-                Ok(()) => usize::MAX, // куча есть, а фреймов нет
+                Ok(()) => (usize::MAX, 0), // куча есть, а фреймов нет
                 Err(e) => {
                     vprintln!("  [obj] P{} OBJ_GET отклонён: {:?}  ← нет capability на store", cur, e);
-                    usize::MAX
+                    (usize::MAX, 0)
                 }
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
+            f.set_ret_at(1, whole);
             f.advance();
         }
         // SYS_OBJ_SET_ROOT(store_cap, name_ptr, name_len, id_ptr) -> 0/MAX: привязать именованный
@@ -1810,6 +1827,12 @@ fn syscall(t: &mut Table, cur: usize) {
                                             unsafe { env.append(line.as_mut_vec()) };
                                         }
                                     }
+                                    // Родство записывается в ОБОИХ случаях (Веха 114). Раньше его
+                                    // ставил только SPAWN, потому что нужно оно было лишь для
+                                    // `SYS_WAIT`/`SYS_KILL`; из-за этого дерево процессов
+                                    // обрывалось на каждом `run`, и мультиплексор не мог понять,
+                                    // чей вывод к нему пришёл (см. `SYS_PARENT`).
+                                    t.procs[child].parent = cur;
                                     if wait_child {
                                         // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
                                         t.procs[cur].state = State::ExecWait(child);
@@ -1819,7 +1842,6 @@ fn syscall(t: &mut Table, cur: usize) {
                                         // ПРОДОЛЖАЕМ его. Ребёнок помечается зомби — его слот не
                                         // переиспользуется, пока родитель не заберёт код выхода.
                                         t.procs[child].zombie = true;
-                                        t.procs[child].parent = cur;
                                         let f = &mut t.procs[cur].frame;
                                         f.set_ret(child);
                                         f.advance();
@@ -2420,6 +2442,54 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
+            f.advance();
+        }
+        // SYS_SLEEP(ns) -> 0 (Веха 114): уснуть на указанное время. Прав не требует — спящий
+        // ничего не делает и ничего не узнаёт; отказать ему значило бы заставить программу
+        // крутить `yield` в пустом цикле, чем она до сих пор и занималась.
+        //
+        // Срок хранится в ТИКАХ, как у `futex_wait` и `recv_timeout`, и будит его та же
+        // [`wake_futex_timeouts`]; наносекунды переводятся ЗДЕСЬ, чтобы программе не надо было
+        // знать таймбазу своей архитектуры. `ns == 0` — не спать, просто уступить процессор.
+        47 => {
+            let ns = t.procs[cur].frame.arg(0) as u64;
+            if ns == 0 {
+                // Возврат оформляем сами: спать не будем, а значит и будить некому.
+                let f = &mut t.procs[cur].frame;
+                f.set_ret(0);
+                f.advance();
+            } else {
+                // sepc НЕ двигаем и ret не ставим — это сделает пробуждение по сроку
+                // ([`wake_futex_timeouts`]), ровно как у `futex_wait`.
+                let deadline = arch::now_ticks().wrapping_add(crate::clock::ns_to_ticks(ns));
+                t.procs[cur].state = State::Sleeping;
+                t.procs[cur].futex_deadline = Some(deadline);
+            }
+            if let Some(n) = t.next_runnable(cur) {
+                t.current = n;
+            }
+        }
+        // SYS_PARENT(pid) -> ppid | MAX (Веха 114): чей это ребёнок.
+        //
+        // Понадобилось мультиплексору. Он раздаёт панелям своё право на stdio, ребёнок панели
+        // (шелл) наследует его дальше — и внук пишет НАМ, но под своим номером процесса. Пока
+        // вывод раскладывался по панелям сравнением «отправитель == ребёнок панели», всё, что
+        // шелл запускал, печаталось В НИКУДА: `pkg update` честно отработал десять минут и не
+        // показал ни строки. Теперь хост поднимается по родителям и находит владельца.
+        //
+        // Гейта прав нет намеренно: номер процесса и так не тайна (его возвращает `SYS_SPAWN`,
+        // он приходит в каждом сообщении), а родство — то же самое знание, только на шаг выше.
+        // Изменить оно ничего не даёт: убить и дождаться по-прежнему можно лишь СВОЕГО ребёнка.
+        48 => {
+            let pid = t.procs[cur].frame.arg(0);
+            let ppid = t
+                .procs
+                .get(pid)
+                .map(|p| p.parent)
+                .filter(|&pp| pp != usize::MAX)
+                .unwrap_or(usize::MAX);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(ppid);
             f.advance();
         }
         // SYS_LOG(on) -> 0: вкл/выкл подробный трейс ядра (vprintln — [ipc]/[obj]/[mm]/[exec]/…).
@@ -3260,7 +3330,52 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             buf[8..16].copy_from_slice(&tv[1].to_le_bytes());
             ret = if a0 == 0 || lx_put(t, cur, a0, &buf) { 0 } else { linux::err(linux::EFAULT) };
         }
-        Some(Lx::Nanosleep) | Some(Lx::ClockNanosleep) => ret = 0, // без реального сна (демо)
+        // Веха 114 — сон стал НАСТОЯЩИМ. Раньше обе эти заглушки возвращали 0 не поспав, и
+        // программа, честно попросившая подождать, получала busy-loop: «спит» — а машина занята.
+        // Теперь кладём на тот же механизм срока, что `futex_wait` и `SYS_SLEEP`.
+        //
+        // `nanosleep(req, rem)` и `clock_nanosleep(clockid, flags, req, rem)` — timespec из двух
+        // 64-битных полей. Абсолютный срок (TIMER_ABSTIME=1) пересчитываем в относительный по
+        // своим часам; `rem` не заполняем — просыпаться раньше срока у нас нечему (сигналов нет),
+        // а значит остатка не бывает.
+        Some(Lx::Nanosleep) | Some(Lx::ClockNanosleep) => {
+            let a3 = t.procs[cur].frame.arg(3);
+            let _ = a3; // `rem` не заполняем — просыпаться раньше срока у нас нечему
+            let (req_va, abstime, clockid) = match decoded {
+                Some(Lx::Nanosleep) => (a0, false, 1),
+                _ => (a2, a1 & 1 != 0, a0),
+            };
+            match lx_get(t, cur, req_va, 16) {
+                Some(ts) => {
+                    let secs = u64::from_le_bytes(ts[0..8].try_into().unwrap());
+                    let nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap());
+                    let want = secs.saturating_mul(1_000_000_000).saturating_add(nsec);
+                    let ns = if abstime {
+                        let now = if clockid == 0 {
+                            crate::clock::realtime_ns()
+                        } else {
+                            crate::clock::uptime_ns()
+                        };
+                        want.saturating_sub(now)
+                    } else {
+                        want
+                    };
+                    if ns == 0 {
+                        ret = 0;
+                    } else {
+                        let deadline =
+                            arch::now_ticks().wrapping_add(crate::clock::ns_to_ticks(ns));
+                        t.procs[cur].state = State::Sleeping;
+                        t.procs[cur].futex_deadline = Some(deadline);
+                        if let Some(n) = t.next_runnable(cur) {
+                            t.current = n;
+                        }
+                        done = false; // спим: кадр и PC не трогаем, возврат оформит пробуждение
+                    }
+                }
+                None => ret = linux::err(linux::EFAULT),
+            }
+        }
         Some(Lx::SchedYield) => {
             ret = 0;
             // мягко уступить: пометим ret и дадим общему эпилогу продвинуть; переключение

@@ -50,6 +50,16 @@ pub fn uptime_ns() -> u64 {
     arch::now_ticks().wrapping_mul(TICK_NS)
 }
 
+/// Наносекунды → тики счётчика, вверх. Обратная [`uptime_ns`]: сроки внутри ядра живут в
+/// ТИКАХ (`futex_deadline`, `now_ticks`), а снаружи проситься спать удобнее в наносекундах —
+/// иначе каждая программа обязана знать таймбазу своей архитектуры (Веха 114).
+///
+/// Округление вверх намеренно: «поспать 1 нс» на riscv (тик = 100 нс) обязано означать «хотя бы
+/// один тик», а не «нисколько».
+pub fn ns_to_ticks(ns: u64) -> u64 {
+    ns.div_ceil(TICK_NS)
+}
+
 /// Настенное время, наносекунды Unix (UTC).
 pub fn realtime_ns() -> u64 {
     WALL_BASE_NS.load(Ordering::Relaxed).wrapping_add(uptime_ns())

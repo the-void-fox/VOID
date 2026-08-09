@@ -480,7 +480,21 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             let rl = root_name(b'f', path, &mut rn);
                             if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) == 32 {
                                 let dbuf = &mut files[j * DATA_MAX..(j + 1) * DATA_MAX];
-                                size[j] = sys::obj_get(store_cap, &idb, dbuf);
+                                // Веха 114: ядро называет НАСТОЯЩУЮ длину объекта, и файл больше
+                                // слота теперь виден. Раньше он молча приезжал обрезанным до
+                                // 128 КиБ — то же самое семейство тихих усечений, что съедало
+                                // хвост `.vv`-модулей. Отдавать половину файла нельзя: половина
+                                // шрифта не шрифт, половина архива не архив.
+                                let (got, whole) = sys::obj_get_ex(store_cap, &idb, dbuf);
+                                if whole > dbuf.len() {
+                                    sys::write_console("[posixfs] файл больше 128 КиБ — открыть нельзя: ".as_bytes());
+                                    sys::write_console(path);
+                                    sys::write_console(b"\n");
+                                    fused[j] = false;
+                                    fidx = usize::MAX;
+                                } else {
+                                    size[j] = got;
+                                }
                             } else {
                                 size[j] = 0; // новый файл (создастся при close)
                                 dirty[j] = true;

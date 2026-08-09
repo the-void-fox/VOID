@@ -2078,6 +2078,10 @@ if on {\n\
 \x20          if net { \"endpoint:net-srv\" } else { [] },\n\
 \x20          \"mmio:fb\", \"power\", \"env\")],\n\
 \x20   [terminal(\"font-size\", 18),\n\
+\x20    # Шрифт — ФАЙЛ, а не часть терминала (Веха 114): имя ищется в установленных пакетах\n\
+\x20    # (packages(\"…\") в packages.vv), абсолютный путь берётся как есть. Без этой строки\n\
+\x20    # терминал рисует встроенным 8×16 — читаемо, но некрасиво.\n\
+\x20    # terminal(\"font\", \"FiraCode-Regular.ttf\"),\n\
 \x20    terminal(\"shell\", \"bin/vvsh\"),\n\
 \x20    terminal(\"shell-args\", \"repl\")],\n\
 \x20   keys,\n\

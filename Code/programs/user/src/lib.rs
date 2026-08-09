@@ -108,6 +108,8 @@ const SYS_POWEROFF: usize = 44;
 const SYS_KILL: usize = 45;
 /// Веха 109 — сборка мусора store по требованию (нужна `pkg gc`).
 const SYS_OBJ_GC: usize = 46;
+const SYS_SLEEP: usize = 47;
+const SYS_PARENT: usize = 48;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -246,6 +248,16 @@ pub fn exit(code: usize) -> ! {
 /// `SYS_YIELD`: уступить процессор следующему готовому процессу.
 pub fn yield_now() {
     abi::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/// `SYS_SLEEP(ns)` (Веха 114) — поспать указанное время и не занимать процессор.
+///
+/// До этого сна не было вовсе: ждать умели только серверы (`recv_timeout`) и нити на футексе, а
+/// обычная программа крутила `yield_now` в цикле — то есть «ждала», не отдавая машину никому
+/// насовсем. Время в наносекундах, потому что тики — это таймбаза архитектуры, и знать её
+/// программе незачем.
+pub fn sleep_ns(ns: u64) {
+    abi::syscall(SYS_SLEEP, ns as usize, 0, 0, 0, 0, 0, 0);
 }
 
 // ─── нити (Веха 35) ───────────────────────────────────────────────────────────
@@ -419,11 +431,21 @@ pub fn obj_put(store_cap: usize, data: &[u8], id_out: &mut [u8; 32]) -> usize {
 
 /// `SYS_OBJ_GET`: прочитать значение по content-id (нужен `READ`). Возвращает длину (0 — нет).
 pub fn obj_get(store_cap: usize, id: &[u8; 32], out: &mut [u8]) -> usize {
-    abi::syscall(
+    obj_get_ex(store_cap, id, out).0
+}
+
+/// То же, но вторым числом — НАСТОЯЩАЯ длина объекта (Веха 114).
+///
+/// Без неё «объект ровно с буфер» и «объект не влез» неразличимы, и читатель вынужден гадать:
+/// в VOID это выглядело как рост буфера удвоением с перечитыванием объекта по нескольку раз.
+/// Теперь размер спрашивается один раз и читается ровно столько, сколько есть.
+pub fn obj_get_ex(store_cap: usize, id: &[u8; 32], out: &mut [u8]) -> (usize, usize) {
+    let r = abi::syscall(
         SYS_OBJ_GET, store_cap,
         id.as_ptr() as usize,
         out.as_mut_ptr() as usize, out.len(), 0, 0, 0,
-    ).0
+    );
+    (r.0, r.1)
 }
 
 /// `SYS_OBJ_PUT_NODE` (Веха 94): положить УЗЕЛ — значение + список исходящих ссылок.
@@ -704,6 +726,16 @@ pub fn spawn_with_stdio(
         args.as_ptr() as usize, args.len(), stdio_cap, 0,
     ).0;
     (r != NO_CAP).then_some(r)
+}
+
+/// `SYS_PARENT(pid)` (Веха 114): чей это ребёнок. `None` — родителя нет или номер неверен.
+///
+/// Нужен хосту stdio: право на него наследуется вглубь, поэтому писать ему может не только
+/// ребёнок, но и внук, — а разложить вывод по панелям надо всё равно. Поднимаясь по родителям,
+/// хост находит владельца ([`stdio`]).
+pub fn parent_of(pid: usize) -> Option<usize> {
+    let p = abi::syscall(SYS_PARENT, pid, 0, 0, 0, 0, 0, 0).0;
+    (p != NO_CAP).then_some(p)
 }
 
 /// `SYS_SELF_ENDPOINT` (Веха 98): право ВЫЗЫВАТЬ нас, чтобы отдать его детям. Не расширение

@@ -307,13 +307,9 @@ fn nix_hash32(digest: &[u8; 32]) -> String {
 /// Сколько раз пробовать загрузку, прежде чем признать её несостоявшейся.
 const DOWNLOAD_TRIES: usize = 3;
 
-/// Подождать, уступая процессор. Своего таймера у программы нет, а занимать им ядро на секунды
-/// незачем: `yield_now` отдаёт время тем, кто работает, — в том числе сетевому серверу.
+/// Подождать. С Вехи 114 это настоящий сон ядра, а не круг из `yield`.
 fn pause_ns(ns: u64) {
-    let until = sys::monotonic_ns() + ns;
-    while sys::monotonic_ns() < until {
-        sys::yield_now();
-    }
+    sys::sleep_ns(ns);
 }
 
 fn download(url: &str, root: &str) -> Result<[u8; 32], String> {

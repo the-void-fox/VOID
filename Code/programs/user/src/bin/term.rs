@@ -72,12 +72,27 @@ use ereb_render::{GlyphCache, GridRenderer, Palette, Surface, TtfFont};
 use void_user as sys;
 use void_user::{stdio, Wait};
 
-/// Куча: кадр 1280×800 RGBA (4 МиБ), копия шрифта (2.6 МиБ), гриды панелей, кэш глифов.
+/// Куча: кадр 1280×800 RGBA (4 МиБ), прочитанный шрифт, гриды панелей, кэш глифов.
 #[global_allocator]
 static ALLOC: sys::heap::Heap<{ 48 * 1024 * 1024 }> = sys::heap::Heap::new();
 
-/// Шрифт вшит в бинарь (см. `fonts/README.md`) — временно, до переноса в store.
-static FONT: &[u8] = include_bytes!("../../fonts/FiraCodeNerdFontMono-Regular.ttf");
+// Запасной шрифт 8×16 — на случай, когда настоящего нет (Веха 114).
+#[path = "../bitfont.rs"]
+mod bitfont;
+use bitfont::BitmapFont;
+// Профиль пакетов — чтобы найти шрифт по ИМЕНИ, а не по хэшу пути (тот же приём, что PATH).
+#[allow(dead_code)] // писательская половина профиля нужна `pkg`, терминалу — чтение
+#[path = "../profile.rs"]
+mod profile;
+
+/// Где в пакете лежат шрифты. Обходится вглубь: угадывать раскладку бесполезно — у
+/// `nerd-fonts-fira-mono` это `share/fonts/opentype/NerdFonts/FiraMono/…otf`, у других пакетов
+/// `share/fonts/truetype/…ttf`. Зато глубина ограничена: пакет чужой, и бродить по нему без
+/// потолка — способ подвесить терминал ещё до первого кадра.
+const FONT_ROOT: &str = "share/fonts";
+const FONT_DEPTH: usize = 4;
+/// Сколько файлов готовы перебрать в одном пакете.
+const FONT_MAX: usize = 256;
 
 /// Окно фреймбуфера в нашем адресном пространстве: между образом и кучей.
 const FB_VA: usize = 0x5000_0000;
@@ -239,6 +254,9 @@ struct Conf {
     binds: Vec<KeyBind>,
     table: Bindings,
     font_px: u32,
+    /// Шрифт: абсолютный путь либо имя файла, которое ищется в пакетах профиля (Веха 114).
+    /// `None` — конфиг про шрифт молчит, рисуем встроенным битмапным.
+    font: Option<String>,
     shell: Vec<u8>,
     shell_args: Vec<u8>,
 }
@@ -250,6 +268,7 @@ impl Conf {
             binds: Vec::new(),
             table: Bindings::new(),
             font_px: 18,
+            font: None,
             shell: b"bin/vvsh".to_vec(),
             shell_args: b"repl".to_vec(),
         };
@@ -298,6 +317,10 @@ impl Conf {
                                 self.font_px = n.clamp(8, 48);
                             }
                         }
+                        // Веха 114 — шрифт приходит ФАЙЛОМ: `/путь/шрифт.ttf` или просто имя
+                        // файла, которое ищется в установленных пакетах. Имя без пути — чтобы в
+                        // конфиге не появлялись хэши store (тот же довод, что у `packages`).
+                        "font" => self.font = Some(val.to_string()),
                         "shell" => self.shell = val.as_bytes().to_vec(),
                         "shell-args" => {
                             let mut args = val.to_string();
@@ -430,8 +453,34 @@ fn read_root(cap: usize, name: &[u8]) -> Option<Vec<u8>> {
 /// в знакоместах. Отдельной структурой ровно потому, что настройки перечитываются на ходу
 /// (Веха 101): смена `font-size` меняет и размер ячейки, и число колонок/строк, и размер кадра —
 /// то есть всё это разом, а не по кусочку.
+/// Откуда взяты глифы. Два источника вместо одного — не роскошь: настоящий шрифт лежит файлом
+/// вне бинаря и может отсутствовать, а терминал обязан подняться в любом случае (Веха 114).
+enum TermFont {
+    Ttf(TtfFont),
+    Bitmap(BitmapFont),
+}
+
+impl ereb_render::Rasterizer for TermFont {
+    fn metrics(&self) -> ereb_render::CellMetrics {
+        match self {
+            TermFont::Ttf(f) => f.metrics(),
+            TermFont::Bitmap(f) => f.metrics(),
+        }
+    }
+    fn rasterize(
+        &mut self,
+        ch: char,
+        style: ereb_render::RenderStyle,
+    ) -> ereb_render::RasterizedGlyph {
+        match self {
+            TermFont::Ttf(f) => f.rasterize(ch, style),
+            TermFont::Bitmap(f) => f.rasterize(ch, style),
+        }
+    }
+}
+
 struct View {
-    cache: GlyphCache<TtfFont>,
+    cache: GlyphCache<TermFont>,
     renderer: GridRenderer,
     surface: Surface,
     cols: usize,
@@ -440,7 +489,7 @@ struct View {
 
 impl View {
     fn build(conf: &Conf, info: &sys::VideoInfo) -> Option<View> {
-        let font = TtfFont::from_vec(FONT.to_vec(), conf.font_px).ok()?;
+        let font = load_font(conf);
         let cache = GlyphCache::new(font);
         let metrics = cache.metrics();
         let palette = Palette::default();
@@ -457,6 +506,167 @@ impl View {
     fn cell_h(&self) -> usize {
         self.renderer.metrics().height.max(1) as usize
     }
+}
+
+/// Сказать что-то человеку. В графическом режиме консоль ядра уезжает в serial, поэтому это
+/// единственный способ терминала пожаловаться на себя — экран он в этот момент ещё не рисует.
+fn log_line(s: &str) {
+    sys::write_console(s.as_bytes());
+    sys::write_console(b"\n");
+}
+
+/// Взять шрифт: сперва названный конфигом файл, иначе встроенный битмапный.
+///
+/// О неудаче говорится ВСЛУХ и с причиной. Молчаливый откат на запасной шрифт был бы худшим из
+/// исходов: человек написал в конфиге путь, увидел не тот шрифт и не узнал, ошибся ли он в пути,
+/// забыл ли поставить пакет или файл оказался не шрифтом.
+fn load_font(conf: &Conf) -> TermFont {
+    if let Some(name) = conf.font.as_deref() {
+        match find_font(name) {
+            Some(bytes) => match TtfFont::from_vec(bytes, conf.font_px) {
+                Ok(f) => return TermFont::Ttf(f),
+                Err(_) => log_line(&alloc::format!("term: {} — не разбирается как шрифт", name)),
+            },
+            None => {
+                log_line(&alloc::format!(
+                    "term: шрифт {} не найден (ни путь, ни пакет профиля)",
+                    name
+                ));
+                // «Не найден» — половина ответа. Вторая половина: а что там ЕСТЬ. Без неё
+                // человек остаётся гадать между опечаткой в имени, не тем пакетом и не той
+                // раскладкой внутри пакета — и идёт выяснять это глазами по скриншоту.
+                list_fonts();
+            }
+        }
+    }
+    // Кегль у растрового шрифта кратен 16, и просьбу «18» он выполнить не может. Говорим, что
+    // получилось на самом деле: молча нарисовать не то — худший исход из возможных.
+    let f = BitmapFont::new(conf.font_px);
+    log_line(&alloc::format!(
+        "term: рисую встроенным шрифтом 8×16 (кегль {} вместо {}); настоящий задаётся так: \
+         packages(\"…\") + terminal(\"font\", \"имя.ttf\")",
+        f.effective_px(),
+        conf.font_px
+    ));
+    TermFont::Bitmap(f)
+}
+
+/// Найти файл шрифта: абсолютный путь читается как есть, имя — ищется в пакетах профиля.
+fn find_font(name: &str) -> Option<Vec<u8>> {
+    let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
+    if name.starts_with('/') {
+        return read_whole(ep, name.as_bytes());
+    }
+    let scap = store_cap()?;
+    for path in font_files(ep, scap) {
+        if path.rsplit('/').next() == Some(name) {
+            return try_font(ep, &path);
+        }
+    }
+    None
+}
+
+/// Все файлы шрифтов, какие видны в пакетах профиля.
+fn font_files(ep: usize, scap: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in profile::path_items(scap) {
+        if !item.top {
+            continue;
+        }
+        let root = alloc::format!("/nix/store/{}/{}", item.base, FONT_ROOT);
+        walk(ep, &root, FONT_DEPTH, &mut out);
+    }
+    out
+}
+
+/// Обойти каталог вглубь, складывая пути ФАЙЛОВ. Каталоги posixfs отдаёт с хвостовым '/'.
+fn walk(ep: usize, dir: &str, depth: usize, out: &mut Vec<String>) {
+    if depth == 0 || out.len() >= FONT_MAX {
+        return;
+    }
+    let mut buf = alloc::vec![0u8; 8 * 1024];
+    let n = void_user::posix::readdir(ep, dir.as_bytes(), &mut buf);
+    if n == 0 || n > buf.len() {
+        return;
+    }
+    let Ok(text) = core::str::from_utf8(&buf[..n]) else { return };
+    for e in text.lines().filter(|e| !e.is_empty()) {
+        match e.strip_suffix('/') {
+            Some(sub) => walk(ep, &alloc::format!("{}/{}", dir, sub), depth - 1, out),
+            None => {
+                if out.len() < FONT_MAX {
+                    out.push(alloc::format!("{}/{}", dir, e));
+                }
+            }
+        }
+    }
+}
+
+/// Показать, какие файлы шрифтов вообще есть в установленных пакетах.
+fn list_fonts() {
+    let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
+    let Some(scap) = store_cap() else {
+        log_line("  профиль не прочитать: нет права на store");
+        return;
+    };
+    let files = font_files(ep, scap);
+    if files.is_empty() {
+        log_line("  в пакетах профиля нет ни одного файла шрифта — поставьте пакет со шрифтом");
+        return;
+    }
+    for f in files.iter().take(24) {
+        log_line(&alloc::format!("  есть: {}", f));
+    }
+    if files.len() > 24 {
+        log_line(&alloc::format!("  …и ещё {}", files.len() - 24));
+    }
+}
+
+/// Прочитать файл шрифта и сказать, откуда он взят.
+fn try_font(ep: usize, path: &str) -> Option<Vec<u8>> {
+    let bytes = read_whole(ep, path.as_bytes())?;
+    log_line(&alloc::format!("term: шрифт {} ({} Б)", path, bytes.len()));
+    Some(bytes)
+}
+
+/// Имена подкаталогов каталога (пусто, если его нет).
+fn subdirs(ep: usize, path: &[u8]) -> Vec<String> {
+    let mut buf = alloc::vec![0u8; 8 * 1024];
+    let n = void_user::posix::readdir(ep, path, &mut buf);
+    if n == 0 || n > buf.len() {
+        return Vec::new();
+    }
+    core::str::from_utf8(&buf[..n])
+        .unwrap_or("")
+        .lines()
+        .filter_map(|e| e.strip_suffix('/'))
+        .map(|e| e.to_string())
+        .collect()
+}
+
+/// Прочитать файл целиком через файловый сервер. `None` — файла нет или это каталог.
+fn read_whole(ep: usize, path: &[u8]) -> Option<Vec<u8>> {
+    use void_user::posix as px;
+    match px::stat(ep, path) {
+        Some((is_dir, _)) if !is_dir => {}
+        _ => return None,
+    }
+    let fd = px::open(ep, path, 0);
+    if fd == usize::MAX {
+        return None;
+    }
+    let mut out = Vec::new();
+    // Кусок побольше строчного: шрифт — мегабайты, а каждый вызов это IPC.
+    let mut chunk = alloc::vec![0u8; 16 * 1024];
+    loop {
+        let n = px::read(ep, fd, &mut chunk);
+        if n == 0 || n == usize::MAX {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    px::close(ep, fd);
+    (!out.is_empty()).then_some(out)
 }
 
 /// Панель: грид, разбор ANSI, ребёнок и его отложенный запрос ввода.
@@ -717,7 +927,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 /// и при пробуждении из сна, — и разошедшиеся копии этой обработки означали бы потерянные
 /// reply-права и повисших детей.
 fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
-    let who = panes.iter().position(|p| p.child == Some(m.sender));
+    let who = owner_pane(panes, m.sender);
     match who {
         Some(i) if m.op == stdio::OP_STDOUT => {
             let len = m.len.min(buf.len());
@@ -766,6 +976,26 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
             false
         }
     }
+}
+
+/// Чья это панель. Отправитель может быть не самим шеллом панели, а тем, кого шелл запустил:
+/// право на наш эндпоинт наследуется вглубь, и пишет нам ВНУК под своим номером процесса.
+///
+/// Это была настоящая пропажа (Веха 114): пока владелец искался сравнением «отправитель ==
+/// ребёнок панели», вывод всего, что запущено из шелла, молча уходил в никуда — `pkg update`
+/// отработал десять минут и не показал ни строки. Поднимаемся по родителям (`SYS_PARENT`) с
+/// потолком: цепочка процессов конечна, а бесконечный цикл в реакторе терминала — это
+/// зависшая система.
+fn owner_pane(panes: &[Pane], sender: usize) -> Option<usize> {
+    const MAX_DEPTH: usize = 16;
+    let mut pid = sender;
+    for _ in 0..MAX_DEPTH {
+        if let Some(i) = panes.iter().position(|p| p.child == Some(pid)) {
+            return Some(i);
+        }
+        pid = sys::parent_of(pid)?;
+    }
+    None
 }
 
 /// Завести панель: грид под её размер плюс запущенный в ней шелл с нашим stdio.
