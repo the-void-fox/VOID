@@ -752,14 +752,16 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Веха 115 — сколько машина успевает писать в экран. Замер делается ДО первого кадра
     // (экран всё равно пуст) и говорится вслух: от этого числа зависит, какие анимации мы
     // вообще можем себе позволить (ADR 0016).
-    let fb_mbs = measure_fb(&info);
+    let (mbs32, mbs64) = measure_fb(&info);
+    let frame = (info.width * info.height * (info.bpp / 8)) as u64;
     log_line(&alloc::format!(
-        "term: экран {}×{}, {} бит — заливка {} МБ/с (полный кадр {} мс)",
+        "term: экран {}×{}, {} бит — заливка {} МБ/с по 4 байта, {} МБ/с по 8 (полный кадр {} мс)",
         info.width,
         info.height,
         info.bpp,
-        fb_mbs,
-        (info.width * info.height * (info.bpp / 8)) as u64 / fb_mbs.max(1) / 1000,
+        mbs32,
+        mbs64,
+        frame / mbs64.max(1) / 1000,
     ));
 
     let Some(mut view) = View::build(&conf, &info) else {
@@ -1496,10 +1498,12 @@ fn draw_cursor(info: &sys::VideoInfo, cx: usize, cy: usize, pressed: bool) {
             }
         }
     }
+    fence();
 }
 
 /// Вернуть на место пиксели кадра в прямоугольнике (стирание курсора).
 fn restore_rect(surface: &Surface, info: &sys::VideoInfo, x0: usize, y0: usize, w: usize, h: usize) {
+    // (курсор и его стирание — мелкие прямоугольники; барьер ставится в конце каждой функции)
     let src = surface.data();
     let sw = surface.width() as usize;
     let sh = surface.height() as usize;
@@ -1522,6 +1526,7 @@ fn restore_rect(surface: &Surface, info: &sys::VideoInfo, x0: usize, y0: usize, 
             }
         }
     }
+    fence();
 }
 
 /// Замерить, с какой скоростью машина пишет в фреймбуфер (Веха 115, требование ADR 0016).
@@ -1531,9 +1536,12 @@ fn restore_rect(surface: &Surface, info: &sys::VideoInfo, x0: usize, y0: usize, 
 /// полный кадр 1280×800×4 = 4 МиБ, и при 200 МБ/с это 20 мс — то есть 50 кадров в секунду ТОЛЬКО
 /// на заливку экрана. Отсюда правило «анимируем трансформации, а не содержимое», и отсюда же
 /// понятно, нужен ли WC-маппинг (PAT/MTRR).
-fn measure_fb(info: &sys::VideoInfo) -> u64 {
+fn measure_fb(info: &sys::VideoInfo) -> (u64, u64) {
     const PASSES: usize = 3;
     let bytes_pp = info.bpp / 8;
+    let bytes = (PASSES * info.width * info.height * bytes_pp) as u64;
+
+    // Проход A — по 4 байта, как писали раньше.
     let t0 = sys::monotonic_ns();
     for _ in 0..PASSES {
         for y in 0..info.height {
@@ -1544,10 +1552,48 @@ fn measure_fb(info: &sys::VideoInfo) -> u64 {
             }
         }
     }
-    let dt = sys::monotonic_ns().saturating_sub(t0).max(1);
-    let bytes = (PASSES * info.width * info.height * bytes_pp) as u64;
-    bytes * 1000 / dt // МБ/с ≈ байты/нс × 1000
+    fence();
+    let a = bytes * 1000 / sys::monotonic_ns().saturating_sub(t0).max(1);
+
+    // Проход B — по 8 байт (два пикселя разом). При UC это почти не помогает: цена в
+    // транзакции, а не в байтах. При WC — помогает вдвое, потому что вдвое меньше записей
+    // копится в буфер. Разница между A и B и есть ответ на вопрос «во что мы упёрлись».
+    let t0 = sys::monotonic_ns();
+    if bytes_pp == 4 {
+        for _ in 0..PASSES {
+            for y in 0..info.height {
+                let mut dst = FB_VA + y * info.pitch;
+                let mut x = 0;
+                while x + 1 < info.width {
+                    unsafe { core::ptr::write_volatile(dst as *mut u64, 0) };
+                    dst += 8;
+                    x += 2;
+                }
+                while x < info.width {
+                    unsafe { core::ptr::write_volatile(dst as *mut u32, 0) };
+                    dst += 4;
+                    x += 1;
+                }
+            }
+        }
+    }
+    fence();
+    let b = bytes * 1000 / sys::monotonic_ns().saturating_sub(t0).max(1);
+    (a, b)
 }
+
+/// Барьер записи. При write-combining записи копятся в буфере процессора и уходят пачкой —
+/// без него последняя пачка может задержаться, и замер (как и кадр) окажется «быстрее» правды.
+/// Инструкция непривилегированная, программе доступна.
+///
+/// На riscv барьера нет и не нужно: фреймбуфера там нет вовсе, а `term` собирается под обе
+/// архитектуры лишь потому, что программы собираются все сразу (в store он сеется только на x86).
+#[cfg(target_arch = "x86_64")]
+fn fence() {
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn fence() {}
 
 /// Перенести кадр из RAM в фреймбуфер, упаковав пиксели в формат прошивки.
 fn blit_rows(surface: &Surface, info: &sys::VideoInfo, y_from: usize, y_to: usize) {
@@ -1559,12 +1605,41 @@ fn blit_rows(surface: &Surface, info: &sys::VideoInfo, y_from: usize, y_to: usiz
     for y in y_from..h {
         let mut dst = FB_VA + y * info.pitch;
         let row = y * sw * 4;
+        // Веха 117 — при write-combining выгодно писать ШИРЕ: пачку в 64 байта набирают 8
+        // восьмибайтных записей вместо 16 четырёхбайтных. Пара соседних пикселей 32-бит
+        // упаковывается в одно слово; хвост и невыровненное начало дописываются по 4 байта.
+        if bytes_pp == 4 {
+            let mut x = 0usize;
+            if dst % 8 != 0 && x < w {
+                let p = row + x * 4;
+                let px = pack(info, src[p], src[p + 1], src[p + 2]);
+                unsafe { core::ptr::write_volatile(dst as *mut u32, px) };
+                dst += 4;
+                x += 1;
+            }
+            while x + 1 < w {
+                let p = row + x * 4;
+                let a = pack(info, src[p], src[p + 1], src[p + 2]) as u64;
+                let q = p + 4;
+                let b = pack(info, src[q], src[q + 1], src[q + 2]) as u64;
+                unsafe { core::ptr::write_volatile(dst as *mut u64, a | (b << 32)) };
+                dst += 8;
+                x += 2;
+            }
+            while x < w {
+                let p = row + x * 4;
+                let px = pack(info, src[p], src[p + 1], src[p + 2]);
+                unsafe { core::ptr::write_volatile(dst as *mut u32, px) };
+                dst += 4;
+                x += 1;
+            }
+            continue;
+        }
         for x in 0..w {
             let p = row + x * 4;
             let px = pack(info, src[p], src[p + 1], src[p + 2]);
             unsafe {
                 match bytes_pp {
-                    4 => core::ptr::write_volatile(dst as *mut u32, px),
                     2 => core::ptr::write_volatile(dst as *mut u16, px as u16),
                     _ => {
                         core::ptr::write_volatile(dst as *mut u8, px as u8);
@@ -1576,6 +1651,9 @@ fn blit_rows(surface: &Surface, info: &sys::VideoInfo, y_from: usize, y_to: usiz
             dst += bytes_pp;
         }
     }
+    // Пачки WC не должны залёживаться: кадр обязан оказаться на экране к моменту, когда мы
+    // считаем его нарисованным.
+    fence();
 }
 
 /// Упаковать RGB по раскладке прошивки (её сообщает `SYS_VIDEO_INFO`; зашивать нельзя — Веха 96).

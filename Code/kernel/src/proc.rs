@@ -2282,13 +2282,20 @@ fn syscall(t: &mut Table, cur: usize) {
                 Ok((base, len)) => {
                     let pages = len.div_ceil(PAGE);
                     let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+                    // Веха 117 — ЭКРАН отображается write-combining, регистры устройств — нет.
+                    // Разница принципиальная: фреймбуферу нужна полоса (записи копятся и уходят
+                    // пачками), а регистру нужен ПОРЯДОК — слитая или переставленная запись в
+                    // него ломает устройство. Поэтому WC получает ровно одно окно — то, которое
+                    // арх признал экраном.
+                    let is_screen = arch::video_window() == Some((base, len));
+                    let attr = if is_screen { arch::MAP_WC } else { 0 };
                     if va >= USER_REGION_START && va + pages * PAGE <= limit && base % PAGE == 0 {
                         let root = arch::space_root(t.procs[cur].space);
                         let mut ok = true;
                         for i in 0..pages {
                             ok &= unsafe {
                                 arch::map(root, va + i * PAGE, base + i * PAGE,
-                                    arch::MAP_R | arch::MAP_W | arch::MAP_U)
+                                    arch::MAP_R | arch::MAP_W | arch::MAP_U | attr)
                             };
                             if !ok {
                                 break; // Веха 89: нет памяти под таблицы — отказ драйверу
@@ -2301,9 +2308,12 @@ fn syscall(t: &mut Table, cur: usize) {
                             // Веха 97: замаплен ЭКРАН — ядро уступает его и уходит в serial.
                             // Единственная точка передачи владения: раньше отдавать нечего
                             // (окно не отображено), позже — некому.
-                            if arch::video_window() == Some((base, len)) {
+                            if is_screen {
                                 arch::video_give_to_user(cur);
-                                println!("  [видео] экран отдан процессу P{} — вывод ядра уходит в serial", cur);
+                                println!(
+                                    "  [видео] экран отдан процессу P{} (WC) — вывод ядра уходит в serial",
+                                    cur
+                                );
                             }
                             vprintln!("  [drv] P{} SYS_MMIO_MAP {:#x} ({} стр.) → {:#x}", cur, base, pages, va);
                             0

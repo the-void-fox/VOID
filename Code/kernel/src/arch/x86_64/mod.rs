@@ -662,9 +662,15 @@ pub const MAP_R: usize = 1 << 0;
 pub const MAP_W: usize = 1 << 1;
 pub const MAP_X: usize = 1 << 2;
 pub const MAP_U: usize = 1 << 3;
+/// Веха 117 — write-combining: записи копятся и уходят пачками. Только для ФРЕЙМБУФЕРА;
+/// регистрам устройства WC противопоказан (записи сливаются и переупорядочиваются, а регистр
+/// ждёт ровно ту последовательность, которую ему написали).
+pub const MAP_WC: usize = 1 << 4;
 
 /// Построить таблицы ядра (direct map + W^X + MMIO) и вернуть корень (PML4).
 pub fn mm_init() -> usize {
+    // PAT программируется здесь: до первой WC-страницы и до включения трансляции.
+    paging::pat_init();
     paging::init()
 }
 
@@ -692,6 +698,9 @@ pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) -> bool {
     }
     if flags & MAP_X == 0 {
         pte |= paging::PTE_NX; // x86: исполнение ЗАПРЕЩАЕТСЯ, а не разрешается
+    }
+    if flags & MAP_WC != 0 {
+        pte |= paging::PTE_PAT; // строка PA4 = WC (см. paging::pat_init)
     }
     paging::map(root, va, pa, pte)
 }

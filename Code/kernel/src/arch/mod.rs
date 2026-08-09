@@ -69,7 +69,8 @@ pub use imp::{
     now_cycles, now_ticks, timer_arm, timer_hw_init,
     // память
     clone_kernel_root, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
-    phys_to_virt, space_root, space_token, translate, virt_to_phys, MAP_R, MAP_U, MAP_W, MAP_X,
+    phys_to_virt, space_root, space_token, translate, virt_to_phys, MAP_R, MAP_U, MAP_W, MAP_WC,
+    MAP_X,
     MM_NAME,
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,

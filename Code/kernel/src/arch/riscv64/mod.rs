@@ -318,6 +318,10 @@ pub const MAP_R: usize = paging::PTE_R;
 pub const MAP_W: usize = paging::PTE_W;
 pub const MAP_X: usize = paging::PTE_X;
 pub const MAP_U: usize = paging::PTE_U;
+/// Веха 117 — write-combining. На Sv39 атрибутов кэширования в PTE нет вовсе (они появляются
+/// расширением Svpbmt, которого у нас нет), поэтому флаг НИЧЕГО не значит и намеренно равен 0:
+/// общий код просит WC одинаково на обеих архитектурах, а получает его там, где он есть.
+pub const MAP_WC: usize = 0;
 
 /// Построить таблицы ядра (direct map RAM + MMIO, W^X) и вернуть корень.
 pub fn mm_init() -> usize {
