@@ -36,6 +36,9 @@ pub mod heap;
 
 /// Веха 98 — соглашение о чужом stdio (вывод и ввод через IPC к хосту вместо общей консоли).
 pub mod stdio;
+/// Веха 117 — протокол окон: клиент рисует в свою память, кладёт объектом в store и
+/// называет content-id; композитор складывает кадр. Ядро про окна не знает ничего.
+pub mod win;
 
 
 // Веха 95 — источник случайности для криптографии. `getrandom` на bare-metal системного
@@ -723,9 +726,22 @@ pub fn spawn(exec_cap: usize, name: &[u8], args: &[u8]) -> Option<usize> {
 pub fn spawn_with_stdio(
     exec_cap: usize, name: &[u8], args: &[u8], stdio_cap: usize,
 ) -> Option<usize> {
+    spawn_with_endpoint(exec_cap, name, args, stdio_cap, b"STDIO\0")
+}
+
+/// То же, но право объявляется в окружении под ЗАДАННЫМ именем (Веха 117).
+///
+/// Хостов у процесса может быть несколько и разных: терминал даёт `STDIO`, композитор окон —
+/// `WM`. Ядро смысла этих строк по-прежнему не знает: оно кладёт в окружение имя и индекс, а что
+/// они значат — дело userspace ([[process-contract]]).
+///
+/// `key` — ASCII-строка, ЗАВЕРШЁННАЯ нулём (её читает ядро из памяти процесса).
+pub fn spawn_with_endpoint(
+    exec_cap: usize, name: &[u8], args: &[u8], cap: usize, key: &[u8],
+) -> Option<usize> {
     let r = abi::syscall(
         SYS_SPAWN, exec_cap, name.as_ptr() as usize, name.len(),
-        args.as_ptr() as usize, args.len(), stdio_cap, 0,
+        args.as_ptr() as usize, args.len(), cap, key.as_ptr() as usize,
     ).0;
     (r != NO_CAP).then_some(r)
 }

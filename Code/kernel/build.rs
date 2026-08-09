@@ -18,7 +18,7 @@ const PROGRAMS: &[&str] = &[
 /// с вшитым шрифтом бинарь весит 2.7 МБ, и на riscv его посев ПАДАЛ — куча ядра (16 МиБ) не
 /// давала такой кусок поверх кэша store. Это же и есть довод перенести шрифт в store отдельным
 /// объектом-деревом (Веха 94 умеет), а не носить его в ELF.
-const PROGRAMS_X86: &[&str] = &["term"];
+const PROGRAMS_X86: &[&str] = &["term", "wm", "winbox"];
 
 fn main() {
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel

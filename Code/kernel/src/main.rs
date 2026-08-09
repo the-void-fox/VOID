@@ -138,7 +138,12 @@ static PROGRAMS: &[(&str, &[u8])] = &[
 /// riscv нет (см. `build.rs`, PROGRAMS_X86). Отдельным списком, а не `cfg` внутри общего:
 /// так видно, что список арх-зависим, а не что кто-то забыл убрать программу.
 #[cfg(target_arch = "x86_64")]
-static PROGRAMS_ARCH: &[(&str, &[u8])] = &[("term", include_bytes!(env!("PROG_TERM")))];
+static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
+    ("term", include_bytes!(env!("PROG_TERM"))),
+    // Веха 117 — композитор окон и его демонстрационный клиент: обоим нужен фреймбуфер.
+    ("wm", include_bytes!(env!("PROG_WM"))),
+    ("winbox", include_bytes!(env!("PROG_WINBOX"))),
+];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];
 

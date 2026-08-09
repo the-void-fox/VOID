@@ -1732,6 +1732,18 @@ fn syscall(t: &mut Table, cur: usize) {
             // Веха 98 — 6-й аргумент SPAWN: право, которое родитель ДОПОЛНИТЕЛЬНО отдаёт ребёнку
             // (обычно свой эндпоинт под stdio). `MAX` — нет такого.
             let extra_cap = if wait_child { usize::MAX } else { t.procs[cur].frame.arg(5) };
+            // Веха 117 — 7-й аргумент: ИМЯ, под которым право объявится в окружении ребёнка.
+            // 0 — прежнее `STDIO` (совместимость). Обобщение здесь уместно ровно потому, что
+            // ядро и так не знает смысла этой строки: раз смысл userspace'а, то и имя тоже.
+            // Композитору окон нужно своё (`WM`), иначе он был бы вынужден выдавать себя за
+            // терминал.
+            let key_ptr = if wait_child { 0 } else { t.procs[cur].frame.arg(6) };
+            // Читаем имя СРАЗУ, пока мы заведомо в адресном пространстве РОДИТЕЛЯ: дальше по
+            // ходу spawn'а ядро работает с пространством ребёнка (загрузка ELF), и та же строка
+            // прочиталась бы уже не оттуда. Ошибка тихая — имя вышло бы мусором, а право
+            // объявилось бы под ним же.
+            let env_key: Option<Vec<u8>> =
+                (key_ptr != 0).then(|| lx_cstr(t, cur, key_ptr, 16)).flatten();
             let dom = t.procs[cur].domain;
             let mut spawned = false;
             match cap::store(dom, Cap::from_bits(scap as u64), Rights::EXEC) {
@@ -1837,7 +1849,12 @@ fn syscall(t: &mut Table, cur: usize) {
                                         {
                                             let idx = t.procs[child].start_caps.len();
                                             t.procs[child].start_caps.push(c.bits() as usize);
-                                            let mut line = alloc::format!("STDIO={}\0", idx);
+                                            let key = env_key
+                                                .as_deref()
+                                                .and_then(|k| core::str::from_utf8(k).ok())
+                                                .filter(|k| !k.is_empty())
+                                                .unwrap_or("STDIO");
+                                            let mut line = alloc::format!("{}={}\0", key, idx);
                                             let env = &mut t.procs[child].env;
                                             // Окружение — блоб `KEY=VAL\0…`; хвостовой NUL уже есть.
                                             unsafe { env.append(line.as_mut_vec()) };
