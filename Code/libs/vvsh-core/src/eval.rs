@@ -530,7 +530,33 @@ fn as_int(v: &Value) -> Result<i64, EvalError> {
     }
 }
 
+/// `+` — сложение чисел ИЛИ склейка строк (Веха 119.1).
+///
+/// Склейка понадобилась конфигу: список программ окна пишется по-человечески
+/// (`apps = ["term"]`), а ядру нужны токены `arg:term`. Заставлять человека писать `"arg:term"`
+/// значило бы протащить внутреннее устройство наружу.
+///
+/// Смешивать типы нельзя: `1 + "a"` — ошибка, а не выдумка. Тип определяется ПЕРВЫМ аргументом.
 fn b_add(args: &[Value]) -> Result<Value, EvalError> {
+    if let Some(Value::Str(first)) = args.first() {
+        let mut out = alloc::string::String::from(&**first);
+        for a in &args[1..] {
+            match a {
+                Value::Str(s) => out.push_str(s),
+                Value::Int(n) => {
+                    use core::fmt::Write;
+                    let _ = write!(out, "{}", n);
+                }
+                other => {
+                    return Err(EvalError::new(alloc::format!(
+                        "+: к строке можно прибавить строку или число, дано {}",
+                        other.type_name()
+                    )))
+                }
+            }
+        }
+        return Ok(Value::str(&out));
+    }
     let mut acc = 0i64;
     for a in args {
         acc = acc.wrapping_add(as_int(a)?);

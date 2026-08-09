@@ -2038,22 +2038,30 @@ const NETWORKING_VV: &str = "# networking.vv — сетевой сервис\n\
 /// Веха 100 — терминал настраивается ТУТ ЖЕ, обычным модулем конфигурации. Модуль решает и
 /// «кто шелл» (пиксельный `term` или текстовый `vsh`), и схему управления: одна вещь — одно
 /// место. Записи `terminal`/`bind` ядру не адресованы, их читает сам `term`.
-const TERMINAL_VV: &str = "# terminal.vv — терминал VOID: включён ли и чем управлять\n\
+const TERMINAL_VV: &str = "# terminal.vv — чем встречает система: экран, шелл, клавиши.\n\
 #\n\
-# on = true  — мультиплексор `term` на настоящих глифах (нужен пиксельный экран: x86 + GRUB);\n\
-# on = false — текстовый шелл `vsh` в консоли ядра (riscv, загрузка без видеорежима).\n\
-on = false\n\
+# mode = \"vsh\"  — текстовый шелл в консоли ядра (работает всегда, в том числе на riscv);\n\
+# mode = \"term\" — терминал на настоящих глифах во весь экран (нужен пиксельный экран: x86+GRUB);\n\
+# mode = \"wm\"   — ОКОННЫЙ РЕЖИМ: композитор, окна, мышь (Вехи 117-119).\n\
+#\n\
+# Если выбранный режим не поднимется, init через пять секунд запустит спасательный vsh —\n\
+# система не превращается в кирпич из-за одной строки конфига.\n\
+mode = \"term\"\n\
 net = import(\"net.vv\")\n\
 \n\
-# Схема управления: bind(РЕЖИМ, КЛАВИША, ДЕЙСТВИЕ). Пустой список биндингов = схема по\n\
+# Программы, которые оконный режим открывает на старте (для mode = \"wm\").\n\
+apps = [\"term\"]\n\
+\n\
+# Схема управления ТЕРМИНАЛОМ: bind(РЕЖИМ, КЛАВИША, ДЕЙСТВИЕ). Пустой список = схема по\n\
 # умолчанию, зашитая в term; хоть один bind — схема задаётся ЦЕЛИКОМ отсюда.\n\
 #   режимы:   normal · pane\n\
-#   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space\n\
+#   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space PageUp PageDown\n\
 #   действия: mode-pane mode-normal literal-prefix split-v split-h next-pane close quit\n\
-#             reload (перечитать этот конфиг на ходу — после `rebuild`, без перезагрузки)\n\
-#             go-left go-right go-up go-down\n\
+#             reload · scroll-up scroll-down scroll-top scroll-bottom · go-left go-right go-up go-down\n\
 keys = [\n\
 \x20 bind(\"normal\", \"C-a\", \"mode-pane\"),\n\
+\x20 bind(\"normal\", \"S-PageUp\", \"scroll-up\"),\n\
+\x20 bind(\"normal\", \"S-PageDown\", \"scroll-down\"),\n\
 \x20 bind(\"pane\", \"C-a\", \"literal-prefix\"),\n\
 \x20 bind(\"pane\", \"|\", \"split-v\"),\n\
 \x20 bind(\"pane\", \"-\", \"split-h\"),\n\
@@ -2065,40 +2073,40 @@ keys = [\n\
 \x20 bind(\"pane\", \"j\", \"go-down\"),\n\
 \x20 bind(\"pane\", \"k\", \"go-up\"),\n\
 \x20 bind(\"pane\", \"l\", \"go-right\"),\n\
-\x20 bind(\"pane\", \"Left\", \"go-left\"),\n\
-\x20 bind(\"pane\", \"Down\", \"go-down\"),\n\
-\x20 bind(\"pane\", \"Up\", \"go-up\"),\n\
-\x20 bind(\"pane\", \"Right\", \"go-right\"),\n\
-\x20 # Веха 116 — прокрутка вывода: Shift+PageUp/PageDown прямо в обычном режиме\n\
-\x20 # (голый PageUp остаётся программе), а в режиме панелей — просто PageUp.\n\
-\x20 bind(\"normal\", \"S-PageUp\", \"scroll-up\"),\n\
-\x20 bind(\"normal\", \"S-PageDown\", \"scroll-down\"),\n\
 \x20 bind(\"pane\", \"PageUp\", \"scroll-up\"),\n\
 \x20 bind(\"pane\", \"PageDown\", \"scroll-down\"),\n\
-\x20 bind(\"pane\", \"Home\", \"scroll-top\"),\n\
-\x20 bind(\"pane\", \"End\", \"scroll-bottom\"),\n\
 ]\n\
 \n\
-if on {\n\
+# Схема управления ОКНАМИ (mode = \"wm\"): умолчания как в niri.\n\
+wm_keys = [\n\
+\x20 bind(\"wm\", \"Super+Return\", \"spawn-term\"),\n\
+\x20 bind(\"wm\", \"Super+Q\", \"close-window\"),\n\
+\x20 bind(\"wm\", \"Super+Tab\", \"focus-next\"),\n\
+\x20 bind(\"wm\", \"Super+L\", \"focus-next\"),\n\
+\x20 bind(\"wm\", \"Super+H\", \"focus-prev\"),\n\
+\x20 bind(\"wm\", \"Super+Shift+Q\", \"quit\"),\n\
+]\n\
+\n\
+netcap = if net { \"endpoint:net-srv\" } else { [] }\n\
+\n\
+if mode == \"wm\" {\n\
 \x20 append(\n\
-\x20   [shell(\"term\",\n\
-\x20          \"endpoint:posixfs\", \"store:rwx\",\n\
-\x20          if net { \"endpoint:net-srv\" } else { [] },\n\
-\x20          \"mmio:fb\", \"power\", \"env\")],\n\
-\x20   [terminal(\"font-size\", 18),\n\
-\x20    # Шрифт — ФАЙЛ, а не часть терминала (Веха 114): имя ищется в установленных пакетах\n\
-\x20    # (packages(\"…\") в packages.vv), абсолютный путь берётся как есть. Без этой строки\n\
-\x20    # терминал рисует встроенным 8×16 — читаемо, но некрасиво.\n\
-\x20    # terminal(\"font\", \"FiraCode-Regular.ttf\"),\n\
-\x20    terminal(\"shell\", \"bin/vvsh\"),\n\
-\x20    terminal(\"shell-args\", \"repl\")],\n\
-\x20   keys,\n\
+\x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb\", \"power\", \"env\",\n\
+\x20          map(|a| \"arg:\" + a, apps))],\n\
+\x20   wm_keys,\n\
 \x20 )\n\
 } else {\n\
-\x20 [shell(\"vsh\",\n\
-\x20        \"endpoint:posixfs\", \"store:rwx\",\n\
-\x20        if net { \"endpoint:net-srv\" } else { [] },\n\
-\x20        \"power\", \"env\")]\n\
+\x20 if mode == \"term\" {\n\
+\x20   append(\n\
+\x20     [shell(\"term\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb\", \"power\", \"env\")],\n\
+\x20     [terminal(\"font-size\", 18),\n\
+\x20      terminal(\"shell\", \"bin/vvsh\"),\n\
+\x20      terminal(\"shell-args\", \"repl\")],\n\
+\x20     keys,\n\
+\x20   )\n\
+\x20 } else {\n\
+\x20   [shell(\"vsh\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"power\", \"env\")]\n\
+\x20 }\n\
 }\n";
 
 /// Веха 112 — пакеты объявляются здесь же, обычным модулем. Имя пакета в списке значит «система

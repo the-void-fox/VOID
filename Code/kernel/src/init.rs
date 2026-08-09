@@ -176,8 +176,14 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
 /// Разобрать и исполнить конфиг: поднять каждую запись (`service`/`shell`), сминтить её права,
 /// разложить их как `a0`/`a1`/стартовые (контракт Вехи 30). Первый два права дублируются в
 /// регистры запуска — как раньше делал `shell_session` руками.
-fn apply(config: &str) {
-    let mut services: Vec<(String, usize)> = Vec::new(); // имя → pid (для endpoint:)
+fn apply(config: &str) -> Vec<(String, usize)> {
+    apply_with(config, Vec::new())
+}
+
+/// То же, но со СПИСКОМ уже работающих сервисов: спасательный шелл поднимается поверх них
+/// (Веха 119.1), а не рядом со вторым файловым сервером.
+fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)> {
+    let mut services: Vec<(String, usize)> = known; // имя → pid (для endpoint:)
     let env = alloc::format!("ARCH={}\0SYSTEM=void\0", arch::ARCH_NAME);
 
     for line in config.lines() {
@@ -266,6 +272,7 @@ fn apply(config: &str) {
             services.push((name.to_string(), pid));
         }
     }
+    services
 }
 
 /// Веха 99.1 — короткое ИМЯ права по токену конфига: `endpoint:posixfs` → `POSIXFS`,
@@ -291,6 +298,14 @@ fn cap_name(token: &str) -> alloc::string::String {
     base.chars()
         .map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() })
         .collect()
+}
+
+/// Поднять ОДНУ строку конфига поверх уже работающих сервисов (спасательный шелл).
+///
+/// Отдельная функция, а не второй `apply`: сервисы уже запущены, и поднимать их заново значило
+/// бы получить два файловых сервера на один store.
+fn apply_shell(line: &str, services: &[(String, usize)]) {
+    apply_with(line, services.to_vec());
 }
 
 /// Веха 40 — точка входа декларативной загрузки (заменяет зашитый `shell_session`). Читает
@@ -330,7 +345,7 @@ pub fn boot() {
         }
     };
     println!("  [init] поколение '{}' — поднимаю систему по конфигу:", gen);
-    apply(&config);
+    let services = apply(&config);
 
     // Веха 51–54 — хостируемый userspace-драйвер e1000: если карта не занята ядром (в VM сеть на
     // virtio-net), поднять её драйвер В USERSPACE поверх шима lx_emul. Веха 54 — если на диск мостом
@@ -375,6 +390,31 @@ pub fn boot() {
         }
     }
 
+    let started = crate::clock::uptime_ns();
     proc::run();
+    let lived = crate::clock::uptime_ns().saturating_sub(started);
     println!("  [init] сессия '{}' завершена (shell вышел) — обратно в ядро", gen);
+
+    // Веха 119.1 — СТРАХОВКА от поколения, которое не поднимается.
+    //
+    // Графический шелл может не запуститься по причинам, о которых конфиг не знает: нет
+    // фреймбуфера (загрузка без видеорежима), не хватило памяти, программа упала на старте.
+    // Раньше это означало систему БЕЗ ШЕЛЛА: выбрать другое поколение нечем, потому что
+    // выбирают его командой, а команду ввести некуда. Машина превращалась в кирпич, чинимый
+    // только с другого компьютера — проверено на себе.
+    //
+    // Признак беды выбран простой и честный: шелл прожил меньше пяти секунд. Живой шелл, из
+    // которого человек вышел сам, столько не живёт разве что при мгновенном `exit` — и тогда
+    // спасательный `vsh` ему не помешает.
+    if lived < 5_000_000_000 {
+        println!(
+            "  [init] шелл поколения '{}' продержался {} мс — поднимаю спасательный vsh",
+            gen,
+            lived / 1_000_000
+        );
+        println!("  [init] почему так вышло — смотри выше в этом же журнале (`klog`)");
+        apply_shell("shell vsh endpoint:posixfs store:rwx power env", &services);
+        proc::run();
+        println!("  [init] спасательная сессия завершена — обратно в ядро");
+    }
 }
