@@ -6,6 +6,7 @@
 //! pkg fetch <путь|имя> скачать ЗАМЫКАНИЕ пути (сам путь и все зависимости)
 //! pkg install <п|имя>  то же + новое поколение профиля с этим пакетом
 //! pkg remove <имя>     новое поколение профиля без пакета
+//! pkg sync             собрать то, что объявил конфиг системы (`packages …`)
 //! pkg list             что стоит в активном поколении профиля
 //! pkg gens             поколения профиля (активное — *)
 //! pkg rollback         вернуть предыдущее поколение
@@ -53,6 +54,17 @@
 //! только строки, — поэтому выбор делается объявленным правилом (свой выход, старшая версия,
 //! дальше порядок индекса) и **говорится вслух**, вместе с числом отвергнутых кандидатов.
 //!
+//! ## Пакеты объявляются, а не устанавливаются (Веха 112)
+//!
+//! `pkg install` — это действие, и как всякое действие оно забывается: через полгода никто не
+//! скажет, почему в системе стоит `jq`. Поэтому у пакетов есть второй, главный путь — **строка
+//! `packages …` в конфиге**. Её читает `pkg sync`: резолвит имена, тянет замыкание и кладёт
+//! поколение профиля `system` — под именем поколения СИСТЕМЫ, а не своим.
+//!
+//! Отсюда откат: у системного профиля нет указателя «активное поколение», его роль играет
+//! `system/current`. Откатили систему — вместе с ней откатились и пакеты, потому что это одно
+//! решение, а не два согласованных ([[declarative-init]], модуль [`profile`]).
+//!
 //! ## Почему отдельная программа
 //!
 //! Тот же довод, что у `httpsc` (Веха 95): чужого кода много (криптография, два распаковщика), а
@@ -84,6 +96,7 @@ mod roots;
 // Формат дерева пакета в store — общий крейт: его читают и posixfs, и персоналия Linux.
 use void_tree as tree;
 // Профиль (поколения и их содержимое) — общий с шеллом: ему он нужен для PATH (Веха 109).
+#[allow(dead_code)] // читательская половина (PATH) нужна шеллу, `pkg` пишет
 #[path = "../profile.rs"]
 mod profile;
 // Правила именования nix (имя/версия/выход и сравнение версий). Отдельным файлом ради хостовой
@@ -130,6 +143,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         (Some(b"fetch"), Some(what)) => done(cmd_fetch(what)),
         (Some(b"install"), Some(what)) => done(cmd_install(what)),
         (Some(b"remove"), Some(what)) => done(cmd_remove(what)),
+        (Some(b"sync"), _) => done(cmd_sync()),
         (Some(b"tree"), Some(what)) => done(cmd_tree(what, third.unwrap_or(b""))),
         (Some(b"cat"), Some(what)) => match third {
             Some(sub) => done(cmd_cat(what, sub)),
@@ -168,6 +182,7 @@ fn usage() {
     sys::write("  fetch <хэш|путь|имя>          скачать замыкание (путь и все зависимости)\n".as_bytes());
     sys::write("  install <хэш|путь|имя>        скачать и внести в профиль (новое поколение)\n".as_bytes());
     sys::write("  remove <имя|хэш>              убрать из профиля (новое поколение)\n".as_bytes());
+    sys::write("  sync                          собрать пакеты, объявленные конфигом системы\n".as_bytes());
     sys::write("  tree <путь> [подпуть]         что лежит внутри распакованного пакета\n".as_bytes());
     sys::write("  cat <путь> <подпуть>          содержимое файла из пакета\n".as_bytes());
     sys::write("  list                          что в активном поколении профиля\n".as_bytes());
@@ -777,29 +792,45 @@ const CANDS_MAX: usize = 512;
 
 /// Все пути канала с данным именем пакета — в порядке предпочтения ([`nixname::cmp_pref`]).
 fn candidates(scap: usize, query: &str) -> Result<Vec<String>, String> {
-    let mut cands: Vec<String> = Vec::new();
-    let mut over = false;
+    Ok(candidates_multi(scap, &[query])?.remove(0))
+}
+
+/// То же для НЕСКОЛЬКИХ имён сразу — за один проход по индексу.
+///
+/// Проход стоит 15 МиБ чтения из store, и он же — вся цена резолва имени. Поэтому конфиг с тремя
+/// пакетами (Веха 112) не должен стоить трёх проходов: имена независимы, а индекс один.
+fn candidates_multi(scap: usize, queries: &[&str]) -> Result<Vec<Vec<String>>, String> {
+    let mut out: Vec<Vec<String>> = vec![Vec::new(); queries.len()];
+    let mut over: Option<usize> = None;
     index_scan(scap, |line| {
         let Some(base) = line.strip_prefix("/nix/store/") else { return };
         if base.as_bytes().get(HASH_LEN) != Some(&b'-') {
             return;
         }
-        if parts(base).0 != query {
-            return;
-        }
-        if cands.len() < CANDS_MAX {
-            cands.push(base.to_string());
-        } else {
-            over = true;
+        let pname = parts(base).0;
+        for (i, q) in queries.iter().enumerate() {
+            if pname != *q {
+                continue;
+            }
+            if out[i].len() < CANDS_MAX {
+                out[i].push(base.to_string());
+            } else {
+                over = Some(i);
+            }
         }
     })?;
 
-    if over {
-        return Err(format!("у имени {} больше {} путей — назовите путь хэшем", query, CANDS_MAX));
+    if let Some(i) = over {
+        return Err(format!(
+            "у имени {} больше {} путей — назовите путь хэшем",
+            queries[i], CANDS_MAX
+        ));
     }
     // Устойчивая сортировка: равные кандидаты остаются в порядке индекса.
-    cands.sort_by(|a, b| nixname::cmp_pref(a, b));
-    Ok(cands)
+    for cands in out.iter_mut() {
+        cands.sort_by(|a, b| nixname::cmp_pref(a, b));
+    }
+    Ok(out)
 }
 
 /// Найти путь по имени пакета.
@@ -810,7 +841,12 @@ fn candidates(scap: usize, query: &str) -> Result<Vec<String>, String> {
 /// равенстве — **первый в индексе** (он отсортирован по хэшу, значит выбор воспроизводим, а не
 /// «какой попался»). Сколько кандидатов отвергнуто — печатается, а не замалчивается.
 fn resolve_name(scap: usize, query: &str) -> Result<Pick, String> {
-    let cands = candidates(scap, query)?;
+    pick_from(scap, query, candidates(scap, query)?)
+}
+
+/// Выбор из уже собранных кандидатов — отдельно от их поиска, потому что искать их можно
+/// по-разному (одно имя или пачку за один проход), а правило выбора обязано быть одним.
+fn pick_from(scap: usize, query: &str, cands: Vec<String>) -> Result<Pick, String> {
     if cands.is_empty() {
         return Err(format!(
             "в индексе канала нет пакета {} — посмотрите `pkg search {}`",
@@ -961,19 +997,23 @@ fn target(scap: usize, arg: &[u8]) -> Result<(String, Option<String>), String> {
     }
     let q = core::str::from_utf8(arg).map_err(|_| "аргумент не UTF-8")?;
     let pick = resolve_name(scap, q)?;
-    sys::write(format!("{} → {}/{}\n", q, STORE_DIR, pick.base).as_bytes());
+    report_pick(q, &pick);
+    let hash = hash_of(&pick.base).to_string();
+    Ok((hash, Some(pick.base)))
+}
+
+/// Сказать вслух, что имя во что превратилось и из скольких кандидатов. Печатается всегда:
+/// выбор по имени — это решение системы за человека, и молчать о нём нельзя.
+fn report_pick(query: &str, pick: &Pick) {
+    sys::write(format!("{} → {}/{}\n", query, STORE_DIR, pick.base).as_bytes());
     if pick.total > 1 {
         let how = match pick.arch {
             Arch::Ours => "первый своей архитектуры",
             Arch::NoLibc => "ни один не ссылается на libc — архитектура ни при чём",
             Arch::Unknown => "архитектура НЕ ПРОВЕРЕНА: нет якоря, сделайте `pkg update`",
         };
-        sys::write(
-            format!("  (кандидатов в канале: {}; {})\n", pick.total, how).as_bytes(),
-        );
+        sys::write(format!("  (кандидатов в канале: {}; {})\n", pick.total, how).as_bytes());
     }
-    let hash = hash_of(&pick.base).to_string();
-    Ok((hash, Some(pick.base)))
 }
 
 /// Спросить у кэша метаданные пути и убедиться, что индекс не соврал. Возвращает имя пути,
@@ -1116,15 +1156,37 @@ fn gen_text(paths: &[Entry]) -> String {
 
 use profile::read as read_gen;
 
-/// Записать новое поколение и сделать его активным. `false` во втором поле — содержимое совпало с
-/// активным поколением, нового не завели (та же защита от пустых поколений, что у `rebuild`).
-fn write_gen(scap: usize, c: &Closure) -> Result<(u32, bool), String> {
+/// Уложить замыкание узлом store: значение — текст поколения, дети — содержимое путей.
+fn gen_node(scap: usize, c: &Closure) -> Result<[u8; 32], String> {
     let text = gen_text(&c.paths);
     let kids: Vec<[u8; 32]> = c.paths.iter().map(|e| e.id).collect();
     let mut id = [0u8; 32];
     if sys::obj_put_node(scap, text.as_bytes(), &kids, &mut id) != 0 {
         return Err(String::from("поколение профиля не влезло в store"));
     }
+    Ok(id)
+}
+
+/// Записать поколение под ЗАДАННЫМ корнем, без всякого указателя. `false` — содержимое там уже
+/// ровно это (узел содержательно адресуем, сравнение точное).
+///
+/// Так живёт системный профиль (Веха 112): его поколение называет конфиг, а активное выбирает
+/// `system/current` — своего указателя ему не нужно.
+fn write_gen_at(scap: usize, root: &str, c: &Closure) -> Result<bool, String> {
+    let id = gen_node(scap, c)?;
+    if root_id(scap, root) == Some(id) {
+        return Ok(false);
+    }
+    if sys::obj_set_root(scap, root.as_bytes(), &id) != 0 {
+        return Err(String::from("корень поколения не завёлся"));
+    }
+    Ok(true)
+}
+
+/// Записать новое поколение и сделать его активным. `false` во втором поле — содержимое совпало с
+/// активным поколением, нового не завели (та же защита от пустых поколений, что у `rebuild`).
+fn write_gen(scap: usize, c: &Closure) -> Result<(u32, bool), String> {
+    let id = gen_node(scap, c)?;
 
     if let Some(cur) = read_current(scap) {
         if root_id(scap, &gen_root(cur)) == Some(id) {
@@ -1399,15 +1461,170 @@ fn cmd_remove(what: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+// ── декларативные пакеты: конфиг → системный профиль (Веха 112) ─────────────────────────────
+
+/// Нормализованный конфиг поколения системы (значение корня `system/gen<N>`).
+fn system_config(scap: usize, gen: &str) -> Result<String, String> {
+    let root = format!("system/{}", gen);
+    let id = root_id(scap, &root).ok_or_else(|| format!("поколения {} нет в store", root))?;
+    let bytes = archive::read_object(scap, &id, 4 * 1024 * 1024)?;
+    String::from_utf8(bytes).map_err(|_| String::from("конфиг поколения не UTF-8"))
+}
+
+/// Имена, объявленные конфигом: строки `packages имя…`, в порядке появления, без повторов.
+///
+/// Записей `packages` в конфиге может быть сколько угодно — их приносят разные модули, ровно как
+/// `service`. Объявленное множество — их объединение.
+fn declared_packages(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("packages ") else { continue };
+        for name in rest.split_whitespace() {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Объявленные имена → пути store, подтверждённые подписанным narinfo.
+///
+/// Индекс читается ОДИН раз на весь список: проход по нему — вся цена резолва, а имена друг о
+/// друге ничего не знают.
+fn resolve_declared(scap: usize, names: &[String]) -> Result<Vec<String>, String> {
+    // Хэш искать в индексе незачем — он уже адрес. Разбор тот же, что у [`target`].
+    let queries: Vec<&str> = names
+        .iter()
+        .filter(|n| path_hash(n.as_bytes()).is_err())
+        .map(|s| s.as_str())
+        .collect();
+    let mut found = if queries.is_empty() {
+        Vec::new()
+    } else {
+        candidates_multi(scap, &queries)?
+    };
+
+    let mut tops = Vec::new();
+    for name in names {
+        let (hash, expect) = match path_hash(name.as_bytes()) {
+            Ok(h) => (h.to_string(), None),
+            Err(_) => {
+                let i = queries
+                    .iter()
+                    .position(|q| *q == name.as_str())
+                    .ok_or_else(|| format!("имя {} потерялось при резолве", name))?;
+                let pick = pick_from(scap, name, core::mem::take(&mut found[i]))?;
+                report_pick(name, &pick);
+                (hash_of(&pick.base).to_string(), Some(pick.base))
+            }
+        };
+        tops.push(confirm(scap, &hash, expect.as_deref())?);
+    }
+    Ok(tops)
+}
+
+/// `pkg sync` — привести системный профиль в соответствие с активным поколением конфига.
+///
+/// Зовётся из `rebuild` (Веха 112) и вручную. Идемпотентна: если объявленное уже собрано для
+/// этого поколения, не качается и не пишется ничего.
+fn cmd_sync() -> Result<(), String> {
+    let scap = sys::start_cap(1);
+    let gen = profile::system_current(scap)
+        .ok_or("система ещё не собрана — сначала `rebuild`")?;
+    let names = declared_packages(&system_config(scap, &gen)?);
+    let root = profile::system_gen_root(&gen);
+
+    // «Не объявлено ни одного» — тоже ответ, и он ЗАПИСЫВАЕТСЯ пустым поколением. Иначе
+    // «конфиг не просил пакетов» выглядело бы точно как «sync ещё не отрабатывал», а это разные
+    // вещи: во втором случае система не выполнила обещание и должна об этом сказать.
+    if names.is_empty() {
+        let empty = Closure { paths: Vec::new(), fetched: 0, bytes: 0 };
+        write_gen_at(scap, &root, &empty)?;
+        sys::write(format!("пакеты {}: конфиг не объявляет ни одного\n", gen).as_bytes());
+        return Ok(());
+    }
+
+    sys::write(format!("пакеты {}: объявлено {}\n", gen, names.len()).as_bytes());
+    let tops = resolve_declared(scap, &names)?;
+
+    // Сверка ДО пересборки: `rebuild` зовёт `sync` каждый раз, и обычный случай — «всё уже так».
+    // Замыкание — функция от списка верхнего уровня, поэтому совпадения списков достаточно.
+    if let Ok(items) = profile::read_root(scap, &root) {
+        let have: Vec<&String> = items.iter().filter(|i| i.top).map(|i| &i.base).collect();
+        if have.len() == tops.len() && tops.iter().all(|t| have.iter().any(|h| *h == t)) {
+            sys::write(format!("пакеты {}: без изменений\n", gen).as_bytes());
+            return Ok(());
+        }
+    }
+
+    let c = realize(scap, &tops)?;
+    report(&c);
+    write_gen_at(scap, &root, &c)?;
+    sys::write(
+        format!("пакеты {}: собрано, {} {}\n", gen, c.paths.len(), paths_word(c.paths.len()))
+            .as_bytes(),
+    );
+    Ok(())
+}
+
+/// Корни поколений системного профиля (`pkg/profile/system/*`).
+fn system_gen_roots(scap: usize) -> Result<Vec<String>, String> {
+    let text = roots::text(scap).ok_or("список корней store не прочитать целиком")?;
+    let prefix = format!("pkg/profile/{}/", profile::SYSTEM);
+    Ok(roots::suffixes(&text, prefix.as_bytes())
+        .into_iter()
+        .filter_map(|s| core::str::from_utf8(s).ok())
+        .map(|s| format!("{}{}", prefix, s))
+        .collect())
+}
+
 fn cmd_list() -> Result<(), String> {
     let scap = sys::start_cap(1);
+    list_system(scap);
+
     let Some(cur) = read_current(scap) else {
         sys::write(format!("профиль {} пуст — `pkg install <путь>`\n", PROFILE).as_bytes());
         return Ok(());
     };
     let paths = read_gen(scap, cur)?;
+    show_gen(&format!("профиль {} — поколение gen{}", PROFILE, cur), &paths);
+    Ok(())
+}
+
+/// Что объявляет конфиг активного поколения системы. Отдельная секция, потому что это ДРУГАЯ
+/// вещь: не «что я поставил», а «что система обещает иметь».
+fn list_system(scap: usize) {
+    let Some(gen) = profile::system_current(scap) else { return };
+    match profile::read_root(scap, &profile::system_gen_root(&gen)) {
+        Ok(items) if items.is_empty() => {
+            sys::write(format!("профиль {} ({}) — конфиг не объявляет пакетов\n", profile::SYSTEM, gen).as_bytes());
+        }
+        Ok(items) => show_gen(&format!("профиль {} — поколение системы {}", profile::SYSTEM, gen), &items),
+        // Корня нет — про это поколение `sync` не отрабатывал. Хорошо это или плохо, знает
+        // только конфиг: если он ничего не объявлял, всё в порядке; если объявлял — система не
+        // выполнила собственное обещание, и молчать об этом нельзя.
+        Err(_) => {
+            let asked = system_config(scap, &gen).map(|t| declared_packages(&t)).unwrap_or_default();
+            let msg = if asked.is_empty() {
+                format!("профиль {} ({}) — конфиг не объявляет пакетов\n", profile::SYSTEM, gen)
+            } else {
+                format!(
+                    "профиль {} ({}) НЕ СОБРАН: конфиг просит {} — `pkg sync`\n",
+                    profile::SYSTEM,
+                    gen,
+                    asked.join(", ")
+                )
+            };
+            sys::write(msg.as_bytes());
+        }
+    }
+}
+
+/// Печать одного поколения: верхний уровень, зависимости, итог.
+fn show_gen(title: &str, paths: &[profile::Item]) {
     let total: usize = paths.iter().map(|i| i.size).sum();
-    sys::write(format!("профиль {} — поколение gen{}\n", PROFILE, cur).as_bytes());
+    sys::write(format!("{}\n", title).as_bytes());
     for i in paths.iter().filter(|i| i.top) {
         sys::write(format!("  {}\n", i.base).as_bytes());
     }
@@ -1419,7 +1636,6 @@ fn cmd_list() -> Result<(), String> {
         }
     }
     sys::write(format!("  всего {} {}, {} Б\n", paths.len(), paths_word(paths.len()), total).as_bytes());
-    Ok(())
 }
 
 /// `pkg tree <путь> [подпуть]` — что лежит внутри распакованного пакета.
@@ -1498,6 +1714,32 @@ fn cmd_gens() -> Result<(), String> {
             .as_bytes(),
         );
     }
+
+    // Системный профиль (Веха 112): поколения называет СИСТЕМА, активное выбирает не `pkg`, а
+    // `system/current`. Поэтому и звёздочка тут стоит по другому основанию.
+    let active = profile::system_current(scap);
+    let mut roots = system_gen_roots(scap)?;
+    roots.sort();
+    if !roots.is_empty() {
+        sys::write(
+            format!("поколения профиля {} (активно — то, что выбрала система):\n", profile::SYSTEM)
+                .as_bytes(),
+        );
+        for r in roots {
+            let name = r.rsplit('/').next().unwrap_or("").to_string();
+            let count = profile::read_root(scap, &r).map(|p| p.len()).unwrap_or(0);
+            sys::write(
+                format!(
+                    "  {}{}  {} {}\n",
+                    name,
+                    if active.as_deref() == Some(name.as_str()) { " *" } else { "  " },
+                    count,
+                    paths_word(count)
+                )
+                .as_bytes(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1520,17 +1762,36 @@ fn cmd_gc(drop_old: bool) -> Result<(), String> {
             sys::obj_del_root(scap, gen_root(n).as_bytes());
             sys::write(format!("  поколение gen{} снято\n", n).as_bytes());
         }
+        // То же для системного профиля: остаётся собранное для АКТИВНОГО поколения системы.
+        // Значит, откат системы на старое поколение после `gc all` вернёт её пакеты не сразу —
+        // понадобится `pkg sync` (и сеть, если содержимое успело уйти). Это и есть цена `all`.
+        let sys_active = profile::system_current(scap).map(|g| profile::system_gen_root(&g));
+        for r in system_gen_roots(scap)? {
+            if Some(&r) == sys_active.as_ref() {
+                continue;
+            }
+            sys::obj_del_root(scap, r.as_bytes());
+            sys::write(format!("  поколение {} снято\n", r).as_bytes());
+        }
     }
 
     // Что держат ВСЕ оставшиеся поколения (не только активное).
-    let mut keep: Vec<String> = Vec::new();
-    for n in gen_numbers(scap)? {
-        for item in read_gen(scap, n).unwrap_or_default() {
+    fn hold(items: Vec<profile::Item>, keep: &mut Vec<String>) {
+        for item in items {
             let h = hash_of(&item.base).to_string();
             if !keep.contains(&h) {
                 keep.push(h);
             }
         }
+    }
+    let mut keep: Vec<String> = Vec::new();
+    for n in gen_numbers(scap)? {
+        hold(read_gen(scap, n).unwrap_or_default(), &mut keep);
+    }
+    // Объявленное конфигом держится наравне с поставленным руками — иначе `gc` сносил бы то,
+    // что система обещает иметь, и первый же откат системы упёрся бы в пустоту.
+    for r in system_gen_roots(scap)? {
+        hold(profile::read_root(scap, &r).unwrap_or_default(), &mut keep);
     }
 
     // Что лежит в сторе.

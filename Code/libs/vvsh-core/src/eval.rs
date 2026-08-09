@@ -445,6 +445,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("shell", b_shell),
     ("terminal", b_terminal),
     ("bind", b_bind),
+    ("packages", b_packages),
     ("system", b_system),
 ];
 
@@ -613,6 +614,38 @@ fn b_bind(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("bind", args)
 }
 
+/// `(packages имя…)` — пакеты, которые система обязана иметь (Веха 112). Читатель этой строки —
+/// не ядро и не терминал, а `pkg sync`: он резолвит имена в пути store и собирает поколение
+/// профиля, привязанное к поколению СИСТЕМЫ.
+///
+/// Своя сборка вместо [`build_entry`] нужна ради одного: у `packages` нет «имени и прав», есть
+/// однородный СПИСОК. Поэтому первый аргумент такой же, как остальные, и список строк вливается
+/// на любом месте — `packages(base, "jq")` пишется естественно, а через `build_entry` первым
+/// аргументом обязана была бы стоять строка.
+fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
+    let mut out = vec![Value::sym("packages")];
+    for a in args {
+        match a {
+            Value::Str(_) => out.push(a.clone()),
+            Value::List(items) => {
+                for it in items.iter() {
+                    match it {
+                        Value::Str(_) => out.push(it.clone()),
+                        _ => return Err(EvalError::new("packages: имя пакета — строка")),
+                    }
+                }
+            }
+            _ => return Err(EvalError::new("packages: имя пакета — строка или список строк")),
+        }
+    }
+    // Пустой `packages()` — не «ни одного пакета», а почти наверняка опечатка: «ни одного»
+    // записывается отсутствием записи или `[]`, как и у всех прочих модулей конфига.
+    if out.len() == 1 {
+        return Err(EvalError::new("packages: нужно хотя бы одно имя (пусто — просто не пиши запись)"));
+    }
+    Ok(Value::list(out))
+}
+
 /// `(system запись…|список-записей…)` → `(#system запись…)`: верхняя форма конфига. Принимает и
 /// отдельные записи, и списки записей (от `(append …)`) — уплощает.
 fn b_system(args: &[Value]) -> Result<Value, EvalError> {
@@ -626,7 +659,7 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
                         Value::List(inner) if is_entry(inner) => out.push(it.clone()),
                         _ => {
                             return Err(EvalError::new(
-                                "system: ожидались записи service/shell/terminal/bind",
+                                "system: ожидались записи service/shell/terminal/bind/packages",
                             ))
                         }
                     }
@@ -638,9 +671,10 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::list(out))
 }
 
-/// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал: конфиг
-/// поколения один, читателей несколько, и каждый берёт свои строки.
+/// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
+/// `packages` — `pkg sync`: конфиг поколения один, читателей несколько, и каждый берёт свои
+/// строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
-        if matches!(&**s, "service" | "shell" | "terminal" | "bind"))
+        if matches!(&**s, "service" | "shell" | "terminal" | "bind" | "packages"))
 }

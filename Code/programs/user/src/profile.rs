@@ -13,6 +13,22 @@
 //!
 //! Значение поколения — текст: заголовок с версией формата, дальше строки `top|dep <путь>
 //! <размер>`. Порядок строк совпадает с порядком исходящих ссылок узла.
+//!
+//! ## Два профиля, и у одного нет своего указателя (Веха 112)
+//!
+//! Профиля теперь два, и различие между ними — не в названии, а в том, **кто решает, какое
+//! поколение активно**:
+//!
+//! - [`PROFILE`] (`default`) — то, что человек поставил руками (`pkg install`). Активное
+//!   поколение помнит собственный указатель `current`, откат — `pkg rollback`.
+//! - [`SYSTEM`] (`system`) — то, что объявил конфиг (`packages …` → `pkg sync`). Своего
+//!   указателя у него **нет**: поколение профиля называется так же, как поколение СИСТЕМЫ, и
+//!   активно то, на которое смотрит `system/current`.
+//!
+//! Второй пункт и есть вся декларативность. Будь у системного профиля свой указатель, его
+//! пришлось бы двигать вместе с `switch`/откатом системы — то есть держать две правды об одном
+//! и надеяться, что они не разойдутся. Здесь расходиться нечему: откатили систему на `gen3` —
+//! пакеты стали теми, что объявлял `gen3`, без единого действия со стороны `pkg`.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -20,9 +36,15 @@ use alloc::vec::Vec;
 
 use void_user as sys;
 
-/// Имя профиля. Профиль пока один; множественность — это ровно другой префикс корня, поэтому
-/// имя вынесено в константу, а не размазано по коду.
+/// Профиль ручной установки (`pkg install`): своё `current`, свой откат.
 pub const PROFILE: &str = "default";
+
+/// Профиль, объявленный конфигом (Веха 112). Указателя `current` у него нет — активное
+/// поколение называет [`SYSTEM_CURRENT`].
+pub const SYSTEM: &str = "system";
+
+/// Корень-указатель на активное поколение СИСТЕМЫ (его двигают `rebuild` и `switch`).
+pub const SYSTEM_CURRENT: &[u8] = b"system/current";
 
 /// Заголовок значения поколения — версия формата, чтобы разбор мог отличить своё от чужого,
 /// а не гадать по первой строке.
@@ -41,6 +63,12 @@ pub struct Item {
 
 pub fn gen_root(n: u32) -> String {
     format!("pkg/profile/{}/gen{}", PROFILE, n)
+}
+
+/// Корень поколения системного профиля. Имя поколения (`gen3`) берётся у СИСТЕМЫ и не
+/// разбирается на число: `pkg` не должен знать, как система нумерует свои поколения.
+pub fn system_gen_root(gen: &str) -> String {
+    format!("pkg/profile/{}/{}", SYSTEM, gen)
 }
 
 pub fn current_root() -> String {
@@ -97,9 +125,9 @@ pub fn parse(text: &str) -> Result<Vec<Item>, String> {
     Ok(out)
 }
 
-/// Прочитать поколение по номеру.
-pub fn read(scap: usize, n: u32) -> Result<Vec<Item>, String> {
-    let id = root_id(scap, &gen_root(n)).ok_or_else(|| format!("нет поколения gen{}", n))?;
+/// Прочитать поколение по имени его корня.
+pub fn read_root(scap: usize, root: &str) -> Result<Vec<Item>, String> {
+    let id = root_id(scap, root).ok_or_else(|| format!("нет поколения {}", root))?;
     // Значение поколения — текст в несколько килобайт; читаем с запасом и по факту.
     let mut buf = alloc::vec![0u8; 256 * 1024];
     let got = sys::obj_get(scap, &id, &mut buf);
@@ -111,10 +139,48 @@ pub fn read(scap: usize, n: u32) -> Result<Vec<Item>, String> {
     parse(text)
 }
 
+/// Прочитать поколение профиля [`PROFILE`] по номеру.
+pub fn read(scap: usize, n: u32) -> Result<Vec<Item>, String> {
+    read_root(scap, &gen_root(n))
+}
+
 /// Содержимое активного поколения (пусто, если профиля ещё нет).
 pub fn active(scap: usize) -> Vec<Item> {
     match current(scap) {
         Some(n) => read(scap, n).unwrap_or_default(),
         None => Vec::new(),
     }
+}
+
+/// Имя активного поколения СИСТЕМЫ (значение корня `system/current`), например `gen3`.
+pub fn system_current(scap: usize) -> Option<String> {
+    let id = root_id(scap, core::str::from_utf8(SYSTEM_CURRENT).ok()?)?;
+    let mut buf = [0u8; 64];
+    let n = sys::obj_get(scap, &id, &mut buf);
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    let s = core::str::from_utf8(&buf[..n]).ok()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Содержимое системного профиля для активного поколения системы. Пусто — если поколение
+/// системы ничего не объявляло (или `pkg sync` для него ещё не отработал).
+pub fn system_active(scap: usize) -> Vec<Item> {
+    match system_current(scap) {
+        Some(g) => read_root(scap, &system_gen_root(&g)).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Всё, что должно быть видно в PATH: поставленное руками и объявленное конфигом — именно в
+/// этом порядке, потому что искать будут по нему и возьмут первое найденное.
+///
+/// Ручное раньше объявленного: `pkg install` — более позднее и более частное решение человека,
+/// и если он поставил свою версию поверх системной, запускаться должна его. У nix порядок тот
+/// же — `~/.nix-profile` стоит в PATH раньше `/run/current-system/sw`.
+pub fn path_items(scap: usize) -> Vec<Item> {
+    let mut out = active(scap);
+    out.extend(system_active(scap));
+    out
 }

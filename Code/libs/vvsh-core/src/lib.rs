@@ -309,4 +309,40 @@ system(
         let err = build_config(r#"system(bind("pane", "split-v"))"#).unwrap_err();
         assert!(err.contains("bind:"), "получили: {}", err);
     }
+
+    // ── пакеты в конфиге (Веха 112) ──────────────────────────────────────────
+    // Ещё один читатель того же текста: строки `packages …` берёт `pkg sync`.
+
+    #[test]
+    fn packages_normalize() {
+        let src = r#"system(
+                       service("posixfs", "store:rw"),
+                       packages("hello", "jq"),
+                     )"#;
+        assert_eq!(
+            build_config(src).expect("сборка"),
+            "service posixfs store:rw\npackages hello jq\n"
+        );
+    }
+
+    /// Список пакетов собирается из модулей, как и всё остальное: `packages` вливает список на
+    /// любом месте, поэтому «база плюс своё» пишется одной строкой.
+    #[test]
+    fn packages_from_modules_merge() {
+        let loader = MapLoader::new(vec![
+            ("base.vv", r#"["hello", "jq"]"#),
+            ("extra.vv", r#"[packages("curl")]"#),
+        ]);
+        let src = r#"base = import("base.vv")
+                     system(packages(base, "xz"), import("extra.vv"))"#;
+        let out = build_config_with(src, &loader).expect("сборка");
+        assert_eq!(out, "packages hello jq xz\npackages curl\n");
+    }
+
+    /// `packages()` без имён — почти наверняка опечатка, и ловится она на сборке.
+    #[test]
+    fn packages_empty_is_error() {
+        let err = build_config(r#"system(packages())"#).unwrap_err();
+        assert!(err.contains("packages:"), "получили: {}", err);
+    }
 }

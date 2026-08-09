@@ -521,14 +521,24 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 if fd < NFILES && fd_used[fd] {
                     let fi = fd_file[fd];
                     let r = fd_off[fd];
+                    // Ёмкость ПРИЁМНИКА (Веха 112): её называет клиент, потому что знает её
+                    // только он. Отдать больше нельзя — лишнее ядро отрежет по дороге, а курсор
+                    // файла уедет на всю длину ответа, и хвост пропадёт молча. Пустой запрос —
+                    // клиент старого образца: ведём себя как раньше.
+                    let room = if len >= 4 {
+                        u32::from_le_bytes([req[0], req[1], req[2], req[3]]) as usize
+                    } else {
+                        rep.len()
+                    }
+                    .min(rep.len());
                     if is_tree[fi] {
                         // Чтение файла пакета — прямо из дерева store; ответ не длиннее куска
                         // блоба (короткое чтение законно, клиент дочитает следующим вызовом).
-                        let n = tree_read(store_cap, &tnode[fi], r, rep, ibuf, kids);
+                        let n = tree_read(store_cap, &tnode[fi], r, &mut rep[..room], ibuf, kids);
                         fd_off[fd] = r + n;
                         reply_len = n;
                     } else {
-                        let n = size[fi].saturating_sub(r).min(rep.len());
+                        let n = size[fi].saturating_sub(r).min(room);
                         rep[..n].copy_from_slice(&files[fi * DATA_MAX + r..fi * DATA_MAX + r + n]);
                         fd_off[fd] = r + n;
                         reply_len = n;

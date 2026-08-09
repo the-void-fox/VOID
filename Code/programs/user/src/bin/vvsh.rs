@@ -5,7 +5,8 @@
 //!   `eval FILE`   — прочитать `.vv`, вычислить НА VOID, напечатать нормализованный конфиг (M1a/b).
 //!   `init-config` — посеять модульный конфиг `/etc/system/*.vv` (правишь его → `rebuild`) (M1c).
 //!   `rebuild`     — вычислить `/etc/system/default.vv` → КОММИТ нового поколения `system/gen<N>`,
-//!                   двинуть `system/current` (активно после ребута) (M1c).
+//!                   двинуть `system/current` (активно после ребута) (M1c) + собрать пакеты,
+//!                   объявленные конфигом (`pkg sync`, Веха 112).
 //!   `gens`        — показать поколения `system/gen*` и активное (декластер `roots`) (M1c).
 //!
 //! `rebuild`/`gens` работают со store (start-cap 1). PUT/SET_ROOT/LIST_ROOTS требуют WRITE (есть у
@@ -232,11 +233,12 @@ fn run_init_config() {
     // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` (1.5 КиБ) однажды доехал
     // наполовину и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не
     // бывало; виноватым тогда выглядел конфиг, а не запись.
-    let files: [(&[u8], &str); 5] = [
+    let files: [(&[u8], &str); 6] = [
         (b"/etc/system/net.vv", NET_VV),
         (b"/etc/system/services.vv", SERVICES_VV),
         (b"/etc/system/networking.vv", NETWORKING_VV),
         (b"/etc/system/terminal.vv", TERMINAL_VV),
+        (b"/etc/system/packages.vv", PACKAGES_VV),
         (DEFAULT_PATH, DEFAULT_VV),
     ];
     let mut bad = false;
@@ -253,8 +255,8 @@ fn run_init_config() {
         return;
     }
     sys::write(
-        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (#t/#f),\n\
-         terminal.vv (терминал и клавиши) → `rebuild`.\n"
+        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (true/false),\n\
+         terminal.vv (терминал и клавиши), packages.vv (пакеты) → `rebuild`.\n"
             .as_bytes(),
     );
 }
@@ -299,6 +301,10 @@ fn run_rebuild() {
                 sys::write("vvsh: нет изменений — конфиг уже в поколении ".as_bytes());
                 sys::write(cn);
                 sys::write(b"\n");
+                // Пакеты синхронизируются ВСЁ РАВНО: «конфиг тот же» не значит «обещанное
+                // выполнено». Прошлый `rebuild` мог не достать пакет (не было сети или индекса),
+                // и тогда повторный `rebuild` — ровно то, чем человек это чинит.
+                sync_packages();
                 return;
             }
         }
@@ -324,6 +330,28 @@ fn run_rebuild() {
         sys::write(cn);
     }
     sys::write(b"\n");
+    sync_packages();
+}
+
+/// Достроить к поколению системы его пакеты (Веха 112).
+///
+/// Сборка системы — это не только строки для ядра: конфиг объявляет ещё и `packages …`. Достать
+/// их умеет `pkg`, и зовём мы именно ЕГО — программой, а не куском кода внутри шелла. Довод тот
+/// же, по которому `pkg` отделён от `vsh`: сеть, криптография и два распаковщика не должны жить
+/// в процессе, который обязан пережить любую их ошибку. Полномочия `pkg` получает по
+/// наследству, ничего сверх шелловских.
+///
+/// Сеть тут не обязательна: если всё объявленное уже в store, `sync` не сделает ни одной
+/// загрузки. Незадача с пакетами НЕ отменяет собранного поколения системы — конфиг ядра и
+/// терминала уже записан, и терять его из-за отвалившегося кэша было бы хуже, чем сказать
+/// вслух, что пакеты не собрались.
+fn sync_packages() {
+    let code = px::spawn_args(cap_store(), b"pkg", b"sync\0");
+    if code == usize::MAX {
+        sys::write("vvsh: pkg не запустился — пакеты конфига не собраны\n".as_bytes());
+    } else if code != 0 {
+        sys::write(alloc::format!("vvsh: pkg sync вернул [код {}] — пакеты не собраны\n", code).as_bytes());
+    }
 }
 
 /// `gens` (подкоманда) — перечислить поколения и выйти. Логика — в [`run_gens`].
@@ -546,11 +574,14 @@ fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
 ///
 /// Ищем только среди пакетов ВЕРХНЕГО УРОВНЯ: зависимости человек не устанавливал, и их `bin/` —
 /// не его PATH (у nix ровно та же граница: профиль ссылается лишь на то, что просили).
+///
+/// Профилей с Вехи 112 два: поставленное руками и объявленное конфигом. Порядок задаёт
+/// [`profile::path_items`] — здесь берётся первый кандидат, который запустился.
 fn path_candidates(name: &[u8]) -> alloc::vec::Vec<alloc::string::String> {
     let ep = cap_fs();
     let mut out = alloc::vec::Vec::new();
     let Ok(name) = core::str::from_utf8(name) else { return out };
-    for item in profile::active(cap_store()) {
+    for item in profile::path_items(cap_store()) {
         if !item.top {
             continue;
         }
@@ -2058,12 +2089,28 @@ if on {\n\
 \x20        \"power\", \"env\")]\n\
 }\n";
 
+/// Веха 112 — пакеты объявляются здесь же, обычным модулем. Имя пакета в списке значит «система
+/// обязана его иметь»: `rebuild` соберёт его в поколение профиля, а откат системы уберёт вместе
+/// с поколением. `pkg install` при этом никуда не девается — это по-прежнему способ поставить
+/// что-то разово, не объявляя.
+const PACKAGES_VV: &str = "# packages.vv — пакеты, которые система обязана иметь.\n\
+#\n\
+# Имена — как в nixpkgs; что есть в канале, покажет `pkg search <строка>`. Резолв имён требует\n\
+# индекса канала: один раз сделай `pkg update`. Пустой список — ни одного пакета.\n\
+#\n\
+# Правка → `rebuild`: пакет скачается и появится в PATH. Откат системы уберёт его обратно.\n\
+want = []\n\
+\n\
+if null?(want) { [] } else { [packages(want)] }\n";
+
 const DEFAULT_VV: &str = "# default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
-# Собери систему из модулей: сеть — net.vv (true/false), терминал и его клавиши — terminal.vv.\n\
+# Собери систему из модулей: сеть — net.vv (true/false), терминал и его клавиши — terminal.vv,\n\
+# пакеты — packages.vv.\n\
 # Затем: run vvsh rebuild\n\
 net = import(\"net.vv\")\n\
 system(\n\
 \x20 import(\"services.vv\"),\n\
 \x20 if net { import(\"networking.vv\") } else { [] },\n\
 \x20 import(\"terminal.vv\"),\n\
+\x20 import(\"packages.vv\"),\n\
 )\n";
