@@ -87,6 +87,7 @@ fn main_loop() -> ! {
         buttons: 0,
         drag: None,
         focus: None,
+        transient: 0,
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -205,6 +206,8 @@ struct Wm {
     /// Тащим окно: (индекс, смещение курсора от угла рамки).
     drag: Option<(usize, i32, i32)>,
     focus: Option<u32>,
+    /// Сколько байт временных буферов прочитано с прошлой уборки (см. `OP_ATTACH`).
+    transient: usize,
 }
 
 impl Wm {
@@ -466,9 +469,12 @@ impl Wm {
                 sys::reply(cap, &ev[..len]);
             }
             None => {
-                // Очередь короткая намеренно: движения мыши устаревают мгновенно, и копить их
-                // сотнями значит показывать клиенту прошлое.
-                if self.wins[i].inbox.len() < 16 {
+                // Потолок разный по СМЫСЛУ события: движения мыши устаревают мгновенно (копить
+                // их сотнями значит показывать клиенту прошлое), а клавиши терять нельзя —
+                // человек их уже нажал. Строка, вставленная в консоль целиком, приезжает
+                // десятками байт разом, и потолок в 16 съедал её середину.
+                let cap = if ev[0] == win::EV_KEY { 256 } else { 16 };
+                if self.wins[i].inbox.len() < cap {
                     let mut rec = [0u8; 8];
                     rec[..len].copy_from_slice(&ev[..len]);
                     rec[7] = len as u8;
@@ -514,19 +520,48 @@ impl Wm {
             }
             win::OP_ATTACH => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let rx = u16::from_le_bytes([buf[4], buf[5]]) as i32;
+                let ry = u16::from_le_bytes([buf[6], buf[7]]) as i32;
+                let rw = u16::from_le_bytes([buf[8], buf[9]]) as i32;
+                let rh = u16::from_le_bytes([buf[10], buf[11]]) as i32;
                 let mut cid = [0u8; 32];
-                cid.copy_from_slice(&buf[4..36]);
+                cid.copy_from_slice(&buf[12..44]);
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
                     // Тот же content-id — содержимое то же, читать нечего. Это и есть выгода
                     // адресации по содержимому: «перерисовал в то же самое» стоит ноль.
                     if self.wins[i].cid != cid {
-                        let need = (self.wins[i].w * self.wins[i].h * 4) as usize;
+                        self.wins[i].cid = cid;
+                        let (ww, wh) = (self.wins[i].w, self.wins[i].h);
+                        if self.wins[i].pixels.len() != (ww * wh * 4) as usize {
+                            self.wins[i].pixels = vec![0u8; (ww * wh * 4) as usize];
+                        }
+                        let need = (rw * rh * 4) as usize;
                         let mut px = vec![0u8; need];
                         let got = sys::obj_get(store, &cid, &mut px);
-                        if got > 0 && got != usize::MAX {
-                            px.truncate(got);
-                            self.wins[i].pixels = px;
-                            self.wins[i].cid = cid;
+                        if got == need {
+                            // Вклеиваем полосу на её место в копии окна.
+                            for row in 0..rh {
+                                let dy = ry + row;
+                                if dy < 0 || dy >= wh {
+                                    continue;
+                                }
+                                let src = (row * rw * 4) as usize;
+                                let dst = ((dy * ww + rx) * 4) as usize;
+                                let n = (rw * 4).min((ww - rx) * 4).max(0) as usize;
+                                if dst + n <= self.wins[i].pixels.len() && src + n <= px.len() {
+                                    self.wins[i].pixels[dst..dst + n]
+                                        .copy_from_slice(&px[src..src + n]);
+                                }
+                            }
+                        }
+                        // Пиксели скопированы — объект больше не нужен НИКОМУ. Он не привязан
+                        // корнем, значит уже мусор; считаем его и время от времени просим ядро
+                        // прибраться, иначе куча ядра кончится (Веха 118: полный кадр каждое
+                        // нажатие клавиши убивал систему за восемь букв).
+                        self.transient += need;
+                        if self.transient > 24 * 1024 * 1024 {
+                            self.transient = 0;
+                            sys::obj_gc(store);
                         }
                     }
                 }
@@ -544,13 +579,37 @@ impl Wm {
                     self.repaint(font, ox + dx, oy + dy, dw.max(1), dh.max(1));
                 }
             }
+            // Неблокирующий опрос: у клиента свой реактор, спать в нашем вызове он не может.
+            win::OP_POLL => {
+                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let ev = self.wins.iter_mut().find(|w| w.id == id).and_then(|w| {
+                    (!w.inbox.is_empty()).then(|| w.inbox.remove(0))
+                });
+                match ev {
+                    Some(rec) => {
+                        let n = (rec[7] as usize).min(7);
+                        sys::reply(m.reply_cap, &rec[..n]);
+                    }
+                    None => {
+                        sys::reply(m.reply_cap, &[]);
+                    }
+                }
+            }
             win::OP_EVENT => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 let Some(i) = self.wins.iter().position(|w| w.id == id) else {
                     sys::reply(m.reply_cap, &[]);
                     return;
                 };
-                match self.wins[i].inbox.pop() {
+                // ОЧЕРЕДЬ, а не стек: `pop` брал с конца, и набранное приезжало задом наперёд
+                // (а при переполнении — вперемешку). Стоимость `remove(0)` при потолке в
+                // сотни записей несущественна, а порядок ввода — свойство, которое нельзя терять.
+                let first = if self.wins[i].inbox.is_empty() {
+                    None
+                } else {
+                    Some(self.wins[i].inbox.remove(0))
+                };
+                match first {
                     // Есть накопленное — отвечаем сразу.
                     Some(rec) => {
                         let n = rec[7] as usize;

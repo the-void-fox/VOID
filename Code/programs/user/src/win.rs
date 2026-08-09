@@ -34,7 +34,13 @@
 
 /// Создать окно: `[ширина u16, высота u16, заголовок…]` → `[id u32]`.
 pub const OP_CREATE: usize = 1;
-/// Привязать пиксели: `[id u32, content-id 32Б]`. Формат — RGBA8888 по строкам, без выравнивания.
+/// Привязать пиксели ПРЯМОУГОЛЬНИКА: `[id u32, x u16, y u16, w u16, h u16, content-id 32Б]`.
+/// Объект содержит ровно `w*h*4` байта RGBA8888 по строкам — только эту область, а не всё окно.
+///
+/// Почему прямоугольником, а не окном целиком (Веха 118): полный кадр терминала 900×520 — это
+/// 1,87 МБ, и КАЖДОЕ нажатие клавиши создавало бы новый объект такого размера. Куча ядра
+/// кончалась за восемь нажатий — паникой. Полоса из пары текстовых строк в двадцать раз меньше,
+/// и это единственное, что на самом деле изменилось.
 pub const OP_ATTACH: usize = 2;
 /// Кадр готов: `[id u32, x u16, y u16, w u16, h u16]` — прямоугольник изменений.
 pub const OP_COMMIT: usize = 3;
@@ -42,6 +48,12 @@ pub const OP_COMMIT: usize = 3;
 pub const OP_EVENT: usize = 4;
 /// Закрыть окно: `[id u32]`.
 pub const OP_DESTROY: usize = 5;
+/// Забрать событие БЕЗ ожидания: `[id u32]` → событие или пустой ответ.
+///
+/// Нужен клиентам, у которых есть свой реактор: терминал — сам сервер для своих панелей, и
+/// уснуть в нашем вызове он не может, иначе перестанет обслуживать детей. Простым программам
+/// (`winbox`) по-прежнему проще спать в [`OP_EVENT`].
+pub const OP_POLL: usize = 6;
 
 /// Событие: движение мыши над окном — `[1, x u16, y u16]` (координаты внутри окна).
 pub const EV_MOTION: u8 = 1;
@@ -162,17 +174,30 @@ impl Window {
     /// `pixels` — RGBA8888 по строкам, ровно `width * height * 4` байта. Кладём через store, а
     /// не шлём по IPC, ровно по доводу из шапки: содержимое адресуется хэшем, а не местом.
     pub fn present(&self, store: usize, pixels: &[u8]) -> bool {
+        self.present_rect(store, pixels, 0, 0, self.width, self.height)
+    }
+
+    /// Отдать ЧАСТЬ кадра: `pixels` — ровно `w*h*4` байта прямоугольника `(x, y, w, h)`.
+    ///
+    /// Это основной путь для всего, что перерисовывается часто: платит только за изменившееся.
+    pub fn present_rect(
+        &self, store: usize, pixels: &[u8], x: u16, y: u16, w: u16, h: u16,
+    ) -> bool {
         let mut id = [0u8; 32];
         if crate::obj_put(store, pixels, &mut id) != 0 {
             return false;
         }
-        let mut req = [0u8; 36];
+        let mut req = [0u8; 44];
         req[0..4].copy_from_slice(&self.id.to_le_bytes());
-        req[4..36].copy_from_slice(&id);
+        req[4..6].copy_from_slice(&x.to_le_bytes());
+        req[6..8].copy_from_slice(&y.to_le_bytes());
+        req[8..10].copy_from_slice(&w.to_le_bytes());
+        req[10..12].copy_from_slice(&h.to_le_bytes());
+        req[12..44].copy_from_slice(&id);
         if crate::call(self.ep, OP_ATTACH, &req, &mut []) == crate::NO_CAP {
             return false;
         }
-        self.damage(0, 0, self.width, self.height)
+        self.damage(x, y, w, h)
     }
 
     /// Сказать «кадр готов» и объявить изменившийся прямоугольник.
@@ -189,8 +214,17 @@ impl Window {
     /// Ждать событие. Ответ отложенный: пока событий нет, клиент спит в `SYS_CALL` — ровно так
     /// же, как программа спит в чтении stdin у терминала.
     pub fn next_event(&self) -> Option<Event> {
+        self.event(OP_EVENT)
+    }
+
+    /// Забрать событие, если оно уже есть. `None` — событий нет ПРЯМО СЕЙЧАС.
+    pub fn poll_event(&self) -> Option<Event> {
+        self.event(OP_POLL)
+    }
+
+    fn event(&self, op: usize) -> Option<Event> {
         let mut rep = [0u8; 16];
-        let n = crate::call(self.ep, OP_EVENT, &self.id.to_le_bytes(), &mut rep);
+        let n = crate::call(self.ep, op, &self.id.to_le_bytes(), &mut rep);
         if n == 0 || n == crate::NO_CAP {
             return None;
         }

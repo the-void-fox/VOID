@@ -97,6 +97,57 @@ const FONT_MAX: usize = 256;
 /// Окно фреймбуфера в нашем адресном пространстве: между образом и кучей.
 const FB_VA: usize = 0x5000_0000;
 
+/// Размер окна терминала, когда он живёт под композитором (Веха 118).
+const WIN_W: u16 = 900;
+const WIN_H: u16 = 520;
+
+/// Куда терминал кладёт кадр.
+///
+/// Один бинарь, два режима — и выбор делается САМ, по наличию композитора в окружении. Так
+/// `term` остаётся и спасательным шеллом на голой машине (владеет экраном), и обычным окном,
+/// когда окна есть. Заводить ради этого две программы значило бы поддерживать два терминала.
+enum Out {
+    /// Экран целиком: пишем прямо во фреймбуфер (`mmio:fb`).
+    Screen,
+    /// Окно композитора: собираем кадр в своей памяти и отдаём объектом (Веха 117).
+    Window { win: sys::win::Window, buf: Vec<u8>, store: usize },
+}
+
+impl Out {
+    /// Адрес, по которому лежит левый верхний пиксель кадра.
+    fn base(&self) -> usize {
+        match self {
+            Out::Screen => FB_VA,
+            Out::Window { buf, .. } => buf.as_ptr() as usize,
+        }
+    }
+    /// Отдать композитору ПОЛОСУ строк `y0..y1` (в пикселях). Экрану предъявлять нечего —
+    /// там кадр уже на месте.
+    ///
+    /// Полосу, а не кадр: полный кадр окна 900×520 — это 1,87 МБ, и по объекту на каждое
+    /// нажатие клавиши кончало кучу ядра за восемь букв (Веха 118). Платим за изменившееся.
+    fn present_rows(&self, info: &sys::VideoInfo, y0: usize, y1: usize) {
+        let Out::Window { win, buf, store } = self else { return };
+        let y0 = y0.min(info.height);
+        let y1 = y1.min(info.height);
+        if y1 <= y0 {
+            return;
+        }
+        let row = info.pitch;
+        win.present_rect(
+            *store,
+            &buf[y0 * row..y1 * row],
+            0,
+            y0 as u16,
+            info.width as u16,
+            (y1 - y0) as u16,
+        );
+    }
+    fn windowed(&self) -> bool {
+        matches!(self, Out::Window { .. })
+    }
+}
+
 /// Настройки по умолчанию — тем же текстом, каким их задаёт конфиг поколения. Так «как оно
 /// устроено из коробки» читается глазами, а разбор остаётся ОДИН: две ветки, «зашитая» и
 /// «из конфига», разъехались бы при первой же правке схемы.
@@ -736,33 +787,49 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // что запускать в панелях.
     let mut conf = Conf::load();
 
-    let Some(fb_cap) = find_fb_cap() else {
-        sys::write_console("[term] нет права на экран (mmio:fb в конфиге init)\n".as_bytes());
-        sys::exit(1);
+    // Веха 118 — есть композитор? Тогда мы ОКНО, а не владелец экрана. Решение принимается
+    // здесь и больше нигде: дальше по коду разница видна только в том, куда лёг кадр.
+    let store = store_cap().unwrap_or(sys::NO_CAP);
+    let (out, info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
+        Some(win) => {
+            log_line("term: работаю окном композитора");
+            // Кадр окна — RGBA по строкам без выравнивания; описываем его теми же полями, что
+            // ядро отдаёт для экрана, чтобы весь рисующий код остался общим.
+            let info = sys::VideoInfo {
+                width: WIN_W as usize,
+                height: WIN_H as usize,
+                pitch: WIN_W as usize * 4,
+                bpp: 32,
+                rgb: [(0, 8), (8, 8), (16, 8)],
+            };
+            let buf = vec![0u8; WIN_W as usize * WIN_H as usize * 4];
+            (Out::Window { win, buf, store }, info)
+        }
+        None => {
+            let Some(fb_cap) = find_fb_cap() else {
+                sys::write_console("[term] нет ни композитора, ни права на экран\n".as_bytes());
+                sys::exit(1);
+            };
+            let Some(info) = sys::video_info(fb_cap) else {
+                sys::write_console("[term] ядро не отдало описание видеорежима\n".as_bytes());
+                sys::exit(1);
+            };
+            if !sys::mmio_map(fb_cap, FB_VA) {
+                sys::write_console("[term] не удалось замапить фреймбуфер\n".as_bytes());
+                sys::exit(1);
+            }
+            // Веха 115 — сколько машина успевает писать в экран. Замер имеет смысл только у
+            // владельца экрана: в окне мы пишем в обычную память.
+            let (mbs32, mbs64) = measure_fb(&info);
+            let frame = (info.width * info.height * (info.bpp / 8)) as u64;
+            log_line(&alloc::format!(
+                "term: экран {}×{}, {} бит — заливка {} МБ/с по 4 байта, {} МБ/с по 8 (полный кадр {} мс)",
+                info.width, info.height, info.bpp, mbs32, mbs64,
+                frame / mbs64.max(1) / 1000,
+            ));
+            (Out::Screen, info)
+        }
     };
-    let Some(info) = sys::video_info(fb_cap) else {
-        sys::write_console("[term] ядро не отдало описание видеорежима\n".as_bytes());
-        sys::exit(1);
-    };
-    if !sys::mmio_map(fb_cap, FB_VA) {
-        sys::write_console("[term] не удалось замапить фреймбуфер\n".as_bytes());
-        sys::exit(1);
-    }
-
-    // Веха 115 — сколько машина успевает писать в экран. Замер делается ДО первого кадра
-    // (экран всё равно пуст) и говорится вслух: от этого числа зависит, какие анимации мы
-    // вообще можем себе позволить (ADR 0016).
-    let (mbs32, mbs64) = measure_fb(&info);
-    let frame = (info.width * info.height * (info.bpp / 8)) as u64;
-    log_line(&alloc::format!(
-        "term: экран {}×{}, {} бит — заливка {} МБ/с по 4 байта, {} МБ/с по 8 (полный кадр {} мс)",
-        info.width,
-        info.height,
-        info.bpp,
-        mbs32,
-        mbs64,
-        frame / mbs64.max(1) / 1000,
-    ));
 
     let Some(mut view) = View::build(&conf, &info) else {
         sys::write_console("[term] шрифт не разобрался\n".as_bytes());
@@ -797,6 +864,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut my = info.height / 2;
     let mut mbtn = 0u8;
     let mut mouse_evs = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0 }; 32];
+    let mut keys_from_win: Vec<u8> = Vec::new();
     // Курсор виден СРАЗУ, а не после первого движения: это рабочий стол, а не телефон —
     // «где мой курсор» не должно быть первым вопросом к системе.
     let mut cursor_drawn = true;
@@ -804,8 +872,25 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     loop {
         let mut worked = false;
 
-        // ── 0. мышь ────────────────────────────────────────────────────────────────────────
-        let mn = sys::mouse_read(&mut mouse_evs);
+        // ── 0. события окна (Веха 118) ─────────────────────────────────────────────────────
+        // Опрашиваем НЕ блокируясь: у нас свой реактор — панели ждут ответов, и уснуть в чужом
+        // вызове мы не имеем права.
+        if let Out::Window { win, .. } = &out {
+            while let Some(ev) = win.poll_event() {
+                worked = true;
+                match ev {
+                    sys::win::Event::Key(k) => keys_from_win.push(k),
+                    sys::win::Event::Close => {
+                        sys::write_console("[term] окно закрыто — выходим\n".as_bytes());
+                        sys::exit(0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── 0б. мышь (только когда экран наш) ──────────────────────────────────────────────
+        let mn = if out.windowed() { 0 } else { sys::mouse_read(&mut mouse_evs) };
         if mn > 0 {
             worked = true;
             let (ox, oy) = (mx, my);
@@ -830,7 +915,15 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         }
 
         // ── 1. клавиатура (никогда не блокируемся) ─────────────────────────────────────────
-        let n = sys::read_console_nonblock(&mut keys);
+        // В окне байты приходят событиями от композитора, на голом экране — из консоли ядра.
+        let n = if out.windowed() {
+            let n = keys_from_win.len().min(keys.len());
+            keys[..n].copy_from_slice(&keys_from_win[..n]);
+            keys_from_win.clear();
+            n
+        } else {
+            sys::read_console_nonblock(&mut keys)
+        };
         if n > 0 {
             worked = true;
             for i in 0..n {
@@ -1006,13 +1099,21 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 );
                 let ch = view.cell_h();
                 for &y in &dirty {
-                    blit_rows(&view.surface, &info, y * ch, ((y + 1) * ch).min(info.height));
+                    blit_rows(&view.surface, &info, out.base(), y * ch,
+                              ((y + 1) * ch).min(info.height));
                 }
-                // Кадр мог затереть курсор — вернуть его поверх (Веха 115). Дёшево: он
-                // 12×19 пикселей, а знать, пересёкся ли он с изменившимися строками, дороже,
-                // чем просто нарисовать.
-                if cursor_drawn {
+                // Кадр мог затереть курсор — вернуть его поверх (Веха 115). В ОКНЕ курсора
+                // не рисуем вовсе: он принадлежит композитору и живёт поверх всех окон.
+                if cursor_drawn && !out.windowed() {
                     draw_cursor(&info, mx, my, mbtn != 0);
+                }
+                // Композитору отдаём одну полосу — от первой изменившейся строки до последней.
+                // Отдельными прямоугольниками на каждую строку было бы точнее, но каждый из них
+                // это ещё один объект и ещё один вызов; полоса — верная середина.
+                if out.windowed() {
+                    if let (Some(&first), Some(&last)) = (dirty.first(), dirty.last()) {
+                        out.present_rows(&info, first * ch, ((last + 1) * ch).min(info.height));
+                    }
                 }
             }
             prev_cells = cells;
@@ -1596,14 +1697,14 @@ fn fence() {
 fn fence() {}
 
 /// Перенести кадр из RAM в фреймбуфер, упаковав пиксели в формат прошивки.
-fn blit_rows(surface: &Surface, info: &sys::VideoInfo, y_from: usize, y_to: usize) {
+fn blit_rows(surface: &Surface, info: &sys::VideoInfo, base: usize, y_from: usize, y_to: usize) {
     let src = surface.data();
     let sw = surface.width() as usize;
     let bytes_pp = info.bpp / 8;
     let w = sw.min(info.width);
     let h = (surface.height() as usize).min(info.height).min(y_to);
     for y in y_from..h {
-        let mut dst = FB_VA + y * info.pitch;
+        let mut dst = base + y * info.pitch;
         let row = y * sw * 4;
         // Веха 117 — при write-combining выгодно писать ШИРЕ: пачку в 64 байта набирают 8
         // восьмибайтных записей вместо 16 четырёхбайтных. Пара соседних пикселей 32-бит
