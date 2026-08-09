@@ -706,6 +706,19 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::exit(1);
     }
 
+    // Веха 115 — сколько машина успевает писать в экран. Замер делается ДО первого кадра
+    // (экран всё равно пуст) и говорится вслух: от этого числа зависит, какие анимации мы
+    // вообще можем себе позволить (ADR 0016).
+    let fb_mbs = measure_fb(&info);
+    log_line(&alloc::format!(
+        "term: экран {}×{}, {} бит — заливка {} МБ/с (полный кадр {} мс)",
+        info.width,
+        info.height,
+        info.bpp,
+        fb_mbs,
+        (info.width * info.height * (info.bpp / 8)) as u64 / fb_mbs.max(1) / 1000,
+    ));
+
     let Some(mut view) = View::build(&conf, &info) else {
         sys::write_console("[term] шрифт не разобрался\n".as_bytes());
         sys::exit(1);
@@ -733,8 +746,43 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut msg = [0u8; stdio::CHUNK];
     let mut redraw = true;
 
+    // Веха 115 — курсор. Позицию ведём МЫ, а не ядро: границы экрана знает тот, кто рисует.
+    // Начинаем в середине — там его точно видно, а «где мой курсор» на старте не вопрос.
+    let mut mx = info.width / 2;
+    let mut my = info.height / 2;
+    let mut mbtn = 0u8;
+    let mut mouse_evs = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0 }; 32];
+    // Курсор виден СРАЗУ, а не после первого движения: это рабочий стол, а не телефон —
+    // «где мой курсор» не должно быть первым вопросом к системе.
+    let mut cursor_drawn = true;
+
     loop {
         let mut worked = false;
+
+        // ── 0. мышь ────────────────────────────────────────────────────────────────────────
+        let mn = sys::mouse_read(&mut mouse_evs);
+        if mn > 0 {
+            worked = true;
+            let (ox, oy) = (mx, my);
+            for e in &mouse_evs[..mn] {
+                mx = (mx as i32 + e.dx as i32).clamp(0, info.width as i32 - 1) as usize;
+                my = (my as i32 + e.dy as i32).clamp(0, info.height as i32 - 1) as usize;
+                if e.buttons != mbtn {
+                    log_line(&alloc::format!(
+                        "term: кнопки {:#04b} в {}×{}",
+                        e.buttons, mx, my
+                    ));
+                    mbtn = e.buttons;
+                }
+            }
+            // Стереть старое место и нарисовать новое — два маленьких прямоугольника вместо
+            // кадра. Стирать надо ДО отрисовки: иначе хвост курсора остаётся на экране.
+            if cursor_drawn {
+                restore_rect(&view.surface, &info, ox, oy, CUR_W, CUR_H);
+            }
+            draw_cursor(&info, mx, my, mbtn != 0);
+            cursor_drawn = true;
+        }
 
         // ── 1. клавиатура (никогда не блокируемся) ─────────────────────────────────────────
         let n = sys::read_console_nonblock(&mut keys);
@@ -898,6 +946,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 let ch = view.cell_h();
                 for &y in &dirty {
                     blit_rows(&view.surface, &info, y * ch, ((y + 1) * ch).min(info.height));
+                }
+                // Кадр мог затереть курсор — вернуть его поверх (Веха 115). Дёшево: он
+                // 12×19 пикселей, а знать, пересёкся ли он с изменившимися строками, дороже,
+                // чем просто нарисовать.
+                if cursor_drawn {
+                    draw_cursor(&info, mx, my, mbtn != 0);
                 }
             }
             prev_cells = cells;
@@ -1297,6 +1351,125 @@ fn find_fb_cap() -> Option<usize> {
                 .map(sys::start_cap)
                 .find(|&c| c != sys::NO_CAP && sys::video_info(c).is_some())
         })
+}
+
+// ── курсор мыши (Веха 115) ───────────────────────────────────────────────────
+//
+// Курсор рисуется ПОВЕРХ кадра, прямо во фреймбуфер, и в теневую поверхность не попадает.
+// Иначе его пришлось бы «стирать» перерисовкой знакомест, то есть гнать через растеризатор
+// текст, который не менялся. А так движение стоит ровно два маленьких прямоугольника: вернуть
+// пиксели под старым положением и нарисовать новое. Это тот же damage-подход, которым Веха 99.2
+// вылечила отрисовку строк, — и он же понадобится композитору (ADR 0016: анимируем
+// трансформации, а не содержимое).
+
+const CUR_W: usize = 12;
+const CUR_H: usize = 19;
+/// Классическая стрелка: `#` — контур (чёрный), `.` — тело (белое), пробел — прозрачно.
+/// Контур обязателен: белая стрелка на белом фоне иначе исчезает.
+const CURSOR: [&str; CUR_H] = [
+    "#           ",
+    "##          ",
+    "#.#         ",
+    "#..#        ",
+    "#...#       ",
+    "#....#      ",
+    "#.....#     ",
+    "#......#    ",
+    "#.......#   ",
+    "#........#  ",
+    "#.....##### ",
+    "#..#..#     ",
+    "#.# #..#    ",
+    "##  #..#    ",
+    "#    #..#   ",
+    "     #..#   ",
+    "      #.#   ",
+    "      ###   ",
+    "            ",
+];
+
+/// Нарисовать курсор во фреймбуфере. `pressed` — кнопка нажата: тело инвертируется, и это
+/// единственная обратная связь, которая у нас пока есть на клик.
+fn draw_cursor(info: &sys::VideoInfo, cx: usize, cy: usize, pressed: bool) {
+    let bytes_pp = info.bpp / 8;
+    let (fill_r, fill_g, fill_b) = if pressed { (90, 140, 255) } else { (255, 255, 255) };
+    for (row, line) in CURSOR.iter().enumerate() {
+        let y = cy + row;
+        if y >= info.height {
+            break;
+        }
+        for (col, ch) in line.bytes().enumerate() {
+            let x = cx + col;
+            if x >= info.width || ch == b' ' {
+                continue;
+            }
+            let (r, g, b) = if ch == b'#' { (0, 0, 0) } else { (fill_r, fill_g, fill_b) };
+            let px = pack(info, r, g, b);
+            let dst = FB_VA + y * info.pitch + x * bytes_pp;
+            unsafe {
+                match bytes_pp {
+                    4 => core::ptr::write_volatile(dst as *mut u32, px),
+                    2 => core::ptr::write_volatile(dst as *mut u16, px as u16),
+                    _ => {
+                        core::ptr::write_volatile(dst as *mut u8, px as u8);
+                        core::ptr::write_volatile((dst + 1) as *mut u8, (px >> 8) as u8);
+                        core::ptr::write_volatile((dst + 2) as *mut u8, (px >> 16) as u8);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Вернуть на место пиксели кадра в прямоугольнике (стирание курсора).
+fn restore_rect(surface: &Surface, info: &sys::VideoInfo, x0: usize, y0: usize, w: usize, h: usize) {
+    let src = surface.data();
+    let sw = surface.width() as usize;
+    let sh = surface.height() as usize;
+    let bytes_pp = info.bpp / 8;
+    for y in y0..(y0 + h).min(info.height).min(sh) {
+        for x in x0..(x0 + w).min(info.width).min(sw) {
+            let p = (y * sw + x) * 4;
+            let px = pack(info, src[p], src[p + 1], src[p + 2]);
+            let dst = FB_VA + y * info.pitch + x * bytes_pp;
+            unsafe {
+                match bytes_pp {
+                    4 => core::ptr::write_volatile(dst as *mut u32, px),
+                    2 => core::ptr::write_volatile(dst as *mut u16, px as u16),
+                    _ => {
+                        core::ptr::write_volatile(dst as *mut u8, px as u8);
+                        core::ptr::write_volatile((dst + 1) as *mut u8, (px >> 8) as u8);
+                        core::ptr::write_volatile((dst + 2) as *mut u8, (px >> 16) as u8);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Замерить, с какой скоростью машина пишет в фреймбуфер (Веха 115, требование ADR 0016).
+///
+/// В QEMU это обычная память хоста, и число ничего не значит. На настоящей машине фреймбуфер —
+/// НЕКЭШИРУЕМЫЙ MMIO через PCIe, и вот там оно решает, возможны ли плавные анимации вообще:
+/// полный кадр 1280×800×4 = 4 МиБ, и при 200 МБ/с это 20 мс — то есть 50 кадров в секунду ТОЛЬКО
+/// на заливку экрана. Отсюда правило «анимируем трансформации, а не содержимое», и отсюда же
+/// понятно, нужен ли WC-маппинг (PAT/MTRR).
+fn measure_fb(info: &sys::VideoInfo) -> u64 {
+    const PASSES: usize = 3;
+    let bytes_pp = info.bpp / 8;
+    let t0 = sys::monotonic_ns();
+    for _ in 0..PASSES {
+        for y in 0..info.height {
+            let mut dst = FB_VA + y * info.pitch;
+            for _ in 0..info.width {
+                unsafe { core::ptr::write_volatile(dst as *mut u32, 0) };
+                dst += bytes_pp;
+            }
+        }
+    }
+    let dt = sys::monotonic_ns().saturating_sub(t0).max(1);
+    let bytes = (PASSES * info.width * info.height * bytes_pp) as u64;
+    bytes * 1000 / dt // МБ/с ≈ байты/нс × 1000
 }
 
 /// Перенести кадр из RAM в фреймбуфер, упаковав пиксели в формат прошивки.

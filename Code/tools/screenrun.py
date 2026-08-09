@@ -1,33 +1,36 @@
 #!/usr/bin/env python3
-"""Прогон VOID с НАСТОЯЩИМ экраном + снимки кадра (Веха 114).
-
-Путь `-kernel` фреймбуфера не даёт, поэтому грузимся с GRUB-образа; ввод идёт в serial,
-а кадр снимается через монитор QEMU (`screendump`) и переводится в PNG без внешних зависимостей.
+"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кадра, клавиатура и мышь (Вехи 114–115).
 
 Зачем. Путь `cargo run` (-kernel, PVH) фреймбуфера НЕ даёт, поэтому графику VOID до сих пор
 смотрели только на железе. Оказалось, достаточно грузиться с GRUB-образа (`Code/boot/mkdisk.sh`)
-и снимать кадр монитором QEMU: получается настоящий 1280x800, который видно прямо в разработке.
-Для графической фазы (ADR 0007) это основной инструмент проверки.
+и снимать кадр из QEMU: получается настоящий 1280x800, который видно прямо в разработке.
+Для графической фазы (ADR 0007/0016) это основной инструмент проверки.
+
+Управление идёт по **QMP**, а не по человеческому монитору: HMP-команды `sendkey`/`mouse_move`
+в QEMU 11 до гостя не доходят (проверено — 8042 не получает ни байта), а `input-send-event`
+доходит. Текст в консоль по-прежнему шлём в serial: это ввод гостя, а не событие устройства.
 
 Сборка образа:
-    nix-shell -p grub2 mtools util-linux --run \
+    nix-shell -p grub2 mtools util-linux --run \\
       "Code/boot/mkdisk.sh Code/target/x86_64-unknown-none/release/void-kernel out.img 700"
 
 Использование: screenrun.py <образ.img> <сценарий.txt> <каталог-выхода>
 Строки сценария:
     sleep <сек>        — подождать
-    key <строка>       — послать строку в консоль гостя (с переводом строки)
+    key <строка>       — послать строку в консоль гостя (serial, с переводом строки)
+    mouse <dx> <dy>    — подвинуть мышь (относительное событие)
+    click <кнопка>     — нажать и отпустить (left / right / middle)
+    btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
     shot <имя>         — снять кадр в <каталог-выхода>/<имя>.png
 """
-import os, socket, struct, subprocess, sys, time, zlib
+import json, os, socket, struct, subprocess, sys, time, zlib
 
 img, script, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
 os.makedirs(outdir, exist_ok=True)
-# Путь к unix-сокету ограничен 108 байтами — каталог скратчпада длиннее, поэтому сокет
-# кладём в /tmp с коротким именем по pid.
-sock_path = f"/tmp/void-mon-{os.getpid()}.sock"
-if os.path.exists(sock_path):
-    os.unlink(sock_path)
+# Путь unix-сокета ограничен 108 байтами, а каталоги сборки длиннее — держим его в /tmp.
+qmp_path = f"/tmp/void-qmp-{os.getpid()}.sock"
+if os.path.exists(qmp_path):
+    os.unlink(qmp_path)
 
 qemu = [
     "qemu-system-x86_64", "-machine", "q35", "-m", "512M",
@@ -38,30 +41,45 @@ qemu = [
     "-device", "virtio-rng-pci,disable-legacy=on",
     "-display", "none",
     "-serial", "stdio",
-    "-monitor", f"unix:{sock_path},server,nowait",
+    "-qmp", f"unix:{qmp_path},server,nowait",
 ]
 log = open(os.path.join(outdir, "serial.log"), "wb")
 p = subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
 
-mon = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(50):
     try:
-        mon.connect(sock_path)
+        sock.connect(qmp_path)
         break
     except OSError:
         time.sleep(0.2)
 else:
     p.kill()
-    sys.exit("монитор QEMU не отвечает")
+    sys.exit("QMP не отвечает")
+qmp = sock.makefile("rw", encoding="utf-8", newline="\n")
+qmp.readline()  # приветствие
 
 
-def monitor(cmd):
-    mon.sendall((cmd + "\n").encode())
-    time.sleep(0.6)
-    try:
-        mon.recv(65536)
-    except OSError:
-        pass
+def call(execute, **args):
+    """Одна команда QMP. События (они приходят без `return`) пропускаем."""
+    qmp.write(json.dumps({"execute": execute, "arguments": args} if args
+                         else {"execute": execute}) + "\n")
+    qmp.flush()
+    for _ in range(20):
+        line = qmp.readline()
+        if not line:
+            return None
+        reply = json.loads(line)
+        if "event" not in reply:
+            return reply
+    return None
+
+
+call("qmp_capabilities")
+
+
+def rel(axis, value):
+    return {"type": "rel", "data": {"axis": axis, "value": value}}
 
 
 def ppm_to_png(src, dst):
@@ -95,21 +113,39 @@ try:
         elif cmd == "key":
             p.stdin.write((arg + "\n").encode())
             p.stdin.flush()
+        elif cmd == "mouse":
+            dx, dy = arg.split()
+            call("input-send-event", events=[rel("x", int(dx)), rel("y", int(dy))])
+        elif cmd == "click":
+            btn = arg.strip() or "left"
+            call("input-send-event", events=[{"type": "btn", "data": {"down": True, "button": btn}}])
+            time.sleep(0.3)
+            call("input-send-event", events=[{"type": "btn", "data": {"down": False, "button": btn}}])
+        elif cmd == "btn":
+            btn, _, state = arg.partition(" ")
+            call("input-send-event",
+                 events=[{"type": "btn",
+                          "data": {"down": state.strip() == "down", "button": btn}}])
         elif cmd == "shot":
             ppm = os.path.join(outdir, arg + ".ppm")
-            monitor(f"screendump {ppm}")
+            call("screendump", filename=ppm)
             for _ in range(30):
                 if os.path.exists(ppm) and os.path.getsize(ppm) > 1000:
                     break
                 time.sleep(0.3)
             w, ht = ppm_to_png(ppm, os.path.join(outdir, arg + ".png"))
-            print(f"снимок {arg}.png {w}×{ht}", flush=True)
+            print(f"снимок {arg}.png {w}x{ht}", flush=True)
         else:
             print("непонятная строка сценария:", line, file=sys.stderr)
 finally:
-    monitor("quit")
+    try:
+        call("quit")
+    except (BrokenPipeError, OSError):
+        pass  # гость уже выключился сам (`poweroff` в сценарии) — это норма
     time.sleep(1)
     if p.poll() is None:
         p.kill()
     log.close()
+    if os.path.exists(qmp_path):
+        os.unlink(qmp_path)
 print("готово")

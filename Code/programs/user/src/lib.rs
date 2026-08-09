@@ -110,6 +110,7 @@ const SYS_KILL: usize = 45;
 const SYS_OBJ_GC: usize = 46;
 const SYS_SLEEP: usize = 47;
 const SYS_PARENT: usize = 48;
+const SYS_MOUSE_READ: usize = 49;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -726,6 +727,52 @@ pub fn spawn_with_stdio(
         args.as_ptr() as usize, args.len(), stdio_cap, 0,
     ).0;
     (r != NO_CAP).then_some(r)
+}
+
+/// Одно событие мыши (Веха 115): смещение с прошлого события и состояние кнопок.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub dx: i16,
+    pub dy: i16,
+    /// бит0 — левая, бит1 — правая, бит2 — средняя.
+    pub buttons: u8,
+}
+
+impl MouseEvent {
+    pub fn left(&self) -> bool {
+        self.buttons & 1 != 0
+    }
+    pub fn right(&self) -> bool {
+        self.buttons & 2 != 0
+    }
+    pub fn middle(&self) -> bool {
+        self.buttons & 4 != 0
+    }
+}
+
+/// `SYS_MOUSE_READ` (Веха 115) — забрать накопившиеся события мыши. Доступно только ВЛАДЕЛЬЦУ
+/// ЭКРАНА: курсор существует лишь там, где есть чем его нарисовать.
+///
+/// Ядро отдаёт СОБЫТИЯ, а не положение курсора: где курсор, решает тот, кто рисует, — он знает
+/// границы экрана, ускорение и то, во что курсор упирается.
+pub fn mouse_read(out: &mut [MouseEvent]) -> usize {
+    const REC: usize = 6;
+    let mut raw = [0u8; 64 * REC];
+    let cap = out.len().min(raw.len() / REC) * REC;
+    let n = abi::syscall(SYS_MOUSE_READ, raw.as_mut_ptr() as usize, cap, 0, 0, 0, 0, 0).0;
+    if n == NO_CAP || n == 0 {
+        return 0;
+    }
+    let count = n / REC;
+    for (i, e) in out.iter_mut().enumerate().take(count) {
+        let b = &raw[i * REC..];
+        *e = MouseEvent {
+            dx: i16::from_le_bytes([b[0], b[1]]),
+            dy: i16::from_le_bytes([b[2], b[3]]),
+            buttons: b[4],
+        };
+    }
+    count
 }
 
 /// `SYS_PARENT(pid)` (Веха 114): чей это ребёнок. `None` — родителя нет или номер неверен.

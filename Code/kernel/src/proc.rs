@@ -634,6 +634,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
         arch::irq_mask_stdin(saved_sie);
     }
     while !arch::console_has_input()
+        && !arch::mouse_pending() // Веха 115: движение мыши — тоже повод проснуться
         && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
         && !NET_IRQ_PENDING.load(Ordering::Relaxed) // Веха 91: кадр разбудит сетевой сервер
         && !deadline.is_some_and(|d| arch::now_ticks() >= d)
@@ -646,6 +647,21 @@ fn wait_stdin(saved_sie: usize) -> bool {
         arch::irq_save_disable();
     }
     let mut t = TABLE.lock();
+    // Веха 115 — движение мыши будит тех же, кого будит клавиша: для реактора терминала это
+    // такое же событие ввода, и спать сквозь него значило бы двигать курсор рывками по таймеру.
+    if arch::mouse_pending() {
+        for i in 0..t.procs.len() {
+            if t.procs[i].state == State::RecvWait && t.procs[i].wake_on_key {
+                let f = &mut t.procs[i].frame;
+                f.set_ret(usize::MAX);
+                f.set_ret_at(2, 0);
+                f.advance();
+                t.procs[i].state = State::Runnable;
+                t.procs[i].futex_deadline = None;
+                t.procs[i].wake_on_key = false;
+            }
+        }
+    }
     if arch::console_has_input() {
         // Веха 86: момент пробуждения от ввода — хороший источник джиттера (интервалы между
         // нажатиями непредсказуемы для программ). Подмешиваем в пул энтропии.
@@ -2490,6 +2506,49 @@ fn syscall(t: &mut Table, cur: usize) {
                 .unwrap_or(usize::MAX);
             let f = &mut t.procs[cur].frame;
             f.set_ret(ppid);
+            f.advance();
+        }
+        // SYS_MOUSE_READ(buf, len) -> байт | MAX (Веха 115): забрать накопившиеся события мыши.
+        //
+        // Событие — 6 байт: dx (i16 LE), dy (i16 LE), кнопки (бит0 левая, бит1 правая, бит2
+        // средняя), и байт под будущее (колесо). Возвращается ЧИСЛО БАЙТ, чтобы читатель не
+        // гадал, сколько событий влезло.
+        //
+        // Право — ВЛАДЕНИЕ ЭКРАНОМ, а не отдельная capability. Довод простой: курсор существует
+        // только на экране, и тот, кто экраном не владеет, не может ни нарисовать его, ни
+        // осмысленно ответить на клик. Заодно это закрывает подслушивание: пока терминал держит
+        // экран, чужой процесс не прочитает, что человек делает мышью.
+        49 => {
+            let (buf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let mine = arch::video_owner() == Some(cur);
+            let result = if !mine {
+                usize::MAX
+            } else if !ensure_heap_range(t, cur, buf, len) {
+                usize::MAX
+            } else {
+                let mut off = 0usize;
+                while off + 6 <= len {
+                    let Some(e) = arch::mouse_pop() else { break };
+                    let bytes = [
+                        e.dx.to_le_bytes()[0], e.dx.to_le_bytes()[1],
+                        e.dy.to_le_bytes()[0], e.dy.to_le_bytes()[1],
+                        e.buttons, 0,
+                    ];
+                    let dst = unsafe { core::slice::from_raw_parts_mut((buf + off) as *mut u8, 6) };
+                    dst.copy_from_slice(&bytes);
+                    off += 6;
+                }
+                let lost = arch::mouse_take_lost();
+                if lost > 0 {
+                    println!("  [мышь] потеряно событий: {} (владелец не успевает читать)", lost);
+                }
+                off
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
             f.advance();
         }
         // SYS_LOG(on) -> 0: вкл/выкл подробный трейс ядра (vprintln — [ipc]/[obj]/[mm]/[exec]/…).

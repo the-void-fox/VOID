@@ -52,6 +52,32 @@ pub fn video_mode() -> Option<(usize, usize, usize)> {
 pub fn video_window() -> Option<(usize, usize)> {
     None
 }
+
+// ── мышь (Веха 115) ─────────────────────────────────────────────────────────
+//
+// На riscv (QEMU virt) нет ни PS/2-контроллера, ни экрана, куда двигать курсор. Заглушки
+// парные x86-версии: «событий нет» — честный ответ, а не ошибка.
+
+/// Одно событие мыши; поля повторяют x86-версию, чтобы `proc.rs` был один на обе арх.
+#[derive(Clone, Copy)]
+pub struct MouseEvent {
+    pub dx: i16,
+    pub dy: i16,
+    pub buttons: u8,
+}
+
+pub fn mouse_pop() -> Option<MouseEvent> {
+    None
+}
+pub fn mouse_pending() -> bool {
+    false
+}
+pub fn mouse_take_lost() -> usize {
+    0
+}
+pub fn mouse_present() -> bool {
+    false
+}
 pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
     (0, 0, 0, 0, [(0, 0); 3])
 }

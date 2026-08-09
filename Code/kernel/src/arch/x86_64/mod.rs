@@ -416,6 +416,69 @@ pub(super) fn rx_push(b: u8) {
 /// Сколько байт ввода потеряно переполнением кольца (забирается и обнуляется [`console_take_lost`]).
 static RX_LOST: AtomicUsize = AtomicUsize::new(0);
 
+// ── события мыши (Веха 115) ──────────────────────────────────────────────────
+//
+// Кольцо СОБЫТИЙ, а не «текущей позиции». Позицию курсора ядро не ведёт намеренно: где курсор,
+// решает владелец экрана (сегодня терминал, завтра композитор) — он знает границы, ускорение и
+// то, во что курсор упирается. Ядро сообщает лишь то, что произошло на проводе.
+//
+// Порядок событий сохраняется потому, что нажатие ОСМЫСЛЕННО ЛИШЬ ВМЕСТЕ с положением: свернув
+// поток в «сумму смещений плюс последние кнопки», мы бы получили клик не там, где он был.
+
+/// Одно событие: смещения и состояние кнопок (бит0 левая, бит1 правая, бит2 средняя).
+#[derive(Clone, Copy)]
+pub struct MouseEvent {
+    pub dx: i16,
+    pub dy: i16,
+    pub buttons: u8,
+}
+
+const MOUSE_CAP: usize = 128;
+static mut MOUSE_BUF: [MouseEvent; MOUSE_CAP] =
+    [MouseEvent { dx: 0, dy: 0, buttons: 0 }; MOUSE_CAP];
+static MOUSE_HEAD: AtomicUsize = AtomicUsize::new(0);
+static MOUSE_TAIL: AtomicUsize = AtomicUsize::new(0);
+static MOUSE_LOST: AtomicUsize = AtomicUsize::new(0);
+
+/// Положить событие (зовётся из обработчика/опроса с выключенными прерываниями).
+pub(super) fn mouse_push(dx: i16, dy: i16, buttons: u8) {
+    let head = MOUSE_HEAD.load(Ordering::Relaxed);
+    if head.wrapping_sub(MOUSE_TAIL.load(Ordering::Relaxed)) < MOUSE_CAP {
+        unsafe { MOUSE_BUF[head % MOUSE_CAP] = MouseEvent { dx, dy, buttons } };
+        MOUSE_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
+    } else {
+        // Переполнение значит, что владелец экрана не успевает читать. Молчать нельзя по той же
+        // причине, что и с вводом консоли (Веха 101): рывок курсора должен иметь объяснение.
+        MOUSE_LOST.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Забрать очередное событие.
+pub fn mouse_pop() -> Option<MouseEvent> {
+    let tail = MOUSE_TAIL.load(Ordering::Relaxed);
+    if tail == MOUSE_HEAD.load(Ordering::Relaxed) {
+        return None;
+    }
+    let e = unsafe { MOUSE_BUF[tail % MOUSE_CAP] };
+    MOUSE_TAIL.store(tail.wrapping_add(1), Ordering::Relaxed);
+    Some(e)
+}
+
+/// Есть ли непрочитанные события (для пробуждения спящего владельца экрана).
+pub fn mouse_pending() -> bool {
+    MOUSE_TAIL.load(Ordering::Relaxed) != MOUSE_HEAD.load(Ordering::Relaxed)
+}
+
+/// Есть ли рабочая PS/2-мышь (ответила на команды включения).
+pub fn mouse_present() -> bool {
+    ps2::mouse_present()
+}
+
+/// Забрать и обнулить счётчик потерянных событий.
+pub fn mouse_take_lost() -> usize {
+    MOUSE_LOST.swap(0, Ordering::Relaxed)
+}
+
 /// Веха 101 — верхняя граница НЕпригодной памяти ниже 4 ГиБ (ACPI reclaim/NVS/reserved из
 /// карты firmware). Нужна одному потребителю — direct-map, чтобы ядро могло ПРОЧИТАТЬ таблицы
 /// ACPI (иначе выключение машины упирается в page fault на первом же указателе).
@@ -567,6 +630,9 @@ pub fn init_device_interrupts() {
         outb(COM1 + 4, 0x0b); // MCR: DTR | RTS | OUT2
     }
     ioapic::route(1, trap::VEC_CONSOLE); // GSI1 — клавиатура PS/2 (общий вектор с COM1)
+    // Веха 115 — GSI12: мышь на том же контроллере 8042 и том же векторе. Обработчик один,
+    // `console_drain` разбирает, чей байт, по биту статуса.
+    ioapic::route(12, trap::VEC_CONSOLE);
     ps2::init();
 }
 
