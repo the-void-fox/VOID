@@ -463,6 +463,12 @@ struct Win {
     title: String,
     /// Копия пикселей клиента (RGBA), прочитанная по content-id.
     pixels: Vec<u8>,
+    /// Размер САМОЙ КОПИИ. Отдельно от назначенного размера окна (Веха 126.1): между «раскладка
+    /// решила, что окно теперь другое» и «клиент прислал новый кадр» проходит время, и всё это
+    /// время надо показывать СТАРУЮ картинку, растянув её. Раньше копия обнулялась сразу —
+    /// окно чернело, а при складывании в стопку это выглядело как артефакты.
+    bw: i32,
+    bh: i32,
     /// Что уже прочитано — чтобы не читать то же самое дважды.
     cid: [u8; 32],
     /// Отложенный ответ на `OP_EVENT` (клиент спит в `SYS_CALL`).
@@ -495,7 +501,13 @@ impl Win {
         self.dur = ms * 1_000_000;
     }
 
-    /// Продвинуть анимацию. `true` — движение ещё идёт.
+    /// Продвинуть анимацию. `true` — на этом кадре окно ДВИНУЛОСЬ (значит его старое и новое
+    /// места надо перерисовать).
+    ///
+    /// Отвечаем «двинулось» и на последнем шаге тоже. Веха 126.1: раньше последний шаг возвращал
+    /// `false`, и если анимация укладывалась в ОДИН кадр (кадр длиннее её срока — на медленной
+    /// машине или при заминке), окно молча перескакивало, ничего не пометив, а на старом месте
+    /// оставался его снимок. Именно это владелец видел, складывая окна в стопку.
     fn tick(&mut self, now: u64) -> bool {
         if self.dur == 0 {
             return false;
@@ -505,7 +517,6 @@ impl Win {
         if t >= 1024 {
             self.shown = self.to;
             self.dur = 0;
-            return false;
         }
         true
     }
@@ -896,7 +907,7 @@ impl Wm {
             let was = self.wins[i].shown.rect();
             let was = (was.0 - sc, was.1, was.2, was.3);
             if self.wins[i].tick(now) {
-                moving = true;
+                moving |= self.wins[i].dur != 0;
                 let r = self.wins[i].shown.rect();
                 self.damage(was.0, was.1, was.2, was.3);
                 self.damage(r.0 - sc, r.1, r.2, r.3);
@@ -1080,8 +1091,8 @@ impl Wm {
             let active = self.focus == Some(win.id);
             let border = self.unpack(self.pack(if active { C_ACCENT } else { C_BORDER }));
             let (cw, ch) = (fw - 2 * BORDER, fh - 2 * BORDER);
-            let src_row = (yy - fy - BORDER) * win.h / ch.max(1);
-            let has_content = !win.pixels.is_empty() && src_row >= 0 && src_row < win.h;
+            let src_row = (yy - fy - BORDER) * win.bh / ch.max(1);
+            let has_content = !win.pixels.is_empty() && src_row >= 0 && src_row < win.bh;
             // Расстояние до края нужно ТОЛЬКО у краёв. В середине окна ответ известен заранее,
             // а корень там стоил бы дороже всего остального вместе взятого: полноэкранная
             // перерисовка — это миллион пикселей, и миллион квадратных корней на кадр
@@ -1109,9 +1120,9 @@ impl Wm {
                     continue;
                 }
                 let content = if has_content && inner != 0 {
-                    let col = (xx - fx - BORDER) * win.w / cw.max(1);
-                    let p = ((src_row * win.w + col) * 4) as usize;
-                    if col >= 0 && col < win.w && p + 2 < win.pixels.len() {
+                    let col = (xx - fx - BORDER) * win.bw / cw.max(1);
+                    let p = ((src_row * win.bw + col) * 4) as usize;
+                    if col >= 0 && col < win.bw && p + 2 < win.pixels.len() {
                         (win.pixels[p], win.pixels[p + 1], win.pixels[p + 2])
                     } else {
                         border
@@ -1149,17 +1160,17 @@ impl Wm {
             let border = self.pack(if active { C_ACCENT } else { C_BORDER });
             let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
             // Строка ИСХОДНОГО окна, попавшая в эту строку экрана.
-            let sy = (yy - it.y) * (win.h + 2 * BORDER) / it.h - BORDER;
+            let sy = (yy - it.y) * (win.bh + 2 * BORDER) / it.h - BORDER;
             let edge_row = yy == it.y || yy == it.y + it.h - 1;
             for xx in it.x.max(x0)..(it.x + it.w).min(x1) {
                 let px = if edge_row || xx == it.x || xx == it.x + it.w - 1 {
                     border
-                } else if sy < 0 || sy >= win.h || win.pixels.is_empty() {
+                } else if sy < 0 || sy >= win.bh || win.pixels.is_empty() {
                     title_bg
                 } else {
-                    let sx = (xx - it.x) * (win.w + 2 * BORDER) / it.w - BORDER;
-                    let p = ((sy * win.w + sx) * 4) as usize;
-                    if sx >= 0 && sx < win.w && p + 2 < win.pixels.len() {
+                    let sx = (xx - it.x) * (win.bw + 2 * BORDER) / it.w - BORDER;
+                    let p = ((sy * win.bw + sx) * 4) as usize;
+                    if sx >= 0 && sx < win.bw && p + 2 < win.pixels.len() {
                         self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]))
                     } else {
                         title_bg
@@ -1294,8 +1305,7 @@ impl Wm {
             if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
                 self.wins[k].w = cw2;
                 self.wins[k].h = ch2;
-                // Копия пикселей больше не описывает окно — заводим новую по размеру.
-                self.wins[k].pixels = vec![0u8; (cw2 * ch2 * 4) as usize];
+                // Копию НЕ трогаем: пусть старая картинка тянется, пока клиент не перерисует.
                 self.wins[k].cid = [0u8; 32];
                 resized.push((id, cw2, ch2));
             }
@@ -1948,6 +1958,8 @@ impl Wm {
                     h,
                     title: String::from(title),
                     pixels: Vec::new(),
+                    bw: 0,
+                    bh: 0,
                     cid: [0u8; 32],
                     waiting: None,
                     inbox: Vec::new(),
@@ -1984,9 +1996,13 @@ impl Wm {
                     // адресации по содержимому: «перерисовал в то же самое» стоит ноль.
                     if self.wins[i].cid != cid {
                         self.wins[i].cid = cid;
+                        // Клиент рисует в НАЗНАЧЕННОМ размере — по его первому кадру после
+                        // смены размера копия и заводится заново.
                         let (ww, wh) = (self.wins[i].w, self.wins[i].h);
-                        if self.wins[i].pixels.len() != (ww * wh * 4) as usize {
+                        if self.wins[i].bw != ww || self.wins[i].bh != wh {
                             self.wins[i].pixels = vec![0u8; (ww * wh * 4) as usize];
+                            self.wins[i].bw = ww;
+                            self.wins[i].bh = wh;
                         }
                         let need = (rw * rh * 4) as usize;
                         // Буфер чтения ОДИН на всю сессию и только растёт (Веха 120.3). Раньше он
