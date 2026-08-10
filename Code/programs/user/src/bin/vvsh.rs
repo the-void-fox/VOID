@@ -2108,13 +2108,26 @@ keys = [\n\
 ]\n\
 \n\
 # Схема управления ОКНАМИ (mode = \"wm\"): умолчания как в niri.\n\
+# Модель — скроллируемый тайлинг: окна живут в КОЛОНКАХ на ленте, экран по ней ездит.\n\
 wm_keys = [\n\
-\x20 bind(\"wm\", \"Super+Return\", \"spawn-term\"),\n\
-\x20 bind(\"wm\", \"Super+Q\", \"close-window\"),\n\
-\x20 bind(\"wm\", \"Super+Tab\", \"focus-next\"),\n\
-\x20 bind(\"wm\", \"Super+L\", \"focus-next\"),\n\
-\x20 bind(\"wm\", \"Super+H\", \"focus-prev\"),\n\
-\x20 bind(\"wm\", \"Super+Shift+Q\", \"quit\"),\n\
+  bind(\"wm\", \"Super+Return\", \"spawn-term\"),\n\
+  bind(\"wm\", \"Super+Q\", \"close-window\"),\n\
+  bind(\"wm\", \"Super+H\", \"focus-column-left\"),\n\
+  bind(\"wm\", \"Super+L\", \"focus-column-right\"),\n\
+  bind(\"wm\", \"Super+Up\", \"focus-window-up\"),\n\
+  bind(\"wm\", \"Super+Down\", \"focus-window-down\"),\n\
+  bind(\"wm\", \"Super+Shift+H\", \"move-column-left\"),\n\
+  bind(\"wm\", \"Super+Shift+L\", \"move-column-right\"),\n\
+  bind(\"wm\", \"Super+Shift+Up\", \"move-window-up\"),\n\
+  bind(\"wm\", \"Super+Shift+Down\", \"move-window-down\"),\n\
+  bind(\"wm\", \"Super+BracketLeft\", \"move-to-column-left\"),\n\
+  bind(\"wm\", \"Super+BracketRight\", \"move-to-column-right\"),\n\
+  bind(\"wm\", \"Super+R\", \"width-next\"),\n\
+  bind(\"wm\", \"Super+Equal\", \"width-plus\"),\n\
+  bind(\"wm\", \"Super+Minus\", \"width-minus\"),\n\
+  bind(\"wm\", \"Super+F\", \"maximize-column\"),\n\
+  bind(\"wm\", \"Super+Tab\", \"focus-next\"),\n\
+  bind(\"wm\", \"Super+Shift+Q\", \"quit\"),\n\
 ]\n\
 \n\
 netcap = if net { \"endpoint:net-srv\" } else { [] }\n\

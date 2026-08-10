@@ -75,8 +75,20 @@ const BORDER: i32 = 1;
 const DEFAULT_BINDS: &str = "\
 bind wm Super+Return spawn-term
 bind wm Super+Q close-window
-bind wm Super+L focus-next
-bind wm Super+H focus-prev
+bind wm Super+H focus-column-left
+bind wm Super+L focus-column-right
+bind wm Super+Up focus-window-up
+bind wm Super+Down focus-window-down
+bind wm Super+Shift+H move-column-left
+bind wm Super+Shift+L move-column-right
+bind wm Super+Shift+Up move-window-up
+bind wm Super+Shift+Down move-window-down
+bind wm Super+BracketLeft move-to-column-left
+bind wm Super+BracketRight move-to-column-right
+bind wm Super+R width-next
+bind wm Super+Equal width-plus
+bind wm Super+Minus width-minus
+bind wm Super+F maximize-column
 bind wm Super+Tab focus-next
 bind wm Super+Shift+Q quit
 ";
@@ -116,6 +128,11 @@ fn parse_combo(tok: &str) -> Option<(u16, u8)> {
         "PageUp" => 0x116,
         "PageDown" => 0x117,
         "Space" => b' ' as u16,
+        // Имена как в конфиге niri: `=` и `-` в строке аккорда путались бы с разделителем `+`.
+        "Equal" => b'=' as u16,
+        "Minus" => b'-' as u16,
+        "BracketLeft" => b'[' as u16,
+        "BracketRight" => b']' as u16,
         s => {
             let c = s.chars().next()?;
             if s.chars().count() != 1 {
@@ -202,7 +219,9 @@ fn main_loop() -> ! {
         next_id: 1,
         cursor: (info.width as i32 / 2, info.height as i32 / 2),
         buttons: 0,
-        drag: None,
+        cols: Vec::new(),
+        cur: 0,
+        scroll_x: 0,
         focus: None,
         transient: 0,
         damage: Vec::new(),
@@ -262,7 +281,7 @@ fn main_loop() -> ! {
         if kn > 0 {
             worked = true;
             for e in &kev[..kn] {
-                wm.key_event(e, &binds, store, me, &mut font);
+                wm.key_event(e, &binds, store, me);
             }
         }
 
@@ -330,15 +349,39 @@ impl Win {
     }
 }
 
+/// Колонка ленты (Веха 121): окна одно под другим плюс ширина колонки.
+///
+/// Модель — скроллируемый тайлинг niri ([[wm-keys]]): окна живут в колонках на бесконечной ленте,
+/// экран — окно просмотра, которое по ней ездит. Плавающие окна остаются исключением, а не
+/// основой; сегодня их нет вовсе.
+struct Column {
+    /// Идентификаторы окон сверху вниз.
+    ids: Vec<u32>,
+    /// Индекс в [`WIDTHS`].
+    width: usize,
+    /// Какое окно колонки в фокусе.
+    focus: usize,
+}
+
+/// Пресеты ширины колонки — доли экрана. Те же, что у владельца в niri.
+const WIDTHS: [(i32, i32); 4] = [(1, 3), (1, 2), (2, 3), (1, 1)];
+
+/// Зазор между окнами и до края экрана.
+const GAP: i32 = 8;
+
 struct Wm {
     info: sys::VideoInfo,
     /// Порядок = z-order: последнее окно рисуется поверх и получает клики первым.
     wins: Vec<Win>,
+    /// Лента колонок слева направо.
+    cols: Vec<Column>,
+    /// Колонка в фокусе.
+    cur: usize,
+    /// Сдвиг ленты относительно экрана: лента длиннее экрана, экран по ней ездит.
+    scroll_x: i32,
     next_id: u32,
     cursor: (i32, i32),
     buttons: u8,
-    /// Тащим окно: (индекс, смещение курсора от угла рамки).
-    drag: Option<(usize, i32, i32)>,
     focus: Option<u32>,
     /// Сколько байт временных буферов прочитано с прошлой уборки (см. `OP_ATTACH`).
     transient: usize,
@@ -653,6 +696,125 @@ impl Wm {
         }
     }
 
+    // ── раскладка колонками (Веха 121) ─────────────────────────────────────────────────────
+
+    fn win_at(&self, id: u32) -> Option<usize> {
+        self.wins.iter().position(|w| w.id == id)
+    }
+
+    /// Ширина колонки в пикселях по её пресету.
+    fn col_width(&self, c: &Column) -> i32 {
+        let (n, d) = WIDTHS[c.width.min(WIDTHS.len() - 1)];
+        (self.info.width as i32 - GAP) * n / d - GAP
+    }
+
+    /// Пересчитать геометрию всех окон и прокрутку ленты; всем, у кого размер изменился, послать
+    /// `EV_RESIZE`.
+    ///
+    /// Один пересчёт на любое изменение — вместо правки координат в каждом действии. Так
+    /// «переехала колонка», «сменилась ширина», «закрылось окно» и «появилось новое» не могут
+    /// разойтись в понимании того, где что лежит.
+    fn relayout(&mut self) {
+        let screen_h = self.info.height as i32;
+        // Сначала — куда уехала лента. Колонка в фокусе обязана быть видна целиком; если она шире
+        // экрана, показываем её левый край.
+        let mut x = GAP;
+        let mut starts: Vec<(i32, i32)> = Vec::new(); // (x, ширина)
+        for c in &self.cols {
+            let w = self.col_width(c);
+            starts.push((x, w));
+            x += w + GAP;
+        }
+        if let Some(&(cx, cw)) = starts.get(self.cur) {
+            let view = self.info.width as i32;
+            if cx - self.scroll_x < GAP {
+                self.scroll_x = cx - GAP;
+            }
+            if cx + cw - self.scroll_x > view - GAP {
+                self.scroll_x = cx + cw - view + GAP;
+            }
+        }
+        if self.cols.is_empty() {
+            self.scroll_x = 0;
+        }
+
+        let mut resized: Vec<(u32, i32, i32)> = Vec::new();
+        for (ci, c) in self.cols.iter().enumerate() {
+            let (cx, cw) = starts[ci];
+            let n = c.ids.len().max(1) as i32;
+            // Высота делится поровну; остаток отдаём последнему окну, чтобы низ был ровным.
+            let cell = (screen_h - GAP) / n - GAP;
+            for (wi, id) in c.ids.iter().enumerate() {
+                let Some(k) = self.win_at(*id) else { continue };
+                let y = GAP + wi as i32 * (cell + GAP);
+                let h = if wi + 1 == c.ids.len() { screen_h - GAP - y } else { cell };
+                // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
+                let (cw2, ch2) = (cw - 2 * BORDER, h - TITLE_H - 2 * BORDER);
+                let (cw2, ch2) = (cw2.max(32), ch2.max(32));
+                self.wins[k].x = cx - self.scroll_x;
+                self.wins[k].y = y;
+                if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
+                    self.wins[k].w = cw2;
+                    self.wins[k].h = ch2;
+                    // Копия пикселей больше не описывает окно — заводим новую по размеру.
+                    self.wins[k].pixels = vec![0u8; (cw2 * ch2 * 4) as usize];
+                    self.wins[k].cid = [0u8; 32];
+                    resized.push((*id, cw2, ch2));
+                }
+            }
+        }
+        for (id, w, h) in resized {
+            if let Some(k) = self.win_at(id) {
+                let ev = [win::EV_RESIZE, w as u8, (w >> 8) as u8, h as u8, (h >> 8) as u8, 0, 0, 0];
+                self.send(k, ev, 5);
+            }
+        }
+        self.damage(0, 0, self.info.width as i32, screen_h);
+    }
+
+    /// Колонка и место окна в ней.
+    fn locate(&self, id: u32) -> Option<(usize, usize)> {
+        self.cols
+            .iter()
+            .enumerate()
+            .find_map(|(ci, c)| c.ids.iter().position(|&x| x == id).map(|wi| (ci, wi)))
+    }
+
+    /// Окно в фокусе по нынешней колонке.
+    fn focused_id(&self) -> Option<u32> {
+        let c = self.cols.get(self.cur)?;
+        c.ids.get(c.focus.min(c.ids.len().saturating_sub(1))).copied()
+    }
+
+    /// Синхронизировать `focus` с раскладкой и перерисовать обводку обоих окон.
+    fn sync_focus(&mut self) {
+        let was = self.focus;
+        self.focus = self.focused_id();
+        if was == self.focus {
+            return;
+        }
+        for id in [was, self.focus].into_iter().flatten() {
+            if let Some(k) = self.win_at(id) {
+                self.damage_chrome(k);
+            }
+        }
+    }
+
+    /// Убрать окно из ленты; пустая колонка исчезает.
+    fn unlink(&mut self, id: u32) {
+        if let Some((ci, wi)) = self.locate(id) {
+            self.cols[ci].ids.remove(wi);
+            if self.cols[ci].ids.is_empty() {
+                self.cols.remove(ci);
+                if self.cur >= self.cols.len() {
+                    self.cur = self.cols.len().saturating_sub(1);
+                }
+            } else if self.cols[ci].focus >= self.cols[ci].ids.len() {
+                self.cols[ci].focus = self.cols[ci].ids.len() - 1;
+            }
+        }
+    }
+
     /// Перерисовать только ОБВОДКУ окна: рамку и титульную полосу.
     ///
     /// Смена фокуса меняет ровно их. Перерисовывать ради цвета рамки всё окно значит переписать
@@ -692,49 +854,24 @@ impl Wm {
         let was = self.buttons;
         self.buttons = e.buttons;
 
-        // Нажатие: поднять окно, начать перетаскивание за титульную полосу.
+        // Нажатие: выбрать окно под курсором. Перетаскивания в тайлинге нет — место окна
+        // задаёт раскладка, а не рука; плавающий режим остаётся исключением на будущее
+        // ([[wm-keys]]), и тащить окно понадобится ровно там.
         if was == 0 && e.buttons != 0 {
-            let hit = self.wins.iter().rposition(|w| w.hit_frame(self.cursor.0, self.cursor.1));
-            let lost = self.focus;
-            match hit {
-                Some(i) => {
-                    // Фокус меняем ДО перерисовки: рамка и заголовок рисуются по нему, и
-                    // порядок наоборот давал подсветку, отставшую на одно нажатие.
-                    let id = self.wins[i].id;
-                    self.focus = Some(id);
-                    self.raise(i);
-                    let i = self.wins.len() - 1; // после подъёма окно последнее
-                    if self.wins[i].hit_title(self.cursor.0, self.cursor.1) {
-                        self.drag =
-                            Some((i, self.cursor.0 - self.wins[i].x, self.cursor.1 - self.wins[i].y));
-                    }
-                    self.unfocus_repaint(lost, Some(id));
-                }
-                None => {
-                    self.focus = None;
-                    self.unfocus_repaint(lost, None);
+            if let Some(i) = self.wins.iter().position(|w| w.hit_frame(self.cursor.0, self.cursor.1))
+            {
+                let id = self.wins[i].id;
+                if let Some((ci, wi)) = self.locate(id) {
+                    self.cur = ci;
+                    self.cols[ci].focus = wi;
+                    self.sync_focus();
+                    self.relayout();
                 }
             }
         }
-        if e.buttons == 0 {
-            self.drag = None;
-        }
 
-        // Перетаскивание — два прямоугольника: старое место и новое. Клиент об этом не знает
-        // вовсе: его пиксели уже у нас, перерисовывать ему нечего.
-        if let Some((i, gx, gy)) = self.drag {
-            let (ox, oy, ow, oh) = self.wins[i].frame();
-            self.wins[i].x = self.cursor.0 - gx;
-            self.wins[i].y = self.cursor.1 - gy;
-            let (nx, ny, nw, nh) = self.wins[i].frame();
-            // Старое место и новое: при мелком шаге они пересекаются, и `damage` сольёт их в
-            // одну область — то есть окно, переехавшее на три пикселя, стоит одной перерисовки.
-            self.damage(ox, oy, ow, oh);
-            self.damage(nx, ny, nw, nh);
-        } else {
-            // Просто движение — стереть курсор со старого места (на новом его нарисует flush).
-            self.damage(old.0, old.1, CUR_W, CUR_H);
-        }
+        // Движение — стереть курсор со старого места (на новом его нарисует flush).
+        self.damage(old.0, old.1, CUR_W, CUR_H);
 
         // Событие окну под курсором.
         if let Some(i) = self.wins.iter().rposition(|w| w.hit_frame(self.cursor.0, self.cursor.1)) {
@@ -756,10 +893,7 @@ impl Wm {
     ///
     /// Порядок принципиален: `Super+Q` не должен доехать до программы буквой `q`. Отпускания
     /// клавиш окну не отдаём вовсе — программам нужен текст, а не состояние клавиатуры.
-    fn key_event(
-        &mut self, e: &sys::KeyEvent, binds: &[Bind], store: usize, me: usize,
-        font: &mut BitmapFont,
-    ) {
+    fn key_event(&mut self, e: &sys::KeyEvent, binds: &[Bind], store: usize, me: usize) {
         if !e.down {
             return;
         }
@@ -795,20 +929,115 @@ impl Wm {
                     }
                 }
             }
-            "focus-next" | "focus-prev" => {
-                if self.wins.is_empty() {
+            // ── навигация по ленте (Веха 121) ──
+            "focus-column-left" | "focus-column-right" => {
+                if self.cols.is_empty() {
                     return;
                 }
-                let cur = self
-                    .focus
-                    .and_then(|id| self.wins.iter().position(|w| w.id == id))
-                    .unwrap_or(0);
-                let n = self.wins.len();
-                let next = if name == "focus-next" { (cur + 1) % n } else { (cur + n - 1) % n };
-                let lost = self.focus;
-                self.focus = Some(self.wins[next].id);
-                self.raise(next);
-                self.unfocus_repaint(lost, self.focus);
+                let last = self.cols.len() - 1;
+                self.cur = if name.ends_with("right") {
+                    (self.cur + 1).min(last)
+                } else {
+                    self.cur.saturating_sub(1)
+                };
+                self.sync_focus();
+                self.relayout();
+            }
+            "focus-window-up" | "focus-window-down" => {
+                let Some(c) = self.cols.get_mut(self.cur) else { return };
+                if c.ids.is_empty() {
+                    return;
+                }
+                let last = c.ids.len() - 1;
+                c.focus = if name.ends_with("down") {
+                    (c.focus + 1).min(last)
+                } else {
+                    c.focus.saturating_sub(1)
+                };
+                self.sync_focus();
+            }
+            // Переносить колонку целиком — это МЕНЯТЬ ЕЁ МЕСТО В ЛЕНТЕ, а не двигать пиксели.
+            "move-column-left" | "move-column-right" => {
+                if self.cols.len() < 2 {
+                    return;
+                }
+                let to = if name.ends_with("right") {
+                    (self.cur + 1).min(self.cols.len() - 1)
+                } else {
+                    self.cur.saturating_sub(1)
+                };
+                if to != self.cur {
+                    self.cols.swap(self.cur, to);
+                    self.cur = to;
+                }
+                self.relayout();
+            }
+            "move-window-up" | "move-window-down" => {
+                let Some(c) = self.cols.get_mut(self.cur) else { return };
+                if c.ids.len() < 2 {
+                    return;
+                }
+                let to = if name.ends_with("down") {
+                    (c.focus + 1).min(c.ids.len() - 1)
+                } else {
+                    c.focus.saturating_sub(1)
+                };
+                if to != c.focus {
+                    c.ids.swap(c.focus, to);
+                    c.focus = to;
+                }
+                self.relayout();
+            }
+            // Окно из своей колонки — в соседнюю (или в новую с краю ленты).
+            "move-to-column-left" | "move-to-column-right" => {
+                let Some(id) = self.focused_id() else { return };
+                let right = name.ends_with("right");
+                let ci = self.cur;
+                self.unlink(id);
+                let to = if right { ci + 1 } else { ci.saturating_sub(1) };
+                if to >= self.cols.len() || (right && to == ci) {
+                    self.cols.insert(to.min(self.cols.len()), Column { ids: vec![id], width: 1, focus: 0 });
+                    self.cur = to.min(self.cols.len() - 1);
+                } else {
+                    self.cols[to].ids.push(id);
+                    self.cols[to].focus = self.cols[to].ids.len() - 1;
+                    self.cur = to;
+                }
+                self.sync_focus();
+                self.relayout();
+            }
+            "width-next" => {
+                if let Some(c) = self.cols.get_mut(self.cur) {
+                    c.width = (c.width + 1) % WIDTHS.len();
+                }
+                self.relayout();
+            }
+            "width-plus" | "width-minus" => {
+                if let Some(c) = self.cols.get_mut(self.cur) {
+                    c.width = if name.ends_with("plus") {
+                        (c.width + 1).min(WIDTHS.len() - 1)
+                    } else {
+                        c.width.saturating_sub(1)
+                    };
+                }
+                self.relayout();
+            }
+            "maximize-column" => {
+                if let Some(c) = self.cols.get_mut(self.cur) {
+                    // Развернуть — это переключатель: второе нажатие возвращает половину экрана.
+                    c.width = if c.width == WIDTHS.len() - 1 { 1 } else { WIDTHS.len() - 1 };
+                }
+                self.relayout();
+            }
+            "focus-next" | "focus-prev" => {
+                if self.cols.is_empty() {
+                    return;
+                }
+                // По ленте по кругу: пока обзора окон нет, `Super+Tab` — это «следующее окно».
+                let n = self.cols.len();
+                self.cur = if name == "focus-next" { (self.cur + 1) % n } else { (self.cur + n - 1) % n };
+                self.sync_focus();
+                self.relayout();
             }
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
@@ -829,13 +1058,11 @@ impl Wm {
                 i += 1;
                 continue;
             }
-            let rect = self.wins[i].frame();
             let id = self.wins[i].id;
             self.wins.remove(i);
-            if self.focus == Some(id) {
-                self.focus = self.wins.last().map(|w| w.id);
-            }
-            self.damage(rect.0, rect.1, rect.2, rect.3);
+            self.unlink(id);
+            self.sync_focus();
+            self.relayout();
         }
     }
 
@@ -848,19 +1075,6 @@ impl Wm {
         if let Some(i) = self.wins.iter().position(|w| w.id == id) {
             self.damage_chrome(i); // погасла только рамка — содержимое окна не менялось
         }
-    }
-
-    /// Поднять окно на верх стопки.
-    fn raise(&mut self, i: usize) {
-        if i + 1 == self.wins.len() {
-            // Уже наверху: перекрытия не изменились, мог смениться только фокус — значит рамка.
-            self.damage_chrome(i);
-            return;
-        }
-        let rect = self.wins[i].frame();
-        let w = self.wins.remove(i);
-        self.wins.push(w);
-        self.damage(rect.0, rect.1, rect.2, rect.3);
     }
 
     /// Отдать событие клиенту: сразу, если он ждёт, иначе в очередь.
@@ -913,11 +1127,16 @@ impl Wm {
                     waiting: None,
                     inbox: Vec::new(),
                 };
-                let rect = win.frame();
                 self.wins.push(win);
-                self.focus = Some(id);
+                // Новое окно — НОВАЯ КОЛОНКА справа от текущей: так работает niri, и так же
+                // ведёт себя лента при `Super+Return`. Класть его в текущую колонку значило бы
+                // делить экран по вертикали без просьбы.
+                let at = if self.cols.is_empty() { 0 } else { self.cur + 1 };
+                self.cols.insert(at, Column { ids: vec![id], width: 1, focus: 0 });
+                self.cur = at;
                 sys::reply(m.reply_cap, &id.to_le_bytes());
-                self.damage(rect.0, rect.1, rect.2, rect.3);
+                self.sync_focus();
+                self.relayout();
             }
             win::OP_ATTACH => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -1061,9 +1280,10 @@ impl Wm {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 sys::reply(m.reply_cap, &[]);
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                    let rect = self.wins[i].frame();
                     self.wins.remove(i);
-                    self.damage(rect.0, rect.1, rect.2, rect.3);
+                    self.unlink(id);
+                    self.sync_focus();
+                    self.relayout();
                 }
             }
             // Чужой запрос — ответить пусто, а не молчать: молчание повесило бы вызвавшего.

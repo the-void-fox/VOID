@@ -856,7 +856,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Веха 118 — есть композитор? Тогда мы ОКНО, а не владелец экрана. Решение принимается
     // здесь и больше нигде: дальше по коду разница видна только в том, куда лёг кадр.
     let store = store_cap().unwrap_or(sys::NO_CAP);
-    let (mut out, info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
+    let (mut out, mut info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
         Some(win) => {
             log_line("term: работаю окном композитора");
             // Кадр окна — RGBA по строкам без выравнивания; описываем его теми же полями, что
@@ -943,6 +943,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         // ── 0. события окна (Веха 118) ─────────────────────────────────────────────────────
         // Опрашиваем НЕ блокируясь: у нас свой реактор — панели ждут ответов, и уснуть в чужом
         // вызове мы не имеем права.
+        let mut new_size: Option<(usize, usize)> = None;
         if let Out::Window { win, .. } = &out {
             while let Some(ev) = win.poll_event() {
                 worked = true;
@@ -953,8 +954,33 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                         win.destroy();
                         sys::exit(0);
                     }
+                    // Размер назначает раскладка (Веха 121). Событий может прийти несколько
+                    // подряд — берём последнее: промежуточные размеры рисовать незачем.
+                    sys::win::Event::Resize { w, h } => new_size = Some((w as usize, h as usize)),
                     _ => {}
                 }
+            }
+        }
+        if let Some((w, h)) = new_size {
+            // Меняется ВСЁ, что считалось от размера: кадр, поверхность рендера, число
+            // знакомест, раскладка панелей и гриды. Ровно то же делает перечитывание конфига
+            // при смене кегля — поэтому путь общий.
+            info.width = w;
+            info.height = h;
+            info.pitch = w * 4;
+            if let Out::Window { buf, win, .. } = &mut out {
+                buf.clear();
+                buf.resize(w * h * 4, 0);
+                win.width = w as u16;
+                win.height = h as u16;
+            }
+            if let Some(v) = View::build(&conf, &info) {
+                view = v;
+                rects = layout_of(&tree, view.cols, view.rows);
+                resize_all(&mut panes, &rects);
+                prev_cells = Vec::new(); // прошлого кадра больше нет — рисуем всё заново
+                redraw = true;
+                worked = true;
             }
         }
 
