@@ -95,6 +95,24 @@ bind wm Super+Equal width-plus
 bind wm Super+Minus width-minus
 bind wm Super+F maximize-column
 bind wm Super+Tab focus-next
+bind wm Super+1 workspace-1
+bind wm Super+2 workspace-2
+bind wm Super+3 workspace-3
+bind wm Super+4 workspace-4
+bind wm Super+5 workspace-5
+bind wm Super+6 workspace-6
+bind wm Super+7 workspace-7
+bind wm Super+8 workspace-8
+bind wm Super+9 workspace-9
+bind wm Super+Shift+1 move-to-workspace-1
+bind wm Super+Shift+2 move-to-workspace-2
+bind wm Super+Shift+3 move-to-workspace-3
+bind wm Super+Shift+4 move-to-workspace-4
+bind wm Super+Shift+5 move-to-workspace-5
+bind wm Super+Shift+6 move-to-workspace-6
+bind wm Super+Shift+7 move-to-workspace-7
+bind wm Super+Shift+8 move-to-workspace-8
+bind wm Super+Shift+9 move-to-workspace-9
 bind wm Super+Shift+Q quit
 ";
 
@@ -149,6 +167,13 @@ fn parse_combo(tok: &str) -> Option<(u16, u8)> {
         }
     };
     Some((sym, mods))
+}
+
+/// Номер рабочего стола из имени действия (`workspace-3` → 2). Считаем от нуля внутри, от
+/// единицы снаружи: на клавиатуре нет нулевого стола.
+fn digit(name: &str) -> Option<usize> {
+    let d = name.rsplit('-').next()?.parse::<usize>().ok()?;
+    (1..=SPACES).contains(&d).then_some(d - 1)
 }
 
 /// Собрать раскладку: строки `bind wm …` из конфига поколения, иначе зашитая схема.
@@ -241,6 +266,8 @@ fn main_loop() -> ! {
         damage: Vec::new(),
         scratch: Vec::new(),
         readbuf: Vec::new(),
+        spaces: (0..SPACES).map(|_| Space::default()).collect(),
+        space: 0,
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -357,6 +384,9 @@ struct Win {
     waiting: Option<usize>,
     /// События, накопленные до того, как клиент спросил.
     inbox: Vec<[u8; 8]>,
+    /// Лежит ли окно на АКТИВНОМ рабочем столе (Веха 122). Окно с чужого стола живо, помнит
+    /// свои пиксели и продолжает работать — его просто не видно и не потрогать.
+    visible: bool,
 }
 
 impl Win {
@@ -392,6 +422,22 @@ struct Column {
     focus: usize,
 }
 
+/// Отложенный рабочий стол: его лента ждёт своей очереди (Веха 122).
+///
+/// АКТИВНЫЙ стол живёт прямо в полях [`Wm`], а остальные — здесь. Так вся раскладка работает с
+/// одной лентой и не знает про столы вовсе; переключение — это обмен лентами, и он в одном месте.
+#[derive(Default)]
+struct Space {
+    cols: Vec<Column>,
+    cur: usize,
+    scroll_x: i32,
+}
+
+/// Сколько рабочих столов. Девять, потому что столько цифр на клавиатуре — у владельца в niri
+/// `Super+1…9`. Динамические столы niri (создаются по мере надобности) отложены: сначала должен
+/// появиться обзор, иначе про существование стола №7 узнать неоткуда.
+const SPACES: usize = 9;
+
 /// Пресеты ширины колонки — доли экрана. Те же, что у владельца в niri.
 const WIDTHS: [(i32, i32); 4] = [(1, 3), (1, 2), (2, 3), (1, 1)];
 
@@ -421,6 +467,10 @@ struct Wm {
     scratch: Vec<u32>,
     /// Буфер чтения объекта клиента: один на сессию, только растёт (см. `OP_ATTACH`).
     readbuf: Vec<u8>,
+    /// Неактивные рабочие столы (активный — в полях выше).
+    spaces: Vec<Space>,
+    /// Номер активного стола.
+    space: usize,
 }
 
 /// Потолок списка повреждений. Список нужен, чтобы движение курсора в углу не тянуло за собой
@@ -636,7 +686,8 @@ impl Wm {
         let mut titles: Vec<(i32, i32, bool, usize)> = Vec::new();
         for i in 0..self.wins.len() {
             let (fx, fy, fw, fh) = self.wins[i].frame();
-            if intersect((fx, fy, fw, fh), (x0, y0, w, h)).is_some()
+            if self.wins[i].visible
+                && intersect((fx, fy, fw, fh), (x0, y0, w, h)).is_some()
                 && fy + 3 < y0 + h
                 && fy + 3 + 16 > y0
             {
@@ -671,6 +722,9 @@ impl Wm {
         let x1 = x0 + out.len() as i32;
 
         for win in &self.wins {
+            if !win.visible {
+                continue;
+            }
             let (fx, fy, fw, fh) = win.frame();
             if yy < fy || yy >= fy + fh {
                 continue;
@@ -745,6 +799,12 @@ impl Wm {
     /// разойтись в понимании того, где что лежит.
     fn relayout(&mut self) {
         let screen_h = self.info.height as i32;
+        // Видно ровно то, что лежит на активном столе. Считаем это здесь, а не при
+        // переключении: раскладка и так обходит все окна активной ленты — второй список
+        // «кто виден» разошёлся бы с первым при первой же правке.
+        for w in self.wins.iter_mut() {
+            w.visible = false;
+        }
         // Сначала — куда уехала лента. Колонка в фокусе обязана быть видна целиком; если она шире
         // экрана, показываем её левый край.
         let mut x = GAP;
@@ -775,6 +835,7 @@ impl Wm {
             let cell = (screen_h - GAP) / n - GAP;
             for (wi, id) in c.ids.iter().enumerate() {
                 let Some(k) = self.win_at(*id) else { continue };
+                self.wins[k].visible = true;
                 let y = GAP + wi as i32 * (cell + GAP);
                 let h = if wi + 1 == c.ids.len() { screen_h - GAP - y } else { cell };
                 // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
@@ -829,8 +890,26 @@ impl Wm {
         }
     }
 
-    /// Убрать окно из ленты; пустая колонка исчезает.
+    /// Убрать окно из ленты ЛЮБОГО стола; пустая колонка исчезает.
+    ///
+    /// Ищем везде, а не только на активном: программа с соседнего стола вправе завершиться, и
+    /// её окно обязано исчезнуть оттуда, а не остаться призраком до перехода на тот стол.
     fn unlink(&mut self, id: u32) {
+        for sp in self.spaces.iter_mut() {
+            for ci in (0..sp.cols.len()).rev() {
+                if let Some(wi) = sp.cols[ci].ids.iter().position(|&x| x == id) {
+                    sp.cols[ci].ids.remove(wi);
+                    if sp.cols[ci].ids.is_empty() {
+                        sp.cols.remove(ci);
+                        if sp.cur >= sp.cols.len() {
+                            sp.cur = sp.cols.len().saturating_sub(1);
+                        }
+                    } else if sp.cols[ci].focus >= sp.cols[ci].ids.len() {
+                        sp.cols[ci].focus = sp.cols[ci].ids.len() - 1;
+                    }
+                }
+            }
+        }
         if let Some((ci, wi)) = self.locate(id) {
             self.cols[ci].ids.remove(wi);
             if self.cols[ci].ids.is_empty() {
@@ -887,7 +966,7 @@ impl Wm {
         // задаёт раскладка, а не рука; плавающий режим остаётся исключением на будущее
         // ([[wm-keys]]), и тащить окно понадобится ровно там.
         if was == 0 && e.buttons != 0 {
-            if let Some(i) = self.wins.iter().position(|w| w.hit_frame(self.cursor.0, self.cursor.1))
+            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1))
             {
                 let id = self.wins[i].id;
                 if let Some((ci, wi)) = self.locate(id) {
@@ -903,7 +982,7 @@ impl Wm {
         // Только на ДВИЖЕНИИ: иначе всплывшее под неподвижным курсором окно перехватывало бы
         // фокус у того, с кем человек работает.
         if (e.dx != 0 || e.dy != 0) && self.buttons == 0 {
-            if let Some(i) = self.wins.iter().position(|w| w.hit_frame(self.cursor.0, self.cursor.1))
+            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1))
             {
                 let id = self.wins[i].id;
                 if self.focus != Some(id) {
@@ -928,7 +1007,7 @@ impl Wm {
         self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
 
         // Событие окну под курсором.
-        if let Some(i) = self.wins.iter().rposition(|w| w.hit_frame(self.cursor.0, self.cursor.1)) {
+        if let Some(i) = self.wins.iter().rposition(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1)) {
             let (ox, oy) = self.wins[i].content_at();
             let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
             if was != e.buttons {
@@ -1089,6 +1168,42 @@ impl Wm {
             // помощь.
             "focus-next" => self.action("focus-column-right", store, me),
             "focus-prev" => self.action("focus-column-left", store, me),
+            // ── рабочие столы (Веха 122) ──
+            //
+            // Переключение — это ОБМЕН ЛЕНТАМИ: активная уходит в хранилище, оттуда приходит
+            // другая. Вся раскладка продолжает работать с одной лентой и про столы не знает.
+            _ if name.starts_with("workspace-") => {
+                let Some(n) = digit(name) else { return };
+                if n == self.space {
+                    return;
+                }
+                self.spaces[self.space] = Space {
+                    cols: core::mem::take(&mut self.cols),
+                    cur: self.cur,
+                    scroll_x: self.scroll_x,
+                };
+                let s = core::mem::take(&mut self.spaces[n]);
+                self.cols = s.cols;
+                self.cur = s.cur;
+                self.scroll_x = s.scroll_x;
+                self.space = n;
+                self.sync_focus();
+                self.relayout();
+            }
+            _ if name.starts_with("move-to-workspace-") => {
+                let Some(n) = digit(name) else { return };
+                let Some(id) = self.focused_id() else { return };
+                if n == self.space {
+                    return;
+                }
+                self.unlink(id);
+                // На чужом столе окно всегда становится НОВОЙ колонкой: класть его в чью-то
+                // чужую колонку значило бы менять раскладку стола, которого человек не видит.
+                self.spaces[n].cols.push(Column { ids: vec![id], width: 1, focus: 0 });
+                self.spaces[n].cur = self.spaces[n].cols.len() - 1;
+                self.sync_focus();
+                self.relayout();
+            }
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
                 sys::exit(0);
@@ -1176,6 +1291,7 @@ impl Wm {
                     cid: [0u8; 32],
                     waiting: None,
                     inbox: Vec::new(),
+                    visible: true,
                 };
                 self.wins.push(win);
                 // Новое окно — НОВАЯ КОЛОНКА справа от текущей: так работает niri, и так же

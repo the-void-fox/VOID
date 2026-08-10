@@ -26,6 +26,10 @@ pkgs.mkShell {
     pkgs.qemu
     pkgs.gdb
     pkgs.rust-analyzer
+    pkgs.grub2
+    pkgs.xorriso
+    pkgs.util-linux
+    pkgs.mtools
   ];
 
   shellHook = ''

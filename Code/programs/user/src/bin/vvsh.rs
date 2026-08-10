@@ -2116,6 +2116,7 @@ keys = [\n\
 #   Super+Shift+Up/Down переставить окно · Super+[ / Super+] окно в соседнюю колонку\n\
 #   Super+R ширина по кругу · Super+Equal/Minus ширина ± · Super+F развернуть\n\
 #   Super+Tab следующая колонка · Super+Shift+Q выйти из сессии\n\
+#   Super+1…9 рабочий стол · Super+Shift+1…9 перенести окно на стол\n\
 #\n\
 # Свой вариант пишется так:\n\
 #   wm_keys = [ bind(\"wm\", \"Super+Return\", \"spawn-term\"), … ]\n\
