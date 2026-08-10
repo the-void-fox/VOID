@@ -87,6 +87,31 @@ fn cwd_set(path: &[u8]) {
     let n = path.len().min(dst.len());
     dst[..n].copy_from_slice(&path[..n]);
     CWD.len.store(n, Ordering::Relaxed);
+    publish_cwd(&dst[..n]);
+}
+
+/// Объявить текущий каталог ДЕТЯМ — записью `CWD=` в собственное окружение (Веха 120.1).
+///
+/// Текущего каталога у процесса в VOID нет: его ведёт шелл. Пока он вёл его только для себя,
+/// запущенная программа понимала относительный путь по-своему — `ved terminal.vv` после
+/// `cd /etc/system` открывал пустой `/terminal.vv`, а сохранение создало бы там мусорный файл.
+fn publish_cwd(path: &[u8]) {
+    let mut buf = [0u8; 512];
+    let n = sys::env(&mut buf).min(buf.len());
+    let mut out = Vec::new();
+    // Старую запись выбрасываем: окружение — список пар, и две записи `CWD=` означали бы, что
+    // ответ зависит от того, кто первым дочитал до своей.
+    for entry in buf[..n].split(|&b| b == 0) {
+        if entry.is_empty() || entry.starts_with(b"CWD=") {
+            continue;
+        }
+        out.extend_from_slice(entry);
+        out.push(0);
+    }
+    out.extend_from_slice(b"CWD=");
+    out.extend_from_slice(path);
+    out.push(0);
+    sys::set_env(&out);
 }
 
 /// Разрешить путь относительно cwd в АБСОЛЮТНЫЙ нормализованный (`.`/`..`/`//` схлопнуты).
@@ -163,6 +188,9 @@ fn cap_net() -> usize {
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     resolve_caps();
+    // Каталог объявляем СРАЗУ, а не только при `cd`: программа, запущенная первой командой,
+    // должна понимать относительный путь так же, как двадцатой.
+    publish_cwd(b"/");
     let mut abuf = [0u8; 256];
     let n = sys::args(&mut abuf).min(abuf.len());
     let mut argv = abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty());

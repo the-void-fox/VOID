@@ -556,9 +556,15 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let Some(path) = path else {
         sys::write("ved: экранный редактор\n\n".as_bytes());
         sys::write("  ved <файл>   открыть (нет файла — создастся при сохранении)\n".as_bytes());
-        sys::write("\nПуть от корня: у программ VOID нет текущего каталога.\n".as_bytes());
+        sys::write("\nПуть относительный — от каталога шелла (`pwd`).\n".as_bytes());
         sys::exit(2);
     };
+    // Относительный путь разбираем от каталога, объявленного шеллом (Веха 120.1). Без этого
+    // `ved terminal.vv` после `cd /etc/system` открывал ПУСТОЙ `/terminal.vv` — и молчал об
+    // этом, потому что несуществующий файл для редактора законен: это новый файл.
+    let mut pbuf = [0u8; 512];
+    let n = px::resolve(path.as_bytes(), &mut pbuf);
+    let path = core::str::from_utf8(&pbuf[..n]).map(|s| s.to_string()).unwrap_or(path);
 
     let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
     if ep == sys::NO_CAP {
@@ -597,7 +603,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 ed.lines.push(String::new());
             }
         }
-        None => ed.msg = "новый файл".to_string(),
+        // Путь называем ПОЛНОСТЬЮ: «новый файл» без пути — это ровно тот случай, когда человек
+        // думает, что открыл существующий, а открыл пустоту рядом с ним (опечатка или не тот
+        // каталог). В заголовке место экономится, здесь — нет.
+        None => ed.msg = format!("новый файл: {}", ed.path),
     }
 
     sys::write(b"\x1b[2J");

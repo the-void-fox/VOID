@@ -117,6 +117,7 @@ const SYS_MOUSE_READ: usize = 49;
 const SYS_KLOG: usize = 50;
 const SYS_KEY_READ: usize = 51;
 const SYS_CONSIZE: usize = 52;
+const SYS_SETENV: usize = 53;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -652,6 +653,34 @@ pub fn env(buf: &mut [u8]) -> usize {
     abi::syscall(SYS_ARGS, 1, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0
 }
 
+/// `SYS_SETENV` (Веха 120.1) — заменить СВОЁ окружение (`KEY=VAL\0…`); дети унаследуют его при
+/// запуске. `false` — блоб длиннее потолка ядра.
+///
+/// Прав не раздаёт: окружение — слой ИМЁН над таблицей стартовых capability, а сама таблица
+/// наследуется целиком и неизменной (разбор — у обработчика в `proc.rs`).
+pub fn set_env(blob: &[u8]) -> bool {
+    abi::syscall(SYS_SETENV, blob.as_ptr() as usize, blob.len(), 0, 0, 0, 0, 0).0 != NO_CAP
+}
+
+/// Текущий каталог, объявленный шеллом (`CWD=` в окружении) → в `out`; возвращает его длину
+/// (0 — каталог не объявляли).
+///
+/// Текущего каталога у процесса в VOID НЕТ: это состояние шелла, а не ядра, и держать его в
+/// ядре значило бы завести общий изменяемый корень имён — ровно то, от чего уходит
+/// capability-модель. Поэтому шелл СООБЩАЕТ его детям, а путь собирает [`posix::resolve`].
+pub fn cwd(out: &mut [u8]) -> usize {
+    let mut buf = [0u8; 512];
+    let n = env(&mut buf).min(buf.len());
+    for entry in buf[..n].split(|&b| b == 0) {
+        if let Some(v) = entry.strip_prefix(b"CWD=") {
+            let k = v.len().min(out.len());
+            out[..k].copy_from_slice(&v[..k]);
+            return k;
+        }
+    }
+    0
+}
+
 /// `SYS_STARTCAP(i)`: i-й стартовый capability процесса (преоткрытые права — как preopen'ы
 /// WASI: выданы ядром при spawn'е или унаследованы при exec). [`NO_CAP`] — конец таблицы.
 pub fn start_cap(i: usize) -> usize {
@@ -1071,6 +1100,47 @@ pub mod posix {
     pub const STDOUT: usize = 1;
     /// Первый настоящий файловый дескриптор (0/1/2 — потоки консоли).
     pub const FD_BASE: usize = 3;
+
+    /// Путь относительно каталога, объявленного шеллом ([`crate::cwd`]) → АБСОЛЮТНЫЙ, с
+    /// схлопнутыми `.`, `..` и `//`; результат в `out`, возвращается его длина (Веха 120.1).
+    ///
+    /// Здесь, а не в каждой программе: логика уже существовала дважды (`vsh`, `vvsh`), и третья
+    /// копия в редакторе разъехалась бы с ними при первой правке. Абсолютный путь переписывается
+    /// как есть — начинать разбор с `/` значит игнорировать любой cwd, и это правильно.
+    ///
+    /// Без кучи (как и вся эта библиотека): компоненты не собираются в список, а дописываются в
+    /// `out`, а `..` откусывает от него последний компонент.
+    pub fn resolve(path: &[u8], out: &mut [u8]) -> usize {
+        fn push(out: &mut [u8], len: usize, c: &[u8]) -> usize {
+            if len + 1 + c.len() > out.len() {
+                return len; // не влезло — путь усечён, но не испорчен
+            }
+            out[len] = b'/';
+            out[len + 1..len + 1 + c.len()].copy_from_slice(c);
+            len + 1 + c.len()
+        }
+        let mut len = 0usize;
+        if path.first() != Some(&b'/') {
+            let mut cwdbuf = [0u8; 256];
+            let n = crate::cwd(&mut cwdbuf);
+            for c in cwdbuf[..n].split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+                len = push(out, len, c);
+            }
+        }
+        for c in path.split(|&b| b == b'/') {
+            match c {
+                b"" | b"." => {}
+                // `..` — откусить последний компонент: ищем `/`, с которого он начался.
+                b".." => len = out[..len].iter().rposition(|&b| b == b'/').unwrap_or(0),
+                _ => len = push(out, len, c),
+            }
+        }
+        if len == 0 && !out.is_empty() {
+            out[0] = b'/'; // всё схлопнулось до корня
+            len = 1;
+        }
+        len
+    }
 
     /// `open(name, mode) -> fd` (или `usize::MAX`).
     pub fn open(ep: usize, name: &[u8], mode: usize) -> usize {

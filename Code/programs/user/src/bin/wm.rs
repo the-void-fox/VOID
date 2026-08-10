@@ -15,8 +15,11 @@
 //! - **Двигает окна композитор.** Перемещение не трогает клиента вообще: его пиксели уже у нас.
 //!   Это и есть правило ADR 0016 «анимируем трансформации, а не содержимое» — здесь оно не
 //!   пожелание, а следствие устройства.
-//! - **Рисуем по damage.** Кадр никогда не перерисовывается целиком: закрашиваются только
-//!   прямоугольники, которые изменились (старое и новое место окна, содержимое, курсор).
+//! - **Рисуем по damage, и ровно раз за оборот цикла.** Кадр никогда не перерисовывается целиком:
+//!   закрашиваются только изменившиеся прямоугольники (старое и новое место окна, содержимое,
+//!   курсор). События их лишь ОТМЕЧАЮТ ([`Wm::damage`]), рисует один [`Wm::flush`] в конце
+//!   оборота — иначе пачка из тридцати событий мыши означала бы тридцать перерисовок, и рука
+//!   обгоняла бы экран (Веха 120.2).
 //! - **Рамки рисуем МЫ** (server-side decorations). Так у всех окон один вид без единой строчки
 //!   в приложениях — ровно то, ради чего затевался общий тулкит (ADR 0016).
 //!
@@ -202,6 +205,8 @@ fn main_loop() -> ! {
         drag: None,
         focus: None,
         transient: 0,
+        damage: Vec::new(),
+        scratch: Vec::new(),
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -246,7 +251,7 @@ fn main_loop() -> ! {
         if mn > 0 {
             worked = true;
             for e in &mouse[..mn] {
-                wm.on_mouse(e, &mut font);
+                wm.on_mouse(e);
             }
         }
 
@@ -264,7 +269,7 @@ fn main_loop() -> ! {
         // Окно живёт, пока жив его хозяин. Полагаться на прощание нельзя: программа может
         // упасть, и тогда её рамка осталась бы на экране навсегда — с картинкой, за которой
         // никого нет. Спрашиваем ядро, а не верим на слово.
-        wm.reap(&mut font);
+        wm.reap();
 
         // ── запросы клиентов ───────────────────────────────────────────────────────────
         // Спим только когда делать нечего — и просыпаемся по клавише ИЛИ движению мыши
@@ -275,8 +280,13 @@ fn main_loop() -> ! {
             sys::recv_console(&mut msg, 200)
         };
         if let Some(m) = got {
-            wm.request(&m, &msg, store, &mut font);
+            wm.request(&m, &msg, store);
         }
+
+        // Кадр — ОДИН на оборот, в самом конце: к этому месту учтены все события пачки, все
+        // ответы клиентов и все ушедшие окна. Пока рисовало каждое событие само, рука обгоняла
+        // экран (Веха 120.2).
+        wm.flush(&mut font);
     }
 }
 
@@ -331,6 +341,34 @@ struct Wm {
     focus: Option<u32>,
     /// Сколько байт временных буферов прочитано с прошлой уборки (см. `OP_ATTACH`).
     transient: usize,
+    /// Что перерисовать в конце оборота (Веха 120.2). Раньше каждое событие рисовало САМО, и
+    /// перетаскивание превращалось в тридцать перерисовок на один оборот цикла.
+    damage: Vec<(i32, i32, i32, i32)>,
+    /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
+    scratch: Vec<u32>,
+}
+
+/// Потолок списка повреждений. Список нужен, чтобы движение курсора в углу не тянуло за собой
+/// перерисовку окна в другом углу; но и длинный список вреден — накладные расходы на каждый
+/// прямоугольник свои. При переполнении всё сливается в один охватывающий.
+const DAMAGE_MAX: usize = 8;
+
+/// Пересечение двух прямоугольников (x, y, w, h). `None` — не пересекаются.
+fn intersect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> Option<(i32, i32, i32, i32)> {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// Охватывающий прямоугольник двух.
+fn union(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let x0 = a.0.min(b.0);
+    let y0 = a.1.min(b.1);
+    let x1 = (a.0 + a.2).max(b.0 + b.2);
+    let y1 = (a.1 + a.3).max(b.1 + b.3);
+    (x0, y0, x1 - x0, y1 - y0)
 }
 
 impl Wm {
@@ -370,12 +408,73 @@ impl Wm {
         }
     }
 
+    /// Записать `n` пикселей одного цвета подряд, начиная с (x, y). Границы проверены ОДИН раз
+    /// на строку, а не на пиксель: именно это и стоило дорого — не сама запись во фреймбуфер.
+    ///
+    /// По 8 байт, пока есть пары: замер на X54C (Веха 116.1) дал 3036 МБ/с против 1784 на
+    /// четырёхбайтных записях. Write-combining любит длинные последовательные пачки.
+    fn fill_run(&self, x: i32, y: i32, n: usize, px: u32) {
+        if y < 0 || y >= self.info.height as i32 || n == 0 {
+            return;
+        }
+        let bpp = self.info.bpp / 8;
+        if bpp != 4 {
+            for i in 0..n as i32 {
+                self.put(x + i, y, px);
+            }
+            return;
+        }
+        let mut dst = FB_VA + y as usize * self.info.pitch + x as usize * bpp;
+        let two = (px as u64) | ((px as u64) << 32);
+        let mut i = 0usize;
+        unsafe {
+            while i + 1 < n {
+                core::ptr::write_volatile(dst as *mut u64, two);
+                dst += 8;
+                i += 2;
+            }
+            if i < n {
+                core::ptr::write_volatile(dst as *mut u32, px);
+            }
+        }
+    }
+
+    /// Записать готовую строку пикселей из RAM.
+    fn write_row(&self, x: i32, y: i32, src: &[u32]) {
+        if y < 0 || y >= self.info.height as i32 || src.is_empty() {
+            return;
+        }
+        let bpp = self.info.bpp / 8;
+        if bpp != 4 {
+            for (i, px) in src.iter().enumerate() {
+                self.put(x + i as i32, y, *px);
+            }
+            return;
+        }
+        let mut dst = FB_VA + y as usize * self.info.pitch + x as usize * bpp;
+        let mut i = 0usize;
+        unsafe {
+            while i + 1 < src.len() {
+                let two = (src[i] as u64) | ((src[i + 1] as u64) << 32);
+                core::ptr::write_volatile(dst as *mut u64, two);
+                dst += 8;
+                i += 2;
+            }
+            if i < src.len() {
+                core::ptr::write_volatile(dst as *mut u32, src[i]);
+            }
+        }
+    }
+
     fn fill_rect(&self, x: i32, y: i32, w: i32, h: i32, c: (u8, u8, u8)) {
         let px = self.pack(c);
+        let x0 = x.max(0);
+        let x1 = (x + w).min(self.info.width as i32);
+        if x1 <= x0 {
+            return;
+        }
         for yy in y.max(0)..(y + h).min(self.info.height as i32) {
-            for xx in x.max(0)..(x + w).min(self.info.width as i32) {
-                self.put(xx, yy, px);
-            }
+            self.fill_run(x0, yy, (x1 - x0) as usize, px);
         }
         fence();
     }
@@ -401,73 +500,126 @@ impl Wm {
 
     // ── композиция ─────────────────────────────────────────────────────────────────────
 
-    /// Перерисовать прямоугольник экрана: стол, затем окна в порядке z, затем курсор.
+    /// Отметить прямоугольник как требующий перерисовки (Веха 120.2).
     ///
-    /// Это единственный путь, которым что-либо появляется на экране, — и именно поэтому
-    /// перемещение окна стоит два таких вызова (старое место и новое), а не кадр.
-    fn repaint(&self, font: &mut BitmapFont, x: i32, y: i32, w: i32, h: i32) {
-        self.fill_rect(x, y, w, h, C_DESKTOP);
-        for (i, win) in self.wins.iter().enumerate() {
-            let (fx, fy, fw, fh) = win.frame();
-            if fx + fw <= x || fy + fh <= y || fx >= x + w || fy >= y + h {
-                continue; // не пересекается
+    /// Раньше каждое событие рисовало само, немедленно. У мыши это означало до тридцати двух
+    /// перерисовок на один оборот цикла — по числу событий в пачке, — и окно продолжало ехать
+    /// уже после того, как человек отпустил кнопку: очередь событий отставала от руки.
+    /// Теперь событие меняет только СОСТОЯНИЕ, а рисуется всё один раз в конце оборота.
+    fn damage(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let Some(r) = intersect(
+            (x, y, w, h),
+            (0, 0, self.info.width as i32, self.info.height as i32),
+        ) else {
+            return;
+        };
+        // Пересекающиеся области сливаем: рисовать одни и те же пиксели дважды за оборот незачем.
+        for d in self.damage.iter_mut() {
+            if intersect(*d, r).is_some() {
+                *d = union(*d, r);
+                return;
             }
-            self.draw_window(font, i, x, y, w, h);
+        }
+        if self.damage.len() >= DAMAGE_MAX {
+            let mut all = r;
+            for d in self.damage.drain(..) {
+                all = union(all, d);
+            }
+            self.damage.push(all);
+            return;
+        }
+        self.damage.push(r);
+    }
+
+    /// Нарисовать всё накопленное. Ровно один раз за оборот цикла — это и есть «кадр».
+    fn flush(&mut self, font: &mut BitmapFont) {
+        if self.damage.is_empty() {
+            return;
+        }
+        let rects = core::mem::take(&mut self.damage);
+        for (x, y, w, h) in rects {
+            self.repaint(font, x, y, w, h);
+        }
+    }
+
+    /// Перерисовать прямоугольник экрана: стол, затем окна в порядке z, затем курсор.
+    fn repaint(&mut self, font: &mut BitmapFont, x: i32, y: i32, w: i32, h: i32) {
+        self.fill_rect(x, y, w, h, C_DESKTOP);
+        for i in 0..self.wins.len() {
+            let f = self.wins[i].frame();
+            if intersect(f, (x, y, w, h)).is_some() {
+                self.draw_window(font, i, x, y, w, h);
+            }
         }
         self.draw_cursor();
     }
 
-    /// Нарисовать окно, ограничив вывод прямоугольником `clip`.
-    fn draw_window(&self, font: &mut BitmapFont, idx: usize, cx: i32, cy: i32, cw: i32, ch: i32) {
-        let win = &self.wins[idx];
-        let active = self.focus == Some(win.id);
-        let (fx, fy, fw, fh) = win.frame();
-        let inside = |x: i32, y: i32| x >= cx && x < cx + cw && y >= cy && y < cy + ch;
+    /// Перерисовать только ОБВОДКУ окна: рамку и титульную полосу.
+    ///
+    /// Смена фокуса меняет ровно их. Перерисовывать ради цвета рамки всё окно значит переписать
+    /// сотни тысяч пикселей вместо нескольких тысяч — а фокус переезжает на каждый клик.
+    fn damage_chrome(&mut self, i: usize) {
+        let (fx, fy, fw, fh) = self.wins[i].frame();
+        let top = BORDER + TITLE_H;
+        self.damage(fx, fy, fw, top);
+        self.damage(fx, fy + fh - BORDER, fw, BORDER);
+        self.damage(fx, fy, BORDER, fh);
+        self.damage(fx + fw - BORDER, fy, BORDER, fh);
+    }
 
-        // Рамка и титульная полоса.
+    /// Нарисовать окно, ограничив вывод прямоугольником `clip`.
+    ///
+    /// Строками, а не пикселями, и ТОЛЬКО по пересечению с клипом. Прошлая версия обходила окно
+    /// целиком, пропуская непопавшие пиксели проверкой: движение курсора над окном 900×600
+    /// стоило полмиллиона холостых итераций — при том, что перерисовать надо было 12×19.
+    fn draw_window(&mut self, font: &mut BitmapFont, idx: usize, cx: i32, cy: i32, cw: i32, ch: i32) {
+        let (fx, fy, fw, fh) = self.wins[idx].frame();
+        let Some((x0, y0, w, h)) = intersect((fx, fy, fw, fh), (cx, cy, cw, ch)) else {
+            return;
+        };
+        let active = self.focus == Some(self.wins[idx].id);
         let border = self.pack(if active { C_ACCENT } else { C_BORDER });
         let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
-        for yy in fy..fy + fh {
-            for xx in fx..fx + fw {
-                if !inside(xx, yy) {
-                    continue;
-                }
-                let on_border = xx == fx || xx == fx + fw - 1 || yy == fy || yy == fy + fh - 1;
-                if on_border {
-                    self.put(xx, yy, border);
-                } else if yy < fy + BORDER + TITLE_H {
-                    self.put(xx, yy, title_bg);
-                }
-            }
-        }
+        let (ox, oy) = self.wins[idx].content_at();
+        let (ww, wh) = (self.wins[idx].w, self.wins[idx].h);
+        let x1 = x0 + w;
 
-        // Содержимое: копия пикселей клиента (RGBA по строкам).
-        let (ox, oy) = win.content_at();
-        if !win.pixels.is_empty() {
-            for row in 0..win.h {
-                let yy = oy + row;
-                if yy < cy || yy >= cy + ch {
-                    continue;
-                }
-                for col in 0..win.w {
-                    let xx = ox + col;
-                    if xx < cx || xx >= cx + cw {
-                        continue;
+        if self.scratch.len() < w as usize {
+            self.scratch.resize(w as usize, 0);
+        }
+        for yy in y0..y0 + h {
+            let title = yy < fy + BORDER + TITLE_H;
+            let content_row = yy - oy;
+            let has_content =
+                !self.wins[idx].pixels.is_empty() && content_row >= 0 && content_row < wh;
+            for (k, xx) in (x0..x1).enumerate() {
+                let on_border = xx == fx || xx == fx + fw - 1 || yy == fy || yy == fy + fh - 1;
+                self.scratch[k] = if on_border {
+                    border
+                } else if title {
+                    title_bg
+                } else if has_content {
+                    let col = xx - ox;
+                    let p = ((content_row * ww + col) * 4) as usize;
+                    if col >= 0 && col < ww && p + 2 < self.wins[idx].pixels.len() {
+                        let px = &self.wins[idx].pixels[p..p + 3];
+                        self.pack((px[0], px[1], px[2]))
+                    } else {
+                        title_bg
                     }
-                    let p = ((row * win.w + col) * 4) as usize;
-                    if p + 2 < win.pixels.len() {
-                        let px = self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]));
-                        self.put(xx, yy, px);
-                    }
-                }
+                } else {
+                    title_bg
+                };
             }
+            self.write_row(x0, yy, &self.scratch[..w as usize]);
         }
         fence();
 
         // Заголовок поверх полосы — рисуем после неё и только если он попал в clip.
         if fy + 3 >= cy - 16 && fy < cy + ch {
             let c = if active { C_TEXT } else { C_BORDER };
-            self.text(font, fx + 6, fy + 3, &win.title, c);
+            let title = self.wins[idx].title.clone();
+            self.text(font, fx + 6, fy + 3, &title, c);
         }
     }
 
@@ -490,7 +642,7 @@ impl Wm {
 
     // ── ввод ───────────────────────────────────────────────────────────────────────────
 
-    fn on_mouse(&mut self, e: &sys::MouseEvent, font: &mut BitmapFont) {
+    fn on_mouse(&mut self, e: &sys::MouseEvent) {
         let old = self.cursor;
         self.cursor.0 = (self.cursor.0 + e.dx as i32).clamp(0, self.info.width as i32 - 1);
         self.cursor.1 = (self.cursor.1 + e.dy as i32).clamp(0, self.info.height as i32 - 1);
@@ -507,17 +659,17 @@ impl Wm {
                     // порядок наоборот давал подсветку, отставшую на одно нажатие.
                     let id = self.wins[i].id;
                     self.focus = Some(id);
-                    self.raise(i, font);
+                    self.raise(i);
                     let i = self.wins.len() - 1; // после подъёма окно последнее
                     if self.wins[i].hit_title(self.cursor.0, self.cursor.1) {
                         self.drag =
                             Some((i, self.cursor.0 - self.wins[i].x, self.cursor.1 - self.wins[i].y));
                     }
-                    self.unfocus_repaint(font, lost, Some(id));
+                    self.unfocus_repaint(lost, Some(id));
                 }
                 None => {
                     self.focus = None;
-                    self.unfocus_repaint(font, lost, None);
+                    self.unfocus_repaint(lost, None);
                 }
             }
         }
@@ -531,13 +683,14 @@ impl Wm {
             let (ox, oy, ow, oh) = self.wins[i].frame();
             self.wins[i].x = self.cursor.0 - gx;
             self.wins[i].y = self.cursor.1 - gy;
-            self.repaint(font, ox, oy, ow, oh);
             let (nx, ny, nw, nh) = self.wins[i].frame();
-            self.repaint(font, nx, ny, nw, nh);
+            // Старое место и новое: при мелком шаге они пересекаются, и `damage` сольёт их в
+            // одну область — то есть окно, переехавшее на три пикселя, стоит одной перерисовки.
+            self.damage(ox, oy, ow, oh);
+            self.damage(nx, ny, nw, nh);
         } else {
-            // Просто движение — стереть курсор со старого места и нарисовать на новом.
-            self.repaint(font, old.0, old.1, CUR_W, CUR_H);
-            self.draw_cursor();
+            // Просто движение — стереть курсор со старого места (на новом его нарисует flush).
+            self.damage(old.0, old.1, CUR_W, CUR_H);
         }
 
         // Событие окну под курсором.
@@ -611,8 +764,8 @@ impl Wm {
                 let next = if name == "focus-next" { (cur + 1) % n } else { (cur + n - 1) % n };
                 let lost = self.focus;
                 self.focus = Some(self.wins[next].id);
-                self.raise(next, font);
-                self.unfocus_repaint(font, lost, self.focus);
+                self.raise(next);
+                self.unfocus_repaint(lost, self.focus);
             }
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
@@ -625,7 +778,7 @@ impl Wm {
     }
 
     /// Убрать окна процессов, которых больше нет.
-    fn reap(&mut self, font: &mut BitmapFont) {
+    fn reap(&mut self) {
         let mut i = 0;
         while i < self.wins.len() {
             let dead = matches!(sys::wait(self.wins[i].owner, true), sys::Wait::Exited(_));
@@ -639,31 +792,32 @@ impl Wm {
             if self.focus == Some(id) {
                 self.focus = self.wins.last().map(|w| w.id);
             }
-            self.repaint(font, rect.0, rect.1, rect.2, rect.3);
+            self.damage(rect.0, rect.1, rect.2, rect.3);
         }
     }
 
     /// Перерисовать окно, потерявшее фокус (его рамка обязана погаснуть).
-    fn unfocus_repaint(&mut self, font: &mut BitmapFont, lost: Option<u32>, now: Option<u32>) {
+    fn unfocus_repaint(&mut self, lost: Option<u32>, now: Option<u32>) {
         let Some(id) = lost else { return };
         if Some(id) == now {
             return;
         }
         if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-            let r = self.wins[i].frame();
-            self.repaint(font, r.0, r.1, r.2, r.3);
+            self.damage_chrome(i); // погасла только рамка — содержимое окна не менялось
         }
     }
 
     /// Поднять окно на верх стопки.
-    fn raise(&mut self, i: usize, font: &mut BitmapFont) {
-        let rect = self.wins[i].frame();
-        if i + 1 != self.wins.len() {
-            let w = self.wins.remove(i);
-            self.wins.push(w);
+    fn raise(&mut self, i: usize) {
+        if i + 1 == self.wins.len() {
+            // Уже наверху: перекрытия не изменились, мог смениться только фокус — значит рамка.
+            self.damage_chrome(i);
+            return;
         }
-        // Перерисовываем всегда: даже если окно уже наверху, у него мог смениться фокус.
-        self.repaint(font, rect.0, rect.1, rect.2, rect.3);
+        let rect = self.wins[i].frame();
+        let w = self.wins.remove(i);
+        self.wins.push(w);
+        self.damage(rect.0, rect.1, rect.2, rect.3);
     }
 
     /// Отдать событие клиенту: сразу, если он ждёт, иначе в очередь.
@@ -690,7 +844,7 @@ impl Wm {
 
     // ── запросы клиентов ───────────────────────────────────────────────────────────────
 
-    fn request(&mut self, m: &sys::Message, buf: &[u8], store: usize, font: &mut BitmapFont) {
+    fn request(&mut self, m: &sys::Message, buf: &[u8], store: usize) {
         let op = m.op & 0xff;
         let len = m.len.min(buf.len());
         match op {
@@ -720,7 +874,7 @@ impl Wm {
                 self.wins.push(win);
                 self.focus = Some(id);
                 sys::reply(m.reply_cap, &id.to_le_bytes());
-                self.repaint(font, rect.0, rect.1, rect.2, rect.3);
+                self.damage(rect.0, rect.1, rect.2, rect.3);
             }
             win::OP_ATTACH => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -780,7 +934,7 @@ impl Wm {
                     let dy = u16::from_le_bytes([buf[6], buf[7]]) as i32;
                     let dw = u16::from_le_bytes([buf[8], buf[9]]) as i32;
                     let dh = u16::from_le_bytes([buf[10], buf[11]]) as i32;
-                    self.repaint(font, ox + dx, oy + dy, dw.max(1), dh.max(1));
+                    self.damage(ox + dx, oy + dy, dw.max(1), dh.max(1));
                 }
             }
             // Неблокирующий опрос: у клиента свой реактор, спать в нашем вызове он не может.
@@ -829,7 +983,7 @@ impl Wm {
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
                     let rect = self.wins[i].frame();
                     self.wins.remove(i);
-                    self.repaint(font, rect.0, rect.1, rect.2, rect.3);
+                    self.damage(rect.0, rect.1, rect.2, rect.3);
                 }
             }
             // Чужой запрос — ответить пусто, а не молчать: молчание повесило бы вызвавшего.

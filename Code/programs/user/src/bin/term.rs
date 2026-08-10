@@ -1425,6 +1425,7 @@ fn compose(
         }
         if i == focus {
             mark_focus(&mut cells, r, cols, rows);
+            mark_caret(&mut cells, p, r, cols, rows);
         }
     }
     status_bar(&mut cells, panes, focus, mode, cols, rows, conf);
@@ -1453,6 +1454,30 @@ fn dirty_rows(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> Vec<usiz
 /// Прежняя версия оставляла панель в левом верхнем углу вовсе без пометки: зазора там нет, и
 /// «где фокус» приходилось узнавать из статус-бара. У любой панели при двух и более панелях
 /// зазор есть хотя бы с одной стороны — значит пометка будет всегда.
+/// Текстовый курсор панели — инверсией знакоместа (Веха 120.1).
+///
+/// Его не было НИКОГДА: пока в панелях жили только шеллы, каждый рисовал себе подчёркивание сам
+/// (`vsh`, `vvsh`), и отсутствия общего курсора никто не замечал. Первая же полноэкранная
+/// программа (`ved`) показала цену: место ввода видно не было вовсе.
+///
+/// Инверсия, а не подчёркивание: она видна на любом фоне и не зависит от шрифта — символ под
+/// курсором остаётся читаемым. Рисуется ТОЛЬКО у панели в фокусе (курсор — это «куда попадёт
+/// клавиша», и два курсора означали бы два места ввода) и только когда панель не пролистана
+/// назад: в истории курсора нет, он в живом кадре.
+fn mark_caret(cells: &mut [Cell], p: &Pane, r: &PaneRect, cols: usize, rows: usize) {
+    if p.scroll > 0 {
+        return;
+    }
+    let c = p.grid.cursor();
+    if !c.visible {
+        return; // программа спрятала курсор (`ESC[?25l`) — это её право
+    }
+    let (x, y) = (r.area.col as usize + c.col, r.area.row as usize + c.row);
+    if c.col < r.area.cols as usize && c.row < r.area.rows as usize && x < cols && y < rows {
+        cells[y * cols + x].flags |= ereb_core::CellFlags::REVERSE;
+    }
+}
+
 fn mark_focus(cells: &mut [Cell], r: &PaneRect, cols: usize, rows: usize) {
     let mut mark = |x: usize, y: usize, ch: char| {
         if x < cols && y < rows {
