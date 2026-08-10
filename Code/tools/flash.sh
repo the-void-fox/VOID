@@ -19,6 +19,10 @@
 # Запускать под root (запись в блочное устройство): sudo Code/tools/flash.sh /dev/sdX
 set -euo pipefail
 
+# Недостроенный образ не должен оставаться лежать: он большой, а место, как выяснилось, кончается.
+tmp=""
+trap '[ -n "$tmp" ] && rm -f "$tmp"' EXIT
+
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
@@ -70,7 +74,17 @@ if [ -z "$img" ]; then
     kernel="$repo/Code/target/x86_64-unknown-none/release/void-kernel"
     [ -f "$kernel" ] || { echo "нет ядра: $kernel
 собери: nix-shell --run 'cd Code && cargo build --release --target x86_64-unknown-none'"; exit 1; }
-    tmp="$(mktemp /tmp/void-flash-XXXXXX.img)"
+    # Образ собираем РЯДОМ СО СБОРКОЙ, а не в /tmp: на NixOS `/tmp` — это tmpfs, то есть
+    # оперативная память, и семисотмегабайтный образ туда просто не влезает («на устройстве не
+    # осталось свободного места» — при живом диске на десятки гигабайт).
+    tmpdir="$repo/Code/target"
+    mkdir -p "$tmpdir"
+    free_mb=$(df -Pm "$tmpdir" | awk 'NR==2 {print $4}')
+    if [ "${free_mb:-0}" -lt 800 ]; then
+        echo "мало места под образ в $tmpdir: свободно ${free_mb} МиБ, нужно ~800"
+        exit 1
+    fi
+    tmp="$tmpdir/void-flash-$$.img"
     img="$tmp"
     echo "собираю образ из $(basename "$kernel") …"
     # 700 МиБ: хватает store под пакеты и всё ещё быстро пишется. Растянуть на весь
@@ -86,7 +100,7 @@ if [ "$assume_yes" != "1" ]; then
     echo "ВСЁ СОДЕРЖИМОЕ $dev БУДЕТ УНИЧТОЖЕНО (включая store прошлой установки)."
     printf 'напиши путь устройства для подтверждения: '
     read -r confirm
-    [ "$confirm" = "$dev" ] || { echo "не совпало — ничего не делаю"; [ -n "$tmp" ] && rm -f "$tmp"; exit 1; }
+    [ "$confirm" = "$dev" ] || { echo "не совпало — ничего не делаю"; exit 1; }
 fi
 
 # ── стирание ─────────────────────────────────────────────────────────────────
@@ -117,7 +131,6 @@ if [ "$grow" = "1" ]; then
 fi
 
 sync
-[ -n "$tmp" ] && rm -f "$tmp"
 echo
 echo "готово. На $dev теперь чистая VOID: свой store, свой конфиг, ничего от прошлой версии."
 echo "Первая загрузка сеет поколения заново; графический режим включается так:"
