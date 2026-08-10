@@ -909,7 +909,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     let mut tree = SplitTree::leaf(PaneId(0));
     let mut next_id = 1usize;
-    let mut rects = layout_of(&tree, view.cols, view.rows);
+    // В окне мультиплексора нет: композитор уже раскладывает окна, а панели внутри окна были бы
+    // вторым оконным менеджером внутри первого (предложение владельца, Веха 122.1).
+    let mux = !out.windowed();
+    let mut rects = layout_of(&tree, view.cols, view.rows, mux);
     let mut exec_cap = sys::NO_CAP;
     let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me, &conf)];
     let mut focus = 0usize;
@@ -976,7 +979,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             }
             if let Some(v) = View::build(&conf, &info) {
                 view = v;
-                rects = layout_of(&tree, view.cols, view.rows);
+                rects = layout_of(&tree, view.cols, view.rows, mux);
                 resize_all(&mut panes, &rects);
                 prev_cells = Vec::new(); // прошлого кадра больше нет — рисуем всё заново
                 redraw = true;
@@ -1025,6 +1028,15 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 let Some(key) = decode(&mut scan, keys[i]) else {
                     continue;
                 };
+                // В окне схема панелей НЕ применяется: `C-a` там ничего не переключает, а уходит
+                // в программу как обычный байт. Иначе префикс мультиплексора молча съедал бы
+                // аккорд, который человек адресовал шеллу или редактору.
+                if !mux {
+                    for b in encode(&key) {
+                        push_input(&mut panes, focus, b);
+                    }
+                    continue;
+                }
                 match ereb_input::translate(&key, &conf.table, mode) {
                     Action::EnterMode(m) => {
                         mode = m;
@@ -1061,9 +1073,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                 } else {
                                     SplitDirection::Horizontal
                                 };
-                                split(&mut tree, &mut panes, &mut next_id, &mut focus, dir,
+                                split(mux, &mut tree, &mut panes, &mut next_id, &mut focus, dir,
                                       view.cols, view.rows, &mut exec_cap, me, &conf);
-                                rects = layout_of(&tree, view.cols, view.rows);
+                                rects = layout_of(&tree, view.cols, view.rows, mux);
                             }
                             "close" => {
                                 close_pane(&mut tree, &mut panes, &mut focus);
@@ -1071,7 +1083,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                     sys::write_console("[term] панелей не осталось — выход\n".as_bytes());
                                     sys::exit(0);
                                 }
-                                rects = layout_of(&tree, view.cols, view.rows);
+                                rects = layout_of(&tree, view.cols, view.rows, mux);
                                 resize_all(&mut panes, &rects);
                             }
                             "quit" => {
@@ -1096,7 +1108,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                         view = v;
                                         // Кегль мог измениться — значит изменилось ВСЁ, что от
                                         // него зависит: раскладка, гриды панелей, размер кадра.
-                                        rects = layout_of(&tree, view.cols, view.rows);
+                                        rects = layout_of(&tree, view.cols, view.rows, mux);
                                         resize_all(&mut panes, &rects);
                                         prev_cells.clear(); // кадр несравним со старым — весь заново
                                     }
@@ -1198,7 +1210,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             redraw = true;
         } else if redraw {
             last_paint = now;
-            let cells = compose(&panes, &rects, focus, mode, view.cols, view.rows, &conf);
+            let cells = compose(&panes, &rects, focus, mode, view.cols, view.rows, &conf, mux);
             // Прокрутка: если кадр — это прежний, уехавший вверх, композитор сдвинет свою копию
             // сам, а мы пришлём только освободившиеся строки. Сдвигаем и `prev_cells` — тогда
             // `dirty_rows` ниже сама увидит ровно новое (Веха 120.3).
@@ -1417,7 +1429,9 @@ fn spawn_shell(exec_cap: &mut usize, me: usize, conf: &Conf) -> Option<usize> {
 
 /// Разбить фокусную панель и завести в новой половине ещё один шелл.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn split(
+    mux: bool,
     tree: &mut SplitTree, panes: &mut Vec<Pane>, next_id: &mut usize, focus: &mut usize,
     dir: SplitDirection, cols: usize, rows: usize, exec_cap: &mut usize, me: usize, conf: &Conf,
 ) {
@@ -1430,7 +1444,7 @@ fn split(
         return;
     }
     *next_id += 1;
-    let rects = layout_of(tree, cols, rows);
+    let rects = layout_of(tree, cols, rows, mux);
     resize_all(panes, &rects); // старые панели поменяли размер — грид обязан следовать
     panes.push(new_pane(fresh, &rects, exec_cap, me, conf));
     *focus = panes.len() - 1;
@@ -1482,10 +1496,18 @@ fn push_input(panes: &mut [Pane], focus: usize, byte: u8) {
 }
 
 /// Раскладка дерева в знакоместах; снизу оставлена строка под статус-бар.
-fn layout_of(tree: &SplitTree, cols: usize, rows: usize) -> Vec<PaneRect> {
+/// `mux` — нужен ли мультиплексор. В ОКНЕ его нет (Веха 122.1, предложение владельца): колонками
+/// и окнами занимается композитор, а панели внутри окна — это второй оконный менеджер внутри
+/// первого. Тогда же освобождается нижняя строка: статус-бар панелей в окне не нужен, заголовок
+/// рисует композитор.
+///
+/// Полноэкранный режим мультиплексор ОСТАВЛЯЕТ: там `term` и есть оконный менеджер — это
+/// спасательный путь на машине без композитора.
+fn layout_of(tree: &SplitTree, cols: usize, rows: usize, mux: bool) -> Vec<PaneRect> {
+    let rows = if mux { rows.saturating_sub(1) } else { rows };
     tree.layout(
-        Area { col: 0, row: 0, cols: cols as u16, rows: (rows - 1) as u16 },
-        1, // зазор в знакоместо: панели должны быть видимо разделены
+        Area { col: 0, row: 0, cols: cols as u16, rows: rows as u16 },
+        if mux { 1 } else { 0 }, // зазор нужен только там, где панелей может быть несколько
     )
 }
 
@@ -1502,7 +1524,7 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
 #[allow(clippy::too_many_arguments)]
 fn compose(
     panes: &[Pane], rects: &[PaneRect], focus: usize, mode: Mode, cols: usize, rows: usize,
-    conf: &Conf,
+    conf: &Conf, mux: bool,
 ) -> Vec<Cell> {
     // Общий кадр — мозаика из гридов панелей: у каждой свой, склеиваем по ячейкам.
     let mut cells = vec![Cell::default(); cols * rows];
@@ -1519,11 +1541,16 @@ fn compose(
             }
         }
         if i == focus {
-            mark_focus(&mut cells, r, cols, rows);
+            // Подсветка «какая панель активна» имеет смысл, только когда панелей несколько.
+            if mux {
+                mark_focus(&mut cells, r, cols, rows);
+            }
             mark_caret(&mut cells, p, r, cols, rows);
         }
     }
-    status_bar(&mut cells, panes, focus, mode, cols, rows, conf);
+    if mux {
+        status_bar(&mut cells, panes, focus, mode, cols, rows, conf);
+    }
     cells
 }
 
@@ -1618,6 +1645,11 @@ fn mark_caret(cells: &mut [Cell], p: &Pane, r: &PaneRect, cols: usize, rows: usi
     }
 }
 
+/// Рамка вокруг активной панели.
+///
+/// Знаки — из псевдографики CP866 (`│`, `─`), а не изящные `▏`/`▔`: последних нет ни в CP866, ни
+/// в запасном битмапном шрифте, и на машине без установленного TTF граница панелей выводилась
+/// столбиком вопросительных знаков (нашлось при проверке спасательного пути, Веха 122.1).
 fn mark_focus(cells: &mut [Cell], r: &PaneRect, cols: usize, rows: usize) {
     let mut mark = |x: usize, y: usize, ch: char| {
         if x < cols && y < rows {
@@ -1631,24 +1663,24 @@ fn mark_focus(cells: &mut [Cell], r: &PaneRect, cols: usize, rows: usize) {
     let y1 = y0 + r.area.rows.saturating_sub(1) as usize;
     if x0 > 0 {
         for y in y0..=y1 {
-            mark(x0 - 1, y, '▏');
+            mark(x0 - 1, y, '│');
         }
     }
     if x1 + 1 < cols {
         for y in y0..=y1 {
-            mark(x1 + 1, y, '▕');
+            mark(x1 + 1, y, '│');
         }
     }
     if y0 > 0 {
         for x in x0..=x1 {
-            mark(x, y0 - 1, '▁');
+            mark(x, y0 - 1, '─');
         }
     }
     // Снизу — только если там ещё панельная область: последняя строка экрана занята статус-баром,
     // и писать в неё значит затирать его.
     if y1 + 1 < rows.saturating_sub(1) {
         for x in x0..=x1 {
-            mark(x, y1 + 1, '▔');
+            mark(x, y1 + 1, '─');
         }
     }
 }
