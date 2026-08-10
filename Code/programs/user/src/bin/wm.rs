@@ -61,6 +61,67 @@ const C_FRAME_ACTIVE: (u8, u8, u8) = (0x24, 0x2c, 0x38);
 const C_BORDER: (u8, u8, u8) = (0x30, 0x36, 0x3d);
 const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
 
+// ── анимации (Веха 125) ──────────────────────────────────────────────────────
+//
+// Требование владельца: «чтобы чувствовалось, будто ты сам двигаешь эту камеру» — резкое
+// ускорение вначале и плавное торможение. Это ease-out: движение начинается на полной скорости
+// и гасится к цели. Обратная кривая (плавный старт) читается как «система подумала и поехала»,
+// а нужно «поехало сразу, а доводит уже само».
+
+/// Сколько длится переезд окна, открытие и закрытие. Числа niri: за 150 мс глаз успевает
+/// проследить связь «было → стало», а ждать уже не начинает.
+const MOVE_MS: u64 = 150;
+const OPEN_MS: u64 = 150;
+const CLOSE_MS: u64 = 130;
+/// Обзор ездит спокойнее: он показывает всю систему, и резкость там суетлива.
+const OV_MS: u64 = 250;
+
+/// Насколько окно «поджато» в начале открытия и в конце закрытия — в 1/256 от размера.
+/// Небольшое (как в niri): большое превращает появление окна в аттракцион.
+const POP: i32 = 232;
+
+/// Ease-out кубический: `1 − (1−t)³`, всё в 1/1024.
+fn ease_out(t: i32) -> i32 {
+    let inv = (1024 - t.clamp(0, 1024)) as i64;
+    (1024 - (inv * inv * inv) / (1024 * 1024)) as i32
+}
+
+/// Линейная доля пути между `a` и `b` (`p` — 0..1024).
+fn lerp(a: i32, b: i32, p: i32) -> i32 {
+    a + (b - a) * p / 1024
+}
+
+/// То, ЧТО РИСУЕТСЯ, — в отличие от того, что назначила раскладка. Между ними и живёт анимация.
+#[derive(Clone, Copy, PartialEq)]
+struct Shown {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    /// Непрозрачность в 1/256.
+    a: u32,
+}
+
+impl Shown {
+    /// Поджатый к центру вариант — начало открытия и конец закрытия.
+    fn popped(&self) -> Shown {
+        let (w, h) = (self.w * POP / 256, self.h * POP / 256);
+        Shown { x: self.x + (self.w - w) / 2, y: self.y + (self.h - h) / 2, w, h, a: 0 }
+    }
+    fn mix(&self, to: &Shown, p: i32) -> Shown {
+        Shown {
+            x: lerp(self.x, to.x, p),
+            y: lerp(self.y, to.y, p),
+            w: lerp(self.w, to.w, p).max(2 * BORDER + 2),
+            h: lerp(self.h, to.h, p).max(2 * BORDER + 2),
+            a: lerp(self.a as i32, to.a as i32, p).clamp(0, 256) as u32,
+        }
+    }
+    fn rect(&self) -> (i32, i32, i32, i32) {
+        (self.x, self.y, self.w, self.h)
+    }
+}
+
 /// Толщина рамки и радиус скругления (Веха 124 — вид взят из noctalia владельца).
 ///
 /// ТИТУЛЬНОЙ ПОЛОСЫ БОЛЬШЕ НЕТ. В тайлинге она не несла ничего: окно не таскают мышью, крестика
@@ -274,6 +335,10 @@ fn main_loop() -> ! {
         space: 0,
         overview: false,
         ov_cam: (0, 0),
+        cam_from: (0, 0),
+        cam_to: (0, 0),
+        cam_at: 0,
+        cam_dur: 0,
         super_held: false,
         ov: Vec::new(),
     };
@@ -358,10 +423,13 @@ fn main_loop() -> ! {
         // ── запросы клиентов ───────────────────────────────────────────────────────────
         // Спим только когда делать нечего — и просыпаемся по клавише ИЛИ движению мыши
         // (Веха 115 научила ядро будить на мышь тех же, кого будит клавиша).
+        // Пока что-то движется, спать до события нельзя: кадры анимации рисуем мы сами.
+        // Восемь миллисекунд — это около ста двадцати кадров в секунду, с запасом.
+        let moving = wm.animate(sys::monotonic_ns());
         let got = if worked {
             sys::try_recv(&mut msg)
         } else {
-            sys::recv_console(&mut msg, 200)
+            sys::recv_console(&mut msg, if moving { 8 } else { 200 })
         };
         if let Some(m) = got {
             wm.request(&m, &msg, store);
@@ -395,12 +463,47 @@ struct Win {
     waiting: Option<usize>,
     /// События, накопленные до того, как клиент спросил.
     inbox: Vec<[u8; 8]>,
+    /// Что рисуется сейчас (Веха 125). Между `shown` и рамкой из раскладки и живёт анимация.
+    shown: Shown,
+    /// Откуда началось нынешнее движение и куда идёт.
+    from: Shown,
+    to: Shown,
+    /// Когда началось и сколько длится; `dur == 0` — стоим на месте.
+    at: u64,
+    dur: u64,
+    /// Окно ещё не раскладывали ни разу — появиться оно должно ростом, а не рывком с нуля.
+    fresh: bool,
+    /// Окно ЗАКРЫВАЕТСЯ: хозяина уже нет, но пиксели держим, пока доигрывает сжатие.
+    closing: bool,
     /// Лежит ли окно на АКТИВНОМ рабочем столе (Веха 122). Окно с чужого стола живо, помнит
     /// свои пиксели и продолжает работать — его просто не видно и не потрогать.
     visible: bool,
 }
 
 impl Win {
+    /// Начать движение к `target`.
+    fn start(&mut self, target: Shown, ms: u64, now: u64) {
+        self.from = self.shown;
+        self.to = target;
+        self.at = now;
+        self.dur = ms * 1_000_000;
+    }
+
+    /// Продвинуть анимацию. `true` — движение ещё идёт.
+    fn tick(&mut self, now: u64) -> bool {
+        if self.dur == 0 {
+            return false;
+        }
+        let t = ((now.saturating_sub(self.at)) * 1024 / self.dur).min(1024) as i32;
+        self.shown = self.from.mix(&self.to, ease_out(t));
+        if t >= 1024 {
+            self.shown = self.to;
+            self.dur = 0;
+            return false;
+        }
+        true
+    }
+
     /// Прямоугольник рамки.
     fn frame(&self) -> (i32, i32, i32, i32) {
         (self.x, self.y, self.w + 2 * BORDER, self.h + 2 * BORDER)
@@ -409,8 +512,9 @@ impl Win {
     fn content_at(&self) -> (i32, i32) {
         (self.x + BORDER, self.y + BORDER)
     }
+    /// Попадание — по ВИДИМОМУ положению: человек целится в то, что нарисовано.
     fn hit_frame(&self, px: i32, py: i32) -> bool {
-        let (fx, fy, fw, fh) = self.frame();
+        let (fx, fy, fw, fh) = self.shown.rect();
         px >= fx && px < fx + fw && py >= fy && py < fy + fh
     }
 }
@@ -494,6 +598,11 @@ struct Wm {
     /// (Веха 123.2): камера едет за ОСОЗНАННЫМ выбором (клавиши, колесо, вход в обзор), а
     /// наведение мышью только переносит фокус.
     ov_cam: (i32, i32),
+    /// Анимация камеры обзора: откуда, куда, когда началась и сколько длится.
+    cam_from: (i32, i32),
+    cam_to: (i32, i32),
+    cam_at: u64,
+    cam_dur: u64,
     /// Что и куда нарисовано в обзоре. Считается один раз при каждом изменении — и рисованием,
     /// и попаданием мыши пользуется ОДИН этот список: два расчёта «где что» означали бы, что
     /// клик приходит не в то окно, которое человек видит.
@@ -755,6 +864,75 @@ impl Wm {
         self.damage.push(r);
     }
 
+    /// Продвинуть все анимации на текущий момент; `true` — что-то ещё движется.
+    ///
+    /// Область под движущимся окном помечается по ОБЪЕДИНЕНИЮ старого и нового положения: за
+    /// окном обязан затираться след, и это ровно та же арифметика, что при перетаскивании
+    /// (Веха 120.2) — только шаг задаёт время, а не рука.
+    fn animate(&mut self, now: u64) -> bool {
+        let mut moving = false;
+        let mut done: Vec<u32> = Vec::new();
+        for i in 0..self.wins.len() {
+            let was = self.wins[i].shown.rect();
+            if self.wins[i].tick(now) {
+                moving = true;
+                let r = self.wins[i].shown.rect();
+                self.damage(was.0, was.1, was.2, was.3);
+                self.damage(r.0, r.1, r.2, r.3);
+            } else if self.wins[i].closing {
+                // Помечаем ВЕСЬ путь сжатия, а не последний кадр: окно уменьшалось из полного
+                // размера, и стереть нужно всё, что оно занимало. Последний кадр покрывает лишь
+                // поджатый прямоугольник — остальное осталось бы призраком на экране (нашлось
+                // проверкой: область просто не перерисовывалась).
+                let r = union(self.wins[i].from.rect(), self.wins[i].shown.rect());
+                self.damage(r.0, r.1, r.2, r.3);
+                done.push(self.wins[i].id);
+            }
+        }
+        // Досжавшиеся окна убираем — их хозяина давно нет.
+        for id in done {
+            if let Some(k) = self.win_at(id) {
+                self.wins.remove(k);
+            }
+        }
+        // Камера обзора едет так же, но своим сроком: обзор показывает всю систему, и резкость
+        // там суетлива.
+        if self.overview && self.cam_dur != 0 {
+            let t = ((now.saturating_sub(self.cam_at)) * 1024 / self.cam_dur).min(1024) as i32;
+            let p = ease_out(t);
+            self.ov_cam = (
+                lerp(self.cam_from.0, self.cam_to.0, p),
+                lerp(self.cam_from.1, self.cam_to.1, p),
+            );
+            if t >= 1024 {
+                self.ov_cam = self.cam_to;
+                self.cam_dur = 0;
+            } else {
+                moving = true;
+            }
+            self.build_overview(false);
+        }
+        moving
+    }
+
+    /// Начать закрытие окна: пиксели держим, пока доигрывает сжатие (Веха 125).
+    ///
+    /// Раньше окно исчезало в тот же миг, когда умирал его хозяин. Чтобы оно успело сжаться,
+    /// композитор обязан ПЕРЕЖИВАТЬ клиента — на сто тридцать миллисекунд у окна появляется
+    /// состояние «закрывается, хозяина уже нет».
+    fn begin_close(&mut self, id: u32) {
+        let now = sys::monotonic_ns();
+        let Some(k) = self.win_at(id) else { return };
+        if self.wins[k].closing {
+            return;
+        }
+        self.wins[k].closing = true;
+        self.wins[k].visible = true;
+        let target = self.wins[k].shown.popped();
+        self.wins[k].start(target, CLOSE_MS, now);
+        self.unlink(id);
+    }
+
     /// Нарисовать всё накопленное. Ровно один раз за оборот цикла — это и есть «кадр».
     fn flush(&mut self) {
         if self.damage.is_empty() {
@@ -809,27 +987,26 @@ impl Wm {
             if !win.visible {
                 continue;
             }
-            let (fx, fy, fw, fh) = win.frame();
-            if yy < fy || yy >= fy + fh {
+            // Рисуем ПО АНИМИРОВАННОМУ прямоугольнику, а не по тому, что назначила раскладка
+            // (Веха 125). Отсюда следствие: содержимое приходится масштабировать — во время
+            // переезда и сжатия окно на экране не совпадает со своим буфером. Приём тот же, что
+            // в обзоре: выборка ближайшего пикселя, движение всё равно скрывает разницу.
+            let (fx, fy, fw, fh) = win.shown.rect();
+            if yy < fy || yy >= fy + fh || fw <= 2 * BORDER || fh <= 2 * BORDER {
                 continue;
             }
-            // Скругление со сглаживанием: край занимает не «есть/нет», а долю пикселя.
             let inset = corner_inset(yy - fy, fh);
-            // Берём на пиксель шире втянутого края — там и живут полутона.
             let (sx, ex) = ((fx + inset - 1).max(x0), (fx + fw - inset + 1).min(x1));
             if ex <= sx {
                 continue;
             }
             let active = self.focus == Some(win.id);
-            let border = self.pack(if active { C_ACCENT } else { C_BORDER });
-            let (ox, oy) = win.content_at();
-            let content_row = yy - oy;
-            let has_content = !win.pixels.is_empty() && content_row >= 0 && content_row < win.h;
-            // Рамка по всему периметру скруглённой формы: сверху/снизу — по толщине, с боков —
-            // от втянутого края.
+            let border = self.unpack(self.pack(if active { C_ACCENT } else { C_BORDER }));
+            let (cw, ch) = (fw - 2 * BORDER, fh - 2 * BORDER);
+            let src_row = (yy - fy - BORDER) * win.h / ch.max(1);
+            let has_content = !win.pixels.is_empty() && src_row >= 0 && src_row < win.h;
             let edge_row = yy - fy < BORDER || fy + fh - 1 - yy < BORDER;
             let inner = inset + BORDER;
-            // Насколько строка вошла в угловую зону по вертикали (0 — не вошла).
             let dv = yy - fy;
             let ay = if dv < RADIUS {
                 RADIUS - dv
@@ -847,18 +1024,19 @@ impl Wm {
                 } else {
                     0
                 };
-                let cover = corner_alpha(ax, ay);
+                // Прозрачность окна и покрытие угла умножаются: у появляющегося окна и края
+                // остаются мягкими.
+                let cover = corner_alpha(ax, ay) * win.shown.a / 256;
                 if cover == 0 {
-                    continue; // пиксель целиком снаружи скругления — под ним остаётся стол
+                    continue;
                 }
-                let on_border = edge_row || xx < fx + inner || xx >= fx + fw - inner;
-                let px = if on_border {
+                let rgb = if edge_row || xx < fx + inner || xx >= fx + fw - inner {
                     border
                 } else if has_content {
-                    let col = xx - ox;
-                    let p = ((content_row * win.w + col) * 4) as usize;
+                    let col = (xx - fx - BORDER) * win.w / cw.max(1);
+                    let p = ((src_row * win.w + col) * 4) as usize;
                     if col >= 0 && col < win.w && p + 2 < win.pixels.len() {
-                        self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]))
+                        (win.pixels[p], win.pixels[p + 1], win.pixels[p + 2])
                     } else {
                         border
                     }
@@ -866,7 +1044,7 @@ impl Wm {
                     border
                 };
                 let i = (xx - x0) as usize;
-                out[i] = if cover >= 256 { px } else { self.blend(out[i], self.unpack(px), cover) };
+                out[i] = self.blend(out[i], rgb, cover);
             }
         }
 
@@ -975,7 +1153,8 @@ impl Wm {
         // переключении: раскладка и так обходит все окна активной ленты — второй список
         // «кто виден» разошёлся бы с первым при первой же правке.
         for w in self.wins.iter_mut() {
-            w.visible = false;
+            // Закрывающееся окно остаётся видимым: его уже нет в раскладке, но сжатие доигрывает.
+            w.visible = w.closing;
         }
         let (frames, _) = self.strip_layout(&self.cols);
 
@@ -1007,6 +1186,22 @@ impl Wm {
             let (cw2, ch2) = ((fw - 2 * BORDER).max(32), (fh - 2 * BORDER).max(32));
             self.wins[k].x = fx - self.scroll_x;
             self.wins[k].y = fy;
+            let target = Shown {
+                x: fx - self.scroll_x,
+                y: fy,
+                w: cw2 + 2 * BORDER,
+                h: ch2 + 2 * BORDER,
+                a: 256,
+            };
+            let now = sys::monotonic_ns();
+            if self.wins[k].fresh {
+                // Первое появление: растём из поджатого и проявляемся.
+                self.wins[k].fresh = false;
+                self.wins[k].shown = target.popped();
+                self.wins[k].start(target, OPEN_MS, now);
+            } else if self.wins[k].to != target {
+                self.wins[k].start(target, MOVE_MS, now);
+            }
             if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
                 self.wins[k].w = cw2;
                 self.wins[k].h = ch2;
@@ -1059,7 +1254,7 @@ impl Wm {
                     frames.iter().find(|f| f.0 == id).map(|f| (f.1 + f.3 / 2) * OV_NUM / OV_DEN)
                 })
                 .unwrap_or(sw / 2);
-            self.ov_cam = (focus_x - sw / 2, cam_y);
+            self.aim_camera((focus_x - sw / 2, cam_y));
         }
         let (cam_x, cam_y) = self.ov_cam;
 
@@ -1102,6 +1297,17 @@ impl Wm {
         self.space = n;
     }
 
+    /// Навести камеру на новое место — не прыжком, а движением (Веха 125).
+    fn aim_camera(&mut self, to: (i32, i32)) {
+        if to == self.ov_cam && self.cam_dur == 0 {
+            return;
+        }
+        self.cam_from = self.ov_cam;
+        self.cam_to = to;
+        self.cam_at = sys::monotonic_ns();
+        self.cam_dur = OV_MS * 1_000_000;
+    }
+
     /// Подвинуть камеру обзора минимально — так, чтобы окно `id` поместилось на экране целиком.
     ///
     /// Ничего не делает, если оно и так видно. Окно больше экрана прижимается левым/верхним
@@ -1123,9 +1329,8 @@ impl Wm {
         if dx == 0 && dy == 0 {
             return;
         }
-        self.ov_cam.0 += dx;
-        self.ov_cam.1 += dy;
-        self.build_overview(false);
+        let to = (self.ov_cam.0 + dx, self.ov_cam.1 + dy);
+        self.aim_camera(to);
     }
 
     /// Колонка и место окна в ней.
@@ -1593,18 +1798,18 @@ impl Wm {
 
     /// Убрать окна процессов, которых больше нет.
     fn reap(&mut self) {
-        let mut i = 0;
-        while i < self.wins.len() {
-            let dead = matches!(sys::wait(self.wins[i].owner, true), sys::Wait::Exited(_));
-            if !dead {
-                i += 1;
+        for i in 0..self.wins.len() {
+            // Закрывающееся окно уже осиротело — спрашивать про его хозяина незачем.
+            if self.wins[i].closing {
                 continue;
             }
-            let id = self.wins[i].id;
-            self.wins.remove(i);
-            self.unlink(id);
-            self.sync_focus();
-            self.relayout();
+            if matches!(sys::wait(self.wins[i].owner, true), sys::Wait::Exited(_)) {
+                let id = self.wins[i].id;
+                self.begin_close(id);
+                self.sync_focus();
+                self.relayout();
+                return; // список изменился — доберём на следующем обороте
+            }
         }
     }
 
@@ -1657,6 +1862,13 @@ impl Wm {
                     cid: [0u8; 32],
                     waiting: None,
                     inbox: Vec::new(),
+                    shown: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
+                    from: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
+                    to: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
+                    at: 0,
+                    dur: 0,
+                    fresh: true,
+                    closing: false,
                     visible: true,
                 };
                 self.wins.push(win);
@@ -1811,9 +2023,8 @@ impl Wm {
             win::OP_DESTROY => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 sys::reply(m.reply_cap, &[]);
-                if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                    self.wins.remove(i);
-                    self.unlink(id);
+                if self.win_at(id).is_some() {
+                    self.begin_close(id);
                     self.sync_focus();
                     self.relayout();
                 }
