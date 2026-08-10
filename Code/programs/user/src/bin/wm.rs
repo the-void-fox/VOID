@@ -207,6 +207,7 @@ fn main_loop() -> ! {
         transient: 0,
         damage: Vec::new(),
         scratch: Vec::new(),
+        readbuf: Vec::new(),
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -346,6 +347,8 @@ struct Wm {
     damage: Vec<(i32, i32, i32, i32)>,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
     scratch: Vec<u32>,
+    /// Буфер чтения объекта клиента: один на сессию, только растёт (см. `OP_ATTACH`).
+    readbuf: Vec<u8>,
 }
 
 /// Потолок списка повреждений. Список нужен, чтобы движение курсора в углу не тянуло за собой
@@ -542,16 +545,112 @@ impl Wm {
         }
     }
 
-    /// Перерисовать прямоугольник экрана: стол, затем окна в порядке z, затем курсор.
+    /// Перерисовать прямоугольник экрана. Строка собирается ЦЕЛИКОМ в памяти — стол, окна в
+    /// порядке z, курсор — и уходит во фреймбуфер одной последовательностью записей.
+    ///
+    /// Отсюда исчезло мерцание (Веха 120.3). Раньше область сначала заливалась цветом стола, а
+    /// потом поверх рисовались окна: пиксель под окном писался ДВАЖДЫ, и глаз успевал поймать
+    /// промежуточное состояние — при перетаскивании это выглядело как мигание окна. Теперь
+    /// каждый пиксель экрана пишется ровно один раз за кадр.
     fn repaint(&mut self, font: &mut BitmapFont, x: i32, y: i32, w: i32, h: i32) {
-        self.fill_rect(x, y, w, h, C_DESKTOP);
+        let Some((x0, y0, w, h)) = intersect(
+            (x, y, w, h),
+            (0, 0, self.info.width as i32, self.info.height as i32),
+        ) else {
+            return;
+        };
+        // Заголовки — глифами, поверх собранных строк: растеризовать шрифт внутри построчной
+        // сборки значило бы делать это заново на каждую строку полосы.
+        let mut titles: Vec<(i32, i32, bool, usize)> = Vec::new();
         for i in 0..self.wins.len() {
-            let f = self.wins[i].frame();
-            if intersect(f, (x, y, w, h)).is_some() {
-                self.draw_window(font, i, x, y, w, h);
+            let (fx, fy, fw, fh) = self.wins[i].frame();
+            if intersect((fx, fy, fw, fh), (x0, y0, w, h)).is_some()
+                && fy + 3 < y0 + h
+                && fy + 3 + 16 > y0
+            {
+                titles.push((fx + 6, fy + 3, self.focus == Some(self.wins[i].id), i));
             }
         }
-        self.draw_cursor();
+
+        // Строку берём ВО ВЛАДЕНИЕ на время сборки: иначе не собрать её, читая окна из `self`.
+        let mut row = core::mem::take(&mut self.scratch);
+        if row.len() < w as usize {
+            row.resize(w as usize, 0);
+        }
+        for yy in y0..y0 + h {
+            self.compose_row(&mut row[..w as usize], yy, x0);
+            self.write_row(x0, yy, &row[..w as usize]);
+        }
+        self.scratch = row;
+        fence();
+
+        for (tx, ty, active, i) in titles {
+            let c = if active { C_TEXT } else { C_BORDER };
+            let title = core::mem::take(&mut self.wins[i].title);
+            self.text(font, tx, ty, &title, c);
+            self.wins[i].title = title;
+        }
+    }
+
+    /// Собрать одну строку экрана: стол → окна в порядке z → курсор.
+    fn compose_row(&self, out: &mut [u32], yy: i32, x0: i32) {
+        let desktop = self.pack(C_DESKTOP);
+        out.fill(desktop);
+        let x1 = x0 + out.len() as i32;
+
+        for win in &self.wins {
+            let (fx, fy, fw, fh) = win.frame();
+            if yy < fy || yy >= fy + fh {
+                continue;
+            }
+            let (Some(sx), Some(ex)) = (Some(fx.max(x0)), Some((fx + fw).min(x1))) else {
+                continue;
+            };
+            if ex <= sx {
+                continue;
+            }
+            let active = self.focus == Some(win.id);
+            let border = self.pack(if active { C_ACCENT } else { C_BORDER });
+            let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
+            let (ox, oy) = win.content_at();
+            let content_row = yy - oy;
+            let has_content =
+                !win.pixels.is_empty() && content_row >= 0 && content_row < win.h;
+            let edge_row = yy == fy || yy == fy + fh - 1;
+            let title = yy < fy + BORDER + TITLE_H;
+            for xx in sx..ex {
+                let px = if edge_row || xx == fx || xx == fx + fw - 1 {
+                    border
+                } else if title || !has_content {
+                    title_bg
+                } else {
+                    let col = xx - ox;
+                    let p = ((content_row * win.w + col) * 4) as usize;
+                    if col >= 0 && col < win.w && p + 2 < win.pixels.len() {
+                        self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]))
+                    } else {
+                        title_bg
+                    }
+                };
+                out[(xx - x0) as usize] = px;
+            }
+        }
+
+        // Курсор поверх всего: он не принадлежит ни одному окну.
+        let cy = yy - self.cursor.1;
+        if cy >= 0 && cy < CUR_H {
+            let fill = self.pack(if self.buttons != 0 { C_ACCENT } else { (255, 255, 255) });
+            let edge = self.pack((0, 0, 0));
+            for (col, ch) in CURSOR[cy as usize].bytes().enumerate() {
+                if ch == b' ' {
+                    continue;
+                }
+                let xx = self.cursor.0 + col as i32;
+                if xx >= x0 && xx < x1 {
+                    out[(xx - x0) as usize] = if ch == b'#' { edge } else { fill };
+                }
+            }
+        }
     }
 
     /// Перерисовать только ОБВОДКУ окна: рамку и титульную полосу.
@@ -565,62 +664,6 @@ impl Wm {
         self.damage(fx, fy + fh - BORDER, fw, BORDER);
         self.damage(fx, fy, BORDER, fh);
         self.damage(fx + fw - BORDER, fy, BORDER, fh);
-    }
-
-    /// Нарисовать окно, ограничив вывод прямоугольником `clip`.
-    ///
-    /// Строками, а не пикселями, и ТОЛЬКО по пересечению с клипом. Прошлая версия обходила окно
-    /// целиком, пропуская непопавшие пиксели проверкой: движение курсора над окном 900×600
-    /// стоило полмиллиона холостых итераций — при том, что перерисовать надо было 12×19.
-    fn draw_window(&mut self, font: &mut BitmapFont, idx: usize, cx: i32, cy: i32, cw: i32, ch: i32) {
-        let (fx, fy, fw, fh) = self.wins[idx].frame();
-        let Some((x0, y0, w, h)) = intersect((fx, fy, fw, fh), (cx, cy, cw, ch)) else {
-            return;
-        };
-        let active = self.focus == Some(self.wins[idx].id);
-        let border = self.pack(if active { C_ACCENT } else { C_BORDER });
-        let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
-        let (ox, oy) = self.wins[idx].content_at();
-        let (ww, wh) = (self.wins[idx].w, self.wins[idx].h);
-        let x1 = x0 + w;
-
-        if self.scratch.len() < w as usize {
-            self.scratch.resize(w as usize, 0);
-        }
-        for yy in y0..y0 + h {
-            let title = yy < fy + BORDER + TITLE_H;
-            let content_row = yy - oy;
-            let has_content =
-                !self.wins[idx].pixels.is_empty() && content_row >= 0 && content_row < wh;
-            for (k, xx) in (x0..x1).enumerate() {
-                let on_border = xx == fx || xx == fx + fw - 1 || yy == fy || yy == fy + fh - 1;
-                self.scratch[k] = if on_border {
-                    border
-                } else if title {
-                    title_bg
-                } else if has_content {
-                    let col = xx - ox;
-                    let p = ((content_row * ww + col) * 4) as usize;
-                    if col >= 0 && col < ww && p + 2 < self.wins[idx].pixels.len() {
-                        let px = &self.wins[idx].pixels[p..p + 3];
-                        self.pack((px[0], px[1], px[2]))
-                    } else {
-                        title_bg
-                    }
-                } else {
-                    title_bg
-                };
-            }
-            self.write_row(x0, yy, &self.scratch[..w as usize]);
-        }
-        fence();
-
-        // Заголовок поверх полосы — рисуем после неё и только если он попал в clip.
-        if fy + 3 >= cy - 16 && fy < cy + ch {
-            let c = if active { C_TEXT } else { C_BORDER };
-            let title = self.wins[idx].title.clone();
-            self.text(font, fx + 6, fy + 3, &title, c);
-        }
     }
 
     // ── курсор (тот же приём, что в `term`: он не часть кадра) ────────────────────────
@@ -721,7 +764,7 @@ impl Wm {
             return;
         }
         if let Some(b) = binds.iter().find(|b| b.sym == e.sym && b.mods == e.mods) {
-            self.action(&b.action.clone(), store, me, font);
+            self.action(&b.action.clone(), store, me);
             return;
         }
         // Аккорд с Super, которому не нашлось действия, программе не отдаём: иначе промах по
@@ -735,7 +778,7 @@ impl Wm {
     }
 
     /// Выполнить действие раскладки.
-    fn action(&mut self, name: &str, store: usize, me: usize, font: &mut BitmapFont) {
+    fn action(&mut self, name: &str, store: usize, me: usize) {
         match name {
             "spawn-term" => {
                 if sys::spawn_with_endpoint(store, b"term", &[], me, b"WM\0").is_none() {
@@ -894,8 +937,17 @@ impl Wm {
                             self.wins[i].pixels = vec![0u8; (ww * wh * 4) as usize];
                         }
                         let need = (rw * rh * 4) as usize;
-                        let mut px = vec![0u8; need];
-                        let got = sys::obj_get(store, &cid, &mut px);
+                        // Буфер чтения ОДИН на всю сессию и только растёт (Веха 120.3). Раньше он
+                        // заводился заново на каждый кадр — полтора мегабайта, взятые и
+                        // отпущенные сотни раз подряд вперемешку с мелочью. Куча со слиянием
+                        // соседей это переживает не всегда: мелкая аллокация, попавшая в середину
+                        // только что освобождённого большого блока, делит его навсегда. Итог —
+                        // «memory allocation of 1785604 bytes failed» посреди работы.
+                        if self.readbuf.len() < need {
+                            self.readbuf.resize(need, 0);
+                        }
+                        let px = &mut self.readbuf[..need];
+                        let got = sys::obj_get(store, &cid, px);
                         if got == need {
                             // Вклеиваем полосу на её место в копии окна.
                             for row in 0..rh {
@@ -917,7 +969,7 @@ impl Wm {
                         // прибраться, иначе куча ядра кончится (Веха 118: полный кадр каждое
                         // нажатие клавиши убивал систему за восемь букв).
                         self.transient += need;
-                        if self.transient > 24 * 1024 * 1024 {
+                        if self.transient > 4 * 1024 * 1024 {
                             self.transient = 0;
                             sys::obj_gc(store);
                         }
@@ -935,6 +987,34 @@ impl Wm {
                     let dw = u16::from_le_bytes([buf[8], buf[9]]) as i32;
                     let dh = u16::from_le_bytes([buf[10], buf[11]]) as i32;
                     self.damage(ox + dx, oy + dy, dw.max(1), dh.max(1));
+                }
+            }
+            // Прокрутка: пиксели уже у нас — сдвигаем свою копию, клиент присылает лишь
+            // освободившуюся строку (Веха 120.3). До этого прокрутка на одну строку означала
+            // пересылку ВСЕГО окна.
+            win::OP_SCROLL => {
+                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let y0 = u16::from_le_bytes([buf[4], buf[5]]) as i32;
+                let y1 = u16::from_le_bytes([buf[6], buf[7]]) as i32;
+                let dy = i16::from_le_bytes([buf[8], buf[9]]) as i32;
+                sys::reply(m.reply_cap, &[]);
+                if let Some(i) = self.wins.iter().position(|w| w.id == id) {
+                    let (ww, wh) = (self.wins[i].w, self.wins[i].h);
+                    let y0 = y0.clamp(0, wh);
+                    let y1 = y1.clamp(y0, wh);
+                    let stride = (ww * 4) as usize;
+                    let pix = &mut self.wins[i].pixels;
+                    if dy > 0 && y1 - y0 > dy && pix.len() >= (y1 * ww * 4) as usize {
+                        let from = ((y0 + dy) * ww * 4) as usize;
+                        let to = (y1 * ww * 4) as usize;
+                        let dst = (y0 * ww * 4) as usize;
+                        pix.copy_within(from..to, dst);
+                        // Освободившийся хвост НЕ чистим: клиент сейчас пришлёт туда новые
+                        // строки, а мигание пустой полосой видно.
+                        let _ = stride;
+                        let (ox, oy) = self.wins[i].content_at();
+                        self.damage(ox, oy + y0, ww, y1 - y0);
+                    }
                 }
             }
             // Неблокирующий опрос: у клиента свой реактор, спать в нашем вызове он не может.

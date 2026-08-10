@@ -98,6 +98,10 @@ const FONT_MAX: usize = 256;
 const FB_VA: usize = 0x5000_0000;
 
 /// Размер окна терминала, когда он живёт под композитором (Веха 118).
+/// Кадр не чаще, чем раз в 16 мс (примерно 60 в секунду). Терминал — не игра: показывать поток
+/// вывода чаще, чем его успевает прочесть глаз, значит платить за каждую строку целым окном.
+const FRAME_NS: u64 = 16_000_000;
+
 const WIN_W: u16 = 900;
 const WIN_H: u16 = 520;
 
@@ -145,6 +149,20 @@ impl Out {
     }
     fn windowed(&self) -> bool {
         matches!(self, Out::Window { .. })
+    }
+
+    /// Сдвинуть СВОЙ кадр вверх на `dy` пикселей в пределах первых `height` строк — и сказать то
+    /// же композитору (Веха 120.3). Обе копии обязаны уехать одинаково: композитор рисует свою,
+    /// мы дорисовываем в свою освободившуюся строку.
+    fn scroll_up(&mut self, info: &sys::VideoInfo, dst_y: usize, src_y: usize, h: usize) {
+        let Out::Window { win, buf, .. } = self else { return };
+        let row = info.pitch;
+        let (from, to, dst) = (src_y * row, (src_y + h) * row, dst_y * row);
+        if src_y <= dst_y || h == 0 || to > buf.len() {
+            return;
+        }
+        buf.copy_within(from..to, dst);
+        win.scroll(dst_y as u16, (src_y + h) as u16, (src_y - dst_y) as i16);
     }
 }
 
@@ -838,7 +856,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Веха 118 — есть композитор? Тогда мы ОКНО, а не владелец экрана. Решение принимается
     // здесь и больше нигде: дальше по коду разница видна только в том, куда лёг кадр.
     let store = store_cap().unwrap_or(sys::NO_CAP);
-    let (out, info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
+    let (mut out, info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
         Some(win) => {
             log_line("term: работаю окном композитора");
             // Кадр окна — RGBA по строкам без выравнивания; описываем его теми же полями, что
@@ -905,6 +923,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut keys = [0u8; 64];
     let mut msg = [0u8; stdio::CHUNK];
     let mut redraw = true;
+    // Когда рисовали прошлый кадр (монотонные наносекунды) — см. FRAME_NS.
+    let mut last_paint = 0u64;
 
     // Веха 115 — курсор. Позицию ведём МЫ, а не ядро: границы экрана знает тот, кто рисует.
     // Начинаем в середине — там его точно видно, а «где мой курсор» на старте не вопрос.
@@ -1135,8 +1155,41 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         }
 
         // ── 5. кадр ────────────────────────────────────────────────────────────────────────
-        if redraw {
+        //
+        // Не чаще, чем экран умеет показать (Веха 120.3). Раньше кадр собирался на КАЖДОЕ
+        // сообщение от ребёнка — то есть на каждую строку вывода. Программа и терминал ходят
+        // тут в лад: шелл пишет строку и ждёт ответа, мы отвечаем и рисуем, он пишет следующую —
+        // так `help` из тридцати строк давал тридцать кадров подряд. А кадр при прокрутке стоит
+        // ВСЕГО окна (900×496×4 ≈ 1,8 МБ: содержимое уехало вверх, изменились все строки),
+        // и это ещё хэш BLAKE3 по каждому мегабайту в ядре. Отсюда «help печатает по три строки
+        // с паузами» и нехватка памяти после десятка таких кадров.
+        //
+        // Порог маленький: набранная буква обязана появляться мгновенно, а вот поток вывода
+        // незачем показывать чаще, чем его успевает прочесть глаз.
+        let now = sys::monotonic_ns();
+        if redraw && now.saturating_sub(last_paint) < FRAME_NS && !panes.is_empty() {
+            // Кадр отложен — но спать до срока нельзя: рисовать придётся нам самим.
+            redraw = true;
+        } else if redraw {
+            last_paint = now;
             let cells = compose(&panes, &rects, focus, mode, view.cols, view.rows, &conf);
+            // Прокрутка: если кадр — это прежний, уехавший вверх, композитор сдвинет свою копию
+            // сам, а мы пришлём только освободившиеся строки. Сдвигаем и `prev_cells` — тогда
+            // `dirty_rows` ниже сама увидит ровно новое (Веха 120.3).
+            if out.windowed() {
+                if let Some((dy, start, run)) =
+                    detect_scroll(&prev_cells, &cells, view.cols, view.rows)
+                {
+                    let ch = view.cell_h();
+                    out.scroll_up(&info, start * ch, (start + dy) * ch, run * ch);
+                    // Тот же сдвиг в своей памяти прошлого кадра — тогда `dirty_rows` ниже
+                    // увидит ровно то, что ДЕЙСТВИТЕЛЬНО новое.
+                    prev_cells.copy_within(
+                        (start + dy) * view.cols..(start + dy + run) * view.cols,
+                        start * view.cols,
+                    );
+                }
+            }
             let dirty = dirty_rows(&prev_cells, &cells, view.cols, view.rows);
             if !dirty.is_empty() {
                 // Рисуем И переносим ТОЛЬКО изменившиеся строки. Раньше отрисовка шла по всему
@@ -1156,11 +1209,24 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 if cursor_drawn && !out.windowed() {
                     draw_cursor(&info, mx, my, mbtn != 0);
                 }
-                // Композитору отдаём одну полосу — от первой изменившейся строки до последней.
-                // Отдельными прямоугольниками на каждую строку было бы точнее, но каждый из них
-                // это ещё один объект и ещё один вызов; полоса — верная середина.
+                // Композитору отдаём СПЛОШНЫЕ УЧАСТКИ изменившихся строк, каждый своим
+                // прямоугольником.
+                //
+                // Здесь была одна полоса «от первой изменившейся до последней» — и она стоила
+                // паники ядра (Веха 120.3). Типичный кадр меняет ДВЕ строки далеко друг от
+                // друга: ту, куда напечатали, и статус-бар внизу. Полоса между ними — это всё
+                // окно: 900×496×4 ≈ 1,79 МБ на каждую строчку вывода. Отсюда и «help печатает
+                // по три строки с паузами», и нехватка памяти после десятка кадров.
                 if out.windowed() {
-                    if let (Some(&first), Some(&last)) = (dirty.first(), dirty.last()) {
+                    let mut i = 0;
+                    while i < dirty.len() {
+                        let first = dirty[i];
+                        let mut last = first;
+                        while i + 1 < dirty.len() && dirty[i + 1] == last + 1 {
+                            i += 1;
+                            last = dirty[i];
+                        }
+                        i += 1;
                         out.present_rows(&info, first * ch, ((last + 1) * ch).min(info.height));
                     }
                 }
@@ -1179,7 +1245,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             // Веха 103 — спим до СОБЫТИЯ, а не по короткому таймеру: пробуждение по клавише
             // появилось в ядре (`recv_console`), и реактор наконец ждёт оба своих источника
             // сразу. Срок остался страховкой — на случай событий, о которых ядро нас не будит.
-            if let Some(m) = sys::recv_console(&mut msg, 200) {
+            // Отложенный кадр обязан состояться: спим не до события, а до срока отрисовки —
+            // иначе последняя строка вывода висела бы ненарисованной до следующего нажатия.
+            let wait = if redraw { 5 } else { 200 };
+            if let Some(m) = sys::recv_console(&mut msg, wait) {
                 redraw |= handle(&mut panes, &m, &msg);
             }
         }
@@ -1430,6 +1499,51 @@ fn compose(
     }
     status_bar(&mut cells, panes, focus, mode, cols, rows, conf);
     cells
+}
+
+/// Уехала ли ПОЛОСА строк вверх — и какая (Веха 120.3).
+///
+/// Возвращает `(dy, начало, сколько_строк)`: строки `начало+dy .. начало+dy+сколько` прошлого
+/// кадра оказались на месте `начало .. начало+сколько` нынешнего.
+///
+/// Ищем полосу, а не весь кадр: у панели есть рамка, а внизу живёт статус-бар — они на месте,
+/// и проверка «весь кадр уехал» не срабатывала НИКОГДА (первая же строка не совпадала).
+/// Это и был урок замера: экономия, которая не включается, — не экономия.
+///
+/// Требуем полосу хотя бы в восемь строк: на коротких совпадение — это случайно совпавшая
+/// пустота, и пересылка сдвига обошлась бы дороже самих строк.
+fn detect_scroll(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> Option<(usize, usize, usize)> {
+    const MIN_BAND: usize = 8;
+    if prev.len() != now.len() || rows < MIN_BAND + 2 {
+        return None;
+    }
+    let same = |y: usize, dy: usize| {
+        now[y * cols..(y + 1) * cols] == prev[(y + dy) * cols..(y + dy + 1) * cols]
+    };
+    let mut best: Option<(usize, usize, usize)> = None;
+    for dy in 1..=(rows / 2) {
+        let limit = rows - dy;
+        let (mut start, mut run) = (0usize, 0usize);
+        let (mut cur_start, mut cur) = (0usize, 0usize);
+        for y in 0..limit {
+            if same(y, dy) {
+                if cur == 0 {
+                    cur_start = y;
+                }
+                cur += 1;
+                if cur > run {
+                    run = cur;
+                    start = cur_start;
+                }
+            } else {
+                cur = 0;
+            }
+        }
+        if run >= MIN_BAND && best.map_or(true, |(_, _, b)| run > b) {
+            best = Some((dy, start, run));
+        }
+    }
+    best
 }
 
 /// СПИСОК изменившихся строк. Списком, а не диапазоном: при выводе меняются одна-две строки, а
