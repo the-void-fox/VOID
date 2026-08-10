@@ -70,11 +70,11 @@ const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
 
 /// Сколько длится переезд окна, открытие и закрытие. Числа niri: за 150 мс глаз успевает
 /// проследить связь «было → стало», а ждать уже не начинает.
-const MOVE_MS: u64 = 300;
-const OPEN_MS: u64 = 260;
-const CLOSE_MS: u64 = 220;
+const MOVE_MS: u64 = 450;
+const OPEN_MS: u64 = 380;
+const CLOSE_MS: u64 = 320;
 /// Обзор ездит спокойнее: он показывает всю систему, и резкость там суетлива.
-const OV_MS: u64 = 320;
+const OV_MS: u64 = 450;
 
 /// Насколько окно «поджато» в начале открытия и в конце закрытия — в 1/256 от размера.
 /// Небольшое (как в niri): большое превращает появление окна в аттракцион.
@@ -326,6 +326,10 @@ fn main_loop() -> ! {
         cols: Vec::new(),
         cur: 0,
         scroll_x: 0,
+        scroll_from: 0,
+        scroll_to: 0,
+        scroll_at: 0,
+        scroll_dur: 0,
         focus: None,
         transient: 0,
         damage: Vec::new(),
@@ -513,8 +517,9 @@ impl Win {
         (self.x + BORDER, self.y + BORDER)
     }
     /// Попадание — по ВИДИМОМУ положению: человек целится в то, что нарисовано.
-    fn hit_frame(&self, px: i32, py: i32) -> bool {
+    fn hit_frame(&self, px: i32, py: i32, scroll: i32) -> bool {
         let (fx, fy, fw, fh) = self.shown.rect();
+        let fx = fx - scroll;
         px >= fx && px < fx + fw && py >= fy && py < fy + fh
     }
 }
@@ -570,7 +575,17 @@ struct Wm {
     /// Колонка в фокусе.
     cur: usize,
     /// Сдвиг ленты относительно экрана: лента длиннее экрана, экран по ней ездит.
+    ///
+    /// Веха 125.2 — сдвиг АНИМИРУЕТСЯ отдельно от окон, и это принципиально. Раньше он входил
+    /// в координату каждого окна, поэтому «лента поехала» означало «каждое окно поехало само по
+    /// себе, из своего места»: окна прибывали вразнобой, наслаивались и оставляли следы. Лента
+    /// — одно целое, и двигаться обязана как целое; окна анимируются только когда меняют место
+    /// В ЛЕНТЕ.
     scroll_x: i32,
+    scroll_from: i32,
+    scroll_to: i32,
+    scroll_at: u64,
+    scroll_dur: u64,
     next_id: u32,
     cursor: (i32, i32),
     buttons: u8,
@@ -868,19 +883,21 @@ impl Wm {
         let mut moving = false;
         let mut done: Vec<u32> = Vec::new();
         for i in 0..self.wins.len() {
+            let sc = self.scroll_x;
             let was = self.wins[i].shown.rect();
+            let was = (was.0 - sc, was.1, was.2, was.3);
             if self.wins[i].tick(now) {
                 moving = true;
                 let r = self.wins[i].shown.rect();
                 self.damage(was.0, was.1, was.2, was.3);
-                self.damage(r.0, r.1, r.2, r.3);
+                self.damage(r.0 - sc, r.1, r.2, r.3);
             } else if self.wins[i].closing {
                 // Помечаем ВЕСЬ путь сжатия, а не последний кадр: окно уменьшалось из полного
                 // размера, и стереть нужно всё, что оно занимало. Последний кадр покрывает лишь
                 // поджатый прямоугольник — остальное осталось бы призраком на экране (нашлось
                 // проверкой: область просто не перерисовывалась).
                 let r = union(self.wins[i].from.rect(), self.wins[i].shown.rect());
-                self.damage(r.0, r.1, r.2, r.3);
+                self.damage(r.0 - sc, r.1, r.2, r.3);
                 done.push(self.wins[i].id);
             }
         }
@@ -890,6 +907,21 @@ impl Wm {
                 self.wins.remove(k);
             }
         }
+        // Лента: пока она едет, меняется положение ВСЕГО на экране — помечаем экран целиком.
+        // Это дороже точечных прямоугольников, но честно: половина экрана и так меняется, а
+        // попытка обойтись кусочками и оставляла те самые следы.
+        if self.scroll_dur != 0 {
+            let t = ((now.saturating_sub(self.scroll_at)) * 1024 / self.scroll_dur).min(1024) as i32;
+            self.scroll_x = lerp(self.scroll_from, self.scroll_to, ease_out(t));
+            if t >= 1024 {
+                self.scroll_x = self.scroll_to;
+                self.scroll_dur = 0;
+            } else {
+                moving = true;
+            }
+            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+        }
+
         // Камера обзора едет так же, но своим сроком: обзор показывает всю систему, и резкость
         // там суетлива.
         if self.overview && self.cam_dur != 0 {
@@ -986,7 +1018,8 @@ impl Wm {
             // (Веха 125). Отсюда следствие: содержимое приходится масштабировать — во время
             // переезда и сжатия окно на экране не совпадает со своим буфером. Приём тот же, что
             // в обзоре: выборка ближайшего пикселя, движение всё равно скрывает разницу.
-            let (fx, fy, fw, fh) = win.shown.rect();
+            let (sxr, fy, fw, fh) = win.shown.rect();
+            let fx = sxr - self.scroll_x;
             if yy < fy || yy >= fy + fh || fw <= 2 * BORDER || fh <= 2 * BORDER {
                 continue;
             }
@@ -1142,20 +1175,27 @@ impl Wm {
         // показываем её левый край.
         let mut x = GAP;
         let view = self.info.width as i32;
+        let mut want = self.scroll_to;
         for (i, c) in self.cols.iter().enumerate() {
             let cw = self.col_width(c);
             if i == self.cur {
-                if x - self.scroll_x < GAP {
-                    self.scroll_x = x - GAP;
+                if x - want < GAP {
+                    want = x - GAP;
                 }
-                if x + cw - self.scroll_x > view - GAP {
-                    self.scroll_x = x + cw - view + GAP;
+                if x + cw - want > view - GAP {
+                    want = x + cw - view + GAP;
                 }
             }
             x += cw + GAP;
         }
         if self.cols.is_empty() {
-            self.scroll_x = 0;
+            want = 0;
+        }
+        if want != self.scroll_to {
+            self.scroll_from = self.scroll_x;
+            self.scroll_to = want;
+            self.scroll_at = sys::monotonic_ns();
+            self.scroll_dur = MOVE_MS * 1_000_000;
         }
 
         let mut resized: Vec<(u32, i32, i32)> = Vec::new();
@@ -1164,10 +1204,10 @@ impl Wm {
             self.wins[k].visible = true;
             // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
             let (cw2, ch2) = ((fw - 2 * BORDER).max(32), (fh - 2 * BORDER).max(32));
-            self.wins[k].x = fx - self.scroll_x;
+            self.wins[k].x = fx;
             self.wins[k].y = fy;
             let target = Shown {
-                x: fx - self.scroll_x,
+                x: fx,
                 y: fy,
                 w: cw2 + 2 * BORDER,
                 h: ch2 + 2 * BORDER,
@@ -1442,7 +1482,7 @@ impl Wm {
         // задаёт раскладка, а не рука; плавающий режим остаётся исключением на будущее
         // ([[wm-keys]]), и тащить окно понадобится ровно там.
         if was == 0 && e.buttons != 0 {
-            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1))
+            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x))
             {
                 let id = self.wins[i].id;
                 if let Some((ci, wi)) = self.locate(id) {
@@ -1490,7 +1530,7 @@ impl Wm {
         }
 
         if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && !self.overview {
-            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1))
+            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x))
             {
                 let id = self.wins[i].id;
                 if self.focus != Some(id) {
@@ -1533,7 +1573,7 @@ impl Wm {
         }
 
         // Событие окну под курсором.
-        if let Some(i) = self.wins.iter().rposition(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1)) {
+        if let Some(i) = self.wins.iter().rposition(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)) {
             let (ox, oy) = self.wins[i].content_at();
             let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
             if was != e.buttons {
