@@ -1032,17 +1032,33 @@ impl Wm {
             let (cw, ch) = (fw - 2 * BORDER, fh - 2 * BORDER);
             let src_row = (yy - fy - BORDER) * win.h / ch.max(1);
             let has_content = !win.pixels.is_empty() && src_row >= 0 && src_row < win.h;
+            // Расстояние до края нужно ТОЛЬКО у краёв. В середине окна ответ известен заранее,
+            // а корень там стоил бы дороже всего остального вместе взятого: полноэкранная
+            // перерисовка — это миллион пикселей, и миллион квадратных корней на кадр
+            // превращали плавное движение в рывки (Веха 125.3).
+            let top = yy - fy;
+            let corner_row = top < RADIUS || fy + fh - 1 - yy < RADIUS;
+            let edge_row = top < BORDER || fy + fh - 1 - yy < BORDER;
+            let opaque = win.shown.a >= 256;
             for xx in sx..ex {
-                // Одно расстояние отвечает на всё: внутри ли пиксель, насколько накрыт и
-                // рамка это или содержимое.
-                let d = rrect_sd(xx, yy, fx, fy, fw, fh, RADIUS);
-                let cover = (128 - d).clamp(0, 256) as u32 * win.shown.a / 256;
+                let dh = xx - fx;
+                let near_x = dh < RADIUS || fx + fw - 1 - xx < RADIUS;
+                let (cover, inner) = if corner_row && near_x {
+                    let d = rrect_sd(xx, yy, fx, fy, fw, fh, RADIUS);
+                    (
+                        (128 - d).clamp(0, 256) as u32,
+                        (128 - (d + BORDER * 256)).clamp(0, 256) as u32,
+                    )
+                } else if edge_row || dh < BORDER || fx + fw - 1 - xx < BORDER {
+                    (256, 0) // прямая часть рамки
+                } else {
+                    (256, 256) // содержимое
+                };
+                let cover = cover * win.shown.a / 256;
                 if cover == 0 {
                     continue;
                 }
-                // Доля «уже не рамка»: тот же скат, сдвинутый внутрь на толщину обводки.
-                let inner = (128 - (d + BORDER * 256)).clamp(0, 256) as u32;
-                let content = if has_content {
+                let content = if has_content && inner != 0 {
                     let col = (xx - fx - BORDER) * win.w / cw.max(1);
                     let p = ((src_row * win.w + col) * 4) as usize;
                     if col >= 0 && col < win.w && p + 2 < win.pixels.len() {
@@ -1054,8 +1070,11 @@ impl Wm {
                     border
                 };
                 let i = (xx - x0) as usize;
-                // Сперва рамка на своё место, потом содержимое поверх неё по доле `inner` —
-                // так граница между рамкой и содержимым тоже сглажена, а не ступенчата.
+                // Быстрый путь: непрозрачный пиксель в середине — просто цвет, без смешивания.
+                if opaque && cover >= 256 && (inner >= 256 || inner == 0) {
+                    out[i] = self.pack(if inner == 0 { border } else { content });
+                    continue;
+                }
                 let px = self.blend(out[i], border, cover);
                 out[i] = if inner == 0 { px } else { self.blend(px, content, inner * cover / 256) };
             }
