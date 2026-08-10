@@ -40,12 +40,6 @@ use alloc::vec::Vec;
 use void_user as sys;
 use void_user::win;
 
-// Запасной шрифт 8×16 — заголовки окон. Настоящий (из пакета) придёт вместе с тулкитом.
-#[path = "../bitfont.rs"]
-mod bitfont;
-use bitfont::BitmapFont;
-use ereb_render::{RasterizedGlyph, Rasterizer, RenderStyle};
-
 /// Кадр 1280×800 RGBA (4 МиБ) + копии содержимого окон.
 #[global_allocator]
 static ALLOC: sys::heap::Heap<{ 32 * 1024 * 1024 }> = sys::heap::Heap::new();
@@ -66,11 +60,15 @@ const C_FRAME: (u8, u8, u8) = (0x16, 0x1b, 0x22);
 const C_FRAME_ACTIVE: (u8, u8, u8) = (0x24, 0x2c, 0x38);
 const C_BORDER: (u8, u8, u8) = (0x30, 0x36, 0x3d);
 const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
-const C_TEXT: (u8, u8, u8) = (0xc9, 0xd1, 0xd9);
 
-/// Высота титульной полосы и толщина рамки.
-const TITLE_H: i32 = 22;
-const BORDER: i32 = 1;
+/// Толщина рамки и радиус скругления (Веха 124 — вид взят из noctalia владельца).
+///
+/// ТИТУЛЬНОЙ ПОЛОСЫ БОЛЬШЕ НЕТ. В тайлинге она не несла ничего: окно не таскают мышью, крестика
+/// нет, а имя программы и так видно по содержимому. Взамен — заметная рамка (она же индикатор
+/// фокуса) и крупное скругление. Побочно исчезло мерцание заголовка: единственные пиксели,
+/// которые писались дважды за кадр, были как раз его глифы.
+const BORDER: i32 = 2;
+const RADIUS: i32 = 12;
 
 // ── раскладка (Веха 119, [[wm-keys]]) ────────────────────────────────────────
 //
@@ -257,7 +255,6 @@ fn main_loop() -> ! {
     sys::write_console(alloc::format!("[wm] композитор VOID, {}\n", BUILD).as_bytes());
     let me = sys::self_endpoint();
     let store = store_cap();
-    let mut font = BitmapFont::new(16);
 
     let mut wm = Wm {
         info,
@@ -373,7 +370,7 @@ fn main_loop() -> ! {
         // Кадр — ОДИН на оборот, в самом конце: к этому месту учтены все события пачки, все
         // ответы клиентов и все ушедшие окна. Пока рисовало каждое событие само, рука обгоняла
         // экран (Веха 120.2).
-        wm.flush(&mut font);
+        wm.flush();
     }
 }
 
@@ -386,6 +383,9 @@ struct Win {
     y: i32,
     w: i32,
     h: i32,
+    /// Заголовок от клиента. Композитор его больше не рисует (полосы заголовка нет), но
+    /// хранит: он понадобится подписям в обзоре и списку окон.
+    #[allow(dead_code)]
     title: String,
     /// Копия пикселей клиента (RGBA), прочитанная по content-id.
     pixels: Vec<u8>,
@@ -401,17 +401,13 @@ struct Win {
 }
 
 impl Win {
-    /// Прямоугольник рамки (вместе с титульной полосой).
+    /// Прямоугольник рамки.
     fn frame(&self) -> (i32, i32, i32, i32) {
-        (self.x, self.y, self.w + 2 * BORDER, self.h + TITLE_H + 2 * BORDER)
+        (self.x, self.y, self.w + 2 * BORDER, self.h + 2 * BORDER)
     }
     /// Левый верхний угол СОДЕРЖИМОГО.
     fn content_at(&self) -> (i32, i32) {
-        (self.x + BORDER, self.y + BORDER + TITLE_H)
-    }
-    fn hit_title(&self, px: i32, py: i32) -> bool {
-        px >= self.x && px < self.x + self.w + 2 * BORDER
-            && py >= self.y && py < self.y + TITLE_H + BORDER
+        (self.x + BORDER, self.y + BORDER)
     }
     fn hit_frame(&self, px: i32, py: i32) -> bool {
         let (fx, fy, fw, fh) = self.frame();
@@ -518,6 +514,27 @@ struct OvItem {
 /// перерисовку окна в другом углу; но и длинный список вреден — накладные расходы на каждый
 /// прямоугольник свои. При переполнении всё сливается в один охватывающий.
 const DAMAGE_MAX: usize = 8;
+
+/// Целочисленный квадратный корень (для скругления углов).
+fn isqrt(v: i32) -> i32 {
+    if v <= 0 {
+        return 0;
+    }
+    let mut r = 0i32;
+    while (r + 1) * (r + 1) <= v {
+        r += 1;
+    }
+    r
+}
+
+/// На сколько втянут край строки, отстоящей от верха окна на `dy`, при высоте `h`.
+fn corner_inset(dy: i32, h: i32) -> i32 {
+    let d = dy.min(h - 1 - dy); // расстояние до ближайшего края по вертикали
+    if d >= RADIUS || d < 0 {
+        return 0;
+    }
+    RADIUS - isqrt(RADIUS * RADIUS - (RADIUS - d) * (RADIUS - d))
+}
 
 /// Пересечение двух прямоугольников (x, y, w, h). `None` — не пересекаются.
 fn intersect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> Option<(i32, i32, i32, i32)> {
@@ -645,25 +662,6 @@ impl Wm {
         fence();
     }
 
-    /// Нарисовать строку битмапным шрифтом. Возвращает ширину нарисованного.
-    fn text(&self, font: &mut BitmapFont, x: i32, y: i32, s: &str, c: (u8, u8, u8)) -> i32 {
-        let px = self.pack(c);
-        let mut pen = x;
-        for ch in s.chars() {
-            let g: RasterizedGlyph = font.rasterize(ch, RenderStyle::Regular);
-            for gy in 0..g.height as i32 {
-                for gx in 0..g.width as i32 {
-                    if g.bitmap[(gy * g.width as i32 + gx) as usize] > 127 {
-                        self.put(pen + gx, y + gy, px);
-                    }
-                }
-            }
-            pen += font.metrics().width as i32;
-        }
-        fence();
-        pen - x
-    }
-
     // ── композиция ─────────────────────────────────────────────────────────────────────
 
     /// Отметить прямоугольник как требующий перерисовки (Веха 120.2).
@@ -698,13 +696,13 @@ impl Wm {
     }
 
     /// Нарисовать всё накопленное. Ровно один раз за оборот цикла — это и есть «кадр».
-    fn flush(&mut self, font: &mut BitmapFont) {
+    fn flush(&mut self) {
         if self.damage.is_empty() {
             return;
         }
         let rects = core::mem::take(&mut self.damage);
         for (x, y, w, h) in rects {
-            self.repaint(font, x, y, w, h);
+            self.repaint(x, y, w, h);
         }
     }
 
@@ -715,33 +713,13 @@ impl Wm {
     /// потом поверх рисовались окна: пиксель под окном писался ДВАЖДЫ, и глаз успевал поймать
     /// промежуточное состояние — при перетаскивании это выглядело как мигание окна. Теперь
     /// каждый пиксель экрана пишется ровно один раз за кадр.
-    fn repaint(&mut self, font: &mut BitmapFont, x: i32, y: i32, w: i32, h: i32) {
+    fn repaint(&mut self, x: i32, y: i32, w: i32, h: i32) {
         let Some((x0, y0, w, h)) = intersect(
             (x, y, w, h),
             (0, 0, self.info.width as i32, self.info.height as i32),
         ) else {
             return;
         };
-        // Заголовки — глифами, поверх собранных строк: растеризовать шрифт внутри построчной
-        // сборки значило бы делать это заново на каждую строку полосы.
-        //
-        // В обзоре их нет вовсе: окна уменьшены, а текст заголовка рисуется в НЕуменьшенных
-        // координатах — на экране это была надпись, висящая поверх чужой миниатюры.
-        let mut titles: Vec<(i32, i32, bool, usize)> = Vec::new();
-        for i in 0..self.wins.len() {
-            if self.overview {
-                break;
-            }
-            let (fx, fy, fw, fh) = self.wins[i].frame();
-            if self.wins[i].visible
-                && intersect((fx, fy, fw, fh), (x0, y0, w, h)).is_some()
-                && fy + 3 < y0 + h
-                && fy + 3 + 16 > y0
-            {
-                titles.push((fx + 6, fy + 3, self.focus == Some(self.wins[i].id), i));
-            }
-        }
-
         // Строку берём ВО ВЛАДЕНИЕ на время сборки: иначе не собрать её, читая окна из `self`.
         let mut row = core::mem::take(&mut self.scratch);
         if row.len() < w as usize {
@@ -754,12 +732,6 @@ impl Wm {
         self.scratch = row;
         fence();
 
-        for (tx, ty, active, i) in titles {
-            let c = if active { C_TEXT } else { C_BORDER };
-            let title = core::mem::take(&mut self.wins[i].title);
-            self.text(font, tx, ty, &title, c);
-            self.wins[i].title = title;
-        }
     }
 
     /// Собрать одну строку экрана: стол → окна → курсор.
@@ -781,34 +753,38 @@ impl Wm {
             if yy < fy || yy >= fy + fh {
                 continue;
             }
-            let (Some(sx), Some(ex)) = (Some(fx.max(x0)), Some((fx + fw).min(x1))) else {
-                continue;
-            };
+            // Скругление: у строки, попавшей в угловую зону, края втянуты внутрь на столько,
+            // сколько «съедает» окружность. Считаем целочисленным корнем — плавающей арифметики
+            // в этих программах нет, а разница в полпикселя на радиусе в дюжину незаметна.
+            let inset = corner_inset(yy - fy, fh);
+            let (sx, ex) = ((fx + inset).max(x0), (fx + fw - inset).min(x1));
             if ex <= sx {
                 continue;
             }
             let active = self.focus == Some(win.id);
             let border = self.pack(if active { C_ACCENT } else { C_BORDER });
-            let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
             let (ox, oy) = win.content_at();
             let content_row = yy - oy;
-            let has_content =
-                !win.pixels.is_empty() && content_row >= 0 && content_row < win.h;
-            let edge_row = yy == fy || yy == fy + fh - 1;
-            let title = yy < fy + BORDER + TITLE_H;
+            let has_content = !win.pixels.is_empty() && content_row >= 0 && content_row < win.h;
+            // Рамка по всему периметру скруглённой формы: сверху/снизу — по толщине, с боков —
+            // от втянутого края.
+            let edge_row = yy - fy < BORDER || fy + fh - 1 - yy < BORDER;
+            let inner = corner_inset(yy - fy, fh) + BORDER;
             for xx in sx..ex {
-                let px = if edge_row || xx == fx || xx == fx + fw - 1 {
+                let on_border =
+                    edge_row || xx < fx + inner || xx >= fx + fw - inner;
+                let px = if on_border {
                     border
-                } else if title || !has_content {
-                    title_bg
-                } else {
+                } else if has_content {
                     let col = xx - ox;
                     let p = ((content_row * win.w + col) * 4) as usize;
                     if col >= 0 && col < win.w && p + 2 < win.pixels.len() {
                         self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]))
                     } else {
-                        title_bg
+                        border
                     }
+                } else {
+                    border
                 };
                 out[(xx - x0) as usize] = px;
             }
@@ -832,9 +808,8 @@ impl Wm {
             let active = self.focus == Some(it.id) && it.space == self.space;
             let border = self.pack(if active { C_ACCENT } else { C_BORDER });
             let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
-            // Строка ИСХОДНОГО окна, попавшая в эту строку экрана. Заголовок в уменьшенном виде
-            // не рисуем: он превратился бы в полосу шума в пару пикселей.
-            let sy = (yy - it.y) * (win.h + TITLE_H + 2 * BORDER) / it.h - TITLE_H - BORDER;
+            // Строка ИСХОДНОГО окна, попавшая в эту строку экрана.
+            let sy = (yy - it.y) * (win.h + 2 * BORDER) / it.h - BORDER;
             let edge_row = yy == it.y || yy == it.y + it.h - 1;
             for xx in it.x.max(x0)..(it.x + it.w).min(x1) {
                 let px = if edge_row || xx == it.x || xx == it.x + it.w - 1 {
@@ -949,7 +924,7 @@ impl Wm {
             let Some(k) = self.win_at(id) else { continue };
             self.wins[k].visible = true;
             // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
-            let (cw2, ch2) = ((fw - 2 * BORDER).max(32), (fh - TITLE_H - 2 * BORDER).max(32));
+            let (cw2, ch2) = ((fw - 2 * BORDER).max(32), (fh - 2 * BORDER).max(32));
             self.wins[k].x = fx - self.scroll_x;
             self.wins[k].y = fy;
             if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
@@ -1047,6 +1022,32 @@ impl Wm {
         self.space = n;
     }
 
+    /// Подвинуть камеру обзора минимально — так, чтобы окно `id` поместилось на экране целиком.
+    ///
+    /// Ничего не делает, если оно и так видно. Окно больше экрана прижимается левым/верхним
+    /// краем: показать его целиком нельзя, а метаться между краями — хуже, чем не двигаться.
+    fn ensure_visible(&mut self, id: u32) {
+        let (sw, sh) = (self.info.width as i32, self.info.height as i32);
+        let Some(it) = self.ov.iter().find(|it| it.id == id) else { return };
+        let (mut dx, mut dy) = (0, 0);
+        if it.x < GAP {
+            dx = it.x - GAP;
+        } else if it.x + it.w > sw - GAP {
+            dx = (it.x + it.w - (sw - GAP)).min(it.x - GAP);
+        }
+        if it.y < GAP {
+            dy = it.y - GAP;
+        } else if it.y + it.h > sh - GAP {
+            dy = (it.y + it.h - (sh - GAP)).min(it.y - GAP);
+        }
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        self.ov_cam.0 += dx;
+        self.ov_cam.1 += dy;
+        self.build_overview(false);
+    }
+
     /// Колонка и место окна в ней.
     fn locate(&self, id: u32) -> Option<(usize, usize)> {
         self.cols
@@ -1114,8 +1115,7 @@ impl Wm {
     /// сотни тысяч пикселей вместо нескольких тысяч — а фокус переезжает на каждый клик.
     fn damage_chrome(&mut self, i: usize) {
         let (fx, fy, fw, fh) = self.wins[i].frame();
-        let top = BORDER + TITLE_H;
-        self.damage(fx, fy, fw, top);
+        self.damage(fx, fy, fw, BORDER);
         self.damage(fx, fy + fh - BORDER, fw, BORDER);
         self.damage(fx, fy, BORDER, fh);
         self.damage(fx + fw - BORDER, fy, BORDER, fh);
@@ -1214,6 +1214,12 @@ impl Wm {
                     }
                     self.sync_focus();
                     self.build_overview(false);
+                    // …и подвинуть камеру РОВНО настолько, чтобы выбранное влезло целиком
+                    // (идея владельца, Веха 124). Это безопасно там, где «поставить в центр»
+                    // ломалось: минимальная подвижка имеет неподвижную точку — как только окно
+                    // влезло, следующее наведение на него не двигает ничего. Центрирование
+                    // такой точки не имеет, поэтому и качалось.
+                    self.ensure_visible(id);
                 }
             }
         }
@@ -1519,17 +1525,6 @@ impl Wm {
             self.unlink(id);
             self.sync_focus();
             self.relayout();
-        }
-    }
-
-    /// Перерисовать окно, потерявшее фокус (его рамка обязана погаснуть).
-    fn unfocus_repaint(&mut self, lost: Option<u32>, now: Option<u32>) {
-        let Some(id) = lost else { return };
-        if Some(id) == now {
-            return;
-        }
-        if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-            self.damage_chrome(i); // погасла только рамка — содержимое окна не менялось
         }
     }
 
