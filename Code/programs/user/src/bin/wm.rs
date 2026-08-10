@@ -334,6 +334,8 @@ fn main_loop() -> ! {
         transient: 0,
         damage: Vec::new(),
         scratch: Vec::new(),
+        shadow: vec![0u32; info.width * info.height],
+        present_all: false,
         readbuf: Vec::new(),
         spaces: (0..SPACES).map(|_| Space::default()).collect(),
         space: 0,
@@ -597,6 +599,13 @@ struct Wm {
     damage: Vec<(i32, i32, i32, i32)>,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
     scratch: Vec<u32>,
+    /// ТЕНЕВОЙ КАДР (Веха 126): весь экран в обычной памяти. Кадр собирается здесь, а на экран
+    /// уходит блитом. Затевалось ради разрывов, а понадобилось ради СТОИМОСТИ: прокрутка ленты
+    /// перерисовывала миллион пикселей на кадр, а с теневым кадром она — сдвиг памяти плюс
+    /// сборка открывшейся полосы.
+    shadow: Vec<u32>,
+    /// Отдать на экран весь кадр (после сдвига памяти изменилось всё).
+    present_all: bool,
     /// Буфер чтения объекта клиента: один на сессию, только растёт (см. `OP_ATTACH`).
     readbuf: Vec<u8>,
     /// Неактивные рабочие столы (активный — в полях выше).
@@ -911,6 +920,7 @@ impl Wm {
         // Это дороже точечных прямоугольников, но честно: половина экрана и так меняется, а
         // попытка обойтись кусочками и оставляла те самые следы.
         if self.scroll_dur != 0 {
+            let prev_scroll = self.scroll_x;
             let t = ((now.saturating_sub(self.scroll_at)) * 1024 / self.scroll_dur).min(1024) as i32;
             self.scroll_x = lerp(self.scroll_from, self.scroll_to, ease_out(t));
             if t >= 1024 {
@@ -919,7 +929,31 @@ impl Wm {
             } else {
                 moving = true;
             }
-            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+            // Лента сдвинулась на `dx` — в теневом кадре это СДВИГ ПАМЯТИ, а собрать заново
+            // надо лишь открывшуюся полосу с краю. Полная пересборка здесь и делала движение
+            // рваным: миллион пикселей на кадр против нескольких тысяч.
+            let dx = self.scroll_x - prev_scroll;
+            let (sw, shh) = (self.info.width as i32, self.info.height as i32);
+            if dx != 0 && dx.abs() < sw && !self.overview {
+                let pitch = sw as usize;
+                let mut sh = core::mem::take(&mut self.shadow);
+                let n = dx.unsigned_abs() as usize;
+                for yy in 0..shh as usize {
+                    let row = &mut sh[yy * pitch..(yy + 1) * pitch];
+                    if dx > 0 {
+                        row.copy_within(n.., 0); // лента уехала влево
+                    } else {
+                        row.copy_within(..pitch - n, n);
+                    }
+                }
+                self.shadow = sh;
+                // Открывшаяся полоса + запас на сглаженные края.
+                let strip = if dx > 0 { (sw - n as i32 - 2, n as i32 + 2) } else { (0, n as i32 + 2) };
+                self.damage(strip.0, 0, strip.1, shh);
+                self.present_all = true;
+            } else {
+                self.damage(0, 0, sw, shh);
+            }
         }
 
         // Камера обзора едет так же, но своим сроком: обзор показывает всю систему, и резкость
@@ -966,9 +1000,28 @@ impl Wm {
             return;
         }
         let rects = core::mem::take(&mut self.damage);
-        for (x, y, w, h) in rects {
-            self.repaint(x, y, w, h);
+        for (x, y, w, h) in &rects {
+            self.repaint(*x, *y, *w, *h);
         }
+        // На экран — либо те же области, либо весь кадр (после сдвига памяти изменилось всё).
+        let pitch = self.info.width as usize;
+        let sh = core::mem::take(&mut self.shadow);
+        if self.present_all {
+            self.present_all = false;
+            for yy in 0..self.info.height as i32 {
+                let off = yy as usize * pitch;
+                self.write_row(0, yy, &sh[off..off + pitch]);
+            }
+        } else {
+            for (x, y, w, h) in &rects {
+                for yy in *y..*y + *h {
+                    let off = yy as usize * pitch + *x as usize;
+                    self.write_row(*x, yy, &sh[off..off + *w as usize]);
+                }
+            }
+        }
+        self.shadow = sh;
+        fence();
     }
 
     /// Перерисовать прямоугольник экрана. Строка собирается ЦЕЛИКОМ в памяти — стол, окна в
@@ -985,17 +1038,14 @@ impl Wm {
         ) else {
             return;
         };
-        // Строку берём ВО ВЛАДЕНИЕ на время сборки: иначе не собрать её, читая окна из `self`.
-        let mut row = core::mem::take(&mut self.scratch);
-        if row.len() < w as usize {
-            row.resize(w as usize, 0);
-        }
+        // Собираем в ТЕНЕВОЙ кадр; на экран он уйдёт блитом в `flush`.
+        let mut sh = core::mem::take(&mut self.shadow);
+        let pitch = self.info.width as usize;
         for yy in y0..y0 + h {
-            self.compose_row(&mut row[..w as usize], yy, x0);
-            self.write_row(x0, yy, &row[..w as usize]);
+            let off = yy as usize * pitch + x0 as usize;
+            self.compose_row(&mut sh[off..off + w as usize], yy, x0);
         }
-        self.scratch = row;
-        fence();
+        self.shadow = sh;
 
     }
 
