@@ -2107,28 +2107,19 @@ keys = [\n\
 \x20 bind(\"pane\", \"PageDown\", \"scroll-down\"),\n\
 ]\n\
 \n\
-# Схема управления ОКНАМИ (mode = \"wm\"): умолчания как в niri.\n\
-# Модель — скроллируемый тайлинг: окна живут в КОЛОНКАХ на ленте, экран по ней ездит.\n\
-wm_keys = [\n\
-  bind(\"wm\", \"Super+Return\", \"spawn-term\"),\n\
-  bind(\"wm\", \"Super+Q\", \"close-window\"),\n\
-  bind(\"wm\", \"Super+H\", \"focus-column-left\"),\n\
-  bind(\"wm\", \"Super+L\", \"focus-column-right\"),\n\
-  bind(\"wm\", \"Super+Up\", \"focus-window-up\"),\n\
-  bind(\"wm\", \"Super+Down\", \"focus-window-down\"),\n\
-  bind(\"wm\", \"Super+Shift+H\", \"move-column-left\"),\n\
-  bind(\"wm\", \"Super+Shift+L\", \"move-column-right\"),\n\
-  bind(\"wm\", \"Super+Shift+Up\", \"move-window-up\"),\n\
-  bind(\"wm\", \"Super+Shift+Down\", \"move-window-down\"),\n\
-  bind(\"wm\", \"Super+BracketLeft\", \"move-to-column-left\"),\n\
-  bind(\"wm\", \"Super+BracketRight\", \"move-to-column-right\"),\n\
-  bind(\"wm\", \"Super+R\", \"width-next\"),\n\
-  bind(\"wm\", \"Super+Equal\", \"width-plus\"),\n\
-  bind(\"wm\", \"Super+Minus\", \"width-minus\"),\n\
-  bind(\"wm\", \"Super+F\", \"maximize-column\"),\n\
-  bind(\"wm\", \"Super+Tab\", \"focus-next\"),\n\
-  bind(\"wm\", \"Super+Shift+Q\", \"quit\"),\n\
-]\n\
+# Схема управления ОКНАМИ (mode = \"wm\"). ПУСТОЙ список = схема по умолчанию, зашитая в wm:\n\
+# так новые действия появляются вместе с системой, а не остаются отменёнными старым конфигом.\n\
+# Хоть один bind — и схема задаётся ЦЕЛИКОМ отсюда (иначе клавишу нельзя было бы отвязать).\n\
+#\n\
+# Умолчания (как в niri): Super+Return терминал · Super+Q закрыть · Super+H/L колонка левее/правее\n\
+#   Super+Up/Down окно в колонке · Super+Shift+H/L переставить колонку\n\
+#   Super+Shift+Up/Down переставить окно · Super+[ / Super+] окно в соседнюю колонку\n\
+#   Super+R ширина по кругу · Super+Equal/Minus ширина ± · Super+F развернуть\n\
+#   Super+Tab следующая колонка · Super+Shift+Q выйти из сессии\n\
+#\n\
+# Свой вариант пишется так:\n\
+#   wm_keys = [ bind(\"wm\", \"Super+Return\", \"spawn-term\"), … ]\n\
+wm_keys = []\n\
 \n\
 netcap = if net { \"endpoint:net-srv\" } else { [] }\n\
 \n\

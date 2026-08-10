@@ -146,14 +146,22 @@ fn parse_combo(tok: &str) -> Option<(u16, u8)> {
     Some((sym, mods))
 }
 
-/// Собрать раскладку: строки `bind wm …` из конфига поколения, иначе умолчания.
-fn load_binds(scap: usize) -> Vec<Bind> {
+/// Собрать раскладку: строки `bind wm …` из конфига поколения, иначе зашитая схема.
+/// Второе значение — ОТКУДА она взялась.
+///
+/// Правило то же, что у терминала (Веха 100): хоть один `bind` в конфиге — и схема задаётся
+/// ЦЕЛИКОМ оттуда. Иначе клавишу нельзя было бы отвязать. Но у правила есть цена, и она
+/// всплыла на живом человеке (Веха 121.1): конфиг, посеянный ДО появления новых действий,
+/// молча отменяет их все — раскладка есть, она просто старая. Поэтому источник теперь
+/// называется вслух: «шесть сочетаний из конфига» при восемнадцати зашитых — это диагноз.
+fn load_binds(scap: usize) -> (Vec<Bind>, bool) {
     let text = read_generation(scap).unwrap_or_default();
-    let mut out = parse_binds(&text);
+    let out = parse_binds(&text);
     if out.is_empty() {
-        out = parse_binds(DEFAULT_BINDS);
+        (parse_binds(DEFAULT_BINDS), false)
+    } else {
+        (out, true)
     }
-    out
 }
 
 fn parse_binds(text: &str) -> Vec<Bind> {
@@ -258,8 +266,23 @@ fn main_loop() -> ! {
         sys::write_console("[wm] клиентов нет — пустой рабочий стол\n".as_bytes());
     }
 
-    let binds = load_binds(store);
-    sys::write_console(alloc::format!("[wm] раскладка: {} сочетаний\n", binds.len()).as_bytes());
+    let (binds, from_config) = load_binds(store);
+    let builtin = parse_binds(DEFAULT_BINDS).len();
+    sys::write_console(
+        alloc::format!(
+            "[wm] раскладка: {} сочетаний {} (зашитая знает {})\n",
+            binds.len(),
+            if from_config { "ИЗ КОНФИГА ПОКОЛЕНИЯ" } else { "— зашитая схема" },
+            builtin,
+        )
+        .as_bytes(),
+    );
+    if from_config && binds.len() < builtin {
+        sys::write_console(
+            "[wm] конфиг знает МЕНЬШЕ действий, чем система: он посеян раньше.              `ved /etc/system/terminal.vv` → wm_keys = [] вернёт схему по умолчанию\n"
+                .as_bytes(),
+        );
+    }
 
     let mut msg = [0u8; 1024];
     let mut mouse = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0 }; 32];
@@ -870,6 +893,23 @@ impl Wm {
             }
         }
 
+        // Фокус за указателем (Веха 121.1, просьба владельца): навёл — работаешь здесь.
+        // Только на ДВИЖЕНИИ: иначе всплывшее под неподвижным курсором окно перехватывало бы
+        // фокус у того, с кем человек работает.
+        if (e.dx != 0 || e.dy != 0) && self.buttons == 0 {
+            if let Some(i) = self.wins.iter().position(|w| w.hit_frame(self.cursor.0, self.cursor.1))
+            {
+                let id = self.wins[i].id;
+                if self.focus != Some(id) {
+                    if let Some((ci, wi)) = self.locate(id) {
+                        self.cur = ci;
+                        self.cols[ci].focus = wi;
+                        self.sync_focus();
+                    }
+                }
+            }
+        }
+
         // Движение — стереть курсор со старого места (на новом его нарисует flush).
         self.damage(old.0, old.1, CUR_W, CUR_H);
 
@@ -1029,16 +1069,12 @@ impl Wm {
                 }
                 self.relayout();
             }
-            "focus-next" | "focus-prev" => {
-                if self.cols.is_empty() {
-                    return;
-                }
-                // По ленте по кругу: пока обзора окон нет, `Super+Tab` — это «следующее окно».
-                let n = self.cols.len();
-                self.cur = if name == "focus-next" { (self.cur + 1) % n } else { (self.cur + n - 1) % n };
-                self.sync_focus();
-                self.relayout();
-            }
+            // Синонимы движения по ленте. По КРУГУ не ходим (Веха 121.1, просьба владельца):
+            // дошёл до края — там и остался. Заворот полезен там, где окон не видно, а у нас
+            // лента перед глазами, и прыжок с конца в начало читается как промах, а не как
+            // помощь.
+            "focus-next" => self.action("focus-column-right", store, me),
+            "focus-prev" => self.action("focus-column-left", store, me),
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
                 sys::exit(0);
