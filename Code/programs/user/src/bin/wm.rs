@@ -96,7 +96,9 @@ bind wm Super+R width-next
 bind wm Super+Equal width-plus
 bind wm Super+Minus width-minus
 bind wm Super+F maximize-column
-bind wm Super+Tab focus-next
+bind wm Super+Tab toggle-overview
+bind wm Escape close-overview
+bind wm Return close-overview
 bind wm Super+1 workspace-1
 bind wm Super+2 workspace-2
 bind wm Super+3 workspace-3
@@ -270,6 +272,8 @@ fn main_loop() -> ! {
         readbuf: Vec::new(),
         spaces: (0..SPACES).map(|_| Space::default()).collect(),
         space: 0,
+        overview: false,
+        ov: Vec::new(),
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -473,6 +477,22 @@ struct Wm {
     spaces: Vec<Space>,
     /// Номер активного стола.
     space: usize,
+    /// Включён ли ОБЗОР (Веха 123): столы уменьшены и видны разом.
+    overview: bool,
+    /// Что и куда нарисовано в обзоре. Считается один раз при каждом изменении — и рисованием,
+    /// и попаданием мыши пользуется ОДИН этот список: два расчёта «где что» означали бы, что
+    /// клик приходит не в то окно, которое человек видит.
+    ov: Vec<OvItem>,
+}
+
+/// Окно в обзоре: куда его уменьшили и с какого стола оно родом.
+struct OvItem {
+    id: u32,
+    space: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
 }
 
 /// Потолок списка повреждений. Список нужен, чтобы движение курсора в углу не тянуло за собой
@@ -685,8 +705,14 @@ impl Wm {
         };
         // Заголовки — глифами, поверх собранных строк: растеризовать шрифт внутри построчной
         // сборки значило бы делать это заново на каждую строку полосы.
+        //
+        // В обзоре их нет вовсе: окна уменьшены, а текст заголовка рисуется в НЕуменьшенных
+        // координатах — на экране это была надпись, висящая поверх чужой миниатюры.
         let mut titles: Vec<(i32, i32, bool, usize)> = Vec::new();
         for i in 0..self.wins.len() {
+            if self.overview {
+                break;
+            }
             let (fx, fy, fw, fh) = self.wins[i].frame();
             if self.wins[i].visible
                 && intersect((fx, fy, fw, fh), (x0, y0, w, h)).is_some()
@@ -717,11 +743,16 @@ impl Wm {
         }
     }
 
-    /// Собрать одну строку экрана: стол → окна в порядке z → курсор.
+    /// Собрать одну строку экрана: стол → окна → курсор.
     fn compose_row(&self, out: &mut [u32], yy: i32, x0: i32) {
         let desktop = self.pack(C_DESKTOP);
         out.fill(desktop);
         let x1 = x0 + out.len() as i32;
+        if self.overview {
+            self.compose_row_overview(out, yy, x0, x1);
+            self.draw_cursor_row(out, yy, x0, x1);
+            return;
+        }
 
         for win in &self.wins {
             if !win.visible {
@@ -764,7 +795,49 @@ impl Wm {
             }
         }
 
-        // Курсор поверх всего: он не принадлежит ни одному окну.
+        self.draw_cursor_row(out, yy, x0, x1);
+    }
+
+    /// Уменьшенные столы: полосами сверху вниз, окна внутри — выборкой ближайшего пикселя.
+    ///
+    /// Выборка «ближайший», а не усреднение: усреднение красивее, но стоит чтения нескольких
+    /// пикселей на каждый выводимый, а обзор перерисовывается на каждое движение курсора.
+    /// Текст в уменьшенном окне всё равно нечитаем — важно узнать окно по форме и цвету.
+    fn compose_row_overview(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
+        for it in &self.ov {
+            if yy < it.y || yy >= it.y + it.h {
+                continue;
+            }
+            let Some(k) = self.win_at(it.id) else { continue };
+            let win = &self.wins[k];
+            let active = self.focus == Some(it.id) && it.space == self.space;
+            let border = self.pack(if active { C_ACCENT } else { C_BORDER });
+            let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
+            // Строка ИСХОДНОГО окна, попавшая в эту строку экрана. Заголовок в уменьшенном виде
+            // не рисуем: он превратился бы в полосу шума в пару пикселей.
+            let sy = (yy - it.y) * (win.h + TITLE_H + 2 * BORDER) / it.h - TITLE_H - BORDER;
+            let edge_row = yy == it.y || yy == it.y + it.h - 1;
+            for xx in it.x.max(x0)..(it.x + it.w).min(x1) {
+                let px = if edge_row || xx == it.x || xx == it.x + it.w - 1 {
+                    border
+                } else if sy < 0 || sy >= win.h || win.pixels.is_empty() {
+                    title_bg
+                } else {
+                    let sx = (xx - it.x) * (win.w + 2 * BORDER) / it.w - BORDER;
+                    let p = ((sy * win.w + sx) * 4) as usize;
+                    if sx >= 0 && sx < win.w && p + 2 < win.pixels.len() {
+                        self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]))
+                    } else {
+                        title_bg
+                    }
+                };
+                out[(xx - x0) as usize] = px;
+            }
+        }
+    }
+
+    /// Курсор поверх всего: он не принадлежит ни одному окну.
+    fn draw_cursor_row(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
         let cy = yy - self.cursor.1;
         if cy >= 0 && cy < CUR_H {
             let fill = self.pack(if self.buttons != 0 { C_ACCENT } else { (255, 255, 255) });
@@ -793,6 +866,29 @@ impl Wm {
         (self.info.width as i32 - GAP) * n / d - GAP
     }
 
+    /// Геометрия ленты в ЕЁ СОБСТВЕННЫХ координатах: рамки окон и полная ширина ленты.
+    ///
+    /// Чистая функция, ничего не меняющая, — и это важно: по ней живут ДВА потребителя,
+    /// раскладка экрана и обзор. Две копии одной арифметики разъехались бы на первой же правке
+    /// (обзор показывал бы не то, что получится при выходе из него).
+    fn strip_layout(&self, cols: &[Column]) -> (Vec<(u32, i32, i32, i32, i32)>, i32) {
+        let screen_h = self.info.height as i32;
+        let mut out = Vec::new();
+        let mut x = GAP;
+        for c in cols {
+            let cw = self.col_width(c);
+            let n = c.ids.len().max(1) as i32;
+            let cell = (screen_h - GAP) / n - GAP;
+            for (wi, id) in c.ids.iter().enumerate() {
+                let y = GAP + wi as i32 * (cell + GAP);
+                let h = if wi + 1 == c.ids.len() { screen_h - GAP - y } else { cell };
+                out.push((*id, x, y, cw, h));
+            }
+            x += cw + GAP;
+        }
+        (out, x)
+    }
+
     /// Пересчитать геометрию всех окон и прокрутку ленты; всем, у кого размер изменился, послать
     /// `EV_RESIZE`.
     ///
@@ -807,54 +903,46 @@ impl Wm {
         for w in self.wins.iter_mut() {
             w.visible = false;
         }
-        // Сначала — куда уехала лента. Колонка в фокусе обязана быть видна целиком; если она шире
-        // экрана, показываем её левый край.
+        let (frames, _) = self.strip_layout(&self.cols);
+
+        // Куда уехала лента: колонка в фокусе обязана быть видна целиком; если она шире экрана,
+        // показываем её левый край.
         let mut x = GAP;
-        let mut starts: Vec<(i32, i32)> = Vec::new(); // (x, ширина)
-        for c in &self.cols {
-            let w = self.col_width(c);
-            starts.push((x, w));
-            x += w + GAP;
-        }
-        if let Some(&(cx, cw)) = starts.get(self.cur) {
-            let view = self.info.width as i32;
-            if cx - self.scroll_x < GAP {
-                self.scroll_x = cx - GAP;
+        let view = self.info.width as i32;
+        for (i, c) in self.cols.iter().enumerate() {
+            let cw = self.col_width(c);
+            if i == self.cur {
+                if x - self.scroll_x < GAP {
+                    self.scroll_x = x - GAP;
+                }
+                if x + cw - self.scroll_x > view - GAP {
+                    self.scroll_x = x + cw - view + GAP;
+                }
             }
-            if cx + cw - self.scroll_x > view - GAP {
-                self.scroll_x = cx + cw - view + GAP;
-            }
+            x += cw + GAP;
         }
         if self.cols.is_empty() {
             self.scroll_x = 0;
         }
 
         let mut resized: Vec<(u32, i32, i32)> = Vec::new();
-        for (ci, c) in self.cols.iter().enumerate() {
-            let (cx, cw) = starts[ci];
-            let n = c.ids.len().max(1) as i32;
-            // Высота делится поровну; остаток отдаём последнему окну, чтобы низ был ровным.
-            let cell = (screen_h - GAP) / n - GAP;
-            for (wi, id) in c.ids.iter().enumerate() {
-                let Some(k) = self.win_at(*id) else { continue };
-                self.wins[k].visible = true;
-                let y = GAP + wi as i32 * (cell + GAP);
-                let h = if wi + 1 == c.ids.len() { screen_h - GAP - y } else { cell };
-                // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
-                let (cw2, ch2) = (cw - 2 * BORDER, h - TITLE_H - 2 * BORDER);
-                let (cw2, ch2) = (cw2.max(32), ch2.max(32));
-                self.wins[k].x = cx - self.scroll_x;
-                self.wins[k].y = y;
-                if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
-                    self.wins[k].w = cw2;
-                    self.wins[k].h = ch2;
-                    // Копия пикселей больше не описывает окно — заводим новую по размеру.
-                    self.wins[k].pixels = vec![0u8; (cw2 * ch2 * 4) as usize];
-                    self.wins[k].cid = [0u8; 32];
-                    resized.push((*id, cw2, ch2));
-                }
+        for (id, fx, fy, fw, fh) in frames {
+            let Some(k) = self.win_at(id) else { continue };
+            self.wins[k].visible = true;
+            // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
+            let (cw2, ch2) = ((fw - 2 * BORDER).max(32), (fh - TITLE_H - 2 * BORDER).max(32));
+            self.wins[k].x = fx - self.scroll_x;
+            self.wins[k].y = fy;
+            if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
+                self.wins[k].w = cw2;
+                self.wins[k].h = ch2;
+                // Копия пикселей больше не описывает окно — заводим новую по размеру.
+                self.wins[k].pixels = vec![0u8; (cw2 * ch2 * 4) as usize];
+                self.wins[k].cid = [0u8; 32];
+                resized.push((id, cw2, ch2));
             }
         }
+        let _ = screen_h;
         for (id, w, h) in resized {
             if let Some(k) = self.win_at(id) {
                 let ev = [win::EV_RESIZE, w as u8, (w >> 8) as u8, h as u8, (h >> 8) as u8, 0, 0, 0];
@@ -862,6 +950,54 @@ impl Wm {
             }
         }
         self.damage(0, 0, self.info.width as i32, screen_h);
+    }
+
+    /// Пересчитать раскладку ОБЗОРА (Веха 123).
+    ///
+    /// Столы идут сверху вниз полосами; в полосе лежит вся лента стола, уменьшенная так, чтобы
+    /// поместиться целиком. Показываем непустые столы и всегда текущий: девять полос, из которых
+    /// восемь пустые, — это не обзор, а таблица.
+    ///
+    /// Масштаб целочисленный (`num/den`) и ОДИН на полосу: окна обязаны сохранить и пропорции, и
+    /// взаимное расположение — иначе обзор перестаёт быть картой того, что получится при выходе.
+    fn build_overview(&mut self) {
+        self.ov.clear();
+        let (sw, sh) = (self.info.width as i32, self.info.height as i32);
+        let mut shown: Vec<usize> = (0..SPACES)
+            .filter(|&i| i == self.space || !self.spaces[i].cols.is_empty())
+            .collect();
+        if shown.is_empty() {
+            shown.push(self.space);
+        }
+        let n = shown.len() as i32;
+        let band_h = (sh - GAP) / n - GAP;
+        for (bi, &sp) in shown.iter().enumerate() {
+            let by = GAP + bi as i32 * (band_h + GAP);
+            let cols: &[Column] =
+                if sp == self.space { &self.cols } else { &self.spaces[sp].cols };
+            let (frames, strip_w) = self.strip_layout(cols);
+            if frames.is_empty() {
+                continue;
+            }
+            let avail_w = sw - 2 * GAP;
+            // Уменьшаем по той стороне, которая упирается первой.
+            let (num, den) = if strip_w * band_h <= avail_w * sh {
+                (band_h, sh)
+            } else {
+                (avail_w, strip_w)
+            };
+            for (id, fx, fy, fw, fh) in frames {
+                self.ov.push(OvItem {
+                    id,
+                    space: sp,
+                    x: GAP + fx * num / den,
+                    y: by + fy * num / den,
+                    w: (fw * num / den).max(1),
+                    h: (fh * num / den).max(1),
+                });
+            }
+        }
+        self.damage(0, 0, sw, sh);
     }
 
     /// Колонка и место окна в ней.
@@ -964,6 +1100,32 @@ impl Wm {
         let was = self.buttons;
         self.buttons = e.buttons;
 
+        // В обзоре клик выбирает окно и ВЫХОДИТ к нему — ради этого обзор и открывают.
+        // Попадание считается по тому же списку, по которому обзор нарисован: отдельный расчёт
+        // «где что» означал бы, что клик приходит не в то окно, которое человек видит.
+        if was == 0 && e.buttons != 0 && self.overview {
+            if let Some(it) = self.ov.iter().find(|it| {
+                self.cursor.0 >= it.x
+                    && self.cursor.0 < it.x + it.w
+                    && self.cursor.1 >= it.y
+                    && self.cursor.1 < it.y + it.h
+            }) {
+                let (id, sp) = (it.id, it.space);
+                if sp != self.space {
+                    self.action_inner(&alloc::format!("workspace-{}", sp + 1), 0, 0);
+                }
+                if let Some((ci, wi)) = self.locate(id) {
+                    self.cur = ci;
+                    self.cols[ci].focus = wi;
+                }
+                self.overview = false;
+                self.ov.clear();
+                self.sync_focus();
+                self.relayout();
+            }
+            return;
+        }
+
         // Нажатие: выбрать окно под курсором. Перетаскивания в тайлинге нет — место окна
         // задаёт раскладка, а не рука; плавающий режим остаётся исключением на будущее
         // ([[wm-keys]]), и тащить окно понадобится ровно там.
@@ -983,7 +1145,7 @@ impl Wm {
         // Фокус за указателем (Веха 121.1, просьба владельца): навёл — работаешь здесь.
         // Только на ДВИЖЕНИИ: иначе всплывшее под неподвижным курсором окно перехватывало бы
         // фокус у того, с кем человек работает.
-        if (e.dx != 0 || e.dy != 0) && self.buttons == 0 {
+        if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && !self.overview {
             if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1))
             {
                 let id = self.wins[i].id;
@@ -1033,8 +1195,14 @@ impl Wm {
             return;
         }
         if let Some(b) = binds.iter().find(|b| b.sym == e.sym && b.mods == e.mods) {
-            self.action(&b.action.clone(), store, me);
-            return;
+            // `Escape` и `Return` привязаны БЕЗ модификатора — они закрывают обзор. Вне обзора
+            // забирать их у программы нельзя: редактору Escape нужен ему, а не нам. Поэтому
+            // действие, осмысленное только в обзоре, вне его не срабатывает и клавиша уходит
+            // дальше как обычная.
+            if !(b.action == "close-overview" && !self.overview) {
+                self.action(&b.action.clone(), store, me);
+                return;
+            }
         }
         // Аккорд с Super, которому не нашлось действия, программе не отдаём: иначе промах по
         // раскладке печатал бы букву посреди текста.
@@ -1047,7 +1215,20 @@ impl Wm {
     }
 
     /// Выполнить действие раскладки.
+    ///
+    /// В обзоре действия те же: он показывает ту же ленту, только уменьшенной. Отдельная схема
+    /// «клавиши обзора» означала бы вторую модель управления ради одного экрана.
     fn action(&mut self, name: &str, store: usize, me: usize) {
+        let was_overview = self.overview;
+        self.action_inner(name, store, me);
+        // Обзор перестраиваем ПОСЛЕ действия: фокус мог переехать на другой стол, а картинка
+        // обязана показывать то, что есть сейчас.
+        if self.overview && was_overview && name != "toggle-overview" {
+            self.build_overview();
+        }
+    }
+
+    fn action_inner(&mut self, name: &str, store: usize, me: usize) {
         match name {
             "spawn-term" => {
                 if sys::spawn_with_endpoint(store, b"term", &[], me, b"WM\0").is_none() {
@@ -1170,6 +1351,18 @@ impl Wm {
             // помощь.
             "focus-next" => self.action("focus-column-right", store, me),
             "focus-prev" => self.action("focus-column-left", store, me),
+            // ── обзор (Веха 123) ──
+            "toggle-overview" => {
+                self.overview = !self.overview;
+                if self.overview {
+                    self.build_overview();
+                } else {
+                    // Выходя, показываем стол ТОГО окна, что выбрано: обзор для того и нужен —
+                    // ткнуть в окно и оказаться при нём, а не вернуться откуда пришёл.
+                    self.ov.clear();
+                    self.relayout();
+                }
+            }
             // ── рабочие столы (Веха 122) ──
             //
             // Переключение — это ОБМЕН ЛЕНТАМИ: активная уходит в хранилище, оттуда приходит
@@ -1205,6 +1398,15 @@ impl Wm {
                 self.spaces[n].cur = self.spaces[n].cols.len() - 1;
                 self.sync_focus();
                 self.relayout();
+            }
+            // Escape/Enter закрывают обзор — и НИЧЕГО не делают вне его: перехватывать эти
+            // клавиши у программ было бы воровством (в редакторе Escape нужен ему, не нам).
+            "close-overview" => {
+                if self.overview {
+                    self.overview = false;
+                    self.ov.clear();
+                    self.relayout();
+                }
             }
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
