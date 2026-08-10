@@ -35,8 +35,16 @@ qmp_path = f"/tmp/void-qmp-{os.getpid()}.sock"
 if os.path.exists(qmp_path):
     os.unlink(qmp_path)
 
+# Ускоритель и память — через окружение (Веха 126.4). По умолчанию TCG и 512 МиБ, как было:
+# снимки экрана от скорости не зависят. Но всё, где важна СКОРОСТЬ или где баг ловится только
+# на реальном темпе (гонки, переполнение кучи, анимации), требует `VOID_QEMU_ACCEL=kvm` —
+# см. notes/void-qemu-run.md.
+accel = os.environ.get("VOID_QEMU_ACCEL", "")
+mem = os.environ.get("VOID_QEMU_MEM", "512M")
+
 qemu = [
-    "qemu-system-x86_64", "-machine", "q35", "-m", "512M",
+    "qemu-system-x86_64", "-machine", "q35", "-m", mem,
+    *(["-accel", accel] if accel else []),
     "-device", "ich9-ahci,id=a",
     "-drive", f"if=none,id=d,file={img},format=raw",
     "-device", "ide-hd,drive=d,bus=a.0", "-boot", "c",

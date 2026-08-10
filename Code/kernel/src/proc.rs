@@ -33,7 +33,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use void_abi::{Cap, ContentId, Rights};
 
@@ -110,6 +110,28 @@ static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
 
 fn trap_top() -> usize {
     addr_of!(TRAP_STACK) as usize + TRAP_STACK_SIZE
+}
+
+/// Веха 126.4 — последний syscall и его процесс (см. [`syscall`]): единственная улика о том,
+/// чей вызов исполнялся, когда ядро потеряло адрес возврата.
+static LAST_SYSCALL: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_PROC: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Номер последнего syscall'а и процесс, его сделавший — для аварийного дампа.
+/// Обратный след по стеку пока умеет только x86 (riscv `fatal` печатает регистры) — отсюда
+/// `allow`: на riscv эти две справки просто никто не спрашивает.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+pub fn last_syscall() -> (usize, usize) {
+    (LAST_SYSCALL.load(Ordering::Relaxed), LAST_PROC.load(Ordering::Relaxed))
+}
+
+/// Веха 126.4 — границы стека trap'ов для аварийного дампа. Обратный след обязан
+/// остановиться ровно на вершине: сразу за ней начинается посторонняя `.bss`, и её
+/// содержимое, выданное за цепочку вызовов, увело бы поиск в ложную сторону.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+pub fn trap_stack_range() -> (usize, usize) {
+    let base = addr_of!(TRAP_STACK) as usize;
+    (base, base + TRAP_STACK_SIZE)
 }
 
 // ─── таблица процессов ────────────────────────────────────────────────────────
@@ -1078,6 +1100,11 @@ fn resume() -> ! {
 /// с таблицей: IPC-вызовы затрагивают состояния/кадры ДРУГИХ процессов и выбор `current`.
 fn syscall(t: &mut Table, cur: usize) {
     let num = t.procs[cur].frame.syscall_num();
+    // Веха 126.4 — хлебная крошка для аварийного дампа. Когда ядро прыгает по нулевому адресу,
+    // кадр вызывающего уже затёрт, и по стеку не узнать даже, ЧЕЙ это был вызов. Две записи в
+    // атомики на syscall стоят ничего, а отвечают на главный вопрос: кто именно.
+    LAST_SYSCALL.store(num, Ordering::Relaxed);
+    LAST_PROC.store(cur, Ordering::Relaxed);
     match num {
         // SYS_WRITE(ptr, len): напечатать буфер процесса (ядро читает U-память, SUM=1).
         1 => {

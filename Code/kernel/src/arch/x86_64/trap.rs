@@ -374,7 +374,18 @@ fn fatal(frame: &TrapFrame) -> ! {
     println!("  ║ vector : {}  ({})", frame.vector, vector_name(frame.vector));
     println!("  ║ err    : {:#x}", frame.err);
     println!("  ║ rip    : {:#018x}   cs: {:#x}", frame.rip, frame.cs);
-    println!("  ║ rflags : {:#018x}", frame.rflags);
+    // Флаги — словами, а не одним числом. Веха 126.4: `DF=1` в ядре означает, что `rep movsb`
+    // внутри `memcpy` пойдёт НАЗАД и затрёт стек, — и это стоило долгих поисков ровно потому,
+    // что улика лежала на виду, но в виде шестнадцатеричного числа (`rflags = 0x10446`).
+    println!(
+        "  ║ rflags : {:#018x}  [{}{}{}{}{}]",
+        frame.rflags,
+        if frame.rflags & (1 << 10) != 0 { "DF!" } else { "df " },
+        if frame.rflags & (1 << 9) != 0 { " IF" } else { " -" },
+        if frame.rflags & (1 << 6) != 0 { " ZF" } else { "" },
+        if frame.rflags & (1 << 7) != 0 { " SF" } else { "" },
+        if frame.rflags & (1 << 0) != 0 { " CF" } else { "" },
+    );
     println!("  ║ rsp    : {:#018x}   ss: {:#x}", frame.rsp, frame.ss);
     println!("  ║ cr2    : {:#018x}  (адрес при #PF)", cr2);
     println!("  ╟─ регистры (r15..rax) ──────────────────────────");
@@ -387,9 +398,96 @@ fn fatal(frame: &TrapFrame) -> ! {
         }
         i += 2;
     }
+    backtrace(frame.rsp);
     println!("  ╚════════════════════════════════════════════════");
     loop {
         unsafe { core::arch::asm!("hlt") }
+    }
+}
+
+/// Веха 126.4 — обратный след по стеку ядра.
+///
+/// `rip = 0` не говорит РОВНО НИЧЕГО о том, кто туда прыгнул: адрес возврата к моменту
+/// аварии уже снят со стека, а кадра вызывающего в регистрах нет. Поэтому просеиваем стек
+/// над `rsp` и печатаем всё, что попадает внутрь `.text` ядра, — это адреса возврата
+/// пережившей аварию части цепочки вызовов, то есть ответ на вопрос «откуда пришли».
+///
+/// Точность важнее полноты: идём только до ВЕРШИНЫ своего стека (за ней лежит чужая
+/// `.bss`, и её содержимое, выданное за цепочку, увело бы поиск в ложную сторону).
+/// Разрешать адреса в имена: `python3 Code/tools/ksyms.py <адрес>…`.
+fn backtrace(rsp: usize) {
+    extern "C" {
+        static _text_start: u8;
+        static _text_end: u8;
+        static _boot_stack: u8;
+        static _boot_stack_top: u8;
+    }
+    let (text_s, text_e) = (&raw const _text_start as usize, &raw const _text_end as usize);
+    let (boot_s, boot_e) = (&raw const _boot_stack as usize, &raw const _boot_stack_top as usize);
+    let (trap_s, trap_e) = crate::proc::trap_stack_range();
+
+    if rsp == 0 || rsp % 8 != 0 {
+        return; // не стек — идти по нему нельзя
+    }
+    // На каком стеке мы стоим? Ядерные нити берут стек из кучи (`sched`), её границ здесь
+    // нет — для них ограничиваемся страницей: RAM отображена, читать безопасно.
+    let (stack, top) = if rsp >= trap_s && rsp < trap_e {
+        ("trap", trap_e)
+    } else if rsp >= boot_s && rsp < boot_e {
+        ("загрузочный", boot_e)
+    } else {
+        ("нити/неизвестный", rsp + 4096)
+    };
+
+    println!("  ╟─ стек: {} ({:#x} байт до вершины) ─────────", stack, top - rsp);
+    // При `ret` по нулевому адресу снятое значение остаётся лежать ровно здесь.
+    if rsp > 8 {
+        let popped = unsafe { core::ptr::read_volatile((rsp - 8) as *const usize) };
+        println!("  ║ [rsp-8] : {:#018x}   ← снятое при ret значение", popped);
+    }
+    let (num, proc) = crate::proc::last_syscall();
+    println!("  ║ последний syscall: {} (процесс P{})", num as isize, proc as isize);
+
+    // Сырой кадр до первого уцелевшего адреса возврата: если его затёрли, ЧЕМ именно затёрли —
+    // видно только так. Нули, ASCII или пиксели дают разные ответы, а догадка — ни одного.
+    let mut first_ret = top;
+    let mut p = rsp;
+    while p < top {
+        let v = unsafe { core::ptr::read_volatile(p as *const usize) };
+        if v >= text_s && v < text_e {
+            first_ret = p;
+            break;
+        }
+        p += 8;
+    }
+    println!("  ╟─ затёртый кадр: {:#x} байт сырьём ─────────", first_ret - rsp);
+    let mut p = rsp;
+    let mut shown = 0;
+    while p < first_ret && shown < 48 {
+        let a = unsafe { core::ptr::read_volatile(p as *const usize) };
+        let b = if p + 8 < first_ret {
+            unsafe { core::ptr::read_volatile((p + 8) as *const usize) }
+        } else {
+            0
+        };
+        println!("  ║ {:#010x}: {:#018x} {:#018x}", p & 0xffff_ffff, a, b);
+        p += 16;
+        shown += 2;
+    }
+
+    println!("  ╟─ обратный след (адреса возврата в .text) ──────");
+    let mut p = first_ret;
+    let mut found = 0;
+    while p < top && found < 24 {
+        let v = unsafe { core::ptr::read_volatile(p as *const usize) };
+        if v >= text_s && v < text_e {
+            println!("  ║ {:#018x}  (стек {:#018x})", v, p);
+            found += 1;
+        }
+        p += 8;
+    }
+    if found == 0 {
+        println!("  ║ адресов .text на стеке нет — кадр вызывающего затёрт");
     }
 }
 
