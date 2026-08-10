@@ -209,6 +209,16 @@ enum KeyScan {
         /// Видели `;` — цифры идут во второй параметр.
         after_semi: bool,
     },
+    /// Веха 120 — хвост многобайтного символа UTF-8. Без этого состояния каждый байт выше 0x7F
+    /// становился ОТДЕЛЬНОЙ клавишей с текстом `b as char`, то есть кодовой точкой Latin-1, и
+    /// [`encode`] честно перекодировал её обратно в UTF-8 — уже двумя байтами. Русская буква,
+    /// пришедшая двумя байтами, доезжала до программы четырьмя: набрать кириллицу в панели
+    /// терминала было нельзя вовсе (нашлось, когда в панели появился редактор).
+    Utf8 {
+        need: u8,
+        len: u8,
+        buf: [u8; 4],
+    },
 }
 
 /// Разобрать байт. `Some(event)` — клавиша сложилась; `None` — ждём продолжения.
@@ -233,6 +243,23 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
                 let ch = (b'a' + b - 1) as char;
                 Some(KeyEvent::new(Keysym(ch as u32), ModMask::CTRL))
             }
+            // Начало многобайтного символа: сам по себе он не клавиша, ждём продолжения.
+            0xc0..=0xf7 => {
+                let need = if b >= 0xf0 {
+                    4
+                } else if b >= 0xe0 {
+                    3
+                } else {
+                    2
+                };
+                let mut buf = [0u8; 4];
+                buf[0] = b;
+                *state = KeyScan::Utf8 { need, len: 1, buf };
+                None
+            }
+            // Одинокий байт продолжения (0x80..0xBF) или 0xF8+ — не начало символа: глотаем,
+            // иначе он уедет в программу обломком чужой буквы.
+            0x80..=0xbf | 0xf8..=0xff => None,
             _ => {
                 // Печатный байт: keysym совпадает с кодом символа (латиница ASCII).
                 let mut k = KeyEvent::new(Keysym(b as u32), ModMask::empty());
@@ -240,6 +267,27 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
                 Some(k)
             }
         },
+        KeyScan::Utf8 { need, len, mut buf } => {
+            if b & 0xc0 != 0x80 {
+                // Последовательность оборвалась — начатое выбрасываем и разбираем этот байт
+                // заново: он начало чего-то нового, а не продолжение испорченного.
+                *state = KeyScan::Ground;
+                return decode(state, b);
+            }
+            buf[len as usize] = b;
+            let len = len + 1;
+            if len < need {
+                *state = KeyScan::Utf8 { need, len, buf };
+                return None;
+            }
+            *state = KeyScan::Ground;
+            let ch = core::str::from_utf8(&buf[..len as usize]).ok()?.chars().next()?;
+            // Keysym — кодовая точка символа: привязать к ней клавишу можно, но схема этого не
+            // делает, и событие уходит в программу через `text` в исходных байтах.
+            let mut k = KeyEvent::new(Keysym(ch as u32), ModMask::empty());
+            k.text.push(ch);
+            Some(k)
+        }
         KeyScan::Esc => {
             if b == b'[' {
                 *state = KeyScan::Csi { num: 0, modn: 0, after_semi: false };

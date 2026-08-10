@@ -105,6 +105,26 @@ def hotkey(combo):
     call("input-send-event", events=events)
 
 
+def unescape(s):
+    r"""Строка сценария → байты: `\e` — Esc, `\xNN` — любой байт (Веха 120: аккорды Ctrl
+    редактора приходят по serial одним управляющим байтом, `\x13` = ^S)."""
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            if s[i + 1] == "e":
+                out.append(0x1B)
+                i += 2
+                continue
+            if s[i + 1] == "x" and i + 3 < len(s):
+                out.append(int(s[i + 2:i + 4], 16))
+                i += 4
+                continue
+        out += s[i].encode()
+        i += 1
+    return bytes(out)
+
+
 def ppm_to_png(src, dst):
     raw = open(src, "rb").read()
     h = raw.split(maxsplit=4)
@@ -137,7 +157,7 @@ try:
             p.stdin.write((arg + "\n").encode())
             p.stdin.flush()
         elif cmd == "raw":
-            p.stdin.write(arg.replace("\\e", "\x1b").encode())
+            p.stdin.write(unescape(arg))
             p.stdin.flush()
         elif cmd == "mouse":
             dx, dy = arg.split()

@@ -256,7 +256,8 @@ fn run_init_config() {
     }
     sys::write(
         "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (true/false),\n\
-         terminal.vv (терминал и клавиши), packages.vv (пакеты) → `rebuild`.\n"
+         terminal.vv (режим экрана, клавиши), packages.vv (пакеты) → `rebuild`.\n\
+         Править — редактором: `ved /etc/system/terminal.vv` (^S сохранить, ^Q выход).\n"
             .as_bytes(),
     );
 }
@@ -884,6 +885,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"rm PATH", "удалить файл (или пустой каталог)");
     help_row(b"mv OLD NEW", "переименовать файл");
     help_row(b"echo TEXT", "напечатать ($x — переменная; TEXT > FILE — запись)");
+    help_row(b"ved FILE", "экранный редактор: ^S сохранить, ^Q выход (программа)");
     help_row(b"grep SUB L", "фильтр строк списка (для конвейеров)");
     help_row(b"run NAME", "запустить программу из store (или просто NAME)");
     help_row(b"thaw NAME", "разморозить процесс из образа");

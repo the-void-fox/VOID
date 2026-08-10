@@ -39,6 +39,13 @@ fn h() -> usize {
     if super::fb::present() { super::fb::rows() } else { H }
 }
 
+/// Размер консоли в знакоместах — наружу (Веха 120, `SYS_CONSIZE`). Программе, рисующей во весь
+/// экран, геометрия нужна, а из userspace она невыводима: тот же экран бывает и текстовым 80×25,
+/// и пиксельным 160×50, и знать об этом может только ядро.
+pub fn size() -> (usize, usize) {
+    (w(), h())
+}
+
 /// Атрибут по умолчанию: светло-серый на чёрном (как классический текстовый BIOS).
 const ATTR_DEFAULT: u8 = 0x07;
 
@@ -191,19 +198,34 @@ unsafe fn erase_line() {
 
 /// Первый числовой параметр CSI (для `ESC[nD` и т.п.); нет параметра → `default`, `0` → 1.
 unsafe fn first_param(default: usize) -> usize {
-    let mut v = 0usize;
+    param_at(0, default)
+}
+
+/// Числовой параметр CSI по НОМЕРУ (0 — первый): `ESC[12;40H` → строка 12, колонка 40.
+///
+/// Веха 120 — до неё разбирался только первый параметр, потому что до неё никто не ставил
+/// курсор в произвольное место: `ESC[H` уводил в начало, и этого хватало и цвету, и `clear`.
+/// Экранному редактору (`bin/ved`) этого мало, а нужен он именно здесь — в спасательном шелле
+/// консоль ядра единственный экран, какой есть.
+unsafe fn param_at(idx: usize, default: usize) -> usize {
+    let mut cur = 0usize;
     let mut any = false;
+    let mut n = 0usize;
     for &b in &PARAMS[..PLEN] {
         if b == b';' {
-            break;
-        }
-        if b.is_ascii_digit() {
-            v = v * 10 + (b - b'0') as usize;
+            if n == idx {
+                return if any { cur.max(1) } else { default };
+            }
+            n += 1;
+            cur = 0;
+            any = false;
+        } else if b.is_ascii_digit() {
+            cur = cur * 10 + (b - b'0') as usize;
             any = true;
         }
     }
-    if any {
-        v.max(1)
+    if n == idx && any {
+        cur.max(1)
     } else {
         default
     }
@@ -262,7 +284,10 @@ pub fn put_char(c: char) {
                 }
             }
             Ansi::Csi => {
-                if c.is_ascii_digit() || c == ';' {
+                // `?` — приватные последовательности (`ESC[?25l` — спрятать курсор). Делать нам
+                // по ним нечего, но и глотать их надо ЦЕЛИКОМ: без этого разбор обрывался на
+                // самом `?`, и хвост «25l» печатался на экран как текст.
+                if c.is_ascii_digit() || c == ';' || c == '?' {
                     if PLEN < PARAMS_MAX {
                         PARAMS[PLEN] = c as u8;
                         PLEN += 1;
@@ -271,7 +296,12 @@ pub fn put_char(c: char) {
                     match c {
                         'm' => apply_sgr(),
                         'J' => clear(),                // ESC[2J — очистить экран (курсор в начало)
-                        'H' | 'f' => { ROW = 0; COL = 0; }
+                        // CUP: `ESC[H` — в начало, `ESC[r;cH` — в заданное знакоместо (нумерация
+                        // с единицы, наша — с нуля).
+                        'H' | 'f' => {
+                            ROW = (param_at(0, 1) - 1).min(h() - 1);
+                            COL = (param_at(1, 1) - 1).min(w() - 1);
+                        }
                         'K' => erase_line(),
                         // Веха 45 — перемещение курсора (для редактирования строки в vsh).
                         'A' => ROW = ROW.saturating_sub(first_param(1)),

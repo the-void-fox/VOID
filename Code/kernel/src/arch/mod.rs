@@ -59,6 +59,8 @@ pub use imp::{
     // консоль (init приёма — внутри init_device_interrupts)
     console_drain, console_getc, console_has_input, console_init, console_take_lost, Console,
     CONSOLE_IRQ,
+    // Веха 120: размер консоли в знакоместах (`(0, 0)` — арх его не знает: serial)
+    console_size,
     // мышь (Веха 115): события с провода, позицию курсора ведёт владелец экрана
     mouse_pending, mouse_pop, mouse_present, mouse_take_lost,
     // клавиатура событиями (Веха 119): код клавиши + маска модификаторов + готовый ASCII

@@ -116,6 +116,7 @@ const SYS_PARENT: usize = 48;
 const SYS_MOUSE_READ: usize = 49;
 const SYS_KLOG: usize = 50;
 const SYS_KEY_READ: usize = 51;
+const SYS_CONSIZE: usize = 52;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -804,6 +805,16 @@ pub fn klog(out: &mut [u8]) -> (usize, usize) {
         return (0, 0);
     }
     (r.0, r.1)
+}
+
+/// `SYS_CONSIZE` (Веха 120) — размер КОНСОЛИ ЯДРА в знакоместах. `None` — ядро размера не знает
+/// (консоль в serial: сколько знакомест у терминала на том конце, оно выяснить не может).
+///
+/// Спрашивать её приходится тому, у кого нет хоста stdio ([`stdio::win_size`]) — то есть
+/// программе в спасательном шелле. Это единственный экран, какой в такой момент есть.
+pub fn console_size() -> Option<(u16, u16)> {
+    let r = abi::syscall(SYS_CONSIZE, 0, 0, 0, 0, 0, 0, 0);
+    (r.0 > 0 && r.1 > 0).then(|| (r.0 as u16, r.1 as u16))
 }
 
 /// Событие клавиатуры (Веха 119): что нажали, с какими модификаторами и какой это символ.

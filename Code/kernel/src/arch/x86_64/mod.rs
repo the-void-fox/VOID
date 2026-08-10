@@ -550,6 +550,13 @@ pub(super) fn phys_low_top() -> usize {
     PHYS_LOW_TOP.load(Ordering::Relaxed)
 }
 
+/// Размер консоли в знакоместах (Веха 120). Экран у неё бывает текстовый (80×25) и пиксельный
+/// (сколько дал GRUB) — программа снаружи различить их не может, а редактору во весь экран это
+/// первое, что нужно знать.
+pub fn console_size() -> (usize, usize) {
+    vga::size()
+}
+
 /// Забрать и обнулить счётчик потерянного ввода.
 pub fn console_take_lost() -> usize {
     RX_LOST.swap(0, Ordering::Relaxed)
