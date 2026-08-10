@@ -537,6 +537,11 @@ pub fn mouse_present() -> bool {
     ps2::mouse_present()
 }
 
+/// Отозвалась ли мышь колесом (Веха 123.1).
+pub fn mouse_wheel() -> bool {
+    ps2::mouse_wheel()
+}
+
 /// Забрать и обнулить счётчик потерянных событий.
 pub fn mouse_take_lost() -> usize {
     MOUSE_LOST.swap(0, Ordering::Relaxed)

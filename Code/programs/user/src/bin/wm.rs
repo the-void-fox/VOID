@@ -276,6 +276,7 @@ fn main_loop() -> ! {
         spaces: (0..SPACES).map(|_| Space::default()).collect(),
         space: 0,
         overview: false,
+        ov_cam: (0, 0),
         super_held: false,
         ov: Vec::new(),
     };
@@ -493,6 +494,10 @@ struct Wm {
     /// принадлежит программе. Маска модификаторов есть у событий КЛАВИШ, у мыши её нет —
     /// поэтому состояние ведём здесь, по нажатиям и отпусканиям.
     super_held: bool,
+    /// Где стоит камера обзора. Хранится, а не вычисляется каждый раз, — и в этом суть
+    /// (Веха 123.2): камера едет за ОСОЗНАННЫМ выбором (клавиши, колесо, вход в обзор), а
+    /// наведение мышью только переносит фокус.
+    ov_cam: (i32, i32),
     /// Что и куда нарисовано в обзоре. Считается один раз при каждом изменении — и рисованием,
     /// и попаданием мыши пользуется ОДИН этот список: два расчёта «где что» означали бы, что
     /// клик приходит не в то окно, которое человек видит.
@@ -976,7 +981,7 @@ impl Wm {
     ///
     /// Экран — это камера над столбцом столов: она наводится на стол в фокусе (по вертикали) и
     /// на окно в фокусе (по горизонтали). Всё, что не попало в кадр, честно остаётся за краем.
-    fn build_overview(&mut self) {
+    fn build_overview(&mut self, recenter: bool) {
         self.ov.clear();
         let (sw, sh) = (self.info.width as i32, self.info.height as i32);
         let band_h = sh * OV_NUM / OV_DEN;
@@ -985,17 +990,23 @@ impl Wm {
             .collect();
         let me = shown.iter().position(|&i| i == self.space).unwrap_or(0) as i32;
 
-        // Камера: стол в фокусе — по центру экрана, соседние видны сверху и снизу.
-        let cam_y = GAP + me * (band_h + OV_GAP) + band_h / 2 - sh / 2;
-        // По горизонтали наводимся на окно в фокусе; нет фокуса — на начало ленты.
-        let focus_x = self
-            .focused_id()
-            .and_then(|id| {
-                let (frames, _) = self.strip_layout(&self.cols);
-                frames.iter().find(|f| f.0 == id).map(|f| (f.1 + f.3 / 2) * OV_NUM / OV_DEN)
-            })
-            .unwrap_or(sw / 2);
-        let cam_x = focus_x - sw / 2;
+        // Камера наводится ТОЛЬКО по осознанному выбору — клавишами, колесом, при входе в
+        // обзор (Веха 123.2). Наведение мышью её не двигает, и это не лень, а необходимость:
+        // стоило камере ехать за курсором, как окна разъезжались под ним, под курсором
+        // оказывалось следующее, оно уезжало в центр — и так без конца. Среднее из трёх окон
+        // выбрать было нельзя в принципе: оно перескакивало раньше, чем в него попадали.
+        if recenter {
+            let cam_y = GAP + me * (band_h + OV_GAP) + band_h / 2 - sh / 2;
+            let focus_x = self
+                .focused_id()
+                .and_then(|id| {
+                    let (frames, _) = self.strip_layout(&self.cols);
+                    frames.iter().find(|f| f.0 == id).map(|f| (f.1 + f.3 / 2) * OV_NUM / OV_DEN)
+                })
+                .unwrap_or(sw / 2);
+            self.ov_cam = (focus_x - sw / 2, cam_y);
+        }
+        let (cam_x, cam_y) = self.ov_cam;
 
         for (bi, &sp) in shown.iter().enumerate() {
             let by = GAP + bi as i32 * (band_h + OV_GAP) - cam_y;
@@ -1202,7 +1213,7 @@ impl Wm {
                         self.cols[ci].focus = wi;
                     }
                     self.sync_focus();
-                    self.build_overview();
+                    self.build_overview(false);
                 }
             }
         }
@@ -1242,7 +1253,7 @@ impl Wm {
                 self.switch_space(to as usize);
                 self.sync_focus();
                 if self.overview {
-                    self.build_overview();
+                    self.build_overview(true);
                 } else {
                     self.relayout();
                 }
@@ -1309,7 +1320,7 @@ impl Wm {
         // Обзор перестраиваем ПОСЛЕ действия: фокус мог переехать на другой стол, а картинка
         // обязана показывать то, что есть сейчас.
         if self.overview && was_overview && name != "toggle-overview" {
-            self.build_overview();
+            self.build_overview(true);
         }
     }
 
@@ -1440,7 +1451,7 @@ impl Wm {
             "toggle-overview" => {
                 self.overview = !self.overview;
                 if self.overview {
-                    self.build_overview();
+                    self.build_overview(true);
                 } else {
                     // Выходя, показываем стол ТОГО окна, что выбрано: обзор для того и нужен —
                     // ткнуть в окно и оказаться при нём, а не вернуться откуда пришёл.
