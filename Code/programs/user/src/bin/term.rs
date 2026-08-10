@@ -934,7 +934,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut mx = info.width / 2;
     let mut my = info.height / 2;
     let mut mbtn = 0u8;
-    let mut mouse_evs = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0 }; 32];
+    let mut mouse_evs = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 }; 32];
     let mut keys_from_win: Vec<u8> = Vec::new();
     // Курсор виден СРАЗУ, а не после первого движения: это рабочий стол, а не телефон —
     // «где мой курсор» не должно быть первым вопросом к системе.

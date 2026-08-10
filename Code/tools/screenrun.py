@@ -22,6 +22,7 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
+    wheel up|down      — колесо мыши (в QEMU это кнопки wheel-up/wheel-down)
     hotkey <аккорд>    — аккорд клавиатуры PS/2, например: hotkey Super+Return
     shot <имя>         — снять кадр в <каталог-выхода>/<имя>.png
 """
@@ -175,6 +176,11 @@ try:
             call("input-send-event",
                  events=[{"type": "btn",
                           "data": {"down": state.strip() == "down", "button": btn}}])
+        elif cmd == "wheel":
+            # Колесо у QEMU — это кнопки `wheel-up`/`wheel-down` (Веха 123.1).
+            btn = "wheel-up" if arg.strip() in ("up", "вверх") else "wheel-down"
+            call("input-send-event", events=[{"type": "btn", "data": {"down": True, "button": btn}}])
+            call("input-send-event", events=[{"type": "btn", "data": {"down": False, "button": btn}}])
         elif cmd == "hotkey":
             hotkey(arg.strip())
         elif cmd == "shot":

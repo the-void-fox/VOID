@@ -71,6 +71,8 @@ pub struct MouseEvent {
     pub dx: i16,
     pub dy: i16,
     pub buttons: u8,
+    /// Колесо (Веха 123.1). Поле есть и здесь: контракт арха один, а мыши на riscv нет вовсе.
+    pub wheel: i8,
 }
 
 pub fn mouse_pop() -> Option<MouseEvent> {

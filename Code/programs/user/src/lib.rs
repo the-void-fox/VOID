@@ -784,6 +784,10 @@ pub struct MouseEvent {
     pub dy: i16,
     /// бит0 — левая, бит1 — правая, бит2 — средняя.
     pub buttons: u8,
+    /// Колесо: +1 — крутнули ОТ СЕБЯ (вверх), -1 — на себя, 0 — не крутили (Веха 123.1).
+    /// Знак приведён к человеческому в ядре: у самого PS/2 он обратный. Шестой байт события
+    /// был запасным с самого начала — расширять протокол не пришлось.
+    pub wheel: i8,
 }
 
 impl MouseEvent {
@@ -818,6 +822,7 @@ pub fn mouse_read(out: &mut [MouseEvent]) -> usize {
             dx: i16::from_le_bytes([b[0], b[1]]),
             dy: i16::from_le_bytes([b[2], b[3]]),
             buttons: b[4],
+            wheel: b[5] as i8,
         };
     }
     count

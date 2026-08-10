@@ -444,20 +444,22 @@ pub struct MouseEvent {
     pub dx: i16,
     pub dy: i16,
     pub buttons: u8,
+    /// Колесо: +1 от себя, -1 на себя, 0 — не крутили (Веха 123.1).
+    pub wheel: i8,
 }
 
 const MOUSE_CAP: usize = 128;
 static mut MOUSE_BUF: [MouseEvent; MOUSE_CAP] =
-    [MouseEvent { dx: 0, dy: 0, buttons: 0 }; MOUSE_CAP];
+    [MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 }; MOUSE_CAP];
 static MOUSE_HEAD: AtomicUsize = AtomicUsize::new(0);
 static MOUSE_TAIL: AtomicUsize = AtomicUsize::new(0);
 static MOUSE_LOST: AtomicUsize = AtomicUsize::new(0);
 
 /// Положить событие (зовётся из обработчика/опроса с выключенными прерываниями).
-pub(super) fn mouse_push(dx: i16, dy: i16, buttons: u8) {
+pub(super) fn mouse_push(dx: i16, dy: i16, buttons: u8, wheel: i8) {
     let head = MOUSE_HEAD.load(Ordering::Relaxed);
     if head.wrapping_sub(MOUSE_TAIL.load(Ordering::Relaxed)) < MOUSE_CAP {
-        unsafe { MOUSE_BUF[head % MOUSE_CAP] = MouseEvent { dx, dy, buttons } };
+        unsafe { MOUSE_BUF[head % MOUSE_CAP] = MouseEvent { dx, dy, buttons, wheel } };
         MOUSE_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
     } else {
         // Переполнение значит, что владелец экрана не успевает читать. Молчать нельзя по той же

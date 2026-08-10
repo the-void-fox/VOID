@@ -120,6 +120,9 @@ bind wm Super+Shift+9 move-to-workspace-9
 bind wm Super+Shift+Q quit
 ";
 
+/// Код клавиши Super — тот же, что кладёт ядро (`ps2.rs::keysym`).
+const SYM_SUPER: u16 = 0x133;
+
 /// Разобранная строка раскладки.
 struct Bind {
     sym: u16,
@@ -273,6 +276,7 @@ fn main_loop() -> ! {
         spaces: (0..SPACES).map(|_| Space::default()).collect(),
         space: 0,
         overview: false,
+        super_held: false,
         ov: Vec::new(),
     };
 
@@ -324,7 +328,7 @@ fn main_loop() -> ! {
     }
 
     let mut msg = [0u8; 1024];
-    let mut mouse = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0 }; 32];
+    let mut mouse = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 }; 32];
     loop {
         let mut worked = false;
 
@@ -450,6 +454,12 @@ const WIDTHS: [(i32, i32); 4] = [(1, 3), (1, 2), (2, 3), (1, 1)];
 /// Зазор между окнами и до края экрана.
 const GAP: i32 = 8;
 
+/// Масштаб обзора — ровно половина. Фиксированный: см. `build_overview`.
+const OV_NUM: i32 = 1;
+const OV_DEN: i32 = 2;
+/// Зазор между полосами столов в обзоре. Заметно больше оконного: он и разделяет столы.
+const OV_GAP: i32 = 48;
+
 struct Wm {
     info: sys::VideoInfo,
     /// Порядок = z-order: последнее окно рисуется поверх и получает клики первым.
@@ -479,6 +489,10 @@ struct Wm {
     space: usize,
     /// Включён ли ОБЗОР (Веха 123): столы уменьшены и видны разом.
     overview: bool,
+    /// Держат ли сейчас Super. Нужно колесу: `Super+колесо` крутит столы, а голое колесо
+    /// принадлежит программе. Маска модификаторов есть у событий КЛАВИШ, у мыши её нет —
+    /// поэтому состояние ведём здесь, по нажатиям и отпусканиям.
+    super_held: bool,
     /// Что и куда нарисовано в обзоре. Считается один раз при каждом изменении — и рисованием,
     /// и попаданием мыши пользуется ОДИН этот список: два расчёта «где что» означали бы, что
     /// клик приходит не в то окно, которое человек видит.
@@ -952,52 +966,74 @@ impl Wm {
         self.damage(0, 0, self.info.width as i32, screen_h);
     }
 
-    /// Пересчитать раскладку ОБЗОРА (Веха 123).
+    /// Пересчитать раскладку ОБЗОРА (Вехи 123, 123.1).
     ///
-    /// Столы идут сверху вниз полосами; в полосе лежит вся лента стола, уменьшенная так, чтобы
-    /// поместиться целиком. Показываем непустые столы и всегда текущий: девять полос, из которых
-    /// восемь пустые, — это не обзор, а таблица.
+    /// Масштаб ФИКСИРОВАННЫЙ ([`OV_NUM`]/[`OV_DEN`]), а не «лишь бы всё влезло» — так сделано в
+    /// niri, и владелец попросил так же. Разница не косметическая: при подгонке под содержимое
+    /// каждое новое окно уменьшало ВСЕ остальные, то есть привычная картинка менялась от того,
+    /// что где-то открылся ещё один терминал. При фиксированном окна просто уходят за край, и
+    /// узнаваемость раскладки не зависит от их числа.
     ///
-    /// Масштаб целочисленный (`num/den`) и ОДИН на полосу: окна обязаны сохранить и пропорции, и
-    /// взаимное расположение — иначе обзор перестаёт быть картой того, что получится при выходе.
+    /// Экран — это камера над столбцом столов: она наводится на стол в фокусе (по вертикали) и
+    /// на окно в фокусе (по горизонтали). Всё, что не попало в кадр, честно остаётся за краем.
     fn build_overview(&mut self) {
         self.ov.clear();
         let (sw, sh) = (self.info.width as i32, self.info.height as i32);
-        let mut shown: Vec<usize> = (0..SPACES)
+        let band_h = sh * OV_NUM / OV_DEN;
+        let shown: Vec<usize> = (0..SPACES)
             .filter(|&i| i == self.space || !self.spaces[i].cols.is_empty())
             .collect();
-        if shown.is_empty() {
-            shown.push(self.space);
-        }
-        let n = shown.len() as i32;
-        let band_h = (sh - GAP) / n - GAP;
+        let me = shown.iter().position(|&i| i == self.space).unwrap_or(0) as i32;
+
+        // Камера: стол в фокусе — по центру экрана, соседние видны сверху и снизу.
+        let cam_y = GAP + me * (band_h + OV_GAP) + band_h / 2 - sh / 2;
+        // По горизонтали наводимся на окно в фокусе; нет фокуса — на начало ленты.
+        let focus_x = self
+            .focused_id()
+            .and_then(|id| {
+                let (frames, _) = self.strip_layout(&self.cols);
+                frames.iter().find(|f| f.0 == id).map(|f| (f.1 + f.3 / 2) * OV_NUM / OV_DEN)
+            })
+            .unwrap_or(sw / 2);
+        let cam_x = focus_x - sw / 2;
+
         for (bi, &sp) in shown.iter().enumerate() {
-            let by = GAP + bi as i32 * (band_h + GAP);
+            let by = GAP + bi as i32 * (band_h + OV_GAP) - cam_y;
+            if by + band_h < 0 || by > sh {
+                continue; // полоса целиком за кадром — считать её нечего
+            }
             let cols: &[Column] =
                 if sp == self.space { &self.cols } else { &self.spaces[sp].cols };
-            let (frames, strip_w) = self.strip_layout(cols);
-            if frames.is_empty() {
-                continue;
-            }
-            let avail_w = sw - 2 * GAP;
-            // Уменьшаем по той стороне, которая упирается первой.
-            let (num, den) = if strip_w * band_h <= avail_w * sh {
-                (band_h, sh)
-            } else {
-                (avail_w, strip_w)
-            };
+            let (frames, _) = self.strip_layout(cols);
             for (id, fx, fy, fw, fh) in frames {
                 self.ov.push(OvItem {
                     id,
                     space: sp,
-                    x: GAP + fx * num / den,
-                    y: by + fy * num / den,
-                    w: (fw * num / den).max(1),
-                    h: (fh * num / den).max(1),
+                    x: fx * OV_NUM / OV_DEN - cam_x,
+                    y: by + fy * OV_NUM / OV_DEN,
+                    w: (fw * OV_NUM / OV_DEN).max(1),
+                    h: (fh * OV_NUM / OV_DEN).max(1),
                 });
             }
         }
         self.damage(0, 0, sw, sh);
+    }
+
+    /// Сделать стол `n` активным: ленты меняются местами (см. [[workspaces]]).
+    fn switch_space(&mut self, n: usize) {
+        if n == self.space || n >= SPACES {
+            return;
+        }
+        self.spaces[self.space] = Space {
+            cols: core::mem::take(&mut self.cols),
+            cur: self.cur,
+            scroll_x: self.scroll_x,
+        };
+        let s = core::mem::take(&mut self.spaces[n]);
+        self.cols = s.cols;
+        self.cur = s.cur;
+        self.scroll_x = s.scroll_x;
+        self.space = n;
     }
 
     /// Колонка и место окна в ней.
@@ -1145,6 +1181,32 @@ impl Wm {
         // Фокус за указателем (Веха 121.1, просьба владельца): навёл — работаешь здесь.
         // Только на ДВИЖЕНИИ: иначе всплывшее под неподвижным курсором окно перехватывало бы
         // фокус у того, с кем человек работает.
+        // В обзоре наведение тоже переносит фокус — и камера едет следом, ставя выбранное в
+        // центр (просьба владельца, как в niri). Считаем по тому же списку, по которому обзор
+        // нарисован, и перестраиваем его только при СМЕНЕ окна: иначе камера дёргалась бы на
+        // каждое движение мыши.
+        if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && self.overview {
+            let hit = self.ov.iter().find(|it| {
+                self.cursor.0 >= it.x
+                    && self.cursor.0 < it.x + it.w
+                    && self.cursor.1 >= it.y
+                    && self.cursor.1 < it.y + it.h
+            });
+            if let Some((id, sp)) = hit.map(|it| (it.id, it.space)) {
+                if self.focus != Some(id) {
+                    if sp != self.space {
+                        self.switch_space(sp);
+                    }
+                    if let Some((ci, wi)) = self.locate(id) {
+                        self.cur = ci;
+                        self.cols[ci].focus = wi;
+                    }
+                    self.sync_focus();
+                    self.build_overview();
+                }
+            }
+        }
+
         if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && !self.overview {
             if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1))
             {
@@ -1170,6 +1232,24 @@ impl Wm {
         self.damage(old.0, old.1, CUR_W, CUR_H);
         self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
 
+        // Колесо: в обзоре — просто крутить столы, вне обзора — с Super (просьба владельца).
+        // Без модификатора вне обзора колесо принадлежит программе: прокрутка страницы важнее.
+        if e.wheel != 0 && (self.overview || self.super_held) {
+            let step = if e.wheel > 0 { -1i32 } else { 1i32 };
+            let mut to = self.space as i32 + step;
+            to = to.clamp(0, SPACES as i32 - 1);
+            if to as usize != self.space {
+                self.switch_space(to as usize);
+                self.sync_focus();
+                if self.overview {
+                    self.build_overview();
+                } else {
+                    self.relayout();
+                }
+            }
+            return;
+        }
+
         // Событие окну под курсором.
         if let Some(i) = self.wins.iter().rposition(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1)) {
             let (ox, oy) = self.wins[i].content_at();
@@ -1191,6 +1271,11 @@ impl Wm {
     /// Порядок принципиален: `Super+Q` не должен доехать до программы буквой `q`. Отпускания
     /// клавиш окну не отдаём вовсе — программам нужен текст, а не состояние клавиатуры.
     fn key_event(&mut self, e: &sys::KeyEvent, binds: &[Bind], store: usize, me: usize) {
+        // Super держат или отпустили — это нужно колесу, и знать об этом надо ДО отсева
+        // отпусканий: иначе Super «залипнет» нажатым навсегда.
+        if e.sym == SYM_SUPER {
+            self.super_held = e.down;
+        }
         if !e.down {
             return;
         }
@@ -1372,16 +1457,7 @@ impl Wm {
                 if n == self.space {
                     return;
                 }
-                self.spaces[self.space] = Space {
-                    cols: core::mem::take(&mut self.cols),
-                    cur: self.cur,
-                    scroll_x: self.scroll_x,
-                };
-                let s = core::mem::take(&mut self.spaces[n]);
-                self.cols = s.cols;
-                self.cur = s.cur;
-                self.scroll_x = s.scroll_x;
-                self.space = n;
+                self.switch_space(n);
                 self.sync_focus();
                 self.relayout();
             }

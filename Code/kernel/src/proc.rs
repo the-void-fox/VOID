@@ -2563,7 +2563,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     let bytes = [
                         e.dx.to_le_bytes()[0], e.dx.to_le_bytes()[1],
                         e.dy.to_le_bytes()[0], e.dy.to_le_bytes()[1],
-                        e.buttons, 0,
+                        e.buttons, e.wheel as u8,
                     ];
                     let dst = unsafe { core::slice::from_raw_parts_mut((buf + off) as *mut u8, 6) };
                     dst.copy_from_slice(&bytes);
