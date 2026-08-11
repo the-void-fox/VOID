@@ -68,6 +68,10 @@ static inline const char *dev_name(const struct device *dev)
 
 /* Управление питанием/пробуждением устройства (учётные). */
 int  device_set_wakeup_enable(struct device *dev, bool enable);
+/* dev_err_probe(dev, err, ...) — напечатать и ВЕРНУТЬ тот же код ошибки: идиома выхода из
+ * probe одной строкой. Возврат обязателен — драйвер пишет `return dev_err_probe(...)`. */
+int  dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
 int  device_wakeup_enable(struct device *dev);
 
 /* dev_pm_ops + DEFINE_SIMPLE_DEV_PM_OPS: у нас питанием не управляем, но символ ops нужен как
@@ -87,6 +91,13 @@ struct dev_pm_ops {
 		.freeze = suspend_fn, .thaw = resume_fn, \
 		.poweroff = suspend_fn, .restore = resume_fn, \
 	}
+/* Прежнее имя (Веха 131) — но НЕ синоним. В Linux `SIMPLE_DEV_PM_OPS` разворачивается через
+ * `SET_SYSTEM_SLEEP_PM_OPS`, который без `CONFIG_PM_SLEEP` исчезает вместе со ссылками на
+ * функции. Это не косметика: сами функции у драйвера тоже спрятаны за `#ifdef CONFIG_PM_SLEEP`
+ * (`atl1c_resume`), и ссылка на них без конфига не собралась бы. Отдаём пустые ops — ровно то,
+ * что получает Linux без этого конфига; засыпать VOID пока всё равно не умеет. */
+#define SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
+	const struct dev_pm_ops __attribute__((unused)) name = { 0 }
 
 /* Регистрация (тела в lx_kit.c): match по шине → bind → probe. */
 int  bus_register(struct bus_type *bus);

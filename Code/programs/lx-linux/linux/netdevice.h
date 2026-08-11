@@ -42,6 +42,7 @@ typedef u64 netdev_features_t;
 #define NETIF_F_HW_VLAN_CTAG_TX    (1ULL << 7)
 #define NETIF_F_HW_VLAN_CTAG_RX    (1ULL << 8)
 #define NETIF_F_HW_VLAN_CTAG_FILTER (1ULL << 9)
+#define NETIF_F_TSO6               (1ULL << 10)
 
 /* ── флаги интерфейса ── */
 #define IFF_UP           0x1
@@ -51,13 +52,33 @@ typedef u64 netdev_features_t;
 #define IFF_SUPP_NOFCS   0x80000000
 #define IFF_UNICAST_FLT  0x20000
 
-/* ── уровни сообщений (netif_msg_*) ── */
+/* ── уровни сообщений (netif_msg_*) ──
+ *
+ * Порядок бит — как в перечислении `netif_msg_class_bits` ядра (DRV=0 … WOL=14). Веха 131
+ * выправила две записи: RX_STATUS и TX_DONE стояли МЕСТАМИ НАОБОРОТ, из-за чего гейт «показывать
+ * состояние приёма» включал сообщения о завершении передачи и наоборот. На работу это не влияло —
+ * только на то, что видно в журнале, — но именно поэтому и могло прожить сколько угодно. */
 #define NETIF_MSG_DRV       0x0001
 #define NETIF_MSG_PROBE     0x0002
 #define NETIF_MSG_LINK      0x0004
-#define NETIF_MSG_RX_STATUS 0x0400
-#define NETIF_MSG_TX_DONE   0x0800
+#define NETIF_MSG_TIMER     0x0008
+#define NETIF_MSG_IFDOWN    0x0010
+#define NETIF_MSG_IFUP      0x0020
+#define NETIF_MSG_RX_ERR    0x0040
+#define NETIF_MSG_TX_ERR    0x0080
+#define NETIF_MSG_TX_QUEUED 0x0100
+#define NETIF_MSG_INTR      0x0200
+#define NETIF_MSG_TX_DONE   0x0400
+#define NETIF_MSG_RX_STATUS 0x0800
+#define NETIF_MSG_PKTDATA   0x1000
 #define NETIF_MSG_HW        0x2000
+#define NETIF_MSG_WOL       0x4000
+
+/* Откуда взялся аппаратный адрес (`net_device.addr_assign_type`). */
+#define NET_ADDR_PERM   0
+#define NET_ADDR_RANDOM 1
+#define NET_ADDR_STOLEN 2
+#define NET_ADDR_SET    3
 
 /* ── результат передачи (ndo_start_xmit) ── */
 typedef enum netdev_tx {
@@ -110,6 +131,7 @@ struct net_device_ops {
 	int         (*ndo_stop)(struct net_device *dev);
 	netdev_tx_t (*ndo_start_xmit)(struct sk_buff *skb, struct net_device *dev);
 	void        (*ndo_set_rx_mode)(struct net_device *dev);
+	struct net_device_stats *(*ndo_get_stats)(struct net_device *dev);
 	int         (*ndo_set_mac_address)(struct net_device *dev, void *addr);
 	int         (*ndo_validate_addr)(struct net_device *dev);
 	int         (*ndo_change_mtu)(struct net_device *dev, int new_mtu);
@@ -130,6 +152,7 @@ struct net_device {
 	unsigned int               min_mtu;
 	unsigned int               max_mtu;
 	unsigned char              addr_len;
+	unsigned char              addr_assign_type; /* NET_ADDR_* — откуда взялся адрес */
 	unsigned char              dev_addr[MAX_ADDR_LEN];
 	netdev_features_t          features;
 	netdev_features_t          hw_features;
@@ -144,6 +167,13 @@ struct net_device {
 	struct device              dev;    /* базовый узел (SET_NETDEV_DEV, &netdev->dev) */
 	void                      *lx_priv; /* приватная область драйвера (netdev_priv) */
 	unsigned long              lx_state;
+	/* Веха 131 — ОДНА очередь передачи, объектом. Драйверы многоочередных карт (atl1c)
+	 * работают не с устройством, а с `netdev_queue`, и в Linux их столько, сколько запросил
+	 * `alloc_etherdev_mq`. У нас очередь одна: и AR8151, и e1000 просят ровно одну
+	 * (четыре — только у варианта MediaTek, которого в X54C нет). Больше одной честно
+	 * отвергаем при создании, а не делаем вид, что справились. */
+	struct netdev_queue       *lx_txq;
+	unsigned int               lx_num_tx_queues;
 };
 
 static inline void *netdev_priv(const struct net_device *dev) { return dev->lx_priv; }
@@ -186,15 +216,51 @@ bool netif_carrier_ok(const struct net_device *dev);
 void netif_device_attach(struct net_device *dev);
 void netif_device_detach(struct net_device *dev);
 
-/* BQL/очередь драйвера — у нас no-op (одна очередь, без backpressure). */
-struct netdev_queue;
+/* ── очередь передачи (Веха 131) ──
+ *
+ * Одна на устройство, но ОБЪЕКТОМ: драйвер многоочередной карты останавливает и будит именно
+ * очередь, а не устройство целиком. Свести это к устройству — не потеря: очередь у нас одна,
+ * и её состояние и есть состояние устройства.
+ *
+ * BQL (byte queue limits) остаётся заглушкой: это регулятор глубины буфера против bufferbloat,
+ * а не условие работы карты. Заводить его имеет смысл, когда появится очередь пакетов, которую
+ * есть чем переполнять. */
+struct netdev_queue {
+	struct net_device *dev;
+};
+
 struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index);
+
+void netif_tx_stop_queue(struct netdev_queue *q);
+void netif_tx_wake_queue(struct netdev_queue *q);
+bool netif_tx_queue_stopped(const struct netdev_queue *q);
+
 static inline void netdev_sent_queue(struct net_device *dev, unsigned int bytes) { (void)dev; (void)bytes; }
 static inline void netdev_completed_queue(struct net_device *dev, unsigned int pkts, unsigned int bytes)
 { (void)dev; (void)pkts; (void)bytes; }
 static inline void netdev_reset_queue(struct net_device *dev) { (void)dev; }
-static inline bool netif_xmit_stopped(const struct netdev_queue *q) { (void)q; return false; }
+/* Возвращает «пора дёргать железо». В Linux это ЛОЖЬ при xmit_more (пакет кладут в пачку и
+ * звонок откладывают) и ИСТИНА иначе. Тип возврата здесь не мелочь: верни мы void или всегда
+ * false — драйвер не дёрнул бы TX-регистр ни разу, кольцо заполнялось бы, а карта молчала. */
+static inline bool __netdev_tx_sent_queue(struct netdev_queue *q, unsigned int bytes, bool xmit_more)
+{ (void)q; (void)bytes; return !xmit_more; }
+static inline void netdev_tx_sent_queue(struct netdev_queue *q, unsigned int bytes)
+{ (void)q; (void)bytes; }
+static inline void netdev_tx_completed_queue(struct netdev_queue *q, unsigned int pkts, unsigned int bytes)
+{ (void)q; (void)pkts; (void)bytes; }
+static inline void netdev_tx_reset_queue(struct netdev_queue *q) { (void)q; }
+static inline bool netif_xmit_stopped(const struct netdev_queue *q) { return netif_tx_queue_stopped(q); }
 static inline bool netdev_xmit_more(void) { return false; }
+
+/* Пересчитать активные фичи из hw_features/wanted. У нас фичи выставляет сам драйвер и никто
+ * их не оспаривает, поэтому пересчитывать нечего — но позвать драйвер имеет право. */
+void netdev_update_features(struct net_device *dev);
+
+/* NAPI для ПЕРЕДАЧИ (netif_napi_add_tx) и нить опроса (netif_threaded_enable): в Linux это
+ * разные контексты, у нас — тот же кооперативный планировщик Lx_kit. */
+void netif_napi_add_tx(struct net_device *dev, struct napi_struct *napi,
+		       int (*poll)(struct napi_struct *, int));
+int  netif_threaded_enable(struct net_device *dev);
 
 /* Сообщения уровня устройства → printk (наш device.h даёт dev_*). */
 #define netdev_err(dev, fmt, ...)    printk(fmt, ##__VA_ARGS__)
@@ -210,14 +276,17 @@ static inline u32 netif_msg_init(int debug_value, int default_msg_enable_bits)
 #define netif_msg_drv(p)        ((p)->msg_enable & NETIF_MSG_DRV)
 #define netif_msg_probe(p)      ((p)->msg_enable & NETIF_MSG_PROBE)
 #define netif_msg_link(p)       ((p)->msg_enable & NETIF_MSG_LINK)
-#define netif_msg_ifdown(p)     ((p)->msg_enable & NETIF_MSG_DRV)
-#define netif_msg_ifup(p)       ((p)->msg_enable & NETIF_MSG_DRV)
-#define netif_msg_rx_err(p)     ((p)->msg_enable & NETIF_MSG_RX_STATUS)
-#define netif_msg_tx_err(p)     ((p)->msg_enable & NETIF_MSG_TX_DONE)
-#define netif_msg_tx_queued(p)  ((p)->msg_enable & NETIF_MSG_TX_DONE)
-#define netif_msg_intr(p)       ((p)->msg_enable & NETIF_MSG_DRV)
-#define netif_msg_timer(p)      ((p)->msg_enable & NETIF_MSG_DRV)
-#define netif_msg_wol(p)        ((p)->msg_enable & NETIF_MSG_DRV)
+#define netif_msg_ifdown(p)     ((p)->msg_enable & NETIF_MSG_IFDOWN)
+#define netif_msg_ifup(p)       ((p)->msg_enable & NETIF_MSG_IFUP)
+#define netif_msg_rx_err(p)     ((p)->msg_enable & NETIF_MSG_RX_ERR)
+#define netif_msg_tx_err(p)     ((p)->msg_enable & NETIF_MSG_TX_ERR)
+#define netif_msg_tx_queued(p)  ((p)->msg_enable & NETIF_MSG_TX_QUEUED)
+#define netif_msg_tx_done(p)    ((p)->msg_enable & NETIF_MSG_TX_DONE)
+#define netif_msg_rx_status(p)  ((p)->msg_enable & NETIF_MSG_RX_STATUS)
+#define netif_msg_pktdata(p)    ((p)->msg_enable & NETIF_MSG_PKTDATA)
+#define netif_msg_intr(p)       ((p)->msg_enable & NETIF_MSG_INTR)
+#define netif_msg_timer(p)      ((p)->msg_enable & NETIF_MSG_TIMER)
+#define netif_msg_wol(p)        ((p)->msg_enable & NETIF_MSG_WOL)
 #define netif_msg_hw(p)         ((p)->msg_enable & NETIF_MSG_HW)
 #define netif_msg_rx_status(p)  ((p)->msg_enable & NETIF_MSG_RX_STATUS)
 #define netif_msg_tx_done(p)    ((p)->msg_enable & NETIF_MSG_TX_DONE)

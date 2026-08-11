@@ -138,4 +138,8 @@ dma_addr_t skb_frag_dma_map(struct device *dev, const skb_frag_t *frag,
 
 void skb_tx_timestamp(struct sk_buff *skb);
 
+/* Номер очереди, в которую стек направил пакет. Очередь у нас одна (см. alloc_etherdev_mq),
+ * поэтому всегда нулевая — но функция обязана быть: драйвер по ней выбирает кольцо. */
+static inline u16 skb_get_queue_mapping(const struct sk_buff *skb) { (void)skb; return 0; }
+
 #endif /* _LINUX_SKBUFF_H_SHIM */

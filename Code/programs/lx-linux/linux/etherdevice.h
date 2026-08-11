@@ -18,6 +18,9 @@
 #define ETH_P_8021Q   0x8100
 
 struct net_device *alloc_etherdev(int sizeof_priv);
+/* Многоочередной вариант (Веха 131). Больше одной очереди мы не умеем и честно отказываем —
+ * см. тело в lx_net.c. */
+struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int txqs);
 __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
 int  eth_validate_addr(struct net_device *dev);
 

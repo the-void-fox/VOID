@@ -1123,3 +1123,39 @@ void get_random_bytes(void *buf, size_t len)
 	memset(buf, 0xa5, len);
 #endif
 }
+
+/* ─── PCIe/MSI (Веха 131) ────────────────────────────────────────────────────
+ *
+ * Прерывание устройства приходит к нам по IRQ-cap (Веха 52), а не сообщением MSI: маршрутизацию
+ * взводит ЯДРО при выдаче права. Поэтому режим сообщений драйверу не даём — честным отказом, а не
+ * «успехом»: получив успех, драйвер перестал бы ждать INTx и не увидел бы ни одного прерывания.
+ */
+int pci_enable_msi(struct pci_dev *dev)  { (void)dev; return -22 /* -EINVAL */; }
+void pci_disable_msi(struct pci_dev *dev) { (void)dev; }
+
+/* Максимальный размер запроса чтения PCIe. Он живёт в capability PCIe, которой мы не держим;
+ * 512 байт — значение по умолчанию для этих карт. Драйвер использует его как подсказку размера
+ * пачки, и ошибиться здесь значит потерять в скорости, а не в правильности. */
+int pcie_get_readrq(struct pci_dev *dev) { (void)dev; return 512; }
+int pcie_set_readrq(struct pci_dev *dev, int rq) { (void)dev; (void)rq; return 0; }
+
+/* Регистры capability PCIe: мы держим только заголовок конфига (первые 64 байта), поэтому
+ * чтение отдаёт нули, а запись уходит в никуда. Драйвер этим сбрасывает накопленные флаги
+ * ошибок — операция, отсутствие которой ничего не ломает. */
+int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
+{ (void)dev; (void)pos; *val = 0; return 0; }
+int pcie_capability_write_word(struct pci_dev *dev, int pos, u16 val)
+{ (void)dev; (void)pos; (void)val; return 0; }
+
+/* dev_err_probe (Веха 131): напечатать причину и вернуть тот же код — идиома выхода из probe
+ * одной строкой. Смысл именно в ВОЗВРАТЕ: драйвер пишет `return dev_err_probe(dev, err, …)`. */
+int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
+{
+	va_list ap;
+
+	(void)dev;
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	return err;
+}

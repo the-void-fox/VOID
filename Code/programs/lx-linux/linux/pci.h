@@ -156,6 +156,13 @@ static inline struct pci_driver *to_pci_driver(struct device_driver *drv)
 /* Без CONFIG_PM_SLEEP управление питанием выключено → указатель на ops = NULL. */
 #define pm_sleep_ptr(p) (NULL)
 
+/* Веха 131 — `module_pci_driver(drv)`: весь модуль сводится к регистрации одного PCI-драйвера.
+ * В Linux это разворачивается в module_init+module_exit; у нас module_init перенаправлен в
+ * функцию с фиксированным именем (см. linux/module.h), поэтому разворачиваем прямо в неё. */
+#define module_pci_driver(__pci_driver) \
+	int lx_module_init(void) { return pci_register_driver(&(__pci_driver)); } \
+	void lx_module_exit(void) { pci_unregister_driver(&(__pci_driver)); }
+
 /* ─ жизненный цикл драйвера (тела в lx_kit.c): регистрация над driver-model ─ */
 int  pci_register_driver(struct pci_driver *drv);
 void pci_unregister_driver(struct pci_driver *drv);
@@ -178,6 +185,15 @@ int  pci_request_regions(struct pci_dev *dev, const char *name);
 void pci_release_regions(struct pci_dev *dev);
 /* Поиск РАСШИРЕННОЙ capability (пространство PCIe за 0x100). Возвращает смещение или 0. */
 int  pci_find_ext_capability(struct pci_dev *dev, int cap);
+/* MSI: у нас прерывание устройства приходит по IRQ-cap (Веха 52), режим сообщений не
+ * программируется — честный отказ, драйвер откатится на INTx. */
+int  pci_enable_msi(struct pci_dev *dev);
+void pci_disable_msi(struct pci_dev *dev);
+/* Размер максимального запроса чтения PCIe. atl1c его подстраивает под свои кольца. */
+int  pcie_get_readrq(struct pci_dev *dev);
+int  pcie_set_readrq(struct pci_dev *dev, int rq);
+int  pcie_capability_write_word(struct pci_dev *dev, int pos, u16 val);
+int  pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val);
 void __iomem *pci_ioremap_bar(struct pci_dev *dev, int bar);
 
 /* Аксессоры BAR (linux/pci.h — inline поверх resource[]). */
@@ -222,5 +238,9 @@ static inline int pci_channel_offline(struct pci_dev *pdev) { (void)pdev; return
 
 /* Внести синтетическое устройство в PCI-ядро Lx_kit (роль перечислителя шины). */
 int lx_pci_register_device(struct pci_dev *dev);
+
+/* Как в upstream (include/linux/pci.h тянет его в самом конце): драйверы полагаются на то, что
+ * DMA-API приезжает вместе с PCI. */
+#include <linux/dma-mapping.h>
 
 #endif /* _LINUX_PCI_H_SHIM */

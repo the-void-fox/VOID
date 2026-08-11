@@ -25,6 +25,9 @@
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define ALIGN(x, a)      (((x) + ((typeof(x))(a) - 1)) & ~((typeof(x))(a) - 1))
 #define round_up(x, a)   ALIGN((x), (a))
+/* roundup(x, y) — округление вверх до кратного ЛЮБОМУ y, не обязательно степени двойки
+ * (этим и отличается от round_up). Веха 131. */
+#define roundup(x, y) ({ typeof(y) __y = (y); (((x) + (__y - 1)) / __y) * __y; })
 #define round_down(x, a) ((x) & ~((typeof(x))(a) - 1))
 
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))

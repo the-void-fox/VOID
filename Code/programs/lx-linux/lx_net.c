@@ -115,18 +115,39 @@ void dma_sync_single_for_cpu(struct device *dev, dma_addr_t a, size_t s, int d) 
 void dma_sync_single_for_device(struct device *dev, dma_addr_t a, size_t s, int d) { (void)dev; (void)a; (void)s; (void)d; }
 
 /* ─ netdev: аллокация/регистрация ─ */
-struct net_device *alloc_etherdev(int sizeof_priv)
+struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int txqs)
 {
-	struct net_device *dev = kmalloc(sizeof(*dev), 0);
+	struct net_device *dev;
+
+	/* Больше одной очереди мы не умеем — и говорим об этом отказом, а не молчанием.
+	 * Драйвер, попросивший четыре и получивший одну, разложил бы кольца по четырём наборам
+	 * регистров, а будил бы одну очередь: пакеты уходили бы в три молчащих кольца, и выглядело
+	 * бы это как «иногда теряются пакеты» — худший вид ошибки. Веха 131. */
+	if (txqs != 1) {
+		printk("lx_net: alloc_etherdev_mq(%u очередей) — умеем только одну\n", txqs);
+		return NULL;
+	}
+
+	dev = kmalloc(sizeof(*dev), 0);
 	if (!dev) return NULL;
 	memset(dev, 0, sizeof(*dev));
 	dev->lx_priv = kmalloc(sizeof_priv, 0);
 	if (dev->lx_priv) memset(dev->lx_priv, 0, sizeof_priv);
 	dev->mc.count = 0; dev->uc.count = 0;
+	dev->lx_txq = kmalloc(sizeof(*dev->lx_txq), 0);
+	if (!dev->lx_txq) { kfree(dev->lx_priv); kfree(dev); return NULL; }
+	dev->lx_txq->dev = dev;
+	dev->lx_num_tx_queues = txqs;
 	return dev;
 }
+
+struct net_device *alloc_etherdev(int sizeof_priv)
+{
+	return alloc_etherdev_mq(sizeof_priv, 1);
+}
+
 void free_netdev(struct net_device *dev)
-{ if (dev) { kfree(dev->lx_priv); kfree(dev); } }
+{ if (dev) { kfree(dev->lx_txq); kfree(dev->lx_priv); kfree(dev); } }
 int register_netdev(struct net_device *dev)
 { printk("lx_net: register_netdev('%s')\n", dev->name[0] ? dev->name : "ethN"); return 0; }
 void unregister_netdev(struct net_device *dev) { (void)dev; }
@@ -145,7 +166,30 @@ void eth_random_addr(u8 *addr)
 void eth_hw_addr_random(struct net_device *dev) { eth_random_addr(dev->dev_addr); }
 
 struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
-{ (void)dev; (void)index; return NULL; }
+{
+	(void)index; /* очередь одна — см. alloc_etherdev_mq */
+	return dev->lx_txq;
+}
+
+/* Остановка/пробуждение ОЧЕРЕДИ сводятся к устройству: очередь у нас одна, и её состояние и
+ * есть состояние устройства. */
+void netif_tx_stop_queue(struct netdev_queue *q)        { netif_stop_queue(q->dev); }
+void netif_tx_wake_queue(struct netdev_queue *q)        { netif_wake_queue(q->dev); }
+bool netif_tx_queue_stopped(const struct netdev_queue *q) { return netif_queue_stopped(q->dev); }
+
+/* Пересчёт активных фич: у нас их выставляет драйвер и никто не оспаривает. */
+void netdev_update_features(struct net_device *dev) { (void)dev; }
+
+/* NAPI передачи — тот же кооперативный планировщик, что и у приёма (в Linux это разные
+ * контексты, у нас один). Отдельная нить опроса (`netif_threaded_enable`) не нужна по той же
+ * причине: задачи Lx_kit и так уступают процессор друг другу. */
+void netif_napi_add_tx(struct net_device *dev, struct napi_struct *napi,
+		       int (*poll)(struct napi_struct *, int))
+{
+	netif_napi_add(dev, napi, poll);
+}
+
+int netif_threaded_enable(struct net_device *dev) { (void)dev; return 0; }
 
 /* ─ netif_* очереди/несущая (оживут при open/link на след. вехе) ─ */
 void netif_start_queue(struct net_device *dev) { (void)dev; }
