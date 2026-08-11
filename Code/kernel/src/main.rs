@@ -142,6 +142,16 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("hostile", include_bytes!(env!("PROG_HOSTILE"))),
 ];
 
+/// Веха 132 — C-ДРАЙВЕРЫ семенами: портированный код Linux, собранный nix'ом и выложенный
+/// `Code/tools/stage-drivers.sh`. Едут В ЯДРЕ по той же причине, что и программы на Rust:
+/// store целевой машины живёт на её внутреннем диске, и с хоста туда не дотянуться (мостом
+/// правится только образ, а с образа на флешке система берёт лишь ядро — USB для VOID не
+/// блочное устройство).
+///
+/// Пустой срез значит «драйвер не выложен при сборке» — [`seed_programs`] такое семя пропускает
+/// и говорит об этом вслух.
+static C_DRIVERS: &[(&str, &[u8])] = &[("lx-atl1c-hw", include_bytes!(env!("DRV_LX_ATL1C_HW")))];
+
 /// Веха 97 — программы ТОЛЬКО ДЛЯ x86: `term` рисует в пиксельный фреймбуфер, которого на
 /// riscv нет (см. `build.rs`, PROGRAMS_X86). Отдельным списком, а не `cfg` внутри общего:
 /// так видно, что список арх-зависим, а не что кто-то забыл убрать программу.
@@ -549,7 +559,17 @@ fn seed_programs() {
     // установленной системе (загрузка с диска без модуля) сеять НЕ надо — команды установки там
     // быть не должно; а если корень остался от прежней загрузки — снять его.
     let install_media = arch::boot_module().is_some();
-    for (name, bytes) in PROGRAMS.iter().chain(PROGRAMS_ARCH) {
+    // Веха 132 — C-драйверы сеются наравне с программами. Не выложенные при сборке (пустое
+    // семя) пропускаем ГРОМКО: тихо посеянная пустота выглядела бы как «карта не работает».
+    let mut drivers: alloc::vec::Vec<(&str, &[u8])> = alloc::vec::Vec::new();
+    for (name, bytes) in C_DRIVERS {
+        if bytes.is_empty() {
+            println!("  [seed] C-драйвер '{}' в этот образ НЕ вложен (см. stage-drivers.sh)", name);
+        } else {
+            drivers.push((name, bytes));
+        }
+    }
+    for (name, bytes) in PROGRAMS.iter().chain(PROGRAMS_ARCH).chain(drivers.iter()) {
         if *name == "install" && !install_media {
             object::del_root(&prog_root(name)); // не носитель — install отсутствует
             continue;

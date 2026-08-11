@@ -21,6 +21,10 @@ const PROGRAMS: &[&str] = &[
 /// объектом-деревом (Веха 94 умеет), а не носить его в ELF.
 const PROGRAMS_X86: &[&str] = &["term", "wm", "winbox"];
 
+/// Веха 132 — C-драйверы (портированный код Linux, сборка nix'ом). Едут семенами В ЯДРЕ, как и
+/// программы на Rust: до store целевой машины иначе не добраться (см. `stage_c_drivers`).
+const C_DRIVERS: &[&str] = &["lx-atl1c-hw"];
+
 fn main() {
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel
 
@@ -35,6 +39,48 @@ fn main() {
     println!("cargo:rerun-if-changed={}", linker.display());
 
     build_user_programs(&dir, prog_target, arch == "x86_64");
+    stage_c_drivers(&dir, &arch);
+}
+
+/// Веха 132 — C-ДРАЙВЕРЫ, собранные nix'ом (портированный код Linux), в семена ядра.
+///
+/// Зачем это здесь, а не мостом с хоста, как раньше. Мост (`void-store-import`) пишет в store
+/// ОБРАЗА, и на машине разработчика этого хватает. Но на ноутбуке store живёт на внутреннем
+/// SATA-диске, а грузится система с флешки: USB для VOID вообще не блочное устройство (xHCI
+/// поднят ради клавиатуры). То есть всё, что мост положил в образ на флешке, на этой машине
+/// недостижимо в принципе — драйвер туда не доставить никак, кроме как ВНУТРИ ЯДРА.
+///
+/// Артефакт nix'а сюда не собирается: `cargo build` не должен зависеть от того, доступен ли
+/// nix. Драйвер выкладывается заранее (`Code/tools/stage-drivers.sh`), а если его нет —
+/// подставляется ПУСТОЕ семя, и об этом говорят и сборка, и загрузка. Молчаливое отсутствие
+/// драйвера выглядело бы как «карта не работает», и искать причину пришлось бы на железе.
+fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let staged = kernel_dir
+        .parent()
+        .expect("kernel/.. — Code/")
+        .join("programs/lx-linux/prebuilt")
+        .join(arch);
+    println!("cargo:rerun-if-changed={}", staged.display());
+
+    for name in C_DRIVERS {
+        let var = name.to_uppercase().replace('-', "_");
+        let src = staged.join(name);
+        let path = if src.is_file() {
+            src
+        } else {
+            // Пустой файл-заглушка: `include_bytes!` нужен путь, существующий во время сборки,
+            // а нулевая длина — признак «драйвера нет», который ядро проверяет при посеве.
+            let stub = out_dir.join(format!("{name}.absent"));
+            std::fs::write(&stub, b"").expect("не записать заглушку драйвера");
+            println!(
+                "cargo:warning=C-драйвер {name} ({arch}) не выложен — ядро соберётся БЕЗ него; \
+                 собрать: Code/tools/stage-drivers.sh"
+            );
+            stub
+        };
+        println!("cargo:rustc-env=DRV_{}={}", var, path.display());
+    }
 }
 
 /// Веха 19.1/23 — собрать userspace-программы (крейт `programs/user`: библиотека шимов + все
