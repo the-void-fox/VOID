@@ -142,6 +142,22 @@ static void netlog_task(void *arg)
 			off += chunk;
 		}
 		sent = off;
+
+		/* ПРИЗНАК ЖИЗНИ раз в секунду, даже когда журналу сказать нечего. Без него на
+		 * простаивающей машине в провод уходил один кадр в пять секунд (прирастала только
+		 * строка отчёта), и «тихо» невозможно было отличить от «редко» — а именно на этом мы
+		 * и застряли, глядя в пустой tcpdump. Постоянный ровный поток отвечает на вопрос
+		 * «доходит ли вообще» сразу. */
+		if (rounds % 5 == 0) {
+			char beat[64];
+			int k = snprintf(beat, sizeof(beat), "VOID жив: кадров %u, отказов %u\n",
+					 frames, failed);
+
+			if (netlog_send(ndev, (const unsigned char *)beat, (unsigned)k) == 0)
+				frames++;
+			else
+				failed++;
+		}
 		msleep(200);
 	}
 }
