@@ -1143,7 +1143,14 @@ fn shm_map_new(t: &mut Table, cur: usize, len: usize, va: usize) -> usize {
         return usize::MAX;
     }
     let dom = t.procs[cur].domain;
-    cap::mint(dom, cap::Target::Shm(id), Rights::READ.union(Rights::WRITE)).bits() as usize
+    // GRANT — не щедрость, а смысл области: она заводится ради того, чтобы ПОДЕЛИТЬСЯ, а отправка
+    // права по IPC требует GRANT (проверяется на `CALL`). Без него создатель владел бы буфером,
+    // которым не может ни с кем поделиться, — то есть обычной памятью.
+    //
+    // Урезает права уже сам создатель (`CAP_DERIVE`) перед отправкой: композитору уезжает
+    // READ|GRANT без WRITE, и в кадр он писать не может.
+    cap::mint(dom, cap::Target::Shm(id), Rights::READ.union(Rights::WRITE).union(Rights::GRANT))
+        .bits() as usize
 }
 
 /// Отобразить УЖЕ существующую область (право проверено вызывающим).

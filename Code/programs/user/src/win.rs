@@ -34,16 +34,13 @@
 //! экран, решает композитор. Так же устроены анимации (ADR 0016): их часы — у него, потому что
 //! двигать окно, ничего не перерисовывая, может только он.
 
-/// Создать окно: `[ширина u16, высота u16, заголовок…]` → `[id u32]`.
+/// Создать окно: `[ширина u16, высота u16, заголовок…]` → `[id u32]` + право на БУФЕР КАДРА.
 pub const OP_CREATE: usize = 1;
-/// Привязать пиксели ПРЯМОУГОЛЬНИКА: `[id u32, x u16, y u16, w u16, h u16, content-id 32Б]`.
-/// Объект содержит ровно `w*h*4` байта RGBA8888 по строкам — только эту область, а не всё окно.
-///
-/// Почему прямоугольником, а не окном целиком (Веха 118): полный кадр терминала 900×520 — это
-/// 1,87 МБ, и КАЖДОЕ нажатие клавиши создавало бы новый объект такого размера. Куча ядра
-/// кончалась за восемь нажатий — паникой. Полоса из пары текстовых строк в двадцать раз меньше,
-/// и это единственное, что на самом деле изменилось.
-pub const OP_ATTACH: usize = 2;
+// 2 и 7 — свободны. Там были `OP_ATTACH` (привязать пиксели прямоугольника объектом store) и
+// `OP_SCROLL` (сдвинуть содержимое у композитора). Обе умерли с общим буфером (Веха 129): первой
+// нечего пересылать, второй нечего двигать — копия одна, и клиент двигает её сам. Номера
+// оставлены пустыми намеренно: перенумеровывать живые операции ради красоты значит ломать
+// работающие программы на ровном месте.
 /// Кадр готов: `[id u32, x u16, y u16, w u16, h u16]` — прямоугольник изменений.
 pub const OP_COMMIT: usize = 3;
 /// Ждать событие: `[id u32]` → ответ ОТЛОЖЕННЫЙ, как чтение stdin у терминала.
@@ -56,18 +53,6 @@ pub const OP_DESTROY: usize = 5;
 /// уснуть в нашем вызове он не может, иначе перестанет обслуживать детей. Простым программам
 /// (`winbox`) по-прежнему проще спать в [`OP_EVENT`].
 pub const OP_POLL: usize = 6;
-/// Сдвинуть содержимое окна по вертикали: `[id u32, y0 u16, y1 u16, dy i16]` — строки `y0..y1`
-/// уезжают на `dy` пикселей вверх (`dy > 0`) или вниз.
-///
-/// Веха 120.3 — это операция ПРОКРУТКИ, и появилась она из замера. Терминал, у которого текст
-/// уехал на строку вверх, менял ВСЕ свои пиксели: 900×496×4 ≈ 1,8 МБ на каждую напечатанную
-/// строку — новый объект store, хэш BLAKE3 по мегабайту, чтение обратно. Вывод `help` стоил
-/// пятидесяти мегабайт и печатался рывками.
-///
-/// Пиксели уже лежат у композитора — сдвинуть их у себя ему стоит одного `copy_within`. Клиенту
-/// остаётся прислать только ОСВОБОДИВШУЮСЯ строку. Тот же приём, что `CopyArea` у X11: дешевле
-/// всего переслать то, что уже на месте, — никак.
-pub const OP_SCROLL: usize = 7;
 /// Веха 129 — НОВЫЙ буфер кадра под изменившийся размер: `[id u32, w u16, h u16]` + право на
 /// область. Отдельная операция, а не поле в `OP_CREATE`: размер окна назначает раскладка, и
 /// менять буфер приходится по её команде, а не при рождении.
@@ -201,14 +186,45 @@ pub fn endpoint() -> Option<usize> {
 const SHM_BASE: usize = 0x7000_0000;
 const SHM_STRIDE: usize = 8 * 1024 * 1024;
 
-/// Сколько буферов уже роздано этому процессу (следующий слот). Окон у клиента обычно одно, но
-/// смена размера берёт НОВУЮ область, поэтому счётчик растёт и просто не переиспользует адреса.
-static NEXT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Сколько слотов помещается до стека (его вершина `0x8000_0000`, под ним 64 страницы).
+const SHM_SLOTS: usize = 31;
 
-fn next_slot_va() -> usize {
-    let i = NEXT_SLOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+/// Занятые слоты — по биту на слот. Слоты ПЕРЕИСПОЛЬЗУЮТСЯ: смена размера берёт новую область, и
+/// без возврата слотов окно, переложенное тридцать раз, упёрлось бы в край окна ВА, хотя занято
+/// при этом одно.
+static SLOTS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Занять свободный слот. `None` — все заняты (у клиента больше тридцати живых буферов).
+fn take_slot() -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    let mut cur = SLOTS.load(Ordering::Relaxed);
+    loop {
+        let free = (0..SHM_SLOTS).find(|i| cur & (1 << i) == 0)?;
+        match SLOTS.compare_exchange_weak(
+            cur, cur | (1 << free), Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(free),
+            Err(now) => cur = now,
+        }
+    }
+}
+
+fn free_slot(i: usize) {
+    SLOTS.fetch_and(!(1 << i), core::sync::atomic::Ordering::Relaxed);
+}
+
+fn slot_va(i: usize) -> usize {
     SHM_BASE + i * SHM_STRIDE
 }
+
+/// Права, с которыми буфер уезжает композитору: `READ | GRANT`, БЕЗ `WRITE`. Он в кадр не пишет —
+/// рисует клиент, композитор читает; ядро отобразит область только на чтение, и «композитор не
+/// портит чужой кадр» становится свойством ЖЕЛЕЗА, а не обещанием кода.
+///
+/// `GRANT` тут не про щедрость: отправка права ПО IPC его и требует (ядро проверяет `GRANT` при
+/// `CALL` — [[ipc-cap-transfer]]). Чистое `READ` без него не уезжает вовсе, и обнаруживается это
+/// не отказом, а тем, что окно не открывается: терминал молча уходил в режим владельца экрана.
+const RIGHT_SHARE: usize = 0b101;
 
 /// Окно клиента: право на композитор, выданный им номер и ОБЩИЙ БУФЕР КАДРА.
 ///
@@ -228,24 +244,51 @@ pub struct Window {
     /// Адрес общего буфера кадра в СВОЁМ пространстве и его длина (`width*height*4`).
     buf: usize,
     buf_len: usize,
+    /// Право на область (полное, наше) и слот окна ВА — нужны, чтобы её ОТПУСТИТЬ.
+    cap: usize,
+    slot: usize,
+}
+
+/// Буфер кадра: своя область памяти, отображённая в свободный слот.
+struct FrameBuf {
+    va: usize,
+    len: usize,
+    cap: usize,
+    slot: usize,
 }
 
 /// Завести общую область под кадр `width×height` и отобразить её себе.
-/// Возвращает (адрес, длина, право на область).
-fn new_frame_buf(width: u16, height: u16) -> Option<(usize, usize, usize)> {
+fn new_frame_buf(width: u16, height: u16) -> Option<FrameBuf> {
     let len = width as usize * height as usize * 4;
-    let va = next_slot_va();
-    let cap = crate::shm_new(len, va)?;
-    Some((va, len, cap))
+    let slot = take_slot()?;
+    let va = slot_va(slot);
+    match crate::shm_new(len, va) {
+        Some(cap) => Some(FrameBuf { va, len, cap, slot }),
+        None => {
+            free_slot(slot); // область не вышла — слот держать не за что
+            None
+        }
+    }
 }
 
 impl Window {
     /// Попросить окно. `None` — композитора нет или он отказал.
     pub fn create(width: u16, height: u16, title: &str) -> Option<Window> {
-        let ep = endpoint()?;
+        let Some(ep) = endpoint() else {
+            crate::write_console("[win] окна нет: WM не объявлен в окружении\n".as_bytes());
+            return None;
+        };
         // Буфер кадра заводим ДО запроса: право на него уезжает вместе с ним, и композитор
         // получает окно уже с картинкой, а не «сначала окно, потом как-нибудь буфер».
-        let (buf, buf_len, cap) = new_frame_buf(width, height)?;
+        let Some(fb) = new_frame_buf(width, height) else {
+            crate::write_console("[win] окна нет: общая область под кадр не завелась\n".as_bytes());
+            return None;
+        };
+        let ro = crate::cap_derive(fb.cap, RIGHT_SHARE);
+        if ro == crate::NO_CAP {
+            crate::write_console("[win] окна нет: право на буфер не урезалось\n".as_bytes());
+            return None;
+        }
         let mut req = [0u8; 4 + TITLE_MAX];
         req[0..2].copy_from_slice(&width.to_le_bytes());
         req[2..4].copy_from_slice(&height.to_le_bytes());
@@ -253,15 +296,28 @@ impl Window {
         let n = t.len().min(TITLE_MAX);
         req[4..4 + n].copy_from_slice(&t[..n]);
         let mut rep = [0u8; 4];
-        if crate::call_full(ep, OP_CREATE, &req[..4 + n], &mut rep, cap).0 != 4 {
+        if crate::call_full(ep, OP_CREATE, &req[..4 + n], &mut rep, ro).0 != 4 {
+            crate::write_console("[win] окна нет: композитор не ответил номером окна\n".as_bytes());
             return None;
         }
-        Some(Window { ep, id: u32::from_le_bytes(rep), width, height, buf, buf_len })
+        Some(Window {
+            ep,
+            id: u32::from_le_bytes(rep),
+            width,
+            height,
+            buf: fb.va,
+            buf_len: fb.len,
+            cap: fb.cap,
+            slot: fb.slot,
+        })
     }
 
     /// Кадр окна: RGBA8888 по строкам, ровно `width * height * 4` байта. Пишется НАПРЯМУЮ —
     /// это те же страницы, в которые смотрит композитор.
     pub fn pixels(&mut self) -> &mut [u8] {
+        if self.buf == 0 {
+            return &mut []; // окно уже закрыто — буфера нет
+        }
         unsafe { core::slice::from_raw_parts_mut(self.buf as *mut u8, self.buf_len) }
     }
 
@@ -271,62 +327,59 @@ impl Window {
     /// под работающим композитором значило бы ловить его на полукадре. Старая уходит, когда её
     /// отпустят оба держателя.
     pub fn resize_buf(&mut self, width: u16, height: u16) -> bool {
-        let Some((buf, buf_len, cap)) = new_frame_buf(width, height) else { return false };
+        let Some(fb) = new_frame_buf(width, height) else { return false };
+        let ro = crate::cap_derive(fb.cap, RIGHT_SHARE);
         let mut req = [0u8; 8];
         req[0..4].copy_from_slice(&self.id.to_le_bytes());
         req[4..6].copy_from_slice(&width.to_le_bytes());
         req[6..8].copy_from_slice(&height.to_le_bytes());
-        if crate::call_full(self.ep, OP_REBUF, &req, &mut [], cap).0 == crate::NO_CAP {
+        if ro == crate::NO_CAP
+            || crate::call_full(self.ep, OP_REBUF, &req, &mut [], ro).0 == crate::NO_CAP
+        {
+            // Не вышло — старый буфер остаётся рабочим, новый отпускаем целиком.
+            crate::shm_unmap(fb.cap, fb.va);
+            free_slot(fb.slot);
             return false;
         }
-        self.buf = buf;
-        self.buf_len = buf_len;
+        // Вызов синхронный: к этому месту композитор УЖЕ отобразил новую область и отпустил
+        // старую. Значит старую можно отпустить и нам — последний держатель уходит, страницы
+        // возвращаются системе. Порядок здесь единственно верный: отпусти мы её раньше ответа,
+        // композитор какое-то время читал бы освобождённые страницы.
+        crate::shm_unmap(self.cap, self.buf);
+        free_slot(self.slot);
+        self.buf = fb.va;
+        self.buf_len = fb.len;
+        self.cap = fb.cap;
+        self.slot = fb.slot;
         self.width = width;
         self.height = height;
         true
     }
 
-    /// Отдать композитору новый кадр: положить пиксели объектом и назвать его.
-    ///
-    /// `pixels` — RGBA8888 по строкам, ровно `width * height * 4` байта. Кладём через store, а
-    /// не шлём по IPC, ровно по доводу из шапки: содержимое адресуется хэшем, а не местом.
-    pub fn present(&self, store: usize, pixels: &[u8]) -> bool {
-        self.present_rect(store, pixels, 0, 0, self.width, self.height)
-    }
-
-    /// Отдать ЧАСТЬ кадра: `pixels` — ровно `w*h*4` байта прямоугольника `(x, y, w, h)`.
-    ///
-    /// Это основной путь для всего, что перерисовывается часто: платит только за изменившееся.
-    pub fn present_rect(
-        &self, store: usize, pixels: &[u8], x: u16, y: u16, w: u16, h: u16,
-    ) -> bool {
-        let mut id = [0u8; 32];
-        if crate::obj_put(store, pixels, &mut id) != 0 {
-            return false;
-        }
-        let mut req = [0u8; 44];
-        req[0..4].copy_from_slice(&self.id.to_le_bytes());
-        req[4..6].copy_from_slice(&x.to_le_bytes());
-        req[6..8].copy_from_slice(&y.to_le_bytes());
-        req[8..10].copy_from_slice(&w.to_le_bytes());
-        req[10..12].copy_from_slice(&h.to_le_bytes());
-        req[12..44].copy_from_slice(&id);
-        if crate::call(self.ep, OP_ATTACH, &req, &mut []) == crate::NO_CAP {
-            return false;
-        }
-        self.damage(x, y, w, h)
-    }
-
     /// Прокрутить содержимое окна: строки `y0..y1` уезжают на `dy` пикселей вверх.
     ///
-    /// Объекта здесь нет вовсе — в этом и смысл: пиксели уже у композитора (см. [`OP_SCROLL`]).
-    pub fn scroll(&self, y0: u16, y1: u16, dy: i16) -> bool {
-        let mut req = [0u8; 10];
-        req[0..4].copy_from_slice(&self.id.to_le_bytes());
-        req[4..6].copy_from_slice(&y0.to_le_bytes());
-        req[6..8].copy_from_slice(&y1.to_le_bytes());
-        req[8..10].copy_from_slice(&dy.to_le_bytes());
-        crate::call(self.ep, OP_SCROLL, &req, &mut []) != crate::NO_CAP
+    /// Веха 129 — это снова обычный сдвиг памяти У СЕБЯ, и композитору о нём знать не нужно:
+    /// буфер общий, значит его копия уехала тем же движением. Операция протокола `OP_SCROLL`
+    /// понадобилась в Вехе 120.3 ровно потому, что копий было ДВЕ и переслать вторую стоило
+    /// мегабайта на строку текста; с общим буфером пересылать нечего.
+    pub fn scroll(&mut self, y0: u16, y1: u16, dy: i16) -> bool {
+        if dy <= 0 || y1 <= y0 {
+            return false;
+        }
+        let stride = self.width as usize * 4;
+        let (y0, y1, dy) = (y0 as usize, y1.min(self.height) as usize, dy as usize);
+        if y1 <= y0 + dy {
+            return false;
+        }
+        let px = self.pixels();
+        let (from, to, dst) = ((y0 + dy) * stride, y1 * stride, y0 * stride);
+        if to > px.len() {
+            return false;
+        }
+        px.copy_within(from..to, dst);
+        // Освободившийся хвост НЕ чистим: клиент сейчас нарисует туда новые строки, а мигание
+        // пустой полосой видно.
+        self.damage(0, y0 as u16, self.width, (y1 - y0) as u16)
     }
 
     /// Сказать «кадр готов» и объявить изменившийся прямоугольник.
@@ -351,9 +404,16 @@ impl Window {
         self.event(OP_POLL)
     }
 
-    /// Сказать композитору, что окна больше не будет.
-    pub fn destroy(&self) {
+    /// Сказать композитору, что окна больше не будет, и отпустить буфер кадра.
+    ///
+    /// Отпускаем ПОСЛЕ ответа: композитор доигрывает закрытие (окно сжимается) и всё это время
+    /// смотрит в буфер. Уйдут оба держателя — страницы вернутся системе сами.
+    pub fn destroy(&mut self) {
         crate::call(self.ep, OP_DESTROY, &self.id.to_le_bytes(), &mut []);
+        crate::shm_unmap(self.cap, self.buf);
+        free_slot(self.slot);
+        self.buf = 0;
+        self.buf_len = 0;
     }
 
     fn event(&self, op: usize) -> Option<Event> {

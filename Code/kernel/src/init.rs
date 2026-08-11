@@ -71,6 +71,21 @@ service net-srv dev:net:rw
 shell term endpoint:posixfs store:rwx mmio:fb power env
 ";
 
+/// Четвёртое поколение (`gen4`, Веха 129) — **оконный режим**: композитор владеет экраном, а
+/// терминал живёт в нём окном. `arg:term` — клиент, которого `wm` открывает на старте.
+///
+/// Системное и переписывается на каждой загрузке, как `gen3`, и по той же причине: это витрина
+/// возможностей образа, а не выбор владельца. До него оконный режим существовал, но добраться до
+/// него можно было только правкой конфига руками (`init-config` → `mode = "wm"` → `rebuild`) —
+/// то есть графическая оболочка была недостижима из коробки, и проверять её приходилось,
+/// набирая конфиг в редакторе по serial. Выбор по-прежнему за владельцем: `switch gen4`.
+const DEFAULT_GEN4: &str = "\
+# VOID — оконный режим: композитор + терминал окном (Веха 129)
+service posixfs store:rw
+service net-srv dev:net:rw
+shell wm endpoint:posixfs store:rwx mmio:fb power env arg:term
+";
+
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.
 fn read_text(root: &str) -> Option<String> {
     let id = object::root(root)?;
@@ -332,6 +347,10 @@ pub fn boot() {
     if read_text("system/gen3").as_deref() != Some(DEFAULT_GEN3) {
         write_text("system/gen3", DEFAULT_GEN3);
         println!("  [init] поколение 'gen3' (системное) обновлено из образа ядра");
+    }
+    if read_text("system/gen4").as_deref() != Some(DEFAULT_GEN4) {
+        write_text("system/gen4", DEFAULT_GEN4);
+        println!("  [init] поколение 'gen4' (оконный режим) обновлено из образа ядра");
     }
 
     // Активное поколение: system/current → имя → system/<имя> → текст конфига.

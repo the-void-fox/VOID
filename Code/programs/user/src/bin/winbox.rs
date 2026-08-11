@@ -1,8 +1,12 @@
 //! `winbox` — простейший клиент композитора (Веха 117).
 //!
-//! Просит окно, рисует в свою память, кладёт пиксели объектом в store и говорит «готово».
-//! По клику меняет цвет и перерисовывается — то есть проверяет обе стороны протокола: и
-//! доставку кадра, и доставку событий.
+//! Просит окно, рисует ПРЯМО В ОБЩИЙ БУФЕР КАДРА и говорит «готово». По клику меняет цвет и
+//! перерисовывается — то есть проверяет обе стороны протокола: и доставку кадра, и доставку
+//! событий.
+//!
+//! Веха 129 — пикселей никуда не «отдают»: буфер, выданный при создании окна, это те же
+//! страницы, в которые смотрит композитор ([[shm]]). До неё кадр ехал объектом store, и по
+//! замеру платили не за пиксели, а за сам факт объекта.
 //!
 //! Приложение НЕ знает ни про фреймбуфер, ни про своё положение на экране, ни про то, что его
 //! таскают мышью. Оно знает только свои пиксели и свои события — так и должно быть.
@@ -11,7 +15,6 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use void_user as sys;
 use void_user::win::{Event, Window};
 
@@ -34,25 +37,23 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         .and_then(|s| core::str::from_utf8(s).ok())
         .unwrap_or("winbox");
 
-    let store = sys::cap_named("STORE").unwrap_or_else(|| sys::start_cap(1));
     let (w, h) = (360u16, 220u16);
-    let Some(window) = Window::create(w, h, name) else {
+    let Some(mut window) = Window::create(w, h, name) else {
         sys::write_console("[winbox] композитора нет (WM в окружении) — окно не открыть\n".as_bytes());
         sys::exit(1);
     };
 
     let mut shade = 0usize;
-    let mut pixels = vec![0u8; w as usize * h as usize * 4];
-    draw(&mut pixels, w, h, shade);
-    window.present(store, &pixels);
+    draw(window.pixels(), w, h, shade);
+    window.damage(0, 0, w, h);
 
     // Живём событиями: пока их нет, спим в `SYS_CALL` внутри `next_event` — процессор не тратим.
     loop {
         match window.next_event() {
             Some(Event::Button { down: true, .. }) => {
                 shade = (shade + 1) % PALETTE.len();
-                draw(&mut pixels, w, h, shade);
-                window.present(store, &pixels);
+                draw(window.pixels(), w, h, shade);
+                window.damage(0, 0, w, h);
             }
             // Веха 127: клавиша приезжает целиком. Смотрим на КЛАВИШУ (`sym`), а не на
             // напечатанный символ, — так `q` останется выходом и в другой раскладке.

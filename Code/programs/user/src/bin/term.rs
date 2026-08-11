@@ -113,55 +113,52 @@ const WIN_H: u16 = 520;
 enum Out {
     /// Экран целиком: пишем прямо во фреймбуфер (`mmio:fb`).
     Screen,
-    /// Окно композитора: собираем кадр в своей памяти и отдаём объектом (Веха 117).
-    Window { win: sys::win::Window, buf: Vec<u8>, store: usize },
+    /// Окно композитора: рисуем прямо в ОБЩИЙ буфер кадра (Веха 129).
+    ///
+    /// Своей копии больше нет. До этой вехи терминал собирал кадр у себя и отдавал изменившиеся
+    /// строки объектом store — и по замеру платил не за пиксели, а за бухгалтерию вокруг них
+    /// ([[compositor-damage]]). Теперь оба режима устроены одинаково: есть адрес, по которому
+    /// лежит кадр, и весь рисующий код о разнице не знает.
+    Window { win: sys::win::Window },
 }
 
 impl Out {
     /// Адрес, по которому лежит левый верхний пиксель кадра.
-    fn base(&self) -> usize {
+    fn base(&mut self) -> usize {
         match self {
             Out::Screen => FB_VA,
-            Out::Window { buf, .. } => buf.as_ptr() as usize,
+            Out::Window { win } => win.pixels().as_ptr() as usize,
         }
     }
-    /// Отдать композитору ПОЛОСУ строк `y0..y1` (в пикселях). Экрану предъявлять нечего —
-    /// там кадр уже на месте.
+    /// Сказать композитору, что ПОЛОСА строк `y0..y1` (в пикселях) изменилась. Экрану говорить
+    /// нечего — там кадр уже на месте.
     ///
-    /// Полосу, а не кадр: полный кадр окна 900×520 — это 1,87 МБ, и по объекту на каждое
-    /// нажатие клавиши кончало кучу ядра за восемь букв (Веха 118). Платим за изменившееся.
+    /// Полосу, а не кадр: перерисовывать весь экран из-за одной изменившейся строки текста —
+    /// работа композитора впустую (Веха 118).
     fn present_rows(&self, info: &sys::VideoInfo, y0: usize, y1: usize) {
-        let Out::Window { win, buf, store } = self else { return };
+        let Out::Window { win } = self else { return };
         let y0 = y0.min(info.height);
         let y1 = y1.min(info.height);
         if y1 <= y0 {
             return;
         }
-        let row = info.pitch;
-        win.present_rect(
-            *store,
-            &buf[y0 * row..y1 * row],
-            0,
-            y0 as u16,
-            info.width as u16,
-            (y1 - y0) as u16,
-        );
+        win.damage(0, y0 as u16, info.width as u16, (y1 - y0) as u16);
     }
     fn windowed(&self) -> bool {
         matches!(self, Out::Window { .. })
     }
 
-    /// Сдвинуть СВОЙ кадр вверх на `dy` пикселей в пределах первых `height` строк — и сказать то
-    /// же композитору (Веха 120.3). Обе копии обязаны уехать одинаково: композитор рисует свою,
-    /// мы дорисовываем в свою освободившуюся строку.
+    /// Сдвинуть кадр вверх на `dy` пикселей — прокрутка текста.
+    ///
+    /// Веха 129: копия ОДНА, и двигаем мы её сами обычным `copy_within`. Прежде копий было две
+    /// (наша и композитора), и вторую приходилось двигать отдельной операцией протокола, чтобы
+    /// не пересылать мегабайт на каждую напечатанную строку (Веха 120.3).
     fn scroll_up(&mut self, info: &sys::VideoInfo, dst_y: usize, src_y: usize, h: usize) {
-        let Out::Window { win, buf, .. } = self else { return };
-        let row = info.pitch;
-        let (from, to, dst) = (src_y * row, (src_y + h) * row, dst_y * row);
-        if src_y <= dst_y || h == 0 || to > buf.len() {
+        let Out::Window { win } = self else { return };
+        if src_y <= dst_y || h == 0 {
             return;
         }
-        buf.copy_within(from..to, dst);
+        let _ = info;
         win.scroll(dst_y as u16, (src_y + h) as u16, (src_y - dst_y) as i16);
     }
 }
@@ -906,7 +903,6 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     // Веха 118 — есть композитор? Тогда мы ОКНО, а не владелец экрана. Решение принимается
     // здесь и больше нигде: дальше по коду разница видна только в том, куда лёг кадр.
-    let store = store_cap().unwrap_or(sys::NO_CAP);
     let (mut out, mut info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
         Some(win) => {
             log_line("term: работаю окном композитора");
@@ -919,8 +915,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 bpp: 32,
                 rgb: [(0, 8), (8, 8), (16, 8)],
             };
-            let buf = vec![0u8; WIN_W as usize * WIN_H as usize * 4];
-            (Out::Window { win, buf, store }, info)
+            (Out::Window { win }, info)
         }
         None => {
             let Some(fb_cap) = find_fb_cap() else {
@@ -999,7 +994,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         // Опрашиваем НЕ блокируясь: у нас свой реактор — панели ждут ответов, и уснуть в чужом
         // вызове мы не имеем права.
         let mut new_size: Option<(usize, usize)> = None;
-        if let Out::Window { win, .. } = &out {
+        if let Out::Window { win } = &mut out {
             while let Some(ev) = win.poll_event() {
                 worked = true;
                 match ev {
@@ -1029,11 +1024,17 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             info.width = w;
             info.height = h;
             info.pitch = w * 4;
-            if let Out::Window { buf, win, .. } = &mut out {
-                buf.clear();
-                buf.resize(w * h * 4, 0);
-                win.width = w as u16;
-                win.height = h as u16;
+            // Веха 129 — под новый размер нужен НОВЫЙ общий буфер: старая область роздана обоим,
+            // и менять её состав под работающим композитором значило бы ловить его на полукадре.
+            // Не вышло — размер окна не меняем: рисовать в буфер, которого нет, хуже, чем
+            // остаться прежним.
+            if let Out::Window { win } = &mut out {
+                if !win.resize_buf(w as u16, h as u16) {
+                    log_line("term: новый буфер кадра не вышел — остаюсь в прежнем размере");
+                    info.width = win.width as usize;
+                    info.height = win.height as usize;
+                    info.pitch = win.width as usize * 4;
+                }
             }
             if let Some(v) = View::build(&conf, &info) {
                 view = v;
@@ -1123,7 +1124,6 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                         "scroll-top" => max,
                                         _ => 0,
                                     };
-                                    redraw = true;
                                 }
                             }
                             "split-v" | "split-h" => {

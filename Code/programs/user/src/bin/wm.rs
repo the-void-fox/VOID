@@ -329,11 +329,10 @@ fn main_loop() -> ! {
         scroll_at: 0,
         scroll_dur: 0,
         focus: None,
-        transient: 0,
+        slots: 0,
         damage: Vec::new(),
             shadow: vec![0u32; info.width * info.height],
         present_all: false,
-        readbuf: Vec::new(),
         spaces: (0..SPACES).map(|_| Space::default()).collect(),
         space: 0,
         overview: false,
@@ -441,7 +440,7 @@ fn main_loop() -> ! {
             sys::recv_console(&mut msg, if moving { 8 } else { 200 })
         };
         if let Some(m) = got {
-            wm.request(&m, &msg, store);
+            wm.request(&m, &msg);
         }
 
         // Кадр — ОДИН на оборот, в самом конце: к этому месту учтены все события пачки, все
@@ -450,6 +449,16 @@ fn main_loop() -> ! {
         wm.flush();
     }
 }
+
+/// Веха 129 — окно ВА композитора под ЧУЖИЕ буферы кадров: между своей кучей (`0x6000_0000`) и
+/// своим стеком (вершина `0x8000_0000`, под ним 64 страницы). Шаг 8 МиБ — полноэкранный кадр
+/// 1600×1200×4 это 7.3 МиБ, то есть окно любого допустимого размера в слот влезает.
+///
+/// Тридцать один слот — это потолок на ОДНОВРЕМЕННО отображённые буферы, а не на число окон за
+/// сеанс: слоты возвращаются, когда буфер отпущен.
+const SHM_BASE: usize = 0x7000_0000;
+const SHM_STRIDE: usize = 8 * 1024 * 1024;
+const SHM_SLOTS: usize = 31;
 
 /// Одно окно.
 struct Win {
@@ -464,16 +473,25 @@ struct Win {
     /// хранит: он понадобится подписям в обзоре и списку окон.
     #[allow(dead_code)]
     title: String,
-    /// Копия пикселей клиента (RGBA), прочитанная по content-id.
-    pixels: Vec<u8>,
-    /// Размер САМОЙ КОПИИ. Отдельно от назначенного размера окна (Веха 126.1): между «раскладка
-    /// решила, что окно теперь другое» и «клиент прислал новый кадр» проходит время, и всё это
-    /// время надо показывать СТАРУЮ картинку, растянув её. Раньше копия обнулялась сразу —
-    /// окно чернело, а при складывании в стопку это выглядело как артефакты.
+    /// Веха 129 — ОБЩИЙ буфер кадра клиента, отображённый у нас: адрес, длина, право и слот
+    /// нашего окна ВА. `buf == 0` — буфера нет (клиент его не дал).
+    ///
+    /// Копии больше нет вовсе. До этой вехи здесь лежал `Vec<u8>`, куда вклеивались куски,
+    /// прочитанные из store по content-id, — и платили мы не за пиксели, а за бухгалтерию вокруг
+    /// них ([[compositor-damage]]). Теперь это ТЕ ЖЕ страницы, в которые пишет клиент, и
+    /// отображены они ТОЛЬКО НА ЧТЕНИЕ: композитор в чужой кадр не пишет, и это свойство железа,
+    /// а не обещание.
+    buf: usize,
+    buf_len: usize,
+    cap: usize,
+    slot: usize,
+    /// Размер, в котором клиент РИСУЕТ (раскладка буфера). Отдельно от назначенного размера окна
+    /// (Веха 126.1): между «раскладка решила, что окно теперь другое» и «клиент завёл буфер под
+    /// новый размер» проходит время, и всё это время надо показывать СТАРУЮ картинку, растянув
+    /// её. Раньше копия обнулялась сразу — окно чернело, а при складывании в стопку это
+    /// выглядело как артефакты.
     bw: i32,
     bh: i32,
-    /// Что уже прочитано — чтобы не читать то же самое дважды.
-    cid: [u8; 32],
     /// Отложенный ответ на `OP_EVENT` (клиент спит в `SYS_CALL`).
     waiting: Option<usize>,
     /// События, накопленные до того, как клиент спросил.
@@ -496,6 +514,14 @@ struct Win {
 }
 
 impl Win {
+    /// Кадр клиента, как его видим мы: RGBA8888 по строкам `bw × bh`. Пусто — буфера нет.
+    fn px(&self) -> &[u8] {
+        if self.buf == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.buf as *const u8, self.buf_len) }
+    }
+
     /// Начать движение к `target`.
     fn start(&mut self, target: Shown, ms: u64, now: u64) {
         self.from = self.shown;
@@ -606,8 +632,8 @@ struct Wm {
     cursor: (i32, i32),
     buttons: u8,
     focus: Option<u32>,
-    /// Сколько байт временных буферов прочитано с прошлой уборки (см. `OP_ATTACH`).
-    transient: usize,
+    /// Занятые слоты окна ВА под буферы клиентов — по биту на слот (Веха 129).
+    slots: u32,
     /// Что перерисовать в конце оборота (Веха 120.2). Раньше каждое событие рисовало САМО, и
     /// перетаскивание превращалось в тридцать перерисовок на один оборот цикла.
     damage: Vec<(i32, i32, i32, i32)>,
@@ -619,8 +645,6 @@ struct Wm {
     shadow: Vec<u32>,
     /// Отдать на экран весь кадр (после сдвига памяти изменилось всё).
     present_all: bool,
-    /// Буфер чтения объекта клиента: один на сессию, только растёт (см. `OP_ATTACH`).
-    readbuf: Vec<u8>,
     /// Неактивные рабочие столы (активный — в полях выше).
     spaces: Vec<Space>,
     /// Номер активного стола.
@@ -937,6 +961,10 @@ impl Wm {
         // Досжавшиеся окна убираем — их хозяина давно нет.
         for id in done {
             if let Some(k) = self.win_at(id) {
+                // Буфер отпускаем здесь, а не при смерти клиента: всё время сжатия окно рисуется
+                // своей последней картинкой, а лежит она в общей области. Ушли оба держателя —
+                // страницы вернулись системе.
+                self.drop_buf(k);
                 self.wins.remove(k);
             }
         }
@@ -1192,7 +1220,8 @@ impl Wm {
             let border = self.unpack(self.pack(if active { C_ACCENT } else { C_BORDER }));
             let (cw, ch) = (fw - 2 * BORDER, fh - 2 * BORDER);
             let src_row = (yy - fy - BORDER) * win.bh / ch.max(1);
-            let has_content = !win.pixels.is_empty() && src_row >= 0 && src_row < win.bh;
+            let px = win.px();
+            let has_content = !px.is_empty() && src_row >= 0 && src_row < win.bh;
             // Расстояние до края нужно ТОЛЬКО у краёв. В середине окна ответ известен заранее,
             // а корень там стоил бы дороже всего остального вместе взятого: полноэкранная
             // перерисовка — это миллион пикселей, и миллион квадратных корней на кадр
@@ -1222,8 +1251,8 @@ impl Wm {
                 let content = if has_content && inner != 0 {
                     let col = (xx - fx - BORDER) * win.bw / cw.max(1);
                     let p = ((src_row * win.bw + col) * 4) as usize;
-                    if col >= 0 && col < win.bw && p + 2 < win.pixels.len() {
-                        (win.pixels[p], win.pixels[p + 1], win.pixels[p + 2])
+                    if col >= 0 && col < win.bw && p + 2 < px.len() {
+                        (px[p], px[p + 1], px[p + 2])
                     } else {
                         border
                     }
@@ -1404,8 +1433,10 @@ impl Wm {
             if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
                 self.wins[k].w = cw2;
                 self.wins[k].h = ch2;
-                // Копию НЕ трогаем: пусть старая картинка тянется, пока клиент не перерисует.
-                self.wins[k].cid = [0u8; 32];
+                // Буфер НЕ трогаем: пусть старая картинка тянется, пока клиент не заведёт новый
+                // (`OP_REBUF`). Обнулять его здесь значило бы чернить окно на всё время между
+                // решением раскладки и ответом клиента — на складывании окон в стопку это
+                // выглядело как артефакты (Веха 126.1).
                 resized.push((id, cw2, ch2));
             }
         }
@@ -2052,9 +2083,57 @@ impl Wm {
         }
     }
 
+    // ── буферы кадров клиентов (Веха 129) ──────────────────────────────────────────────
+
+    /// Отобразить у себя область, право на которую прислал клиент. `None` — права нет, область
+    /// не та или свободных слотов не осталось.
+    ///
+    /// Ошибка здесь — НЕ повод падать: право приходит от клиента, а клиент может прислать что
+    /// угодно. Окно просто останется без картинки (рамка и место в раскладке у него будут).
+    fn map_client_buf(&mut self, cap: usize, w: i32, h: i32) -> Option<(usize, usize, usize)> {
+        if cap == sys::NO_CAP {
+            sys::write_console("[wm] окно без буфера: клиент не прислал права на область\n".as_bytes());
+            return None;
+        }
+        let Some(slot) = (0..SHM_SLOTS).find(|i| self.slots & (1 << i) == 0) else {
+            sys::write_console("[wm] окно без буфера: кончились слоты окна ВА\n".as_bytes());
+            return None;
+        };
+        let va = SHM_BASE + slot * SHM_STRIDE;
+        let Some(len) = sys::shm_map(cap, va) else {
+            sys::write_console("[wm] окно без буфера: область не отобразилась\n".as_bytes());
+            return None;
+        };
+        // Область обязана вмещать кадр объявленного размера: рисуем мы по ЕЁ содержимому, и
+        // короткая область значила бы чтение за краем на каждой строке.
+        if len < (w * h * 4) as usize {
+            sys::write_console("[wm] окно без буфера: область короче объявленного кадра\n".as_bytes());
+            sys::shm_unmap(cap, va);
+            return None;
+        }
+        self.slots |= 1 << slot;
+        Some((va, len, slot))
+    }
+
+    /// Отпустить буфер окна: снять отображение и вернуть слот. Ушли оба держателя — страницы
+    /// вернулись системе.
+    fn drop_buf(&mut self, i: usize) {
+        let w = &mut self.wins[i];
+        if w.buf == 0 {
+            return;
+        }
+        sys::shm_unmap(w.cap, w.buf);
+        let slot = w.slot;
+        w.buf = 0;
+        w.buf_len = 0;
+        w.bw = 0;
+        w.bh = 0;
+        self.slots &= !(1 << slot);
+    }
+
     // ── запросы клиентов ───────────────────────────────────────────────────────────────
 
-    fn request(&mut self, m: &sys::Message, buf: &[u8], store: usize) {
+    fn request(&mut self, m: &sys::Message, buf: &[u8]) {
         let op = m.op & 0xff;
         let len = m.len.min(buf.len());
         match op {
@@ -2067,6 +2146,9 @@ impl Wm {
                 // Каскадом: каждое следующее окно правее и ниже — иначе они лягут друг на друга
                 // и человек решит, что открылось одно.
                 let n = self.wins.len() as i32;
+                // Буфер кадра приезжает ПРАВОМ вместе с запросом: окно рождается уже с
+                // картинкой. Не дали — окно всё равно будет, просто пустое.
+                let (buf, buf_len, slot) = self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0));
                 let win = Win {
                     id,
                     owner: m.sender,
@@ -2075,10 +2157,12 @@ impl Wm {
                     w,
                     h,
                     title: String::from(title),
-                    pixels: Vec::new(),
-                    bw: 0,
-                    bh: 0,
-                    cid: [0u8; 32],
+                    buf,
+                    buf_len,
+                    cap: m.cap,
+                    slot,
+                    bw: if buf != 0 { w } else { 0 },
+                    bh: if buf != 0 { h } else { 0 },
                     waiting: None,
                     inbox: Vec::new(),
                     shown: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
@@ -2101,110 +2185,57 @@ impl Wm {
                 self.sync_focus();
                 self.relayout();
             }
-            win::OP_ATTACH => {
+            // Веха 129 — НОВЫЙ буфер под изменившийся размер. Отпускаем старый и берём
+            // присланный: между этими двумя строками окно остаётся без картинки ровно на время
+            // одного вызова, и до конца оборота его всё равно никто не рисует.
+            win::OP_REBUF => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let rx = u16::from_le_bytes([buf[4], buf[5]]) as i32;
-                let ry = u16::from_le_bytes([buf[6], buf[7]]) as i32;
-                let rw = u16::from_le_bytes([buf[8], buf[9]]) as i32;
-                let rh = u16::from_le_bytes([buf[10], buf[11]]) as i32;
-                let mut cid = [0u8; 32];
-                cid.copy_from_slice(&buf[12..44]);
-                if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                    // Тот же content-id — содержимое то же, читать нечего. Это и есть выгода
-                    // адресации по содержимому: «перерисовал в то же самое» стоит ноль.
-                    if self.wins[i].cid != cid {
-                        self.wins[i].cid = cid;
-                        // Клиент рисует в НАЗНАЧЕННОМ размере — по его первому кадру после
-                        // смены размера копия и заводится заново.
-                        let (ww, wh) = (self.wins[i].w, self.wins[i].h);
-                        if self.wins[i].bw != ww || self.wins[i].bh != wh {
-                            self.wins[i].pixels = vec![0u8; (ww * wh * 4) as usize];
-                            self.wins[i].bw = ww;
-                            self.wins[i].bh = wh;
-                        }
-                        let need = (rw * rh * 4) as usize;
-                        // Буфер чтения ОДИН на всю сессию и только растёт (Веха 120.3). Раньше он
-                        // заводился заново на каждый кадр — полтора мегабайта, взятые и
-                        // отпущенные сотни раз подряд вперемешку с мелочью. Куча со слиянием
-                        // соседей это переживает не всегда: мелкая аллокация, попавшая в середину
-                        // только что освобождённого большого блока, делит его навсегда. Итог —
-                        // «memory allocation of 1785604 bytes failed» посреди работы.
-                        if self.readbuf.len() < need {
-                            self.readbuf.resize(need, 0);
-                        }
-                        let px = &mut self.readbuf[..need];
-                        let got = sys::obj_get(store, &cid, px);
-                        if got == need {
-                            // Вклеиваем полосу на её место в копии окна.
-                            for row in 0..rh {
-                                let dy = ry + row;
-                                if dy < 0 || dy >= wh {
-                                    continue;
-                                }
-                                let src = (row * rw * 4) as usize;
-                                let dst = ((dy * ww + rx) * 4) as usize;
-                                let n = (rw * 4).min((ww - rx) * 4).max(0) as usize;
-                                if dst + n <= self.wins[i].pixels.len() && src + n <= px.len() {
-                                    self.wins[i].pixels[dst..dst + n]
-                                        .copy_from_slice(&px[src..src + n]);
-                                }
-                            }
-                        }
-                        // Пиксели скопированы — объект больше не нужен НИКОМУ. Он не привязан
-                        // корнем, значит уже мусор; считаем его и время от времени просим ядро
-                        // прибраться, иначе куча ядра кончится (Веха 118: полный кадр каждое
-                        // нажатие клавиши убивал систему за восемь букв).
-                        self.transient += need;
-                        // Порог 4 МиБ — заведомо ниже кучи ядра (16 МиБ), ради чего его и
-                        // опускали с 24: при 24 уборка не начиналась НИКОГДА, память кончалась
-                        // раньше. Веха 126.3 подняла его до 12 как подпорку под падение ядра;
-                        // Веха 126.4 нашла настоящую причину (флаг направления, trap_entry.s),
-                        // и подпорка снята — уборка снова зовётся по своему честному порогу.
-                        if self.transient > 4 * 1024 * 1024 {
-                            self.transient = 0;
-                            sys::obj_gc(store);
-                        }
+                let w = u16::from_le_bytes([buf[4], buf[5]]) as i32;
+                let h = u16::from_le_bytes([buf[6], buf[7]]) as i32;
+                if let Some(i) = self.wins.iter().position(|x| x.id == id) {
+                    self.drop_buf(i);
+                    if let Some((va, len, slot)) = self.map_client_buf(m.cap, w, h) {
+                        let win = &mut self.wins[i];
+                        win.buf = va;
+                        win.buf_len = len;
+                        win.cap = m.cap;
+                        win.slot = slot;
+                        win.bw = w;
+                        win.bh = h;
                     }
                 }
+                // Ответ ПОСЛЕ отображения: клиент по возврату из вызова отпускает свою старую
+                // область, и делать это, пока мы ещё в неё смотрим, нельзя.
                 sys::reply(m.reply_cap, &[]);
             }
             win::OP_COMMIT => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 sys::reply(m.reply_cap, &[]);
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                    let (ox, oy) = self.wins[i].content_at();
                     let dx = u16::from_le_bytes([buf[4], buf[5]]) as i32;
                     let dy = u16::from_le_bytes([buf[6], buf[7]]) as i32;
                     let dw = u16::from_le_bytes([buf[8], buf[9]]) as i32;
                     let dh = u16::from_le_bytes([buf[10], buf[11]]) as i32;
-                    self.damage(ox + dx, oy + dy, dw.max(1), dh.max(1));
-                }
-            }
-            // Прокрутка: пиксели уже у нас — сдвигаем свою копию, клиент присылает лишь
-            // освободившуюся строку (Веха 120.3). До этого прокрутка на одну строку означала
-            // пересылку ВСЕГО окна.
-            win::OP_SCROLL => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let y0 = u16::from_le_bytes([buf[4], buf[5]]) as i32;
-                let y1 = u16::from_le_bytes([buf[6], buf[7]]) as i32;
-                let dy = i16::from_le_bytes([buf[8], buf[9]]) as i32;
-                sys::reply(m.reply_cap, &[]);
-                if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                    let (ww, wh) = (self.wins[i].w, self.wins[i].h);
-                    let y0 = y0.clamp(0, wh);
-                    let y1 = y1.clamp(y0, wh);
-                    let stride = (ww * 4) as usize;
-                    let pix = &mut self.wins[i].pixels;
-                    if dy > 0 && y1 - y0 > dy && pix.len() >= (y1 * ww * 4) as usize {
-                        let from = ((y0 + dy) * ww * 4) as usize;
-                        let to = (y1 * ww * 4) as usize;
-                        let dst = (y0 * ww * 4) as usize;
-                        pix.copy_within(from..to, dst);
-                        // Освободившийся хвост НЕ чистим: клиент сейчас пришлёт туда новые
-                        // строки, а мигание пустой полосой видно.
-                        let _ = stride;
-                        let (ox, oy) = self.wins[i].content_at();
-                        self.damage(ox, oy + y0, ww, y1 - y0);
+                    // Прямоугольник клиента — в КООРДИНАТАХ ЭКРАНА, а это не то же самое, что его
+                    // место в раскладке. Считать надо от ПОКАЗАННОГО положения (`shown`) за
+                    // вычетом сдвига ленты: лента длиннее экрана и по нему ездит.
+                    //
+                    // Здесь было `content_at()` — место окна в ЛЕНТЕ. Пока окон было два, лента
+                    // никуда не уезжала (сдвиг 0) и разницы не было видно; третье окно её
+                    // сдвигало, и повреждения всех последующих кадров уходили за край экрана.
+                    // Выглядело это так, будто новое окно рождается ЧЁРНЫМ: рамку рисовала
+                    // раскладка, а содержимое не перерисовывалось уже никогда.
+                    let (fx, fy, fw, fh) = self.wins[i].shown.rect();
+                    let sc = if self.overview { 0 } else { self.scroll_x };
+                    let (want_w, want_h) =
+                        (self.wins[i].w + 2 * BORDER, self.wins[i].h + 2 * BORDER);
+                    if self.overview || fw != want_w || fh != want_h {
+                        // Окно в движении (растёт, едет, уменьшено обзором) — его пиксели легли на
+                        // экран масштабированными, и попасть в них прямоугольником клиента нельзя.
+                        // Помечаем окно целиком: кадр анимации всё равно перерисовывает его.
+                        self.damage(fx - sc, fy, fw, fh);
+                    } else {
+                        self.damage(fx - sc + BORDER + dx, fy + BORDER + dy, dw.max(1), dh.max(1));
                     }
                 }
             }
