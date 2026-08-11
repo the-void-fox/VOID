@@ -54,6 +54,29 @@ fn report(name: &str, iters: usize, ticks: usize) {
     void_user::write(&line[..p]);
 }
 
+/// Буфер под замеры кадровых размеров (Веха 129). Статикой, а не кучей: `bench` — no_std-бинарь
+/// без `alloc`, и заводить её ради одного буфера незачем.
+static mut FRAME_BUF: [u8; 512 * 1024] = [0; 512 * 1024];
+
+/// Отчёт для замеров, где важен не только вызов, но и ПРОПУСКНАЯ СПОСОБНОСТЬ: строка кадра
+/// платит за каждый свой байт (BLAKE3 + копия), и «нс на операцию» об этом не говорит ничего.
+fn report_bytes(name: &str, iters: usize, size: usize, ticks: usize) {
+    let mut line = [0u8; 200];
+    let mut p = 0;
+    put_str(&mut line, &mut p, "    ");
+    put_str(&mut line, &mut p, name);
+    put_str(&mut line, &mut p, ": ");
+    put_num(&mut line, &mut p, iters);
+    put_str(&mut line, &mut p, " итер · ~");
+    put_num(&mut line, &mut p, ticks * TICK_NS / iters / 1000);
+    put_str(&mut line, &mut p, " µs/op · ");
+    // МБ/с = всего байт / всего наносекунд * 1e9 / 1e6; считаем в целых, порядок не теряя.
+    let ns = (ticks * TICK_NS).max(1);
+    put_num(&mut line, &mut p, iters * size * 1000 / ns);
+    put_str(&mut line, &mut p, " МБ/с\n");
+    void_user::write(&line[..p]);
+}
+
 #[no_mangle]
 pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
     // 1. Null syscall: SYS_YIELD, других готовых нет — полный круг
@@ -95,6 +118,25 @@ pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
         void_user::obj_put(store_cap, &data, &mut id);
     }
     report("obj_put 32 Б (BLAKE3+store)", n, now() - t0);
+
+    // 4a. Веха 129 — obj_put НА РАЗМЕРАХ КАДРА. Тридцать два байта меряют накладные расходы
+    //     вызова, а окно платит за содержимое: изменившаяся строка окна 630 пикселей — это
+    //     2520 байт, а полный кадр такого окна — около двух мегабайт. Через store сегодня ходит
+    //     КАЖДЫЙ такой кусок: BLAKE3 по всей длине, выделение в куче ядра, копия, потом уборка.
+    //     Это и есть цена, которую снимает разделяемая память, — и чтобы говорить о выигрыше
+    //     цифрами, её надо знать до, а не после.
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(FRAME_BUF) };
+    buf[8..16].copy_from_slice(&now().to_le_bytes());
+    for (label, size, n) in
+        [("obj_put строка окна 2.5 КиБ", 2520usize, 200usize), ("obj_put кусок 512 КиБ", 512 * 1024, 10)]
+    {
+        let t0 = now();
+        for i in 0..n as u64 {
+            buf[0..8].copy_from_slice(&i.to_le_bytes()); // соль: дедуп не должен срезать работу
+            void_user::obj_put(store_cap, &buf[..size], &mut id);
+        }
+        report_bytes(label, n, size, now() - t0);
+    }
 
     // 5. obj_get последнего значения по content-id.
     let n = 100;
