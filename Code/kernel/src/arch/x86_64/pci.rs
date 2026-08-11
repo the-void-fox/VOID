@@ -240,6 +240,52 @@ pub fn dump() {
     }
 }
 
+/// Веха 132 — найти устройство `vendor:device` НА ЛЮБОЙ ШИНЕ и отдать его BAR0 (физ. база).
+/// Включает память и bus-master, отображает окно регистров.
+///
+/// Отдельно от `probe_e1000` и родни не из любви к обобщению: те смотрят только шину 0, потому
+/// что на q35 всё там и стоит. На живом ноутбуке карта сидит за мостом PCIe (X54C: AR8151 на
+/// шине 04) — обход по одной шине не нашёл бы её никогда, и выглядело бы это как «карты нет».
+///
+/// Длина окна берётся параметром: у каждой карты она своя, а читать её размером BAR'а (запись
+/// единиц и обратное чтение) значит на мгновение снять устройство с его адреса — на живой
+/// машине с работающей прошивкой это лишний риск ради числа, которое мы и так знаем.
+pub fn probe_bar0(vendor_want: u16, device_want: u16, len: usize) -> Option<usize> {
+    for bus in 0..=255u32 {
+        for dev in 0..32u32 {
+            let multi = cfg_r8b(bus, dev << 3, 0x0e) & 0x80 != 0;
+            for func in 0..if multi { 8 } else { 1 } {
+                let slot = dev << 3 | func;
+                let id = cfg_r32b(bus, slot, 0);
+                let (vendor, device) = (id as u16, (id >> 16) as u16);
+                if vendor != vendor_want || device != device_want {
+                    continue;
+                }
+                // Память + bus-master: без первого не отвечают регистры, без второго карта не
+                // сможет ходить в память сама (кольца дескрипторов — следующая веха).
+                let cmd = cfg_r32b(bus, slot, 0x04);
+                outl(CFG_ADDR, cfg_addr_bdf(bus, slot, 0x04));
+                outl(CFG_DATA, cmd | 0x6);
+
+                let lo = cfg_r32b(bus, slot, 0x10);
+                if lo & 1 != 0 {
+                    return None; // BAR0 в пространстве ввода-вывода — регистров там нет
+                }
+                let mut base = (lo & !0xf) as usize;
+                if lo & 0x4 != 0 {
+                    base |= (cfg_r32b(bus, slot, 0x14) as usize) << 32;
+                }
+                if base == 0 {
+                    return None; // прошивка окна не назначила — отображать нечего
+                }
+                unsafe { paging::map_mmio(base, len) };
+                return Some(base);
+            }
+        }
+    }
+    None
+}
+
 /// Найти virtio-blk на шине 0 и подготовить его: BAR-окна отображены, MSI-X взведён.
 pub fn probe_virtio_blk() -> Option<BlkDevice> {
     for dev in 0..32u32 {

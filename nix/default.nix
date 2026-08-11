@@ -439,6 +439,29 @@ let
         '';
       };
 
+      # lx_atl1c_drv (Веха 132) — ПЕРВЫЙ КОНТАКТ с настоящей Atheros AR8151 через портированный
+      # код: BAR0 по MMIO-cap (start_cap 0), затем ВЕНДОРНЫЕ функции atl1c_hw.c читают EEPROM,
+      # MAC, PHY и состояние линка. DMA/IRQ ещё не нужны — кольца дескрипторов следующей вехой.
+      #
+      # Проверяется ТОЛЬКО на живом X54C: AR8151 в QEMU не эмулируется. Поэтому харнесс — один
+      # прогон, отвечающий на максимум вопросов сразу: переспросить стоит перезагрузки ноутбука.
+      lx_atl1c_drv = stdenv.mkDerivation {
+        pname = "lx-atl1c-hw";
+        version = "0.132";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -Ilinux-src/atl1c -I${void-libc}/lib -DCONFIG_64BIT -DLX_HAVE_SYSCALL \
+            -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
+            drv_atl1c.c linux-src/atl1c/atl1c_hw.c lx_kit.c lx_net.c -o lx-atl1c-hw
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-atl1c-hw $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

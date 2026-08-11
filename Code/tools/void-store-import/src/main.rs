@@ -15,6 +15,14 @@
 //! корень и без индекса). Корни `bin/*` — программы, в каталог файлов не заносятся.
 //!
 //! ВАЖНО: не запускать, пока образ занят QEMU, — у store нет журнала совместного доступа.
+//!
+//! **Раздел ищется сам (Веха 132).** До неё мост писал store всегда с НУЛЕВОГО сектора — это
+//! верно для «сырого» образа store (каким его подключают вторым диском), но ЗАГРУЗОЧНЫЙ образ
+//! (`boot/mkdisk.sh`) устроен иначе: там store лежит вторым разделом, а в начале — загрузочная
+//! запись и раздел с ядром. Мост их молча затирал и рапортовал успех; образ после этого не
+//! грузился вовсе, а на настоящем носителе это было бы уничтожением данных без вопроса.
+//! Теперь: есть MBR с разделом типа 0x9f (store VOID) — работаем внутри него; нет — как раньше,
+//! с нуля.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,12 +40,18 @@ const DIR_NAME_MAX: usize = 32;
 
 struct FileIo {
     file: std::fs::File,
+    /// Сектор, с которого начинается store. 0 — «сырой» образ; иначе начало раздела 0x9f.
+    base: u64,
+    /// Длина store в секторах (от `base`).
     sectors: u64,
 }
 
+/// Тип раздела store VOID в таблице MBR (его же ставит `boot/mkdisk.sh`).
+const PART_TYPE_VOID: u8 = 0x9f;
+
 impl FileIo {
     fn open(path: &str) -> Result<Self, String> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -46,19 +60,68 @@ impl FileIo {
         if len == 0 || len % SECTOR as u64 != 0 {
             return Err(format!("{path}: длина {len} не кратна сектору {SECTOR}"));
         }
-        Ok(FileIo { file, sectors: len / SECTOR as u64 })
+        let total = len / SECTOR as u64;
+
+        // Заголовок: ищем таблицу MBR и в ней раздел store.
+        let mut mbr = [0u8; SECTOR];
+        file.seek(SeekFrom::Start(0)).map_err(|e| format!("{path}: {e}"))?;
+        file.read_exact(&mut mbr).map_err(|e| format!("{path}: {e}"))?;
+        let (base, sectors) = match find_void_partition(&mbr) {
+            Some((start, count)) => {
+                if start + count > total {
+                    return Err(format!(
+                        "{path}: раздел store (сектора {start}..{}) выходит за край образа",
+                        start + count
+                    ));
+                }
+                eprintln!("  (раздел store VOID: сектор {start}, {count} секторов)");
+                (start, count)
+            }
+            None => {
+                // Подпись MBR есть, а нашего раздела нет — это чужой размеченный носитель.
+                // Писать в него с нуля значит стереть чужую таблицу разделов молча.
+                if mbr[510] == 0x55 && mbr[511] == 0xaa {
+                    return Err(format!(
+                        "{path}: размечен, но раздела store VOID (тип {PART_TYPE_VOID:#x}) в нём нет — \
+                         отказываюсь писать с нулевого сектора"
+                    ));
+                }
+                (0, total)
+            }
+        };
+        Ok(FileIo { file, base, sectors })
     }
+}
+
+/// Найти в таблице MBR раздел store VOID: возвращает (первый сектор, число секторов).
+/// Четыре записи по 16 байт с 0x1BE; тип — байт 4, LBA-начало и длина — по 4 байта с 8 и 12.
+fn find_void_partition(mbr: &[u8; SECTOR]) -> Option<(u64, u64)> {
+    if mbr[510] != 0x55 || mbr[511] != 0xaa {
+        return None; // подписи нет — образ не размечен
+    }
+    for i in 0..4 {
+        let e = 0x1be + i * 16;
+        if mbr[e + 4] != PART_TYPE_VOID {
+            continue;
+        }
+        let start = u32::from_le_bytes([mbr[e + 8], mbr[e + 9], mbr[e + 10], mbr[e + 11]]) as u64;
+        let count = u32::from_le_bytes([mbr[e + 12], mbr[e + 13], mbr[e + 14], mbr[e + 15]]) as u64;
+        if start != 0 && count != 0 {
+            return Some((start, count));
+        }
+    }
+    None
 }
 
 impl BlockIo for FileIo {
     fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR]) -> bool {
         sector < self.sectors
-            && self.file.seek(SeekFrom::Start(sector * SECTOR as u64)).is_ok()
+            && self.file.seek(SeekFrom::Start((self.base + sector) * SECTOR as u64)).is_ok()
             && self.file.read_exact(buf).is_ok()
     }
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool {
-        sector < self.sectors // за край образа не пишем — честный «диск кончился»
-            && self.file.seek(SeekFrom::Start(sector * SECTOR as u64)).is_ok()
+        sector < self.sectors // за край РАЗДЕЛА не пишем — честный «диск кончился»
+            && self.file.seek(SeekFrom::Start((self.base + sector) * SECTOR as u64)).is_ok()
             && self.file.write_all(buf).is_ok()
     }
     /// Веха 89 — ёмкость образа: store теперь считает место ДО записи и не начинает коммит,

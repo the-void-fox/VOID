@@ -153,6 +153,10 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         // Веха 51 — окно MMIO устройства: найти его на PCI, отдать (физ. база + длина).
         let region = match dev {
             "e1000" => crate::arch::probe_e1000().map(|base| (base, 0x20000usize)),
+            // Веха 132 — Atheros AR8151 (X54C). Ищется НА ЛЮБОЙ ШИНЕ: карта сидит за мостом
+            // PCIe, и обход одной шины её не находил. Окно регистров у этих карт — 256 КиБ.
+            #[cfg(target_arch = "x86_64")]
+            "atl1c" => crate::arch::probe_bar0(0x1969, 0x1083, 0x40000).map(|b| (b, 0x40000usize)),
             // Веха 97 — ЭКРАН как обычное устройство под capability: терминал получает окно
             // фреймбуфера и рисует сам. Ядро при этом умолкает (см. fb::give_to_user).
             "fb" => crate::arch::video_window(),
@@ -406,6 +410,31 @@ pub fn boot() {
                 }
                 _ => println!("  [init] {}: не удалось выдать MMIO/DMA cap (пропуск)", driver),
             }
+        }
+    }
+
+    // Веха 132 — Atheros AR8151 (проводная карта X54C) как userspace-драйвер поверх
+    // ПОРТИРОВАННОГО кода Linux. Пока это харнесс первого контакта: MMIO-права хватает, чтобы
+    // прочитать EEPROM, MAC и PHY вендорными функциями. DMA и прерывание появятся вместе с
+    // кольцами дескрипторов.
+    //
+    // Тихо пропускается, если карты нет: в QEMU её не эмулируют вовсе, и это нормальный случай,
+    // а не ошибка. На X54C, наоборот, отсутствие строки ниже само по себе диагноз.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(base) = arch::probe_bar0(0x1969, 0x1083, 0x40000) {
+        println!("  [init] найдена Atheros AR8151 (1969:1083), регистры {:#x}", base);
+        match spawn("lx-atl1c-hw") {
+            Some(pid) => match mint_cap(pid, "mmio:atl1c", &[]) {
+                Some(m) => {
+                    proc::set_arg(pid, m);
+                    proc::push_start_cap(pid, m);
+                    println!("  [init] драйвер lx-atl1c-hw P{} — выдано MMIO-право", pid);
+                }
+                None => println!("  [init] lx-atl1c-hw: MMIO-право выдать не удалось"),
+            },
+            // Драйвер живёт на диске и приезжает мостом (nix-build + void-store-import), как и
+            // портированный e1000. Нет его — карта просто остаётся без драйвера.
+            None => println!("  [init] AR8151 есть, а драйвера lx-atl1c-hw в store нет"),
         }
     }
 
