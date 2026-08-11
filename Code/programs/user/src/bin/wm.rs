@@ -347,6 +347,12 @@ fn main_loop() -> ! {
         cam_dur: 0,
         super_held: false,
         ov: Vec::new(),
+        ov_t: 0,
+        ov_from: 0,
+        ov_to: 0,
+        ov_at: 0,
+        ov_dur: 0,
+        ov_band_y: 0,
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -642,6 +648,17 @@ struct Wm {
     /// и попаданием мыши пользуется ОДИН этот список: два расчёта «где что» означали бы, что
     /// клик приходит не в то окно, которое человек видит.
     ov: Vec<OvItem>,
+    /// Переход «лента ↔ обзор» (Веха 126.6): 0 — лента, 1024 — обзор. Одного числа хватает на
+    /// всё: обзор — это ОДНА картинка, и наезд камеры на свой стол выражается одним
+    /// преобразованием ([`Wm::ov_xform`]), а не анимацией каждого окна по отдельности.
+    ov_t: i32,
+    ov_from: i32,
+    ov_to: i32,
+    ov_at: u64,
+    ov_dur: u64,
+    /// Начало полосы СВОЕГО стола в координатах обзора — точка, в которую наезжает камера.
+    /// Считается там же, где сам обзор: иначе разошлось бы с ним при первой же правке.
+    ov_band_y: i32,
 }
 
 /// Окно в обзоре: куда его уменьшили и с какого стола оно родом.
@@ -984,7 +1001,64 @@ impl Wm {
             }
             self.build_overview(false);
         }
+
+        // Переход «лента ↔ обзор» (Веха 126.6). Двигается ВСЁ на экране, поэтому кадр
+        // помечаем целиком — как и при движении ленты: попытка обойтись кусочками оставляла
+        // бы следы, а половина экрана всё равно меняется.
+        if self.ov_dur != 0 {
+            let t = ((now.saturating_sub(self.ov_at)) * 1024 / self.ov_dur).min(1024) as i32;
+            self.ov_t = lerp(self.ov_from, self.ov_to, ease_out(t));
+            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+            if t >= 1024 {
+                self.ov_t = self.ov_to;
+                self.ov_dur = 0;
+                if self.ov_to == 0 {
+                    // Выход доигран: дальше рисует лента, список обзора больше не нужен.
+                    self.overview = false;
+                    self.ov.clear();
+                }
+            } else {
+                moving = true;
+            }
+        }
         moving
+    }
+
+    /// Начать переход обзора. `to`: 1024 — в обзор, 0 — обратно в ленту.
+    /// Считаем ОТ ТЕКУЩЕГО положения, а не от края: нажатый посреди перехода `Super+Tab`
+    /// разворачивает движение с того места, где оно есть, а не дёргает картинку к началу.
+    fn ov_start(&mut self, to: i32) {
+        self.ov_from = self.ov_t;
+        self.ov_to = to;
+        self.ov_at = sys::monotonic_ns();
+        self.ov_dur = OV_MS * 1_000_000;
+    }
+
+    /// Уйти из обзора: лента встаёт в КОНЕЧНОЕ положение сразу, а видимый переход к ней
+    /// доигрывает преобразование обзора.
+    ///
+    /// Порядок именно такой, и он не произволен: преобразование целится в конечные
+    /// прямоугольники ленты, и если бы те в этот момент ещё ехали своей анимацией, окна
+    /// приехали бы мимо — а в конце перехода их дёрнуло бы на место.
+    fn leave_overview(&mut self) {
+        self.relayout();
+        self.settle();
+        // Пересчитать элементы под новую ленту (в обзоре могли выбрать другой стол), но КАМЕРУ
+        // не трогать: она осталась там, где человек смотрел, — значит прыжка не будет.
+        self.build_overview(false);
+        self.ov_start(0);
+    }
+
+    /// Досрочно доиграть движение ленты и окон — поставить всё туда, где оно окажется.
+    fn settle(&mut self) {
+        self.scroll_x = self.scroll_to;
+        self.scroll_dur = 0;
+        for w in self.wins.iter_mut() {
+            if w.dur != 0 {
+                w.shown = w.to;
+                w.dur = 0;
+            }
+        }
     }
 
     /// Начать закрытие окна: пиксели держим, пока доигрывает сжатие (Веха 125).
@@ -1077,18 +1151,48 @@ impl Wm {
             }
             // Рисуем ПО АНИМИРОВАННОМУ прямоугольнику, а не по тому, что назначила раскладка
             // (Веха 125). Отсюда следствие: содержимое приходится масштабировать — во время
-            // переезда и сжатия окно на экране не совпадает со своим буфером. Приём тот же, что
-            // в обзоре: выборка ближайшего пикселя, движение всё равно скрывает разницу.
+            // переезда и сжатия окно на экране не совпадает со своим буфером.
             let (sxr, fy, fw, fh) = win.shown.rect();
-            let fx = sxr - self.scroll_x;
+            let active = self.focus == Some(win.id);
+            let rect = (sxr - self.scroll_x, fy, fw, fh);
+            self.draw_win_row(out, yy, x0, x1, rect, win, active, win.shown.a);
+        }
+
+        self.draw_cursor_row(out, yy, x0, x1);
+    }
+
+    /// Одна строка ОДНОГО окна по экранному прямоугольнику — общая для ленты и обзора.
+    ///
+    /// Вынесено из [`Self::compose_row`] Вехой 126.6. До неё обзор рисовал окна своим кодом:
+    /// квадратная рамка в один пиксель, без скруглений и сглаживания. Это были ДВА РАЗНЫХ ВИДА
+    /// одного окна, и переход между ними анимировать нечем — как ни двигай прямоугольник, в
+    /// момент переключения картинка менялась скачком. С общим кодом остаётся ровно одна
+    /// разница — прямоугольник, — а прямоугольник анимируется.
+    ///
+    /// Масштаб берётся из соотношения прямоугольника и буфера окна: выборка ближайшего пикселя.
+    /// Усреднение было бы красивее, но стоит нескольких чтений на каждый выводимый пиксель, а
+    /// обзор перерисовывается на каждое движение курсора; текст в уменьшенном окне всё равно
+    /// нечитаем — важно узнать окно по форме и цвету.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_win_row(
+        &self,
+        out: &mut [u32],
+        yy: i32,
+        x0: i32,
+        x1: i32,
+        (fx, fy, fw, fh): (i32, i32, i32, i32),
+        win: &Win,
+        active: bool,
+        alpha: u32,
+    ) {
+        {
             if yy < fy || yy >= fy + fh || fw <= 2 * BORDER || fh <= 2 * BORDER {
-                continue;
+                return;
             }
             let (sx, ex) = (fx.max(x0), (fx + fw).min(x1));
             if ex <= sx {
-                continue;
+                return;
             }
-            let active = self.focus == Some(win.id);
             let border = self.unpack(self.pack(if active { C_ACCENT } else { C_BORDER }));
             let (cw, ch) = (fw - 2 * BORDER, fh - 2 * BORDER);
             let src_row = (yy - fy - BORDER) * win.bh / ch.max(1);
@@ -1100,7 +1204,7 @@ impl Wm {
             let top = yy - fy;
             let corner_row = top < RADIUS || fy + fh - 1 - yy < RADIUS;
             let edge_row = top < BORDER || fy + fh - 1 - yy < BORDER;
-            let opaque = win.shown.a >= 256;
+            let opaque = alpha >= 256;
             for xx in sx..ex {
                 let dh = xx - fx;
                 let near_x = dh < RADIUS || fx + fw - 1 - xx < RADIUS;
@@ -1115,7 +1219,7 @@ impl Wm {
                 } else {
                     (256, 256) // содержимое
                 };
-                let cover = cover * win.shown.a / 256;
+                let cover = cover * alpha / 256;
                 if cover == 0 {
                     continue;
                 }
@@ -1140,45 +1244,44 @@ impl Wm {
                 out[i] = if inner == 0 { px } else { self.blend(px, content, inner * cover / 256) };
             }
         }
-
-        self.draw_cursor_row(out, yy, x0, x1);
     }
 
-    /// Уменьшенные столы: полосами сверху вниз, окна внутри — выборкой ближайшего пикселя.
-    ///
-    /// Выборка «ближайший», а не усреднение: усреднение красивее, но стоит чтения нескольких
-    /// пикселей на каждый выводимый, а обзор перерисовывается на каждое движение курсора.
-    /// Текст в уменьшенном окне всё равно нечитаем — важно узнать окно по форме и цвету.
+    /// Обзор: те же окна тем же кодом ([`Self::draw_win_row`]), но через преобразование обзора.
     fn compose_row_overview(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
+        let (a, bx, by) = self.ov_xform();
         for it in &self.ov {
-            if yy < it.y || yy >= it.y + it.h {
-                continue;
-            }
             let Some(k) = self.win_at(it.id) else { continue };
             let win = &self.wins[k];
+            let rect = (
+                it.x * a / 1024 + bx,
+                it.y * a / 1024 + by,
+                (it.w * a / 1024).max(2 * BORDER + 2),
+                (it.h * a / 1024).max(2 * BORDER + 2),
+            );
             let active = self.focus == Some(it.id) && it.space == self.space;
-            let border = self.pack(if active { C_ACCENT } else { C_BORDER });
-            let title_bg = self.pack(if active { C_FRAME_ACTIVE } else { C_FRAME });
-            // Строка ИСХОДНОГО окна, попавшая в эту строку экрана.
-            let sy = (yy - it.y) * (win.bh + 2 * BORDER) / it.h - BORDER;
-            let edge_row = yy == it.y || yy == it.y + it.h - 1;
-            for xx in it.x.max(x0)..(it.x + it.w).min(x1) {
-                let px = if edge_row || xx == it.x || xx == it.x + it.w - 1 {
-                    border
-                } else if sy < 0 || sy >= win.bh || win.pixels.is_empty() {
-                    title_bg
-                } else {
-                    let sx = (xx - it.x) * (win.bw + 2 * BORDER) / it.w - BORDER;
-                    let p = ((sy * win.bw + sx) * 4) as usize;
-                    if sx >= 0 && sx < win.bw && p + 2 < win.pixels.len() {
-                        self.pack((win.pixels[p], win.pixels[p + 1], win.pixels[p + 2]))
-                    } else {
-                        title_bg
-                    }
-                };
-                out[(xx - x0) as usize] = px;
-            }
+            self.draw_win_row(out, yy, x0, x1, rect, win, active, 256);
         }
+    }
+
+    /// Преобразование обзора для текущего кадра: `экран = обзор × A / 1024 + B` (Веха 126.6).
+    ///
+    /// При `ov_t = 1024` (обзор целиком) это тождество — обзор рисуется ровно так, как посчитан.
+    /// При `ov_t = 0` оно возвращает окна активного стола ТОЧНО туда, где они лежат в ленте:
+    /// поэтому крайний кадр перехода совпадает с кадром ленты пиксель в пиксель, и переключения
+    /// режима на экране не видно вовсе — видно только движение.
+    ///
+    /// Полосы прочих столов при этом уезжают за край сами собой, без единой строки кода на это:
+    /// соседняя полоса отстоит на `band_h + OV_GAP`, а увеличение вдвое уносит её за высоту
+    /// экрана. Ровно это и значит «камера наезжает на свой стол».
+    fn ov_xform(&self) -> (i32, i32, i32) {
+        let p = self.ov_t; // 0 — лента, 1024 — обзор
+        let a = lerp(1024 * OV_DEN / OV_NUM, 1024, p);
+        // Куда должно смещаться, чтобы при `p = 0` совпасть с лентой (вывод — в заметке
+        // [[overview]]): по горизонтали камера обзора минус прокрутка ленты, по вертикали —
+        // начало полосы СВОЕГО стола.
+        let b0x = self.ov_cam.0 * OV_DEN / OV_NUM - self.scroll_x;
+        let b0y = -self.ov_band_y * OV_DEN / OV_NUM;
+        (a, lerp(b0x, 0, p), lerp(b0y, 0, p))
     }
 
     /// Курсор поверх всего: он не принадлежит ни одному окну.
@@ -1359,6 +1462,11 @@ impl Wm {
 
         for (bi, &sp) in shown.iter().enumerate() {
             let by = GAP + bi as i32 * (band_h + OV_GAP) - cam_y;
+            // Своя полоса запоминается ДО отсечения: она может быть за кадром (камера уехала на
+            // другой стол), а переходу её начало нужно в любом случае — это точка наезда.
+            if sp == self.space {
+                self.ov_band_y = by;
+            }
             if by + band_h < 0 || by > sh {
                 continue; // полоса целиком за кадром — считать её нечего
             }
@@ -1534,7 +1642,10 @@ impl Wm {
         // В обзоре клик выбирает окно и ВЫХОДИТ к нему — ради этого обзор и открывают.
         // Попадание считается по тому же списку, по которому обзор нарисован: отдельный расчёт
         // «где что» означал бы, что клик приходит не в то окно, которое человек видит.
-        if was == 0 && e.buttons != 0 && self.overview {
+        // Пока ВЫХОД из обзора доигрывает, ввод обзору уже не принадлежит: на экране идёт
+        // наезд камеры, а список попаданий посчитан для неподвижной картинки — клик пришёл бы
+        // не в то окно, которое человек видит. `ov_to != 0` и значит «мы всё ещё в обзоре».
+        if was == 0 && e.buttons != 0 && self.overview && self.ov_to != 0 {
             if let Some(it) = self.ov.iter().find(|it| {
                 self.cursor.0 >= it.x
                     && self.cursor.0 < it.x + it.w
@@ -1549,10 +1660,8 @@ impl Wm {
                     self.cur = ci;
                     self.cols[ci].focus = wi;
                 }
-                self.overview = false;
-                self.ov.clear();
                 self.sync_focus();
-                self.relayout();
+                self.leave_overview();
             }
             return;
         }
@@ -1580,7 +1689,7 @@ impl Wm {
         // центр (просьба владельца, как в niri). Считаем по тому же списку, по которому обзор
         // нарисован, и перестраиваем его только при СМЕНЕ окна: иначе камера дёргалась бы на
         // каждое движение мыши.
-        if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && self.overview {
+        if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && self.overview && self.ov_to != 0 {
             let hit = self.ov.iter().find(|it| {
                 self.cursor.0 >= it.x
                     && self.cursor.0 < it.x + it.w
@@ -1709,7 +1818,7 @@ impl Wm {
         self.action_inner(name, store, me);
         // Обзор перестраиваем ПОСЛЕ действия: фокус мог переехать на другой стол, а картинка
         // обязана показывать то, что есть сейчас.
-        if self.overview && was_overview && name != "toggle-overview" {
+        if self.overview && was_overview && self.ov_to != 0 && name != "toggle-overview" {
             self.build_overview(true);
         }
     }
@@ -1839,14 +1948,14 @@ impl Wm {
             "focus-prev" => self.action("focus-column-left", store, me),
             // ── обзор (Веха 123) ──
             "toggle-overview" => {
-                self.overview = !self.overview;
-                if self.overview {
+                if !self.overview {
+                    self.overview = true;
                     self.build_overview(true);
-                } else {
+                    self.ov_start(1024);
+                } else if self.ov_to != 0 {
                     // Выходя, показываем стол ТОГО окна, что выбрано: обзор для того и нужен —
                     // ткнуть в окно и оказаться при нём, а не вернуться откуда пришёл.
-                    self.ov.clear();
-                    self.relayout();
+                    self.leave_overview();
                 }
             }
             // ── рабочие столы (Веха 122) ──
@@ -1879,10 +1988,8 @@ impl Wm {
             // Escape/Enter закрывают обзор — и НИЧЕГО не делают вне его: перехватывать эти
             // клавиши у программ было бы воровством (в редакторе Escape нужен ему, не нам).
             "close-overview" => {
-                if self.overview {
-                    self.overview = false;
-                    self.ov.clear();
-                    self.relayout();
+                if self.overview && self.ov_to != 0 {
+                    self.leave_overview();
                 }
             }
             "quit" => {
