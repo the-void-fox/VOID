@@ -114,6 +114,97 @@ char *kstrndup(const char *s, size_t max, gfp_t flags)
 	return p;
 }
 
+/* Расширения формата ЯДРА Linux: `%pM` — MAC-адрес, `%pI4` — адрес IPv4 (include/linux/printk.h
+ * и lib/vsprintf.c). Ни одно из них не знает printf стандартной библиотеки, и это не мелочь:
+ * первый же настоящий драйвер напечатал «mac address : 0x6000833cM» — указатель и букву. Лог,
+ * который выглядит осмысленным, но врёт, хуже отсутствующего.
+ *
+ * Переписываем формат ДО передачи в vprintf: `%pM` → готовая строка «xx:xx:…», `%pI4` →
+ * «a.b.c.d». Прочие `%p<буква>` пропускаем как обычный указатель — соврать про них нечем, а
+ * молчать нельзя: печатаем сам указатель и оставляем букву, как было (это видно и не обманывает).
+ *
+ * Разбор ручной: подставлять аргументы из va_list по одному иначе нельзя — vprintf съедает
+ * список целиком. Длина ограничена: строка журнала это строка журнала.
+ */
+static void lx_fmt_expand(const char *fmt, va_list ap)
+{
+	char out[512];
+	size_t o = 0;
+	const char *f = fmt;
+
+	while (*f && o + 32 < sizeof(out)) {
+		if (f[0] != '%') {
+			out[o++] = *f++;
+			continue;
+		}
+		if (f[1] == '%') {          /* «%%» — сам процент, аргумента нет */
+			out[o++] = '%';
+			out[o++] = '%';
+			f += 2;
+			continue;
+		}
+		if (f[1] == 'p' && f[2] == 'M') {
+			const unsigned char *m = va_arg(ap, const unsigned char *);
+			o += (size_t)snprintf(out + o, sizeof(out) - o,
+					      "%02x:%02x:%02x:%02x:%02x:%02x",
+					      m[0], m[1], m[2], m[3], m[4], m[5]);
+			f += 3;
+			continue;
+		}
+		if (f[1] == 'p' && f[2] == 'I' && f[3] == '4') {
+			const unsigned char *a = va_arg(ap, const unsigned char *);
+			o += (size_t)snprintf(out + o, sizeof(out) - o, "%u.%u.%u.%u",
+					      a[0], a[1], a[2], a[3]);
+			f += 4;
+			continue;
+		}
+		/* Обычная спецификация: копируем её как есть и отдаём один аргумент vsnprintf'у.
+		 * Проще, чем разбирать типы: копия спецификации + один va_arg нужного размера. */
+		{
+			char spec[24];
+			size_t k = 0;
+			spec[k++] = *f++;                       /* '%' */
+			while (*f && k + 1 < sizeof(spec) && !strchr("diouxXeEfgGcspn", *f)) {
+				spec[k++] = *f++;               /* флаги, ширина, точность, длина */
+			}
+			if (*f) {
+				char conv = *f;
+				char len2 = (k >= 2) ? spec[k - 1] : 0;
+				spec[k++] = *f++;
+				spec[k] = '\0';
+				switch (conv) {
+				case 'd': case 'i':
+					o += (size_t)(len2 == 'l'
+						? snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, long))
+						: snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, int)));
+					break;
+				case 'u': case 'o': case 'x': case 'X':
+					o += (size_t)(len2 == 'l'
+						? snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, unsigned long))
+						: snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, unsigned)));
+					break;
+				case 'c':
+					o += (size_t)snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, int));
+					break;
+				case 's':
+					o += (size_t)snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, const char *));
+					break;
+				case 'p':
+					o += (size_t)snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, void *));
+					break;
+				case 'e': case 'E': case 'f': case 'g': case 'G':
+					o += (size_t)snprintf(out + o, sizeof(out) - o, spec, va_arg(ap, double));
+					break;
+				default:
+					break; /* %n и прочее — не печатаем ничего */
+				}
+			}
+		}
+	}
+	out[o < sizeof(out) ? o : sizeof(out) - 1] = '\0';
+	fputs(out, stdout);
+}
+
 int printk(const char *fmt, ...)
 {
 	static int unbuffered;
@@ -131,8 +222,9 @@ int printk(const char *fmt, ...)
 	}
 
 	va_start(ap, fmt);
-	n = vprintf(fmt, ap); /* уровни KERN_* у нас пустые — печатаем строку как есть */
+	lx_fmt_expand(fmt, ap); /* уровни KERN_* у нас пустые; %pM/%pI4 — расширения ядра */
 	va_end(ap);
+	n = 0;
 	return n;
 }
 

@@ -229,8 +229,24 @@ struct net_device *alloc_etherdev(int sizeof_priv)
 
 void free_netdev(struct net_device *dev)
 { if (dev) { kfree(dev->lx_txq); kfree(dev->lx_priv); kfree(dev); } }
+/* Веха 133.2 — ИМЯ интерфейса. Драйвер кладёт в `name` шаблон «eth%d», а номер подставляет
+ * ядро при регистрации; у нас этого не делал никто, и в лог уходило буквальное «ethN».
+ * Интерфейс у нас пока один, поэтому номер всегда 0 — но подставлять его обязан тот, кто
+ * регистрирует, иначе имя в логе и имя в системе разойдутся при первом же втором устройстве. */
 int register_netdev(struct net_device *dev)
-{ printk("lx_net: register_netdev('%s')\n", dev->name[0] ? dev->name : "ethN"); return 0; }
+{
+	static int next_index;
+	char *pc = strchr(dev->name, '%');
+
+	if (pc && pc[1] == 'd') {
+		int n = snprintf(pc, sizeof(dev->name) - (size_t)(pc - dev->name), "%d", next_index++);
+		(void)n;
+	} else if (!dev->name[0]) {
+		snprintf(dev->name, sizeof(dev->name), "eth%d", next_index++);
+	}
+	printk("lx_net: register_netdev('%s')\n", dev->name);
+	return 0;
+}
 void unregister_netdev(struct net_device *dev) { (void)dev; }
 
 __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)

@@ -40,10 +40,36 @@ static struct pci_dev g_pdev = {
 /* Подъём драйвера: module_init → pci_register_driver → match по id_table → atl1c_probe. */
 static void atl1c_bringup(void *arg)
 {
+	int err;
+
 	(void)arg;
 	printk("[atl1c] зову module_init → pci_register_driver → probe\n");
 	lx_module_init();
-	printk("[atl1c] probe отработал; дальше живём событиями\n");
+	printk("[atl1c] probe отработал\n");
+
+	/* ПОДНЯТЬ ИНТЕРФЕЙС. probe только опознаёт карту и заводит netdev; кольца дескрипторов,
+	 * буферы приёма и запуск движков делает `ndo_open` — в Linux его зовёт `ip link set up`.
+	 * У нас поднимать некому: сетевой службы, знающей про это устройство, ещё нет. Зовём сами —
+	 * и это ровно тот шаг, ради которого строилась честная DMA-часть (Веха 133). */
+	{
+		struct net_device *ndev = pci_get_drvdata(&g_pdev);
+
+		if (!ndev) {
+			printk("[atl1c] probe не оставил netdev — поднимать нечего\n");
+			return;
+		}
+		printk("[atl1c] поднимаю интерфейс '%s' (ndo_open)\n", ndev->name);
+		if (!ndev->netdev_ops || !ndev->netdev_ops->ndo_open) {
+			printk("[atl1c] у драйвера нет ndo_open — это не сетевое устройство?\n");
+			return;
+		}
+		err = ndev->netdev_ops->ndo_open(ndev);
+		printk("[atl1c] ndo_open вернул %d (%s)\n", err, err ? "ОШИБКА" : "интерфейс поднят");
+		if (err)
+			return;
+		printk("[atl1c] MAC %pM, несущая %s\n", ndev->dev_addr,
+		       netif_carrier_ok(ndev) ? "ЕСТЬ" : "нет");
+	}
 }
 
 int main(void)
@@ -67,6 +93,8 @@ int main(void)
 	}
 	lx_net_set_dma_cap(dma_cap);
 	lx_net_set_irq_cap(irq_cap);
+	/* Прерывание нужно НЕ для порядка: приём кадров у atl1c идёт через NAPI, а будит его
+	 * обработчик прерывания. Без IRQ-права драйвер поднимется и будет молчать. */
 
 	/* BAR0 драйвер возьмёт через pci_ioremap_bar → ioremap, а тот у нас отдаёт уже
 	 * отображённое окно. Длину объявляем настоящую — по ней драйвер считает границы. */

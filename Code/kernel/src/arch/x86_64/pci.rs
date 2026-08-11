@@ -286,6 +286,38 @@ pub fn probe_bar0(vendor_want: u16, device_want: u16, len: usize) -> Option<usiz
     None
 }
 
+/// Веха 133.2 — включить INTx устройства `vendor:device` (на любой шине) и замаршрутизировать
+/// линии PCI на вектор userspace-драйверов. Возвращает вектор.
+///
+/// Тот же приём, что у e1000 (`e1000_irq_setup`), но с обходом по всем шинам. Маршрутизируем
+/// ВСЕ четыре линии PCI (GSI 16..23) на один вектор: точное соответствие «слот → PIRQ» знает
+/// только таблица ACPI `_PRT`, которую мы не разбираем. Приём грубый и осознанно такой —
+/// userspace-драйвер в системе один, и лишнее пробуждение стоит ему одного холостого чтения
+/// регистра причины. Появится второй драйвер — придётся разбирать `_PRT` по-настоящему.
+pub fn intx_irq_setup(vendor_want: u16, device_want: u16) -> Option<u8> {
+    for bus in 0..=255u32 {
+        for dev in 0..32u32 {
+            let multi = cfg_r8b(bus, dev << 3, 0x0e) & 0x80 != 0;
+            for func in 0..if multi { 8 } else { 1 } {
+                let slot = dev << 3 | func;
+                let id = cfg_r32b(bus, slot, 0);
+                if id as u16 != vendor_want || (id >> 16) as u16 != device_want {
+                    continue;
+                }
+                // Снять Interrupt Disable (бит 10 команды) — иначе карта дёргать линию не станет.
+                let cmd = cfg_r32b(bus, slot, 0x04);
+                outl(CFG_ADDR, cfg_addr_bdf(bus, slot, 0x04));
+                outl(CFG_DATA, cmd & !(1 << 10));
+                for gsi in 16..24 {
+                    super::ioapic::route_level_low(gsi, trap::VEC_USERDRV);
+                }
+                return Some(trap::VEC_USERDRV);
+            }
+        }
+    }
+    None
+}
+
 /// Найти virtio-blk на шине 0 и подготовить его: BAR-окна отображены, MSI-X взведён.
 pub fn probe_virtio_blk() -> Option<BlkDevice> {
     for dev in 0..32u32 {

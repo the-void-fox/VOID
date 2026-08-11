@@ -441,7 +441,19 @@ pub fn boot() {
                         proc::set_arg2(pid, d);
                         proc::push_start_cap(pid, m);
                         proc::push_start_cap(pid, d);
-                        println!("  [init] драйвер {} P{} — выданы MMIO+DMA права", name, pid);
+                        // IRQ-право третьим (start_cap 2), как у e1000: без него драйвер не
+                        // узнает о приходе кадра и остался бы с опросом.
+                        let irq = arch::intx_irq_setup(0x1969, 0x1083).map(|vec| {
+                            cap::mint(proc::domain(pid), cap::Target::Irq { vector: vec },
+                                      Rights::READ).bits() as usize
+                        });
+                        if let Some(i) = irq {
+                            proc::push_start_cap(pid, i);
+                        }
+                        println!(
+                            "  [init] драйвер {} P{} — выданы MMIO+DMA{} права",
+                            name, pid, if irq.is_some() { "+IRQ" } else { "" },
+                        );
                     }
                     _ => println!("  [init] {}: MMIO/DMA права выдать не удалось", name),
                 }

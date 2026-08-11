@@ -39,6 +39,8 @@ pub use pci::{
 pub use pci::dump as pci_dump;
 /// Веха 132 — найти устройство на ЛЮБОЙ шине и отдать его BAR0 (карта ноутбука за мостом PCIe).
 pub use pci::probe_bar0;
+/// Веха 133.2 — включить INTx устройства и замаршрутизировать линии PCI на вектор драйверов.
+pub use pci::intx_irq_setup;
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
