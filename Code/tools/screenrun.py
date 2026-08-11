@@ -41,10 +41,15 @@ if os.path.exists(qmp_path):
 # см. notes/void-qemu-run.md.
 accel = os.environ.get("VOID_QEMU_ACCEL", "")
 mem = os.environ.get("VOID_QEMU_MEM", "512M")
+# Модель процессора. По умолчанию QEMU даёт `qemu64` — там нет ни SMEP, ни половины того, что
+# есть на любом живом железе. Всё, что зависит от возможностей процессора, обязано проверяться с
+# `VOID_QEMU_CPU=host` (под KVM) или `max`, иначе код просто не исполнится и «проверка» соврёт.
+cpu = os.environ.get("VOID_QEMU_CPU", "")
 
 qemu = [
     "qemu-system-x86_64", "-machine", "q35", "-m", mem,
     *(["-accel", accel] if accel else []),
+    *(["-cpu", cpu] if cpu else []),
     "-device", "ich9-ahci,id=a",
     "-drive", f"if=none,id=d,file={img},format=raw",
     "-device", "ide-hd,drive=d,bus=a.0", "-boot", "c",
