@@ -27,7 +27,6 @@
 #define SYS_IRQ_WAIT 33
 #define SYS_SLEEP 47
 #define SYS_RANDOM 37
-#define SYS_KLOG 50
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
 #define VOID_NO_CAP ((uintptr_t)-1)
@@ -182,16 +181,9 @@ static inline int vsys_irq_wait(uintptr_t cap) {
 static inline void vsys_random(void *buf, size_t len) {
     vsys(SYS_RANDOM, (uintptr_t)buf, len, 0, 0, 0, 0, 0);
 }
-/* SYS_KLOG(buf, len): забрать журнал ЯДРА (Веха 116). Возврат — сколько байт положено; если
- * буфер меньше журнала, приезжают ПОСЛЕДНИЕ байты. Нужен драйверу, который вещает журнал по
- * проводу (Веха 134): у машины без COM-порта это единственный способ увидеть сказанное ядром. */
 /* SYS_SLEEP(ns): поспать и НЕ занимать процессор. Веха 134 — понадобился холостому ходу
- * планировщика Lx_kit: он ждал срок таймера глухим циклом, и долгоживущий драйвер (вещатель
- * журнала) съедал бы свою долю процессора вечно. */
+ * планировщика Lx_kit: он ждал срок таймера глухим циклом, и долгоживущий драйвер съедал бы
+ * свою долю процессора вечно. */
 static inline void vsys_sleep_ns(unsigned long long ns) {
     vsys(SYS_SLEEP, (uintptr_t)ns, 0, 0, 0, 0, 0, 0);
-}
-static inline size_t vsys_klog(void *buf, size_t len) {
-    uintptr_t n = vsys(SYS_KLOG, (uintptr_t)buf, len, 0, 0, 0, 0, 0);
-    return n == VOID_NO_CAP ? 0 : (size_t)n;
 }
