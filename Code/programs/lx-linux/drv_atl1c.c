@@ -29,6 +29,7 @@
 #include "atl1c.h"
 #include "lx_sched.h"
 
+#include <linux/delay.h> /* msleep — уступает процессор в задаче Lx_kit */
 #include <linux/mii.h>
 
 /* Куда ляжет окно регистров карты. Тот же адрес, что у e1000-харнесса: пространство своё у
@@ -93,6 +94,7 @@ static void atl1c_task(void *arg)
 {
 	u32 reg;
 	u16 phy_id1 = 0, phy_id2 = 0, bmsr = 0, speed = 0, duplex = 0;
+	unsigned waited;
 	int err;
 
 	(void)arg;
@@ -158,21 +160,46 @@ static void atl1c_task(void *arg)
 	}
 	printk("[atl1c] PHY id = %04x:%04x\n", phy_id1, phy_id2);
 
-	if (atl1c_read_phy_reg(&g_hw, MII_BMSR, &bmsr)) {
-		printk("[atl1c] BMSR не прочитан\n");
+	/* BMSR сразу после сброса — только чтобы показать, что регистр читается осмысленно. Линка
+	 * тут быть НЕ МОЖЕТ: согласование ещё не начиналось (его запустит шаг 7). */
+	if (atl1c_read_phy_reg(&g_hw, MII_BMSR, &bmsr) || mdio_silent(bmsr)) {
+		printk("[atl1c] BMSR не прочитан — PHY молчит\n");
 		return;
 	}
-	/* BMSR читают ДВАЖДЫ: бит несущей залипающий, первое чтение отдаёт «было с прошлого раза». */
-	atl1c_read_phy_reg(&g_hw, MII_BMSR, &bmsr);
-	if (mdio_silent(bmsr)) {
-		printk("[atl1c] BMSR = ffff — PHY молчит, о линке сказать нечего\n");
-		return;
-	}
-	printk("[atl1c] BMSR = %04x — линк %s, автосогласование %s\n", bmsr,
-	       (bmsr & BMSR_LSTATUS) ? "ЕСТЬ" : "нет",
-	       (bmsr & BMSR_ANEGCOMPLETE) ? "завершено" : "не завершено");
+	printk("[atl1c] BMSR сразу после сброса = %04x (согласование ещё не начиналось)\n", bmsr);
 
-	/* 7. Что PHY говорит о скорости. Осмысленно только при поднятой несущей. */
+	/* 7. ЗАПУСТИТЬ автосогласование. Прошлый прогон читал BMSR через микросекунды после сброса
+	 *    PHY и сообщал «линк нет» при воткнутом кабеле — и был формально прав: согласование к
+	 *    тому мигу не начиналось. Начинает его `atl1c_phy_init` (вендорная): она объявляет, что
+	 *    мы умеем, и взводит ANRESTART. Что объявлять — берётся из `autoneg_advertised`, и это
+	 *    ровно то, что ставит драйвер в своём `atl1c_sw_init`. */
+	g_hw.media_type = MEDIA_TYPE_AUTO_SENSOR;
+	g_hw.autoneg_advertised = ADVERTISED_Autoneg;
+	err = atl1c_phy_init(&g_hw);
+	printk("[atl1c] автосогласование запущено (atl1c_phy_init): %s\n", err ? "ОШИБКА" : "ok");
+	if (err) {
+		return;
+	}
+
+	/* 8. ДОЖДАТЬСЯ его. На витой паре согласование занимает секунды — столько же, сколько
+	 *    моргает лампочка на коммутаторе. Ждём до пяти, опрашивая раз в 100 мс; `msleep` здесь
+	 *    уступает процессор, а не крутит его вхолостую (задача Lx_kit). */
+	for (waited = 0; waited < 5000; waited += 100) {
+		atl1c_read_phy_reg(&g_hw, MII_BMSR, &bmsr); /* залипающий бит — читаем дважды */
+		if (atl1c_read_phy_reg(&g_hw, MII_BMSR, &bmsr))
+			break;
+		if (mdio_silent(bmsr))
+			break;
+		if (bmsr & BMSR_ANEGCOMPLETE)
+			break;
+		msleep(100);
+	}
+	printk("[atl1c] BMSR = %04x через %u мс — линк %s, автосогласование %s\n",
+	       bmsr, waited,
+	       (bmsr & BMSR_LSTATUS) ? "ЕСТЬ" : "нет",
+	       (bmsr & BMSR_ANEGCOMPLETE) ? "завершено" : "НЕ завершено");
+
+	/* 9. Что PHY говорит о скорости. Осмысленно только при поднятой несущей. */
 	if (bmsr & BMSR_LSTATUS) {
 		if (atl1c_get_speed_and_duplex(&g_hw, &speed, &duplex) == 0)
 			printk("[atl1c] линк: %u Мбит/с, %s дуплекс\n",
@@ -180,7 +207,7 @@ static void atl1c_task(void *arg)
 		else
 			printk("[atl1c] скорость/дуплекс не определились\n");
 	} else {
-		printk("[atl1c] кабель не воткнут — скорость не спрашиваем\n");
+		printk("[atl1c] несущей нет — кабель не воткнут либо согласование не сошлось\n");
 	}
 
 	printk("[atl1c] первый контакт завершён\n");
