@@ -360,6 +360,57 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
     }
 }
 
+/// Веха 127 — событие ОКНА → внутреннее событие клавиши, минуя разбор escape-кодов.
+///
+/// Композитор отдаёт клавишу целиком (код, модификаторы, символ), поэтому собирать её обратно из
+/// байтов незачем: [`decode`] нужен там, где источник байтовый — консоль ядра и serial. Так и
+/// устроен любой эмулятор терминала: наружу от него идут байты, внутрь приходят события.
+///
+/// `sym` и `ch` различаются, и это существенно: схема привязана к КЛАВИШЕ (`bind pane h go-left`),
+/// а в программу уходит СИМВОЛ. У `Ctrl+A` это `sym = 'a'`, `ch = 0x01` — привязка сработает по
+/// букве, а управляющий байт соберёт [`encode`].
+fn win_key(sym: u16, mods: u8, ch: u16) -> KeyEvent {
+    let mut m = ModMask::empty();
+    if mods & 1 != 0 {
+        m |= ModMask::SHIFT;
+    }
+    if mods & 2 != 0 {
+        m |= ModMask::CTRL;
+    }
+    if mods & 4 != 0 {
+        m |= ModMask::ALT;
+    }
+    let keysym = match sym {
+        0x101 => Keysym::RETURN,
+        0x102 => Keysym::ESCAPE,
+        0x103 => Keysym::TAB,
+        0x104 => Keysym::BACKSPACE,
+        0x105 => Keysym::DELETE,
+        0x106 => Keysym::INSERT,
+        0x110 => Keysym::LEFT,
+        0x111 => Keysym::RIGHT,
+        0x112 => Keysym::UP,
+        0x113 => Keysym::DOWN,
+        0x114 => Keysym::HOME,
+        0x115 => Keysym::END,
+        0x116 => Keysym::PAGE_UP,
+        0x117 => Keysym::PAGE_DOWN,
+        c => Keysym(c as u32),
+    };
+    let mut k = KeyEvent::new(keysym, m);
+    // Текст — только у печатающих клавиш и только без Ctrl. Управляющие символы сюда не кладём
+    // по той же причине, что и [`decode`]: Enter это Enter, а не Ctrl-M, и байт для программы
+    // соберёт `encode` — иначе `Ctrl+A` уехал бы в неё буквой `a`.
+    if ch != 0 && !m.contains(ModMask::CTRL) {
+        if let Some(c) = char::from_u32(ch as u32) {
+            if !c.is_control() {
+                k.text.push(c);
+            }
+        }
+    }
+    k
+}
+
 /// Обратный перевод: событие → байты для программы в панели. Нужен потому, что перехваченными
 /// оказываются НЕ все клавиши, а непойманные обязаны дойти до ребёнка в том же виде, в каком их
 /// ждёт любая программа.
@@ -935,7 +986,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut my = info.height / 2;
     let mut mbtn = 0u8;
     let mut mouse_evs = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 }; 32];
-    let mut keys_from_win: Vec<u8> = Vec::new();
+    // Веха 127: от композитора приходят СОБЫТИЯ, а не байты.
+    let mut keys_from_win: Vec<KeyEvent> = Vec::new();
     // Курсор виден СРАЗУ, а не после первого движения: это рабочий стол, а не телефон —
     // «где мой курсор» не должно быть первым вопросом к системе.
     let mut cursor_drawn = true;
@@ -951,7 +1003,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             while let Some(ev) = win.poll_event() {
                 worked = true;
                 match ev {
-                    sys::win::Event::Key(k) => keys_from_win.push(k),
+                    // Отпускания сегодня не приходят вовсе, но проверка тут не лишняя:
+                    // включат — и терминал не начнёт печатать каждую букву дважды.
+                    sys::win::Event::Key { sym, mods, ch, down } => {
+                        if down {
+                            keys_from_win.push(win_key(sym, mods, ch));
+                        }
+                    }
                     sys::win::Event::Close => {
                         sys::write_console("[term] окно закрыто — выходим\n".as_bytes());
                         win.destroy();
@@ -1013,21 +1071,22 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         }
 
         // ── 1. клавиатура (никогда не блокируемся) ─────────────────────────────────────────
-        // В окне байты приходят событиями от композитора, на голом экране — из консоли ядра.
-        let n = if out.windowed() {
-            let n = keys_from_win.len().min(keys.len());
-            keys[..n].copy_from_slice(&keys_from_win[..n]);
-            keys_from_win.clear();
-            n
+        // В окне клавиши приходят СОБЫТИЯМИ от композитора (Веха 127), на голом экране — байтами
+        // из консоли ядра, и там их ещё надо сложить автоматом разбора.
+        let events: Vec<KeyEvent> = if out.windowed() {
+            core::mem::take(&mut keys_from_win)
         } else {
-            sys::read_console_nonblock(&mut keys)
+            let n = sys::read_console_nonblock(&mut keys);
+            // «Байты пришли» и «клавиша сложилась» — РАЗНОЕ: начало escape-последовательности
+            // событий ещё не даёт, но спать после него нельзя, иначе её хвост подождёт до срока.
+            if n > 0 {
+                worked = true;
+            }
+            (0..n).filter_map(|i| decode(&mut scan, keys[i])).collect()
         };
-        if n > 0 {
+        if !events.is_empty() {
             worked = true;
-            for i in 0..n {
-                let Some(key) = decode(&mut scan, keys[i]) else {
-                    continue;
-                };
+            for key in events {
                 // В окне схема панелей НЕ применяется: `C-a` там ничего не переключает, а уходит
                 // в программу как обычный байт. Иначе префикс мультиплексора молча съедал бы
                 // аккорд, который человек адресовал шеллу или редактору.

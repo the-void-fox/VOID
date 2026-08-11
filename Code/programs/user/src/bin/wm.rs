@@ -56,8 +56,6 @@ const BUILD: &str = env!("VOID_BUILD");
 
 // ── вид (ADR 0016: один палитра-источник, приложения цветов не знают) ────────
 const C_DESKTOP: (u8, u8, u8) = (0x0d, 0x11, 0x17);
-const C_FRAME: (u8, u8, u8) = (0x16, 0x1b, 0x22);
-const C_FRAME_ACTIVE: (u8, u8, u8) = (0x24, 0x2c, 0x38);
 const C_BORDER: (u8, u8, u8) = (0x30, 0x36, 0x3d);
 const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
 
@@ -333,8 +331,7 @@ fn main_loop() -> ! {
         focus: None,
         transient: 0,
         damage: Vec::new(),
-        scratch: Vec::new(),
-        shadow: vec![0u32; info.width * info.height],
+            shadow: vec![0u32; info.width * info.height],
         present_all: false,
         readbuf: Vec::new(),
         spaces: (0..SPACES).map(|_| Space::default()).collect(),
@@ -615,7 +612,6 @@ struct Wm {
     /// перетаскивание превращалось в тридцать перерисовок на один оборот цикла.
     damage: Vec<(i32, i32, i32, i32)>,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
-    scratch: Vec<u32>,
     /// ТЕНЕВОЙ КАДР (Веха 126): весь экран в обычной памяти. Кадр собирается здесь, а на экран
     /// уходит блитом. Затевалось ради разрывов, а понадобилось ради СТОИМОСТИ: прокрутка ленты
     /// перерисовывала миллион пикселей на кадр, а с теневым кадром она — сдвиг памяти плюс
@@ -1801,12 +1797,27 @@ impl Wm {
         }
         // Аккорд с Super, которому не нашлось действия, программе не отдаём: иначе промах по
         // раскладке печатал бы букву посреди текста.
-        if e.mods & 8 != 0 || e.ascii == 0 {
+        if e.mods & 8 != 0 {
             return;
         }
+        // Веха 127: клавиша уходит в окно ЦЕЛИКОМ — код, модификаторы, символ. Прежде здесь
+        // стояло `|| e.ascii == 0`, то есть всё, что не печатает букву, молча выбрасывалось:
+        // стрелки, Home/End, PageUp. Именно поэтому в окне не работали ни они, ни собственные
+        // клавиши терминала.
         let Some(id) = self.focus else { return };
         let Some(i) = self.wins.iter().position(|w| w.id == id) else { return };
-        self.send(i, [win::EV_KEY, e.ascii, 0, 0, 0, 0, 0, 0], 2);
+        let ch = e.ascii as u16;
+        let ev = [
+            win::EV_KEY,
+            e.sym as u8,
+            (e.sym >> 8) as u8,
+            e.mods,
+            ch as u8,
+            (ch >> 8) as u8,
+            e.down as u8,
+            0,
+        ];
+        self.send(i, ev, 7);
     }
 
     /// Выполнить действие раскладки.

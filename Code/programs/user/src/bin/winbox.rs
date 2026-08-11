@@ -54,10 +54,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 draw(&mut pixels, w, h, shade);
                 window.present(store, &pixels);
             }
-            Some(Event::Key(k)) => {
+            // Веха 127: клавиша приезжает целиком. Смотрим на КЛАВИШУ (`sym`), а не на
+            // напечатанный символ, — так `q` останется выходом и в другой раскладке.
+            Some(Event::Key { sym, mods, .. }) => {
                 // Ctrl-C или 'q' — уйти. Прощаемся с композитором, а не просто умираем:
                 // окно должно исчезнуть в тот же миг, а не когда нас заметят мёртвыми.
-                if k == 3 || k == b'q' {
+                if (sym == b'c' as u16 && mods & 2 != 0) || sym == b'q' as u16 {
                     window.destroy();
                     sys::exit(0);
                 }
