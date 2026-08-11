@@ -138,6 +138,46 @@ pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
         report_bytes(label, n, size, now() - t0);
     }
 
+    // 4b. Веха 129 — РАЗДЕЛЯЕМАЯ ПАМЯТЬ: то, чем заменяется путь выше. Сначала опыт, потом
+    //     число: отображаем ОДНУ область по ДВУМ адресам и убеждаемся, что это те же страницы.
+    //     Одним процессом межпроцессность не проверить, но механизм — вполне: если бы область
+    //     копировалась, а не разделялась, второй адрес показал бы старое.
+    const SHM_LEN: usize = 512 * 1024;
+    // Свободное окно МЕЖДУ кучей (0x6000_0000) и стеком (вершина 0x8000_0000): образ программы
+    // лежит с 0x4000_0000, и первая попытка положить область туда убила процесс его же кодом.
+    let va1 = 0x7000_0000usize;
+    let va2 = 0x7080_0000usize;
+    match void_user::shm_new(SHM_LEN, va1) {
+        None => void_user::write("    разделяемая память: СОЗДАТЬ НЕ ВЫШЛО\n".as_bytes()),
+        Some(cap) => {
+            let got = void_user::shm_map(cap, va2);
+            if got != Some(SHM_LEN) {
+                void_user::write("    разделяемая память: ОТОБРАЗИТЬ ВТОРЫМ АДРЕСОМ НЕ ВЫШЛО\n".as_bytes());
+            } else {
+                let a = unsafe { core::slice::from_raw_parts_mut(va1 as *mut u8, SHM_LEN) };
+                let b = unsafe { core::slice::from_raw_parts(va2 as *const u8, SHM_LEN) };
+                a[0] = 0xA5;
+                a[SHM_LEN - 1] = 0x5A;
+                let same = b[0] == 0xA5 && b[SHM_LEN - 1] == 0x5A;
+                void_user::write(if same {
+                    "    разделяемая память: два адреса — одни страницы · ok\n".as_bytes()
+                } else {
+                    "    разделяемая память: АДРЕСА РАЗОШЛИСЬ — это не общая память\n".as_bytes()
+                });
+                // Столько же байт, сколько «кусок 512 КиБ» выше, но без объекта: только запись.
+                let n = 10;
+                let t0 = now();
+                for i in 0..n as u64 {
+                    a[0..8].copy_from_slice(&i.to_le_bytes());
+                    for p in (0..SHM_LEN).step_by(4096) {
+                        a[p] = i as u8; // тронуть каждую страницу — честная работа с памятью
+                    }
+                }
+                report_bytes("запись в общую область 512 КиБ", n, SHM_LEN, now() - t0);
+            }
+        }
+    }
+
     // 5. obj_get последнего значения по content-id.
     let n = 100;
     let mut out = [0u8; 64];

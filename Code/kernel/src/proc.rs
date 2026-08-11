@@ -183,6 +183,10 @@ enum State {
 struct Proc {
     /// Токен адресного пространства ([`arch::space_token`]; на RISC-V — значение satp).
     space: usize,
+    /// Веха 129 — какие области разделяемой памяти процесс держит отображёнными ([[shm]]).
+    /// Нужен ровно затем, чтобы отпустить их при смерти: страницы там общие, и освободить их
+    /// может только последний держатель, а `free_private` их намеренно не трогает.
+    shm: Vec<usize>,
     frame: TrapFrame,
     state: State,
     /// Домен защиты процесса — его личный c-space ([[capabilities]]). Начальные права
@@ -404,6 +408,7 @@ fn create_process_locked(
         },
         env: Vec::new(),
         start_caps: Vec::new(),
+        shm: Vec::new(),
         group: idx, // новый процесс — лидер собственной группы нитей
         retval: 0,
         futex_addr: 0,
@@ -451,6 +456,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         args: Vec::new(),
         env: Vec::new(),
         start_caps: Vec::new(),
+        shm: Vec::new(),
         group, // та же группа, что у лидера (group лидера == его индекс)
         retval: 0,
         futex_addr: 0,
@@ -1049,6 +1055,11 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
                 // reply), и только потом отдать слот под переиспользование: иначе устаревший
                 // cap начал бы адресовать чужой, новый процесс.
                 cap::revoke_process(i);
+                // Веха 129 — отпустить области разделяемой памяти. Страницы в них общие:
+                // освободит их та, у которой уйдёт последний держатель, а не этот процесс.
+                for id in core::mem::take(&mut t.procs[i].shm) {
+                    crate::shm::release(id);
+                }
                 // Веха 97 — умер владелец ЭКРАНА: вернуть экран ядру. Без этого терминал,
                 // упавший или вышедший, оставлял бы систему немой — ядро продолжало бы считать
                 // экран занятым и печатать в один serial.
@@ -1121,6 +1132,62 @@ fn resume() -> ! {
             loop {} // не достигается
         }
     }
+}
+
+/// Веха 129 — создать область разделяемой памяти и отобразить её себе. Возвращает биты права
+/// на область или `usize::MAX`.
+fn shm_map_new(t: &mut Table, cur: usize, len: usize, va: usize) -> usize {
+    let Some(id) = crate::shm::create(len) else { return usize::MAX };
+    if shm_attach(t, cur, id, va, true) == usize::MAX {
+        crate::shm::release(id); // отобразить не вышло — область никому не нужна
+        return usize::MAX;
+    }
+    let dom = t.procs[cur].domain;
+    cap::mint(dom, cap::Target::Shm(id), Rights::READ.union(Rights::WRITE)).bits() as usize
+}
+
+/// Отобразить УЖЕ существующую область (право проверено вызывающим).
+fn shm_map_existing(t: &mut Table, cur: usize, id: usize, va: usize, writable: bool) -> usize {
+    if !crate::shm::retain(id) {
+        return usize::MAX;
+    }
+    if shm_attach(t, cur, id, va, writable) == usize::MAX {
+        crate::shm::release(id);
+        return usize::MAX;
+    }
+    crate::shm::len(id)
+}
+
+/// Общая часть: разложить страницы области по адресам процесса начиная с `va`.
+///
+/// Диапазон проверяется теми же границами, что и у кучи с DMA: чужое отображение обязано лечь в
+/// пользовательскую область, а не поверх ядра или стека.
+fn shm_attach(t: &mut Table, cur: usize, id: usize, va: usize, writable: bool) -> usize {
+    let frames = crate::shm::frames(id);
+    if frames.is_empty() || va % PAGE != 0 {
+        return usize::MAX;
+    }
+    let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
+    if va < USER_REGION_START || va + frames.len() * PAGE > limit {
+        return usize::MAX;
+    }
+    let root = arch::space_root(t.procs[cur].space);
+    // MAP_SHARED — пометка в записи: смерть процесса не должна освобождать общие страницы
+    // (`free_private` такие листья пропускает).
+    let mut flags = arch::MAP_R | arch::MAP_U | arch::MAP_SHARED;
+    if writable {
+        flags |= arch::MAP_W;
+    }
+    for (i, &pa) in frames.iter().enumerate() {
+        let ok = unsafe { arch::map(root, va + i * PAGE, pa, flags) };
+        if !ok {
+            arch::flush_tlb();
+            return usize::MAX; // Веха 89: нет памяти под таблицу — честный отказ
+        }
+    }
+    arch::flush_tlb();
+    t.procs[cur].shm.push(id);
+    0
 }
 
 /// Диспетчер syscall'ов. Номер в `a7`, аргументы в `a0..`, результат в `a0`. Работает прямо
@@ -2692,6 +2759,52 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             let f = &mut t.procs[cur].frame;
             f.set_ret(if ok { 0 } else { usize::MAX });
+            f.advance();
+        }
+        // SYS_SHM_NEW(len, va) -> биты права | MAX (Веха 129): создать ОБЩУЮ ОБЛАСТЬ на `len`
+        // байт, отобразить её себе по `va` (U|R|W) и вернуть право на неё.
+        //
+        // Адрес выбирает ВЫЗЫВАЮЩИЙ — как у `SYS_DMA_ALLOC`. Ядро проверяет только границы
+        // пользовательской области; попасть в собственный образ или кучу — забота процесса, и
+        // на это уже наступили при первом же опыте (область легла на 0x4000_0000, где лежит код
+        // самой программы, и процесс убил себя). Библиотека держит для этого своё окно.
+        //
+        // Право потом передаётся по IPC тому, с кем делятся буфером ([[shm]]). Никакого
+        // «глобального имени области» нет и не будет: единственный способ её получить — принять
+        // право, а подделать его нельзя. Так «этот процесс видит буфер того окна» становится
+        // проверяемым фактом.
+        54 => {
+            let (len, va) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let result = shm_map_new(t, cur, len, va);
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_SHM_MAP(shm_cap, va) -> длина | MAX (Веха 129): отобразить у себя ТЕ ЖЕ страницы.
+        // Права cap решают режим: без WRITE область ложится только на чтение — композитору
+        // хватает чтения, и давать ему больше незачем.
+        55 => {
+            let (scap, va) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            let c = Cap::from_bits(scap as u64);
+            let result = match cap::shm(dom, c, Rights::READ) {
+                Ok(id) => {
+                    let writable = cap::rights(dom, c).map(|r| r.contains(Rights::WRITE)).unwrap_or(false);
+                    shm_map_existing(t, cur, id, va, writable)
+                }
+                Err(e) => {
+                    vprintln!("  [shm] P{} SYS_SHM_MAP отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
             f.advance();
         }
         // SYS_CONSIZE() -> (колонок, строк) (Веха 120): размер КОНСОЛИ ЯДРА в знакоместах.

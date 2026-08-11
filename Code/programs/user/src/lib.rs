@@ -100,6 +100,9 @@ const SYS_IRQ_WAIT: usize = 33;
 const SYS_OBJ_LIST_ROOTS: usize = 34;
 const SYS_LOG: usize = 35;
 const SYS_TIME: usize = 36;
+/// Веха 129 — разделяемая память: создать область и отобразить существующую.
+const SYS_SHM_NEW: usize = 54;
+const SYS_SHM_MAP: usize = 55;
 const SYS_RANDOM: usize = 37;
 const SYS_OBJ_PUT_NODE: usize = 38;
 const SYS_OBJ_CHILDREN: usize = 39;
@@ -545,6 +548,24 @@ pub fn obj_gc(store_cap: usize) -> usize {
 /// сессия ТИХАЯ (трейс сбивал вывод команд); включить на лету — `log(true)`.
 pub fn log(on: bool) {
     abi::syscall(SYS_LOG, on as usize, 0, 0, 0, 0, 0, 0);
+}
+
+/// Веха 129 — создать ОБЩУЮ ОБЛАСТЬ памяти на `len` байт и отобразить её по `va` (страничное
+/// выравнивание обязательно). Возвращает **право** на область (`None` — не вышло).
+///
+/// Право передаётся по IPC тому, с кем делятся буфером: без него область не отобразить, а
+/// подделать его нельзя. Так пиксели окна перестают ездить объектами store — по IPC остаётся
+/// только «строки такие-то изменились» ([[shm]]).
+pub fn shm_new(len: usize, va: usize) -> Option<usize> {
+    let r = abi::syscall(SYS_SHM_NEW, len, va, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r)
+}
+
+/// Веха 129 — отобразить по `va` область, право на которую получено. Возвращает её длину.
+/// Без права `WRITE` в самом cap область ляжет только на чтение.
+pub fn shm_map(shm_cap: usize, va: usize) -> Option<usize> {
+    let r = abi::syscall(SYS_SHM_MAP, shm_cap, va, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r)
 }
 
 /// `SYS_TIME(0)` — настенное время, наносекунды Unix (UTC). Веха 86: часы читаются у прошивки

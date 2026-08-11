@@ -750,6 +750,10 @@ pub const MAP_U: usize = 1 << 3;
 /// ждёт ровно ту последовательность, которую ему написали).
 pub const MAP_WC: usize = 1 << 4;
 
+/// Веха 129 — страница из ОБЩЕЙ области: пометить её в записи, чтобы смерть процесса не
+/// освободила чужие фреймы (см. `paging::PTE_SHARED`).
+pub const MAP_SHARED: usize = 1 << 5;
+
 /// Построить таблицы ядра (direct map + W^X + MMIO) и вернуть корень (PML4).
 pub fn mm_init() -> usize {
     // PAT программируется здесь: до первой WC-страницы и до включения трансляции.
@@ -784,6 +788,9 @@ pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) -> bool {
     }
     if flags & MAP_WC != 0 {
         pte |= paging::PTE_PAT; // строка PA4 = WC (см. paging::pat_init)
+    }
+    if flags & MAP_SHARED != 0 {
+        pte |= paging::PTE_SHARED;
     }
     paging::map(root, va, pa, pte)
 }

@@ -77,6 +77,14 @@ pub enum Target {
     /// capability обязана называть вслух. Выдаётся токеном `power` в конфиге — обычно шеллу.
     /// Эфемерно (минтится на каждой загрузке из конфига, как MMIO/DMA).
     Power,
+    /// Веха 129 — **область разделяемой памяти** ([[shm]]): право отобразить у себя ТЕ ЖЕ
+    /// физические страницы. Создатель получает право при `SYS_SHM_NEW` и передаёт его по IPC
+    /// тому, с кем делится буфером; `READ` — отобразить на чтение, `WRITE` — ещё и на запись.
+    ///
+    /// Так «этот процесс имеет доступ к буферу того окна» становится проверяемым фактом, а не
+    /// соглашением: без права область не отобразить, а право не подделать. Эфемерно — область
+    /// живёт в памяти и перезагрузку не переживает.
+    Shm(usize),
     /// Веха 52 — прерывание устройства: право ждать IRQ (`SYS_IRQ_WAIT`). `vector` — на который
     /// ядро замаршрутизировало IRQ устройства (IOAPIC → LAPIC). Так userspace-драйвер спит до
     /// прерывания вместо опроса. Эфемерно (маршрутизация ставится на загрузке).
@@ -233,9 +241,8 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         Target::Root(name) => object::root(name).ok_or(CapError::Dangling)?,
         // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
-        | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power => {
-            return Err(CapError::WrongKind)
-        }
+        | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power
+        | Target::Shm(_) => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -256,7 +263,7 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
             Target::Root(name) => name,
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
             | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-            | Target::Power => return Err(CapError::WrongKind),
+            | Target::Power | Target::Shm(_) => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -351,6 +358,19 @@ pub fn dma(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
 
 /// Веха 52 — разрешить cap на **прерывание устройства** и вернуть вектор (требует `READ`).
 /// Так `SYS_IRQ_WAIT` даёт userspace-драйверу спать до IRQ только при наличии права.
+/// Веха 129 — проверить право на ОБЛАСТЬ разделяемой памяти и вернуть её индекс.
+pub fn shm(dom: DomainId, cap: Cap, need: Rights) -> Result<usize, CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Shm(id) => Ok(id),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
 pub fn irq(dom: DomainId, cap: Cap, need: Rights) -> Result<u8, CapError> {
     let cs = CSPACE.lock();
     let e = resolve(&cs, dom, cap)?;
@@ -467,10 +487,11 @@ pub fn persist() {
                         Target::Root(_) => 4,
                         Target::Device(Device::Net) => 5,
                         // Эфемерные (не переживают ребут): reply, эндпоинты, MMIO/DMA-права
-                        // драйверов (минтятся заново после PCI-поиска).
+                        // драйверов (минтятся заново после PCI-поиска), области разделяемой
+                        // памяти (живут в RAM и умирают вместе с ней).
                         Target::Endpoint(_) | Target::Reply(_)
                         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-                        | Target::Power => 0,
+                        | Target::Power | Target::Shm(_) => 0,
                     },
                     None => 0,
                 };

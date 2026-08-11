@@ -80,6 +80,7 @@ mod object;
 mod proc;
 mod jitter;
 mod random;
+mod shm;
 mod sched;
 mod sync;
 mod timer;

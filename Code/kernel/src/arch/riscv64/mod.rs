@@ -352,6 +352,9 @@ pub const MAP_U: usize = paging::PTE_U;
 /// общий код просит WC одинаково на обеих архитектурах, а получает его там, где он есть.
 pub const MAP_WC: usize = 0;
 
+/// Веха 129 — страница из ОБЩЕЙ области (см. `paging::PTE_SHARED`).
+pub const MAP_SHARED: usize = paging::PTE_SHARED;
+
 /// Построить таблицы ядра (direct map RAM + MMIO, W^X) и вернуть корень.
 pub fn mm_init() -> usize {
     paging::init()
