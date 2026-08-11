@@ -35,6 +35,8 @@ pub use pci::{
     e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_virtio_rng,
     probe_xhci,
 };
+/// Веха 130 — опись шины PCI в журнал ядра: что вообще стоит в этой машине.
+pub use pci::dump as pci_dump;
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
