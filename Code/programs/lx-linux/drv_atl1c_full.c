@@ -37,14 +37,25 @@ static struct pci_dev g_pdev = {
 	.lx_name          = "0000:04:00.0",
 };
 
+/* Подъём драйвера: module_init → pci_register_driver → match по id_table → atl1c_probe. */
+static void atl1c_bringup(void *arg)
+{
+	(void)arg;
+	printk("[atl1c] зову module_init → pci_register_driver → probe\n");
+	lx_module_init();
+	printk("[atl1c] probe отработал; дальше живём событиями\n");
+}
+
 int main(void)
 {
 	uintptr_t mmio_cap = vsys_start_cap(0);
 	uintptr_t dma_cap  = vsys_start_cap(1);
 	uintptr_t irq_cap  = vsys_start_cap(2);
 
+	/* Небуферизованный вывод С ПЕРВОЙ СТРОКИ: если probe где-то застрянет, увидеть надо всё
+	 * сказанное ДО этого места, а не ничего (Веха 133.1). */
+	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("[atl1c] полный драйвер: запускаю настоящий probe (Веха 133)\n");
-	fflush(stdout);
 
 	if (mmio_cap == VOID_NO_CAP) {
 		printf("[atl1c] нет MMIO-права — запускать должен init\n");
@@ -67,10 +78,13 @@ int main(void)
 	printf("[atl1c] DMA-право %s, IRQ-право %s\n",
 	       dma_cap == VOID_NO_CAP ? "НЕТ" : "есть",
 	       irq_cap == VOID_NO_CAP ? "НЕТ" : "есть");
-	fflush(stdout);
 
-	lx_module_init(); /* → pci_register_driver → match → atl1c_probe */
-
+	/* probe идёт ЗАДАЧЕЙ планировщика, а не прямо отсюда (Веха 133.1). Вендорный код зовёт
+	 * msleep, wait_event и completion — им нужен тот, кто уступит процессор. Вне задачи msleep
+	 * сваливается в честную буси-паузу (терпимо), а ожидание события уступать НЕКОМУ, и подъём
+	 * повис бы. Ровно так же устроен харнесс e1000 (Вехи 69–73). */
+	lx_task_create(atl1c_bringup, NULL, "atl1c");
 	lx_sched_run();
+	printf("[atl1c] планировщику больше нечего делать — выходим\n");
 	return 0;
 }
