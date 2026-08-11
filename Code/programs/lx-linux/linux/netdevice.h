@@ -167,6 +167,9 @@ struct net_device {
 	struct device              dev;    /* базовый узел (SET_NETDEV_DEV, &netdev->dev) */
 	void                      *lx_priv; /* приватная область драйвера (netdev_priv) */
 	unsigned long              lx_state;
+/* Биты `lx_state` (Веха 134.3). Пока один: несущая. Ведём её честно — заглушка «несущая есть
+ * всегда» уже соврала один раз в прогоне, где `netif_carrier_on` не звался вовсе. */
+#define LX_STATE_CARRIER 0
 	/* Веха 131 — ОДНА очередь передачи, объектом. Драйверы многоочередных карт (atl1c)
 	 * работают не с устройством, а с `netdev_queue`, и в Linux их столько, сколько запросил
 	 * `alloc_etherdev_mq`. У нас очередь одна: и AR8151, и e1000 просят ровно одну

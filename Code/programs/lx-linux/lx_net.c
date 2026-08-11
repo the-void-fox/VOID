@@ -363,10 +363,22 @@ bool netif_running(const struct net_device *dev) { return dev->flags & IFF_UP; }
 /* Веха 133.3 — след подъёма: несущая переключается в начале `atl1c_up` и по результату
  * согласования, то есть по этим двум строкам видно, дошёл ли драйвер до работы с линком. */
 void netif_carrier_on(struct net_device *dev)
-{ (void)dev; printk("lx_net: netif_carrier_on — несущая есть\n"); }
+{
+	dev->lx_state |= 1UL << LX_STATE_CARRIER;
+	printk("lx_net: netif_carrier_on — несущая есть\n");
+}
 void netif_carrier_off(struct net_device *dev)
-{ (void)dev; printk("lx_net: netif_carrier_off\n"); }
-bool netif_carrier_ok(const struct net_device *dev) { (void)dev; return true; }
+{
+	dev->lx_state &= ~(1UL << LX_STATE_CARRIER);
+	printk("lx_net: netif_carrier_off\n");
+}
+/* Веха 134.3 — состояние несущей ВЕДЁТСЯ, а не выдумывается. Здесь стояло `return true`, и
+ * харнесс бодро печатал «несущая ЕСТЬ» в прогоне, где `netif_carrier_on` не звался ни разу.
+ * Заглушка, отвечающая «да» независимо от происходящего, — это не упрощение, а ложный свидетель. */
+bool netif_carrier_ok(const struct net_device *dev)
+{
+	return (dev->lx_state & (1UL << LX_STATE_CARRIER)) != 0;
+}
 void netif_device_attach(struct net_device *dev) { (void)dev; }
 void netif_device_detach(struct net_device *dev) { (void)dev; }
 

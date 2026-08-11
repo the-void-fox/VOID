@@ -18,7 +18,9 @@
 #include "atl1c.h"
 #include "lx_sched.h"
 
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
+#include <linux/mii.h>
 #include <linux/skbuff.h>
 
 #define ATL1C_BAR0_VA 0x50000000UL
@@ -165,6 +167,35 @@ static void atl1c_bringup(void *arg)
 			printk("[atl1c] probe не оставил netdev — поднимать нечего\n");
 			return;
 		}
+		/* СНАЧАЛА ДОЖДАТЬСЯ ЛИНКА. Драйвер проверяет его РОВНО ОДИН РАЗ — внутри ndo_open
+		 * (`atl1c_check_link_status` в `atl1c_up`). Если в тот миг автосогласование ещё идёт
+		 * (а оно занимает секунды — на этой машине 4.8), драйвер честно решает «линка нет» и
+		 * ВЫКЛЮЧАЕТ MAC. Повторить проверку потом некому: её зовёт обработчик прерывания по
+		 * событию смены линка, а до рабочих прерываний мы ещё не дошли.
+		 *
+		 * Отсюда и загадка «кадры отдаются, карта их не берёт»: кольцо наполнялось, а
+		 * передатчик был выключен (MAC_CTRL без TX_EN). В харнессе первого контакта (Веха 132)
+		 * ожидание было — здесь я его потерял.
+		 *
+		 * Ждём ПУБЛИЧНОЙ функцией драйвера, не подглядывая в его внутренности. */
+		{
+			struct atl1c_adapter *ad = netdev_priv(ndev);
+			unsigned waited;
+			u16 bmsr = 0;
+
+			for (waited = 0; waited < 15000; waited += 100) {
+				atl1c_read_phy_reg(&ad->hw, MII_BMSR, &bmsr); /* бит залипающий */
+				if (atl1c_read_phy_reg(&ad->hw, MII_BMSR, &bmsr))
+					break;
+				if ((bmsr & BMSR_LSTATUS) && (bmsr & BMSR_ANEGCOMPLETE))
+					break;
+				msleep(100);
+			}
+			printk("[atl1c] линк перед подъёмом: BMSR %04x через %u мс — %s\n",
+			       bmsr, waited,
+			       (bmsr & BMSR_LSTATUS) ? "ЕСТЬ" : "НЕТ (интерфейс поднимется без TX)");
+		}
+
 		printk("[atl1c] поднимаю интерфейс '%s' (ndo_open)\n", ndev->name);
 		if (!ndev->netdev_ops || !ndev->netdev_ops->ndo_open) {
 			printk("[atl1c] у драйвера нет ndo_open — это не сетевое устройство?\n");
