@@ -49,8 +49,15 @@ void lx_net_set_irq_cap(uintptr_t cap) { lx_irq_cap = cap; }
  * с самого начала берутся ИЗ ОБЛАСТИ, полученной по DMA-праву. Тогда перевод — арифметика в её
  * пределах, а для памяти не из арены `dma_map_single` честно отказывает.
  *
- * Арена простая: выделение подряд, БЕЗ возврата. Буферы приёма живут столько же, сколько драйвер;
- * кончится — скажем вслух, а не молча отдадим невалидный адрес.
+ * Возврат (Веха 134). Сперва арена была одноразовой: буферы приёма живут столько же, сколько
+ * драйвер, и этого хватало. Но вещатель журнала берёт буфер НА КАЖДЫЙ КАДР — без возврата арена
+ * кончилась бы через несколько сотен кадров, и передача прекратилась бы ТИХО (кадр без адреса
+ * карте не отдать). Поэтому freed-блоки складываются в табличку и переиспользуются.
+ *
+ * Табличка, а не настоящий аллокатор, — сознательно: блоки здесь одного-двух размеров (буфер
+ * приёма и кадр журнала), поэтому первый подходящий находится сразу, а дробить и склеивать
+ * нечего. Не нашлось подходящего — берём из нетронутого хвоста. Кончилось всё — скажем вслух,
+ * а не отдадим невалидный адрес молча.
  */
 /* 2 МиБ. Кольцо приёма atl1c — 512 буферов, и при MTU 1500 это ровно мегабайт: впритык к
  * прежнему размеру арены, то есть лишняя переменная при отладке. Запас вдвое стоит двух мегабайт
@@ -63,11 +70,20 @@ static size_t    lx_arena_size;
 static size_t    lx_arena_used;
 static int       lx_arena_failed;
 
+/* Возвращённые блоки: первый подходящий по размеру берётся заново (см. описание выше). */
+#define LX_ARENA_FREE_MAX 2048
+static struct {
+	void  *p;
+	size_t size;
+} lx_arena_free[LX_ARENA_FREE_MAX];
+static unsigned lx_arena_free_n;
+
 /* Отдать `size` байт из арены (выравнивание на 8). NULL — арены нет или она кончилась. */
 static void *lx_arena_alloc(size_t size)
 {
 #ifdef LX_HAVE_SYSCALL
 	size_t need = (size + 7) & ~(size_t)7;
+	unsigned i;
 
 	if (!lx_arena_va && !lx_arena_failed && lx_dma_cap != VOID_NO_CAP) {
 		uintptr_t va = lx_dma_va_next;
@@ -82,19 +98,41 @@ static void *lx_arena_alloc(size_t size)
 			lx_arena_size = (size_t)LX_DMA_ARENA_PAGES * 4096;
 		}
 	}
+	/* Сперва — из возвращённых: без этого вечный вещатель журнала съел бы арену за минуты. */
+	for (i = 0; i < lx_arena_free_n; i++) {
+		if (lx_arena_free[i].size >= need) {
+			void *p = lx_arena_free[i].p;
+
+			lx_arena_free[i] = lx_arena_free[--lx_arena_free_n];
+			return p;
+		}
+	}
 	if (lx_arena_va && lx_arena_used + need <= lx_arena_size) {
 		void *p = (void *)(lx_arena_va + lx_arena_used);
 		lx_arena_used += need;
 		return p;
 	}
 	if (lx_arena_va) {
-		printk("lx_net: арена DMA кончилась (%u из %u байт)\n",
-		       (unsigned)lx_arena_used, (unsigned)lx_arena_size);
+		printk("lx_net: арена DMA кончилась (%u из %u байт, в возврате %u блоков)\n",
+		       (unsigned)lx_arena_used, (unsigned)lx_arena_size, lx_arena_free_n);
 	}
 #else
 	(void)size; /* сборка-«вычислялка»: DMA не задействован, буферы идут из кучи */
 #endif
 	return NULL;
+}
+
+/* Вернуть блок арене. Не влез в табличку — блок просто теряется, и об этом говорим: молчаливая
+ * утечка кончилась бы «передача сама собой прекратилась через полчаса». */
+static void lx_arena_free_block(void *p, size_t size)
+{
+	if (lx_arena_free_n < LX_ARENA_FREE_MAX) {
+		lx_arena_free[lx_arena_free_n].p = p;
+		lx_arena_free[lx_arena_free_n].size = (size + 7) & ~(size_t)7;
+		lx_arena_free_n++;
+		return;
+	}
+	printk("lx_net: табличка возврата арены полна — блок %u байт потерян\n", (unsigned)size);
 }
 
 /* Лежит ли указатель в арене — то есть можно ли назвать карте его адрес. */
@@ -393,8 +431,10 @@ struct sk_buff *napi_build_skb(void *data, unsigned int frag_size) { (void)data;
 void dev_kfree_skb(struct sk_buff *skb)
 {
 	if (!skb) return;
-	/* Из арены не возвращаем — она нарочно без возврата (см. её описание); из кучи возвращаем. */
-	if (skb->lx_heap) kfree(skb->head);
+	if (skb->lx_heap)
+		kfree(skb->head);          /* сборка без арены — память из кучи */
+	else if (skb->head)
+		lx_arena_free_block(skb->head, skb->truesize); /* Веха 134: арена принимает назад */
 	kfree(skb);
 }
 void dev_kfree_skb_any(struct sk_buff *skb) { dev_kfree_skb(skb); }

@@ -85,10 +85,22 @@ static void netlog_task(void *arg)
 	struct net_device *ndev = arg;
 	static unsigned char log[64 * 1024];
 	size_t sent = 0;
+	unsigned rounds = 0, frames = 0, failed = 0;
 
 	for (;;) {
 		size_t n = vsys_klog(log, sizeof(log));
 		size_t off;
+
+		/* Раз в пять секунд — отчёт О СЕБЕ на экран машины. Пока журнал по проводу не поехал,
+		 * узнать, что с ним, можно только отсюда: сам он себя доставить не может. Счётчик
+		 * отданных карте кадров рядом со счётчиком отказов отвечает на главный вопрос — молчит
+		 * карта или молчит провод. */
+		if (++rounds % 25 == 0) {
+			struct net_device_stats *st = &ndev->stats;
+
+			printk("[netlog] кадров отдано %u, отказов %u; у карты передано %lu, ошибок %lu\n",
+			       frames, failed, st->tx_packets, st->tx_errors);
+		}
 
 		/* Журнал укоротился — значит кольцо провернулось и часть мы потеряли. Начинаем с
 		 * начала снимка: слать по второму разу всё незачем, а притворяться, что потери не
@@ -101,8 +113,11 @@ static void netlog_task(void *arg)
 
 			if (chunk > VOID_LOG_CHUNK)
 				chunk = VOID_LOG_CHUNK;
-			if (netlog_send(ndev, log + off, chunk) != 0)
+			if (netlog_send(ndev, log + off, chunk) != 0) {
+				failed++;
 				break; /* карта не приняла — повторим в следующий заход */
+			}
+			frames++;
 			off += chunk;
 		}
 		sent = off;
@@ -145,13 +160,34 @@ static void atl1c_bringup(void *arg)
 		printk("[atl1c] MAC %pM, несущая %s\n", ndev->dev_addr,
 		       netif_carrier_ok(ndev) ? "ЕСТЬ" : "нет");
 
+		/* РАЗГОВОРЧИВОСТЬ НА ПОЛНУЮ. У драйвера есть путь, где кадр выбрасывается, а ответ
+		 * всё равно «принято»:
+		 *
+		 *     if (atl1c_tx_map(...) < 0) { netif_info(adapter, tx_done, …); … }
+		 *     return NETDEV_TX_OK;
+		 *
+		 * и это сообщение гасится, потому что класс `tx_done` в msg_enable по умолчанию не
+		 * включён. То есть передача может молча не состояться, а мы будем считать её удачной.
+		 * Включаем все классы: на bring-up'е лишняя строка стоит ничего, а пропущенная —
+		 * перезагрузки. */
+		{
+			struct atl1c_adapter *ad = netdev_priv(ndev);
+
+			ad->msg_enable = 0xffff;
+		}
+
 		/* Первый кадр — приметный: по нему на той стороне видно, что провод живой, ещё до
-		 * того, как поедет журнал. */
-		if (netlog_send(ndev, (const unsigned char *)
-				"VOID: провод живой, начинаю вещать журнал\n", 76) == 0)
-			printk("[atl1c] пробный кадр ушёл в провод\n");
-		else
-			printk("[atl1c] пробный кадр карта НЕ приняла\n");
+		 * того, как поедет журнал. Длину берём у самой строки: считать её руками — верный
+		 * способ отправить в провод четыре лишних байта чужой памяти (уже отправлял). */
+		{
+			static const char hello[] = "VOID: провод живой, начинаю вещать журнал\n";
+
+			if (netlog_send(ndev, (const unsigned char *)hello,
+					(unsigned)(sizeof(hello) - 1)) == 0)
+				printk("[atl1c] пробный кадр отдан карте\n");
+			else
+				printk("[atl1c] пробный кадр карта НЕ приняла\n");
+		}
 
 		lx_task_create(netlog_task, ndev, "netlog");
 	}
