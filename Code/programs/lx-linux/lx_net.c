@@ -52,7 +52,10 @@ void lx_net_set_irq_cap(uintptr_t cap) { lx_irq_cap = cap; }
  * Арена простая: выделение подряд, БЕЗ возврата. Буферы приёма живут столько же, сколько драйвер;
  * кончится — скажем вслух, а не молча отдадим невалидный адрес.
  */
-#define LX_DMA_ARENA_PAGES 256 /* 1 МиБ — с запасом на кольцо приёма по 2 КиБ на буфер */
+/* 2 МиБ. Кольцо приёма atl1c — 512 буферов, и при MTU 1500 это ровно мегабайт: впритык к
+ * прежнему размеру арены, то есть лишняя переменная при отладке. Запас вдвое стоит двух мегабайт
+ * физической памяти на машине, где их четыре тысячи. */
+#define LX_DMA_ARENA_PAGES 512
 
 static uintptr_t lx_arena_va;   /* начало арены в нашем пространстве */
 static uintptr_t lx_arena_pa;   /* её же физический адрес — карта ходит сюда */
@@ -309,8 +312,12 @@ void netif_wake_queue(struct net_device *dev) { (void)dev; }
 void netif_tx_disable(struct net_device *dev) { (void)dev; }
 bool netif_queue_stopped(const struct net_device *dev) { (void)dev; return false; }
 bool netif_running(const struct net_device *dev) { return dev->flags & IFF_UP; }
-void netif_carrier_on(struct net_device *dev) { (void)dev; }
-void netif_carrier_off(struct net_device *dev) { (void)dev; }
+/* Веха 133.3 — след подъёма: несущая переключается в начале `atl1c_up` и по результату
+ * согласования, то есть по этим двум строкам видно, дошёл ли драйвер до работы с линком. */
+void netif_carrier_on(struct net_device *dev)
+{ (void)dev; printk("lx_net: netif_carrier_on — несущая есть\n"); }
+void netif_carrier_off(struct net_device *dev)
+{ (void)dev; printk("lx_net: netif_carrier_off\n"); }
 bool netif_carrier_ok(const struct net_device *dev) { (void)dev; return true; }
 void netif_device_attach(struct net_device *dev) { (void)dev; }
 void netif_device_detach(struct net_device *dev) { (void)dev; }
@@ -341,6 +348,13 @@ static struct sk_buff *lx_skb_alloc(unsigned int len)
 	memset(skb, 0, sizeof(*skb));
 	/* Данные — ИЗ АРЕНЫ DMA: в них будет писать сама карта (Веха 133). Арены нет (сборка без
 	 * syscall'ов) — берём кучу: там пакетов не бывает, считается только логика. */
+	/* Каждый 128-й буфер — в лог. Кольцо приёма это 512 буферов; печатать все значит утопить
+	 * журнал, а не печатать ничего — не узнать, дошли ли мы до их раздачи и где встали. */
+	{
+		static unsigned n;
+		if ((n++ & 127) == 0)
+			printk("lx_net: буфер приёма №%u (%u байт)\n", n - 1, room);
+	}
 	skb->head = lx_arena_alloc(room);
 	if (!skb->head) {
 		skb->head = kmalloc(room, 0);
