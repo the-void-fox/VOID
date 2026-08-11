@@ -414,7 +414,7 @@ fn main_loop() -> ! {
         }
 
         // ── клавиши: сперва АККОРДЫ, потом обычный ввод окну в фокусе ──────────────────
-        let mut kev = [sys::KeyEvent { sym: 0, mods: 0, down: false, ascii: 0 }; 32];
+        let mut kev = [sys::KeyEvent { sym: 0, mods: 0, down: false, ch: 0 }; 32];
         let kn = sys::key_read(&mut kev);
         if kn > 0 {
             worked = true;
@@ -1801,12 +1801,12 @@ impl Wm {
             return;
         }
         // Веха 127: клавиша уходит в окно ЦЕЛИКОМ — код, модификаторы, символ. Прежде здесь
-        // стояло `|| e.ascii == 0`, то есть всё, что не печатает букву, молча выбрасывалось:
+        // стояло `|| e.ascii == 0`, то есть всё, что не печатает символ, молча выбрасывалось:
         // стрелки, Home/End, PageUp. Именно поэтому в окне не работали ни они, ни собственные
         // клавиши терминала.
         let Some(id) = self.focus else { return };
         let Some(i) = self.wins.iter().position(|w| w.id == id) else { return };
-        let ch = e.ascii as u16;
+        let ch = e.ch;
         let ev = [
             win::EV_KEY,
             e.sym as u8,

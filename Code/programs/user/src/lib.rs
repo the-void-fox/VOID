@@ -859,8 +859,9 @@ pub struct KeyEvent {
     /// Биты: 1 Shift, 2 Ctrl, 4 Alt, 8 Super.
     pub mods: u8,
     pub down: bool,
-    /// Готовый символ (0 — клавиша непечатная). Раскладку знает ядро, и знает в одном месте.
-    pub ascii: u8,
+    /// Готовый символ КОДОВОЙ ТОЧКОЙ (0 — клавиша непечатная). Раскладку знает ядро, и знает в
+    /// одном месте. Точка, а не байт: с раскладкой RU/EN печатается кириллица (Веха 127.1).
+    pub ch: u16,
 }
 
 impl KeyEvent {
@@ -889,7 +890,7 @@ pub fn key_read(out: &mut [KeyEvent]) -> usize {
             sym: u16::from_le_bytes([b[0], b[1]]),
             mods: b[2],
             down: b[3] != 0,
-            ascii: b[4],
+            ch: u16::from_le_bytes([b[4], b[5]]),
         };
     }
     count

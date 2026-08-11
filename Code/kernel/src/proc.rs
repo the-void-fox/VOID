@@ -2626,7 +2626,8 @@ fn syscall(t: &mut Table, cur: usize) {
                     let Some(e) = arch::key_pop() else { break };
                     let b = [
                         e.sym.to_le_bytes()[0], e.sym.to_le_bytes()[1],
-                        e.mods, e.down as u8, e.ascii, 0,
+                        e.mods, e.down as u8,
+                        e.ch.to_le_bytes()[0], e.ch.to_le_bytes()[1],
                     ];
                     let dst = unsafe { core::slice::from_raw_parts_mut((buf + off) as *mut u8, 6) };
                     dst.copy_from_slice(&b);

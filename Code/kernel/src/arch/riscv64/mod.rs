@@ -98,7 +98,7 @@ pub struct KeyEvent {
     pub sym: u16,
     pub mods: u8,
     pub down: bool,
-    pub ascii: u8,
+    pub ch: u16,
 }
 
 pub fn key_pop() -> Option<KeyEvent> {

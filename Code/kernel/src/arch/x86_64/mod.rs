@@ -491,29 +491,32 @@ pub fn mouse_pending() -> bool {
 // кто разбирает АККОРДЫ — оконному менеджеру. Из байта аккорд не восстановить: `Super+L` и `l`
 // это один и тот же байт, а Super в ASCII не выражается вовсе.
 
-/// Одно событие: код клавиши, маска модификаторов, нажатие/отпускание и готовый ASCII-байт.
+/// Одно событие: код клавиши, маска модификаторов, нажатие/отпускание и готовый символ.
 ///
-/// ASCII кладётся СЮДА ЖЕ намеренно: раскладку знает ядро (таблица скан-кодов), и заставлять
+/// Символ кладётся СЮДА ЖЕ намеренно: раскладку знает ядро (таблица скан-кодов), и заставлять
 /// оконный менеджер собирать букву заново значило бы завести вторую раскладку, которая разойдётся
 /// с первой.
+///
+/// Веха 127.1 — это КОДОВАЯ ТОЧКА, а не байт: с раскладкой RU/EN печатается кириллица, которая в
+/// байт не влезает. `sym` при этом остаётся US-кодом клавиши и от раскладки НЕ зависит.
 #[derive(Clone, Copy)]
 pub struct KeyEvent {
     pub sym: u16,
     pub mods: u8,
     pub down: bool,
-    pub ascii: u8,
+    pub ch: u16,
 }
 
 const KEY_CAP: usize = 128;
 static mut KEY_BUF: [KeyEvent; KEY_CAP] =
-    [KeyEvent { sym: 0, mods: 0, down: false, ascii: 0 }; KEY_CAP];
+    [KeyEvent { sym: 0, mods: 0, down: false, ch: 0 }; KEY_CAP];
 static KEY_HEAD: AtomicUsize = AtomicUsize::new(0);
 static KEY_TAIL: AtomicUsize = AtomicUsize::new(0);
 
-pub(super) fn key_push(sym: u16, mods: u8, down: bool, ascii: u8) {
+pub(super) fn key_push(sym: u16, mods: u8, down: bool, ch: u16) {
     let head = KEY_HEAD.load(Ordering::Relaxed);
     if head.wrapping_sub(KEY_TAIL.load(Ordering::Relaxed)) < KEY_CAP {
-        unsafe { KEY_BUF[head % KEY_CAP] = KeyEvent { sym, mods, down, ascii } };
+        unsafe { KEY_BUF[head % KEY_CAP] = KeyEvent { sym, mods, down, ch } };
         KEY_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
     }
 }
@@ -590,7 +593,7 @@ pub fn console_drain() {
         // важнее. Клавиатура PS/2 кладёт события сама, с настоящей маской.
         let b = inb(COM1);
         rx_push(b);
-        key_push(keysym_of_ascii(b), 0, true, b);
+        key_push(keysym_of_ascii(b), 0, true, b as u16);
         n += 1;
     }
     ps2::drain();
