@@ -310,6 +310,37 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: usize) -> bool {
     true
 }
 
+/// Веха 129 — снять отображение ОДНОЙ общей страницы (двойник x86, см. его же комментарий).
+///
+/// Нарочно узкая: только 4-КиБ лист с [`PTE_SHARED`] и только указывающий на названный фрейм
+/// `pa`. Зовут это по просьбе процесса, адрес выбирает он — без проверок «снять отображение»
+/// стало бы способом продырявить собственный образ.
+///
+/// # Safety
+/// `root_pa` — валидная корневая таблица; TLB сбрасывает вызывающий.
+pub unsafe fn unmap_shared(root_pa: usize, va: usize, pa: usize) -> bool {
+    let mut table = root_pa;
+    let mut level = 2i32;
+    while level >= 0 {
+        let idx = (va >> (12 + 9 * level as usize)) & 0x1ff;
+        let pte = tbl_ptr(table).add(idx);
+        if *pte & PTE_V == 0 {
+            return false;
+        }
+        if *pte & (PTE_R | PTE_X) != 0 {
+            // Лист. Мега/гигастраница (уровень выше нулевого) общей быть не может — не наша.
+            if level != 0 || *pte & PTE_SHARED == 0 || ((*pte >> 10) & PPN_MASK) << 12 != pa {
+                return false;
+            }
+            *pte = 0;
+            return true;
+        }
+        table = ((*pte >> 10) & PPN_MASK) << 12;
+        level -= 1;
+    }
+    false
+}
+
 /// Отобразить диапазон [start, end) ТОЖДЕСТВЕННО (VA == PA), постранично — окна MMIO.
 unsafe fn map_range_id(root_pa: usize, start: usize, end: usize, flags: usize) {
     let mut va = start & !(PAGE_SIZE - 1);

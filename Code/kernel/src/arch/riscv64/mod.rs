@@ -379,6 +379,16 @@ pub unsafe fn map(root: usize, va: usize, pa: usize, flags: usize) -> bool {
     paging::map(root, va, pa, flags)
 }
 
+/// Веха 129 — снять отображение общей страницы `va`, лежащей на фрейме `pa`. `false` — там не
+/// она (см. `paging::unmap_shared`: чужого этот вызов не трогает).
+///
+/// # Safety
+/// См. `paging::unmap_shared`.
+#[must_use]
+pub unsafe fn unmap_shared(root: usize, va: usize, pa: usize) -> bool {
+    paging::unmap_shared(root, va, pa)
+}
+
 /// Сбросить TLB после смены отображений АКТИВНОГО пространства (повтор инструкции после
 /// ленивого фолта обязан увидеть новую трансляцию).
 pub fn flush_tlb() {

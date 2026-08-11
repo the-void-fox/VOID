@@ -25,7 +25,8 @@
 //!   смене константы и пути загрузки ([[0010-address-space-layout]]).
 //! - **Память**: `mm_init() -> корень`, `mm_enable`, `clone_kernel_root`, `map` с флагами
 //!   `MAP_R/W/X/U`, `translate`, `flush_tlb`, токены адресных пространств
-//!   `space_token(корень)`/`space_root(токен)` (на RISC-V токен = значение satp), `MM_NAME`.
+//!   `space_token(корень)`/`space_root(токен)` (на RISC-V токен = значение satp), `MM_NAME`;
+//!   `unmap_shared` — снять отображение ОДНОЙ общей страницы (Веха 129, [[shm]]).
 //! - **Trap'ы**: `trap_init`; [`TrapFrame`] — снимок регистров с методами вместо голых
 //!   индексов (`syscall_num`, `arg(i)`, `set_ret`/`set_ret_at`, `set_start_arg`, `advance`,
 //!   `restart` — перевзвести блокирующий syscall на повтор: на riscv sepc и так стоит на
@@ -73,7 +74,8 @@ pub use imp::{
     now_cycles, now_ticks, timer_arm, timer_hw_init,
     // память
     clone_kernel_root, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
-    phys_to_virt, space_root, space_token, translate, virt_to_phys, MAP_R, MAP_SHARED, MAP_U,
+    phys_to_virt, space_root, space_token, translate, unmap_shared, virt_to_phys, MAP_R,
+    MAP_SHARED, MAP_U,
     MAP_W, MAP_WC,
     MAP_X,
     MM_NAME,

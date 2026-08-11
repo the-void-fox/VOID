@@ -1190,6 +1190,45 @@ fn shm_attach(t: &mut Table, cur: usize, id: usize, va: usize, writable: bool) -
     0
 }
 
+/// Веха 129 — отпустить область: снять её страницы с адресов процесса и убавить держателя.
+///
+/// Без этого разделяемая память была бы механизмом без второй половины: буфер кадра меняется на
+/// КАЖДУЮ смену размера окна (в тайлинге — при появлении соседа), и область, которую никто не
+/// отпускает, оставалась бы висеть до смерти процесса. Пара окон, пожившая под перекладыванием,
+/// съедала бы память гарантированно.
+///
+/// Проверки — «страницы на месте и это ТЕ САМЫЕ страницы»; всё, чего процесс добьётся ложью в
+/// аргументах, — отказ. Отпускаем ВСЁ ИЛИ НИЧЕГО: полуснятое отображение это буфер, часть
+/// которого уже чужая, — а такое обнаружится далеко от места ошибки.
+fn shm_unmap(t: &mut Table, cur: usize, id: usize, va: usize) -> usize {
+    // Держит ли он её вообще: право даёт доступ, а отпустить можно лишь СВОЁ отображение.
+    let Some(slot) = t.procs[cur].shm.iter().position(|&x| x == id) else { return usize::MAX };
+    let frames = crate::shm::frames(id);
+    if frames.is_empty() || va % PAGE != 0 {
+        return usize::MAX;
+    }
+    let root = arch::space_root(t.procs[cur].space);
+    // Сперва проверяем весь диапазон, потом снимаем: иначе ошибка на середине оставила бы
+    // процесс с половиной буфера.
+    for (i, &pa) in frames.iter().enumerate() {
+        if arch::translate(root, va + i * PAGE) != Some(pa) {
+            return usize::MAX;
+        }
+    }
+    for (i, &pa) in frames.iter().enumerate() {
+        let ok = unsafe { arch::unmap_shared(root, va + i * PAGE, pa) };
+        // Отказ здесь — не ложь процесса (её отсеял проход выше), а нарушение инварианта ЯДРА:
+        // по адресу лежит фрейм области, но помечен он не общим, то есть один фрейм роздан
+        // дважды. Такое чинить на месте нечем и молчать о таком нельзя — память уже портится.
+        assert!(ok, "shm_unmap: фрейм области отображён как приватный (va {:#x}, P{})",
+            va + i * PAGE, cur);
+    }
+    arch::flush_tlb();
+    t.procs[cur].shm.remove(slot);
+    crate::shm::release(id);
+    0
+}
+
 /// Диспетчер syscall'ов. Номер в `a7`, аргументы в `a0..`, результат в `a0`. Работает прямо
 /// с таблицей: IPC-вызовы затрагивают состояния/кадры ДРУГИХ процессов и выбор `current`.
 fn syscall(t: &mut Table, cur: usize) {
@@ -2800,6 +2839,28 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Err(e) => {
                     vprintln!("  [shm] P{} SYS_SHM_MAP отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_SHM_UNMAP(shm_cap, va) -> 0 | MAX (Веха 129): отпустить область — снять её со
+        // своих адресов и убавить держателя. Ушёл последний — страницы вернулись в общий котёл.
+        //
+        // Право нужно то же, что на отображение: оно называет область, а не даёт власть над ней.
+        // Отпустить чужое отображение через него нельзя — снимается только своё (см. `shm_unmap`).
+        56 => {
+            let (scap, va) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::shm(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(id) => shm_unmap(t, cur, id, va),
+                Err(e) => {
+                    vprintln!("  [shm] P{} SYS_SHM_UNMAP отклонён: {:?}", cur, e);
                     usize::MAX
                 }
             };

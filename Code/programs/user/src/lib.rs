@@ -103,6 +103,7 @@ const SYS_TIME: usize = 36;
 /// Веха 129 — разделяемая память: создать область и отобразить существующую.
 const SYS_SHM_NEW: usize = 54;
 const SYS_SHM_MAP: usize = 55;
+const SYS_SHM_UNMAP: usize = 56;
 const SYS_RANDOM: usize = 37;
 const SYS_OBJ_PUT_NODE: usize = 38;
 const SYS_OBJ_CHILDREN: usize = 39;
@@ -566,6 +567,15 @@ pub fn shm_new(len: usize, va: usize) -> Option<usize> {
 pub fn shm_map(shm_cap: usize, va: usize) -> Option<usize> {
     let r = abi::syscall(SYS_SHM_MAP, shm_cap, va, 0, 0, 0, 0, 0).0;
     (r != usize::MAX).then_some(r)
+}
+
+/// Веха 129 — отпустить область: снять её со своих адресов (`va` — тот, по которому её
+/// отображали). Ушёл последний держатель — страницы вернулись системе.
+///
+/// Звать обязательно там, где буфер СМЕНИЛСЯ: размер окна в тайлинге меняется при появлении
+/// каждого соседа, и не отпущенная область осталась бы висеть до смерти процесса.
+pub fn shm_unmap(shm_cap: usize, va: usize) -> bool {
+    abi::syscall(SYS_SHM_UNMAP, shm_cap, va, 0, 0, 0, 0, 0).0 == 0
 }
 
 /// `SYS_TIME(0)` — настенное время, наносекунды Unix (UTC). Веха 86: часы читаются у прошивки

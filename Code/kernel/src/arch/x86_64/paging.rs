@@ -376,6 +376,41 @@ pub unsafe fn map(root_pa: usize, va: usize, pa: usize, flags: u64) -> bool {
     true
 }
 
+/// Веха 129 — снять отображение ОДНОЙ общей страницы: `va` перестаёт указывать куда-либо.
+///
+/// Нарочно узкая: снимается только лист с [`PTE_SHARED`], и только если он указывает на
+/// НАЗВАННЫЙ фрейм `pa`. Оба условия здесь не из осторожности, а потому что зовут это по
+/// просьбе процесса: адрес выбирает он, и без проверок «снять отображение» стало бы способом
+/// продырявить собственный образ или стек — а такую дыру процесс переживёт ровно до следующего
+/// обращения. С проверками максимум, чего он добьётся, — уберёт свою же общую страницу.
+///
+/// Промежуточные таблицы остаются: они дешевле фрейма и почти наверняка понадобятся снова
+/// (следующий буфер ляжет в соседний слот того же окна ВА). Освободит их гибель процесса.
+///
+/// # Safety
+/// `root_pa` — валидный PML4 текущего или чужого пространства; TLB сбрасывает вызывающий.
+pub unsafe fn unmap_shared(root_pa: usize, va: usize, pa: usize) -> bool {
+    let mut table = root_pa;
+    let mut level = 3usize;
+    while level >= 1 {
+        let idx = (va >> (12 + 9 * level)) & 0x1ff;
+        let pte = *tbl_ptr(table).add(idx);
+        // Отображения нет вовсе или путь ведёт в huge-лист — снимать нечего.
+        if pte & PTE_P == 0 || pte & PTE_PS != 0 {
+            return false;
+        }
+        table = (pte & ADDR_MASK) as usize;
+        level -= 1;
+    }
+    let pte = tbl_ptr(table).add((va >> 12) & 0x1ff);
+    if *pte & PTE_P == 0 || *pte & PTE_SHARED == 0 || (*pte & ADDR_MASK) != (pa as u64 & ADDR_MASK)
+    {
+        return false;
+    }
+    *pte = 0;
+    true
+}
+
 /// Отобразить диапазон [start, end) ТОЖДЕСТВЕННО (VA == PA), постранично — окна MMIO.
 unsafe fn map_range(root_pa: usize, start: usize, end: usize, flags: u64) {
     let mut va = start & !(PAGE_SIZE - 1);

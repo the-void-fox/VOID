@@ -78,7 +78,17 @@ fn report_bytes(name: &str, iters: usize, size: usize, ticks: usize) {
 }
 
 #[no_mangle]
-pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
+pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
+    // Права. Замер писался под запуск ИЗ ЯДРА (`bench_demo`: a0 — store, a1 — эндпоинт posixfs),
+    // и это молча ломалось при запуске из шелла: `spawn` кладёт в те же регистры аргументы
+    // командной строки, а не права. Store-cap оказывался мусором, ЛЮБОЙ obj_put отклонялся — и
+    // замер бодро печатал цифры, которые были стоимостью ОТКАЗА. Ошибка тихая ровно потому, что
+    // отказ быстрее работы: «стало быстрее» и «работа не сделана» выглядят одинаково.
+    //
+    // Поэтому права ищутся по именам окружения, как у всех прочих программ, а регистры остаются
+    // запасным путём — для запуска из ядра, где окружения ещё нет.
+    let store_cap = void_user::cap_named("STORE").unwrap_or(a0);
+    let ep = void_user::cap_named("POSIXFS").unwrap_or(a1);
     // 1. Null syscall: SYS_YIELD, других готовых нет — полный круг
     //    trap → диспетчер → enter_user обратно в нас.
     let n = 1000;
@@ -113,9 +123,19 @@ pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
     let mut data = [0u8; 32];
     data[8..16].copy_from_slice(&now().to_le_bytes());
     let t0 = now();
+    let mut failed = 0;
     for i in 0..n as u64 {
         data[0..8].copy_from_slice(&i.to_le_bytes());
-        void_user::obj_put(store_cap, &data, &mut id);
+        if void_user::obj_put(store_cap, &data, &mut id) != 0 {
+            failed += 1;
+        }
+    }
+    // Отказ обязан быть ВИДЕН. Отказавший obj_put возвращается мгновенно — и «система стала
+    // быстрее» неотличимо от «работа не сделана». На этом уже обожглись дважды: сперва замер без
+    // диска мерил отказы записи, потом тот же отказ вернулся под другим предлогом. Молчаливый
+    // замер хуже отсутствующего: он выдаёт ложь за измерение.
+    if failed != 0 {
+        void_user::write("    obj_put: ОТКАЗЫ — цифры ниже НЕ ИЗМЕРЕНИЕ, а стоимость отказа\n".as_bytes());
     }
     report("obj_put 32 Б (BLAKE3+store)", n, now() - t0);
 
@@ -131,9 +151,15 @@ pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
         [("obj_put строка окна 2.5 КиБ", 2520usize, 200usize), ("obj_put кусок 512 КиБ", 512 * 1024, 10)]
     {
         let t0 = now();
+        let mut failed = 0;
         for i in 0..n as u64 {
             buf[0..8].copy_from_slice(&i.to_le_bytes()); // соль: дедуп не должен срезать работу
-            void_user::obj_put(store_cap, &buf[..size], &mut id);
+            if void_user::obj_put(store_cap, &buf[..size], &mut id) != 0 {
+                failed += 1;
+            }
+        }
+        if failed != 0 {
+            void_user::write("      ↑ ОТКАЗЫ: строка ниже мерит отказ, а не запись\n".as_bytes());
         }
         report_bytes(label, n, size, now() - t0);
     }
@@ -174,7 +200,55 @@ pub extern "C" fn _start(store_cap: usize, ep: usize) -> ! {
                     }
                 }
                 report_bytes("запись в общую область 512 КиБ", n, SHM_LEN, now() - t0);
+
+                // Отпускание. Область живёт, пока её держат: снимаем ВТОРОЙ адрес и убеждаемся,
+                // что первый работает по-прежнему. Если бы `shm_unmap` освобождал страницы, не
+                // спрашивая счётчик, следующая строка писала бы в чужую память — молча.
+                let freed_one = void_user::shm_unmap(cap, va2);
+                a[16] = 0x77;
+                let alive = freed_one && a[16] == 0x77;
+                void_user::write(if alive {
+                    "    отпустить один адрес: область жива у второго держателя · ok\n".as_bytes()
+                } else {
+                    "    отпустить один адрес: ОБЛАСТЬ НЕ ПЕРЕЖИЛА УХОД ДЕРЖАТЕЛЯ\n".as_bytes()
+                });
+                // Ложь в аргументах — отказ, а не дыра: адрес, по которому области нет.
+                let lie = void_user::shm_unmap(cap, 0x7100_0000);
+                // Повторное отпускание того же адреса — тоже отказ (держателя там уже нет).
+                let twice = void_user::shm_unmap(cap, va2);
+                void_user::write(if !lie && !twice {
+                    "    отпустить чужое/дважды: отказ · ok\n".as_bytes()
+                } else {
+                    "    отпустить чужое/дважды: ПРОШЛО — проверок нет\n".as_bytes()
+                });
+                void_user::shm_unmap(cap, va1);
             }
+        }
+    }
+
+    // 4c. Веха 129 — а ВОЗВРАЩАЮТСЯ ли страницы. Шестьсот кругов «создать 8 МиБ — отпустить»:
+    //     4.8 ГиБ суммарно, то есть заведомо больше памяти любой машины, на которой это
+    //     запускается. Размер и число подобраны именно так: круг на 512 КиБ × 200 давал 100 МиБ,
+    //     и при 512 МиБ памяти УТЕЧКА ПРОШЛА БЫ НЕЗАМЕЧЕННОЙ — «проверка», которая ничего не
+    //     проверяет. Если отпускание не освобождает фреймы, круг обязан оборваться отказом.
+    {
+        const SHM_LEN: usize = 8 * 1024 * 1024;
+        const ROUNDS: usize = 600;
+        let va = 0x7000_0000usize;
+        let mut done = 0usize;
+        let t0 = now();
+        for _ in 0..ROUNDS {
+            let Some(cap) = void_user::shm_new(SHM_LEN, va) else { break };
+            unsafe { (va as *mut u8).write_volatile(1) }; // тронуть — страницы настоящие
+            if !void_user::shm_unmap(cap, va) {
+                break;
+            }
+            done += 1;
+        }
+        if done == ROUNDS {
+            report("создать+отпустить область 8 МиБ", done, now() - t0);
+        } else {
+            void_user::write("    круговорот областей: ОБОРВАЛСЯ — страницы не возвращаются\n".as_bytes());
         }
     }
 
