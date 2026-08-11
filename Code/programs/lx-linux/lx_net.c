@@ -138,6 +138,11 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 {
 	void *p;
 	(void)dev; (void)gfp;
+	/* Веха 133.3 — СЛЕД подъёма. Драйвер повис где-то внутри ndo_open и не сказал ни слова:
+	 * вендорный код печатает только об ошибках, а «дошёл сюда» в нём нет. Трогать его нельзя —
+	 * значит говорить обязаны наши шимы, через которые он и ходит. Дёшево (несколько строк на
+	 * подъём) и отвечает на главный вопрос: докуда добрался. */
+	printk("lx_net: dma_alloc_coherent(%u байт)\n", (unsigned)size);
 #ifdef LX_HAVE_SYSCALL
 	/* Реальный DMA: `pages` ПОДРЯД идущих страниц по DMA-cap; физ-адрес начала — device-адрес.
 	 *
@@ -297,7 +302,8 @@ void netif_napi_add_tx(struct net_device *dev, struct napi_struct *napi,
 int netif_threaded_enable(struct net_device *dev) { (void)dev; return 0; }
 
 /* ─ netif_* очереди/несущая (оживут при open/link на след. вехе) ─ */
-void netif_start_queue(struct net_device *dev) { (void)dev; }
+void netif_start_queue(struct net_device *dev)
+{ (void)dev; printk("lx_net: netif_start_queue — очередь передачи открыта\n"); }
 void netif_stop_queue(struct net_device *dev) { (void)dev; }
 void netif_wake_queue(struct net_device *dev) { (void)dev; }
 void netif_tx_disable(struct net_device *dev) { (void)dev; }
@@ -315,7 +321,8 @@ void netif_napi_add(struct net_device *dev, struct napi_struct *napi, int (*poll
 void netif_napi_set_irq(struct napi_struct *napi, int irq) { (void)napi; (void)irq; }
 void netif_queue_set_napi(struct net_device *dev, unsigned int q, int type, struct napi_struct *napi)
 { (void)dev; (void)q; (void)type; (void)napi; }
-void napi_enable(struct napi_struct *napi) { napi->state = 1; }
+void napi_enable(struct napi_struct *napi)
+{ napi->state = 1; printk("lx_net: napi_enable\n"); }
 void napi_disable(struct napi_struct *napi) { napi->state = 0; }
 void __napi_schedule(struct napi_struct *napi) { (void)napi; }
 bool napi_schedule_prep(struct napi_struct *napi) { (void)napi; return false; }
@@ -388,7 +395,8 @@ void tcp_v6_gso_csum_prep(struct sk_buff *skb) { (void)skb; }
  *   no-op, как раньше. irqreturn_t (enum, int-размер) → lx_irq_handler_t (int) кастуем. ─ */
 int  request_irq(unsigned int irq, irq_handler_t h, unsigned long flags, const char *name, void *dev)
 {
-	(void)flags; (void)name;
+	(void)flags;
+	printk("lx_net: request_irq('%s', линия %u)\n", name ? name : "?", irq);
 #ifdef LX_HAVE_SYSCALL
 	if (lx_irq_cap != VOID_NO_CAP) {
 		lx_irq_register((int)irq, lx_irq_cap, (lx_irq_handler_t)h, dev);

@@ -63,7 +63,9 @@ static void atl1c_bringup(void *arg)
 			printk("[atl1c] у драйвера нет ndo_open — это не сетевое устройство?\n");
 			return;
 		}
+		printk("[atl1c] --- вход в ndo_open ---\n");
 		err = ndev->netdev_ops->ndo_open(ndev);
+		printk("[atl1c] --- выход из ndo_open ---\n");
 		printk("[atl1c] ndo_open вернул %d (%s)\n", err, err ? "ОШИБКА" : "интерфейс поднят");
 		if (err)
 			return;
