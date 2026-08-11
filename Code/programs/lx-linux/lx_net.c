@@ -222,6 +222,16 @@ struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int txqs)
 	memset(dev, 0, sizeof(*dev));
 	dev->lx_priv = kmalloc(sizeof_priv, 0);
 	if (dev->lx_priv) memset(dev->lx_priv, 0, sizeof_priv);
+	/* Веха 133.4 — ГОЛОВЫ СПИСКОВ обязаны указывать САМИ НА СЕБЯ. Обнулённый `list_head` это не
+	 * пустой список, а битый: `next == NULL`, и первый же обход (`netdev_for_each_mc_addr` в
+	 * `atl1c_set_multi`) уходит по нулевому адресу. Здесь стоял только memset — и подъём
+	 * интерфейса вставал намертво ровно на этом месте, молча.
+	 *
+	 * Ошибка пряталась потому, что до atl1c списки НИКТО НЕ ОБХОДИЛ: e1000-харнессы до
+	 * set_rx_mode не доходили. Первый же настоящий драйвер, дошедший до настройки фильтров,
+	 * наступил на неё сразу. */
+	INIT_LIST_HEAD(&dev->mc.list);
+	INIT_LIST_HEAD(&dev->uc.list);
 	dev->mc.count = 0; dev->uc.count = 0;
 	dev->lx_txq = kmalloc(sizeof(*dev->lx_txq), 0);
 	if (!dev->lx_txq) { kfree(dev->lx_priv); kfree(dev); return NULL; }
@@ -324,7 +334,15 @@ void netif_device_detach(struct net_device *dev) { (void)dev; }
 
 /* ─ NAPI (оживёт при RX-поллинге на след. вехе) ─ */
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi, int (*poll)(struct napi_struct *, int))
-{ napi->dev = dev; napi->poll = poll; napi->weight = NAPI_POLL_WEIGHT; napi->state = 0; }
+{
+	napi->dev = dev;
+	napi->poll = poll;
+	napi->weight = NAPI_POLL_WEIGHT;
+	napi->state = 0;
+	/* Тот же случай, что у списков адресов (Веха 133.4): обнулённая голова — битая, а не
+	 * пустая. Сегодня этот список никто не обходит, но заводить его наполовину незачем. */
+	INIT_LIST_HEAD(&napi->poll_list);
+}
 void netif_napi_set_irq(struct napi_struct *napi, int irq) { (void)napi; (void)irq; }
 void netif_queue_set_napi(struct net_device *dev, unsigned int q, int type, struct napi_struct *napi)
 { (void)dev; (void)q; (void)type; (void)napi; }
