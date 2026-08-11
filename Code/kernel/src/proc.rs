@@ -2176,7 +2176,11 @@ fn syscall(t: &mut Table, cur: usize) {
             };
             let dom = t.procs[cur].domain;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::READ) {
-                Ok(cap::Device::Net) if ensure_heap_range(t, cur, buf, 6) => {
+                // Веха 132.2 — НЕТ КАРТЫ значит отказ, а не нулевой MAC. Прежде вызов «удавался»
+                // с адресом 00:00:00:00:00:00, и `net-srv` поднимал стек над пустотой: в одном
+                // логе стояло и «сетевой карты нет», и «net-srv запущен, MAC 00:…» с попыткой
+                // DHCP. Система противоречила сама себе, и это заметил владелец.
+                Ok(cap::Device::Net) if crate::net::present() && ensure_heap_range(t, cur, buf, 6) => {
                     let mac = crate::net::mac();
                     let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 6) };
                     dst.copy_from_slice(&mac);

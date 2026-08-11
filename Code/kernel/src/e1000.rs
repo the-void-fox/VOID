@@ -68,6 +68,12 @@ unsafe impl Send for E1000 {}
 
 static E1000: SpinLock<Option<E1000>> = SpinLock::new(None);
 
+/// Веха 132.2 — поднялся ли драйвер. Отличать «карты нет» от «карта с нулевым MAC» обязательно:
+/// на втором net-srv поднимался вхолостую и уходил спрашивать DHCP у пустоты.
+pub fn present() -> bool {
+    E1000.lock().is_some()
+}
+
 #[inline]
 unsafe fn rd(base: usize, off: usize) -> u32 {
     read_volatile((base + off) as *const u32)

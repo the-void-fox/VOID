@@ -40,8 +40,16 @@
  * тем же значением: `atl1c_hw.c` печатает его в диагностике спящего режима. */
 char atl1c_driver_name[] = "atl1c";
 
-static struct atl1c_hw g_hw;
-static struct pci_dev  g_pdev;
+static struct atl1c_hw      g_hw;
+static struct pci_dev       g_pdev;
+/* Вендорный код ходит через hw->adapter->pdev и смотрит adapter->msg_enable (гейты сообщений).
+ * Полноценный adapter появится вместе с netdev; здесь нужны ровно эти два поля. */
+static struct atl1c_adapter g_adapter;
+
+/* Ответ `ffff` на шине MDIO значит НЕ «все биты подняты», а «никто не ответил»: незанятая линия
+ * читается единицами. Без этой проверки харнесс бодро сообщал «линк ЕСТЬ, автосогласование
+ * завершено» по регистру, которого никто не выставлял. */
+static bool mdio_silent(u16 v) { return v == 0xffff; }
 
 static void print_mac(const char *what, const u8 *mac)
 {
@@ -105,6 +113,17 @@ static void atl1c_task(void *arg)
 	printk("[atl1c] чип: %s (device id %04x, ревизия %02x)\n",
 	       nic_type_name(g_hw.nic_type), g_hw.device_id, g_hw.revision_id);
 
+	/* Настройки, которые в драйвере проставляет `atl1c_setup_mac_funcs` — она static (см. шапку).
+	 * Значимо здесь одно: ATL1C_HIB_DISABLE НЕ выставлен, и по этому признаку `atl1c_phy_reset`
+	 * включает PHY спящий режим ровно так же, как в Linux. Остальные флаги на путь PHY не влияют,
+	 * но пусть состояние совпадает с настоящим — расхождение потом ищется дольше, чем пишется. */
+	g_hw.ctrl_flags = ATL1C_INTR_MODRT_ENABLE | ATL1C_TXQ_MODE_ENHANCE |
+			  ATL1C_ASPM_L0S_SUPPORT | ATL1C_ASPM_L1_SUPPORT |
+			  ATL1C_ASPM_CTRL_MON;
+	if (g_hw.nic_type == athr_l1c || g_hw.nic_type == athr_l1d ||
+	    g_hw.nic_type == athr_l1d_2)
+		g_hw.link_cap_flags |= ATL1C_LINK_CAP_1000M;
+
 	/* 3. EEPROM. Его отсутствие не беда (MAC тогда берётся из регистров, зашитых прошивкой),
 	 *    но знать это надо: от этого зависит, откуда взялся адрес. */
 	err = atl1c_check_eeprom_exist(&g_hw);
@@ -119,11 +138,22 @@ static void atl1c_task(void *arg)
 	}
 	print_mac(err ? "MAC (случайный!)" : "MAC (из карты)", g_hw.mac_addr);
 
-	/* 5. MDIO. Идентификатор PHY у этих карт — 0x004d/0xd0xx (Atheros); нули или единицы
-	 *    значат, что шина управления PHY молчит. */
+	/* 5. ПОДНЯТЬ PHY. Первый прогон на живой карте показал `PHY id = ffff:ffff` — шина MDIO
+	 *    молчала. Причина не в шине: после включения машины PHY стоит в power-down
+	 *    (`GPHY_CTRL_PHY_IDDQ`) и под внешним сбросом, и выводит её оттуда именно эта функция.
+	 *    Она вендорная — то есть последовательность подъёма мы не сочиняем, а исполняем ту же,
+	 *    что Linux. */
+	err = atl1c_phy_reset(&g_hw);
+	printk("[atl1c] подъём PHY (atl1c_phy_reset): %s\n", err ? "ОШИБКА" : "ok");
+
+	/* 6. MDIO. Идентификатор PHY у Atheros — 0x004d:0xd0xx. */
 	if (atl1c_read_phy_reg(&g_hw, MII_PHYSID1, &phy_id1) ||
 	    atl1c_read_phy_reg(&g_hw, MII_PHYSID2, &phy_id2)) {
-		printk("[atl1c] MDIO не отвечает — PHY не опросить\n");
+		printk("[atl1c] MDIO: обмен не завершился — PHY не опросить\n");
+		return;
+	}
+	if (mdio_silent(phy_id1) && mdio_silent(phy_id2)) {
+		printk("[atl1c] PHY НЕ ОТВЕЧАЕТ (id ffff:ffff — линия свободна)\n");
 		return;
 	}
 	printk("[atl1c] PHY id = %04x:%04x\n", phy_id1, phy_id2);
@@ -134,11 +164,15 @@ static void atl1c_task(void *arg)
 	}
 	/* BMSR читают ДВАЖДЫ: бит несущей залипающий, первое чтение отдаёт «было с прошлого раза». */
 	atl1c_read_phy_reg(&g_hw, MII_BMSR, &bmsr);
+	if (mdio_silent(bmsr)) {
+		printk("[atl1c] BMSR = ffff — PHY молчит, о линке сказать нечего\n");
+		return;
+	}
 	printk("[atl1c] BMSR = %04x — линк %s, автосогласование %s\n", bmsr,
 	       (bmsr & BMSR_LSTATUS) ? "ЕСТЬ" : "нет",
 	       (bmsr & BMSR_ANEGCOMPLETE) ? "завершено" : "не завершено");
 
-	/* 6. Что PHY говорит о скорости. Осмысленно только при поднятой несущей. */
+	/* 7. Что PHY говорит о скорости. Осмысленно только при поднятой несущей. */
 	if (bmsr & BMSR_LSTATUS) {
 		if (atl1c_get_speed_and_duplex(&g_hw, &speed, &duplex) == 0)
 			printk("[atl1c] линк: %u Мбит/с, %s дуплекс\n",
@@ -173,7 +207,12 @@ int main(void)
 	g_pdev.vendor = PCI_VENDOR_ID_ATTANSIC;
 	g_pdev.device = PCI_DEVICE_ID_ATHEROS_L1D_2_0;
 
+	memset(&g_adapter, 0, sizeof(g_adapter));
+	g_adapter.pdev = &g_pdev;
+	g_adapter.msg_enable = 0xffff; /* говорить всё: прогон на железе стоит перезагрузки */
+
 	memset(&g_hw, 0, sizeof(g_hw));
+	g_hw.adapter = &g_adapter;
 	g_hw.hw_addr = (u8 __iomem *)ATL1C_BAR0_VA;
 	g_hw.device_id = g_pdev.device;
 	g_hw.vendor_id = g_pdev.vendor;
