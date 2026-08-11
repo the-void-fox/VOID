@@ -96,10 +96,29 @@ static void netlog_task(void *arg)
 		 * отданных карте кадров рядом со счётчиком отказов отвечает на главный вопрос — молчит
 		 * карта или молчит провод. */
 		if (++rounds % 25 == 0) {
-			struct net_device_stats *st = &ndev->stats;
+			struct atl1c_adapter *ad = netdev_priv(ndev);
+			struct atl1c_tpd_ring *tx = &ad->tpd_ring[0];
+			u32 mac_ctrl = 0;
+			u16 hw_cons = 0;
 
-			printk("[netlog] кадров отдано %u, отказов %u; у карты передано %lu, ошибок %lu\n",
-			       frames, failed, st->tx_packets, st->tx_errors);
+			/* Спрашиваем САМУ КАРТУ, а не свои счётчики. Наши говорят лишь то, что кадр
+			 * отдан драйверу; вопрос же в том, забрала ли его карта.
+			 *
+			 *   - `next_to_use` — куда МЫ положили последний дескриптор;
+			 *   - `tpd_cons`    — до какого места дошла КАРТА (её собственный указатель);
+			 *   - MAC_CTRL      — включён ли вообще передатчик.
+			 *
+			 * Если наш указатель ушёл вперёд, а карта стоит на нуле — она не читает кольцо,
+			 * и разговор про DMA. Если оба идут, а на проводе тихо — разговор про провод. */
+			/* Таблица очередей `atl1c_qregs` объявлена static — берём регистр очереди 0
+			 * напрямую по имени, оно из того же заголовка. */
+			AT_READ_REG(&ad->hw, REG_MAC_CTRL, &mac_ctrl);
+			AT_READ_REGW(&ad->hw, REG_TPD_PRI0_CIDX, &hw_cons);
+			printk("[netlog] отдано %u, отказов %u; кольцо: мы %u, карта %u; MAC_CTRL %08x (TX %s, RX %s)\n",
+			       frames, failed, (unsigned)tx->next_to_use, (unsigned)hw_cons,
+			       (unsigned)mac_ctrl,
+			       (mac_ctrl & MAC_CTRL_TX_EN) ? "вкл" : "ВЫКЛ",
+			       (mac_ctrl & MAC_CTRL_RX_EN) ? "вкл" : "ВЫКЛ");
 		}
 
 		/* Журнал укоротился — значит кольцо провернулось и часть мы потеряли. Начинаем с
