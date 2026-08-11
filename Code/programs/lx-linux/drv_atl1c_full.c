@@ -18,7 +18,26 @@
 #include "atl1c.h"
 #include "lx_sched.h"
 
+#include <linux/etherdevice.h>
+#include <linux/skbuff.h>
+
 #define ATL1C_BAR0_VA 0x50000000UL
+
+/* ─── ЖУРНАЛ ПО ПРОВОДУ (Веха 134) ───────────────────────────────────────────
+ *
+ * Зачем. Каждая проверка на этой машине стоит перезагрузки и фотографии экрана: COM-порта нет,
+ * USB для VOID не блочное устройство, а видеть надо весь журнал ядра. Как только карта начала
+ * передавать, всё это решается само: шлём журнал СЫРЫМИ Ethernet-кадрами прямо в провод.
+ *
+ * Ни IP, ни ARP, ни DHCP — их у нас ещё нет, и здесь они не нужны: широковещательный кадр со
+ * своим EtherType доходит до соседа по кабелю без всякой настройки. На той стороне слушает
+ * `Code/tools/netlog.py`.
+ *
+ * EtherType 0x88B5 — из диапазона, отведённого IEEE под опытное и местное применение. Занимать
+ * ради отладки чужой номер нельзя, а этот для того и заведён.
+ */
+#define VOID_LOG_ETHERTYPE 0x88b5
+#define VOID_LOG_CHUNK     1024 /* полезная нагрузка кадра — с запасом под MTU 1500 */
 
 extern void lx_net_set_dma_cap(uintptr_t cap);
 extern void lx_net_set_irq_cap(uintptr_t cap);
@@ -36,6 +55,60 @@ static struct pci_dev g_pdev = {
 	.irq              = 5,
 	.lx_name          = "0000:04:00.0",
 };
+
+/* Отправить один кадр с куском журнала. 0 — карта его приняла. */
+static int netlog_send(struct net_device *ndev, const unsigned char *data, unsigned len)
+{
+	struct sk_buff *skb;
+	unsigned char *p;
+
+	/* Буфер берём через netdev_alloc_skb: он выделяет ИЗ АРЕНЫ DMA, а значит адрес этой памяти
+	 * можно назвать карте (см. lx_net.c). Память из обычной кучи здесь не годится вовсе. */
+	skb = __netdev_alloc_skb(ndev, ETH_HLEN + len, 0);
+	if (!skb)
+		return -1;
+
+	p = skb_put(skb, ETH_HLEN + len);
+	memset(p, 0xff, ETH_ALEN);                       /* всем: соседа по кабелю мы не знаем */
+	memcpy(p + ETH_ALEN, ndev->dev_addr, ETH_ALEN);
+	p[12] = (unsigned char)(VOID_LOG_ETHERTYPE >> 8);
+	p[13] = (unsigned char)(VOID_LOG_ETHERTYPE & 0xff);
+	memcpy(p + ETH_HLEN, data, len);
+
+	skb->dev = ndev;
+	return ndev->netdev_ops->ndo_start_xmit(skb, ndev) == NETDEV_TX_OK ? 0 : -1;
+}
+
+/* Задача-вещатель: следит за журналом ядра и отправляет всё, что в нём появилось. */
+static void netlog_task(void *arg)
+{
+	struct net_device *ndev = arg;
+	static unsigned char log[64 * 1024];
+	size_t sent = 0;
+
+	for (;;) {
+		size_t n = vsys_klog(log, sizeof(log));
+		size_t off;
+
+		/* Журнал укоротился — значит кольцо провернулось и часть мы потеряли. Начинаем с
+		 * начала снимка: слать по второму разу всё незачем, а притворяться, что потери не
+		 * было, нельзя — она видна по разрыву в тексте. */
+		if (n < sent)
+			sent = 0;
+
+		for (off = sent; off < n;) {
+			unsigned chunk = (unsigned)(n - off);
+
+			if (chunk > VOID_LOG_CHUNK)
+				chunk = VOID_LOG_CHUNK;
+			if (netlog_send(ndev, log + off, chunk) != 0)
+				break; /* карта не приняла — повторим в следующий заход */
+			off += chunk;
+		}
+		sent = off;
+		msleep(200);
+	}
+}
 
 /* Подъём драйвера: module_init → pci_register_driver → match по id_table → atl1c_probe. */
 static void atl1c_bringup(void *arg)
@@ -71,6 +144,16 @@ static void atl1c_bringup(void *arg)
 			return;
 		printk("[atl1c] MAC %pM, несущая %s\n", ndev->dev_addr,
 		       netif_carrier_ok(ndev) ? "ЕСТЬ" : "нет");
+
+		/* Первый кадр — приметный: по нему на той стороне видно, что провод живой, ещё до
+		 * того, как поедет журнал. */
+		if (netlog_send(ndev, (const unsigned char *)
+				"VOID: провод живой, начинаю вещать журнал\n", 76) == 0)
+			printk("[atl1c] пробный кадр ушёл в провод\n");
+		else
+			printk("[atl1c] пробный кадр карта НЕ приняла\n");
+
+		lx_task_create(netlog_task, ndev, "netlog");
 	}
 }
 
