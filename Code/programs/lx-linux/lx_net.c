@@ -37,6 +37,70 @@ static uintptr_t lx_irq_cap = VOID_NO_CAP;
 void lx_net_set_irq_cap(uintptr_t cap) { lx_irq_cap = cap; }
 #endif
 
+/* ─── АРЕНА DMA под буферы пакетов (Веха 133) ────────────────────────────────
+ *
+ * Зачем она. `dma_map_single` обязан отдать адрес, ПО КОТОРОМУ ХОДИТ КАРТА, — физический. У нас
+ * он возвращал виртуальный, и это работало ровно до тех пор, пока никто не пробовал ПРИНИМАТЬ
+ * пакеты: карта писала бы DMA'ом по случайной физической памяти, а выглядело бы это как порча
+ * чужих данных — самое дорогое в поиске.
+ *
+ * Переводить произвольный VA в физический мы не можем и не хотим: это потребовало бы от ядра
+ * нового полномочия «назови физический адрес любой моей страницы». Вместо этого буферы пакетов
+ * с самого начала берутся ИЗ ОБЛАСТИ, полученной по DMA-праву. Тогда перевод — арифметика в её
+ * пределах, а для памяти не из арены `dma_map_single` честно отказывает.
+ *
+ * Арена простая: выделение подряд, БЕЗ возврата. Буферы приёма живут столько же, сколько драйвер;
+ * кончится — скажем вслух, а не молча отдадим невалидный адрес.
+ */
+#define LX_DMA_ARENA_PAGES 256 /* 1 МиБ — с запасом на кольцо приёма по 2 КиБ на буфер */
+
+static uintptr_t lx_arena_va;   /* начало арены в нашем пространстве */
+static uintptr_t lx_arena_pa;   /* её же физический адрес — карта ходит сюда */
+static size_t    lx_arena_size;
+static size_t    lx_arena_used;
+static int       lx_arena_failed;
+
+/* Отдать `size` байт из арены (выравнивание на 8). NULL — арены нет или она кончилась. */
+static void *lx_arena_alloc(size_t size)
+{
+#ifdef LX_HAVE_SYSCALL
+	size_t need = (size + 7) & ~(size_t)7;
+
+	if (!lx_arena_va && !lx_arena_failed && lx_dma_cap != VOID_NO_CAP) {
+		uintptr_t va = lx_dma_va_next;
+		uintptr_t pa = vsys_dma_alloc_n(lx_dma_cap, va, LX_DMA_ARENA_PAGES);
+		if (pa == VOID_NO_CAP) {
+			lx_arena_failed = 1;
+			printk("lx_net: арена DMA не завелась — приём работать не будет\n");
+		} else {
+			lx_dma_va_next += (uintptr_t)LX_DMA_ARENA_PAGES * 4096;
+			lx_arena_va = va;
+			lx_arena_pa = pa;
+			lx_arena_size = (size_t)LX_DMA_ARENA_PAGES * 4096;
+		}
+	}
+	if (lx_arena_va && lx_arena_used + need <= lx_arena_size) {
+		void *p = (void *)(lx_arena_va + lx_arena_used);
+		lx_arena_used += need;
+		return p;
+	}
+	if (lx_arena_va) {
+		printk("lx_net: арена DMA кончилась (%u из %u байт)\n",
+		       (unsigned)lx_arena_used, (unsigned)lx_arena_size);
+	}
+#else
+	(void)size; /* сборка-«вычислялка»: DMA не задействован, буферы идут из кучи */
+#endif
+	return NULL;
+}
+
+/* Лежит ли указатель в арене — то есть можно ли назвать карте его адрес. */
+static int lx_in_arena(const void *p)
+{
+	uintptr_t a = (uintptr_t)p;
+	return lx_arena_va && a >= lx_arena_va && a < lx_arena_va + lx_arena_size;
+}
+
 /* ─ состояние системы (e1000 shutdown отличает выключение) ─ */
 enum system_states system_state = SYSTEM_RUNNING;
 
@@ -75,12 +139,18 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 	void *p;
 	(void)dev; (void)gfp;
 #ifdef LX_HAVE_SYSCALL
-	/* Реальный DMA: страница по DMA-cap, её ФИЗ-адрес — device-доступный (одна страница ≤ 4 КиБ). */
-	if (lx_dma_cap != VOID_NO_CAP && size <= 4096) {
+	/* Реальный DMA: `pages` ПОДРЯД идущих страниц по DMA-cap; физ-адрес начала — device-адрес.
+	 *
+	 * Веха 133 — здесь стоял потолок в одну страницу, а всё, что больше, тихо уходило в кучу:
+	 * `*handle` получал тогда ВИРТУАЛЬНЫЙ адрес, и карта писала бы DMA'ом по случайной физической
+	 * памяти. Пока драйверам хватало страницы, это не всплывало; кольцам atl1c нужны десятки
+	 * килобайт — всплыло бы сразу, порчей чужой памяти. */
+	if (lx_dma_cap != VOID_NO_CAP) {
+		size_t pages = (size + 4095) / 4096;
 		uintptr_t va = lx_dma_va_next;
-		uintptr_t pa = vsys_dma_alloc(lx_dma_cap, va);
+		uintptr_t pa = vsys_dma_alloc_n(lx_dma_cap, va, pages);
 		if (pa == VOID_NO_CAP) { *handle = 0; return NULL; }
-		lx_dma_va_next += 4096;
+		lx_dma_va_next += pages * 4096;
 		memset((void *)va, 0, size);
 		*handle = (dma_addr_t)pa;
 		return (void *)va;
@@ -99,8 +169,19 @@ void dma_free_coherent(struct device *dev, size_t size, void *vaddr, dma_addr_t 
 #endif
 	kfree(vaddr);
 }
+/* Веха 133 — адрес ДЛЯ КАРТЫ. Работает только для памяти из арены DMA; для всего прочего
+ * возвращает 0, и вызывающий обязан это заметить (`dma_mapping_error`). Соврать здесь
+ * виртуальным адресом, как было раньше, значит отправить карту писать по случайной физической
+ * памяти — ошибка, которая проявится далеко от места и не в этом драйвере. */
 dma_addr_t dma_map_single(struct device *dev, void *ptr, size_t size, int dir)
-{ (void)dev; (void)size; (void)dir; return (dma_addr_t)(unsigned long)ptr; }
+{
+	(void)dev; (void)size; (void)dir;
+	if (!lx_in_arena(ptr)) {
+		printk("lx_net: dma_map_single вне арены DMA — адрес карте не назвать\n");
+		return 0;
+	}
+	return (dma_addr_t)(lx_arena_pa + ((uintptr_t)ptr - lx_arena_va));
+}
 void dma_unmap_single(struct device *dev, dma_addr_t addr, size_t size, int dir)
 { (void)dev; (void)addr; (void)size; (void)dir; }
 dma_addr_t dma_map_page(struct device *dev, struct page *page, size_t offset, size_t size, int dir)
@@ -165,6 +246,14 @@ void eth_random_addr(u8 *addr)
 
 void eth_hw_addr_random(struct net_device *dev) { eth_random_addr(dev->dev_addr); }
 
+/* Веха 133 — ethtool СОЗНАТЕЛЬНО отсутствует. `atl1c_ethtool.c` в сборку не входит: это
+ * интерфейс для одноимённой утилиты Linux, которой у нас нет, а тянет он за собой три десятка
+ * структур (link_ksettings, drvinfo, regs, wolinfo…), к работе карты отношения не имеющих.
+ * Драйвер зовёт это в probe безусловно, поэтому пустое тело обязано быть: netdev остаётся без
+ * ethtool_ops, как устройство, которое ethtool не поддерживает. Понадобится показывать состояние
+ * линка в сетевом TUI — шим вырастет тогда, под настоящего потребителя. */
+void atl1c_set_ethtool_ops(struct net_device *netdev) { (void)netdev; }
+
 struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
 {
 	(void)index; /* очередь одна — см. alloc_etherdev_mq */
@@ -227,7 +316,13 @@ static struct sk_buff *lx_skb_alloc(unsigned int len)
 	unsigned int room = len + NET_SKB_PAD;
 	if (!skb) return NULL;
 	memset(skb, 0, sizeof(*skb));
-	skb->head = kmalloc(room, 0);
+	/* Данные — ИЗ АРЕНЫ DMA: в них будет писать сама карта (Веха 133). Арены нет (сборка без
+	 * syscall'ов) — берём кучу: там пакетов не бывает, считается только логика. */
+	skb->head = lx_arena_alloc(room);
+	if (!skb->head) {
+		skb->head = kmalloc(room, 0);
+		skb->lx_heap = 1;
+	}
 	if (!skb->head) { kfree(skb); return NULL; }
 	skb->data = skb->head + NET_SKB_PAD;
 	skb->tail = skb->data;
@@ -240,7 +335,13 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int len, gfp
 struct sk_buff *napi_alloc_skb(struct napi_struct *napi, unsigned int len) { (void)napi; return lx_skb_alloc(len); }
 struct sk_buff *build_skb(void *data, unsigned int frag_size) { (void)data; return lx_skb_alloc(frag_size); }
 struct sk_buff *napi_build_skb(void *data, unsigned int frag_size) { (void)data; return lx_skb_alloc(frag_size); }
-void dev_kfree_skb(struct sk_buff *skb) { if (skb) { kfree(skb->head); kfree(skb); } }
+void dev_kfree_skb(struct sk_buff *skb)
+{
+	if (!skb) return;
+	/* Из арены не возвращаем — она нарочно без возврата (см. её описание); из кучи возвращаем. */
+	if (skb->lx_heap) kfree(skb->head);
+	kfree(skb);
+}
 void dev_kfree_skb_any(struct sk_buff *skb) { dev_kfree_skb(skb); }
 void consume_skb(struct sk_buff *skb) { dev_kfree_skb(skb); }
 void napi_consume_skb(struct sk_buff *skb, int budget) { (void)budget; dev_kfree_skb(skb); }

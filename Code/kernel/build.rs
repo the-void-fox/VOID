@@ -23,7 +23,7 @@ const PROGRAMS_X86: &[&str] = &["term", "wm", "winbox"];
 
 /// Веха 132 — C-драйверы (портированный код Linux, сборка nix'ом). Едут семенами В ЯДРЕ, как и
 /// программы на Rust: до store целевой машины иначе не добраться (см. `stage_c_drivers`).
-const C_DRIVERS: &[&str] = &["lx-atl1c-hw"];
+const C_DRIVERS: &[&str] = &["lx-atl1c-hw", "lx-atl1c-full"];
 
 fn main() {
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel

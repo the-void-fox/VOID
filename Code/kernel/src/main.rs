@@ -150,7 +150,11 @@ static PROGRAMS: &[(&str, &[u8])] = &[
 ///
 /// Пустой срез значит «драйвер не выложен при сборке» — [`seed_programs`] такое семя пропускает
 /// и говорит об этом вслух.
-static C_DRIVERS: &[(&str, &[u8])] = &[("lx-atl1c-hw", include_bytes!(env!("DRV_LX_ATL1C_HW")))];
+static C_DRIVERS: &[(&str, &[u8])] = &[
+    ("lx-atl1c-hw", include_bytes!(env!("DRV_LX_ATL1C_HW"))),
+    // Веха 133 — тот же драйвер ЦЕЛИКОМ: настоящий `atl1c_probe` с кольцами на DMA.
+    ("lx-atl1c-full", include_bytes!(env!("DRV_LX_ATL1C_FULL"))),
+];
 
 /// Веха 97 — программы ТОЛЬКО ДЛЯ x86: `term` рисует в пиксельный фреймбуфер, которого на
 /// riscv нет (см. `build.rs`, PROGRAMS_X86). Отдельным списком, а не `cfg` внутри общего:

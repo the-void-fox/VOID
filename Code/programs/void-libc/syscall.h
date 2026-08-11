@@ -164,6 +164,12 @@ static inline int vsys_mmio_map(uintptr_t cap, uintptr_t va) {
 static inline uintptr_t vsys_dma_alloc(uintptr_t cap, uintptr_t va) {
     return vsys(SYS_DMA_ALLOC, cap, va, 0, 0, 0, 0, 0);
 }
+/* То же на `pages` ПОДРЯД идущих страниц (Веха 133): кольцо дескрипторов карта обходит сама, о
+ * таблицах страниц не зная, — значит физическая непрерывность обязательна, и набрать её
+ * несколькими вызовами по странице нельзя. */
+static inline uintptr_t vsys_dma_alloc_n(uintptr_t cap, uintptr_t va, size_t pages) {
+    return vsys(SYS_DMA_ALLOC, cap, va, pages, 0, 0, 0, 0);
+}
 /* SYS_IRQ_WAIT(cap): уснуть до прерывания устройства. 1 — проснулись по IRQ, 0 — нет права. */
 static inline int vsys_irq_wait(uintptr_t cap) {
     return vsys(SYS_IRQ_WAIT, cap, 0, 0, 0, 0, 0, 0) == 0;

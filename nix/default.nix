@@ -462,6 +462,36 @@ let
         '';
       };
 
+      # lx_atl1c_full (Веха 133) — РАЗВЕДКА ЛИНКОВКИ: весь драйвер целиком (atl1c_main.c +
+      # atl1c_hw.c + atl1c_ethtool.c) против шимов. Цель та же, что у lx_atl1c_probe: не
+      # программа, а список нехваток — теперь уже на этапе линковки.
+      #
+      # Зачем целиком: кольца дескрипторов строит `atl1c_setup_ring_resources`, и она, как и
+      # вся настройка движков, объявлена static. Снаружи не позвать — значит надо запускать
+      # НАСТОЯЩИЙ `atl1c_probe`, а он тянет за собой netdev, NAPI, таймеры и DMA.
+      #
+      # `atl1c_ethtool.c` НЕ линкуется намеренно: это интерфейс для утилиты `ethtool`, которой у
+      # нас нет, а его поверхность — три десятка структур и констант, к работе карты отношения
+      # не имеющих. Вместо него Lx_kit даёт пустой `atl1c_set_ethtool_ops`. Понадобится показывать
+      # состояние линка в сетевом TUI — шим вырастет тогда, под настоящего потребителя.
+      lx_atl1c_full = stdenv.mkDerivation {
+        pname = "lx-atl1c-full";
+        version = "0.133";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -Ilinux-src/atl1c -I${void-libc}/lib -DCONFIG_64BIT -DLX_HAVE_SYSCALL \
+            -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
+            drv_atl1c_full.c linux-src/atl1c/atl1c_main.c linux-src/atl1c/atl1c_hw.c \
+            lx_kit.c lx_net.c -o lx-atl1c-full
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp lx-atl1c-full $out/bin/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

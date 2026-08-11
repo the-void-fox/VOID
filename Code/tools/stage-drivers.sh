@@ -19,7 +19,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
 # Драйвер → атрибут деривации в nix/default.nix.
-declare -A DRIVERS=( [lx-atl1c-hw]=lx_atl1c_drv )
+declare -A DRIVERS=( [lx-atl1c-hw]=lx_atl1c_drv [lx-atl1c-full]=lx_atl1c_full )
 
 arches=("${@:-x86_64 riscv64}")
 read -ra arches <<< "${arches[*]}"

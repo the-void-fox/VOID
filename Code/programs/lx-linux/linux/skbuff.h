@@ -54,6 +54,9 @@ struct sk_buff {
 	unsigned int     len;       /* всего байт (линейка + фрагменты) */
 	unsigned int     data_len;  /* байт во фрагментах */
 	unsigned int     truesize;
+	/* Веха 133 — данные взяты из КУЧИ, а не из арены DMA (сборки без syscall'ов). Различать
+	 * обязательно: арена не возвращает память, куча возвращает. */
+	unsigned char    lx_heap;
 	__be16           protocol;
 	__u16            csum_offset;
 	__u16            csum_start;

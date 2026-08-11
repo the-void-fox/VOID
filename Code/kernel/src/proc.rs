@@ -2520,30 +2520,46 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
-        // SYS_DMA_ALLOC(dma_cap, va) -> физ-адрес | MAX (Веха 51): выделить один обнулённый фрейм,
-        // замапить его в драйвер по `va` (U|R|W) и вернуть его ФИЗИЧЕСКИЙ адрес — им драйвер
-        // программирует DMA устройства. Без IOMMU это доверенное право (dma-cap только у драйверов).
+        // SYS_DMA_ALLOC(dma_cap, va, pages) -> физ-адрес | MAX (Веха 51; страницы — Веха 133):
+        // выделить `pages` ПОДРЯД идущих обнулённых фреймов, замапить их в драйвер начиная с `va`
+        // (U|R|W) и вернуть ФИЗИЧЕСКИЙ адрес начала — им драйвер программирует DMA устройства.
+        // Без IOMMU это доверенное право (dma-cap только у драйверов).
+        //
+        // Непрерывность обязательна и не сводится к нескольким вызовам по странице: кольцо
+        // дескрипторов карта обходит сама, о таблицах страниц не зная. `pages == 0` читаем как 1 —
+        // так продолжают работать драйверы, написанные до этой вехи.
         32 => {
-            let (dcap, va) = {
+            let (dcap, va, pages) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1))
+                (f.arg(0), f.arg(1), f.arg(2).max(1))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::dma(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
                 Ok(()) => {
                     let limit = USER_STACK_TOP_VA - USER_STACK_PAGES * PAGE;
-                    if va >= USER_REGION_START && va + PAGE <= limit {
-                        match frame::alloc() {
+                    if va >= USER_REGION_START && va + pages * PAGE <= limit {
+                        match frame::alloc_contig(pages) {
                             Some(pa) => {
                                 let root = arch::space_root(t.procs[cur].space);
-                                let ok = unsafe {
-                                    arch::map(root, va, pa, arch::MAP_R | arch::MAP_W | arch::MAP_U)
-                                };
+                                let mut ok = true;
+                                for i in 0..pages {
+                                    ok &= unsafe {
+                                        arch::map(root, va + i * PAGE, pa + i * PAGE,
+                                                  arch::MAP_R | arch::MAP_W | arch::MAP_U)
+                                    };
+                                    if !ok {
+                                        break;
+                                    }
+                                }
                                 arch::flush_tlb();
                                 if ok {
-                                    pa // физ-адрес фрейма (драйверу нужен именно физический)
+                                    pa // физ-адрес начала (драйверу нужен именно физический)
                                 } else {
-                                    frame::free(pa); // Веха 89: нет памяти под таблицу — отказ
+                                    // Веха 89: нет памяти под таблицу — отказ. Куски отдаём
+                                    // поштучно: непрерывность нужна была карте, а не котлу.
+                                    for i in 0..pages {
+                                        frame::free(pa + i * PAGE);
+                                    }
                                     usize::MAX
                                 }
                             }

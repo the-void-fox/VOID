@@ -423,18 +423,31 @@ pub fn boot() {
     #[cfg(target_arch = "x86_64")]
     if let Some(base) = arch::probe_bar0(0x1969, 0x1083, 0x40000) {
         println!("  [init] найдена Atheros AR8151 (1969:1083), регистры {:#x}", base);
-        match spawn("lx-atl1c-hw") {
-            Some(pid) => match mint_cap(pid, "mmio:atl1c", &[]) {
-                Some(m) => {
-                    proc::set_arg(pid, m);
-                    proc::push_start_cap(pid, m);
-                    println!("  [init] драйвер lx-atl1c-hw P{} — выдано MMIO-право", pid);
+        // Веха 133 — предпочесть ПОЛНЫЙ драйвер (настоящий `atl1c_probe`, кольца на DMA); если
+        // его нет в образе, поднять харнесс первого контакта (Веха 132: регистры, MAC, PHY).
+        let (name, started) = match spawn("lx-atl1c-full") {
+            Some(pid) => ("lx-atl1c-full", Some(pid)),
+            None => ("lx-atl1c-hw", spawn("lx-atl1c-hw")),
+        };
+        match started {
+            Some(pid) => {
+                // MMIO — окно регистров, DMA — кольца дескрипторов, IRQ — приём без опроса.
+                // Права те же и в том же порядке, что у портированного e1000 (Вехи 69–72):
+                // start_cap 0/1/2. Харнессу первого контакта лишние права не мешают — он их
+                // просто не берёт.
+                match (mint_cap(pid, "mmio:atl1c", &[]), mint_cap(pid, "dma", &[])) {
+                    (Some(m), Some(d)) => {
+                        proc::set_arg(pid, m);
+                        proc::set_arg2(pid, d);
+                        proc::push_start_cap(pid, m);
+                        proc::push_start_cap(pid, d);
+                        println!("  [init] драйвер {} P{} — выданы MMIO+DMA права", name, pid);
+                    }
+                    _ => println!("  [init] {}: MMIO/DMA права выдать не удалось", name),
                 }
-                None => println!("  [init] lx-atl1c-hw: MMIO-право выдать не удалось"),
-            },
-            // Драйвер живёт на диске и приезжает мостом (nix-build + void-store-import), как и
-            // портированный e1000. Нет его — карта просто остаётся без драйвера.
-            None => println!("  [init] AR8151 есть, а драйвера lx-atl1c-hw в store нет"),
+            }
+            // Драйвер едет семенем в образе ядра (Веха 132.1). Нет его — карта без драйвера.
+            None => println!("  [init] AR8151 есть, а драйвера в образе нет"),
         }
     }
 
