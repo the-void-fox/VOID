@@ -25,6 +25,7 @@
 #define SYS_MMIO_MAP 31
 #define SYS_DMA_ALLOC 32
 #define SYS_IRQ_WAIT 33
+#define SYS_RANDOM 37
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
 #define VOID_NO_CAP ((uintptr_t)-1)
@@ -166,4 +167,10 @@ static inline uintptr_t vsys_dma_alloc(uintptr_t cap, uintptr_t va) {
 /* SYS_IRQ_WAIT(cap): уснуть до прерывания устройства. 1 — проснулись по IRQ, 0 — нет права. */
 static inline int vsys_irq_wait(uintptr_t cap) {
     return vsys(SYS_IRQ_WAIT, cap, 0, 0, 0, 0, 0, 0) == 0;
+}
+/* SYS_RANDOM(buf, len): случайные байты от ядра (аппаратный ГСЧ + пул событий). Права не
+ * требует: случайность — не ресурс, а свойство системы. Веха 131 — понадобился драйверу:
+ * сетевые карты без MAC в EEPROM обязаны сгенерировать себе адрес. */
+static inline void vsys_random(void *buf, size_t len) {
+    vsys(SYS_RANDOM, (uintptr_t)buf, len, 0, 0, 0, 0, 0);
 }

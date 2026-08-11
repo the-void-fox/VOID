@@ -411,6 +411,34 @@ let
         '';
       };
 
+      # lx_atl1c_probe (Веха 131) — РАЗВЕДКА сборки: НЕИЗМЕНЁННЫЙ драйвер Atheros atl1c
+      # (Linux 6.18.7: drivers/net/ethernet/atheros/atl1c/{atl1c_main,atl1c_hw}.c, GPL-2.0)
+      # компилируется до объектных файлов против наших шимов. Линковки здесь нет намеренно:
+      # цель — узнать, каких заголовков и функций не хватает, а не получить программу.
+      #
+      # Зачем именно atl1c: это карта X54C (1969:1083 = AR8151 v2.0, опознана Вехой 130 на
+      # живой машине). Своей реализации не пишем — у этих карт инициализация PHY полна частных
+      # случаев, которых нет в даташите, и хостинг проверенного кода надёжнее (Веха 73).
+      lx_atl1c_probe = stdenv.mkDerivation {
+        pname = "lx-atl1c-probe";
+        version = "0.131";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -Ilinux-src/atl1c -DCONFIG_64BIT \
+            -Wno-unused-parameter -Wno-pointer-sign -O2 -c \
+            linux-src/atl1c/atl1c_hw.c -o atl1c_hw.o
+          $CC ${voidCFlags} -I. -Ilinux-src/atl1c -DCONFIG_64BIT \
+            -Wno-unused-parameter -Wno-pointer-sign -O2 -c \
+            linux-src/atl1c/atl1c_main.c -o atl1c_main.o
+        '';
+        installPhase = ''
+          mkdir -p $out/lib
+          cp atl1c_hw.o atl1c_main.o $out/lib/
+        '';
+      };
+
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
       bzip2 = voidify (pkgs.bzip2.overrideAttrs (old: {

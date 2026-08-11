@@ -34,6 +34,10 @@ static inline void ether_addr_copy(u8 *dst, const u8 *src) { memcpy(dst, src, ET
 static inline bool ether_addr_equal(const u8 *a, const u8 *b) { return memcmp(a, b, ETH_ALEN) == 0; }
 static inline void eth_hw_addr_set(struct net_device *dev, const u8 *addr)
 { memcpy(dev->dev_addr, addr, ETH_ALEN); }
+/* Случайный локально-администрируемый одноадресный MAC. Карта без адреса в EEPROM обязана
+ * выдумать себе адрес — бит 1 первого байта помечает его как «назначенный локально», бит 0
+ * снятый делает его одноадресным (Веха 131). */
+void eth_random_addr(u8 *addr);
 void eth_hw_addr_random(struct net_device *dev);
 
 #endif /* _LINUX_ETHERDEVICE_H_SHIM */

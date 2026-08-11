@@ -31,4 +31,20 @@ struct ethtool_ops {
 #define DUPLEX_FULL    0x01
 #define DUPLEX_UNKNOWN 0xff
 
+/* Веха 131 — режимы линка старым «плоским» видом (`ADVERTISED_*`). Драйвер atl1c держит в них
+ * желание пользователя («какие скорости предлагать») и переводит их в биты регистров PHY.
+ *
+ * Значения — позиции битов из перечисления `ethtool_link_mode_bit_indices` (uapi/linux/ethtool.h,
+ * 10baseT_Half = 0 … Autoneg = 6). В самом Linux это делает макрос
+ * `__ETHTOOL_LINK_MODE_LEGACY_MASK`; здесь раскрыто, потому что тянуть перечисление на полторы
+ * сотни режимов ради семи из них незачем. Важно, что позиции ТЕ ЖЕ: эти числа уходят в конфиг и
+ * сравниваются с тем, что показывает Linux на той же карте. */
+#define ADVERTISED_10baseT_Half   (1UL << 0)
+#define ADVERTISED_10baseT_Full   (1UL << 1)
+#define ADVERTISED_100baseT_Half  (1UL << 2)
+#define ADVERTISED_100baseT_Full  (1UL << 3)
+#define ADVERTISED_1000baseT_Half (1UL << 4)
+#define ADVERTISED_1000baseT_Full (1UL << 5)
+#define ADVERTISED_Autoneg        (1UL << 6)
+
 #endif /* _LINUX_ETHTOOL_H_SHIM */

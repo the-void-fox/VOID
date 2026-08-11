@@ -133,6 +133,10 @@ fn class_name(class: u8, sub: u8) -> &'static str {
         (0x06, 0x01) => "мост: ISA",
         (0x06, 0x04) => "мост: PCI-PCI",
         (0x06, _) => "мост",
+        // 07/80 на Intel-PCH — это MEI (Management Engine). Первый прогон на X54C напечатал его
+        // как «?», и это правильно: врать именем хуже, чем сказать «не знаю».
+        (0x07, 0x80) => "связь: MEI",
+        (0x07, _) => "связь",
         (0x0c, 0x03) => "USB",
         (0x0c, 0x05) => "SMBus",
         (0x0c, _) => "последовательная шина",
@@ -153,6 +157,11 @@ fn vendor_name(v: u16) -> &'static str {
         0x168c => "Atheros",
         0x14e4 => "Broadcom",
         0x1969 => "Attansic/Atheros",
+        // Всё, что ниже, опознано на X54C: RT5390 (Wi-Fi), ASM1042 (USB3), сам ноутбук и его ODM.
+        0x1814 => "Ralink/MTK",
+        0x1b21 => "ASMedia",
+        0x1043 => "ASUS",
+        0x105b => "Foxconn",
         0x11ab => "Marvell",
         0x1022 | 0x1002 => "AMD/ATI",
         0x10de => "NVIDIA",

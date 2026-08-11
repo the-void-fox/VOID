@@ -27,12 +27,29 @@
 #define BMSR_LSTATUS   0x0004
 #define BMSR_ANEGCOMPLETE 0x0020
 
-/* Биты ADVERTISE. */
+/* Биты ADVERTISE (регистр 4) — что мы предлагаем партнёру при автосогласовании.
+ * Значения — из uapi/linux/mii.h; расширено Вехой 131 под atl1c (пауза и гигабит). */
 #define ADVERTISE_CSMA     0x0001
 #define ADVERTISE_10HALF   0x0020
 #define ADVERTISE_10FULL   0x0040
 #define ADVERTISE_100HALF  0x0080
 #define ADVERTISE_100FULL  0x0100
+#define ADVERTISE_PAUSE_CAP  0x0400
+#define ADVERTISE_PAUSE_ASYM 0x0800
+#define ADVERTISE_ALL      (ADVERTISE_10HALF | ADVERTISE_10FULL | \
+			    ADVERTISE_100HALF | ADVERTISE_100FULL)
+
+/* Биты LPA (регистр 5) — что предложил ПАРТНЁР. Те же позиции, что у ADVERTISE: так
+ * задумано в 802.3, и по совпадению битов сразу видно общий знаменатель. */
+#define LPA_10HALF         0x0020
+#define LPA_10FULL         0x0040
+#define LPA_100HALF        0x0080
+#define LPA_100FULL        0x0100
+
+/* Гигабитное согласование живёт в ОТДЕЛЬНОМ регистре (9, CTRL1000), поэтому те же 0x0100/0x0200
+ * значат здесь другое, чем в регистре 4. Путать их — классическая ошибка. */
+#define ADVERTISE_1000HALF 0x0100
+#define ADVERTISE_1000FULL 0x0200
 
 struct mii_if_info {
 	int phy_id;

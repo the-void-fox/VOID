@@ -10,6 +10,11 @@
 #define _LINUX_PCI_H_SHIM
 
 #include <linux/types.h>
+/* Веха 131: в Linux `pci.h` тянет за собой compiler.h и bits.h по длинной цепочке включений,
+ * и драйверы на это опираются — atl1c зовёт unlikely()/BIT() в своих заголовках, включив только
+ * pci.h. У нас шимы минимальные, поэтому цепочку приходится восстанавливать явно. */
+#include <linux/kernel.h>
+#include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/io.h>
@@ -35,9 +40,10 @@ struct pci_device_id {
 	.vendor = PCI_VENDOR_ID_##vend, .device = (dev), \
 	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID
 
-/* Вендоры, нужные полигону. */
-#define PCI_VENDOR_ID_INTEL  0x8086
-#define PCI_VENDOR_ID_VMWARE 0x15ad
+/* Вендоры, нужные полигону. ATTANSIC — карта X54C (Веха 130 опознала 1969:1083 = AR8151 v2.0). */
+#define PCI_VENDOR_ID_INTEL    0x8086
+#define PCI_VENDOR_ID_VMWARE   0x15ad
+#define PCI_VENDOR_ID_ATTANSIC 0x1969
 
 /* Число стандартных BAR'ов заголовка Type 0. */
 #define PCI_STD_NUM_BARS 6
@@ -54,6 +60,26 @@ struct pci_device_id {
 #define PCI_REVISION_ID         0x08
 #define PCI_SUBSYSTEM_VENDOR_ID 0x2c
 #define PCI_SUBSYSTEM_ID        0x2e
+/* Веха 131 — то, что читает atl1c. `PCI_CLASS_REVISION` это тот же dword 0x08, прочитанный
+ * целиком (класс в старших 24 битах, ревизия в младших 8): драйвер берёт из него ревизию чипа. */
+#define PCI_CLASS_REVISION      0x08
+#define PCI_COMMAND_INTX_DISABLE 0x400
+
+/* Регистр состояния устройства PCIe (смещение внутри capability PCIe) и его биты об ошибках.
+ * atl1c при подъёме сбрасывает накопленные ошибки: карта в ноутбуке живёт за мостом, и
+ * записанные прошивкой флаги иначе выглядели бы как свежая беда. */
+#define PCI_EXP_DEVSTA          0x0a
+#define PCI_EXP_DEVSTA_CED      0x0001
+#define PCI_EXP_DEVSTA_NFED     0x0002
+#define PCI_EXP_DEVSTA_FED      0x0004
+#define PCI_EXP_DEVSTA_URD      0x0008
+
+/* Расширенная capability AER и два бита серьёзности, которые atl1c понижает: у этих карт
+ * link-уровневые сбои бывают штатными и не должны валить систему. */
+#define PCI_EXT_CAP_ID_ERR      0x01
+#define PCI_ERR_UNCOR_SEVER     0x0c
+#define PCI_ERR_UNC_DLP         0x00000010
+#define PCI_ERR_UNC_FCP         0x00002000
 
 /* Состояния питания (linux/pci.h). */
 typedef int pci_power_t;
@@ -146,6 +172,12 @@ void pci_clear_mwi(struct pci_dev *dev);
 int  pci_select_bars(struct pci_dev *dev, unsigned long flags);
 int  pci_request_selected_regions(struct pci_dev *dev, int bars, const char *name);
 void pci_release_selected_regions(struct pci_dev *dev, int bars);
+/* Веха 131 — «все регионы разом». В Linux это отдельные функции, а не обёртки над
+ * selected-версиями; atl1c зовёт именно их. */
+int  pci_request_regions(struct pci_dev *dev, const char *name);
+void pci_release_regions(struct pci_dev *dev);
+/* Поиск РАСШИРЕННОЙ capability (пространство PCIe за 0x100). Возвращает смещение или 0. */
+int  pci_find_ext_capability(struct pci_dev *dev, int cap);
 void __iomem *pci_ioremap_bar(struct pci_dev *dev, int bar);
 
 /* Аксессоры BAR (linux/pci.h — inline поверх resource[]). */

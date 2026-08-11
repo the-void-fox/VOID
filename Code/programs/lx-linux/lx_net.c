@@ -12,6 +12,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/random.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -134,7 +135,14 @@ __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 { (void)dev; return skb ? skb->protocol : 0; }
 int eth_validate_addr(struct net_device *dev)
 { return is_valid_ether_addr(dev->dev_addr) ? 0 : -22 /* -EINVAL */; }
-void eth_hw_addr_random(struct net_device *dev) { memset(dev->dev_addr, 0x02, ETH_ALEN); }
+void eth_random_addr(u8 *addr)
+{
+	get_random_bytes(addr, ETH_ALEN);
+	addr[0] &= 0xfe; /* одноадресный */
+	addr[0] |= 0x02; /* назначен локально */
+}
+
+void eth_hw_addr_random(struct net_device *dev) { eth_random_addr(dev->dev_addr); }
 
 struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
 { (void)dev; (void)index; return NULL; }

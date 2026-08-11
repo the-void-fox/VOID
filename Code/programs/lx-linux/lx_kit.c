@@ -26,6 +26,8 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include <linux/random.h>
+
 #include "lx_sched.h" /* кооперативный планировщик (Веха 62) */
 
 #ifdef LX_HAVE_SYSCALL
@@ -761,6 +763,27 @@ void pci_release_selected_regions(struct pci_dev *dev, int bars)
 	(void)dev; (void)bars;
 }
 
+int pci_request_regions(struct pci_dev *dev, const char *name)
+{
+	return pci_request_selected_regions(dev, (1 << PCI_STD_NUM_BARS) - 1, name);
+}
+
+void pci_release_regions(struct pci_dev *dev)
+{
+	pci_release_selected_regions(dev, (1 << PCI_STD_NUM_BARS) - 1);
+}
+
+/* Расширенные capability живут ЗА пределами первых 256 байт конфига (с 0x100), связанным
+ * списком с 32-битными заголовками. Мы держим только первые 256 байт (`lx_config`), поэтому
+ * честно отвечаем «нет такой»: драйвер обязан пережить отсутствие AER — это необязательная
+ * возможность, а не право на существование. Соврать здесь ненулевым смещением значило бы
+ * пустить его писать по случайному месту конфига. */
+int pci_find_ext_capability(struct pci_dev *dev, int cap)
+{
+	(void)dev; (void)cap;
+	return 0;
+}
+
 /* Окно BAR: ioremap identity над стартом BAR (реальное окно — по MMIO-cap VOID). */
 void __iomem *pci_ioremap_bar(struct pci_dev *dev, int bar)
 {
@@ -1052,4 +1075,51 @@ void lx_sched_run(void)
 			free(t);
 		}
 	}
+}
+
+/* ─── CRC-32 (Веха 131) ──────────────────────────────────────────────────────
+ *
+ * Сетевым драйверам он нужен для хэша многоадресных MAC-адресов. Побитовая версия, а не
+ * табличная: считается она по шесть байт на адрес и в горячий путь не попадает, а таблица
+ * на 256 слов стоила бы килобайта ради экономии, которой никто не заметит.
+ *
+ * Полином 0xEDB88320 — это 0x04C11DB7, записанный задом наперёд: crc32_le обрабатывает биты
+ * от младшего к старшему, в том порядке, в каком Ethernet кладёт их в провод.
+ */
+u32 crc32_le(u32 crc, const void *p, size_t len)
+{
+	const unsigned char *b = p;
+	size_t i;
+	int k;
+
+	for (i = 0; i < len; i++) {
+		crc ^= b[i];
+		for (k = 0; k < 8; k++)
+			crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1) + 1));
+	}
+	return crc;
+}
+
+/* ─── случайность (Веха 131) ─────────────────────────────────────────────────
+ *
+ * Ядро VOID отдаёт её по `SYS_RANDOM` — аппаратный ГСЧ, подмешанный к пулу событий. Права на
+ * это не нужно: случайность не ресурс, а свойство системы.
+ *
+ * Сборкам БЕЗ syscall'ов (харнессы, где драйвер только компилируется и считает логику) отдаём
+ * заведомо непригодные байты и говорим об этом вслух. Молчаливая псевдослучайность здесь была бы
+ * опаснее отказа: MAC-адрес, выданный «случайно», но одинаковый на всех машинах, сталкивался бы
+ * в одной сети — и искали бы это долго.
+ */
+void get_random_bytes(void *buf, size_t len)
+{
+#ifdef LX_HAVE_SYSCALL
+	vsys_random(buf, len);
+#else
+	static int warned;
+	if (!warned) {
+		warned = 1;
+		printk("lx_kit: СЛУЧАЙНОСТИ НЕТ (сборка без syscall'ов) — байты фиктивные\n");
+	}
+	memset(buf, 0xa5, len);
+#endif
 }
