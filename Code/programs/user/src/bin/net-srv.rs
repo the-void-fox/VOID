@@ -29,6 +29,8 @@
 
 use void_user as sys;
 
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::storage::PacketMetadata;
@@ -43,8 +45,41 @@ use sys::net_cli::{
     ST_EOF, ST_ERR, ST_OK, ST_TIMEOUT,
 };
 
-/// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы.
+/// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы. Сокету с
+/// номером `i` в пуле достаётся `PING_IDENT + i`: одинаковый ident на всех означал бы, что ответ
+/// на ЧУЖОЙ запрос примет первый попавшийся сокет.
 const PING_IDENT: u16 = 0x1D0;
+
+/// Размер пула сокетов для пинга (Веха 135). Зачем пул — см. `ping`.
+///
+/// Восемь, а не один, и не сто. Сокет сжигается только на адресе, который НЕ ОТЗЫВАЕТСЯ НА ARP, а
+/// такой обязан лежать в нашей же подсети: до всего остального ARP делается к шлюзу, и отвечает
+/// шлюз. То есть сжечь пул можно лишь восемью разными несуществующими соседями подряд.
+const PING_SOCKETS: usize = 8;
+
+/// Коды отказа пинга (уходят клиенту первым байтом ответа).
+const PING_UNRESOLVED: u8 = 1;
+const PING_NO_REPLY: u8 = 2;
+const PING_EXHAUSTED: u8 = 3;
+
+/// Пул сокетов пинга: `cur` — текущий, всё до него сожжено и из набора удалено.
+struct PingPool {
+    handles: [SocketHandle; PING_SOCKETS],
+    cur: usize,
+}
+
+/// Номер очередного echo-запроса. Растёт на каждый пинг (Веха 135).
+///
+/// Раньше здесь стояла жёсткая единица, а приём брал за ответ ЛЮБОЙ пакет, попавший в сокет:
+/// ни отправителя, ни тип, ни номер никто не проверял. Это давало ложь в замере, причём в
+/// сторону «всё хорошо». Пинг ушёл, ответ опоздал за бюджет — вернули «нет ответа», но ответ-то
+/// пришёл и лёг в буфер приёма. Следующий пинг — хоть бы и на заведомо мёртвый адрес — видел его
+/// первым же `can_recv` и рапортовал успех с RTT в считаные микросекунды.
+///
+/// В SLIRP этого было не увидеть: он отвечает мгновенно и не теряет, так что буфер приёма никогда
+/// не бывал непустым к началу следующего пинга. Нашлось на честном сегменте с записью провода
+/// (`netlab.py`): в дампе все три запроса шли с `seq 1`.
+static PING_SEQ: AtomicU16 = AtomicU16::new(1);
 
 /// Веха 90 — бюджет операции, которой может понадобиться РАЗРЕШИТЬ адрес. Больше секунды не по
 /// прихоти: `NeighborCache` в smoltcp глушит ARP-запросы на 1 с после ЛЮБОГО предыдущего (поле
@@ -231,14 +266,12 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     let mut iface = Interface::new(config, &mut device, sys::net_phy::now());
 
     // Сокеты и их буферы — статические (smoltcp собран без alloc): по одному кадру на сторону.
-    let mut rx_meta = [PacketMetadata::EMPTY; 4];
-    let mut rx_data = [0u8; 1024];
-    let mut tx_meta = [PacketMetadata::EMPTY; 4];
-    let mut tx_data = [0u8; 1024];
-    let icmp_socket = icmp::Socket::new(
-        icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
-        icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),
-    );
+    // ICMP — пул из PING_SOCKETS штук (Веха 135, см. `ping`); буферы объявлены ДО `SocketSet`,
+    // как и у TCP: сокеты одалживают их на всё время жизни набора.
+    let mut icmp_rx_meta = [[PacketMetadata::EMPTY; 4]; PING_SOCKETS];
+    let mut icmp_rx_data = [[0u8; 256]; PING_SOCKETS];
+    let mut icmp_tx_meta = [[PacketMetadata::EMPTY; 4]; PING_SOCKETS];
+    let mut icmp_tx_data = [[0u8; 256]; PING_SOCKETS];
     let mut dhcp_socket = dhcpv4::Socket::new();
     // Умолчание smoltcp — повтор DISCOVER раз в 10 с; это дольше нашего бюджета на баннер, и
     // единственный потерянный пакет стоил бы всей загрузки. Два повтора внутри бюджета честнее.
@@ -254,9 +287,21 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     let mut tcp_rx = [[0u8; TCP_RX]; MAX_CONN];
     let mut tcp_tx = [[0u8; TCP_TX]; MAX_CONN];
 
-    let mut storage = [SocketStorage::EMPTY; 3 + MAX_CONN];
+    let mut storage = [SocketStorage::EMPTY; 2 + PING_SOCKETS + MAX_CONN];
     let mut sockets = SocketSet::new(&mut storage[..]);
-    let icmp_handle = sockets.add(icmp_socket);
+    let mut icmp_bufs = icmp_rx_meta
+        .iter_mut()
+        .zip(icmp_rx_data.iter_mut())
+        .zip(icmp_tx_meta.iter_mut())
+        .zip(icmp_tx_data.iter_mut());
+    let icmp_handles: [SocketHandle; PING_SOCKETS] = core::array::from_fn(|_| {
+        let (((rm, rd), tm), td) = icmp_bufs.next().expect("буферов ровно PING_SOCKETS");
+        sockets.add(icmp::Socket::new(
+            icmp::PacketBuffer::new(&mut rm[..], &mut rd[..]),
+            icmp::PacketBuffer::new(&mut tm[..], &mut td[..]),
+        ))
+    });
+    let mut pings = PingPool { handles: icmp_handles, cur: 0 };
     let dns_handle = sockets.add(dns_socket);
     let dhcp_handle = cfg.dhcp.then(|| sockets.add(dhcp_socket));
     let mut bufs = tcp_rx.iter_mut().zip(tcp_tx.iter_mut());
@@ -274,9 +319,9 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     let mut hold = [[0u8; MAX_CHUNK]; MAX_CONN];
     let mut next_port: u16 = EPHEMERAL_BASE;
 
-    {
-        let s = sockets.get_mut::<icmp::Socket>(icmp_handle);
-        if s.bind(icmp::Endpoint::Ident(PING_IDENT)).is_err() {
+    for (i, h) in pings.handles.iter().enumerate() {
+        let s = sockets.get_mut::<icmp::Socket>(*h);
+        if s.bind(icmp::Endpoint::Ident(PING_IDENT + i as u16)).is_err() {
             sys::write("[net-srv] не удалось открыть ICMP-сокет\n".as_bytes());
         }
     }
@@ -319,13 +364,14 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         sys::write("[net-srv] самопинг шлюза ".as_bytes());
         write_ipv4(gw);
         sys::write(": ".as_bytes());
-        match ping(&mut iface, &mut device, &mut sockets, icmp_handle, gw) {
+        match ping(&mut iface, &mut device, &mut sockets, &mut pings, gw) {
             Ok(rtt) => {
                 sys::write("ответ за ".as_bytes());
                 write_dec(rtt);
                 sys::write(" мкс\n".as_bytes());
             }
-            Err(2) => sys::write("нет ICMP-ответа\n".as_bytes()),
+            Err(PING_NO_REPLY) => sys::write("нет ICMP-ответа\n".as_bytes()),
+            Err(PING_EXHAUSTED) => sys::write("сокеты пинга кончились\n".as_bytes()),
             Err(_) => sys::write("адрес не разрешился\n".as_bytes()),
         }
     } else {
@@ -381,7 +427,7 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
             OP_PING if body.len() >= 4 => {
                 let target = Ipv4Address::new(body[0], body[1], body[2], body[3]);
                 let mut rep = [0u8; 5];
-                match ping(&mut iface, &mut device, &mut sockets, icmp_handle, target) {
+                match ping(&mut iface, &mut device, &mut sockets, &mut pings, target) {
                     Ok(rtt) => rep[1..5].copy_from_slice(&(rtt as u32).to_le_bytes()),
                     Err(code) => rep[0] = code,
                 }
@@ -852,25 +898,47 @@ fn resolve(
 ///
 /// Стек прокачивается `iface.poll` в цикле: это же разбирает ARP, отвечает на чужие запросы к
 /// нам и вообще двигает всю машинерию — своей обработки протоколов у нас больше нет.
+/// Пинг. Отдельный сокет из пула — не блажь, а обход свойства smoltcp (Веха 135).
+///
+/// Пакет, для которого не разрешился сосед, smoltcp НЕ ВЫБРАСЫВАЕТ: он остаётся головой очереди
+/// передачи сокета навсегда (`dispatch` возвращает ошибку, а `dequeue_with` при ошибке оставляет
+/// запись). Публичного способа очистить очередь передачи у сокета нет.
+///
+/// Что это давало на одном общем сокете. Один пинг по несуществующему адресу СВОЕЙ подсети — и
+/// сетевая служба ломалась насовсем: очередь передачи навсегда занята, все последующие пинги
+/// (уже по живым адресам) вставали за ним и не уходили на провод вовсе, а машина до перезагрузки
+/// молотила ARP-запросами по мёртвому адресу. Замерено: 186 ARP за полторы минуты, три пинга по
+/// заведомо живому шлюзу подряд — ни одного ICMP-пакета на проводе.
+///
+/// Лечение: сокет, в котором пакет застрял, СПИСЫВАЕТСЯ из набора (`SocketSet::remove` — вместе с
+/// сокетом уходит и застрявший пакет, и ARP-долбёжка), а пинг переходит на следующий из пула.
+/// Пул конечен, и когда он кончится, служба скажет об этом прямо, а не соврёт «нет ответа».
 fn ping(
     iface: &mut Interface,
     device: &mut sys::net_phy::VoidDevice,
     sockets: &mut SocketSet,
-    handle: SocketHandle,
+    pool: &mut PingPool,
     target: Ipv4Address,
 ) -> Result<usize, u8> {
     let started = sys::now();
     let deadline = sys::net_phy::now() + Duration::from_millis(RESOLVE_MS);
 
+    if pool.cur >= PING_SOCKETS {
+        return Err(PING_EXHAUSTED);
+    }
+    let handle = pool.handles[pool.cur];
+    let ident = PING_IDENT + pool.cur as u16;
+
     // 1) Отправить. `can_send` станет истинным не сразу: smoltcp сперва разрешит адрес по ARP,
     //    а до этого места в очереди нет — поэтому крутим poll до дедлайна.
     let payload = [0u8; 16];
+    let seq_no = PING_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut sent = false;
     while !sent && sys::net_phy::now() < deadline {
         iface.poll(sys::net_phy::now(), device, sockets);
         let s = sockets.get_mut::<icmp::Socket>(handle);
         if s.can_send() {
-            let repr = Icmpv4Repr::EchoRequest { ident: PING_IDENT, seq_no: 1, data: &payload };
+            let repr = Icmpv4Repr::EchoRequest { ident, seq_no, data: &payload };
             if let Ok(buf) = s.send(repr.buffer_len(), IpAddress::Ipv4(target)) {
                 repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &device_checksum(device));
                 sent = true;
@@ -878,20 +946,70 @@ fn ping(
         }
     }
     if !sent {
-        return Err(1);
+        return Err(PING_UNRESOLVED);
     }
 
-    // 2) Ждать ответ.
-    while sys::net_phy::now() < deadline {
+    // 2) Ждать ответ ИМЕННО НА ЭТОТ запрос. Всё, что не совпало (опоздавший ответ на прошлый
+    //    пинг, ICMP-ошибка, чужой echo), выбрасываем и ждём дальше — иначе засчитаем чужое за
+    //    своё и соврём про RTT.
+    let checksum = device_checksum(device);
+    let mut answered = None;
+    while answered.is_none() && sys::net_phy::now() < deadline {
         iface.poll(sys::net_phy::now(), device, sockets);
-        let s = sockets.get_mut::<icmp::Socket>(handle);
-        if s.can_recv() {
-            let _ = s.recv();
-            let ticks = sys::now().wrapping_sub(started);
-            return Ok(ticks * sys::TICK_NS / 1000);
+        loop {
+            let s = sockets.get_mut::<icmp::Socket>(handle);
+            if !s.can_recv() {
+                break;
+            }
+            let ours = match s.recv() {
+                Ok((bytes, from)) => is_our_reply(bytes, from, target, ident, seq_no, &checksum),
+                Err(_) => false,
+            };
+            if ours {
+                answered = Some(sys::now().wrapping_sub(started));
+                break;
+            }
         }
     }
-    Err(2)
+
+    // 3) Ушёл ли запрос ВООБЩЕ. Непустая очередь передачи по истечении бюджета означает, что
+    //    сосед так и не разрешился и пакет застрял навсегда — сокет придётся списать.
+    if sockets.get_mut::<icmp::Socket>(handle).send_queue() > 0 {
+        sockets.remove(handle);
+        pool.cur += 1;
+        sys::write("[net-srv] адрес не отзывается на ARP, сокет пинга списан (осталось ".as_bytes());
+        write_dec(PING_SOCKETS - pool.cur);
+        sys::write(")\n".as_bytes());
+        return Err(PING_UNRESOLVED);
+    }
+
+    match answered {
+        Some(ticks) => Ok(ticks * sys::TICK_NS / 1000),
+        None => Err(PING_NO_REPLY),
+    }
+}
+
+/// Ответ ли это на наш запрос: echo-reply от того, кого спрашивали, с нашим ident и номером.
+/// `Icmpv4Repr::parse` заодно сверяет контрольную сумму, так что битый пакет за ответ не сойдёт.
+fn is_our_reply(
+    bytes: &[u8],
+    from: IpAddress,
+    target: Ipv4Address,
+    ident: u16,
+    seq_no: u16,
+    checksum: &smoltcp::phy::ChecksumCapabilities,
+) -> bool {
+    if from != IpAddress::Ipv4(target) {
+        return false;
+    }
+    let Ok(packet) = Icmpv4Packet::new_checked(bytes) else {
+        return false;
+    };
+    matches!(
+        Icmpv4Repr::parse(&packet, checksum),
+        Ok(Icmpv4Repr::EchoReply { ident: got_id, seq_no: got_seq, .. })
+            if got_id == ident && got_seq == seq_no
+    )
 }
 
 /// Возможности устройства по контрольным суммам — нужны `Icmpv4Repr::emit`.

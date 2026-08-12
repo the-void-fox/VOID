@@ -25,6 +25,9 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     wheel up|down      — колесо мыши (в QEMU это кнопки wheel-up/wheel-down)
     hotkey <аккорд>    — аккорд клавиатуры PS/2, например: hotkey Super+Return
     shot <имя>         — снять кадр в <каталог-выхода>/<имя>.png
+
+Окружение (сеть — Веха 135, см. блок ниже): VOID_QEMU_ACCEL, VOID_QEMU_MEM, VOID_QEMU_CPU,
+VOID_QEMU_NIC, VOID_QEMU_NET, VOID_QEMU_PCAP.
 """
 import json, os, socket, struct, subprocess, sys, time, zlib
 
@@ -46,6 +49,61 @@ mem = os.environ.get("VOID_QEMU_MEM", "512M")
 # `VOID_QEMU_CPU=host` (под KVM) или `max`, иначе код просто не исполнится и «проверка» соврёт.
 cpu = os.environ.get("VOID_QEMU_CPU", "")
 
+# ─── сетевой стенд (Веха 135) ────────────────────────────────────────────────────────────────
+#
+# Раньше здесь было намертво вбито `-netdev user` — SLIRP. Для сетевой фазы это плохой стенд, и
+# вот чем: SLIRP не провод, а НАТ в процессе QEMU. Он отвечает мгновенно и всегда, сам
+# придумывает ответы на ARP и DHCP, не пускает широковещание дальше себя и не показывает, что
+# именно мы положили на провод. Ровно тот класс лжи, на котором мы уже обожглись (см.
+# notes/known-gaps.md и «QEMU прячет ошибки»): вялость старта из-за глухого цикла DHCP была
+# невидима именно потому, что SLIRP отвечал в тот же миг.
+#
+#   VOID_QEMU_NIC   virtio | e1000 | none      — какую карту показать гостю
+#   VOID_QEMU_NET   user | seg:<путь> | join:<путь> | tap:<имя> | none
+#   VOID_QEMU_PCAP  <файл.pcap>                — записать ВСЁ, что прошло через карту
+#
+# `seg:` и `join:` — сегмент L2 между двумя VOID'ами: первый слушает unix-сокет, второй
+# подключается, и дальше это честный кусок провода (кадр в кадр, без чужого стека посередине).
+# Привилегий не требует. `tap:<имя>` — выход в настоящую сеть машины; tap должен быть заведён
+# заранее и принадлежать пользователю (см. notes/void-qemu-run.md).
+nic = os.environ.get("VOID_QEMU_NIC", "virtio")
+net = os.environ.get("VOID_QEMU_NET", "user")
+pcap = os.environ.get("VOID_QEMU_PCAP", "")
+
+NIC_DEV = {
+    "virtio": "virtio-net-pci,netdev=net0,disable-legacy=on",
+    "e1000": "e1000,netdev=net0",
+}
+# Умолчание QEMU для первой карты — 52:54:00:12:34:56, ОДИНАКОВОЕ у всех машин. Пока машина одна,
+# это незаметно; на общем сегменте два одинаковых MAC ломают всё сразу (см. netlab.py).
+mac = os.environ.get("VOID_QEMU_MAC", "")
+
+
+def netdev_args():
+    """Строки `-netdev`/`-device`/`-object` под выбранный стенд."""
+    if net == "none" or nic == "none":
+        return []
+    kind, _, arg = net.partition(":")
+    if kind == "user":
+        backend = "user,id=net0"
+    elif kind == "seg":
+        backend = f"stream,id=net0,server=on,addr.type=unix,addr.path={arg}"
+    elif kind == "join":
+        backend = f"stream,id=net0,server=off,addr.type=unix,addr.path={arg}"
+    elif kind == "tap":
+        # script=no/downscript=no: поднимать tap — дело хозяина стенда, не QEMU.
+        backend = f"tap,id=net0,ifname={arg},script=no,downscript=no"
+    else:
+        sys.exit(f"VOID_QEMU_NET: не понимаю '{net}'")
+    if nic not in NIC_DEV:
+        sys.exit(f"VOID_QEMU_NIC: не понимаю '{nic}' (есть: {', '.join(NIC_DEV)}, none)")
+    dev = NIC_DEV[nic] + (f",mac={mac}" if mac else "")
+    args = ["-netdev", backend, "-device", dev]
+    if pcap:
+        args += ["-object", f"filter-dump,id=dump0,netdev=net0,file={pcap}"]
+    return args
+
+
 qemu = [
     "qemu-system-x86_64", "-machine", "q35", "-m", mem,
     *(["-accel", accel] if accel else []),
@@ -53,7 +111,12 @@ qemu = [
     "-device", "ich9-ahci,id=a",
     "-drive", f"if=none,id=d,file={img},format=raw",
     "-device", "ide-hd,drive=d,bus=a.0", "-boot", "c",
-    "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0,disable-legacy=on",
+    # VOID_QEMU_SNAPSHOT=1 — писать не в образ, а во временный слой поверх него. Нужно, когда
+    # один образ гонят СРАЗУ НЕСКОЛЬКО машин (netlab.py): иначе вторая падает на «Failed to get
+    # write lock» — QEMU честно не даёт двум писать в один диск. Побочно это делает прогон
+    # повторяемым: store каждый раз стартует с одного и того же поколения.
+    *(["-snapshot"] if os.environ.get("VOID_QEMU_SNAPSHOT") else []),
+    *netdev_args(),
     "-device", "virtio-rng-pci,disable-legacy=on",
     "-display", "none",
     "-serial", "stdio",
