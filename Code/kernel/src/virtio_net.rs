@@ -24,8 +24,14 @@ use alloc::vec::Vec;
 use crate::sync::SpinLock;
 use crate::{arch, frame};
 
-/// Размер очереди (число дескрипторов/буферов). RX-буферов столько же.
-const QSIZE: usize = 8;
+/// ВМЕСТИМОСТЬ колец (верхняя граница числа дескрипторов). Сколько занято на самом деле —
+/// `Queue::size`: устройство объявляет свой максимум, и превысить его нельзя.
+///
+/// Веха 135.2 — было 8. Это потолок не только «сколько кадров влезет», но и СКОРОСТИ TCP: глубина
+/// кольца — это то, сколько кадров переживёт приём, пока мы их не разгребли, а по этому числу
+/// (`max_burst_size` в net_phy.rs) smoltcp зажимает объявляемое окно. С восьмёркой окно упиралось
+/// в ~11.8 КиБ независимо от буферов.
+const QSIZE: usize = 64;
 /// Размер одного буфера: 12-байтный заголовок + кадр (Ethernet MTU 1514 + запас).
 const BUF: usize = 2048;
 /// Длина заголовка virtio_net_hdr (modern, VIRTIO_F_VERSION_1 → есть num_buffers).
@@ -141,6 +147,10 @@ struct Queue {
     desc: usize,
     avail: usize,
     used: usize,
+    /// Согласованный с устройством размер очереди: `min(QSIZE, максимум устройства)`. Кольца
+    /// выделены на QSIZE записей, но заворачиваться обязаны по ЭТОМУ числу — иначе мы и
+    /// устройство считаем слоты по-разному, а это тихая порча кадров.
+    size: usize,
     /// Наш продюсер-индекс avail (сколько всего опубликовали).
     avail_idx: u16,
     /// Сколько записей used уже обработали.
@@ -151,7 +161,7 @@ impl Queue {
     /// Опубликовать дескриптор `head` в avail и увеличить idx (без notify).
     unsafe fn publish(&mut self, head: u16) {
         let avail = crate::frame::ptr(self.avail) as *mut Avail;
-        write_volatile(&mut (*avail).ring[(self.avail_idx as usize) % QSIZE], head);
+        write_volatile(&mut (*avail).ring[(self.avail_idx as usize) % self.size], head);
         fence(Ordering::SeqCst);
         self.avail_idx = self.avail_idx.wrapping_add(1);
         write_volatile(&mut (*avail).idx, self.avail_idx);
@@ -167,7 +177,7 @@ impl Queue {
     /// Снять следующую запись used: (id дескриптора, число байт от устройства).
     unsafe fn take_used(&mut self) -> (u16, u32) {
         let used = crate::frame::ptr(self.used) as *const Used;
-        let slot = (self.used_idx as usize) % QSIZE;
+        let slot = (self.used_idx as usize) % self.size;
         let e = &(*used).ring[slot];
         let (id, len) = (read_volatile(&e.id) as u16, read_volatile(&e.len));
         fence(Ordering::SeqCst);
@@ -249,6 +259,11 @@ pub fn present() -> bool {
     NET.lock().is_some()
 }
 
+/// Согласованная с устройством глубина приёмной очереди (0 — карты нет).
+pub fn rx_ring_len() -> usize {
+    NET.lock().as_ref().map_or(0, |n| n.rx.size)
+}
+
 /// Веха 91 - прерывание ПРИЁМА карты (0 - нет, драйвер остаётся на опросе) и адреса, по которым
 /// его подтверждают. Адреса сохраняем заранее: обработчик прерывания не имеет права брать замок
 /// `NET`, который держит обычный код (Веха 89, п.1 - иначе дедлок на одном ядре).
@@ -325,16 +340,21 @@ pub fn init() -> bool {
 /// Возвращает готовую [`Queue`] или `None`, если очереди у устройства нет.
 unsafe fn setup_queue_mmio(base: usize, q: u16) -> Option<Queue> {
     w32(base, REG_QUEUE_SEL, q as u32);
-    if r32(base, REG_QUEUE_NUM_MAX) == 0 {
+    let dev_max = r32(base, REG_QUEUE_NUM_MAX) as usize;
+    if dev_max == 0 {
         return None;
     }
-    w32(base, REG_QUEUE_NUM, QSIZE as u32);
+    // Объявленный устройством максимум — именно МАКСИМУМ, просить больше нельзя. Раньше сюда
+    // безусловно писалось QSIZE, а прочитанное значение только сравнивалось с нулём; с восьмёркой
+    // это ни на чём не проявлялось, но правильным не было.
+    let size = QSIZE.min(dev_max);
+    w32(base, REG_QUEUE_NUM, size as u32);
     let (desc, avail, used) = alloc_rings();
     write_addr(base, REG_QUEUE_DESC_LOW, REG_QUEUE_DESC_HIGH, desc);
     write_addr(base, REG_QUEUE_DRIVER_LOW, REG_QUEUE_DRIVER_HIGH, avail);
     write_addr(base, REG_QUEUE_DEVICE_LOW, REG_QUEUE_DEVICE_HIGH, used);
     w32(base, REG_QUEUE_READY, 1);
-    Some(Queue { desc, avail, used, avail_idx: 0, used_idx: 0 })
+    Some(Queue { desc, avail, used, size, avail_idx: 0, used_idx: 0 })
 }
 
 fn init_mmio(base: usize) -> bool {
@@ -408,10 +428,13 @@ fn init_pci(common: usize, notify_base: usize, notify_mult: u32, device: usize) 
     let mut queues: [Option<Queue>; 2] = [None, None];
     for q in 0..2u16 {
         w16p(PCI_QUEUE_SEL, q);
-        if r16p(PCI_QUEUE_SIZE) == 0 {
+        // Прочитанное здесь — МАКСИМУМ устройства (0 значит «очереди нет»); просить больше нельзя.
+        let dev_max = r16p(PCI_QUEUE_SIZE) as usize;
+        if dev_max == 0 {
             return false;
         }
-        w16p(PCI_QUEUE_SIZE, QSIZE as u16);
+        let size = QSIZE.min(dev_max);
+        w16p(PCI_QUEUE_SIZE, size as u16);
         // Веха 91 - привязать очередь ПРИЁМА (q=0) к записи 0 таблицы MSI-X. Без этого
         // устройство остаётся с NO_VECTOR и прерываний не шлёт вовсе: ровно этот шаг делает
         // virtio-blk, и ровно его тут не хватало - сеть поэтому и жила опросом.
@@ -424,7 +447,7 @@ fn init_pci(common: usize, notify_base: usize, notify_mult: u32, device: usize) 
         notify[q as usize] =
             notify_base + r16p(PCI_QUEUE_NOTIFY_OFF) as usize * notify_mult as usize;
         w16p(PCI_QUEUE_ENABLE, 1);
-        queues[q as usize] = Some(Queue { desc, avail, used, avail_idx: 0, used_idx: 0 });
+        queues[q as usize] = Some(Queue { desc, avail, used, size, avail_idx: 0, used_idx: 0 });
     }
 
     status |= STATUS_DRIVER_OK as u8;
@@ -452,8 +475,11 @@ fn alloc_rings() -> (usize, usize, usize) {
 
 /// Опубликовать готовое устройство под замком и засеять приёмные буферы.
 fn publish(notify: Notify, rx: Queue, tx: Queue, mac: [u8; 6]) {
-    let mut rx_bufs = Vec::with_capacity(QSIZE);
-    for _ in 0..QSIZE {
+    // Буферов ровно столько, сколько слотов согласовано с устройством, — не QSIZE: лишние были бы
+    // памятью, в которую никто никогда не напишет.
+    let slots = rx.size;
+    let mut rx_bufs = Vec::with_capacity(slots);
+    for _ in 0..slots {
         rx_bufs.push(Box::new([0u8; BUF]));
     }
     let mut net = VirtioNet { notify, rx, tx, rx_bufs, tx_buf: Box::new([0u8; BUF]), mac };
@@ -461,7 +487,7 @@ fn publish(notify: Notify, rx: Queue, tx: Queue, mac: [u8; 6]) {
     // Засеять RX-кольцо: дескриптор i указывает на буфер i (устройство В него ПИШЕТ).
     unsafe {
         let desc = crate::frame::ptr(net.rx.desc) as *mut Desc;
-        for i in 0..QSIZE {
+        for i in 0..slots {
             let pa = arch::virt_to_phys(net.rx_bufs[i].as_ptr() as usize) as u64;
             set_desc(desc, i, pa, BUF as u32, DESC_F_WRITE, 0);
             net.rx.publish(i as u16);
