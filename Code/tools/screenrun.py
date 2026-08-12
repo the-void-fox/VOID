@@ -83,7 +83,10 @@ mac = os.environ.get("VOID_QEMU_MAC", "")
 def netdev_args():
     """Строки `-netdev`/`-device`/`-object` под выбранный стенд."""
     if net == "none" or nic == "none":
-        return []
+        # `-nic none` обязателен: без КАКИХ-ЛИБО сетевых ключей QEMU молча добавляет карту сам
+        # (SLIRP по умолчанию). Проверено — «none» давал гостю сеть и адрес по DHCP, то есть
+        # ровно то, что просили выключить.
+        return ["-nic", "none"]
     kind, _, arg = net.partition(":")
     if kind == "user":
         backend = "user,id=net0"

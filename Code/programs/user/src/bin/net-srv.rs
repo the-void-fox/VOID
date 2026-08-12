@@ -22,7 +22,20 @@
 //!   разрешился, 2 — нет ответа, 3 — карты нет.
 //! - `OP_RESOLVE` (Веха 92) — нагрузка = имя (UTF-8, без завершающего NUL); payload = A-запись.
 //!   status 0 — ok, 1 — имя не разрешилось (NXDOMAIN/нет DNS), 2 — нет ответа за отведённое
-//!   время, 3 — карты нет / негодный запрос.
+//!   время, 3 — карты нет / негодный запрос, 5 — имя ЗАПРЕЩЕНО политикой (Веха 136).
+//!
+//! **Веха 136 — резолвер настраивается конфигом поколения** ([[vvsh-config-layout]]), теми же
+//! `arg:`-токенами:
+//!
+//! - `dns=A.B.C.D[,A.B.C.D…]` — до четырёх резолверов по порядку опроса (был один);
+//! - `host=имя=A.B.C.D` — своя запись имени: отвечаем сами, не спрашивая сеть;
+//! - `block=КОРЕНЬ|CONTENT-ID` — список блокировки («блокировщик рекламы»): объект store с
+//!   именами (формат hosts или голые имена), имя из списка закрывает и его поддомены. Читать
+//!   его сервису можно, только если конфиг дал право `store:r`.
+//!
+//! Порядок разбора имени — свои записи, потом список, и лишь потом провод. Список живёт в store
+//! объектом, а не файлом сбоку: он тогда неизменяем, адресуется по содержимому, применяется
+//! `rebuild`'ом и откатывается вместе с поколением.
 
 #![no_std]
 #![no_main]
@@ -42,7 +55,7 @@ use smoltcp::wire::{
 
 use sys::net_cli::{
     MAX_CHUNK, OP_PING, OP_RESOLVE, OP_TCP_CLOSE, OP_TCP_CONNECT, OP_TCP_RECV, OP_TCP_SEND, ST_BAD,
-    ST_EOF, ST_ERR, ST_OK, ST_TIMEOUT,
+    ST_BLOCKED, ST_EOF, ST_ERR, ST_OK, ST_TIMEOUT,
 };
 
 /// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы. Сокету с
@@ -91,7 +104,15 @@ const RESOLVE_MS: u64 = 3000;
 
 /// Бюджет DNS-запроса: дольше пинга, потому что путь длиннее (запрос уходит за пределы машины)
 /// и smoltcp сам ретранслирует по своему таймеру.
-const DNS_MS: u64 = 5000;
+///
+/// Веха 136 — число продиктовано smoltcp, а не вкусом. Измерено на стенде: запрос повторяется
+/// через 1 с, потом 2 с (дальше удвоение), а к СЛЕДУЮЩЕМУ серверу стек переходит только по
+/// своему сроку в 10 с (`RETRANSMIT_TIMEOUT`, константа вендоренного крейта). Бюджет меньше 10 с
+/// означал бы, что второй резолвер не спрашивают НИКОГДА — то есть резерв только на бумаге.
+const DNS_MS: u64 = 12_000;
+
+/// Сколько резолверов держим (`DNS_MAX_SERVER_COUNT` в сборке smoltcp — столько же).
+const DNS_SERVERS: usize = 4;
 
 /// Сколько ждать аренду ПРИ ЗАГРУЗКЕ, прежде чем печатать баннер и падать на статику. Это
 /// бюджет БАННЕРА, а не DHCP: сокет остаётся в наборе и продолжает пытаться в рабочем цикле —
@@ -154,23 +175,221 @@ impl Conn {
     const EMPTY: Conn = Conn { used: false, closing: false, hold_len: 0, pending: None };
 }
 
+// ── Веха 136: политика имён ──────────────────────────────────────────────────────────────────
+/// Сколько своих записей «имя → адрес» помещается (мини-hosts из конфига).
+const HOSTS_MAX: usize = 16;
+/// Потолок длины имени. DNS позволяет 255; столько в наших таблицах не нужно, а память нужна.
+const NAME_MAX: usize = 96;
+/// Арена имён списка блокировки и число ячеек таблицы (степень двойки — маска вместо деления).
+///
+/// 192 КиБ вмещают около десяти тысяч имён. Настоящие списки бывают на порядок больше, и
+/// **это ограничение честное**: при переполнении сервер печатает, сколько имён взял из скольких,
+/// а не делает вид, что взял все. Держать их сжатыми (фильтр Блума) было бы соблазнительно, но
+/// его ложные срабатывания — это МОЛЧА заблокированный чужой домен, чего от блокировщика ждать
+/// нельзя.
+const BLOCK_ARENA: usize = 192 * 1024;
+const BLOCK_SLOTS: usize = 16 * 1024;
+/// Буфер чтения куска блоба (столько же, сколько кусок у `fetch`).
+const BLOB_CHUNK: usize = 16 * 1024;
+/// Потолок числа кусков списка (16 КиБ каждый) — 8 МиБ файла.
+const BLOB_KIDS: usize = 512;
+
+/// Список блокировки: имена в арене, поиск по открытой адресации.
+///
+/// Живёт статикой, а не на стеке: стек процесса — 256 КиБ на всё, а таблица заведомо больше.
+struct Blocklist {
+    names: [u8; BLOCK_ARENA],
+    /// Ячейка = смещение имени в арене + 1 (0 — пусто).
+    slot: [u32; BLOCK_SLOTS],
+    used: usize,
+    count: usize,
+    /// Сколько имён ВСТРЕТИЛОСЬ в списке (включая не влезшие) — чтобы «взято 10000 из 150000»
+    /// было видно, а не подразумевалось.
+    seen: usize,
+    /// Рабочие буферы чтения из store (тоже статикой, по той же причине).
+    chunk: [u8; BLOB_CHUNK],
+    kids: [[u8; 32]; BLOB_KIDS],
+}
+
+static mut BLOCKLIST: Blocklist = Blocklist {
+    names: [0; BLOCK_ARENA],
+    slot: [0; BLOCK_SLOTS],
+    used: 0,
+    count: 0,
+    seen: 0,
+    chunk: [0; BLOB_CHUNK],
+    kids: [[0; 32]; BLOB_KIDS],
+};
+
+impl Blocklist {
+    /// FNV-1a: короткая, без таблиц и достаточная для рассеивания доменных имён.
+    fn hash(name: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in name {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    /// Положить имя (уже в нижнем регистре). `false` — арена или таблица кончились.
+    fn insert(&mut self, name: &[u8]) -> bool {
+        if name.is_empty() || name.len() > NAME_MAX || self.count * 4 >= BLOCK_SLOTS * 3 {
+            return false;
+        }
+        if self.used + 1 + name.len() > BLOCK_ARENA {
+            return false;
+        }
+        if self.contains(name) {
+            return true; // повтор — не ошибка и не место
+        }
+        let off = self.used;
+        self.names[off] = name.len() as u8;
+        self.names[off + 1..off + 1 + name.len()].copy_from_slice(name);
+        self.used += 1 + name.len();
+        let mut i = (Self::hash(name) as usize) & (BLOCK_SLOTS - 1);
+        while self.slot[i] != 0 {
+            i = (i + 1) & (BLOCK_SLOTS - 1);
+        }
+        self.slot[i] = off as u32 + 1;
+        self.count += 1;
+        true
+    }
+
+    fn contains(&self, name: &[u8]) -> bool {
+        let mut i = (Self::hash(name) as usize) & (BLOCK_SLOTS - 1);
+        while self.slot[i] != 0 {
+            let off = self.slot[i] as usize - 1;
+            let len = self.names[off] as usize;
+            if &self.names[off + 1..off + 1 + len] == name {
+                return true;
+            }
+            i = (i + 1) & (BLOCK_SLOTS - 1);
+        }
+        false
+    }
+
+    /// Запрещено ли имя: само или ЛЮБОЙ его родительский домен. Список «example.com» обязан
+    /// закрывать и `ads.example.com` — иначе от блокировщика нет толку: рекламные сети раздают
+    /// поддомены пачками.
+    fn blocks(&self, name: &[u8]) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        let mut start = 0;
+        loop {
+            if self.contains(&name[start..]) {
+                return true;
+            }
+            match name[start..].iter().position(|&c| c == b'.') {
+                // Одна метка («com») в списке — это блокировка всей зоны; такое в списках
+                // встречается и делается намеренно, поэтому доходим до конца.
+                Some(i) => start += i + 1,
+                None => return false,
+            }
+        }
+    }
+
+    /// Разобрать строку списка. Понимает и голое имя, и hosts-формат (`0.0.0.0 ads.example.com`)
+    /// — именно в нём раздают готовые списки блокировки.
+    fn feed_line(&mut self, line: &[u8]) {
+        let line = line.split(|&c| c == b'#').next().unwrap_or(&[]);
+        let mut fields = line.split(|c: &u8| c.is_ascii_whitespace()).filter(|s| !s.is_empty());
+        let (first, second) = (fields.next(), fields.next());
+        let name = match (first, second) {
+            // hosts-формат: адрес и имя. Имя — второе поле.
+            (Some(_), Some(n)) => n,
+            (Some(n), None) => n,
+            _ => return,
+        };
+        // Собственные записи hosts-файлов, которые к блокировке отношения не имеют.
+        if matches!(name, b"localhost" | b"localhost.localdomain" | b"broadcasthost" | b"local") {
+            return;
+        }
+        let mut lower = [0u8; NAME_MAX];
+        let Some(n) = normalize(name, &mut lower) else { return };
+        self.seen += 1;
+        self.insert(&lower[..n]);
+    }
+}
+
+/// Привести имя к нижнему регистру и проверить, что это вообще доменное имя. `None` — не имя
+/// (мусорная строка, слишком длинное, посторонние символы).
+fn normalize(name: &[u8], out: &mut [u8; NAME_MAX]) -> Option<usize> {
+    let name = name.strip_suffix(b".").unwrap_or(name); // «example.com.» — то же имя
+    if name.is_empty() || name.len() > NAME_MAX {
+        return None;
+    }
+    for (i, &b) in name.iter().enumerate() {
+        let c = b.to_ascii_lowercase();
+        if !(c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_') {
+            return None;
+        }
+        out[i] = c;
+    }
+    Some(name.len())
+}
+
+/// Своя запись «имя → адрес»: отвечаем сами, на провод не ходим.
+#[derive(Clone, Copy)]
+struct Host {
+    name: [u8; NAME_MAX],
+    len: usize,
+    addr: Ipv4Address,
+}
+
 /// Настройки сервера: значения по умолчанию + то, что переопределил конфиг системы.
 struct Cfg {
     dhcp: bool,
     cidr: Ipv4Cidr,
     gw: Option<Ipv4Address>,
-    dns: Option<Ipv4Address>,
+    /// Резолверы по порядку опроса. Веха 136: их может быть несколько — один сервер означает
+    /// «резолвер умер = имён нет вовсе».
+    dns: [Option<Ipv4Address>; DNS_SERVERS],
+    /// Свои записи имён (`arg:host=имя=A.B.C.D`).
+    hosts: [Host; HOSTS_MAX],
+    nhosts: usize,
+    /// Корень store (или content-id) со списком блокировки (`arg:block=…`).
+    block: [u8; 96],
+    block_len: usize,
 }
 
 impl Cfg {
     /// Умолчания под SLIRP QEMU — они же запасной путь, если DHCP молчит.
     fn new() -> Self {
+        let mut dns = [None; DNS_SERVERS];
+        dns[0] = Some(Ipv4Address::new(10, 0, 2, 3));
         Self {
             dhcp: true,
             cidr: Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24),
             gw: Some(Ipv4Address::new(10, 0, 2, 2)),
-            dns: Some(Ipv4Address::new(10, 0, 2, 3)),
+            dns,
+            hosts: [Host { name: [0; NAME_MAX], len: 0, addr: Ipv4Address::new(0, 0, 0, 0) };
+                HOSTS_MAX],
+            nhosts: 0,
+            block: [0; 96],
+            block_len: 0,
         }
+    }
+
+    /// Резолверы, которые надо объявить стеку (в порядке опроса).
+    fn dns_list(&self) -> ([IpAddress; DNS_SERVERS], usize) {
+        let mut out = [IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)); DNS_SERVERS];
+        let mut n = 0;
+        for a in self.dns.iter().flatten() {
+            out[n] = IpAddress::Ipv4(*a);
+            n += 1;
+        }
+        (out, n)
+    }
+
+    /// Найти свою запись имени (`arg:host=…`). Ищется ДО списка блокировки и до сети: это
+    /// сознательное «я знаю лучше» владельца машины.
+    fn host(&self, name: &[u8]) -> Option<Ipv4Address> {
+        self.hosts[..self.nhosts]
+            .iter()
+            .find(|h| &h.name[..h.len] == name)
+            .map(|h| h.addr)
     }
 
     /// Разобрать argv (`SYS_ARGS(0)`, записи через NUL; [0] — имя программы).
@@ -218,16 +437,64 @@ impl Cfg {
                     None => false,
                 },
                 b"dns" if matches!(val, b"none") => {
-                    cfg.dns = None;
+                    cfg.dns = [None; DNS_SERVERS];
                     true
                 }
-                b"dns" => match parse_ipv4(val) {
-                    Some(a) => {
-                        cfg.dns = Some(a);
-                        true
+                // Веха 136: резолверов может быть несколько через запятую. Один — это
+                // «резолвер молчит = имён в системе нет»; на настоящей сети так не живут.
+                b"dns" => {
+                    let mut list = [None; DNS_SERVERS];
+                    let mut n = 0;
+                    let mut ok = true;
+                    for part in val.split(|&b| b == b',').filter(|s| !s.is_empty()) {
+                        match parse_ipv4(part) {
+                            Some(a) if n < DNS_SERVERS => {
+                                list[n] = Some(a);
+                                n += 1;
+                            }
+                            Some(_) => {
+                                sys::write("[net-srv] резолверов больше ".as_bytes());
+                                write_dec(DNS_SERVERS);
+                                sys::write(" — лишние пропущены\n".as_bytes());
+                            }
+                            None => ok = false,
+                        }
                     }
-                    None => false,
+                    if ok && n > 0 {
+                        cfg.dns = list;
+                    }
+                    ok && n > 0
+                }
+                // Веха 136 — своя запись имени: `host=имя=A.B.C.D`. Значение содержит второй
+                // '=', поэтому режем по нему, а не по первому.
+                b"host" => match val.iter().position(|&b| b == b'=') {
+                    Some(e) if cfg.nhosts < HOSTS_MAX => {
+                        let (n, a) = (&val[..e], &val[e + 1..]);
+                        let mut slot = Host {
+                            name: [0; NAME_MAX],
+                            len: 0,
+                            addr: Ipv4Address::new(0, 0, 0, 0),
+                        };
+                        match (normalize(n, &mut slot.name), parse_ipv4(a)) {
+                            (Some(len), Some(addr)) => {
+                                slot.len = len;
+                                slot.addr = addr;
+                                cfg.hosts[cfg.nhosts] = slot;
+                                cfg.nhosts += 1;
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
                 },
+                // Веха 136 — список блокировки: корень store или content-id. Сам список читается
+                // позже, когда известно, дали ли нам право на store.
+                b"block" if val.len() <= cfg.block.len() => {
+                    cfg.block[..val.len()].copy_from_slice(val);
+                    cfg.block_len = val.len();
+                    true
+                }
                 _ => false,
             };
             if !ok {
@@ -241,7 +508,11 @@ impl Cfg {
 fn warn_arg(tok: &[u8]) {
     sys::write("[net-srv] не понял аргумент '".as_bytes());
     sys::write(tok);
-    sys::write("' (жду dhcp=off|on, ip=A.B.C.D/NN, gw=A.B.C.D, dns=A.B.C.D)\n".as_bytes());
+    sys::write(
+        "' (жду dhcp=off|on, ip=A.B.C.D/NN, gw=A.B.C.D, dns=A.B.C.D[,A.B.C.D], \
+         host=имя=A.B.C.D, block=корень)\n"
+            .as_bytes(),
+    );
 }
 
 #[no_mangle]
@@ -263,6 +534,39 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     sys::write("[net-srv] запущен, MAC ".as_bytes());
     write_mac(&mac);
     sys::write(" (smoltcp)\n".as_bytes());
+
+    // Веха 136 — список блокировки. Таблица имён статическая: стек процесса 256 КиБ на всё, а
+    // она заведомо больше. `addr_of_mut!` вместо `&mut STATIC` — иначе это ссылка на статик со
+    // всеми вытекающими предупреждениями компилятора.
+    let blocklist: &'static mut Blocklist = unsafe { &mut *core::ptr::addr_of_mut!(BLOCKLIST) };
+    if cfg.block_len > 0 {
+        // Право на store у сервиса появляется только если оно ДАНО в конфиге (`store:r`).
+        // Отсутствие права — не поломка: список просто не читается, и об этом говорится вслух.
+        match sys::cap_named("STORE") {
+            Some(store_cap) => {
+                let (kept, seen) = load_blocklist(store_cap, &cfg.block[..cfg.block_len], blocklist);
+                sys::write("[net-srv] список блокировки: ".as_bytes());
+                write_dec(kept);
+                if seen > kept {
+                    sys::write(" имён из ".as_bytes());
+                    write_dec(seen);
+                    sys::write(" (остальные не влезли)".as_bytes());
+                } else {
+                    sys::write(" имён".as_bytes());
+                }
+                sys::write("\n".as_bytes());
+            }
+            None => sys::write(
+                "[net-srv] список блокировки задан, но права на store нет (нужен store:r)\n"
+                    .as_bytes(),
+            ),
+        }
+    }
+    if cfg.nhosts > 0 {
+        sys::write("[net-srv] своих записей имён: ".as_bytes());
+        write_dec(cfg.nhosts);
+        sys::write("\n".as_bytes());
+    }
 
     let mut device = sys::net_phy::VoidDevice::new(dev_cap);
     let mut config = Config::new(EthernetAddress(mac).into());
@@ -359,6 +663,16 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         }
         if !leased {
             sys::write("[net-srv] DHCP: никто не ответил — беру статику\n".as_bytes());
+            // Веха 136 — вернуть СПОКОЙНЫЙ период повтора. Ускоренный (2 с) заведён ради
+            // загрузки: в бюджет баннера обязаны влезть два DISCOVER, иначе единственный
+            // потерянный пакет стоил бы всей загрузки. Дальше он вреден — на сегменте без
+            // DHCP-сервера машина вещала бы широковещательный DISCOVER каждые две секунды до
+            // самого выключения. Видно это стало только на честном проводе: SLIRP отвечает
+            // сразу, и повтора там не бывает вовсе.
+            let s = sockets.get_mut::<dhcpv4::Socket>(dh);
+            let mut retry = s.get_retry_config();
+            retry.discover_timeout = Duration::from_secs(10);
+            s.set_retry_config(retry);
         }
     }
     if !leased {
@@ -443,7 +757,10 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
                 let mut rep = [0u8; 5];
                 match core::str::from_utf8(body) {
                     Ok(name) => {
-                        match resolve(&mut iface, &mut device, &mut sockets, dns_handle, name) {
+                        match resolve(
+                            &mut iface, &mut device, &mut sockets, dns_handle, &cfg, blocklist,
+                            name,
+                        ) {
                             Ok(addr) => rep[1..5].copy_from_slice(&addr.octets()),
                             Err(code) => rep[0] = code,
                         }
@@ -753,18 +1070,25 @@ enum Lease {
     Got {
         cidr: Ipv4Cidr,
         router: Option<Ipv4Address>,
-        dns: Option<Ipv4Address>,
+        /// Веха 136 — резолверов от роутера обычно ДВА, и раньше второй молча выбрасывался
+        /// (`dns_servers.first()`). Берём всех, кого дали.
+        dns: [Option<Ipv4Address>; DNS_SERVERS],
+        ndns: usize,
     },
 }
 
 fn poll_dhcp(sockets: &mut SocketSet, handle: SocketHandle) -> Option<Lease> {
     match sockets.get_mut::<dhcpv4::Socket>(handle).poll()? {
         dhcpv4::Event::Deconfigured => Some(Lease::Lost),
-        dhcpv4::Event::Configured(c) => Some(Lease::Got {
-            cidr: c.address,
-            router: c.router,
-            dns: c.dns_servers.first().copied(),
-        }),
+        dhcpv4::Event::Configured(c) => {
+            let mut dns = [None; DNS_SERVERS];
+            let mut ndns = 0;
+            for a in c.dns_servers.iter().take(DNS_SERVERS) {
+                dns[ndns] = Some(*a);
+                ndns += 1;
+            }
+            Some(Lease::Got { cidr: c.address, router: c.router, dns, ndns })
+        }
     }
 }
 
@@ -790,7 +1114,7 @@ fn apply_dhcp(
                 *have_addr = false;
             }
         }
-        Lease::Got { cidr, router, dns } => {
+        Lease::Got { cidr, router, dns, ndns } => {
             set_addr(iface, cidr);
             match router {
                 Some(r) => {
@@ -800,16 +1124,20 @@ fn apply_dhcp(
                     iface.routes_mut().remove_default_ipv4_route();
                 }
             }
-            set_dns(sockets, dns_handle, dns);
+            let mut list = [IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)); DNS_SERVERS];
+            for (i, a) in dns.iter().flatten().enumerate() {
+                list[i] = IpAddress::Ipv4(*a);
+            }
+            set_dns(sockets, dns_handle, &list[..ndns]);
             sys::write("[net-srv] DHCP: адрес ".as_bytes());
             write_cidr(cidr);
             if let Some(r) = router {
                 sys::write(", шлюз ".as_bytes());
                 write_ipv4(r);
             }
-            if let Some(d) = dns {
-                sys::write(", DNS ".as_bytes());
-                write_ipv4(d);
+            for (i, d) in dns.iter().flatten().enumerate() {
+                sys::write(if i == 0 { ", DNS ".as_bytes() } else { ", ".as_bytes() });
+                write_ipv4(*d);
             }
             sys::write("\n".as_bytes());
             *have_addr = true;
@@ -823,16 +1151,17 @@ fn apply_static(iface: &mut Interface, sockets: &mut SocketSet, dns_handle: Sock
     if let Some(gw) = cfg.gw {
         let _ = iface.routes_mut().add_default_ipv4_route(gw);
     }
-    set_dns(sockets, dns_handle, cfg.dns);
+    let (list, n) = cfg.dns_list();
+    set_dns(sockets, dns_handle, &list[..n]);
     sys::write("[net-srv] статика: адрес ".as_bytes());
     write_cidr(cfg.cidr);
     if let Some(gw) = cfg.gw {
         sys::write(", шлюз ".as_bytes());
         write_ipv4(gw);
     }
-    if let Some(d) = cfg.dns {
-        sys::write(", DNS ".as_bytes());
-        write_ipv4(d);
+    for (i, d) in cfg.dns.iter().flatten().enumerate() {
+        sys::write(if i == 0 { ", DNS ".as_bytes() } else { ", ".as_bytes() });
+        write_ipv4(*d);
     }
     sys::write("\n".as_bytes());
 }
@@ -844,12 +1173,8 @@ fn set_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
     });
 }
 
-fn set_dns(sockets: &mut SocketSet, handle: SocketHandle, server: Option<Ipv4Address>) {
-    let s = sockets.get_mut::<dns::Socket>(handle);
-    match server {
-        Some(a) => s.update_servers(&[IpAddress::Ipv4(a)]),
-        None => s.update_servers(&[]),
-    }
+fn set_dns(sockets: &mut SocketSet, handle: SocketHandle, servers: &[IpAddress]) {
+    sockets.get_mut::<dns::Socket>(handle).update_servers(servers);
 }
 
 /// Текущий шлюз по умолчанию (для самопинга). Читается из таблицы маршрутов, а не из конфига:
@@ -860,8 +1185,125 @@ fn default_gateway(iface: &mut Interface) -> Option<Ipv4Address> {
     }
 }
 
+/// Веха 136 — прочитать список блокировки из store. `spec` — имя корня либо content-id (64
+/// hex-символа). Возвращает `(взято, встретилось)`.
+///
+/// Почему из store, а не из файла: список — это ДАННЫЕ ПОКОЛЕНИЯ. Положенный `fetch`'ем объект
+/// неизменяем и адресуется по содержимому, конфиг называет его, `rebuild` применяет, откат
+/// поколения возвращает прежний. Файл в posixfs дал бы изменяемое состояние сбоку от системы —
+/// ровно то, чего VOID не делает ([[0002-persistent-content-addressed-capability-core]]).
+///
+/// Формат — какой раздают в интернете: строки `0.0.0.0 имя` (hosts) или голые имена, `#` —
+/// комментарий.
+fn load_blocklist(store_cap: usize, spec: &[u8], bl: &mut Blocklist) -> (usize, usize) {
+    let mut id = [0u8; 32];
+    if spec.len() == 64 && spec.iter().all(|b| b.is_ascii_hexdigit()) {
+        // Content-id прямо в конфиге: список прибит НАВСЕГДА к своему содержимому. Корень удобнее
+        // (его можно переназначить новой загрузкой), id — строже (его нельзя подменить).
+        let hex = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => c - b'A' + 10,
+        };
+        for (i, pair) in spec.chunks(2).enumerate() {
+            id[i] = hex(pair[0]) << 4 | hex(pair[1]);
+        }
+    } else if sys::obj_get_root(store_cap, spec, &mut id) != 32 {
+        sys::write("[net-srv] список блокировки: нет такого корня\n".as_bytes());
+        return (0, 0);
+    }
+
+    // Объект бывает двух видов: БЛОБ (`fetch` режет всё длиннее 16 КиБ на куски и связывает их
+    // узлом — так приезжают настоящие списки) или простой объект, положенный целиком.
+    let (n, total) = sys::obj_get_ex(store_cap, &id, &mut bl.chunk);
+    if n == 0 || n == usize::MAX {
+        sys::write("[net-srv] список блокировки: объект не читается\n".as_bytes());
+        return (0, 0);
+    }
+    let mut lines = Lines::new();
+    match sys::http::blob_info(&bl.chunk[..n]) {
+        Some((_, nchunks, _)) => {
+            if nchunks > BLOB_KIDS {
+                sys::write("[net-srv] список длиннее 8 МиБ — беру начало\n".as_bytes());
+            }
+            let want = nchunks.min(BLOB_KIDS);
+            let got = sys::obj_children(store_cap, &id, &mut bl.kids[..want]);
+            if got == 0 || got == usize::MAX {
+                sys::write("[net-srv] список блокировки: куски не читаются\n".as_bytes());
+                return (0, 0);
+            }
+            for i in 0..got.min(want) {
+                let kid = bl.kids[i];
+                let len = sys::obj_get(store_cap, &kid, &mut bl.chunk);
+                if len == 0 || len == usize::MAX {
+                    break;
+                }
+                // По байту, а не слайсом: буфер куска лежит В ТОМ ЖЕ `bl`, что и таблица имён, и
+                // одолжить его целиком нельзя. Байт копируется — заимствование не держится.
+                for j in 0..len {
+                    lines.push(bl.chunk[j], bl);
+                }
+            }
+        }
+        None => {
+            if total > bl.chunk.len() {
+                sys::write("[net-srv] список не влез целиком — беру начало\n".as_bytes());
+            }
+            for j in 0..n.min(bl.chunk.len()) {
+                lines.push(bl.chunk[j], bl);
+            }
+        }
+    }
+    lines.flush(bl); // последняя строка могла остаться без перевода строки
+    (bl.count, bl.seen)
+}
+
+/// Сборка строк из потока байт: список приезжает кусками по 16 КиБ, и имя не обязано уложиться
+/// в границу куска.
+struct Lines {
+    buf: [u8; NAME_MAX * 2],
+    len: usize,
+    /// Строка длиннее буфера — выбрасываем её целиком, а не берём огрызок: огрызок имени это
+    /// ЧУЖОЕ имя, и заблокировать его было бы хуже, чем пропустить строку.
+    overflow: bool,
+}
+
+impl Lines {
+    fn new() -> Self {
+        Self { buf: [0; NAME_MAX * 2], len: 0, overflow: false }
+    }
+
+    fn push(&mut self, byte: u8, bl: &mut Blocklist) {
+        if byte == b'\n' {
+            self.flush(bl);
+        } else if self.len < self.buf.len() {
+            self.buf[self.len] = byte;
+            self.len += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn flush(&mut self, bl: &mut Blocklist) {
+        if !self.overflow && self.len > 0 {
+            let (buf, len) = (self.buf, self.len);
+            bl.feed_line(&buf[..len]);
+        }
+        self.len = 0;
+        self.overflow = false;
+    }
+}
+
+
 /// Веха 92 — разрешить имя в A-запись через DNS-сокет smoltcp. Возвращает адрес либо код
-/// (1 — имя не разрешилось / DNS-сервер неизвестен, 2 — не ответил за [`DNS_MS`]).
+/// (1 — имя не разрешилось / DNS-сервер неизвестен, 2 — не ответил за [`DNS_MS`],
+/// [`ST_BLOCKED`] — запрещено политикой).
+///
+/// Веха 136 — ПОЛИТИКА идёт до провода, и порядок в ней не случаен:
+/// 1. **своя запись** (`arg:host=…`) — прямое «я знаю лучше» владельца машины;
+/// 2. **список блокировки** — отказ с отдельным кодом, чтобы «заблокировано» не выглядело
+///    поломкой сети;
+/// 3. и только потом вопрос резолверу.
 ///
 /// Запрос асинхронный: `start_query` только заводит слот, а сам обмен делает `iface.poll`.
 /// Поэтому здесь тот же приём, что в `ping` — крутим стек до дедлайна. Клиент всё это время
@@ -871,16 +1313,29 @@ fn resolve(
     device: &mut sys::net_phy::VoidDevice,
     sockets: &mut SocketSet,
     handle: SocketHandle,
+    cfg: &Cfg,
+    bl: &Blocklist,
     name: &str,
 ) -> Result<Ipv4Address, u8> {
+    let mut lower = [0u8; NAME_MAX];
+    if let Some(n) = normalize(name.as_bytes(), &mut lower) {
+        if let Some(addr) = cfg.host(&lower[..n]) {
+            return Ok(addr);
+        }
+        if bl.blocks(&lower[..n]) {
+            return Err(ST_BLOCKED);
+        }
+    }
     let query = {
         let cx = iface.context();
         let s = sockets.get_mut::<dns::Socket>(handle);
         s.start_query(cx, name, DnsQueryType::A).map_err(|_| 1u8)?
     };
-    let deadline = sys::net_phy::now() + Duration::from_millis(DNS_MS);
+    let since = sys::net_phy::now();
+    let deadline = since + Duration::from_millis(DNS_MS);
     while sys::net_phy::now() < deadline {
         iface.poll(sys::net_phy::now(), device, sockets);
+        wait_step(iface, sockets, since);
         match sockets.get_mut::<dns::Socket>(handle).get_query_result(query) {
             // Слот уже освобождён самим `get_query_result` — второй раз его трогать нельзя.
             Ok(addrs) => {
@@ -940,8 +1395,10 @@ fn ping(
     let payload = [0u8; 16];
     let seq_no = PING_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut sent = false;
+    let since = sys::net_phy::now();
     while !sent && sys::net_phy::now() < deadline {
         iface.poll(sys::net_phy::now(), device, sockets);
+        wait_step(iface, sockets, since);
         let s = sockets.get_mut::<icmp::Socket>(handle);
         if s.can_send() {
             let repr = Icmpv4Repr::EchoRequest { ident, seq_no, data: &payload };
@@ -960,8 +1417,10 @@ fn ping(
     //    своё и соврём про RTT.
     let checksum = device_checksum(device);
     let mut answered = None;
+    let since = sys::net_phy::now();
     while answered.is_none() && sys::net_phy::now() < deadline {
         iface.poll(sys::net_phy::now(), device, sockets);
+        wait_step(iface, sockets, since);
         loop {
             let s = sockets.get_mut::<icmp::Socket>(handle);
             if !s.can_recv() {
@@ -996,6 +1455,30 @@ fn ping(
         Some(ticks) => Ok(sys::ticks_to_ns(ticks as u64) as usize / 1000),
         None => Err(PING_NO_REPLY),
     }
+}
+
+/// Веха 136 — шаг ожидания внутри блокирующей операции (`ping`, `resolve`): сперва крутим стек,
+/// потом СПИМ.
+///
+/// Зачем не спать сразу: `ping` меряет RTT, и сон в 10 мс превратил бы честные 400 мкс в 10 мс.
+/// Зачем вообще спать: без этого ожидание — глухой цикл на весь бюджет (у DNS это 5 секунд), а
+/// планировщик по кругу отдаёт такому циклу половину времени машины. Ровно этим была «вялость
+/// первых секунд после загрузки» (Веха 132.4) — там же, в этом файле, только в цикле DHCP.
+///
+/// Плата за сон честная: кадр, пришедший во время сна, замечаем не сразу, а до 10 мс спустя.
+/// Поэтому первые [`SPIN_MS`] и не спим — быстрый ответ ловится с прежней точностью.
+fn wait_step(iface: &mut Interface, sockets: &SocketSet, since: Instant) {
+    const SPIN_MS: u64 = 20;
+    const NAP_CAP_MS: u64 = 10;
+    let now = sys::net_phy::now();
+    if now - since < Duration::from_millis(SPIN_MS) {
+        return;
+    }
+    let nap = match iface.poll_delay(now, sockets) {
+        Some(d) => d.millis().clamp(1, NAP_CAP_MS),
+        None => NAP_CAP_MS,
+    };
+    sys::sleep_ns(nap * 1_000_000);
 }
 
 /// Ответ ли это на наш запрос: echo-reply от того, кого спрашивали, с нашим ident и номером.
