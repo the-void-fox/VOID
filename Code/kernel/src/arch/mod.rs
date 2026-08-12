@@ -18,7 +18,9 @@
 //!   `init_device_interrupts` (контроллер + маршрутизация IRQ диска/консоли);
 //!   `mark_in_kernel` (инвариант «trap пришёл из ядра» после возврата из сессии).
 //! - **Таймер**: `timer_hw_init` (размаскировать и включить), `timer_arm` (перевзвести квант
-//!   вытеснения; величина кванта — дело арха: таймбазы разные).
+//!   вытеснения; величина кванта — дело арха: таймбазы разные), `timer_hz` — ЧАСТОТА монотонного
+//!   счётчика (Веха 136): x86 измеряет её по PIT, riscv читает `timebase-frequency` из DTB.
+//!   `None` — платформа частоту не назвала, и ядро честно берёт приблизительное умолчание.
 //! - **direct-map** (Веха 87): `KERNEL_OFFSET` — смещение отображения RAM, `phys_to_virt` /
 //!   `virt_to_phys` — перевод «физический адрес ↔ указатель ядра». Всё ядро обращается к
 //!   физической памяти ТОЛЬКО через них, поэтому переезд ядра в верхнюю половину сводится к
@@ -71,7 +73,7 @@ pub use imp::{
     irq_mask_idle, irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel,
     wait_for_interrupt,
     // таймер
-    now_cycles, now_ticks, timer_arm, timer_hw_init,
+    now_cycles, now_ticks, timer_arm, timer_hw_init, timer_hz,
     // память
     clone_kernel_root, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
     phys_to_virt, space_root, space_token, translate, unmap_shared, virt_to_phys, MAP_R,

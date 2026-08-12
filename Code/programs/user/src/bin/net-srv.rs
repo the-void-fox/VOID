@@ -424,7 +424,7 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         let Some(m) = (if sleep_ms == 0 {
             sys::try_recv(&mut req)
         } else {
-            sys::recv_net(&mut req, (sleep_ms as usize) * (1_000_000 / sys::TICK_NS))
+            sys::recv_net(&mut req, sys::ns_to_ticks(sleep_ms * 1_000_000) as usize)
         }) else {
             continue;
         };
@@ -990,7 +990,10 @@ fn ping(
     }
 
     match answered {
-        Some(ticks) => Ok(ticks * sys::TICK_NS / 1000),
+        // Веха 136: тики → микросекунды по ИЗМЕРЕННОЙ таймбазе. С прежней константой RTT на этой
+        // машине печатался втрое больше настоящего — цифра выглядела правдоподобной и потому
+        // никого не настораживала.
+        Some(ticks) => Ok(sys::ticks_to_ns(ticks as u64) as usize / 1000),
         None => Err(PING_NO_REPLY),
     }
 }

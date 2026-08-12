@@ -6,13 +6,14 @@
 //! мерил бы println, а не syscall.
 //!
 //! Время — [`void_user::now`] прямо из U-mode (rdtime/rdtsc, не syscall); перевод в
-//! наносекунды — [`void_user::TICK_NS`] (на x86 предполагает TSC QEMU TCG ~1 ГГц).
+//! наносекунды — [`void_user::ticks_to_ns`] по таймбазе, ИЗМЕРЕННОЙ ядром (Веха 136; до неё
+//! здесь стояла константа «TSC ≈ 1 ГГц», и на живом процессоре все числа были втрое мимо).
 //! ВАЖНО: всё меряется под QEMU (TCG, без KVM) — это цифры ЭМУЛЯЦИИ, они честно
 //! сравниваются только с другой системой в том же QEMU (см. README: гость Linux).
 #![no_std]
 #![no_main]
 
-use void_user::{now, posix, TICK_NS};
+use void_user::{now, posix, ticks_to_ns};
 
 /// Десятичная печать числа (форматтера в no_std-бинаре нет — пишем сами).
 fn put_num(out: &mut [u8], pos: &mut usize, mut v: usize) {
@@ -47,9 +48,9 @@ fn report(name: &str, iters: usize, ticks: usize) {
     put_str(&mut line, &mut p, ": ");
     put_num(&mut line, &mut p, iters);
     put_str(&mut line, &mut p, " итер · ");
-    put_num(&mut line, &mut p, ticks * TICK_NS / 1000);
+    put_num(&mut line, &mut p, ticks_to_ns(ticks as u64) as usize / 1000);
     put_str(&mut line, &mut p, " µs всего · ~");
-    put_num(&mut line, &mut p, ticks * TICK_NS / iters);
+    put_num(&mut line, &mut p, ticks_to_ns(ticks as u64) as usize / iters);
     put_str(&mut line, &mut p, " ns/op\n");
     void_user::write(&line[..p]);
 }
@@ -68,10 +69,10 @@ fn report_bytes(name: &str, iters: usize, size: usize, ticks: usize) {
     put_str(&mut line, &mut p, ": ");
     put_num(&mut line, &mut p, iters);
     put_str(&mut line, &mut p, " итер · ~");
-    put_num(&mut line, &mut p, ticks * TICK_NS / iters / 1000);
+    put_num(&mut line, &mut p, ticks_to_ns(ticks as u64) as usize / iters / 1000);
     put_str(&mut line, &mut p, " µs/op · ");
     // МБ/с = всего байт / всего наносекунд * 1e9 / 1e6; считаем в целых, порядок не теряя.
-    let ns = (ticks * TICK_NS).max(1);
+    let ns = (ticks_to_ns(ticks as u64) as usize).max(1);
     put_num(&mut line, &mut p, iters * size * 1000 / ns);
     put_str(&mut line, &mut p, " МБ/с\n");
     void_user::write(&line[..p]);

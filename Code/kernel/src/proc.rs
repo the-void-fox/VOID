@@ -2949,14 +2949,21 @@ fn syscall(t: &mut Table, cur: usize) {
         // SYS_TIME(kind) -> наносекунды (Веха 86). kind: 0 = настенное время Unix (UTC),
         // 1 = монотонное с загрузки. Гейта прав нет — время не секрет и ничего не меняет
         // (как SYS_LOG). Наносекунды влезают в usize: обе арх 64-битные (u64 хватит до 2554 года).
+        //
+        // Веха 136: kind = 2 — ТАЙМБАЗА, тиков в секунду. Программа читает счётчик сама (`rdtsc`
+        // /`rdtime` открыты в U-mode ради дешёвых замеров), а цену тика знать обязана: раньше она
+        // была константой в каждой программе («x86 ≈ 1 ГГц»), и когда ядро научилось эту частоту
+        // измерять, userspace продолжил бы считать по-старому. Одна таймбаза на систему — та,
+        // которую измерило ядро.
         36 => {
             let kind = t.procs[cur].frame.arg(0);
-            let ns = match kind {
+            let v = match kind {
                 1 => crate::clock::uptime_ns(),
+                2 => crate::clock::tick_hz(),
                 _ => crate::clock::realtime_ns(),
             };
             let f = &mut t.procs[cur].frame;
-            f.set_ret(ns as usize);
+            f.set_ret(v as usize);
             f.advance();
         }
         // SYS_RANDOM(buf, len) -> len | MAX (Веха 86): заполнить буфер процесса случайными

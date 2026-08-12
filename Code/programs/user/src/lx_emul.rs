@@ -326,7 +326,10 @@ impl Completion {
 
 /// `udelay(us)` — активная задержка на `us` микросекунд (по монотонному счётчику [`crate::now`]).
 pub fn udelay(us: usize) {
-    let ticks = (us * 1000) / crate::TICK_NS.max(1); // микросекунды → нс → тики
+    // Веха 136: тики считаем по таймбазе, которую измерило ядро. С прежней константой «1 нс на
+    // тик» задержки драйверов на живом процессоре выходили втрое короче заказанных — а это ровно
+    // те задержки, которыми чип обязан успеть выполнить команду.
+    let ticks = crate::ns_to_ticks(us as u64 * 1000) as usize;
     let start = crate::now();
     while crate::now().wrapping_sub(start) < ticks {
         core::hint::spin_loop();

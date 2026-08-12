@@ -12,7 +12,7 @@ mod sbi;
 mod trap;
 mod uart;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // Ассемблерная точка входа `_start`: OpenSBI прыгает на 0x8020_0000 в S-mode → стек → kmain.
 core::arch::global_asm!(include_str!("entry.s"));
@@ -270,8 +270,22 @@ pub fn probe_virtio_rng() -> Option<crate::arch::BlkTransport> {
 
 // ─── таймер ─────────────────────────────────────────────────────────────────
 
-/// Квант вытеснения: 200_000 тиков при таймбазе 10 МГц (QEMU virt) = 20 мс.
-const TIMER_INTERVAL: u64 = 200_000;
+/// Таймбаза `rdtime`, тиков в секунду. Умолчание — контракт QEMU virt (10 МГц); настоящее
+/// значение приезжает из DTB в [`platform_init`] (Веха 136).
+static TIMEBASE_HZ: AtomicU64 = AtomicU64::new(10_000_000);
+
+/// Частота монотонного счётчика. `Some` всегда: у riscv она объявлена платой, а не измеряется —
+/// но если DTB не дал её, это по-прежнему умолчание QEMU, и звать его точным нельзя.
+pub fn timer_hz() -> Option<u64> {
+    Some(TIMEBASE_HZ.load(Ordering::Relaxed))
+}
+
+/// Квант вытеснения — 20 мс, СЧИТАННЫЕ от настоящей таймбазы (Веха 136). Раньше здесь стояло
+/// 200_000 тиков «= 20 мс», что верно ровно при 10 МГц: на плате с таймбазой 1 МГц тот же
+/// квант молча стал бы 200 мс, и система выглядела бы вязкой без всякой причины.
+fn timer_interval() -> u64 {
+    (TIMEBASE_HZ.load(Ordering::Relaxed) / 50).max(1)
+}
 
 /// Размаскировать таймерные прерывания и глобально включить прерывания S-mode.
 pub fn timer_hw_init() {
@@ -282,11 +296,11 @@ pub fn timer_hw_init() {
 /// Перевзвести одноразовый таймер на «сейчас + квант» (SBI TIME). Это же действие
 /// сбрасывает pending-бит таймера.
 pub fn timer_arm() {
-    sbi::set_timer(csr::read_time() + TIMER_INTERVAL);
+    sbi::set_timer(csr::read_time() + timer_interval());
 }
 
-/// Веха 35 — монотонный счётчик тиков для futex-дедлайнов (`rdtime`, таймбаза QEMU
-/// virt 10 МГц). Тот же счётчик, что читает U-mode для замеров и `Instant` (TICK_NS=100).
+/// Веха 35 — монотонный счётчик тиков для futex-дедлайнов (`rdtime`; частоту объявляет плата,
+/// см. [`timer_hz`]). Тот же счётчик, что читает U-mode для замеров и `Instant`.
 pub fn now_ticks() -> u64 {
     csr::read_time()
 }
@@ -470,6 +484,14 @@ pub fn platform_init(_hartid: usize, dtb: usize) {
     if let Some(base) = dtb_find_compatible(dtb, b"google,goldfish-rtc") {
         RTC_BASE_CELL.store(base, Ordering::Relaxed);
     }
+    // Веха 136 — ЧАСТОТА таймбазы `rdtime` тоже из DTB, а не из головы. Прежние 10 МГц — это
+    // умолчание QEMU virt; у настоящей платы бывает 1 МГц (SiFive), 24 МГц и другие. Пока частота
+    // была константой, время на такой плате шло бы во столько же раз мимо.
+    if let Some(hz) = dtb_find_u32(dtb, b"timebase-frequency") {
+        if hz > 0 {
+            TIMEBASE_HZ.store(hz as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 // ─── разбор device tree (FDT) — только узел /memory (Веха 85) ────────────────
@@ -564,6 +586,61 @@ fn dtb_ram_regions(dtb: usize) -> usize {
         }
     }
     total
+}
+
+/// Найти первое свойство с данным именем и значением в одну ячейку (u32) — где бы оно ни лежало.
+/// Веха 136: так читается `timebase-frequency`. Узел не уточняем намеренно: у QEMU virt свойство
+/// висит на `/cpus`, у иных плат — на каждом `/cpus/cpu@N`, и значение там одно и то же. Искать
+/// «первое такое» надёжнее, чем угадывать путь.
+fn dtb_find_u32(dtb: usize, want: &[u8]) -> Option<u32> {
+    if dtb == 0 {
+        return None;
+    }
+    unsafe {
+        if fdt_be32(dtb) != FDT_MAGIC {
+            return None;
+        }
+        let totalsize = fdt_be32(dtb + 4) as usize;
+        let off_struct = fdt_be32(dtb + 8) as usize;
+        let off_strings = fdt_be32(dtb + 12) as usize;
+        let end = dtb + totalsize;
+        let strings_base = dtb + off_strings;
+        let mut p = dtb + off_struct;
+        while p + 4 <= end {
+            let tok = fdt_be32(p);
+            p += 4;
+            match tok {
+                FDT_BEGIN_NODE => {
+                    let name_ptr = p;
+                    let mut q = name_ptr;
+                    while q < end && *(q as *const u8) != 0 {
+                        q += 1;
+                    }
+                    p += ((q - name_ptr) + 1 + 3) & !3;
+                }
+                FDT_END_NODE | FDT_NOP => {}
+                FDT_PROP => {
+                    let len = fdt_be32(p) as usize;
+                    let nameoff = fdt_be32(p + 4) as usize;
+                    let val = p + 8;
+                    p += 8 + ((len + 3) & !3);
+                    if len == 4 {
+                        let nptr = strings_base + nameoff;
+                        let mut q = nptr;
+                        while q < end && *(q as *const u8) != 0 {
+                            q += 1;
+                        }
+                        if core::slice::from_raw_parts(nptr as *const u8, q - nptr) == want {
+                            return Some(fdt_be32(val));
+                        }
+                    }
+                }
+                FDT_END => break,
+                _ => break,
+            }
+        }
+    }
+    None
 }
 
 /// Найти в DTB узел с данным `compatible` и вернуть базовый адрес из его `reg`.
