@@ -56,6 +56,9 @@ const BUILD: &str = env!("VOID_BUILD");
 
 // ── вид (ADR 0016: один палитра-источник, приложения цветов не знают) ────────
 const C_DESKTOP: (u8, u8, u8) = (0x0d, 0x11, 0x17);
+/// Веха 137 — рамка полосы стола в обзоре и её же вариант для стола в фокусе.
+const C_BAND: (u8, u8, u8) = (0x1e, 0x28, 0x33);
+const C_BAND_ON: (u8, u8, u8) = (0x2f, 0x4a, 0x6b);
 const C_BORDER: (u8, u8, u8) = (0x30, 0x36, 0x3d);
 const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
 
@@ -237,7 +240,7 @@ fn parse_combo(tok: &str) -> Option<(u16, u8)> {
 /// единицы снаружи: на клавиатуре нет нулевого стола.
 fn digit(name: &str) -> Option<usize> {
     let d = name.rsplit('-').next()?.parse::<usize>().ok()?;
-    (1..=SPACES).contains(&d).then_some(d - 1)
+    (1..=SPACE_KEYS).contains(&d).then_some(d - 1)
 }
 
 /// Собрать раскладку: строки `bind wm …` из конфига поколения, иначе зашитая схема.
@@ -333,7 +336,9 @@ fn main_loop() -> ! {
         damage: Vec::new(),
             shadow: vec![0u32; info.width * info.height],
         present_all: false,
-        spaces: (0..SPACES).map(|_| Space::default()).collect(),
+        // Веха 137 — стол ровно один, пустой. Дальше их число ведёт `tidy_spaces`.
+        ov_bands: Vec::new(),
+        spaces: vec![Space::default()],
         space: 0,
         overview: false,
         ov_cam: (0, 0),
@@ -591,10 +596,9 @@ struct Space {
     scroll_x: i32,
 }
 
-/// Сколько рабочих столов. Девять, потому что столько цифр на клавиатуре — у владельца в niri
-/// `Super+1…9`. Динамические столы niri (создаются по мере надобности) отложены: сначала должен
-/// появиться обзор, иначе про существование стола №7 узнать неоткуда.
-const SPACES: usize = 9;
+/// Сколько столов достижимо ПРЯМЫМ переходом с клавиатуры — по числу цифр (`Super+1…9`).
+/// Столов при этом может быть и больше, и меньше: их число живёт своей жизнью (см. [`Wm::tidy_spaces`]).
+const SPACE_KEYS: usize = 9;
 
 /// Пресеты ширины колонки — доли экрана. Те же, что у владельца в niri.
 const WIDTHS: [(i32, i32); 4] = [(1, 3), (1, 2), (2, 3), (1, 1)];
@@ -610,6 +614,11 @@ const OV_GAP: i32 = 48;
 
 struct Wm {
     info: sys::VideoInfo,
+    /// Веха 137 — полосы столов в обзоре: `(x, y, w, h, активный)` в координатах обзора.
+    /// Нужны, чтобы стол было ВИДНО, когда на нём нет окон: с динамическими столами последний
+    /// всегда пустой, и без полосы про него неоткуда узнать — ровно то возражение, из-за
+    /// которого динамические столы и откладывали.
+    ov_bands: Vec<(i32, i32, i32, i32, bool)>,
     /// Порядок = z-order: последнее окно рисуется поверх и получает клики первым.
     wins: Vec<Win>,
     /// Лента колонок слева направо.
@@ -1101,6 +1110,11 @@ impl Wm {
         let target = self.wins[k].shown.popped();
         self.wins[k].start(target, CLOSE_MS, now);
         self.unlink(id);
+        // Веха 137 — закрылось последнее окно стола, и стол должен исчезнуть (кроме того, на
+        // котором стоим, и последнего). Делается ЗДЕСЬ, а не внутри `unlink`: тот же `unlink`
+        // зовут при переезде окна между столами, и убрать стол посреди переезда значило бы
+        // сдвинуть номер назначения у себя под руками.
+        self.tidy_spaces();
     }
 
     /// Нарисовать всё накопленное. Ровно один раз за оборот цикла — это и есть «кадр».
@@ -1274,6 +1288,27 @@ impl Wm {
     /// Обзор: те же окна тем же кодом ([`Self::draw_win_row`]), но через преобразование обзора.
     fn compose_row_overview(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
         let (a, bx, by) = self.ov_xform();
+        // Полосы столов — ПОД окнами и только в самом обзоре (`ov_t`): на переходе они бы
+        // разъезжались вместе с камерой и мигали по краям кадра.
+        if self.ov_t > 512 {
+            for &(px, py, pw, ph, active) in &self.ov_bands {
+                let (rx, ry) = (px * a / 1024 + bx, py * a / 1024 + by);
+                let (rw, rh) = ((pw * a / 1024).max(2), (ph * a / 1024).max(2));
+                if yy < ry || yy >= ry + rh {
+                    continue;
+                }
+                let edge = yy == ry || yy == ry + rh - 1;
+                let c = if active { C_BAND_ON } else { C_BAND };
+                let (lo, hi) = (rx.max(x0), (rx + rw).min(x1));
+                for x in lo..hi {
+                    let i = (x - x0) as usize;
+                    let on_side = x == rx || x == rx + rw - 1;
+                    if edge || on_side {
+                        out[i] = self.pack(c);
+                    }
+                }
+            }
+        }
         for it in &self.ov {
             let Some(k) = self.win_at(it.id) else { continue };
             let win = &self.wins[k];
@@ -1462,11 +1497,14 @@ impl Wm {
     /// на окно в фокусе (по горизонтали). Всё, что не попало в кадр, честно остаётся за краем.
     fn build_overview(&mut self, recenter: bool) {
         self.ov.clear();
+        self.ov_bands.clear();
         let (sw, sh) = (self.info.width as i32, self.info.height as i32);
         let band_h = sh * OV_NUM / OV_DEN;
-        let shown: Vec<usize> = (0..SPACES)
-            .filter(|&i| i == self.space || !self.spaces[i].cols.is_empty())
-            .collect();
+        // Веха 137 — столы динамические, и пустых среди них не бывает нигде, кроме конца и
+        // активного (это и есть инвариант `tidy_spaces`). Поэтому показываем ВСЕ: фильтр,
+        // который здесь стоял, теперь ничего бы не отсекал, а прятал бы расхождение, если оно
+        // всё-таки появится.
+        let shown: Vec<usize> = (0..self.space_count()).collect();
         let me = shown.iter().position(|&i| i == self.space).unwrap_or(0) as i32;
 
         // Камера наводится ТОЛЬКО по осознанному выбору — клавишами, колесом, при входе в
@@ -1497,6 +1535,7 @@ impl Wm {
             if by + band_h < 0 || by > sh {
                 continue; // полоса целиком за кадром — считать её нечего
             }
+            self.ov_bands.push((0, by, sw, band_h, sp == self.space));
             let cols: &[Column] =
                 if sp == self.space { &self.cols } else { &self.spaces[sp].cols };
             let (frames, _) = self.strip_layout(cols);
@@ -1514,9 +1553,60 @@ impl Wm {
         self.damage(0, 0, sw, sh);
     }
 
+    /// Сколько столов существует СЕЙЧАС (Веха 137). Активный тоже занимает свой слот в
+    /// `spaces` — его лента лишь временно вынута в поля `Wm`.
+    fn space_count(&self) -> usize {
+        self.spaces.len()
+    }
+
+    /// Пуст ли стол `i`. Активный спрашивать надо не у `spaces`: его лента вынута в поля `Wm`,
+    /// и в массиве на его месте лежит пустышка. Об эту разницу спотыкается всё, что считает
+    /// столы, — поэтому вопрос задаётся ровно в одном месте.
+    fn space_is_empty(&self, i: usize) -> bool {
+        if i == self.space {
+            self.cols.is_empty()
+        } else {
+            self.spaces.get(i).is_none_or(|s| s.cols.is_empty())
+        }
+    }
+
+    /// Веха 137 — привести число столов в порядок по правилу niri: **в конце всегда ровно один
+    /// пустой стол, а опустевшие в середине исчезают**.
+    ///
+    /// Раньше столов было ровно девять — по числу цифр на клавиатуре. Это не «упрощение», а
+    /// другая модель: в ней пустые столы всегда занимают места в обзоре, а десятый стол не
+    /// существует, даже когда он нужен. Динамические столы откладывались до обзора («иначе про
+    /// существование стола №7 узнать неоткуда»), и с Вехой 123 эта причина отпала.
+    ///
+    /// Активный стол не убираем, даже пустой: человек на нём стоит. Он исчезнет сам, когда с
+    /// него уйдут, — как и в niri.
+    fn tidy_spaces(&mut self) {
+        let mut i = 0;
+        while i < self.spaces.len() {
+            let last = i + 1 == self.spaces.len();
+            if !last && i != self.space && self.space_is_empty(i) {
+                self.spaces.remove(i);
+                if self.space > i {
+                    self.space -= 1;
+                }
+                continue; // на месте удалённого теперь следующий — его и проверяем
+            }
+            i += 1;
+        }
+        if self.spaces.is_empty() {
+            self.spaces.push(Space::default());
+            self.space = 0;
+        } else if !self.space_is_empty(self.spaces.len() - 1) {
+            self.spaces.push(Space::default());
+        }
+    }
+
     /// Сделать стол `n` активным: ленты меняются местами (см. [[workspaces]]).
+    ///
+    /// Веха 137: после перехода число столов пересматривается — стол, с которого ушли пустым,
+    /// исчезает, а за последним занятым появляется новый пустой.
     fn switch_space(&mut self, n: usize) {
-        if n == self.space || n >= SPACES {
+        if n == self.space || n >= self.space_count() {
             return;
         }
         self.spaces[self.space] = Space {
@@ -1529,6 +1619,7 @@ impl Wm {
         self.cur = s.cur;
         self.scroll_x = s.scroll_x;
         self.space = n;
+        self.tidy_spaces();
     }
 
     /// Навести камеру на новое место — не прыжком, а движением (Веха 125).
@@ -1774,7 +1865,7 @@ impl Wm {
         if e.wheel != 0 && (self.overview || self.super_held) {
             let step = if e.wheel > 0 { -1i32 } else { 1i32 };
             let mut to = self.space as i32 + step;
-            to = to.clamp(0, SPACES as i32 - 1);
+            to = to.clamp(0, self.space_count() as i32 - 1);
             if to as usize != self.space {
                 self.switch_space(to as usize);
                 self.sync_focus();
@@ -2006,6 +2097,10 @@ impl Wm {
             // другая. Вся раскладка продолжает работать с одной лентой и про столы не знает.
             _ if name.starts_with("workspace-") => {
                 let Some(n) = digit(name) else { return };
+                // Веха 137 — столов может быть меньше девяти, и цифра сверх их числа не ошибка,
+                // а просьба «в самый дальний». Последний стол всегда пустой, так что `Super+9`
+                // на системе с двумя столами означает «на чистый», а не «никуда».
+                let n = n.min(self.space_count().saturating_sub(1));
                 if n == self.space {
                     return;
                 }
@@ -2016,6 +2111,7 @@ impl Wm {
             _ if name.starts_with("move-to-workspace-") => {
                 let Some(n) = digit(name) else { return };
                 let Some(id) = self.focused_id() else { return };
+                let n = n.min(self.space_count().saturating_sub(1));
                 if n == self.space {
                     return;
                 }
@@ -2024,6 +2120,9 @@ impl Wm {
                 // чужую колонку значило бы менять раскладку стола, которого человек не видит.
                 self.spaces[n].cols.push(Column { ids: vec![id], width: 1, focus: 0 });
                 self.spaces[n].cur = self.spaces[n].cols.len() - 1;
+                // Окно уехало на последний (пустой) стол — значит пустого в конце больше нет и
+                // его надо завести; а стол, с которого окно ушло последним, исчезнет.
+                self.tidy_spaces();
                 self.sync_focus();
                 self.relayout();
             }
@@ -2181,6 +2280,9 @@ impl Wm {
                 let at = if self.cols.is_empty() { 0 } else { self.cur + 1 };
                 self.cols.insert(at, Column { ids: vec![id], width: 1, focus: 0 });
                 self.cur = at;
+                // Веха 137 — окно село на последний (пустой) стол: пустого в конце больше нет,
+                // и его надо завести, иначе «дальше» переходить будет некуда.
+                self.tidy_spaces();
                 sys::reply(m.reply_cap, &id.to_le_bytes());
                 self.sync_focus();
                 self.relayout();
