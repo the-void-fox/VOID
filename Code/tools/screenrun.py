@@ -69,6 +69,7 @@ cpu = os.environ.get("VOID_QEMU_CPU", "")
 nic = os.environ.get("VOID_QEMU_NIC", "virtio")
 net = os.environ.get("VOID_QEMU_NET", "user")
 pcap = os.environ.get("VOID_QEMU_PCAP", "")
+delay_us = os.environ.get("VOID_QEMU_DELAY_US", "")
 
 NIC_DEV = {
     "virtio": "virtio-net-pci,netdev=net0,disable-legacy=on",
@@ -101,6 +102,11 @@ def netdev_args():
     args = ["-netdev", backend, "-device", dev]
     if pcap:
         args += ["-object", f"filter-dump,id=dump0,netdev=net0,file={pcap}"]
+    # Задержка канала. Локально RTT ~0.3 мс, и на таком проводе НЕ ВИДНО всего, что зависит от
+    # произведения «полоса × задержка»: окна, ретрансмиссий, размера порции. Настоящая сеть — это
+    # десятки миллисекунд, и там ошибки в окне стоят порядков скорости.
+    if delay_us:
+        args += ["-object", f"filter-buffer,id=lag0,netdev=net0,interval={delay_us}"]
     return args
 
 

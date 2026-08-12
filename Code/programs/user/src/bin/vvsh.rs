@@ -939,8 +939,11 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"poweroff", "выключить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
     help_row(b"nar-unpack", "разложить NAR из корня store в файлы");
-    sys::write("  Lisp: (define x 5) · (lambda (a) …) · (if c t e) · (map f L) · (filter p L)\n".as_bytes());
-    sys::write("  Конвейер: (| (ls) (grep \"vv\") count)\n".as_bytes());
+    // Справка обязана показывать ТОТ синтаксис, что понимает reader. Здесь висели S-выражения,
+    // хотя с Вехи 102 (ADR 0013) язык инфиксный: `(define x 5)` шелл теперь не примет вовсе.
+    sys::write("  Выражение — с ведущим \\: \\x = 5 · \\ping(\"10.0.2.2\")\n".as_bytes());
+    sys::write("  Язык: x = 5 · |a| a + 1 · if c { a } else { b } · [1, 2] · map(f, L)\n".as_bytes());
+    sys::write("  Конвейер: \\ls() |> grep(\"vv\") |> count()\n".as_bytes());
     Ok(Value::nil())
 }
 
