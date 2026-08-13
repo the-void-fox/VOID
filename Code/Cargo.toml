@@ -26,6 +26,9 @@ exclude = [
     # vvsh (ADR 0006): ядро крейт НЕ линкует (A2), а сам он host-тестируемый (свой .cargo/config
     # на host-таргет) — потому стандалон, вне workspace ядра. Потребитель — programs/user (path-dep).
     "libs/vvsh-core",
+    # Веха 138: декодеры PNG/JPEG. Тот же случай, что vvsh-core, — host-тестируемый стандалон
+    # (эталонные крейты в dev-зависимостях, в VOID они не едут), потребитель — programs/user.
+    "libs/void-img",
 ]
 
 [workspace.package]

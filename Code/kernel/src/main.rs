@@ -165,6 +165,8 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 117 — композитор окон и его демонстрационный клиент: обоим нужен фреймбуфер.
     ("wm", include_bytes!(env!("PROG_WM"))),
     ("winbox", include_bytes!(env!("PROG_WINBOX"))),
+    // Веха 138 — показ картинки из store: тоже клиент композитора, тоже без смысла без экрана.
+    ("img", include_bytes!(env!("PROG_IMG"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

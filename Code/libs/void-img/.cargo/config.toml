@@ -1,0 +1,6 @@
+# Ближний конфиг побеждает Code/.cargo/config.toml (там build.target = riscv, для ядра).
+# void-img host-тестируем: `cargo test --release` тут гоняет оба декодера на настоящих файлах
+# без QEMU. При сборке как зависимость programs/user действует таргет ТОГО крейта (конфиг берётся
+# по CWD вызова), а не этот — так что void-сборку это не задевает.
+[build]
+target = "x86_64-unknown-linux-gnu"

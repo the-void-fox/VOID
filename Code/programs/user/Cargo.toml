@@ -94,6 +94,10 @@ sha2 = { version = "0.10", default-features = false }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc", "fast"] }
 base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
 
+# Веха 138 — КАРТИНКИ: PNG и JPEG в RGBA. Крейт стандалон и host-тестируемый (см. libs/void-img):
+# контейнер PNG свой, inflate от miniz_oxide, JPEG целиком от zune-jpeg. Линкуется только в `img`.
+void-img = { path = "../../libs/void-img" }
+
 # bare-metal: у `getrandom` нет системного источника, поэтому регистрируем свой —
 # он уходит в `SYS_RANDOM` ядра (Веха 86 + джиттер/virtio-rng).
 getrandom = { version = "0.2", features = ["custom"] }
@@ -104,3 +108,13 @@ lto = true
 panic = "abort"
 strip = true
 codegen-units = 1
+
+# Веха 138 — распаковщикам картинок ПРОФИЛЬ ПОБЫСТРЕЕ. Общий профиль крейта — `opt-level = "z"`
+# (все ELF едут семенами в образе ядра, размер там дорог), но у декодера цена «z» не в байтах, а
+# в секундах ожидания на экране: обои разворачиваются один раз, зато на пару мегапикселей.
+[profile.release.package.void-img]
+opt-level = 3
+[profile.release.package.zune-jpeg]
+opt-level = 3
+[profile.release.package.miniz_oxide]
+opt-level = 3

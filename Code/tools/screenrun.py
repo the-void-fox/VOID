@@ -19,6 +19,8 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     sleep <сек>        — подождать
     key <строка>       — послать строку в консоль гостя (serial, с переводом строки)
     raw <байты>        — то же БЕЗ перевода строки; \e = Esc (для CSI: raw \e[5;2~)
+    type <строка>      — набрать строку НА КЛАВИАТУРЕ (PS/2): единственный ввод, доходящий
+                         до шелла в ОКНЕ (mode = "wm"), куда serial не идёт вовсе
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
@@ -194,6 +196,51 @@ def hotkey(combo):
     call("input-send-event", events=events)
 
 
+# Печатные знаки, у которых имя qcode не совпадает с самим знаком. Верхний регистр и знаки из
+# `SHIFTED` набираются с зажатым Shift — то есть ровно так, как их набирает человек.
+PRINTABLE = {
+    " ": "spc", "/": "slash", ".": "dot", "-": "minus", ",": "comma", ";": "semicolon",
+    "'": "apostrophe", "=": "equal", "[": "bracket_left", "]": "bracket_right",
+    "\\": "backslash", "`": "grave_accent", "\n": "ret", "\t": "tab",
+}
+SHIFTED = {"_": "minus", ":": "semicolon", '"': "apostrophe", "(": "9", ")": "0", "+": "equal",
+           "?": "slash", "*": "8", "!": "1", "~": "grave_accent", "{": "bracket_left",
+           "}": "bracket_right", "|": "backslash", "<": "comma", ">": "dot"}
+
+
+def typewrite(s):
+    """Строка НАСТОЯЩЕЙ клавиатурой (PS/2), а не в serial.
+
+    Нужно оконному режиму: там ввод идёт через композитор к окну, и серийная консоль до шелла
+    в окне не доходит вовсе. Пауза между знаками та же, что у [`serial`], и по той же причине.
+    """
+    for ch in s:
+        if ch.isalpha() and ch.isupper() or ch in SHIFTED:
+            hotkey("Shift+" + (SHIFTED[ch] if ch in SHIFTED else ch.lower()))
+        elif ch.isalnum():
+            hotkey(ch.lower())
+        elif ch in PRINTABLE:
+            hotkey(PRINTABLE[ch])
+        else:
+            print(f"нечем набрать знак {ch!r}", file=sys.stderr)
+        time.sleep(0.04)
+
+
+def serial(data):
+    """Байты в консоль гостя — ПО ОДНОМУ, с паузой.
+
+    Веха 138: писать строку одним куском нельзя. У 16550 приёмный FIFO на 16 байт, а хост под
+    KVM успевает налить туда всю команду прежде, чем гость разберёт первый байт: остальное
+    молча теряется. Ровно так `rebuild` доезжал до шелла как `reb` — команда не находилась, а
+    сценарий выглядел исполненным. Пауза в 20 мс на знак стоит четверть секунды на команду и
+    снимает весь класс.
+    """
+    for b in data:
+        p.stdin.write(bytes([b]))
+        p.stdin.flush()
+        time.sleep(0.02)
+
+
 def unescape(s):
     r"""Строка сценария → байты: `\e` — Esc, `\xNN` — любой байт (Веха 120: аккорды Ctrl
     редактора приходят по serial одним управляющим байтом, `\x13` = ^S)."""
@@ -243,11 +290,11 @@ try:
         if cmd == "sleep":
             time.sleep(float(arg))
         elif cmd == "key":
-            p.stdin.write((arg + "\n").encode())
-            p.stdin.flush()
+            serial(arg.encode() + b"\n")
         elif cmd == "raw":
-            p.stdin.write(unescape(arg))
-            p.stdin.flush()
+            serial(unescape(arg))
+        elif cmd == "type":
+            typewrite(arg)
         elif cmd == "mouse":
             dx, dy = arg.split()
             call("input-send-event", events=[rel("x", int(dx)), rel("y", int(dy))])

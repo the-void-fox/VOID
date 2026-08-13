@@ -1,0 +1,38 @@
+# void-img — распаковка картинок: PNG и JPEG в готовый RGBA8888 (Веха 138).
+#
+# Стандалон, как и vvsh-core: крейт host-ТЕСТИРУЕМ (`cargo test --release` здесь гоняет декодеры
+# на настоящих файлах и сверяет с эталонными реализациями), а в VOID приезжает path-зависимостью
+# из programs/user. Из workspace ядра исключён — у ядра свой таргет и свой профиль.
+#
+# Проверять картинки на хосте — не удобство, а необходимость: ошибка в развороте строк или в
+# фильтре PNG даёт не отказ, а КРИВУЮ КАРТИНКУ, и в QEMU её пришлось бы ловить глазами по снимку.
+[package]
+name = "void-img"
+version = "0.0.1"
+edition = "2021"
+authors = ["voidfox"]
+description = "Распаковка PNG и JPEG в RGBA8888 для VOID: контейнер PNG свой, inflate — miniz_oxide, JPEG — zune-jpeg. no_std+alloc."
+
+[dependencies]
+# inflate. Своим не пишем сознательно: это самая мясистая и самая проверяемая часть PNG, а
+# miniz_oxide — то, чем распаковывает половина экосистемы (включая backtrace внутри std).
+# `default-features = false` + `with-alloc` = no_std с кучей, без std и без SIMD.
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# JPEG целиком чужой (см. README): свой baseline написать можно, прогрессивный — это ещё один
+# проект. `default-features = false` снимает std и SIMD-пути x86/neon (в них intrinsics и
+# рантайм-детект, которого в VOID нет).
+zune-jpeg = { version = "0.5", default-features = false }
+
+[dev-dependencies]
+# ЭТАЛОНЫ для host-тестов, в VOID не попадают. Смысл именно в независимости: наш PNG сверяется
+# с png от image-rs, наш JPEG (zune) — с jpeg-decoder от image-rs. Совпасть по ошибке два разных
+# декодера не могут.
+#
+# Эти двое НЕ лежат в vendor/ и тянутся с crates.io: `cargo test` тут требует сети (или прогретого
+# кэша cargo). Сборку самой VOID это не задевает — programs/user собирается оффлайн из своего
+# vendor/, куда попадают только miniz_oxide, zune-jpeg и их зависимости.
+png = "0.18"
+jpeg-decoder = "0.3"
+
+[profile.release]
+opt-level = 3

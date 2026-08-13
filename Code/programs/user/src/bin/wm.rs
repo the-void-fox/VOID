@@ -366,6 +366,10 @@ fn main_loop() -> ! {
     let n = sys::args(&mut abuf);
     let mut spawned = 0usize;
     for prog in abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1) {
+        // Аргумента у клиента быть не может, и это не наше ограничение: конфиг поколения —
+        // текст, разбираемый по ПРОБЕЛАМ (`init::apply_with`), поэтому `arg:img wall` доедет
+        // сюда как два токена. Обоям (клиент слоя с именем картинки) это понадобится — чинить
+        // придётся кавычки в конфиге, а не здесь.
         match sys::spawn_with_endpoint(store, prog, &[], me, b"WM\0") {
             Some(pid) => {
                 sys::write_console("[wm] запущен клиент ".as_bytes());
