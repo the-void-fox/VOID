@@ -655,7 +655,7 @@ pub fn run() {
 /// Здесь `sstatus.SIE = 0`, поэтому «потерянного пробуждения» нет: `wfi` просыпается от
 /// PENDING прерывания независимо от SIE, а сам обработчик мы пускаем коротким окном с SIE=1.
 fn wait_stdin(saved_sie: usize) -> bool {
-    let (waiting, irq_waiting, deadline): (Vec<usize>, bool, Option<u64>) = {
+    let (waiting, irq_waiting, deadline, wants_input): (Vec<usize>, bool, Option<u64>, bool) = {
         let t = TABLE.lock();
         let w = (0..t.procs.len()).filter(|&i| t.procs[i].state == State::StdinWait).collect();
         // Веха 91: ближайший дедлайн спящих по времени (SYS_RECV с таймаутом, futex_wait).
@@ -663,10 +663,28 @@ fn wait_stdin(saved_sie: usize) -> bool {
         let d = t.procs.iter().filter_map(|p| p.futex_deadline).min();
         let wake = any_irq_waiting(&t)
             || t.procs.iter().any(|p| p.wake_on_net || p.wake_on_key);
-        (w, wake, d)
+        // Веха 139.1 — есть ли КОМУ взять события мыши и клавиатуры прямо сейчас. Ровно тот же
+        // набор процессов, который будит их приход (см. конец функции): спать «до события»,
+        // которого никто не ждёт, — не ожидание, а холостой цикл.
+        let want = t.procs.iter().any(|p| p.state == State::RecvWait && p.wake_on_key);
+        (w, wake, d, want)
     };
     if waiting.is_empty() && !irq_waiting && deadline.is_none() {
         return false;
+    }
+    // Веха 139.1 — ВЫБРОСИТЬ события ввода, которые прочитать НЕКОМУ.
+    //
+    // Очередь событий (`SYS_KEY_READ`/`SYS_MOUSE_READ`) читает только владелец экрана. В
+    // текстовом режиме (`vsh`/`vvsh` в консоли ядра) владельца нет вовсе, а класть события туда
+    // ядро продолжает: каждый байт с serial становится ещё и событием клавиши (Веха 119).
+    // Очередь заполнялась первым же нажатием и оставалась непустой НАВСЕГДА — а `key_pending()`
+    // ниже был условием выхода из сна. Простой превращался в бесконечный цикл с ВЫКЛЮЧЕННЫМИ
+    // прерываниями, и прерывание консоли не бралось процессором вовсе (LAPIC IRR: вектор висит,
+    // ISR пуст). Снаружи это выглядело так: первое нажатие работает, дальше ввод отзывается
+    // только когда систему разбудит кто-то другой — с сетью раз в ~600 мс, без сети никогда.
+    if arch::video_owner().is_none() {
+        while arch::key_pop().is_some() {}
+        while arch::mouse_pop().is_some() {}
     }
     // Веха 33: уход в простой — естественная точка синка group commit. Под нагрузкой
     // пачки собирает maybe_commit (порог/период), а здесь фиксируется хвост: «echo и
@@ -685,8 +703,10 @@ fn wait_stdin(saved_sie: usize) -> bool {
         arch::irq_mask_stdin(saved_sie);
     }
     while !arch::console_has_input()
-        && !arch::mouse_pending() // Веха 115: движение мыши — тоже повод проснуться
-        && !arch::key_pending() // Веха 119: и событие клавиатуры
+        // Веха 115: движение мыши — тоже повод проснуться, Веха 119: и событие клавиатуры.
+        // Но только если их ЖДУТ (`wants_input`): непрочитанное событие иначе становится
+        // вечным поводом не спать — см. рассуждение выше.
+        && !(wants_input && (arch::mouse_pending() || arch::key_pending()))
         && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
         && !NET_IRQ_PENDING.load(Ordering::Relaxed) // Веха 91: кадр разбудит сетевой сервер
         && !deadline.is_some_and(|d| arch::now_ticks() >= d)
