@@ -287,6 +287,29 @@ system(
         );
     }
 
+    /// Веха 139 — обои объявляются записью `desktop`, и читает её композитор, а не ядро.
+    /// Проверяем то, ради чего запись отдельная: имя картинки доезжает до строки поколения
+    /// ЦЕЛИКОМ, и условие «обоев нет» выражается пустым списком, а не пустым именем.
+    #[test]
+    fn desktop_wallpaper_normalizes() {
+        let src = r#"wall = "f/etc/фон.png"
+                     system(
+                       shell("wm", "mmio:fb"),
+                       if wall == "" { [] } else { [desktop("wallpaper", wall)] },
+                     )"#;
+        assert_eq!(
+            build_config(src).expect("сборка"),
+            "shell wm mmio:fb\ndesktop wallpaper f/etc/фон.png\n"
+        );
+        let off = r#"wall = ""
+                     system(shell("wm", "mmio:fb"),
+                            if wall == "" { [] } else { [desktop("wallpaper", wall)] })"#;
+        assert_eq!(build_config(off).expect("сборка"), "shell wm mmio:fb\n");
+        // Опечатка в числе полей — ошибка СБОРКИ, а не молча пропущенная строка в загруженной
+        // системе: ради этого этап нормализации и существует.
+        assert!(build_config(r#"system(desktop("wallpaper"))"#).is_err());
+    }
+
     /// Терминал живёт отдельным модулем и может целиком выключаться (как net.vv).
     #[test]
     fn terminal_module_can_be_off() {

@@ -445,6 +445,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("shell", b_shell),
     ("terminal", b_terminal),
     ("bind", b_bind),
+    ("desktop", b_desktop),
     ("packages", b_packages),
     ("channel", b_channel),
     ("system", b_system),
@@ -649,6 +650,17 @@ fn b_bind(args: &[Value]) -> Result<Value, EvalError> {
 /// однородный СПИСОК. Поэтому первый аргумент такой же, как остальные, и список строк вливается
 /// на любом месте — `packages(base, "jq")` пишется естественно, а через `build_entry` первым
 /// аргументом обязана была бы стоять строка.
+/// `(desktop ключ значение)` — настройка РАБОЧЕГО СТОЛА (Веха 139), читает её композитор `wm`.
+/// Сегодня ключ один: `(desktop "wallpaper" "имя-в-store")`.
+///
+/// Отдельный вид записи, а не `terminal`, и не потому, что так красивее: `terminal …` читает
+/// программа `term`, а обои принадлежат оконному режиму. Свалить их в одну запись значило бы,
+/// что текстовый терминал обязан молча пропускать чужие ключи, — а молчаливый пропуск опечатки
+/// это ровно то, от чего этап сборки конфига и защищает.
+fn b_desktop(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("desktop", args)
+}
+
 fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
     let mut out = vec![Value::sym("packages")];
     for a in args {
@@ -692,7 +704,7 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
                         Value::List(inner) if is_entry(inner) => out.push(it.clone()),
                         _ => {
                             return Err(EvalError::new(
-                                "system: ожидались записи service/shell/terminal/bind/packages/channel",
+                                "system: ожидались записи service/shell/terminal/desktop/bind/packages/channel",
                             ))
                         }
                     }
@@ -705,9 +717,10 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
-/// `packages`/`channel` — `pkg`: конфиг поколения один, читателей несколько, и каждый берёт свои
-/// строки.
+/// `desktop` — композитор, `packages`/`channel` — `pkg`: конфиг поколения один, читателей
+/// несколько, и каждый берёт свои строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
-        if matches!(&**s, "service" | "shell" | "terminal" | "bind" | "packages" | "channel"))
+        if matches!(&**s,
+            "service" | "shell" | "terminal" | "desktop" | "bind" | "packages" | "channel"))
 }

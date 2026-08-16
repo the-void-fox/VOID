@@ -167,6 +167,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     ("winbox", include_bytes!(env!("PROG_WINBOX"))),
     // Веха 138 — показ картинки из store: тоже клиент композитора, тоже без смысла без экрана.
     ("img", include_bytes!(env!("PROG_IMG"))),
+    // Веха 139 — обои: клиент СЛОЯ композитора. Запускает его сам `wm`, прочитав в конфиге
+    // поколения строку `desktop wallpaper …`.
+    ("wall", include_bytes!(env!("PROG_WALL"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

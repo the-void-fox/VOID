@@ -44,6 +44,9 @@ pub fn normalize_config(v: &Value) -> Result<String, EvalError> {
             ("terminal", n) if n != 3 => {
                 return Err(EvalError::new("terminal: (terminal ключ значение)"))
             }
+            ("desktop", n) if n != 3 => {
+                return Err(EvalError::new("desktop: (desktop ключ значение)"))
+            }
             // Канал один: «откуда система берёт софт» — решение, а не список предпочтений.
             ("channel", n) if n != 2 => return Err(EvalError::new("channel: (channel url)")),
             _ => {}

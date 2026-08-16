@@ -2113,6 +2113,14 @@ net = import(\"net.vv\")\n\
 # Программы, которые оконный режим открывает на старте (для mode = \"wm\").\n\
 apps = [\"term\"]\n\
 \n\
+# ОБОИ (Веха 139): имя объекта store с картинкой — PNG или JPEG. Пусто — просто цвет стола.\n\
+# Картинка заполняет экран С ОБРЕЗКОЙ: пропорции сохраняются, лишнее срезается поровну с краёв.\n\
+#\n\
+# Картинка кладётся в store как всё остальное — из шелла или мостом с хоста:\n\
+#   \\fetch(\"http://пример/фон.jpg\", \"wall\")   → wallpaper = \"wall\"\n\
+#   void-store-import образ.img put фон.png f/etc/wall.png\n\
+wallpaper = \"\"\n\
+\n\
 # Схема управления ТЕРМИНАЛОМ: bind(РЕЖИМ, КЛАВИША, ДЕЙСТВИЕ). Пустой список = схема по\n\
 # умолчанию, зашитая в term; хоть один bind — схема задаётся ЦЕЛИКОМ отсюда.\n\
 #   режимы:   normal · pane\n\
@@ -2159,6 +2167,7 @@ if mode == \"wm\" {\n\
 \x20 append(\n\
 \x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb\", \"power\", \"env\",\n\
 \x20          map(|a| \"arg:\" + a, apps))],\n\
+\x20   if wallpaper == \"\" { [] } else { [desktop(\"wallpaper\", wallpaper)] },\n\
 \x20   wm_keys,\n\
 \x20 )\n\
 } else {\n\

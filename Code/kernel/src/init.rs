@@ -218,7 +218,13 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
         // поколение из store и берёт свои. Молча пропускаем: это не ошибка конфига.
         // Вехи 112–113 — `packages …`/`channel …` тоже не ядру: объявленные пакеты собирает
         // `pkg sync`, а ядру на загрузке до них дела нет (они уже лежат в store, если собрались).
-        if kind == "terminal" || kind == "bind" || kind == "packages" || kind == "channel" {
+        // Веха 139 — `desktop …` (обои и прочий рабочий стол) читает композитор, не ядро.
+        if kind == "terminal"
+            || kind == "bind"
+            || kind == "desktop"
+            || kind == "packages"
+            || kind == "channel"
+        {
             continue;
         }
         if kind != "service" && kind != "shell" {

@@ -8,16 +8,17 @@
 //! Запуск: `img <корень|content-id>`. Картинка кладётся в store мостом с хоста
 //! (`void-store-import <образ> put файл.png f/etc/wall.png`) или скачивается из vvsh
 //! (`\fetch("http://…/x.jpg", "wall")`) — во втором случае объект приезжает блобом из кусков,
-//! и собирать его обратно приходится здесь.
+//! и собирает его обратно [`obj::read`] (общий с обоями).
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use void_user as sys;
 use void_user::win::{Event, Window};
+
+#[path = "../obj.rs"]
+mod obj;
 
 /// Арена под пиксели. Куча процесса ЛЕНИВАЯ (`SYS_MAP` резервирует диапазон, страницы приходят
 /// по обращению), поэтому «попросить с запасом» ничего не стоит: снимок 4624×3468 разворачивается
@@ -49,8 +50,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::write("img: нет права на store (STORE в окружении)\n".as_bytes());
         sys::exit(1);
     };
-    let Some(bytes) = read_object(store, spec) else {
-        sys::exit(1);
+    let bytes = match obj::read(store, spec) {
+        Ok(b) => b,
+        Err(e) => {
+            say(&alloc::format!("img: {e}\n"));
+            sys::exit(1);
+        }
     };
 
     // Сначала заголовок: размеры и формат известны до того, как выделен хоть байт под пиксели.
@@ -148,76 +153,4 @@ fn fit(w: u32, h: u32, mw: u32, mh: u32) -> (u32, u32) {
     } else {
         (((w64 * mh as u64 / h64) as u32).max(1), mh)
     }
-}
-
-/// Место под файл — с ОТКАЗОМ вместо паники. Картинка приезжает из store целиком, и «не хватило
-/// кучи» тут такой же нормальный исход, как «нет такого корня»: файл выбирает человек.
-fn room(len: usize) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    if v.try_reserve_exact(len).is_err() {
-        say(&alloc::format!("img: не хватило кучи под файл ({} КиБ)\n", len / 1024));
-        return None;
-    }
-    Some(v)
-}
-
-/// Прочитать объект store целиком: и простой (положен одним куском), и блоб (`fetch` режет всё
-/// длиннее 16 КиБ и связывает куски узлом). Картинки почти всегда блоб — файл в мегабайт одним
-/// объектом не кладут.
-fn read_object(store: usize, spec: &[u8]) -> Option<Vec<u8>> {
-    let mut id = [0u8; 32];
-    if spec.len() == 64 && spec.iter().all(|b| b.is_ascii_hexdigit()) {
-        let hex = |c: u8| match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            _ => c - b'A' + 10,
-        };
-        for (i, pair) in spec.chunks(2).enumerate() {
-            id[i] = hex(pair[0]) << 4 | hex(pair[1]);
-        }
-    } else if sys::obj_get_root(store, spec, &mut id) != 32 {
-        sys::write("img: нет такого корня в store\n".as_bytes());
-        return None;
-    }
-
-    // Первое чтение — с длиной: `obj_get_ex` говорит, сколько всего байт в объекте, даже если
-    // в буфер влезло меньше. Манифест блоба заведомо короче 512 байт.
-    let mut head = [0u8; 512];
-    let (n, total) = sys::obj_get_ex(store, &id, &mut head);
-    if n == 0 || n == usize::MAX {
-        sys::write("img: объект не читается\n".as_bytes());
-        return None;
-    }
-    let Some((size, nchunks, csize)) = sys::http::blob_info(&head[..n]) else {
-        // Простой объект: перечитать целиком в буфер нужной длины.
-        let mut out = room(total)?;
-        out.resize(total, 0);
-        let got = sys::obj_get(store, &id, &mut out);
-        if got != total {
-            sys::write("img: объект прочитался не целиком\n".as_bytes());
-            return None;
-        }
-        return Some(out);
-    };
-
-    let mut kids = alloc::vec![[0u8; 32]; nchunks];
-    if sys::obj_children(store, &id, &mut kids) != nchunks {
-        sys::write("img: список кусков блоба не сошёлся\n".as_bytes());
-        return None;
-    }
-    let mut out = room(size)?;
-    let mut buf = alloc::vec![0u8; csize];
-    for kid in &kids {
-        let n = sys::obj_get(store, kid, &mut buf);
-        if n == 0 || n == usize::MAX {
-            sys::write("img: кусок блоба не читается\n".as_bytes());
-            return None;
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    if out.len() != size {
-        sys::write("img: куски блоба не сложились в объявленную длину\n".as_bytes());
-        return None;
-    }
-    Some(out)
 }

@@ -22,6 +22,10 @@
 //!   обгоняла бы экран (Веха 120.2).
 //! - **Рамки рисуем МЫ** (server-side decorations). Так у всех окон один вид без единой строчки
 //!   в приложениях — ровно то, ради чего затевался общий тулкит (ADR 0016).
+//! - **Обои и бар — КЛИЕНТЫ, а не наши поля** (Веха 139, [[layers]]). Поверхность слоя
+//!   ([`win::OP_LAYER`]) — то же окно (`Win` с `layer: Some(…)`), только место ей назначает
+//!   якорь, а не раскладка, стопка берётся из слоя, и оформления у неё нет. Иначе композитор
+//!   обязан был бы уметь читать store и разбирать PNG — в программе, где лежат буферы ВСЕХ окон.
 //!
 //! ## Чего здесь пока нет
 //!
@@ -251,14 +255,32 @@ fn digit(name: &str) -> Option<usize> {
 /// всплыла на живом человеке (Веха 121.1): конфиг, посеянный ДО появления новых действий,
 /// молча отменяет их все — раскладка есть, она просто старая. Поэтому источник теперь
 /// называется вслух: «шесть сочетаний из конфига» при восемнадцати зашитых — это диагноз.
-fn load_binds(scap: usize) -> (Vec<Bind>, bool) {
-    let text = read_generation(scap).unwrap_or_default();
-    let out = parse_binds(&text);
+fn load_binds(text: &str) -> (Vec<Bind>, bool) {
+    let out = parse_binds(text);
     if out.is_empty() {
         (parse_binds(DEFAULT_BINDS), false)
     } else {
         (out, true)
     }
+}
+
+/// Веха 139 — имя картинки для обоев: строка `desktop wallpaper <объект store>` из конфига
+/// поколения. Ничего нет — обоев нет, и это нормальный вид системы, а не отсутствие настройки.
+///
+/// Хвост строки берём ЦЕЛИКОМ, не разбивая по пробелам: имя корня в store — произвольная строка,
+/// и пробел в ней не наше дело. Именно из-за разбора по пробелам имя нельзя было передать через
+/// `arg:` в самом конфиге (`init::apply_with` режет строку на токены) — здесь конец пути, и
+/// резать его второй раз незачем.
+fn wallpaper_name(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("desktop wallpaper") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn parse_binds(text: &str) -> Vec<Bind> {
@@ -320,6 +342,7 @@ fn main_loop() -> ! {
 
     let mut wm = Wm {
         info,
+        work: (0, 0, info.width as i32, info.height as i32),
         wins: Vec::new(),
         next_id: 1,
         cursor: (info.width as i32 / 2, info.height as i32 / 2),
@@ -360,16 +383,35 @@ fn main_loop() -> ! {
     wm.fill_rect(0, 0, info.width as i32, info.height as i32, C_DESKTOP);
     wm.draw_cursor();
 
+    // Конфиг поколения читаем ОДИН раз: из него и раскладка клавиш, и обои.
+    let generation = read_generation(store).unwrap_or_default();
+
+    // Веха 139 — обои. Это ТАКОЙ ЖЕ клиент, как терминал, только просит он поверхность слоя, а
+    // не окно; композитор о картинках по-прежнему не знает ничего. Имя картинки уезжает
+    // аргументом — здесь это можно, а в конфиге поколения нельзя (см. `wallpaper_name`).
+    if let Some(name) = wallpaper_name(&generation) {
+        let mut arg = Vec::from(name.as_bytes());
+        arg.push(0);
+        match sys::spawn_with_endpoint(store, b"wall", &arg, me, b"WM\0") {
+            Some(_) => {
+                sys::write_console("[wm] обои: ".as_bytes());
+                sys::write_console(name.as_bytes());
+                sys::write_console(b"\n");
+            }
+            None => sys::write_console("[wm] обои не запустились (нет bin/wall?)\n".as_bytes()),
+        }
+    }
+
     // Клиенты — из argv. Право на себя отдаём под именем `WM`: терминал даёт детям `STDIO`,
     // мы даём окна, и путать эти два хоста нельзя.
     let mut abuf = [0u8; 256];
     let n = sys::args(&mut abuf);
     let mut spawned = 0usize;
     for prog in abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1) {
-        // Аргумента у клиента быть не может, и это не наше ограничение: конфиг поколения —
-        // текст, разбираемый по ПРОБЕЛАМ (`init::apply_with`), поэтому `arg:img wall` доедет
-        // сюда как два токена. Обоям (клиент слоя с именем картинки) это понадобится — чинить
-        // придётся кавычки в конфиге, а не здесь.
+        // Аргумента у клиента из `apps` быть не может, и это не наше ограничение: конфиг
+        // поколения — текст, разбираемый по ПРОБЕЛАМ (`init::apply_with`), поэтому `arg:img wall`
+        // доедет сюда двумя токенами. Обои этой стены не заметили: у них своя строка конфига
+        // (`desktop wallpaper …`), которую мы читаем сами и передаём дальше уже аргументом.
         match sys::spawn_with_endpoint(store, prog, &[], me, b"WM\0") {
             Some(pid) => {
                 sys::write_console("[wm] запущен клиент ".as_bytes());
@@ -389,7 +431,7 @@ fn main_loop() -> ! {
         sys::write_console("[wm] клиентов нет — пустой рабочий стол\n".as_bytes());
     }
 
-    let (binds, from_config) = load_binds(store);
+    let (binds, from_config) = load_binds(&generation);
     let builtin = parse_binds(DEFAULT_BINDS).len();
     sys::write_console(
         alloc::format!(
@@ -520,6 +562,22 @@ struct Win {
     /// Лежит ли окно на АКТИВНОМ рабочем столе (Веха 122). Окно с чужого стола живо, помнит
     /// свои пиксели и продолжает работать — его просто не видно и не потрогать.
     visible: bool,
+    /// Веха 139 — поверхность СЛОЯ (обои, бар), а не окно ленты. `None` — обычное окно.
+    ///
+    /// Одна структура на оба вида намеренно. Всё, что делает окно окном, — буфер, события,
+    /// damage, смерть хозяина — у слоя ровно то же самое; разница только в том, кто назначает
+    /// место и где оно в стопке. Заведи мы второй список, каждая из этих общих вещей
+    /// существовала бы в двух копиях и разошлась бы на первой же правке.
+    layer: Option<LayerCfg>,
+}
+
+/// Чего поверхность слоя попросила у композитора (Веха 139) — см. [`win::Layer`].
+#[derive(Clone, Copy)]
+struct LayerCfg {
+    layer: u8,
+    anchor: u8,
+    /// Сколько пикселей у своего края поверхность отнимает у окон.
+    exclusive: i32,
 }
 
 impl Win {
@@ -529,6 +587,28 @@ impl Win {
             return &[];
         }
         unsafe { core::slice::from_raw_parts(self.buf as *const u8, self.buf_len) }
+    }
+
+    /// Обычное ли это окно (участвует в ленте, берёт фокус, получает клавиши).
+    fn tiled(&self) -> bool {
+        self.layer.is_none()
+    }
+    /// Слой НИЖЕ окон ленты: обои и подложка.
+    fn under(&self) -> bool {
+        self.layer.is_some_and(|l| l.layer < win::LAYER_TOP)
+    }
+    /// Слой ВЫШЕ окон ленты: бар, панель, всплывающее.
+    fn over(&self) -> bool {
+        self.layer.is_some_and(|l| l.layer >= win::LAYER_TOP)
+    }
+    /// Толщина рамки и радиус скругления. У слоя их нет: обои в рамке с уголками — это не
+    /// оформление, а ошибка, и бар со скруглёнными углами оставил бы щели у краёв экрана.
+    fn deco(&self) -> (i32, i32) {
+        if self.tiled() {
+            (BORDER, RADIUS)
+        } else {
+            (0, 0)
+        }
     }
 
     /// Начать движение к `target`.
@@ -561,11 +641,13 @@ impl Win {
 
     /// Прямоугольник рамки.
     fn frame(&self) -> (i32, i32, i32, i32) {
-        (self.x, self.y, self.w + 2 * BORDER, self.h + 2 * BORDER)
+        let (b, _) = self.deco();
+        (self.x, self.y, self.w + 2 * b, self.h + 2 * b)
     }
     /// Левый верхний угол СОДЕРЖИМОГО.
     fn content_at(&self) -> (i32, i32) {
-        (self.x + BORDER, self.y + BORDER)
+        let (b, _) = self.deco();
+        (self.x + b, self.y + b)
     }
     /// Попадание — по ВИДИМОМУ положению: человек целится в то, что нарисовано.
     fn hit_frame(&self, px: i32, py: i32, scroll: i32) -> bool {
@@ -610,6 +692,10 @@ const WIDTHS: [(i32, i32); 4] = [(1, 3), (1, 2), (2, 3), (1, 1)];
 /// Зазор между окнами и до края экрана.
 const GAP: i32 = 8;
 
+/// Меньше этого рабочую область не ужать никакой панели (Веха 139): клиент вправе попросить
+/// занятую зону во весь экран, но остаться совсем без места для окон система не должна.
+const MIN_WORK: i32 = 64;
+
 /// Масштаб обзора — ровно половина. Фиксированный: см. `build_overview`.
 const OV_NUM: i32 = 1;
 const OV_DEN: i32 = 2;
@@ -618,6 +704,9 @@ const OV_GAP: i32 = 48;
 
 struct Wm {
     info: sys::VideoInfo,
+    /// Веха 139 — РАБОЧАЯ ОБЛАСТЬ `(x, y, w, h)`: экран минус зоны, занятые слоями (бар).
+    /// Лента живёт в ней, а не на экране; без слоёв с занятой зоной она равна экрану.
+    work: (i32, i32, i32, i32),
     /// Веха 137 — полосы столов в обзоре: `(x, y, w, h, активный)` в координатах обзора.
     /// Нужны, чтобы стол было ВИДНО, когда на нём нет окон: с динамическими столами последний
     /// всегда пустой, и без полосы про него неоткуда узнать — ровно то возражение, из-за
@@ -1109,6 +1198,17 @@ impl Wm {
         if self.wins[k].closing {
             return;
         }
+        // Веха 139 — поверхность слоя уходит СРАЗУ, без сжатия: обои, уползающие в точку, это
+        // не «оживление», а поломка на экране; а бар, доигрывающий анимацию после смерти
+        // хозяина, всё это время держал бы занятую зону, и лента дёргалась бы дважды.
+        if self.wins[k].layer.is_some() {
+            let (rx, ry, rw, rh) = self.wins[k].shown.rect();
+            self.drop_buf(k);
+            self.wins.remove(k);
+            self.damage(rx, ry, rw, rh);
+            self.recompute_work();
+            return;
+        }
         self.wins[k].closing = true;
         self.wins[k].visible = true;
         let target = self.wins[k].shown.popped();
@@ -1176,19 +1276,25 @@ impl Wm {
 
     }
 
-    /// Собрать одну строку экрана: стол → окна → курсор.
+    /// Собрать одну строку экрана: стол → нижние слои → окна → верхние слои → курсор.
     fn compose_row(&self, out: &mut [u32], yy: i32, x0: i32) {
         let desktop = self.pack(C_DESKTOP);
         out.fill(desktop);
         let x1 = x0 + out.len() as i32;
+
+        // Веха 139 — слои ПОД окнами. Рисуются и в ленте, и в обзоре, и порядок здесь не
+        // порядок в `wins`, а порядок СЛОЁВ: композитор поднимает окно в стопке при фокусе, и
+        // всплывшее окно не должно уметь оказаться под обоями.
+        self.draw_layers(out, yy, x0, x1, false);
         if self.overview {
             self.compose_row_overview(out, yy, x0, x1);
+            self.draw_layers(out, yy, x0, x1, true);
             self.draw_cursor_row(out, yy, x0, x1);
             return;
         }
 
         for win in &self.wins {
-            if !win.visible {
+            if !win.visible || !win.tiled() {
                 continue;
             }
             // Рисуем ПО АНИМИРОВАННОМУ прямоугольнику, а не по тому, что назначила раскладка
@@ -1200,7 +1306,21 @@ impl Wm {
             self.draw_win_row(out, yy, x0, x1, rect, win, active, win.shown.a);
         }
 
+        self.draw_layers(out, yy, x0, x1, true);
         self.draw_cursor_row(out, yy, x0, x1);
+    }
+
+    /// Строка поверхностей слоя: `over = false` — те, что под окнами, `true` — те, что над.
+    ///
+    /// Место у слоя ФИКСИРОВАННОЕ и в экранных координатах: ни прокрутка ленты, ни обзор его не
+    /// трогают. Обои, уезжающие вместе с лентой, были бы не обоями, а очень широким окном.
+    fn draw_layers(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32, over: bool) {
+        for win in &self.wins {
+            if if over { !win.over() } else { !win.under() } {
+                continue;
+            }
+            self.draw_win_row(out, yy, x0, x1, win.shown.rect(), win, false, 256);
+        }
     }
 
     /// Одна строка ОДНОГО окна по экранному прямоугольнику — общая для ленты и обзора.
@@ -1228,7 +1348,11 @@ impl Wm {
         alpha: u32,
     ) {
         {
-            if yy < fy || yy >= fy + fh || fw <= 2 * BORDER || fh <= 2 * BORDER {
+            // Веха 139 — рамка и скругление берутся У ОКНА, а не из констант: у поверхности
+            // слоя их нет вовсе, и с нулевой рамкой этот же код превращается в честное
+            // «содержимое от края до края» — без единой отдельной ветки на слои.
+            let (bord, rad) = win.deco();
+            if yy < fy || yy >= fy + fh || fw <= 2 * bord || fh <= 2 * bord {
                 return;
             }
             let (sx, ex) = (fx.max(x0), (fx + fw).min(x1));
@@ -1236,8 +1360,8 @@ impl Wm {
                 return;
             }
             let border = self.unpack(self.pack(if active { C_ACCENT } else { C_BORDER }));
-            let (cw, ch) = (fw - 2 * BORDER, fh - 2 * BORDER);
-            let src_row = (yy - fy - BORDER) * win.bh / ch.max(1);
+            let (cw, ch) = (fw - 2 * bord, fh - 2 * bord);
+            let src_row = (yy - fy - bord) * win.bh / ch.max(1);
             let px = win.px();
             let has_content = !px.is_empty() && src_row >= 0 && src_row < win.bh;
             // Расстояние до края нужно ТОЛЬКО у краёв. В середине окна ответ известен заранее,
@@ -1245,19 +1369,19 @@ impl Wm {
             // перерисовка — это миллион пикселей, и миллион квадратных корней на кадр
             // превращали плавное движение в рывки (Веха 125.3).
             let top = yy - fy;
-            let corner_row = top < RADIUS || fy + fh - 1 - yy < RADIUS;
-            let edge_row = top < BORDER || fy + fh - 1 - yy < BORDER;
+            let corner_row = top < rad || fy + fh - 1 - yy < rad;
+            let edge_row = top < bord || fy + fh - 1 - yy < bord;
             let opaque = alpha >= 256;
             for xx in sx..ex {
                 let dh = xx - fx;
-                let near_x = dh < RADIUS || fx + fw - 1 - xx < RADIUS;
+                let near_x = dh < rad || fx + fw - 1 - xx < rad;
                 let (cover, inner) = if corner_row && near_x {
-                    let d = rrect_sd(xx, yy, fx, fy, fw, fh, RADIUS);
+                    let d = rrect_sd(xx, yy, fx, fy, fw, fh, rad);
                     (
                         (128 - d).clamp(0, 256) as u32,
-                        (128 - (d + BORDER * 256)).clamp(0, 256) as u32,
+                        (128 - (d + bord * 256)).clamp(0, 256) as u32,
                     )
-                } else if edge_row || dh < BORDER || fx + fw - 1 - xx < BORDER {
+                } else if edge_row || dh < bord || fx + fw - 1 - xx < bord {
                     (256, 0) // прямая часть рамки
                 } else {
                     (256, 256) // содержимое
@@ -1267,7 +1391,7 @@ impl Wm {
                     continue;
                 }
                 let content = if has_content && inner != 0 {
-                    let col = (xx - fx - BORDER) * win.bw / cw.max(1);
+                    let col = (xx - fx - bord) * win.bw / cw.max(1);
                     let p = ((src_row * win.bw + col) * 4) as usize;
                     if col >= 0 && col < win.bw && p + 2 < px.len() {
                         (px[p], px[p + 1], px[p + 2])
@@ -1372,10 +1496,75 @@ impl Wm {
         self.wins.iter().position(|w| w.id == id)
     }
 
-    /// Ширина колонки в пикселях по её пресету.
+    /// Ширина колонки в пикселях по её пресету — от РАБОЧЕЙ ОБЛАСТИ, а не от экрана.
     fn col_width(&self, c: &Column) -> i32 {
         let (n, d) = WIDTHS[c.width.min(WIDTHS.len() - 1)];
-        (self.info.width as i32 - GAP) * n / d - GAP
+        (self.work.2 - GAP) * n / d - GAP
+    }
+
+    /// Веха 139 — где лежит поверхность слоя: якорь + запрошенный размер → прямоугольник экрана.
+    ///
+    /// Прижата к обоим краям оси — растянута по ней (обои прижаты ко всем четырём и занимают
+    /// экран целиком). Прижата к одному — стоит у него своим размером. Ни к одному — по центру:
+    /// это не «правильное» поведение, а единственное осмысленное на бессмысленный запрос.
+    ///
+    /// Считается от ЭКРАНА, а не от рабочей области: слой сам её и определяет, и считать его
+    /// место от неё значило бы бесконечно уточнять само себя.
+    fn layer_rect(&self, l: &LayerCfg, w: i32, h: i32) -> (i32, i32, i32, i32) {
+        let (sw, sh) = (self.info.width as i32, self.info.height as i32);
+        let axis = |anchor_lo: bool, anchor_hi: bool, size: i32, screen: i32| match (
+            anchor_lo, anchor_hi,
+        ) {
+            (true, true) => (0, screen),
+            (true, false) => (0, size.min(screen)),
+            (false, true) => ((screen - size).max(0), size.min(screen)),
+            (false, false) => (((screen - size) / 2).max(0), size.min(screen)),
+        };
+        let (x, rw) = axis(
+            l.anchor & win::ANCHOR_LEFT != 0, l.anchor & win::ANCHOR_RIGHT != 0, w, sw,
+        );
+        let (y, rh) = axis(
+            l.anchor & win::ANCHOR_TOP != 0, l.anchor & win::ANCHOR_BOTTOM != 0, h, sh,
+        );
+        (x, y, rw, rh)
+    }
+
+    /// Веха 139 — пересчитать РАБОЧУЮ ОБЛАСТЬ: экран минус зоны, занятые слоями.
+    ///
+    /// Это и есть весь смысл «занятой зоны»: бар сверху не накрывает окна, а сдвигает их —
+    /// иначе первая строка терминала уходила бы под панель. Отсчитывается зона от края ЭКРАНА,
+    /// а не от края поверхности: так два бара на одном краю просто не складываются в лесенку, а
+    /// перекрываются, и это честнее, чем зависимость раскладки от порядка запуска клиентов.
+    fn recompute_work(&mut self) {
+        let (sw, sh) = (self.info.width as i32, self.info.height as i32);
+        let (mut x0, mut y0, mut x1, mut y1) = (0, 0, sw, sh);
+        for w in &self.wins {
+            let Some(l) = w.layer else { continue };
+            if l.exclusive <= 0 || w.closing {
+                continue;
+            }
+            // Зона имеет смысл только у прижатого к ОДНОМУ краю оси: «панель посередине отняла
+            // тридцать пикселей» не значит ничего — непонятно, с какой стороны.
+            let (t, b) = (l.anchor & win::ANCHOR_TOP != 0, l.anchor & win::ANCHOR_BOTTOM != 0);
+            let (le, r) = (l.anchor & win::ANCHOR_LEFT != 0, l.anchor & win::ANCHOR_RIGHT != 0);
+            match (t, b) {
+                (true, false) => y0 = y0.max(l.exclusive),
+                (false, true) => y1 = y1.min(sh - l.exclusive),
+                _ => {}
+            }
+            match (le, r) {
+                (true, false) => x0 = x0.max(l.exclusive),
+                (false, true) => x1 = x1.min(sw - l.exclusive),
+                _ => {}
+            }
+        }
+        // Панель во весь экран не должна оставлять раскладку с отрицательной шириной: окну
+        // всегда есть куда лечь, даже если это выглядит тесно.
+        let work = (x0, y0, (x1 - x0).max(MIN_WORK), (y1 - y0).max(MIN_WORK));
+        if work != self.work {
+            self.work = work;
+            self.relayout();
+        }
     }
 
     /// Геометрия ленты в ЕЁ СОБСТВЕННЫХ координатах: рамки окон и полная ширина ленты.
@@ -1384,16 +1573,19 @@ impl Wm {
     /// раскладка экрана и обзор. Две копии одной арифметики разъехались бы на первой же правке
     /// (обзор показывал бы не то, что получится при выходе из него).
     fn strip_layout(&self, cols: &[Column]) -> (Vec<(u32, i32, i32, i32, i32)>, i32) {
-        let screen_h = self.info.height as i32;
+        // Веха 139 — считаем от РАБОЧЕЙ ОБЛАСТИ. Её начало входит прямо в координаты ленты, а не
+        // прибавляется где-то потом: иначе смещение пришлось бы помнить и рисованию, и попаданию
+        // мыши, и обзору — трём местам сразу, то есть трём случаям разойтись.
+        let (ox, oy, _, oh) = self.work;
         let mut out = Vec::new();
-        let mut x = GAP;
+        let mut x = ox + GAP;
         for c in cols {
             let cw = self.col_width(c);
             let n = c.ids.len().max(1) as i32;
-            let cell = (screen_h - GAP) / n - GAP;
+            let cell = (oh - GAP) / n - GAP;
             for (wi, id) in c.ids.iter().enumerate() {
-                let y = GAP + wi as i32 * (cell + GAP);
-                let h = if wi + 1 == c.ids.len() { screen_h - GAP - y } else { cell };
+                let y = oy + GAP + wi as i32 * (cell + GAP);
+                let h = if wi + 1 == c.ids.len() { oy + oh - GAP - y } else { cell };
                 out.push((*id, x, y, cw, h));
             }
             x += cw + GAP;
@@ -1414,23 +1606,24 @@ impl Wm {
         // «кто виден» разошёлся бы с первым при первой же правке.
         for w in self.wins.iter_mut() {
             // Закрывающееся окно остаётся видимым: его уже нет в раскладке, но сжатие доигрывает.
-            w.visible = w.closing;
+            // Поверхность слоя видна ВСЕГДА: обои и бар не принадлежат столу (Веха 139).
+            w.visible = w.closing || !w.tiled();
         }
         let (frames, _) = self.strip_layout(&self.cols);
 
-        // Куда уехала лента: колонка в фокусе обязана быть видна целиком; если она шире экрана,
-        // показываем её левый край.
-        let mut x = GAP;
-        let view = self.info.width as i32;
+        // Куда уехала лента: колонка в фокусе обязана быть видна целиком; если она шире рабочей
+        // области, показываем её левый край.
+        let (ox, _, ow, _) = self.work;
+        let mut x = ox + GAP;
         let mut want = self.scroll_to;
         for (i, c) in self.cols.iter().enumerate() {
             let cw = self.col_width(c);
             if i == self.cur {
-                if x - want < GAP {
-                    want = x - GAP;
+                if x - want < ox + GAP {
+                    want = x - ox - GAP;
                 }
-                if x + cw - want > view - GAP {
-                    want = x + cw - view + GAP;
+                if x + cw - want > ox + ow - GAP {
+                    want = x + cw - (ox + ow) + GAP;
                 }
             }
             x += cw + GAP;
@@ -1792,7 +1985,7 @@ impl Wm {
         // задаёт раскладка, а не рука; плавающий режим остаётся исключением на будущее
         // ([[wm-keys]]), и тащить окно понадобится ровно там.
         if was == 0 && e.buttons != 0 {
-            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x))
+            if let Some(i) = self.wins.iter().position(|w| w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x))
             {
                 let id = self.wins[i].id;
                 if let Some((ci, wi)) = self.locate(id) {
@@ -1840,7 +2033,7 @@ impl Wm {
         }
 
         if (e.dx != 0 || e.dy != 0) && self.buttons == 0 && !self.overview {
-            if let Some(i) = self.wins.iter().position(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x))
+            if let Some(i) = self.wins.iter().position(|w| w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x))
             {
                 let id = self.wins[i].id;
                 if self.focus != Some(id) {
@@ -1882,8 +2075,11 @@ impl Wm {
             return;
         }
 
-        // Событие окну под курсором.
-        if let Some(i) = self.wins.iter().rposition(|w| w.visible && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)) {
+        // Событие окну под курсором. Поверхности слоя ввод НЕ достаётся (Веха 139): обои кликать
+        // не по чему, а бару клики понадобятся своей вехой — и вместе с ними придётся решить,
+        // как курсор над панелью не уводит фокус у окна, под которым он оказался. Отдавать
+        // события «пока просто так» значило бы принять это решение вслепую.
+        if let Some(i) = self.wins.iter().rposition(|w| w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)) {
             let (ox, oy) = self.wins[i].content_at();
             let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
             if was != e.buttons {
@@ -2276,6 +2472,7 @@ impl Wm {
                     fresh: true,
                     closing: false,
                     visible: true,
+                    layer: None,
                 };
                 self.wins.push(win);
                 // Новое окно — НОВАЯ КОЛОНКА справа от текущей: так работает niri, и так же
@@ -2290,6 +2487,76 @@ impl Wm {
                 sys::reply(m.reply_cap, &id.to_le_bytes());
                 self.sync_focus();
                 self.relayout();
+            }
+            // Веха 139 — ПОВЕРХНОСТЬ СЛОЯ: обои, бар, панель. Отличий от окна ровно два — место
+            // назначает не раскладка, а якорь, и в ленту она не встаёт.
+            win::OP_LAYER => {
+                let spec = LayerCfg {
+                    layer: buf[0].min(win::LAYER_OVERLAY),
+                    anchor: buf[1],
+                    // Занятая зона не может превышать экран: клиент присылает что угодно.
+                    exclusive: (u16::from_le_bytes([buf[6], buf[7]]) as i32)
+                        .min(self.info.height as i32)
+                        .min(self.info.width as i32),
+                };
+                let w = u16::from_le_bytes([buf[2], buf[3]]).max(1) as i32;
+                let h = u16::from_le_bytes([buf[4], buf[5]]).max(1) as i32;
+                let title = core::str::from_utf8(buf.get(8..len).unwrap_or(&[])).unwrap_or("слой");
+                let id = self.next_id;
+                self.next_id += 1;
+                let (buf, buf_len, slot) = self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0));
+                let (rx, ry, rw, rh) = self.layer_rect(&spec, w, h);
+                let win = Win {
+                    id,
+                    owner: m.sender,
+                    x: rx,
+                    y: ry,
+                    w: rw,
+                    h: rh,
+                    title: String::from(title),
+                    buf,
+                    buf_len,
+                    cap: m.cap,
+                    slot,
+                    bw: if buf != 0 { w } else { 0 },
+                    bh: if buf != 0 { h } else { 0 },
+                    waiting: None,
+                    inbox: Vec::new(),
+                    // Слой не анимируется: он появляется там, где ему назначено. Выезжающие
+                    // обои или подпрыгивающий бар — не «оживление», а рябь на каждом запуске.
+                    shown: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
+                    from: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
+                    to: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
+                    at: 0,
+                    dur: 0,
+                    fresh: false,
+                    closing: false,
+                    visible: true,
+                    layer: Some(spec),
+                };
+                self.wins.push(win);
+                sys::reply(m.reply_cap, &id.to_le_bytes());
+                // Клиент просил один размер, якорь назначил другой (растянуться на весь край) —
+                // сказать ему об этом тем же событием, что и окнам: пусть заведёт буфер под то,
+                // что ему на самом деле дали. До ответа рисуем растянутым — как и окно, которое
+                // ещё не успело перерисоваться (Веха 126.1).
+                if (rw, rh) != (w, h) {
+                    let k = self.wins.len() - 1;
+                    let ev = [win::EV_RESIZE, rw as u8, (rw >> 8) as u8, rh as u8, (rh >> 8) as u8,
+                              0, 0, 0];
+                    self.send(k, ev, 5);
+                }
+                self.damage(rx, ry, rw, rh);
+                // Зона могла отнять место у ленты — пересчёт раскладки внутри.
+                self.recompute_work();
+            }
+            // Веха 139 — размер экрана. Обоям и бару он нужен ДО того, как они заведут буфер, а
+            // права на сам фреймбуфер у них нет и быть не должно.
+            win::OP_SCREEN => {
+                let mut rep = [0u8; 4];
+                rep[0..2].copy_from_slice(&(self.info.width as u16).to_le_bytes());
+                rep[2..4].copy_from_slice(&(self.info.height as u16).to_le_bytes());
+                sys::reply(m.reply_cap, &rep);
             }
             // Веха 129 — НОВЫЙ буфер под изменившийся размер. Отпускаем старый и берём
             // присланный: между этими двумя строками окно остаётся без картинки ровно на время
@@ -2332,16 +2599,19 @@ impl Wm {
                     // Выглядело это так, будто новое окно рождается ЧЁРНЫМ: рамку рисовала
                     // раскладка, а содержимое не перерисовывалось уже никогда.
                     let (fx, fy, fw, fh) = self.wins[i].shown.rect();
-                    let sc = if self.overview { 0 } else { self.scroll_x };
-                    let (want_w, want_h) =
-                        (self.wins[i].w + 2 * BORDER, self.wins[i].h + 2 * BORDER);
-                    if self.overview || fw != want_w || fh != want_h {
+                    // Слой не ездит с лентой и не уменьшается обзором: его прямоугольник —
+                    // сразу экранный, и прямоугольник клиента ложится в него как есть.
+                    let tiled = self.wins[i].tiled();
+                    let sc = if self.overview || !tiled { 0 } else { self.scroll_x };
+                    let (b, _) = self.wins[i].deco();
+                    let (want_w, want_h) = (self.wins[i].w + 2 * b, self.wins[i].h + 2 * b);
+                    if (self.overview && tiled) || fw != want_w || fh != want_h {
                         // Окно в движении (растёт, едет, уменьшено обзором) — его пиксели легли на
                         // экран масштабированными, и попасть в них прямоугольником клиента нельзя.
                         // Помечаем окно целиком: кадр анимации всё равно перерисовывает его.
                         self.damage(fx - sc, fy, fw, fh);
                     } else {
-                        self.damage(fx - sc + BORDER + dx, fy + BORDER + dy, dw.max(1), dh.max(1));
+                        self.damage(fx - sc + b + dx, fy + b + dy, dw.max(1), dh.max(1));
                     }
                 }
             }
