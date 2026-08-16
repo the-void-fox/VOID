@@ -738,7 +738,7 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         let Some(m) = (if sleep_ms == 0 {
             sys::try_recv(&mut req)
         } else {
-            sys::recv_net(&mut req, sys::ns_to_ticks(sleep_ms * 1_000_000) as usize)
+            sys::recv_net(&mut req, sleep_ms * 1_000_000)
         }) else {
             continue;
         };

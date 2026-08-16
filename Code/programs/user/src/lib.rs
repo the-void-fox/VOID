@@ -342,13 +342,19 @@ pub fn try_recv(buf: &mut [u8]) -> Option<Message> {
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
 
-/// Веха 91 — `SYS_RECV` со СНОМ до дедлайна: `None`, если за `timeout_ticks` запроса не было.
+/// Веха 91 — `SYS_RECV` со СНОМ до дедлайна: `None`, если за `timeout_ns` запроса не было.
 /// Это «сон вместо опроса» для серверов-реакторов: пока никто не зовёт и делать нечего, процесс
 /// не занимает процессор вовсе, но просыпается к моменту, который назвал сам (у сетевого стека
 /// это `poll_at` — ближайший таймер ретрансмиссии).
-pub fn recv_timeout(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
+///
+/// Веха 139.3 — срок в НАНОСЕКУНДАХ, как у [`sleep_ns`]. Раньше эти три обёртки брали ТИКИ, то
+/// есть таймбазу архитектуры, — и два реактора из трёх её не знали: `wm` и `term` писали `200`,
+/// имея в виду миллисекунды, а получали 200 тактов TSC (около 60 нс). Сон вырождался в опрос, и
+/// простаивающая графическая сессия жгла ЦЕЛОЕ ЯДРО (замер: 100% при пустом экране). Прятать
+/// таймбазу здесь — единственное надёжное место: она нужна только на границе с ядром.
+pub fn recv_timeout(buf: &mut [u8], timeout_ns: u64) -> Option<Message> {
     let (op, reply_cap, len, cap, sender) = abi::syscall5(
-        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 2, timeout_ticks, 0,
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 2, ns_to_ticks(timeout_ns) as usize, 0,
     );
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
@@ -357,9 +363,10 @@ pub fn recv_timeout(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
 /// терминала: он обязан обслуживать два источника — вывод детей и клавиатуру, — а ждать умел
 /// только на одном, поэтому крутился по короткому таймеру. Теперь спит до события.
 /// `None` — проснулись не из-за сообщения (клавиша или срок): читать клавиатуру и повторять.
-pub fn recv_console(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
+/// Срок — в наносекундах (см. [`recv_timeout`]).
+pub fn recv_console(buf: &mut [u8], timeout_ns: u64) -> Option<Message> {
     let (op, reply_cap, len, cap, sender) = abi::syscall5(
-        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 4, timeout_ticks, 0,
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 4, ns_to_ticks(timeout_ns) as usize, 0,
     );
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
@@ -367,9 +374,10 @@ pub fn recv_console(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
 /// Веха 91 - `SYS_RECV` со сном до дедлайна ИЛИ до прихода СЕТЕВОГО КАДРА. То, ради чего веха:
 /// сетевой сервер спит, ничего не занимая, и просыпается ровно тогда, когда карта что-то
 /// приняла, - а не на ближайшем тике таймера. `None` - проснулись не из-за запроса.
-pub fn recv_net(buf: &mut [u8], timeout_ticks: usize) -> Option<Message> {
+/// Срок — в наносекундах (см. [`recv_timeout`]).
+pub fn recv_net(buf: &mut [u8], timeout_ns: u64) -> Option<Message> {
     let (op, reply_cap, len, cap, sender) = abi::syscall5(
-        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 3, timeout_ticks, 0,
+        SYS_RECV, buf.as_mut_ptr() as usize, buf.len(), 3, ns_to_ticks(timeout_ns) as usize, 0,
     );
     (op != usize::MAX).then_some(Message { op, reply_cap, len, cap, sender })
 }
