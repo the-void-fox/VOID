@@ -170,6 +170,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 139 — обои: клиент СЛОЯ композитора. Запускает его сам `wm`, прочитав в конфиге
     // поколения строку `desktop wallpaper …`.
     ("wall", include_bytes!(env!("PROG_WALL"))),
+    // Веха 140 — панель: второй клиент слоя и первый с кликами. Запускает её тоже `wm`, по
+    // строке конфига `desktop bar on`.
+    ("bar", include_bytes!(env!("PROG_BAR"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

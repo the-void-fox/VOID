@@ -2121,6 +2121,10 @@ apps = [\"term\"]\n\
 #   void-store-import образ.img put фон.png f/etc/wall.png\n\
 wallpaper = \"\"\n\
 \n\
+# ПАНЕЛЬ сверху (Веха 140): столы, заголовок окна в фокусе и часы (UTC). Столы кликабельны.\n\
+# Панель ЗАНИМАЕТ место: окна начинаются под ней, а не заезжают под неё.\n\
+bar = true\n\
+\n\
 # Схема управления ТЕРМИНАЛОМ: bind(РЕЖИМ, КЛАВИША, ДЕЙСТВИЕ). Пустой список = схема по\n\
 # умолчанию, зашитая в term; хоть один bind — схема задаётся ЦЕЛИКОМ отсюда.\n\
 #   режимы:   normal · pane\n\
@@ -2168,6 +2172,7 @@ if mode == \"wm\" {\n\
 \x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb\", \"power\", \"env\",\n\
 \x20          map(|a| \"arg:\" + a, apps))],\n\
 \x20   if wallpaper == \"\" { [] } else { [desktop(\"wallpaper\", wallpaper)] },\n\
+\x20   if bar { [desktop(\"bar\", \"on\")] } else { [] },\n\
 \x20   wm_keys,\n\
 \x20 )\n\
 } else {\n\
