@@ -26,6 +26,7 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
     wheel up|down      — колесо мыши (в QEMU это кнопки wheel-up/wheel-down)
     hotkey <аккорд>    — аккорд клавиатуры PS/2, например: hotkey Super+Return
+    hold <клавиша> <down|up> — ЗАДЕРЖАТЬ клавишу (Super+колесо, перетаскивание с Super)
     shot <имя>         — снять кадр в <каталог-выхода>/<имя>.png
 
 Окружение (сеть — Веха 135, см. блок ниже): VOID_QEMU_ACCEL, VOID_QEMU_MEM, VOID_QEMU_CPU,
@@ -315,6 +316,13 @@ try:
             call("input-send-event", events=[{"type": "btn", "data": {"down": False, "button": btn}}])
         elif cmd == "hotkey":
             hotkey(arg.strip())
+        elif cmd == "hold":
+            # Веха 142 — клавишу можно ЗАДЕРЖАТЬ: без этого не проверить ни Super+колесо, ни
+            # перетаскивание окон с Super, потому что `hotkey` отпускает клавишу сразу.
+            k, _, state = arg.partition(" ")
+            key = QCODE.get(k.strip(), k.strip().lower())
+            call("input-send-event", events=[{"type": "key", "data": {
+                "down": state.strip() == "down", "key": {"type": "qcode", "data": key}}}])
         elif cmd == "shot":
             ppm = os.path.join(outdir, arg + ".ppm")
             call("screendump", filename=ppm)

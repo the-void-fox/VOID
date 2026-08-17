@@ -65,7 +65,7 @@ pub use imp::{
     // Веха 120: размер консоли в знакоместах (`(0, 0)` — арх его не знает: serial)
     console_size,
     // мышь (Веха 115): события с провода, позицию курсора ведёт владелец экрана
-    mouse_pending, mouse_pop, mouse_present, mouse_take_lost, mouse_wheel,
+    mouse_five, mouse_pending, mouse_pop, mouse_present, mouse_take_lost, mouse_wheel,
     // клавиатура событиями (Веха 119): код клавиши + маска модификаторов + готовый ASCII
     key_pending, key_pop,
     // прерывания

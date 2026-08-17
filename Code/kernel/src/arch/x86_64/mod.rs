@@ -551,6 +551,11 @@ pub fn mouse_wheel() -> bool {
     ps2::mouse_wheel()
 }
 
+/// Веха 142 — приняла ли мышь пятикнопочный режим (наклон колеса приходит кнопками).
+pub fn mouse_five() -> bool {
+    ps2::mouse_five()
+}
+
 /// Забрать и обнулить счётчик потерянных событий.
 pub fn mouse_take_lost() -> usize {
     MOUSE_LOST.swap(0, Ordering::Relaxed)

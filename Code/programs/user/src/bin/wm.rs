@@ -73,13 +73,31 @@ const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
 // и гасится к цели. Обратная кривая (плавный старт) читается как «система подумала и поехала»,
 // а нужно «поехало сразу, а доводит уже само».
 
-/// Сколько длится переезд окна, открытие и закрытие. Числа niri: за 150 мс глаз успевает
-/// проследить связь «было → стало», а ждать уже не начинает.
-const MOVE_MS: u64 = 450;
-const OPEN_MS: u64 = 380;
-const CLOSE_MS: u64 = 320;
-/// Обзор ездит спокойнее: он показывает всю систему, и резкость там суетлива.
-const OV_MS: u64 = 450;
+/// Сколько длится ПЕРЕЕЗД окна — основа всех сроков (Веха 142: настраивается,
+/// `desktop anim <мс>` из конфига поколения). Остальные три считаются от него теми же долями,
+/// какими стояли до настройки: открытие чуть короче переезда, закрытие ещё короче, обзор равен
+/// переезду. Долями, а не четырьмя числами в конфиге, потому что соотношения между ними — это
+/// решение о виде системы, а не вкус: рассогласовать их значит получить рябь, а не свою настройку.
+const ANIM_MS: u64 = 360;
+/// Доли от [`Wm::anim`] в процентах.
+const D_OPEN: u64 = 84;
+const D_CLOSE: u64 = 71;
+const D_OV: u64 = 100;
+/// Потолок: анимация длиннее секунды — это уже не «плавно», а «система задумалась».
+const ANIM_MAX: u64 = 1000;
+
+/// Веха 142 — перетаскивание окна мышью с зажатым Super.
+///
+/// Хранится накопленный сдвиг, а не «схваченная точка»: в тайлинге окно не кладут в координату,
+/// его переставляют местами. Как только накопится шаг ([`Wm::drag_steps`]), выполняется обычное
+/// действие раскладки, а накопитель уменьшается на этот шаг — остаток продолжает копиться, и
+/// медленное движение не теряет ход.
+struct Drag {
+    /// ПКМ — меняем ширину колонки; иначе переставляем окно.
+    resize: bool,
+    ax: i32,
+    ay: i32,
+}
 
 /// Насколько окно «поджато» в начале открытия и в конце закрытия — в 1/256 от размера.
 /// Небольшое (как в niri): большое превращает появление окна в аттракцион.
@@ -283,6 +301,19 @@ fn wallpaper_name(text: &str) -> Option<&str> {
     None
 }
 
+/// Веха 142 — ЧИСЛОВАЯ настройка рабочего стола: строка `desktop <имя> <число>`. Сегодня это
+/// только `anim`, но разбор общий: следующая настройка не должна приносить с собой свой парсер.
+fn desktop_num(text: &str, key: &str) -> Option<u64> {
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("desktop ") else { continue };
+        let Some(v) = rest.trim().strip_prefix(key) else { continue };
+        if let Ok(n) = v.trim().parse::<u64>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
 /// Веха 140 — просит ли конфиг поколения ПАНЕЛЬ: строка `desktop bar on`.
 ///
 /// Выключателем, а не высотой: высота панели следует за шрифтом (8×16 плюс поля), и вынести её в
@@ -387,6 +418,8 @@ fn main_loop() -> ! {
         ov_dur: 0,
         ov_band_y: 0,
         status: (0, 1, None),
+        anim: ANIM_MS,
+        drag: None,
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -395,6 +428,12 @@ fn main_loop() -> ! {
 
     // Конфиг поколения читаем ОДИН раз: из него и раскладка клавиш, и обои.
     let generation = read_generation(store).unwrap_or_default();
+    // Веха 142 — скорость анимаций из конфига (`desktop anim <мс>`). Значение чужое, поэтому
+    // потолок ставим свой: срок длиннее секунды делает систему не плавной, а задумчивой.
+    if let Some(ms) = desktop_num(&generation, "anim") {
+        wm.anim = ms.min(ANIM_MAX);
+        sys::write_console(alloc::format!("[wm] анимации: {} мс\n", wm.anim).as_bytes());
+    }
 
     // Веха 139 — обои. Это ТАКОЙ ЖЕ клиент, как терминал, только просит он поверхность слоя, а
     // не окно; композитор о картинках по-прежнему не знает ничего. Имя картинки уезжает
@@ -475,22 +514,30 @@ fn main_loop() -> ! {
     loop {
         let mut worked = false;
 
-        // ── мышь ───────────────────────────────────────────────────────────────────────
-        let mn = sys::mouse_read(&mut mouse);
-        if mn > 0 {
-            worked = true;
-            for e in &mouse[..mn] {
-                wm.on_mouse(e);
-            }
-        }
-
         // ── клавиши: сперва АККОРДЫ, потом обычный ввод окну в фокусе ──────────────────
+        //
+        // Клавиши читаются ПЕРЕД мышью (Веха 142), и порядок этот не косметический. Мышь с
+        // модификатором — тоже команда системе (`Super`+колесо переключает столы, `Super`+кнопка
+        // тащит окно), а держит ли человек Super, композитор узнаёт из очереди КЛАВИШ. Пока мышь
+        // разбиралась первой, событие мыши, попавшее в тот же оборот, что и нажатие Super, видело
+        // модификатор ещё не нажатым — и уходило в программу как обычный клик. Со стороны это
+        // «Super+колесо не работает» и «окно иногда не тащится»: не всегда, а когда рука успела
+        // сделать оба движения быстрее одного оборота цикла.
         let mut kev = [sys::KeyEvent { sym: 0, mods: 0, down: false, ch: 0 }; 32];
         let kn = sys::key_read(&mut kev);
         if kn > 0 {
             worked = true;
             for e in &kev[..kn] {
                 wm.key_event(e, &binds, store, me);
+            }
+        }
+
+        // ── мышь ───────────────────────────────────────────────────────────────────────
+        let mn = sys::mouse_read(&mut mouse);
+        if mn > 0 {
+            worked = true;
+            for e in &mouse[..mn] {
+                wm.on_mouse(e);
             }
         }
 
@@ -652,6 +699,17 @@ impl Win {
 
     /// Начать движение к `target`.
     fn start(&mut self, target: Shown, ms: u64, now: u64) {
+        // Веха 142 — `anim = 0` в конфиге значит «без анимаций», и это законная настройка.
+        // Ставим на место СРАЗУ: иначе `tick` с нулевым сроком вернул бы «не двигалось», и окно
+        // навсегда осталось бы там, откуда собиралось ехать, — поджатым при открытии.
+        if ms == 0 {
+            self.shown = target;
+            self.from = target;
+            self.to = target;
+            self.at = now;
+            self.dur = 0;
+            return;
+        }
         self.from = self.shown;
         self.to = target;
         self.at = now;
@@ -750,7 +808,9 @@ struct Wm {
     /// Нужны, чтобы стол было ВИДНО, когда на нём нет окон: с динамическими столами последний
     /// всегда пустой, и без полосы про него неоткуда узнать — ровно то возражение, из-за
     /// которого динамические столы и откладывали.
-    ov_bands: Vec<(i32, i32, i32, i32, bool)>,
+    /// Полосы столов в обзоре: `(x, y, w, h, номер стола)`. Номер, а не признак «активный»:
+    /// по нему же считается клик по пустому месту стола (Веха 142).
+    ov_bands: Vec<(i32, i32, i32, i32, usize)>,
     /// Порядок = z-order: последнее окно рисуется поверх и получает клики первым.
     wins: Vec<Win>,
     /// Лента колонок слева направо.
@@ -796,6 +856,11 @@ struct Wm {
     /// принадлежит программе. Маска модификаторов есть у событий КЛАВИШ, у мыши её нет —
     /// поэтому состояние ведём здесь, по нажатиям и отпусканиям.
     super_held: bool,
+    /// Веха 142 — длительность ПЕРЕЕЗДА окна в мс; остальные сроки — доли от неё
+    /// ([`D_OPEN`], [`D_CLOSE`], [`D_OV`]). Ноль означает «без анимаций»: рывком, но честно.
+    anim: u64,
+    /// Веха 142 — идёт перетаскивание мышью с Super (ЛКМ — переставить, ПКМ — ширина).
+    drag: Option<Drag>,
     /// Где стоит камера обзора. Хранится, а не вычисляется каждый раз, — и в этом суть
     /// (Веха 123.2): камера едет за ОСОЗНАННЫМ выбором (клавиши, колесо, вход в обзор), а
     /// наведение мышью только переносит фокус.
@@ -1203,7 +1268,17 @@ impl Wm {
         self.ov_from = self.ov_t;
         self.ov_to = to;
         self.ov_at = sys::monotonic_ns();
-        self.ov_dur = OV_MS * 1_000_000;
+        self.ov_dur = self.anim * D_OV / 100 * 1_000_000;
+        // `anim = 0` — переход не доигрывается вовсе, поэтому его конец надо исполнить здесь,
+        // иначе обзор не открылся бы и не закрылся (см. `Win::start`).
+        if self.ov_dur == 0 {
+            self.ov_t = to;
+            if to == 0 {
+                self.overview = false;
+                self.ov.clear();
+            }
+            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+        }
     }
 
     /// Уйти из обзора: лента встаёт в КОНЕЧНОЕ положение сразу, а видимый переход к ней
@@ -1258,7 +1333,8 @@ impl Wm {
         self.wins[k].closing = true;
         self.wins[k].visible = true;
         let target = self.wins[k].shown.popped();
-        self.wins[k].start(target, CLOSE_MS, now);
+        let d = self.anim * D_CLOSE / 100;
+        self.wins[k].start(target, d, now);
         self.unlink(id);
         // Веха 137 — закрылось последнее окно стола, и стол должен исчезнуть (кроме того, на
         // котором стоим, и последнего). Делается ЗДЕСЬ, а не внутри `unlink`: тот же `unlink`
@@ -1365,7 +1441,9 @@ impl Wm {
             if if over { !win.over() } else { !win.under() } {
                 continue;
             }
-            self.draw_win_row(out, yy, x0, x1, win.shown.rect(), win, false, 256);
+            // Непрозрачность берём У ПОВЕРХНОСТИ, а не «256»: с Вехи 142 обои проявляются, и
+            // прибитая единица делала их появление мгновенным независимо от анимации.
+            self.draw_win_row(out, yy, x0, x1, win.shown.rect(), win, false, win.shown.a);
         }
     }
 
@@ -1465,7 +1543,8 @@ impl Wm {
         // Полосы столов — ПОД окнами и только в самом обзоре (`ov_t`): на переходе они бы
         // разъезжались вместе с камерой и мигали по краям кадра.
         if self.ov_t > 512 {
-            for &(px, py, pw, ph, active) in &self.ov_bands {
+            for &(px, py, pw, ph, sp) in &self.ov_bands {
+                let active = sp == self.space;
                 let (rx, ry) = (px * a / 1024 + bx, py * a / 1024 + by);
                 let (rw, rh) = ((pw * a / 1024).max(2), (ph * a / 1024).max(2));
                 if yy < ry || yy >= ry + rh {
@@ -1557,6 +1636,21 @@ impl Wm {
     }
 
     /// Ширина колонки в пикселях по её пресету — от РАБОЧЕЙ ОБЛАСТИ, а не от экрана.
+    /// Веха 142 — сколько пикселей руки стоит один шаг перетаскивания: `(по X, по Y)`.
+    ///
+    /// Для ПЕРЕСТАНОВКИ шаг — половина ширины колонки и четверть высоты рабочей области: рука
+    /// проходит примерно то расстояние, на которое окно и переедет, поэтому движение читается
+    /// как перенос, а не как переключатель. Для ШИРИНЫ шаг мельче: ступеней всего четыре
+    /// ([`WIDTHS`]), и проходить экран ради последней было бы утомительно.
+    fn drag_steps(&self, resize: bool) -> (i32, i32) {
+        let (_, _, ow, oh) = self.work;
+        if resize {
+            return ((ow / 10).max(40), i32::MAX);
+        }
+        let cw = self.cols.get(self.cur).map_or(ow / 2, |c| self.col_width(c));
+        ((cw / 2).max(60), (oh / 4).max(60))
+    }
+
     fn col_width(&self, c: &Column) -> i32 {
         let (n, d) = WIDTHS[c.width.min(WIDTHS.len() - 1)];
         (self.work.2 - GAP) * n / d - GAP
@@ -1661,6 +1755,8 @@ impl Wm {
     /// разойтись в понимании того, где что лежит.
     fn relayout(&mut self) {
         let screen_h = self.info.height as i32;
+        // Срок анимаций берём ДО цикла: внутри `self` уже занят изменяемой ссылкой на окно.
+        let anim = self.anim;
         // Видно ровно то, что лежит на активном столе. Считаем это здесь, а не при
         // переключении: раскладка и так обходит все окна активной ленты — второй список
         // «кто виден» разошёлся бы с первым при первой же правке.
@@ -1695,7 +1791,10 @@ impl Wm {
             self.scroll_from = self.scroll_x;
             self.scroll_to = want;
             self.scroll_at = sys::monotonic_ns();
-            self.scroll_dur = MOVE_MS * 1_000_000;
+            self.scroll_dur = self.anim * 1_000_000;
+            if self.scroll_dur == 0 {
+                self.scroll_x = want;
+            }
         }
 
         let mut resized: Vec<(u32, i32, i32)> = Vec::new();
@@ -1718,9 +1817,9 @@ impl Wm {
                 // Первое появление: растём из поджатого и проявляемся.
                 self.wins[k].fresh = false;
                 self.wins[k].shown = target.popped();
-                self.wins[k].start(target, OPEN_MS, now);
+                self.wins[k].start(target, anim * D_OPEN / 100, now);
             } else if self.wins[k].to != target {
-                self.wins[k].start(target, MOVE_MS, now);
+                self.wins[k].start(target, anim, now);
             }
             if self.wins[k].w != cw2 || self.wins[k].h != ch2 {
                 self.wins[k].w = cw2;
@@ -1733,6 +1832,15 @@ impl Wm {
             }
         }
         let _ = screen_h;
+        // Веха 142 — в ОБЗОРЕ пересобрать и его. Обзор рисуется по своему списку `ov`, и пока
+        // раскладка меняла только ленту, новое окно, открытое из обзора (`Super+Return`), в этот
+        // список не попадало: оно существовало, работало и получало ввод, но на экране его не
+        // было до первого действия, которое обзор перестраивало. Одно место на всё — потому что
+        // путей в раскладку много (открылось, закрылось, переехало, сменило ширину), и любой
+        // забытый снова разошёлся бы с картинкой.
+        if self.overview {
+            self.build_overview(false);
+        }
         for (id, w, h) in resized {
             if let Some(k) = self.win_at(id) {
                 let ev = [win::EV_RESIZE, w as u8, (w >> 8) as u8, h as u8, (h >> 8) as u8, 0, 0, 0];
@@ -1792,7 +1900,7 @@ impl Wm {
             if by + band_h < 0 || by > sh {
                 continue; // полоса целиком за кадром — считать её нечего
             }
-            self.ov_bands.push((0, by, sw, band_h, sp == self.space));
+            self.ov_bands.push((0, by, sw, band_h, sp));
             let cols: &[Column] =
                 if sp == self.space { &self.cols } else { &self.spaces[sp].cols };
             let (frames, _) = self.strip_layout(cols);
@@ -1902,7 +2010,12 @@ impl Wm {
         self.cam_from = self.ov_cam;
         self.cam_to = to;
         self.cam_at = sys::monotonic_ns();
-        self.cam_dur = OV_MS * 1_000_000;
+        self.cam_dur = self.anim * D_OV / 100 * 1_000_000;
+        // `anim = 0` — ставим сразу: нулевой срок движение не доигрывает, а пропускает (см.
+        // `Win::start`), и камера осталась бы там, где была.
+        if self.cam_dur == 0 {
+            self.ov_cam = to;
+        }
     }
 
     /// Подвинуть камеру обзора минимально — так, чтобы окно `id` поместилось на экране целиком.
@@ -2052,7 +2165,95 @@ impl Wm {
                 }
                 self.sync_focus();
                 self.leave_overview();
+            } else if let Some(&(_, by, _, bh, sp)) =
+                self.ov_bands.iter().find(|b| self.cursor.1 >= b.1 && self.cursor.1 < b.1 + b.3)
+            {
+                // Веха 142 — клик мимо окон, но по ПОЛОСЕ стола: перейти на этот стол и выйти.
+                // Пустой стол иначе выбрать мышью было нечем — на нём нет ни одного окна, а
+                // именно туда чаще всего и уходят из обзора, чтобы начать с чистого места.
+                let _ = (by, bh);
+                if sp != self.space {
+                    self.switch_space(sp);
+                    self.sync_focus();
+                }
+                self.leave_overview();
             }
+            return;
+        }
+
+        // ── Веха 142: мышь с Super принадлежит КОМПОЗИТОРУ ──────────────────────────────────
+        //
+        // Super — тот же признак «это команда системе, а не программе», что и у клавиш. Поэтому
+        // ни нажатие, ни движение с зажатым Super окну не отдаются: иначе редактор получал бы
+        // выделение текста ровно там, где человек двигал окно.
+        //
+        // ЛКМ переставляет окно, ПКМ меняет ширину колонки. Обе тянут за собой ОБЫЧНЫЕ действия
+        // раскладки (`move-column-*`, `width-*`), а не свою арифметику: в тайлинге место окна
+        // задаётся лентой, и «положить окно в пиксель» тут значения не имеет. Побочно это значит,
+        // что рука и клавиши делают ровно одно и то же — разойтись им нечем.
+        // Веха 142 — БОКОВЫЕ кнопки (четвёртая и пятая). Ими же мышь сообщает наклон колеса
+        // влево-вправо: у PS/2 отдельной оси для наклона нет, и тилт-колёса шлют его именно
+        // кнопками. С Super это переход по колонкам — то же, что `Super+H`/`Super+L`.
+        //
+        // Разбирается ДО перетаскивания: «нажата кнопка» верно и для них, и не раздели мы эти
+        // случаи, наклон колеса начинал бы таскать окно.
+        let pressed = e.buttons & !was;
+        if self.super_held && pressed & 0x18 != 0 {
+            let name = if pressed & 0x08 != 0 { "focus-column-left" } else { "focus-column-right" };
+            self.action_inner(name, 0, 0);
+            self.damage(old.0, old.1, CUR_W, CUR_H);
+            self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
+            return;
+        }
+        // Тащат ТОЛЬКО левой и правой: остальные кнопки к месту окна отношения не имеют.
+        if self.super_held && !self.overview && was == 0 && e.buttons & 0x03 != 0 {
+            if let Some(i) = self.wins.iter().position(|w| {
+                w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)
+            }) {
+                let id = self.wins[i].id;
+                if let Some((ci, wi)) = self.locate(id) {
+                    self.cur = ci;
+                    self.cols[ci].focus = wi;
+                    self.sync_focus();
+                }
+            }
+            self.drag = Some(Drag { resize: e.buttons & 2 != 0, ax: 0, ay: 0 });
+            self.damage(old.0, old.1, CUR_W, CUR_H);
+            self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
+            return;
+        }
+        if let Some(mut d) = self.drag.take() {
+            if e.buttons != 0 {
+                d.ax += e.dx as i32;
+                d.ay += e.dy as i32;
+                // Шаг — доля ЭКРАННОГО размера, а не число пикселей: на большом экране окна
+                // крупнее, и постоянный порог означал бы «на 4K окна прыгают от дрожи руки».
+                let (sx, sy) = self.drag_steps(d.resize);
+                while d.ax.abs() >= sx {
+                    let right = d.ax > 0;
+                    d.ax -= if right { sx } else { -sx };
+                    self.action_inner(
+                        match (d.resize, right) {
+                            (true, true) => "width-plus",
+                            (true, false) => "width-minus",
+                            (false, true) => "move-column-right",
+                            (false, false) => "move-column-left",
+                        },
+                        0,
+                        0,
+                    );
+                }
+                // По вертикали переставляем окно ВНУТРИ колонки. Ширину вертикалью не меняем:
+                // высоту окна в ленте задаёт число соседей, отдельной высоты у него нет.
+                while !d.resize && d.ay.abs() >= sy {
+                    let down = d.ay > 0;
+                    d.ay -= if down { sy } else { -sy };
+                    self.action_inner(if down { "move-window-down" } else { "move-window-up" }, 0, 0);
+                }
+                self.drag = Some(d);
+            }
+            self.damage(old.0, old.1, CUR_W, CUR_H);
+            self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
             return;
         }
 
@@ -2634,6 +2835,8 @@ impl Wm {
                 self.next_id += 1;
                 let (buf, buf_len, slot) = self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0));
                 let (rx, ry, rw, rh) = self.layer_rect(&spec, w, h);
+                // Проявляются только ОБОИ (нижний слой): см. ниже, у поля `shown`.
+                let fade = spec.layer == win::LAYER_BG;
                 let win = Win {
                     id,
                     owner: m.sender,
@@ -2652,14 +2855,21 @@ impl Wm {
                     wait_until: None,
                     watching: false,
                     inbox: Vec::new(),
-                    // Слой не анимируется: он появляется там, где ему назначено. Выезжающие
-                    // обои или подпрыгивающий бар — не «оживление», а рябь на каждом запуске.
-                    shown: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
-                    from: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
+                    // Слой не ЕЗДИТ: он появляется там, где ему назначено. Выезжающие обои или
+                    // подпрыгивающий бар — не «оживление», а рябь на каждом запуске.
+                    //
+                    // Веха 142 — но обои ПРОЯВЛЯЮТСЯ. Место при этом не меняется, меняется только
+                    // непрозрачность: знак считается полторы секунды (см. [[logo]]), и до этого
+                    // момента стол уже нарисован — без проявления картинка возникает рывком,
+                    // будто что-то моргнуло. Бар этого не требует: он появляется сразу.
+                    shown: Shown { x: rx, y: ry, w: rw, h: rh, a: if fade { 0 } else { 256 } },
+                    from: Shown { x: rx, y: ry, w: rw, h: rh, a: if fade { 0 } else { 256 } },
                     to: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
                     at: 0,
                     dur: 0,
-                    fresh: false,
+                    // «Свежая» поверхность — та, что ещё ни разу не нарисовала себя. Для обоев
+                    // это и есть повод проявиться, когда картинка появится (см. `OP_COMMIT`).
+                    fresh: fade,
                     closing: false,
                     visible: true,
                     layer: Some(spec),
@@ -2715,6 +2925,19 @@ impl Wm {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 sys::reply(m.reply_cap, &[]);
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
+                    // Веха 142 — ПЕРВЫЙ кадр обоев: отсюда и начинается их проявление.
+                    //
+                    // Не с создания поверхности: обои рисуют знак полторы секунды (см. [[logo]])
+                    // и просят место ДО того, как им есть что показать. Проявись они от
+                    // создания — проявился бы пустой буфер, а картинка потом возникла бы рывком,
+                    // то есть ровно тем, от чего проявление и заводили.
+                    if self.wins[i].fresh && !self.wins[i].tiled() {
+                        self.wins[i].fresh = false;
+                        let (rx, ry, rw, rh) = self.wins[i].shown.rect();
+                        let d = self.anim * D_OPEN / 100;
+                        let to = Shown { x: rx, y: ry, w: rw, h: rh, a: 256 };
+                        self.wins[i].start(to, d, sys::monotonic_ns());
+                    }
                     let dx = u16::from_le_bytes([buf[4], buf[5]]) as i32;
                     let dy = u16::from_le_bytes([buf[6], buf[7]]) as i32;
                     let dw = u16::from_le_bytes([buf[8], buf[9]]) as i32;

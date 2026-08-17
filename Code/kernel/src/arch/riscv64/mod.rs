@@ -90,6 +90,9 @@ pub fn mouse_present() -> bool {
 pub fn mouse_wheel() -> bool {
     false
 }
+pub fn mouse_five() -> bool {
+    false
+}
 
 /// Веха 119 — события клавиатуры. На riscv клавиатура приходит по UART байтами, аккордов
 /// (Super/Alt) там нет физически, поэтому событий нет тоже — честная заглушка.
