@@ -99,6 +99,19 @@ struct Drag {
     ay: i32,
 }
 
+/// Веха 142.1 — переезд между СТОЛАМИ: старая лента уходит, новая приходит по вертикали.
+///
+/// Хранятся окна УХОДЯЩЕГО стола и его сдвиг ленты: после обмена лент `self.scroll_x` уже чужой,
+/// и рисовать по нему старые окна значило бы сдвинуть их вбок на ровном месте.
+struct Slide {
+    ids: Vec<u32>,
+    scroll: i32,
+    /// +1 — новый стол приходит СНИЗУ (ушли на стол с бо́льшим номером), −1 — сверху.
+    dir: i32,
+    at: u64,
+    dur: u64,
+}
+
 /// Насколько окно «поджато» в начале открытия и в конце закрытия — в 1/256 от размера.
 /// Небольшое (как в niri): большое превращает появление окна в аттракцион.
 const POP: i32 = 232;
@@ -380,8 +393,19 @@ fn main_loop() -> ! {
     let me = sys::self_endpoint();
     let store = store_cap();
 
+    // Веха 142.1 — раскладка каналов пикселя считается ОДИН раз. `pack` звался на каждый пиксель
+    // кадра и каждый раз перебирал три канала циклом с clamp'ом — при миллионе пикселей это и
+    // была основная цена сборки (замер: 27 мс на кадр).
+    let rgb = [
+        (info.rgb[0].0 as u32, 8 - info.rgb[0].1.clamp(1, 8) as u32),
+        (info.rgb[1].0 as u32, 8 - info.rgb[1].1.clamp(1, 8) as u32),
+        (info.rgb[2].0 as u32, 8 - info.rgb[2].1.clamp(1, 8) as u32),
+    ];
+    let rgb8 = rgb.iter().all(|&(_, drop)| drop == 0);
     let mut wm = Wm {
         info,
+        rgb,
+        rgb8,
         work: (0, 0, info.width as i32, info.height as i32),
         wins: Vec::new(),
         next_id: 1,
@@ -420,6 +444,7 @@ fn main_loop() -> ! {
         status: (0, 1, None),
         anim: ANIM_MS,
         drag: None,
+        slide: None,
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
@@ -855,12 +880,18 @@ struct Wm {
     /// Держат ли сейчас Super. Нужно колесу: `Super+колесо` крутит столы, а голое колесо
     /// принадлежит программе. Маска модификаторов есть у событий КЛАВИШ, у мыши её нет —
     /// поэтому состояние ведём здесь, по нажатиям и отпусканиям.
+    /// Веха 142.1 — `(сдвиг, сколько бит отбросить)` на канал: готовая раскладка пикселя.
+    rgb: [(u32, u32); 3],
+    /// Все три канала по восемь бит — тогда разбор пикселя это сдвиг, а не деление.
+    rgb8: bool,
     super_held: bool,
     /// Веха 142 — длительность ПЕРЕЕЗДА окна в мс; остальные сроки — доли от неё
     /// ([`D_OPEN`], [`D_CLOSE`], [`D_OV`]). Ноль означает «без анимаций»: рывком, но честно.
     anim: u64,
     /// Веха 142 — идёт перетаскивание мышью с Super (ЛКМ — переставить, ПКМ — ширина).
     drag: Option<Drag>,
+    /// Веха 142.1 — идёт переезд между столами.
+    slide: Option<Slide>,
     /// Где стоит камера обзора. Хранится, а не вычисляется каждый раз, — и в этом суть
     /// (Веха 123.2): камера едет за ОСОЗНАННЫМ выбором (клавиши, колесо, вход в обзор), а
     /// наведение мышью только переносит фокус.
@@ -965,6 +996,33 @@ fn intersect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> Option<(i32, i
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
 }
 
+/// Веха 142.1 — `a` минус `b`: до четырёх прямоугольников в `out` (полосы сверху, снизу, слева,
+/// справа от дырки). Не пересекаются — значит `a` целиком.
+fn subtract_rect(
+    a: (i32, i32, i32, i32),
+    b: (i32, i32, i32, i32),
+    out: &mut Vec<(i32, i32, i32, i32)>,
+) {
+    let Some(h) = intersect(a, b) else {
+        out.push(a);
+        return;
+    };
+    let (ax, ay, aw, ah) = a;
+    let (hx, hy, hw, hh) = h;
+    if hy > ay {
+        out.push((ax, ay, aw, hy - ay));
+    }
+    if hy + hh < ay + ah {
+        out.push((ax, hy + hh, aw, ay + ah - hy - hh));
+    }
+    if hx > ax {
+        out.push((ax, hy, hx - ax, hh));
+    }
+    if hx + hw < ax + aw {
+        out.push((hx + hw, hy, ax + aw - hx - hw, hh));
+    }
+}
+
 /// Охватывающий прямоугольник двух.
 fn union(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
     let x0 = a.0.min(b.0);
@@ -980,31 +1038,39 @@ impl Wm {
     // Пишем ПРЯМО во фреймбуфер (он write-combining с Вехи 116.1 — 1,3+ ГБ/с на железе), без
     // теневого кадра: лишняя копия экрана стоила бы 4 МиБ памяти и второго прохода по ним.
 
-    #[inline]
+    #[inline(always)]
     fn pack(&self, c: (u8, u8, u8)) -> u32 {
-        let mut out = 0u32;
-        for (i, chan) in [c.0, c.1, c.2].iter().enumerate() {
-            let (pos, size) = self.info.rgb[i];
-            let size = size.clamp(1, 8);
-            out |= ((*chan as u32) >> (8 - size)) << pos;
-        }
-        out
+        ((c.0 as u32 >> self.rgb[0].1) << self.rgb[0].0)
+            | ((c.1 as u32 >> self.rgb[1].1) << self.rgb[1].0)
+            | ((c.2 as u32 >> self.rgb[2].1) << self.rgb[2].0)
     }
 
     /// Разобрать пиксель обратно в RGB — нужно смешиванию (сглаживание углов, дальше прозрачность).
+    #[inline(always)]
     fn unpack(&self, px: u32) -> (u8, u8, u8) {
+        // Веха 142.1 — восьмибитные каналы (все живые режимы, кроме 16-битных) разбираются
+        // сдвигом, без деления. Общий путь ниже остаётся ради честности: 5-битное «31» обязано
+        // стать 255, а не 248, — но платить за это шестью делениями на пиксель в каждом
+        // смешивании не за что.
+        if self.rgb8 {
+            return (
+                ((px >> self.rgb[0].0) & 0xff) as u8,
+                ((px >> self.rgb[1].0) & 0xff) as u8,
+                ((px >> self.rgb[2].0) & 0xff) as u8,
+            );
+        }
         let mut out = [0u8; 3];
         for (i, o) in out.iter_mut().enumerate() {
             let (pos, size) = self.info.rgb[i];
             let size = size.clamp(1, 8);
             let v = (px >> pos) & ((1u32 << size) - 1);
-            // Растягиваем обратно до восьми бит: 5-битное «31» обязано стать 255, а не 248.
             *o = ((v * 255) / ((1u32 << size) - 1).max(1)) as u8;
         }
         (out[0], out[1], out[2])
     }
 
     /// Смешать цвет с тем, что уже лежит в пикселе, в пропорции `a` (0..256).
+    #[inline(always)]
     fn blend(&self, dst: u32, src: (u8, u8, u8), a: u32) -> u32 {
         if a >= 256 {
             return self.pack(src);
@@ -1215,9 +1281,35 @@ impl Wm {
                 // Открывшаяся полоса + запас на сглаженные края.
                 let strip = if dx > 0 { (sw - n as i32 - 2, n as i32 + 2) } else { (0, n as i32 + 2) };
                 self.damage(strip.0, 0, strip.1, shh);
+                // Веха 142.1 — и ВСЁ, ЧТО С ЛЕНТОЙ НЕ ЕДЕТ. Сдвиг памяти двигает кадр целиком, а
+                // едет в нём только лента: обои, панель и курсор стоят на месте. Их сдвинутые
+                // пиксели никто не чинил до конца анимации, и это владелец увидел так: «курсор
+                // сперва уезжает влево, потом телепортируется на место», «обои слегка дёргаются».
+                // Одна причина на оба наблюдения.
+                //
+                // Пересобираем не весь кадр (это те самые миллион пикселей, ради которых сдвиг и
+                // заводили), а ровно дополнение к окнам: щели между колонками, поля, панель.
+                self.damage_outside_windows();
+                let (cx, cy) = self.cursor;
+                self.damage(cx - n as i32 - 2, cy - 2, CUR_W + 2 * n as i32 + 4, CUR_H + 4);
                 self.present_all = true;
             } else {
                 self.damage(0, 0, sw, shh);
+            }
+        }
+
+        // Веха 142.1 — переезд между столами. Двигается ВСЁ содержимое ленты (обе), поэтому кадр
+        // помечаем целиком: сдвигом памяти тут не обойтись — на экране одновременно две ленты,
+        // и едут они в РАЗНЫЕ стороны.
+        if let Some(sl) = &self.slide {
+            let done = now.saturating_sub(sl.at) >= sl.dur;
+            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+            if done {
+                // Уходящие окна больше не рисуем — раскладка вернёт им `visible = false`.
+                self.slide = None;
+                self.relayout();
+            } else {
+                moving = true;
             }
         }
 
@@ -1343,6 +1435,38 @@ impl Wm {
         self.tidy_spaces();
     }
 
+    /// Веха 142.1 — пометить весь экран, КРОМЕ занятого окнами ленты.
+    ///
+    /// Нужно после сдвига памяти теневого кадра: сдвиг двигает всё, а едет только лента. Считаем
+    /// вычитанием прямоугольников — экран минус каждое видимое окно; остаток это щели, поля,
+    /// поверхности слоя и всё, что стоит на месте.
+    ///
+    /// Если остаток дробится слишком мелко (окон много), честнее пометить экран целиком: два
+    /// десятка мелких прямоугольников обходятся дороже одного большого.
+    fn damage_outside_windows(&mut self) {
+        let (sw, shh) = (self.info.width as i32, self.info.height as i32);
+        let mut rest: Vec<(i32, i32, i32, i32)> = vec![(0, 0, sw, shh)];
+        for i in 0..self.wins.len() {
+            if !self.wins[i].visible || !self.wins[i].tiled() {
+                continue;
+            }
+            let (wx, wy, ww, wh) = self.wins[i].shown.rect();
+            let hole = (wx - self.scroll_x, wy, ww, wh);
+            let mut next = Vec::with_capacity(rest.len() + 3);
+            for r in rest {
+                subtract_rect(r, hole, &mut next);
+            }
+            rest = next;
+            if rest.len() > 24 {
+                self.damage(0, 0, sw, shh);
+                return;
+            }
+        }
+        for (x, y, w, h) in rest {
+            self.damage(x, y, w, h);
+        }
+    }
+
     /// Нарисовать всё накопленное. Ровно один раз за оборот цикла — это и есть «кадр».
     fn flush(&mut self) {
         if self.damage.is_empty() {
@@ -1415,6 +1539,19 @@ impl Wm {
             return;
         }
 
+        // Веха 142.1 — смещения переезда столов: уходящая лента и приходящая едут по вертикали
+        // навстречу, каждая на свой экран.
+        let (dy_in, dy_out, sl_scroll) = match &self.slide {
+            Some(sl) => {
+                let h = self.info.height as i32;
+                let t = ((sys::monotonic_ns().saturating_sub(sl.at)) * 1024 / sl.dur.max(1))
+                    .min(1024) as i32;
+                let p = ease_out(t);
+                (sl.dir * (h - h * p / 1024), -sl.dir * (h * p / 1024), sl.scroll)
+            }
+            None => (0, 0, 0),
+        };
+
         for win in &self.wins {
             if !win.visible || !win.tiled() {
                 continue;
@@ -1424,7 +1561,9 @@ impl Wm {
             // переезда и сжатия окно на экране не совпадает со своим буфером.
             let (sxr, fy, fw, fh) = win.shown.rect();
             let active = self.focus == Some(win.id);
-            let rect = (sxr - self.scroll_x, fy, fw, fh);
+            let leaving = self.slide.as_ref().is_some_and(|s| s.ids.contains(&win.id));
+            let (sc, dy) = if leaving { (sl_scroll, dy_out) } else { (self.scroll_x, dy_in) };
+            let rect = (sxr - sc, fy + dy, fw, fh);
             self.draw_win_row(out, yy, x0, x1, rect, win, active, win.shown.a);
         }
 
@@ -1496,6 +1635,41 @@ impl Wm {
             let corner_row = top < rad || fy + fh - 1 - yy < rad;
             let edge_row = top < bord || fy + fh - 1 - yy < bord;
             let opaque = alpha >= 256;
+
+            // Веха 142.1 — БЫСТРАЯ СТРОКА: непрозрачное содержимое один-к-одному, вдали от углов
+            // и рамки. Это подавляющее большинство пикселей кадра — вся середина каждого окна и
+            // все обои целиком, — и общий путь считал на каждый из них две ЦЕЛОЧИСЛЕННЫЕ ДЕЛЕНИЯ
+            // (столбец источника и смешивание) плюс пяток ветвей. Замер: сборка кадра 27 мс, из
+            // них почти всё здесь; после этой ветки — единицы миллисекунд.
+            //
+            // Условие «один-к-одному» проверяется по размерам, а не предполагается: во время
+            // переезда и в обзоре окно ЯВНО масштабируется, и там работает общий путь.
+            if opaque && has_content && !corner_row && !edge_row && win.bw == cw && win.bh == ch {
+                let cs = (fx + bord).max(sx);
+                let ce = (fx + fw - bord).min(ex);
+                let bp = self.pack(border);
+                for xx in sx..cs {
+                    out[(xx - x0) as usize] = bp;
+                }
+                // Копирование идёт СРЕЗАМИ, а не по индексам: так с каждого пикселя уходят
+                // четыре проверки границ (три байта источника и запись), а их цена на миллионе
+                // пикселей сравнима с самим преобразованием цвета.
+                if ce > cs {
+                    let b0 = (src_row * win.bw) as usize * 4 + (cs - fx - bord) as usize * 4;
+                    let b1 = b0 + (ce - cs) as usize * 4;
+                    if b1 <= px.len() {
+                        let dst = &mut out[(cs - x0) as usize..(ce - x0) as usize];
+                        for (d, s) in dst.iter_mut().zip(px[b0..b1].chunks_exact(4)) {
+                            *d = self.pack((s[0], s[1], s[2]));
+                        }
+                    }
+                }
+                for xx in ce..ex {
+                    out[(xx - x0) as usize] = bp;
+                }
+                return;
+            }
+
             for xx in sx..ex {
                 let dh = xx - fx;
                 let near_x = dh < rad || fx + fw - 1 - xx < rad;
@@ -1760,10 +1934,12 @@ impl Wm {
         // Видно ровно то, что лежит на активном столе. Считаем это здесь, а не при
         // переключении: раскладка и так обходит все окна активной ленты — второй список
         // «кто виден» разошёлся бы с первым при первой же правке.
+        // Уходящий стол дорисовывает переезд — его окна видимы, пока едут (Веха 142.1).
+        let sliding: Vec<u32> = self.slide.as_ref().map(|s| s.ids.clone()).unwrap_or_default();
         for w in self.wins.iter_mut() {
             // Закрывающееся окно остаётся видимым: его уже нет в раскладке, но сжатие доигрывает.
             // Поверхность слоя видна ВСЕГДА: обои и бар не принадлежат столу (Веха 139).
-            w.visible = w.closing || !w.tiled();
+            w.visible = w.closing || !w.tiled() || sliding.contains(&w.id);
         }
         let (frames, _) = self.strip_layout(&self.cols);
 
@@ -1973,6 +2149,20 @@ impl Wm {
     fn switch_space(&mut self, n: usize) {
         if n == self.space || n >= self.space_count() {
             return;
+        }
+        // Веха 142.1 — переезд столов виден. Раньше лента менялась мгновенно: только что было
+        // одно, стало другое, и связь «куда я попал» приходилось достраивать в голове. В обзоре
+        // переезда нет — там своя камера, и вторая анимация поверх неё была бы дракой.
+        if self.anim > 0 && !self.overview {
+            let ids: Vec<u32> =
+                self.wins.iter().filter(|w| w.tiled() && w.visible).map(|w| w.id).collect();
+            self.slide = Some(Slide {
+                ids,
+                scroll: self.scroll_x,
+                dir: if n > self.space { 1 } else { -1 },
+                at: sys::monotonic_ns(),
+                dur: self.anim * D_OV / 100 * 1_000_000,
+            });
         }
         self.spaces[self.space] = Space {
             cols: core::mem::take(&mut self.cols),

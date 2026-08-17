@@ -1858,28 +1858,34 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
     }
 }
 
-/// Перерисовать строку ввода целиком: в начало, приглашение, содержимое, стереть хвост, вернуть курсор.
+/// Перерисовать строку ввода целиком: в начало, приглашение, содержимое, стереть хвост, вернуть
+/// курсор — ОДНОЙ записью.
+///
+/// Одной, а не пятью, и это не экономия. Каждая `write` — вызов к терминалу, и тот успевает
+/// нарисовать кадр МЕЖДУ ними: на экране мелькало промежуточное состояние, где возврат каретки
+/// уже сделан, а строка ещё не напечатана. Со стороны это «при стирании курсор прыгает в начало
+/// строки и возвращается» — давняя жалоба владельца, и причина оказалась не в терминале.
 fn redraw(prompt: &[u8], line: &[u8], llen: usize, pos: usize) {
-    sys::write(b"\r");
-    sys::write(prompt);
-    sys::write(&line[..llen]);
-    sys::write(b"\x1b[K"); // стереть до конца строки
+    // Приглашение (320) + строка (LINE_CAP) + управляющие последовательности. Больше `CHUNK`
+    // stdio всё равно поедет двумя сообщениями, но это уже длина строки, а не наша щедрость.
+    let mut buf = [0u8; 1400];
+    let mut i = 0usize;
+    append(&mut buf, &mut i, b"\r");
+    append(&mut buf, &mut i, prompt);
+    append(&mut buf, &mut i, &line[..llen]);
+    append(&mut buf, &mut i, b"\x1b[K"); // стереть до конца строки
     if pos < llen {
-        csi_num(llen - pos, b'D'); // курсор влево на (llen-pos) колонок
+        csi_num(&mut buf, &mut i, llen - pos, b'D'); // курсор влево на (llen-pos) колонок
     }
+    sys::write(&buf[..i]);
 }
 
-/// Записать управляющую последовательность `ESC[<n><fin>` (например, сдвиг курсора).
-fn csi_num(n: usize, fin: u8) {
+/// Дописать управляющую последовательность `ESC[<n><fin>` в буфер (сдвиг курсора и подобное).
+fn csi_num(out: &mut [u8], i: &mut usize, n: usize, fin: u8) {
     if n == 0 {
         return;
     }
-    let mut buf = [0u8; 16];
-    let mut i = 0;
-    buf[i] = 0x1b;
-    i += 1;
-    buf[i] = b'[';
-    i += 1;
+    append(out, i, b"\x1b[");
     let mut tmp = [0u8; 10];
     let mut t = 0;
     let mut m = n;
@@ -1890,12 +1896,9 @@ fn csi_num(n: usize, fin: u8) {
     }
     while t > 0 {
         t -= 1;
-        buf[i] = tmp[t];
-        i += 1;
+        append(out, i, &tmp[t..t + 1]);
     }
-    buf[i] = fin;
-    i += 1;
-    sys::write(&buf[..i]);
+    append(out, i, &[fin]);
 }
 
 fn append(out: &mut [u8], i: &mut usize, bytes: &[u8]) {
