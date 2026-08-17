@@ -133,8 +133,48 @@ pub const NO_CAP: usize = usize::MAX;
 
 /// Паника программы — завершиться ненулевым кодом, не трогая ядро: раскрутки стека нет
 /// (panic="abort"), а печатать backtrace — не забота userspace-программы.
+/// Веха 143.1 — паника программы ГОВОРИТ, где умерла.
+///
+/// Раньше здесь стоял молчаливый `exit(101)`, и это дорого обошлось: композитор падал на выходе
+/// за границу среза, а снаружи выглядело как «wm умер, паники нет, экран вернулся ядру». Место
+/// падения приходилось искать чтением кода вместо чтения журнала.
+///
+/// Пишем В КОНСОЛЬ ЯДРА, а не в stdio: хоста может не быть (композитор), а если он есть, то он
+/// сам может быть тем, кто падает. Буфер на стеке — куча в этот момент уже не заслуживает
+/// доверия, да и у библиотеки её нет.
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
+    struct Buf {
+        b: [u8; 256],
+        n: usize,
+    }
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &c in s.as_bytes() {
+                if self.n < self.b.len() {
+                    self.b[self.n] = c;
+                    self.n += 1;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut out = Buf { b: [0; 256], n: 0 };
+    let _ = out.write_str("  [паника] ");
+    // Имя программы из argv[0] — иначе по журналу не понять, КТО именно упал.
+    let mut abuf = [0u8; 64];
+    let n = args(&mut abuf);
+    let name = abuf[..n].split(|&b| b == 0).next().unwrap_or(&[]);
+    if let Ok(s) = core::str::from_utf8(name) {
+        let _ = out.write_str(s);
+        let _ = out.write_str(": ");
+    }
+    if let Some(l) = info.location() {
+        let _ = write!(out, "{}:{}: ", l.file(), l.line());
+    }
+    let _ = write!(out, "{}\n", info.message());
+    write_console(&out.b[..out.n]);
     exit(101)
 }
 
