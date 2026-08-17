@@ -72,7 +72,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         say("bar: композитор не принял подписку на состояние — столы показаны не будут\n");
     }
 
-    let mut st = State { space: 0, spaces: 1, title: String::new(), cells: Vec::new() };
+    let mut st =
+        State { space: 0, spaces: 1, layout: 0, title: String::new(), cells: Vec::new() };
     st.fetch(&surf);
     if year_now() < 2000 {
         say("bar: часов у машины нет — время идёт с загрузки (см. SYS_TIME)\n");
@@ -121,6 +122,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 struct State {
     space: u8,
     spaces: u8,
+    /// Раскладка клавиатуры: 0 — US, 1 — RU (Веха 143).
+    layout: u8,
     title: String,
     /// Клетки столов: `(x0, x1)` в координатах панели, по индексу = номер стола.
     ///
@@ -134,10 +137,11 @@ impl State {
     /// Спросить композитор: стол, сколько столов, заголовок окна в фокусе.
     fn fetch(&mut self, surf: &Window) {
         let mut buf = [0u8; win::TITLE_MAX];
-        let Some((space, spaces, n)) = surf.status(&mut buf) else { return };
-        self.space = space;
-        self.spaces = spaces.max(1);
-        self.title = String::from(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+        let Some(st) = surf.status(&mut buf) else { return };
+        self.space = st.space;
+        self.spaces = st.spaces.max(1);
+        self.layout = st.layout;
+        self.title = String::from(core::str::from_utf8(&buf[..st.title_len]).unwrap_or(""));
     }
 
     /// Номер стола под точкой `x` панели. `None` — там не клетка стола.
@@ -175,11 +179,19 @@ impl State {
         let clock_w = glyph::text_width(&clock, 1) as i32;
         c.text(w - PAD - clock_w, ty, &clock, C_FG);
 
+        // Веха 143 — РАСКЛАДКА перед часами. Две буквы, а не флажок: флаг это страна, а не язык
+        // ввода, и «какой сейчас язык» читается буквами быстрее, чем узнаётся картинка.
+        // Активная раскладка написана ярко, чтобы отличаться от часов боковым зрением.
+        let lang = if self.layout == 0 { "EN" } else { "RU" };
+        let lang_w = glyph::text_width(lang, 1) as i32;
+        let lang_x = w - PAD - clock_w - PAD - lang_w;
+        c.text(lang_x, ty, lang, if self.layout == 0 { C_DIM } else { C_FG });
+
         // Заголовок посередине — тем, что осталось между столами и часами. Обрезаем ПО СИМВОЛАМ,
         // а не по байтам: заголовок это UTF-8, и разрезанный посреди буквы он превратился бы в
         // мусор (у нас заголовки русские).
         let left = x + PAD;
-        let right = w - PAD - clock_w - PAD;
+        let right = lang_x - PAD;
         if right > left && !self.title.is_empty() {
             let room = ((right - left) / glyph::W as i32).max(0) as usize;
             let shown: String = self.title.chars().take(room).collect();

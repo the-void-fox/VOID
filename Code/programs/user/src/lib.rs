@@ -125,6 +125,8 @@ const SYS_KLOG: usize = 50;
 const SYS_KEY_READ: usize = 51;
 const SYS_CONSIZE: usize = 52;
 const SYS_SETENV: usize = 53;
+/// Веха 143 — раскладка клавиатуры: `0` спросить, `1` следующая.
+const SYS_KEYMAP: usize = 57;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -672,6 +674,18 @@ pub fn read_stdin(buf: &mut [u8]) -> usize {
         return n;
     }
     abi::syscall(SYS_READ, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0, 0).0
+}
+
+/// Веха 143 — какая раскладка клавиатуры сейчас: 0 — US, 1 — RU. Спросить может кто угодно.
+pub fn keymap() -> usize {
+    abi::syscall(SYS_KEYMAP, 0, 0, 0, 0, 0, 0, 0).0
+}
+
+/// Веха 143 — переключить раскладку на следующую; `None` — экран не наш (переключает тот, кто
+/// на этом экране рисует: композитор в окнах, полноэкранный терминал в тексте).
+pub fn keymap_next() -> Option<usize> {
+    let n = abi::syscall(SYS_KEYMAP, 1, 0, 0, 0, 0, 0, 0).0;
+    (n != usize::MAX).then_some(n)
 }
 
 /// `SYS_KILL(pid)` (Веха 103) — завершить СВОЕГО ребёнка (запущенного [`spawn`]). `false` —

@@ -2171,9 +2171,11 @@ keys = [\n\
 #   Super+R ширина по кругу · Super+Equal/Minus ширина ± · Super+F развернуть\n\
 #   Super+Tab следующая колонка · Super+Shift+Q выйти из сессии\n\
 #   Super+1…9 рабочий стол · Super+Shift+1…9 перенести окно на стол\n\
+#   Super+Z раскладка RU/EN (switch-layout)\n\
 #\n\
 # Свой вариант пишется так:\n\
-#   wm_keys = [ bind(\"wm\", \"Super+Return\", \"spawn-term\"), … ]\n\
+#   wm_keys = [ bind(\"wm\", \"Super+Return\", \"spawn-term\"),\n\
+#               bind(\"wm\", \"Super+Space\", \"switch-layout\"), … ]\n\
 wm_keys = []\n\
 \n\
 netcap = if net { \"endpoint:net-srv\" } else { [] }\n\

@@ -192,6 +192,7 @@ bind wm Super+Equal width-plus
 bind wm Super+Minus width-minus
 bind wm Super+F maximize-column
 bind wm Super+Tab toggle-overview
+bind wm Super+Z switch-layout
 bind wm Escape close-overview
 bind wm Return close-overview
 bind wm Super+1 workspace-1
@@ -441,7 +442,7 @@ fn main_loop() -> ! {
         ov_at: 0,
         ov_dur: 0,
         ov_band_y: 0,
-        status: (0, 1, None),
+        status: (0, 1, None, 0),
         anim: ANIM_MS,
         drag: None,
         slide: None,
@@ -922,7 +923,7 @@ struct Wm {
     /// Одно место, а не рассылка из `sync_focus`, `switch_space` и `tidy_spaces`: состояние
     /// меняют ещё закрытие окна, обзор и раскладка, и каждый новый путь пришлось бы вспоминать.
     /// Забытая рассылка — это бар, молча показывающий прошлое.
-    status: (usize, usize, Option<u32>),
+    status: (usize, usize, Option<u32>, usize),
 }
 
 /// Окно в обзоре: куда его уменьшили и с какого стола оно родом.
@@ -2817,6 +2818,15 @@ impl Wm {
                     self.leave_overview();
                 }
             }
+            // Веха 143 — РАСКЛАДКА. Действие композитора, а не аккорд в драйвере: какой клавишей
+            // её переключать — вкус владельца (у него это `Super+Z`), а вкусы живут в конфиге.
+            // Таблицы при этом остаются в ядре: вторая копия раскладки в userspace разошлась бы
+            // с той, по которой считается ввод в текстовом режиме.
+            "switch-layout" => {
+                if sys::keymap_next().is_none() {
+                    sys::write_console("[wm] раскладку не переключить: экран не наш\n".as_bytes());
+                }
+            }
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
                 sys::exit(0);
@@ -2850,7 +2860,9 @@ impl Wm {
     /// стола, фокус, закрытие окна, раскладка и обзор — рассылку из каждого пришлось бы
     /// вспоминать, а забытая означает бар, молча показывающий прошлое.
     fn notify_status(&mut self) {
-        let now = (self.space, self.space_count(), self.focus);
+        // Веха 143 — раскладка входит в снимок: её меняет не только наше действие (в ядре
+        // остался зашитый Alt+Shift для текстового режима), поэтому спрашиваем, а не помним.
+        let now = (self.space, self.space_count(), self.focus, sys::keymap());
         if now == self.status {
             return;
         }
@@ -3210,9 +3222,13 @@ impl Wm {
             // Веха 140 — СОСТОЯНИЕ рабочего места для бара: стол, сколько столов, заголовок окна
             // в фокусе. Заголовок здесь, а не в событии, потому что событие — семь байт.
             win::OP_STATUS => {
-                let mut rep = Vec::with_capacity(2 + win::TITLE_MAX);
+                let mut rep = Vec::with_capacity(3 + win::TITLE_MAX);
                 rep.push(self.space as u8);
                 rep.push(self.space_count().min(255) as u8);
+                // Веха 143 — раскладка третьим байтом. Спрашивать её у ядра самой панели не
+                // годится: `SYS_KEYMAP` отвечает всем, но панель узнаёт об ИЗМЕНЕНИИ только от
+                // композитора, и брать два разных источника для одного числа значит развести их.
+                rep.push(sys::keymap().min(255) as u8);
                 if let Some(id) = self.focus {
                     if let Some(w) = self.wins.iter().find(|w| w.id == id) {
                         let t = w.title.as_bytes();

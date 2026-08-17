@@ -556,6 +556,17 @@ pub fn mouse_five() -> bool {
     ps2::mouse_five()
 }
 
+/// Веха 143 — текущая раскладка клавиатуры (0 — US, 1 — RU) и её переключение.
+pub fn keymap() -> usize {
+    ps2::keymap()
+}
+pub fn keymap_set(n: usize) {
+    ps2::keymap_set(n % ps2::KEYMAPS)
+}
+pub fn keymaps() -> usize {
+    ps2::KEYMAPS
+}
+
 /// Забрать и обнулить счётчик потерянных событий.
 pub fn mouse_take_lost() -> usize {
     MOUSE_LOST.swap(0, Ordering::Relaxed)
