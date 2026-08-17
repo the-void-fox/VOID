@@ -446,6 +446,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("terminal", b_terminal),
     ("bind", b_bind),
     ("desktop", b_desktop),
+    ("ui", b_ui),
     ("packages", b_packages),
     ("channel", b_channel),
     ("system", b_system),
@@ -661,6 +662,21 @@ fn b_desktop(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("desktop", args)
 }
 
+/// `(ui ключ значение)` — вид оболочки (Веха 144), читает тулкит `void-ui`: цвета, скругление,
+/// отступы, кегль, масштаб и имя файла шрифта.
+///
+/// Отдельная запись, а не `desktop`, по тому же правилу, по которому `desktop` отделён от
+/// `terminal`: `desktop …` читает КОМПОЗИТОР (обои, панель, скорость анимаций), `ui …` — любая
+/// программа, рисующая интерфейс. Свали их в одну — и каждый читатель обязан молча пропускать
+/// чужие ключи, а молчаливый пропуск опечатки это ровно то, от чего этап сборки и защищает.
+///
+/// Почему вид системы вообще в конфиге: тогда он получает поколения и откат бесплатно
+/// (ADR 0017). Отдельный «файл темы» пришлось бы версионировать руками, и «система откатилась,
+/// а панель осталась чужого цвета» стало бы нормой.
+fn b_ui(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("ui", args)
+}
+
 fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
     let mut out = vec![Value::sym("packages")];
     for a in args {
@@ -717,10 +733,11 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
-/// `desktop` — композитор, `packages`/`channel` — `pkg`: конфиг поколения один, читателей
-/// несколько, и каждый берёт свои строки.
+/// `desktop` — композитор, `ui` — тулкит оболочки, `packages`/`channel` — `pkg`: конфиг
+/// поколения один, читателей несколько, и каждый берёт свои строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
-            "service" | "shell" | "terminal" | "desktop" | "bind" | "packages" | "channel"))
+            "service" | "shell" | "terminal" | "desktop" | "ui" | "bind" | "packages"
+                | "channel"))
 }

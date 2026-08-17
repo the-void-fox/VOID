@@ -435,6 +435,7 @@ fn main_loop() -> ! {
         cam_at: 0,
         cam_dur: 0,
         super_held: false,
+        hover: None,
         ov: Vec::new(),
         ov_t: 0,
         ov_from: 0,
@@ -690,6 +691,8 @@ struct LayerCfg {
     anchor: u8,
     /// Сколько пикселей у своего края поверхность отнимает у окон.
     exclusive: i32,
+    /// Веха 144 — у пикселей значима альфа: смешивать, а не копировать (`win::LAYER_ALPHA`).
+    alpha: bool,
 }
 
 impl Win {
@@ -712,6 +715,10 @@ impl Win {
     /// Слой ВЫШЕ окон ленты: бар, панель, всплывающее.
     fn over(&self) -> bool {
         self.layer.is_some_and(|l| l.layer >= win::LAYER_TOP)
+    }
+    /// Веха 144 — поверхность просит смешивания по альфе каждого пикселя.
+    fn alpha_px(&self) -> bool {
+        self.layer.is_some_and(|l| l.alpha)
     }
     /// Толщина рамки и радиус скругления. У слоя их нет: обои в рамке с уголками — это не
     /// оформление, а ошибка, и бар со скруглёнными углами оставил бы щели у краёв экрана.
@@ -886,6 +893,9 @@ struct Wm {
     /// Все три канала по восемь бит — тогда разбор пикселя это сдвиг, а не деление.
     rgb8: bool,
     super_held: bool,
+    /// Веха 144 — номер поверхности ПОД КУРСОРОМ. Нужен только для того, чтобы сказать прежней,
+    /// что курсор ушёл: без этого подсветка виджетов под курсором залипала бы навсегда.
+    hover: Option<u32>,
     /// Веха 142 — длительность ПЕРЕЕЗДА окна в мс; остальные сроки — доли от неё
     /// ([`D_OPEN`], [`D_CLOSE`], [`D_OV`]). Ноль означает «без анимаций»: рывком, но честно.
     anim: u64,
@@ -1636,6 +1646,34 @@ impl Wm {
             let corner_row = top < rad || fy + fh - 1 - yy < rad;
             let edge_row = top < bord || fy + fh - 1 - yy < bord;
             let opaque = alpha >= 256;
+
+            // Веха 144 — ПОВЕРХНОСТЬ СО ЗНАЧИМОЙ АЛЬФОЙ (панель на скруглённых островах).
+            // Отдельная ветка, а не флажок в общем пути, ровно потому, что у слоя нет ни рамки,
+            // ни скругления: строка здесь — это чистое наложение src-over, без единого вопроса
+            // про углы. Влезь она в общий путь, «прозрачный пиксель» пришлось бы отличать от
+            // «пикселя за рамкой», а те рисуются ЦВЕТОМ РАМКИ — панель получила бы серую сетку
+            // вместо обоев в дырках.
+            if win.alpha_px() {
+                if !has_content {
+                    return;
+                }
+                for xx in sx..ex {
+                    let col = (xx - fx) * win.bw / fw.max(1);
+                    let p = ((src_row * win.bw + col) * 4) as usize;
+                    if col < 0 || col >= win.bw || p + 3 >= px.len() {
+                        continue;
+                    }
+                    // Альфа кадра, приглушённая непрозрачностью самой поверхности: одно и то же
+                    // число управляет и «панель полупрозрачна», и «панель проявляется».
+                    let a = px[p + 3] as u32 * 256 / 255 * alpha / 256;
+                    if a == 0 {
+                        continue;
+                    }
+                    let i = (xx - x0) as usize;
+                    out[i] = self.blend(out[i], (px[p], px[p + 1], px[p + 2]), a);
+                }
+                return;
+            }
 
             // Веха 142.1 — БЫСТРАЯ СТРОКА: непрозрачное содержимое один-к-одному, вдали от углов
             // и рамки. Это подавляющее большинство пикселей кадра — вся середина каждого окна и
@@ -2574,10 +2612,25 @@ impl Wm {
 
         // Событие поверхности под курсором: слою, если он там, иначе окну ленты. Один и тот же
         // код на оба случая — разница только в том, ЧТО нашлось под курсором (Веха 140).
-        if let Some(i) = on_layer
+        let under = on_layer
             .or_else(|| self.wins.iter().rposition(|w| w.visible && w.tiled()
-                && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)))
-        {
+                && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)));
+        // Веха 144 — сказать прежней поверхности, что курсор УШЁЛ. Событие то же самое
+        // (`EV_MOTION`), но с координатами вне поверхности: `0xffff` не бывает настоящей точкой,
+        // а заводить отдельное событие ради одного признака значило бы раздувать протокол.
+        //
+        // Понадобилось панели: у её виджетов появилась подсветка под курсором, а сообщения
+        // «мыши больше нет над тобой» в протоколе не было вовсе — подсветка залипала на том
+        // месте, где курсор ушёл с панели в окно.
+        let now_id = under.map(|i| self.wins[i].id);
+        if self.hover != now_id {
+            if let Some(k) = self.hover.and_then(|h| self.wins.iter().position(|w| w.id == h)) {
+                let ev = [win::EV_MOTION, 0xff, 0xff, 0xff, 0xff, 0, 0, 0];
+                self.send(k, ev, 5);
+            }
+            self.hover = now_id;
+        }
+        if let Some(i) = under {
             let (ox, oy) = self.wins[i].content_at();
             let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
             if was != e.buttons {
@@ -3036,10 +3089,14 @@ impl Wm {
                     exclusive: (u16::from_le_bytes([buf[6], buf[7]]) as i32)
                         .min(self.info.height as i32)
                         .min(self.info.width as i32),
+                    // Веха 144 — байт флагов. Читаем его по ДЛИНЕ сообщения, а не по индексу:
+                    // приёмный буфер фиксированный, и за `len` в нём лежит мусор от прошлого
+                    // запроса — прочитав его, мы бы включали смешивание случайным клиентам.
+                    alpha: len > 8 && buf[8] & win::LAYER_ALPHA != 0,
                 };
                 let w = u16::from_le_bytes([buf[2], buf[3]]).max(1) as i32;
                 let h = u16::from_le_bytes([buf[4], buf[5]]).max(1) as i32;
-                let title = core::str::from_utf8(buf.get(8..len).unwrap_or(&[])).unwrap_or("слой");
+                let title = core::str::from_utf8(buf.get(9..len).unwrap_or(&[])).unwrap_or("слой");
                 let id = self.next_id;
                 self.next_id += 1;
                 let (buf, buf_len, slot) = self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0));
@@ -3254,6 +3311,14 @@ impl Wm {
                 // Первое состояние — сразу: иначе бар до первой смены стола показывал бы пустоту.
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
                     self.send(i, [win::EV_STATUS, 0, 0, 0, 0, 0, 0, 0], 1);
+                }
+            }
+            // Веха 144 — переключить раскладку (клик по буквам в баре). Тем же вызовом, что и
+            // аккорд `Super+Z`: панели своего пути к раскладке не дано — экран не её.
+            win::OP_LAYOUT => {
+                sys::reply(m.reply_cap, &[]);
+                if sys::keymap_next().is_none() {
+                    sys::write_console("[wm] раскладку не переключить: экран не наш\n".as_bytes());
                 }
             }
             // Веха 140 — переключить стол (клик по столу в баре). Тем же путём, что аккорд

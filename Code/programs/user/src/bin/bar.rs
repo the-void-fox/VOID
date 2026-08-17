@@ -1,4 +1,4 @@
-//! `bar` — панель (Веха 140): столы, заголовок окна в фокусе и часы на верхнем слое.
+//! `bar` — панель (Веха 140; переписана на тулкит `void-ui` Вехой 144).
 //!
 //! Второй клиент слоя после обоев и первый, кому нужны КЛИКИ: столы в панели переключаются
 //! мышью. Занятая зона у неё настоящая — окна начинаются под панелью, а не заезжают под неё
@@ -22,6 +22,19 @@
 //! Часы показывают **UTC**: часовых поясов в VOID нет вовсе, а врать про местное время хуже, чем
 //! честно показать всемирное. Если у машины нет RTC, время идёт с загрузки — панель говорит об
 //! этом вслух при старте, иначе «02:14» выглядело бы как сломанные часы, а не как их отсутствие.
+//!
+//! ## Веха 144 — острова вместо полосы
+//!
+//! Панель больше не полоса во всю ширину: это три скруглённых острова на обоях (так же выглядит
+//! оболочка, которой владелец пользуется сегодня, — `IMG/mk7q48w.png`). Отсюда два следствия,
+//! из-за которых веха и не свелась к перекраске:
+//!
+//! - поверхность стала ПРОЗРАЧНОЙ, а значит композитору понадобилось смешивание по альфе
+//!   (`win::LAYER_ALPHA`) — до этого он копировал кадр слоя строками;
+//! - перерисовывать всю поверхность на каждую минуту стало жалко, поэтому панель считает
+//!   **подпись** каждого острова и трогает только тот, у которого она изменилась. Это же
+//!   заставило тулкит с самого начала уметь damage, а не «нарисовать всё заново».
+
 #![no_std]
 #![no_main]
 
@@ -31,24 +44,19 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use void_user as sys;
-use void_user::glyph;
 use void_user::win::{self, Event, Window};
 
-/// Куча небольшая: панель держит заголовок, строку часов и свой кадр (1920×28×4 — 215 КиБ).
+// Тулкит — библиотека, и панель пользуется не всем, что в нём есть: следующий потребитель
+// (меню, Веха 145) возьмёт остальное. Поэтому неиспользованное здесь не ошибка.
+#[allow(dead_code)]
+#[path = "../ui/mod.rs"]
+mod ui;
+use ui::{Align, Font, Rect, Theme, Ui};
+
+/// Куча: настоящий шрифт приезжает файлом на мегабайты, и глифы кэшируются растрами. Куча
+/// ленивая — под неё берётся адресное окно, а страницы приходят по мере нужды.
 #[global_allocator]
-static ALLOC: sys::heap::Heap<{ 4 * 1024 * 1024 }> = sys::heap::Heap::new();
-
-/// Высота панели: глиф 16 плюс по шесть сверху и снизу. Не в конфиге намеренно — она следует за
-/// шрифтом, и разъехаться с ним не должна (см. `bar_wanted` в `wm`).
-const BAR_H: u16 = 28;
-/// Отступ от края и между частями.
-const PAD: i32 = 8;
-
-const C_BG: (u8, u8, u8) = (0x11, 0x16, 0x1d);
-const C_FG: (u8, u8, u8) = (0xc4, 0xcf, 0xdb);
-const C_DIM: (u8, u8, u8) = (0x5c, 0x68, 0x77);
-const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
-const C_ON_ACCENT: (u8, u8, u8) = (0x08, 0x0c, 0x12);
+static ALLOC: sys::heap::Heap<{ 24 * 1024 * 1024 }> = sys::heap::Heap::new();
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
@@ -57,14 +65,33 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::exit(1);
     };
 
+    // Тема и шрифт — ДО поверхности: от них зависит высота панели, а высоту надо назвать в
+    // запросе. Размер, посчитанный после, пришлось бы менять вторым вызовом на глазах у человека.
+    let th = Theme::from_config(&ui::conf::generation().unwrap_or_default());
+    let mut font = Font::load(th.font.as_deref(), th.font_px);
+
+    // Сказать, что панель решила. Молчание здесь стоило бы человеку получаса: «почему шрифт не
+    // тот» и «почему всё мелкое» — вопросы, ответ на которые панель знает, а он нет.
+    say(&alloc::format!(
+        "bar: шрифт {} {} px, масштаб {}%, высота {} px\n",
+        if font.ttf() { "из пакета" } else { "встроенный 8×16" },
+        th.font_px,
+        th.scale,
+        font.line_h() + 2 * th.px(5) + 2 * th.px(6),
+    ));
+
+    let mut bar = Bar::new(&th, font.line_h());
     let spec = win::Layer {
         layer: win::LAYER_TOP,
         anchor: win::ANCHOR_TOP | win::ANCHOR_LEFT | win::ANCHOR_RIGHT,
         // Занятая зона равна высоте: окна начинаются ПОД панелью. Ноль означал бы «панель поверх
         // окон», то есть первая строка терминала навсегда под ней.
-        exclusive: BAR_H,
+        exclusive: bar.h as u16,
+        // Веха 144 — острова скруглены, значит углы у них прозрачные. Без этого флага композитор
+        // скопировал бы кадр как есть и нарисовал вокруг островов чёрный прямоугольник.
+        alpha: true,
     };
-    let Some(mut surf) = Window::layer(spec, sw, BAR_H, "панель") else {
+    let Some(mut surf) = Window::layer(spec, sw, bar.h as u16, "панель") else {
         say("bar: композитор не дал поверхность слоя\n");
         sys::exit(1);
     };
@@ -72,13 +99,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         say("bar: композитор не принял подписку на состояние — столы показаны не будут\n");
     }
 
-    let mut st =
-        State { space: 0, spaces: 1, layout: 0, title: String::new(), cells: Vec::new() };
-    st.fetch(&surf);
+    bar.fetch(&surf);
     if year_now() < 2000 {
         say("bar: часов у машины нет — время идёт с загрузки (см. SYS_TIME)\n");
     }
-    st.draw(&mut surf);
+    bar.draw(&mut surf, &th, &mut font, None);
 
     let mut minute = minute_now();
     loop {
@@ -87,19 +112,31 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         match surf.next_event_timeout(ms_to_next_minute()) {
             // Состояние сменилось — спросить и перерисовать.
             Some(Event::Status) => {
-                st.fetch(&surf);
-                st.draw(&mut surf);
+                bar.fetch(&surf);
+                bar.draw(&mut surf, &th, &mut font, None);
             }
-            // Клик по столу. Отвечаем ТОЛЬКО на нажатие: реагировать и на отпускание значило бы
-            // два переключения на один щелчок.
-            Some(Event::Button { x, down: true, .. }) => {
-                if let Some(n) = st.cell_at(x as i32) {
-                    surf.switch_space(n);
+            // Клик. Отвечаем ТОЛЬКО на нажатие: реагировать и на отпускание значило бы два
+            // переключения на один щелчок.
+            Some(Event::Button { x, y, down: true, .. }) => {
+                bar.ptr = Some((x as i32, y as i32));
+                bar.draw(&mut surf, &th, &mut font, Some((x as i32, y as i32)));
+                bar.act(&surf);
+            }
+            Some(Event::Motion { x, y }) => {
+                // Курсор УШЁЛ с панели — композитор говорит это координатами вне поверхности
+                // (Веха 144). Без такого сообщения подсветка под курсором залипала бы навсегда:
+                // событий «мыши больше нет над тобой» до этого не существовало.
+                let ptr = (x != u16::MAX).then_some((x as i32, y as i32));
+                if ptr != bar.ptr {
+                    bar.ptr = ptr;
+                    bar.draw(&mut surf, &th, &mut font, None);
                 }
             }
             Some(Event::Resize { w, h }) if (w, h) != (surf.width, surf.height) => {
                 if surf.resize_buf(w, h) {
-                    st.draw(&mut surf);
+                    bar.h = h as i32;
+                    bar.forget();
+                    bar.draw(&mut surf, &th, &mut font, None);
                 }
             }
             Some(Event::Close) => {
@@ -111,30 +148,78 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 let m = minute_now();
                 if m != minute {
                     minute = m;
-                    st.draw(&mut surf);
+                    bar.draw(&mut surf, &th, &mut font, None);
                 }
             }
         }
     }
 }
 
+/// Остров панели: где он и что на нём было нарисовано в прошлый раз.
+///
+/// Подпись — не украшение, а вся суть перерисовки по damage: сравнить одно число дешевле, чем
+/// сравнивать состояние по полям, и невозможно забыть добавить в сравнение новое поле — оно
+/// просто не попадёт в подпись, и это видно в одном месте.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Isle {
+    rect: Rect,
+    sig: u64,
+}
+
 /// Что панель показывает и где у неё что нарисовано.
-struct State {
+struct Bar {
+    h: i32,
     space: u8,
     spaces: u8,
     /// Раскладка клавиатуры: 0 — US, 1 — RU (Веха 143).
     layout: u8,
     title: String,
-    /// Клетки столов: `(x0, x1)` в координатах панели, по индексу = номер стола.
-    ///
-    /// Тот же список, по которому панель НАРИСОВАНА, — им же считается попадание клика. Два
-    /// расчёта «где что» разошлись бы, и человек нажимал бы не на тот стол, который видит; на
-    /// этих граблях композитор уже стоял (обзор, Веха 123).
-    cells: Vec<(i32, i32)>,
+    /// Где курсор в координатах панели. `None` — не над ней.
+    ptr: Option<(i32, i32)>,
+    /// Острова прошлого кадра: столы, заголовок, часы.
+    isles: [Isle; 3],
+    /// Кадра ещё не было: холст надо очистить ЦЕЛИКОМ. Общая область приходит нулевой, но
+    /// строить вид на чужой гарантии дешевле один раз проверить самим.
+    fresh: bool,
+    /// Место переключателя раскладки — он тоже кликается.
+    lang_at: Rect,
+    /// Что решил последний кадр: на какой стол перейти и трогать ли раскладку.
+    go: Option<u8>,
+    flip: bool,
 }
 
-impl State {
-    /// Спросить композитор: стол, сколько столов, заголовок окна в фокусе.
+/// Индексы островов в [`Bar::isles`].
+const I_SPACES: usize = 0;
+const I_TITLE: usize = 1;
+const I_CLOCK: usize = 2;
+
+impl Bar {
+    fn new(th: &Theme, line_h: i32) -> Bar {
+        // Высота считается ОТ ШРИФТА и от темы: разъехаться им нельзя (см. `bar_wanted` в `wm`).
+        let isle_h = line_h + 2 * th.px(5);
+        let h = isle_h + 2 * th.px(6);
+        Bar {
+            h,
+            space: 0,
+            spaces: 1,
+            layout: 0,
+            title: String::new(),
+            ptr: None,
+            isles: [Isle::default(); 3],
+            fresh: true,
+            lang_at: Rect::ZERO,
+            go: None,
+            flip: false,
+        }
+    }
+
+    /// Забыть нарисованное: следующий кадр перерисует всё (смена размера экрана).
+    fn forget(&mut self) {
+        self.isles = [Isle::default(); 3];
+        self.fresh = true;
+    }
+
+    /// Спросить композитор: стол, сколько столов, раскладка, заголовок окна в фокусе.
     fn fetch(&mut self, surf: &Window) {
         let mut buf = [0u8; win::TITLE_MAX];
         let Some(st) = surf.status(&mut buf) else { return };
@@ -144,114 +229,195 @@ impl State {
         self.title = String::from(core::str::from_utf8(&buf[..st.title_len]).unwrap_or(""));
     }
 
-    /// Номер стола под точкой `x` панели. `None` — там не клетка стола.
-    fn cell_at(&self, x: i32) -> Option<u8> {
-        self.cells.iter().position(|&(a, b)| x >= a && x < b).map(|i| i as u8)
+    /// Исполнить то, что решил кадр: клик по столу или по раскладке.
+    ///
+    /// Отдельно от рисования намеренно: переключение стола вызывает у композитора новое
+    /// состояние, а значит и новое событие нам — делать это посреди кадра значило бы рисовать
+    /// по данным, которые уже устарели.
+    fn act(&mut self, surf: &Window) {
+        if let Some(n) = self.go.take() {
+            surf.switch_space(n);
+        }
+        if core::mem::take(&mut self.flip) {
+            // Через композитор, а не `SYS_KEYMAP` самой: право переключать раскладку у владельца
+            // ЭКРАНА, а это он. Панель пробовала звать ядро напрямую — и получала отказ, потому
+            // что она композитору не ровня, а ребёнок (Веха 144, найдено на первом же клике).
+            surf.switch_layout();
+        }
     }
 
-    fn draw(&mut self, surf: &mut Window) {
+    fn draw(
+        &mut self,
+        surf: &mut Window,
+        th: &Theme,
+        font: &mut Font,
+        click: Option<(i32, i32)>,
+    ) {
         let (w, h) = (surf.width as i32, surf.height as i32);
-        let mut c = Canvas { px: surf.pixels(), w, h };
-        c.fill(0, 0, w, h, C_BG);
-        // Нижняя черта: без неё панель сливается с тёмным окном под ней.
-        c.fill(0, h - 1, w, 1, (0x22, 0x2a, 0x34));
+        let margin = th.px(6);
+        let isle_h = h - 2 * margin;
+        let clock = clock_text();
+        let date = date_text();
+        let lang = if self.layout == 0 { "EN" } else { "RU" };
 
-        let ty = (h - glyph::H as i32) / 2;
-
-        // Столы слева. Клетка активного залита — цвет виден издалека, а цифра нет.
-        self.cells.clear();
-        let mut x = PAD;
+        // ── раскладка ряда: сперва посчитать, потом рисовать ───────────────────────────────
+        //
+        // Считаем всё до единого пикселя ДО первого касания холста: остров, чья ширина зависит
+        // от соседа, иначе рисовался бы по вчерашним числам.
+        let pill_gap = th.px(4);
+        let mut widths = Vec::with_capacity(self.spaces as usize);
+        let mut spaces_w = 2 * th.pad;
         for i in 0..self.spaces {
             let label = alloc::format!("{}", i + 1);
-            let tw = glyph::text_width(&label, 1) as i32;
-            let cw = tw + 2 * PAD;
-            let active = i == self.space;
-            if active {
-                c.fill(x, 4, cw, h - 8, C_ACCENT);
+            let pw = (font.width(&label) + th.px(14)).max(isle_h - th.px(8));
+            if i > 0 {
+                spaces_w += pill_gap;
             }
-            c.text(x + PAD, ty, &label, if active { C_ON_ACCENT } else { C_DIM });
-            self.cells.push((x, x + cw));
-            x += cw + 2;
+            spaces_w += pw;
+            widths.push((label, pw));
         }
+        let l_isle = Rect::new(margin, margin, spaces_w, isle_h);
 
-        // Часы справа.
-        let clock = clock_text();
-        let clock_w = glyph::text_width(&clock, 1) as i32;
-        c.text(w - PAD - clock_w, ty, &clock, C_FG);
+        let lang_w = font.width(lang) + th.px(12);
+        let clock_w = font.width(&clock);
+        let date_w = font.width(&date);
+        let r_w = 2 * th.pad + lang_w + th.px(8) + th.line + th.px(8) + clock_w + th.px(6) + date_w;
+        let r_isle = Rect::new(w - margin - r_w, margin, r_w, isle_h);
 
-        // Веха 143 — РАСКЛАДКА перед часами. Две буквы, а не флажок: флаг это страна, а не язык
-        // ввода, и «какой сейчас язык» читается буквами быстрее, чем узнаётся картинка.
-        // Активная раскладка написана ярко, чтобы отличаться от часов боковым зрением.
-        let lang = if self.layout == 0 { "EN" } else { "RU" };
-        let lang_w = glyph::text_width(lang, 1) as i32;
-        let lang_x = w - PAD - clock_w - PAD - lang_w;
-        c.text(lang_x, ty, lang, if self.layout == 0 { C_DIM } else { C_FG });
+        // Заголовок посередине — тем местом, что осталось между островами. Пустой заголовок
+        // острова не рождает: пустая карточка посреди панели выглядела бы поломкой.
+        let room = r_isle.x - l_isle.right() - 2 * margin;
+        let t_isle = if self.title.is_empty() || room < th.px(60) {
+            Rect::ZERO
+        } else {
+            let tw = (font.width(&self.title) + 2 * th.pad).min(room);
+            let x = ((w - tw) / 2).clamp(l_isle.right() + margin, r_isle.x - margin - tw);
+            Rect::new(x, margin, tw, isle_h)
+        };
 
-        // Заголовок посередине — тем, что осталось между столами и часами. Обрезаем ПО СИМВОЛАМ,
-        // а не по байтам: заголовок это UTF-8, и разрезанный посреди буквы он превратился бы в
-        // мусор (у нас заголовки русские).
-        let left = x + PAD;
-        let right = lang_x - PAD;
-        if right > left && !self.title.is_empty() {
-            let room = ((right - left) / glyph::W as i32).max(0) as usize;
-            let shown: String = self.title.chars().take(room).collect();
-            c.text(left, ty, &shown, C_FG);
-        }
-
-        surf.damage(0, 0, w as u16, h as u16);
-    }
-}
-
-/// Кадр панели: RGBA8888 по строкам — то, во что смотрит композитор.
-struct Canvas<'a> {
-    px: &'a mut [u8],
-    w: i32,
-    h: i32,
-}
-
-impl Canvas<'_> {
-    fn put(&mut self, x: i32, y: i32, c: (u8, u8, u8)) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+        // ── что перерисовывать ─────────────────────────────────────────────────────────────
+        let hot = |r: Rect| self.ptr.is_some_and(|(x, y)| r.contains(x, y));
+        let hot_pill = {
+            let mut x = l_isle.x + th.pad;
+            let mut idx = -1i32;
+            for (i, (_, pw)) in widths.iter().enumerate() {
+                if hot(Rect::new(x, l_isle.y, *pw, isle_h)) {
+                    idx = i as i32;
+                }
+                x += pw + pill_gap;
+            }
+            idx
+        };
+        let want = [
+            Isle { rect: l_isle, sig: sig(&[self.space as u64, self.spaces as u64, hot_pill as u64]) },
+            Isle { rect: t_isle, sig: sig_str(&self.title) },
+            Isle {
+                rect: r_isle,
+                sig: sig(&[
+                    self.layout as u64,
+                    sig_str(&clock),
+                    sig_str(&date),
+                    hot(self.lang_at) as u64,
+                ]),
+            },
+        ];
+        // Клик всегда рисует всё: он меняет и то, что под курсором, и то, что было активным, —
+        // а «что именно» знает уже сам виджет, а не эта таблица.
+        let all = click.is_some();
+        let redraw: [bool; 3] = core::array::from_fn(|i| all || want[i] != self.isles[i]);
+        if !redraw.iter().any(|&x| x) {
             return;
         }
-        let i = ((y * self.w + x) * 4) as usize;
-        if i + 3 < self.px.len() {
-            self.px[i] = c.0;
-            self.px[i + 1] = c.1;
-            self.px[i + 2] = c.2;
-            self.px[i + 3] = 0xff;
-        }
-    }
 
-    fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, c: (u8, u8, u8)) {
-        for yy in y..y + h {
-            for xx in x..x + w {
-                self.put(xx, yy, c);
-            }
-        }
-    }
+        let mut u = Ui::new(surf.pixels(), w, h, th, font);
+        u.input(self.ptr, click);
 
-    /// Строка шрифтом 8×16 из таблицы ядра. Без сглаживания: у растрового шрифта его не бывает,
-    /// и в панели оно не нужно — текст здесь короткий и всегда на своём фоне.
-    fn text(&mut self, x: i32, y: i32, s: &str, c: (u8, u8, u8)) {
-        let mut cx = x;
-        for ch in s.chars() {
-            for (row, bits) in glyph::rows(ch).iter().enumerate() {
-                for col in 0..glyph::W as i32 {
-                    if bits & (0x80 >> col) != 0 {
-                        self.put(cx + col, y + row as i32, c);
-                    }
+        // Стереть старое место острова вместе с новым: остров, ставший уже, оставил бы за собой
+        // кусок себя прежнего — на прозрачной поверхности это не «след», а мусор поверх обоев.
+        if core::mem::take(&mut self.fresh) {
+            u.clear_all();
+        } else {
+            for i in 0..3 {
+                if redraw[i] {
+                    u.clear(self.isles[i].rect.union(want[i].rect));
                 }
             }
-            cx += glyph::W as i32;
+        }
+
+        if redraw[I_SPACES] {
+            let mut inner = u.island(l_isle);
+            for (i, (label, pw)) in widths.iter().enumerate() {
+                // Попадание клика считает САМ виджет — по тому прямоугольнику, по которому он
+                // и нарисован. До тулкита панель вела вторую таблицу клеток, и это была не
+                // экономия, а два расчёта «где что», обязанных совпасть (обзор композитора уже
+                // расходился так — Веха 123).
+                let cell = inner.cut_left(*pw);
+                let pill = Rect::new(cell.x, cell.y + th.px(4), cell.w, isle_h - 2 * th.px(4));
+                if u.pill(pill, label, i as u8 == self.space) {
+                    self.go = Some(i as u8);
+                }
+                inner.cut_left(pill_gap);
+            }
+        }
+
+        if redraw[I_TITLE] && !t_isle.is_empty() {
+            let inner = u.island(t_isle);
+            u.label(inner, &self.title, th.text, Align::Center);
+        }
+
+        if redraw[I_CLOCK] {
+            let mut inner = u.island(r_isle);
+            let lang_at = inner.cut_left(lang_w);
+            if u.button(lang_at, lang) {
+                self.flip = true;
+            }
+            self.lang_at = lang_at;
+            inner.cut_left(th.px(8));
+            u.sep(inner.cut_left(th.line).inset_xy(0, th.px(5)));
+            inner.cut_left(th.px(8));
+            u.label(inner.cut_left(clock_w), &clock, th.text, Align::Left);
+            inner.cut_left(th.px(6));
+            u.label(inner, &date, th.muted, Align::Left);
+        }
+
+        let d = u.dirty();
+        self.isles = want;
+        if !d.is_empty() {
+            surf.damage(d.x as u16, d.y as u16, d.w as u16, d.h as u16);
         }
     }
+}
+
+/// Подпись набора чисел (FNV-1a). Нужна только для сравнения «то же самое или нет».
+fn sig(vals: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in vals {
+        for b in v.to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+fn sig_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in s.as_bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 /// Часы «ЧЧ:ММ» по UTC.
 fn clock_text() -> String {
     let (_, _, _, hh, mm, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
     alloc::format!("{hh:02}:{mm:02}")
+}
+
+/// Дата «ДД.ММ» — рядом с часами и приглушённо: она нужна реже времени, но искать её в другом
+/// месте человеку не должно приходиться.
+fn date_text() -> String {
+    let (_, mo, d, _, _, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
+    alloc::format!("{d:02}.{mo:02}")
 }
 
 fn minute_now() -> u64 {

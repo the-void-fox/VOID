@@ -310,6 +310,40 @@ system(
         assert!(build_config(r#"system(desktop("wallpaper"))"#).is_err());
     }
 
+    /// Веха 144 — вид оболочки объявляется записью `ui`, читает её тулкит `void-ui`.
+    ///
+    /// Проверяем ровно то, ради чего запись отдельная от `desktop`: цвет доезжает строкой без
+    /// изменений (решётка не съедается разбором), число печатается числом, а неполная запись —
+    /// ошибка СБОРКИ. Иначе опечатка в теме означала бы панель, молча оставшуюся прежней.
+    #[test]
+    fn ui_theme_normalizes() {
+        // Строка в двух решётках намеренно: внутри есть `"#` (цвет), и одной решётки не хватает.
+        let src = r##"system(
+                       shell("wm", "mmio:fb"),
+                       ui("accent", "#4c7dfd"),
+                       ui("scale", 150),
+                       ui("font", "FiraMonoNerdFont-Regular.otf"),
+                     )"##;
+        assert_eq!(
+            build_config(src).expect("сборка"),
+            "shell wm mmio:fb\n\
+             ui accent #4c7dfd\n\
+             ui scale 150\n\
+             ui font FiraMonoNerdFont-Regular.otf\n"
+        );
+        assert!(build_config(r##"system(ui("accent"))"##).is_err());
+
+        // Так вид записан в шаблоне конфига: список с примерами под комментарием. Пустой он
+        // обязан собираться молча — иначе свежая система не пересобралась бы вовсе, а причиной
+        // была бы строка, которую человек даже не писал.
+        let tmpl = r##"look = [
+                         # ui("font", "FiraMonoNerdFont-Regular.otf"),
+                         # ui("accent", "#4c7dfd"),
+                       ]
+                       system(shell("wm", "mmio:fb"), look)"##;
+        assert_eq!(build_config(tmpl).expect("сборка"), "shell wm mmio:fb\n");
+    }
+
     /// Терминал живёт отдельным модулем и может целиком выключаться (как net.vv).
     #[test]
     fn terminal_module_can_be_off() {

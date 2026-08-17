@@ -80,19 +80,12 @@ static ALLOC: sys::heap::Heap<{ 48 * 1024 * 1024 }> = sys::heap::Heap::new();
 #[path = "../bitfont.rs"]
 mod bitfont;
 use bitfont::BitmapFont;
-// Профиль пакетов — чтобы найти шрифт по ИМЕНИ, а не по хэшу пути (тот же приём, что PATH).
-#[allow(dead_code)] // писательская половина профиля нужна `pkg`, терминалу — чтение
-#[path = "../profile.rs"]
-mod profile;
-
-/// Где в пакете лежат шрифты. Обходится вглубь: угадывать раскладку бесполезно — у
-/// `nerd-fonts-fira-mono` это `share/fonts/opentype/NerdFonts/FiraMono/…otf`, у других пакетов
-/// `share/fonts/truetype/…ttf`. Зато глубина ограничена: пакет чужой, и бродить по нему без
-/// потолка — способ подвесить терминал ещё до первого кадра.
-const FONT_ROOT: &str = "share/fonts";
-const FONT_DEPTH: usize = 4;
-/// Сколько файлов готовы перебрать в одном пакете.
-const FONT_MAX: usize = 256;
+// Веха 144 — поиск файла шрифта в пакетах профиля переехал в тулкит: за тем же самым пришла
+// панель, и вторая копия неминуемо разошлась бы с этой («терминал шрифт нашёл, панель нет»).
+// Терминалу из тулкита нужен только этот модуль; остальное отсечёт LTO.
+#[allow(dead_code)]
+#[path = "../ui/mod.rs"]
+mod ui;
 
 /// Окно фреймбуфера в нашем адресном пространстве: между образом и кучей.
 const FB_VA: usize = 0x5000_0000;
@@ -727,7 +720,7 @@ fn log_line(s: &str) {
 /// забыл ли поставить пакет или файл оказался не шрифтом.
 fn load_font(conf: &Conf) -> TermFont {
     if let Some(name) = conf.font.as_deref() {
-        match find_font(name) {
+        match ui::font::find(name) {
             Some(bytes) => match TtfFont::from_vec(bytes, conf.font_px) {
                 Ok(f) => return TermFont::Ttf(f),
                 Err(_) => log_line(&alloc::format!("term: {} — не разбирается как шрифт", name)),
@@ -740,7 +733,7 @@ fn load_font(conf: &Conf) -> TermFont {
                 // «Не найден» — половина ответа. Вторая половина: а что там ЕСТЬ. Без неё
                 // человек остаётся гадать между опечаткой в имени, не тем пакетом и не той
                 // раскладкой внутри пакета — и идёт выяснять это глазами по скриншоту.
-                list_fonts();
+                ui::font::list();
             }
         }
     }
@@ -754,124 +747,6 @@ fn load_font(conf: &Conf) -> TermFont {
         conf.font_px
     ));
     TermFont::Bitmap(f)
-}
-
-/// Найти файл шрифта: абсолютный путь читается как есть, имя — ищется в пакетах профиля.
-fn find_font(name: &str) -> Option<Vec<u8>> {
-    let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
-    if name.starts_with('/') {
-        return read_whole(ep, name.as_bytes());
-    }
-    let scap = store_cap()?;
-    for path in font_files(ep, scap) {
-        if path.rsplit('/').next() == Some(name) {
-            return try_font(ep, &path);
-        }
-    }
-    None
-}
-
-/// Все файлы шрифтов, какие видны в пакетах профиля.
-fn font_files(ep: usize, scap: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for item in profile::path_items(scap) {
-        if !item.top {
-            continue;
-        }
-        let root = alloc::format!("/nix/store/{}/{}", item.base, FONT_ROOT);
-        walk(ep, &root, FONT_DEPTH, &mut out);
-    }
-    out
-}
-
-/// Обойти каталог вглубь, складывая пути ФАЙЛОВ. Каталоги posixfs отдаёт с хвостовым '/'.
-fn walk(ep: usize, dir: &str, depth: usize, out: &mut Vec<String>) {
-    if depth == 0 || out.len() >= FONT_MAX {
-        return;
-    }
-    let mut buf = alloc::vec![0u8; 8 * 1024];
-    let n = void_user::posix::readdir(ep, dir.as_bytes(), &mut buf);
-    if n == 0 || n > buf.len() {
-        return;
-    }
-    let Ok(text) = core::str::from_utf8(&buf[..n]) else { return };
-    for e in text.lines().filter(|e| !e.is_empty()) {
-        match e.strip_suffix('/') {
-            Some(sub) => walk(ep, &alloc::format!("{}/{}", dir, sub), depth - 1, out),
-            None => {
-                if out.len() < FONT_MAX {
-                    out.push(alloc::format!("{}/{}", dir, e));
-                }
-            }
-        }
-    }
-}
-
-/// Показать, какие файлы шрифтов вообще есть в установленных пакетах.
-fn list_fonts() {
-    let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
-    let Some(scap) = store_cap() else {
-        log_line("  профиль не прочитать: нет права на store");
-        return;
-    };
-    let files = font_files(ep, scap);
-    if files.is_empty() {
-        log_line("  в пакетах профиля нет ни одного файла шрифта — поставьте пакет со шрифтом");
-        return;
-    }
-    for f in files.iter().take(24) {
-        log_line(&alloc::format!("  есть: {}", f));
-    }
-    if files.len() > 24 {
-        log_line(&alloc::format!("  …и ещё {}", files.len() - 24));
-    }
-}
-
-/// Прочитать файл шрифта и сказать, откуда он взят.
-fn try_font(ep: usize, path: &str) -> Option<Vec<u8>> {
-    let bytes = read_whole(ep, path.as_bytes())?;
-    log_line(&alloc::format!("term: шрифт {} ({} Б)", path, bytes.len()));
-    Some(bytes)
-}
-
-/// Имена подкаталогов каталога (пусто, если его нет).
-fn subdirs(ep: usize, path: &[u8]) -> Vec<String> {
-    let mut buf = alloc::vec![0u8; 8 * 1024];
-    let n = void_user::posix::readdir(ep, path, &mut buf);
-    if n == 0 || n > buf.len() {
-        return Vec::new();
-    }
-    core::str::from_utf8(&buf[..n])
-        .unwrap_or("")
-        .lines()
-        .filter_map(|e| e.strip_suffix('/'))
-        .map(|e| e.to_string())
-        .collect()
-}
-
-/// Прочитать файл целиком через файловый сервер. `None` — файла нет или это каталог.
-fn read_whole(ep: usize, path: &[u8]) -> Option<Vec<u8>> {
-    use void_user::posix as px;
-    match px::stat(ep, path) {
-        Some((is_dir, _)) if !is_dir => {}
-        _ => return None,
-    }
-    let fd = px::open(ep, path, 0);
-    if fd == usize::MAX {
-        return None;
-    }
-    let mut out = Vec::new();
-    // Кусок побольше строчного: шрифт — мегабайты, а каждый вызов это IPC.
-    let mut chunk = alloc::vec![0u8; 16 * 1024];
-    loop {
-        let n = px::read(ep, fd, &mut chunk);
-        if n == 0 || n == usize::MAX {
-            break;
-        }
-        out.extend_from_slice(&chunk[..n]);
-    }
-    px::close(ep, fd);
-    (!out.is_empty()).then_some(out)
 }
 
 /// Панель: грид, разбор ANSI, ребёнок и его отложенный запрос ввода.

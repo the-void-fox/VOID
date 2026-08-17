@@ -297,8 +297,18 @@ try:
         elif cmd == "type":
             typewrite(arg)
         elif cmd == "mouse":
-            dx, dy = arg.split()
-            call("input-send-event", events=[rel("x", int(dx)), rel("y", int(dy))])
+            # Двигаем ШАГАМИ: в пакете PS/2 смещение — девять знаковых бит, и всё, что больше,
+            # мышь просто не умеет сказать. Один вызов с `dx = -3000` доезжал до гостя как
+            # «-255», то есть сценарий целился в пилюлю панели, а попадал куда придётся — и
+            # выглядело это как «клик не сработал», а не как обрезанное число.
+            dx, dy = (int(v) for v in arg.split())
+            step = 120
+            while dx or dy:
+                sx = max(-step, min(step, dx))
+                sy = max(-step, min(step, dy))
+                call("input-send-event", events=[rel("x", sx), rel("y", sy)])
+                dx -= sx
+                dy -= sy
         elif cmd == "click":
             btn = arg.strip() or "left"
             call("input-send-event", events=[{"type": "btn", "data": {"down": True, "button": btn}}])
