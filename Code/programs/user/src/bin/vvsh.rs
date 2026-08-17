@@ -1762,13 +1762,13 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                     match b {
                         b'C' => {
                             if pos < llen {
-                                pos += 1;
+                                pos = next_char(line, pos, llen);
                                 sys::write(b"\x1b[C");
                             }
                         }
                         b'D' => {
                             if pos > 0 {
-                                pos -= 1;
+                                pos = prev_char(line, pos);
                                 sys::write(b"\x1b[D");
                             }
                         }
@@ -1807,8 +1807,9 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                         }
                         b'~' => {
                             if pos < llen {
-                                line.copy_within(pos + 1..llen, pos);
-                                llen -= 1;
+                                let e = next_char(line, pos, llen);
+                                line.copy_within(e..llen, pos);
+                                llen -= e - pos;
                                 redraw(prompt, line, llen, pos);
                             }
                         }
@@ -1823,9 +1824,10 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                     0x1b => esc = 1,
                     0x7f | 0x08 => {
                         if pos > 0 {
-                            line.copy_within(pos..llen, pos - 1);
-                            pos -= 1;
-                            llen -= 1;
+                            let p = prev_char(line, pos);
+                            line.copy_within(pos..llen, p);
+                            llen -= pos - p;
+                            pos = p;
                             redraw(prompt, line, llen, pos);
                         }
                     }
@@ -1845,7 +1847,12 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                             llen += 1;
                             pos += 1;
                             if pos == llen {
-                                sys::write(&[c]); // добавление в конец — просто эхо
+                                // Эхо ЦЕЛЫМ символом: терминал рисует кадр между записями, и
+                                // половина кириллической буквы успевала мелькнуть на экране «?».
+                                let st = prev_char(line, pos);
+                                if pos - st == utf8_len(line[st]) {
+                                    sys::write(&line[st..pos]);
+                                }
                             } else {
                                 redraw(prompt, line, llen, pos);
                             }
@@ -1855,6 +1862,46 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                 },
             }
         }
+    }
+}
+
+/// Веха 143.2 — граница символа СЛЕВА от `i`. Строка ввода живёт в байтах, а редактируется по
+/// СИМВОЛАМ: кириллица в UTF-8 занимает два байта, и шаг в байт оставлял половину буквы —
+/// терминал рисовал на её месте «?», а стиралась она со второго нажатия.
+fn prev_char(line: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        // Продолжения UTF-8 — байты вида 10xxxxxx; начало символа — любой другой.
+        if line[j] & 0xC0 != 0x80 {
+            break;
+        }
+    }
+    j
+}
+
+/// Граница символа СПРАВА от `i` (для Delete и стрелки вправо).
+fn next_char(line: &[u8], i: usize, llen: usize) -> usize {
+    let mut j = (i + 1).min(llen);
+    while j < llen && line[j] & 0xC0 == 0x80 {
+        j += 1;
+    }
+    j
+}
+
+/// Сколько ЗНАКОМЕСТ занимает кусок строки: байты-продолжения места не занимают. Нужно сдвигу
+/// курсора — тот считает колонки, а не байты.
+fn cols(part: &[u8]) -> usize {
+    part.iter().filter(|&&b| b & 0xC0 != 0x80).count()
+}
+
+/// Сколько байт в символе по его первому байту.
+fn utf8_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
     }
 }
 
@@ -1875,7 +1922,8 @@ fn redraw(prompt: &[u8], line: &[u8], llen: usize, pos: usize) {
     append(&mut buf, &mut i, &line[..llen]);
     append(&mut buf, &mut i, b"\x1b[K"); // стереть до конца строки
     if pos < llen {
-        csi_num(&mut buf, &mut i, llen - pos, b'D'); // курсор влево на (llen-pos) колонок
+        // Влево — на число ЗНАКОМЕСТ, а не байт: иначе на кириллице курсор уезжал вдвое дальше.
+        csi_num(&mut buf, &mut i, cols(&line[pos..llen]), b'D');
     }
     sys::write(&buf[..i]);
 }
