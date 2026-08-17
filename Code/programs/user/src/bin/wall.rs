@@ -22,8 +22,17 @@
 //! с краёв. Растянуть без пропорций нельзя (люди на снимке станут толще), вписать целиком —
 //! те самые полосы.
 //!
-//! Запуск: `wall <корень store | content-id>`. Обычно его запускает сам `wm`, прочитав в
-//! конфиге поколения строку `desktop wallpaper <имя>`.
+//! ## Обои без файла (Веха 141)
+//!
+//! Имя `builtin:logo` вместо объекта store означает «нарисуй знак VOID» — [`logo`]. Свежей
+//! системе, где в store нет ни одной картинки, это даёт свой рабочий стол, а не пустой цвет; и
+//! на любом разрешении знак выходит точным, потому что он не растягивается, а СЧИТАЕТСЯ заново.
+//!
+//! Приставка `builtin:` нужна как раз для того, чтобы имя нельзя было спутать с корнем store:
+//! просто `logo` рано или поздно совпало бы с чьим-нибудь объектом, и обои молча сменились бы.
+//!
+//! Запуск: `wall <корень store | content-id | builtin:logo>`. Обычно его запускает сам `wm`,
+//! прочитав в конфиге поколения строку `desktop wallpaper <имя>`.
 #![no_std]
 #![no_main]
 
@@ -34,6 +43,8 @@ use void_user::win::{self, Event, Window};
 
 #[path = "../obj.rs"]
 mod obj;
+#[path = "../logo.rs"]
+mod logo;
 
 /// Куча ЛЕНИВАЯ (`SYS_MAP` только резервирует диапазон), поэтому запас ничего не стоит, пока в
 /// него не пишут. Пик здесь — распакованная картинка целиком плюс кадр экрана: снимок с
@@ -43,6 +54,9 @@ static ALLOC: sys::heap::Heap<{ 128 * 1024 * 1024 }> = sys::heap::Heap::new();
 
 /// Потолок площади — тот же, что у `img`: 17 Мпикс это снимок 4624×3468 и запас в арене.
 const MAX_PIXELS: u64 = 17_000_000;
+
+/// Имя «обоев без файла»: знак VOID, нарисованный на месте (Веха 141).
+const BUILTIN_LOGO: &[u8] = b"builtin:logo";
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
@@ -63,42 +77,42 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::exit(1);
     };
 
-    let Some(store) = sys::cap_named("STORE") else {
-        say("wall: нет права на store (STORE в окружении)\n");
-        sys::exit(1);
-    };
-    let bytes = match obj::read(store, spec) {
-        Ok(b) => b,
-        Err(e) => {
-            say(&alloc::format!("wall: {e}\n"));
+    // Знаку store не нужен вовсе — даже права не спрашиваем: обои, которые рисуются формулами,
+    // не должны падать оттого, что права на объекты кто-то не дал.
+    let art = if spec == BUILTIN_LOGO {
+        Art::Logo
+    } else {
+        let Some(store) = sys::cap_named("STORE") else {
+            say("wall: нет права на store (STORE в окружении)\n");
             sys::exit(1);
+        };
+        match obj::read(store, spec) {
+            Ok(b) => Art::File(b),
+            Err(e) => {
+                say(&alloc::format!("wall: {e}\n"));
+                sys::exit(1);
+            }
         }
     };
-
-    let Some(full) = render(&bytes, sw, sh) else { sys::exit(1) };
 
     let Some(mut surf) = Window::layer(win::Layer::WALLPAPER, sw, sh, "обои") else {
         say("wall: композитор не дал поверхность слоя\n");
         sys::exit(1);
     };
-    surf.pixels().copy_from_slice(&full.px);
-    surf.damage(0, 0, sw, sh);
-    drop(full);
+    if !paint(&art, &mut surf, sw, sh) {
+        surf.destroy();
+        sys::exit(1);
+    }
 
     // Дальше только спим. Уйти нельзя: буфер кадра — НАШИ страницы, и композитор смотрит в них
     // ровно пока мы живы. Выход отсюда — это «обоев больше нет», а не «обои показаны».
     loop {
         match surf.next_event() {
-            // Поверхности назначили другой размер. Считаем ЗАНОВО ОТ ФАЙЛА, а не от готового
+            // Поверхности назначили другой размер. Считаем ЗАНОВО ОТ ИСТОЧНИКА, а не от готового
             // кадра: тот уже обрезан под прежний экран, и обрезать обрезанное значит терять
             // края дважды. Файл ради этого и держим — он в сотни раз меньше пикселей.
             Some(Event::Resize { w, h }) if (w, h) != (surf.width, surf.height) => {
-                let Some(next) = render(&bytes, w, h) else { continue };
-                if !surf.resize_buf(w, h) {
-                    continue;
-                }
-                surf.pixels().copy_from_slice(&next.px);
-                surf.damage(0, 0, w, h);
+                paint(&art, &mut surf, w, h);
             }
             Some(Event::Close) => {
                 surf.destroy();
@@ -107,6 +121,40 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             _ => {}
         }
     }
+}
+
+/// Откуда берётся картинка. Байты файла держим ВСЮ ЖИЗНЬ программы — из них пересчитывается
+/// кадр при смене разрешения (см. ветку `Resize`).
+enum Art {
+    File(alloc::vec::Vec<u8>),
+    Logo,
+}
+
+/// Заполнить поверхность под размер `w × h`, при надобности сменив ей буфер.
+///
+/// Порядок важен: сперва готовый кадр, потом уже смена буфера у поверхности. Обратный порядок
+/// означал бы, что неудачная распаковка оставляет на экране пустой буфер вместо прежних обоев.
+fn paint(art: &Art, surf: &mut Window, w: u16, h: u16) -> bool {
+    match art {
+        Art::File(bytes) => {
+            let Some(img) = render(bytes, w, h) else { return false };
+            if (w, h) != (surf.width, surf.height) && !surf.resize_buf(w, h) {
+                return false;
+            }
+            surf.pixels().copy_from_slice(&img.px);
+        }
+        Art::Logo => {
+            if (w, h) != (surf.width, surf.height) && !surf.resize_buf(w, h) {
+                return false;
+            }
+            let t0 = sys::now() as u64;
+            logo::wallpaper(surf.pixels(), w as u32, h as u32, &logo::Palette::VOID);
+            let ms = sys::ticks_to_ns(sys::now() as u64 - t0) / 1_000_000;
+            say(&alloc::format!("wall: знак VOID {w}×{h}, {ms} мс\n"));
+        }
+    }
+    surf.damage(0, 0, w, h);
+    true
 }
 
 /// Файл → кадр `w × h`, заполненный с обрезкой. `None` — уже сказано, из-за чего.
