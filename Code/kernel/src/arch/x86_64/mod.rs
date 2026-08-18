@@ -749,9 +749,14 @@ pub fn timer_hw_init() {
     enable_interrupts();
 }
 
-/// Перевзвести квант вытеснения (one-shot: запись initial count = старт отсчёта).
+/// Перевзвести квант вытеснения.
 pub fn timer_arm() {
     lapic::arm();
+}
+
+/// Веха 145.4 — разбудить В ЭТОТ момент (`now_ticks`, то есть тики `rdtsc`).
+pub fn timer_arm_at(deadline: u64) {
+    lapic::arm_at(deadline);
 }
 
 // ─── память (4-уровневый пейджинг) ──────────────────────────────────────────
