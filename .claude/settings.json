@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Code/tools/run.sh *)",
+      "Bash(Code/tools/shot.py *)",
+      "Bash(cargo test *)",
+      "Bash(cargo tree *)",
+      "Bash(git check-ignore *)",
+      "Bash(nix log *)",
+      "Bash(nix-store -q *)",
+      "Bash(readelf *)",
+      "Bash(nm *)",
+      "Bash(objdump *)",
+      "Bash(mdir *)",
+      "Bash(rustup target list *)",
+      "Bash(rustc --version)"
+    ]
+  }
+}

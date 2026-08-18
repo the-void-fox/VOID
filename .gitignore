@@ -6,3 +6,8 @@
 
 # C-драйверы, выложенные stage-drivers.sh, — артефакты сборки nix, не исходники.
 /Code/programs/lx-linux/prebuilt/
+
+# Референс-исходники для чтения (niri, smithay, Redox, genode, resvg/usvg, Intel SDM) — 380+ МБ
+# ЧУЖОГО кода и PDF. Лежат в дереве, чтобы их можно было читать офлайн, но в репозиторий VOID
+# им нельзя: это не наши исходники, и один `git add -A` утащил бы их целиком.
+/Reference/
