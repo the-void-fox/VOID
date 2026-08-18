@@ -207,6 +207,73 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Веха 145.1 — картинка RGBA в прямоугольник `r`, обрезанная скруглением `rad`.
+    ///
+    /// Масштаба здесь нет: картинку под нужный размер приводит `void-img` (там честное
+    /// усреднение, а не выборка каждого N-го пикселя — иначе лицо на аватаре превращается в
+    /// муар). Наше дело — положить готовые пиксели под маску круга.
+    pub fn image(&mut self, r: Rect, px: &[u8], iw: i32, ih: i32, rad: i32) {
+        if r.w <= 0 || r.h <= 0 || iw <= 0 || ih <= 0 {
+            return;
+        }
+        let rad = rad.clamp(0, r.w.min(r.h) / 2);
+        let vis = r.intersect(self.clip);
+        for y in vis.y..vis.bottom() {
+            let sy = (y - r.y).clamp(0, ih - 1);
+            for x in vis.x..vis.right() {
+                let cov = if rad == 0 {
+                    256
+                } else {
+                    (128 - rrect_sd(x, y, r, rad)).clamp(0, 256) as u32
+                };
+                if cov == 0 {
+                    continue;
+                }
+                let sx = (x - r.x).clamp(0, iw - 1);
+                let i = ((sy * iw + sx) * 4) as usize;
+                let Some(s) = px.get(i..i + 4) else { continue };
+                self.blend(x, y, Rgba::new(s[0], s[1], s[2], s[3]), cov);
+            }
+        }
+    }
+
+    /// Веха 145.1 — знак ВЫКЛЮЧЕНИЯ: разомкнутое сверху кольцо и вертикальная черта.
+    ///
+    /// Нарисован формулой, а не взят из шрифта и не разобран из SVG. Довод простой: знаков
+    /// системы единицы, и каждый — две-три геометрические фигуры, а SVG это парсер путей плюс
+    /// растеризатор кривых плюс трансформации. Иконочный шрифт был бы дешевле SVG (растеризатор
+    /// контуров у нас уже есть), но шрифт приходит ПАКЕТОМ — на свежей системе его нет, и кнопка
+    /// выключения осталась бы пустым кружком. Формула не зависит ни от чего.
+    pub fn power(&mut self, r: Rect, thick: i32, c: Rgba) {
+        let (cx, cy) = (2 * r.x + r.w - 1, 2 * r.y + r.h - 1); // центр в ПОЛОВИНАХ пикселя
+        let rad = (r.w.min(r.h) - thick) / 2;
+        let (t2, rad16) = (thick * 8, rad * 16); // полутолщина и радиус в 1/16 пикселя
+        let vis = r.intersect(self.clip);
+        for y in vis.y..vis.bottom() {
+            let dy = 16 * y - 8 * cy;
+            for x in vis.x..vis.right() {
+                let dx = 16 * x - 8 * cx;
+                // Разрыв кольца сверху — клин примерно в 26°: `2|dx| < -dy`. Тригонометрии не
+                // нужно, а знак читается ровно так же.
+                if dy < 0 && 2 * dx.abs() < -dy {
+                    continue;
+                }
+                let d = isqrt(dx * dx + dy * dy);
+                // Полоса шириной в пиксель по обе стороны от окружности — это и есть сглаживание.
+                let out = ((rad16 + t2 - d) * 16).clamp(0, 256) as u32;
+                let inn = ((d - (rad16 - t2)) * 16).clamp(0, 256) as u32;
+                let cov = out.min(inn);
+                if cov > 0 {
+                    self.blend(x, y, c, cov);
+                }
+            }
+        }
+        // Черта: от верхнего края кольца до его центра. Скруглённая — концы кольца тоже круглые.
+        let top = r.y + (r.h - (2 * rad + thick)) / 2;
+        let stem = Rect::new(r.x + (r.w - thick) / 2, top, thick, rad + thick / 2);
+        self.rrect(stem, thick / 2, c);
+    }
+
     /// Серая маска глифа (или иконки) цветом `c`. Нужна тексту: растеризатор отдаёт покрытие.
     pub fn mask(&mut self, x: i32, y: i32, w: i32, h: i32, mask: &[u8], c: Rgba) {
         for row in 0..h {

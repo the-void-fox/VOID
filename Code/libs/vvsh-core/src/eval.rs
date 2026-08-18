@@ -447,6 +447,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("bind", b_bind),
     ("desktop", b_desktop),
     ("ui", b_ui),
+    ("device", b_device),
     ("packages", b_packages),
     ("channel", b_channel),
     ("system", b_system),
@@ -677,6 +678,18 @@ fn b_ui(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("ui", args)
 }
 
+/// `(device ключ значение)` — КТО ЭТА МАШИНА (Веха 145.1): `name` — имя устройства, `avatar` —
+/// корень store с картинкой.
+///
+/// Не `ui`, хотя показывает это меню, и не `desktop`. Причина в том, что это не вид, а
+/// **личность машины**: в VOID нет пользователей вовсе (нет ни root, ни юзеров — всё на
+/// capability), поэтому «чьё это устройство» здесь отвечает не имя человека, а имя устройства.
+/// И у этого имени будет второй читатель, как только у сети появится узнаваемое имя узла, —
+/// свали мы его в `ui`, пришлось бы объяснять, почему сетевой стек читает настройки интерфейса.
+fn b_device(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("device", args)
+}
+
 fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
     let mut out = vec![Value::sym("packages")];
     for a in args {
@@ -733,11 +746,12 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
-/// `desktop` — композитор, `ui` — тулкит оболочки, `packages`/`channel` — `pkg`: конфиг
-/// поколения один, читателей несколько, и каждый берёт свои строки.
+/// `desktop` — композитор, `ui` — тулкит оболочки, `device` — «кто эта машина»,
+/// `packages`/`channel` — `pkg`: конфиг поколения один, читателей несколько, и каждый берёт
+/// свои строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
-            "service" | "shell" | "terminal" | "desktop" | "ui" | "bind" | "packages"
-                | "channel"))
+            "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
+                | "packages" | "channel"))
 }

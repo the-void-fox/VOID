@@ -97,6 +97,14 @@ fn walk(ep: usize, dir: &str, depth: usize, out: &mut Vec<String>) {
     }
 }
 
+/// Прочитать файл по АБСОЛЮТНОМУ пути (Веха 145.1). Нужно аватару устройства: картинка может
+/// лежать и объектом store, и просто файлом — в том числе внутри установленного пакета, где
+/// корня store у неё нет вовсе.
+pub fn read_path(path: &str) -> Option<Vec<u8>> {
+    let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
+    read_whole(ep, path.as_bytes())
+}
+
 /// Прочитать файл целиком через файловый сервер. `None` — файла нет или это каталог.
 fn read_whole(ep: usize, path: &[u8]) -> Option<Vec<u8>> {
     use sys::posix as px;

@@ -71,6 +71,15 @@ use void_user::win::{self, Event, Window};
 mod ui;
 use ui::{Align, Font, Motion, Rect, Theme, Ui};
 
+// Аватар устройства приезжает объектом store — тем же путём, что картинка обоев (Веха 145.1).
+#[allow(dead_code)]
+#[path = "../obj.rs"]
+mod obj;
+
+/// Потолок на размер аватара при распаковке — тот же, что у обоев: картинку выбирает человек, и
+/// «слишком большая» обязано быть ответом, а не падением в аллокаторе.
+const MAX_PIXELS: u64 = 17_000_000;
+
 /// Куча: настоящий шрифт приезжает файлом на мегабайты, и глифы кэшируются растрами. Куча
 /// ленивая — под неё берётся адресное окно, а страницы приходят по мере нужды.
 #[global_allocator]
@@ -96,7 +105,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Сказать, что панель решила. Молчание здесь стоило бы человеку получаса: «почему шрифт не
     // тот» и «почему всё мелкое» — вопросы, ответ на которые панель знает, а он нет.
     let anim_ms = ui::anim::duration_from_config(&generation);
-    let mut bar = Bar::new(&th, font.line_h(), sw as i32, sh as i32, anim_ms);
+    let mut bar = Bar::new(&th, font.line_h(), sw as i32, sh as i32, anim_ms, &generation);
     say(&alloc::format!(
         "bar: шрифт {} {} px, масштаб {}%, высота {} px, движение {} мс\n",
         if font.ttf() { "из пакета" } else { "встроенный 8×16" },
@@ -104,6 +113,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         th.scale,
         bar.h,
         anim_ms,
+    ));
+    // Кто эта машина — вслух, по той же причине, что и шрифт: «почему в меню написано VOID, а не
+    // моё имя» — вопрос, ответ на который панель знает, а человек нет.
+    say(&alloc::format!(
+        "bar: устройство «{}», аватар {}\n",
+        bar.device,
+        bar.avatar_root.as_deref().unwrap_or("не задан (буква в кружке)"),
     ));
 
     let spec = win::Layer {
@@ -203,8 +219,6 @@ const A_TITLE: u32 = 3;
 const A_MENU: u32 = 4;
 const A_LANG: u32 = 5;
 const A_SYS: u32 = 6;
-const A_EN: u32 = 7;
-const A_RU: u32 = 8;
 const A_POWER: u32 = 9;
 /// Подсветка пилюль столов: `A_PILL + номер стола`.
 const A_PILL: u32 = 16;
@@ -240,6 +254,20 @@ struct Bar {
     /// Имя активного поколения — оно же надпись на кнопке меню: система, которой ты пользуешься,
     /// называет себя сама.
     gen: String,
+    /// Веха 145.1 — КТО ЭТА МАШИНА: имя устройства, его первая буква (запасной аватар) и корень
+    /// store с картинкой. Пользователей в VOID нет, поэтому «чьё это» — про устройство.
+    device: String,
+    /// Имя пришло ИЗ КОНФИГА, а не подставлено. Нужно шапке: под безымянной машиной писать
+    /// «VOID <сборка>» вторым «VOID» подряд — это выглядеть сломанным, а не скромным.
+    named: bool,
+    letter: String,
+    avatar_root: Option<String>,
+    /// Распакованный аватар под размер кружка и признак «пробовали уже». Пробуем ОДИН раз и по
+    /// первому открытию меню: распаковка картинки на старте панели задержала бы весь экран.
+    avatar: Option<void_img::Image>,
+    avatar_tried: bool,
+    /// Сторона кружка аватара в пикселях — считается от шрифта, как и всё в карточке.
+    av_px: u32,
     /// Сколько корней в store и полностью ли влез список (иначе «37+»).
     roots: (u32, bool),
     /// Место переключателя раскладки в панели — оно известно только тому кадру, который его
@@ -250,6 +278,10 @@ struct Bar {
     flip: bool,
     toggle: bool,
     power: bool,
+    /// Кадр изменил то, ЧТО РИСУЕТСЯ, уже после того как посчитал подпись (сегодня это только
+    /// подтверждение выключения). Такому изменению нужен ещё один кадр, и попросить его больше
+    /// некому: события от композитора не будет — оно ничего в системе не меняло.
+    again: bool,
     mo: Motion,
 }
 
@@ -261,7 +293,12 @@ const I_SYS: usize = 3;
 const I_CARD: usize = 4;
 
 impl Bar {
-    fn new(th: &Theme, line_h: i32, sw: i32, sh: i32, anim_ms: u64) -> Bar {
+    fn new(th: &Theme, line_h: i32, sw: i32, sh: i32, anim_ms: u64, gen_text: &str) -> Bar {
+        // Имя устройства из конфига; без него — «VOID». Пустым его оставлять нельзя: шапка меню
+        // без единого слова выглядит недорисованной.
+        let named = ui::conf::device(gen_text, "name");
+        let device = named.clone().unwrap_or_else(|| "VOID".to_string());
+        let avatar = ui::conf::device(gen_text, "avatar");
         // Высота считается ОТ ШРИФТА и от темы: разъехаться им нельзя (см. `bar_wanted` в `wm`).
         let isle_h = line_h + 2 * th.px(5);
         let h = isle_h + 2 * th.px(6);
@@ -282,12 +319,21 @@ impl Bar {
             grown: false,
             confirm: false,
             gen: ui::conf::generation_name().unwrap_or_else(|| "VOID".to_string()),
+            device: device.clone(),
+            named: named.is_some(),
+            letter: device.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default(),
+            avatar_root: avatar,
+            avatar: None,
+            avatar_tried: false,
+            // Кружок в две строки высотой минус поле — тот же расчёт, что у шапки карточки.
+            av_px: (2 * (line_h + th.px(6)) - 2 * th.px(2)).max(8) as u32,
             roots: (0, true),
             lang_at: Rect::ZERO,
             go: None,
             flip: false,
             toggle: false,
             power: false,
+            again: false,
             mo: Motion::new(anim_ms),
         }
     }
@@ -406,14 +452,16 @@ impl Bar {
                 // ходить в store каждую минуту ради того, на что никто не смотрит.
                 self.roots = store_roots();
                 self.confirm = false;
+                self.load_avatar();
             }
             return true;
         }
-        false
+        core::mem::take(&mut self.again)
     }
 
     fn draw(&mut self, surf: &mut Window, th: &Theme, font: &mut Font, click: Option<(i32, i32)>) {
         self.mo.begin(sys::monotonic_ns());
+        let confirm_was = self.confirm;
         let (w, h) = (surf.width as i32, surf.height as i32);
         let margin = th.px(6);
         let isle_h = self.h - 2 * margin;
@@ -506,12 +554,9 @@ impl Bar {
         let menu_t = self.mo.val(A_MENU, if self.open { 256 } else { 0 }).clamp(0, 256) as u32;
         let card = self.card_rect(th, font, menu_t);
         let card_clip = Rect::new(0, self.h - margin, w, h - (self.h - margin));
-        // Места считаются ДО опроса движения: `self.mo` берётся изменяемо, а прямоугольники —
+        // Место считается ДО опроса движения: `self.mo` берётся изменяемо, а прямоугольник —
         // из `self`, и в одном выражении эти два заимствования спорят.
-        let (en_r, ru_r) = (self.tile_rect(th, font, card, 0), self.tile_rect(th, font, card, 1));
         let pow_r = self.power_rect(th, font, card);
-        let en_hot = self.mo.val(A_EN, if hot(en_r) { 256 } else { 0 }) as u32;
-        let ru_hot = self.mo.val(A_RU, if hot(ru_r) { 256 } else { 0 }) as u32;
         let pow_hot = self.mo.val(A_POWER, if hot(pow_r) { 256 } else { 0 }) as u32;
         let uptime = uptime_text();
 
@@ -542,13 +587,14 @@ impl Bar {
                 sig: sig(&[
                     menu_t as u64,
                     self.confirm as u64,
-                    self.layout as u64,
                     self.space as u64,
                     self.spaces as u64,
                     self.roots.0 as u64,
+                    self.avatar.is_some() as u64,
+                    sig_str(&self.device),
                     sig_str(&uptime),
                     sig_str(&clock),
-                    (en_hot as u64) | ((ru_hot as u64) << 16) | ((pow_hot as u64) << 32),
+                    pow_hot as u64,
                 ]),
             },
         ];
@@ -629,7 +675,7 @@ impl Bar {
             u.clear(self.isles[I_CARD].rect.union(want[I_CARD].rect));
             if menu_t > 0 {
                 u.fade(menu_t);
-                self.draw_card(&mut u, th, card, &uptime, &clock, en_hot, ru_hot, pow_hot);
+                self.draw_card(&mut u, th, card, &uptime, &clock, pow_hot);
                 u.fade(256);
             }
             u.clip(Rect::new(0, 0, w, h));
@@ -651,6 +697,12 @@ impl Bar {
             }
         }
 
+        // Виджет мог поменять картинку прямо в этом кадре (кнопка выключения «взвелась»), а
+        // подпись посчитана ДО него. Просим ещё кадр: иначе кнопка осталась бы невзведённой на
+        // экране до ближайшей минуты — найдено проверкой, курсор при этом стоял неподвижно, и
+        // разбудить панель было нечему.
+        self.again |= self.confirm != confirm_was;
+
         let d = u.dirty();
         self.isles = want;
         if !d.is_empty() {
@@ -659,6 +711,62 @@ impl Bar {
     }
 
     // ── меню ───────────────────────────────────────────────────────────────────────────────
+
+    /// Веха 145.1 — распаковать аватар устройства. Один раз за жизнь панели и по первому открытию
+    /// меню: картинку выбирает человек, она может быть на мегабайты, и платить за неё при старте
+    /// панели значило бы задерживать весь экран ради того, на что ещё никто не смотрит.
+    ///
+    /// Приезжает он объектом store, как обои: корень называет конфиг (`device("avatar", …)`),
+    /// файловой системы для этого не нужно вовсе.
+    fn load_avatar(&mut self) {
+        if self.avatar_tried {
+            return;
+        }
+        self.avatar_tried = true;
+        let Some(root) = self.avatar_root.clone() else { return };
+        // Путь читается файловым сервером, имя — корнем store. Тот же уговор, что у шрифта, и по
+        // той же причине: картинка человека может лежать и объектом, и файлом внутри пакета, а
+        // требовать от него «сперва положи в store» значит требовать инструмента, которого у
+        // него под рукой нет.
+        let bytes = if root.starts_with('/') {
+            match ui::font::read_path(&root) {
+                Some(b) => b,
+                None => {
+                    say(&alloc::format!("bar: аватар «{root}»: файла нет\n"));
+                    return;
+                }
+            }
+        } else {
+            let Some(store) = ui::conf::store_cap() else {
+                say("bar: аватар не прочитать — нет права на store\n");
+                return;
+            };
+            match obj::read(store, root.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    say(&alloc::format!("bar: аватар «{root}»: {e}\n"));
+                    return;
+                }
+            }
+        };
+        let img = match void_img::decode(&bytes, MAX_PIXELS) {
+            Ok(i) => i,
+            Err(e) => {
+                say(&alloc::format!("bar: аватар «{root}»: {e}\n"));
+                return;
+            }
+        };
+        let (iw, ih) = (img.w, img.h);
+        // `cover`, а не `scaled`: аватар квадратный, а снимок обычно нет — вписывать его целиком
+        // значит оставить поля внутри кружка.
+        match img.cover(self.av_px, self.av_px) {
+            Ok(a) => {
+                say(&alloc::format!("bar: аватар {iw}×{ih} → {0}×{0}\n", self.av_px));
+                self.avatar = Some(a);
+            }
+            Err(e) => say(&alloc::format!("bar: аватар «{root}»: {e}\n")),
+        }
+    }
 
     /// Высота строки сведений и высота плитки — считаются от шрифта, как и всё остальное.
     fn metrics(th: &Theme, font: &Font) -> (i32, i32, i32) {
@@ -671,40 +779,29 @@ impl Bar {
     /// Где сейчас карточка меню. `t` — насколько она проявилась (0..256): выезд это сдвиг вверх,
     /// гаснущий вместе с прозрачностью, а не «появилась целиком».
     fn card_rect(&self, th: &Theme, font: &mut Font, t: u32) -> Rect {
-        let (row, sep, tile) = Self::metrics(th, &*font);
+        let (row, sep, btn) = Self::metrics(th, &*font);
         let w = (font.width("корней в store") + font.width("00:00 · 00.00.0000") + th.gap
             + 2 * th.pad)
             .max(th.px(240));
-        let h = 2 * th.pad + row + sep + 5 * row + sep + row + tile + sep + tile;
+        let h = 2 * th.pad + 2 * row + sep + 5 * row + sep + btn;
         let margin = th.px(6);
         // Выезд: подняться на палец и опуститься. Больший ход читается как «упало сверху».
         let lift = th.px(18) * (256 - t as i32) / 256;
         Rect::new(self.sw - margin - w, self.h - lift, w, h)
     }
 
-    /// Место столбца плиток раскладки (`i` — 0 EN, 1 RU) и кнопки выключения. Считаются ТЕМ ЖЕ
-    /// кодом, что и рисование ([`Bar::draw_card`] режет тот же прямоугольник теми же кусками):
-    /// два расчёта «где что» — это два случая разойтись, на которых система уже стояла.
-    fn tile_rect(&self, th: &Theme, font: &Font, card: Rect, i: i32) -> Rect {
-        if card.is_empty() || !self.open {
-            return Rect::ZERO;
-        }
-        let (row, sep, tile) = Self::metrics(th, font);
-        let mut c = card.inset_xy(th.pad, th.pad);
-        c.cut_top(row + sep + 5 * row + sep + row);
-        let strip = c.cut_top(tile);
-        let half = (strip.w - th.gap) / 2;
-        Rect::new(strip.x + i * (half + th.gap), strip.y, half, tile)
-    }
-
+    /// Место круглой кнопки выключения. Считается ТЕМ ЖЕ кодом, что и рисование
+    /// ([`Bar::draw_card`] режет тот же прямоугольник теми же кусками): два расчёта «где что» —
+    /// это два случая разойтись, на которых система уже стояла (обзор, Веха 123).
     fn power_rect(&self, th: &Theme, font: &Font, card: Rect) -> Rect {
         if card.is_empty() || !self.open {
             return Rect::ZERO;
         }
-        let (row, sep, tile) = Self::metrics(th, font);
+        let (row, sep, btn) = Self::metrics(th, font);
         let mut c = card.inset_xy(th.pad, th.pad);
-        c.cut_top(row + sep + 5 * row + sep + row + tile + sep);
-        c.cut_top(tile)
+        c.cut_top(2 * row + sep + 5 * row + sep);
+        let foot = c.cut_top(btn);
+        Rect::new(foot.right() - btn, foot.y, btn, btn)
     }
 
     /// Карточка центра управления.
@@ -714,10 +811,13 @@ impl Bar {
     /// её отсюда — это ещё один протокол). Пустой ползунок громкости ради красоты запрещён тем же
     /// правилом, которым запрещён спиннер после смерти процесса ([[0016-void-ui-toolkit]]).
     ///
+    /// **Переключателя раскладки здесь нет** (решение владельца, Веха 145.1): он и так в панели,
+    /// в двух сантиметрах выше, и второй его экземпляр — это два места, где одно и то же надо
+    /// поддерживать. Меню пока почти пустое, и это честнее, чем набить его повторами.
+    ///
     /// «Карточки владельца» из плана здесь нет и не будет: владельцев в VOID не существует —
-    /// система сознательно без юзеров и root ([[no-users]]). Вместо имени человека — имя СИСТЕМЫ:
-    /// сборка, поколение, время работы.
-    #[allow(clippy::too_many_arguments)]
+    /// система сознательно без юзеров и root. Вместо человека — УСТРОЙСТВО: его имя и аватар из
+    /// конфига (`device("name", …)`, `device("avatar", …)`), а под ними сборка системы.
     fn draw_card(
         &mut self,
         u: &mut Ui,
@@ -725,19 +825,27 @@ impl Bar {
         card: Rect,
         uptime: &str,
         clock: &str,
-        en_hot: u32,
-        ru_hot: u32,
         pow_hot: u32,
     ) {
-        let (row, sep, tile) = Self::metrics(th, &*u.font);
+        let (row, sep, btn) = Self::metrics(th, &*u.font);
         u.card(card);
         let mut c = card.inset_xy(th.pad, th.pad);
 
-        let head = c.cut_top(row);
-        u.label(head, "VOID", th.accent, Align::Left);
-        u.label(head, BUILD, th.muted, Align::Right);
+        // ── шапка: кто эта машина ──────────────────────────────────────────────────────────
+        let mut head = c.cut_top(2 * row);
+        let av = head.cut_left(2 * row);
+        let img = self.avatar.as_ref().map(|a| (&a.px[..], a.w as i32, a.h as i32));
+        u.avatar(av.inset(th.px(2)), img, &self.letter);
+        head.cut_left(th.gap);
+        let name = Rect::new(head.x, head.y, head.w, row);
+        let sub = Rect::new(head.x, head.y + row, head.w, row);
+        u.label(name, &self.device, th.text, Align::Left);
+        let sub_text =
+            if self.named { alloc::format!("VOID {BUILD}") } else { BUILD.to_string() };
+        u.label(sub, &sub_text, th.muted, Align::Left);
         u.hsep(c.cut_top(sep));
 
+        // ── сведения ───────────────────────────────────────────────────────────────────────
         let (year, mo, d, _, _, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
         u.row(c.cut_top(row), "поколение", &self.gen);
         u.row(c.cut_top(row), "работает", uptime);
@@ -758,22 +866,16 @@ impl Bar {
         );
         u.hsep(c.cut_top(sep));
 
-        u.label(c.cut_top(row), "раскладка клавиатуры", th.muted, Align::Left);
-        let strip = c.cut_top(tile);
-        let half = (strip.w - th.gap) / 2;
-        let en = Rect::new(strip.x, strip.y, half, tile);
-        let ru = Rect::new(strip.x + half + th.gap, strip.y, half, tile);
-        if u.tile(en, "EN", en_hot, if self.layout == 0 { 256 } else { 0 }) && self.layout != 0 {
-            self.flip = true;
+        // ── выключение ─────────────────────────────────────────────────────────────────────
+        let mut foot = c.cut_top(btn);
+        let round = foot.cut_right(btn);
+        foot.cut_right(th.gap); // подпись не должна упираться в кнопку
+        if self.confirm {
+            // Подпись только на втором шаге: у кнопки со знаком её быть не должно, а у кнопки,
+            // которая сейчас выключит машину, — обязана.
+            u.label(foot, "нажми ещё раз", th.danger, Align::Right);
         }
-        if u.tile(ru, "RU", ru_hot, if self.layout == 1 { 256 } else { 0 }) && self.layout != 1 {
-            self.flip = true;
-        }
-        u.hsep(c.cut_top(sep));
-
-        let btn = c.cut_top(tile);
-        let label = if self.confirm { "точно выключить?" } else { "выключить" };
-        if u.danger(btn, label, pow_hot) {
+        if u.power_button(round, pow_hot, self.confirm) {
             if self.confirm {
                 self.power = true;
             } else {

@@ -344,6 +344,33 @@ system(
         assert_eq!(build_config(tmpl).expect("сборка"), "shell wm mmio:fb\n");
     }
 
+    /// Веха 145.1 — «кто эта машина»: имя и аватар УСТРОЙСТВА, а не пользователя (их в VOID нет).
+    ///
+    /// Отдельной записью, а не ключом `ui`: это личность машины, и второй читатель у неё появится
+    /// вместе с именем узла в сети — а сетевому стеку не место в настройках интерфейса.
+    #[test]
+    fn device_identity_normalizes() {
+        let src = r#"system(
+                       shell("wm", "mmio:fb"),
+                       device("name", "voidbook"),
+                       device("avatar", "f/etc/avatar.png"),
+                     )"#;
+        assert_eq!(
+            build_config(src).expect("сборка"),
+            "shell wm mmio:fb\n\
+             device name voidbook\n\
+             device avatar f/etc/avatar.png\n"
+        );
+        assert!(build_config(r#"system(device("name"))"#).is_err());
+
+        // Пустой список из шаблона обязан собираться молча — как и `look`.
+        let tmpl = r#"who = [
+                        # device("name", "voidbook"),
+                      ]
+                      system(shell("wm", "mmio:fb"), who)"#;
+        assert_eq!(build_config(tmpl).expect("сборка"), "shell wm mmio:fb\n");
+    }
+
     /// Терминал живёт отдельным модулем и может целиком выключаться (как net.vv).
     #[test]
     fn terminal_module_can_be_off() {

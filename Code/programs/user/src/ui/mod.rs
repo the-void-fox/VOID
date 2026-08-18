@@ -408,6 +408,46 @@ impl<'a> Ui<'a> {
         self.clicked(r)
     }
 
+    /// Веха 145.1 — **круглая кнопка со знаком** (просьба владельца про выключение).
+    ///
+    /// Круг, а не скруглённый прямоугольник, и знак вместо слова: у действия, которое одно на всю
+    /// карточку, подпись избыточна, а круглая форма отличает его от всего прочего сама. `armed` —
+    /// «нажми ещё раз»: кнопка заливается опасным цветом, и это единственное подтверждение,
+    /// которое здесь нужно (диалог означал бы окно поверх окна).
+    pub fn power_button(&mut self, r: Rect, hot: u32, armed: bool) -> bool {
+        let d = r.w.min(r.h);
+        let r = Rect::new(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d);
+        let col = self.th.danger;
+        let fill = if armed { col.with_a(0xcc) } else { col.with_a((0x30 * hot.min(256) / 256) as u8) };
+        let (fill, br) = (self.tint(fill), self.tint(col.with_a(if armed { 0xff } else { 0x99 })));
+        self.c.rrect_bordered(r, d / 2, self.th.line, fill, br);
+        let ink = if armed { self.th.on_accent } else { col };
+        let thick = self.th.px(2).max(2);
+        let ink = self.tint(ink);
+        self.c.power(r.inset(self.th.px(7).max(4)), thick, ink);
+        self.mark(r);
+        self.clicked(r)
+    }
+
+    /// Веха 145.1 — **аватар устройства**: картинка в кружке, а без картинки — буква в кружке.
+    ///
+    /// Запасной путь не украшение: аватар приходит объектом store, и на свежей системе его нет —
+    /// пустая дырка в карточке выглядела бы поломкой, а буква именем.
+    pub fn avatar(&mut self, r: Rect, img: Option<(&[u8], i32, i32)>, letter: &str) {
+        let d = r.w.min(r.h);
+        let r = Rect::new(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d);
+        match img {
+            Some((px, iw, ih)) => self.c.image(r, px, iw, ih, d / 2),
+            None => {
+                let bg = self.tint(self.th.accent.with_a(0x33));
+                let br = self.tint(self.th.accent.with_a(0x88));
+                self.c.rrect_bordered(r, d / 2, self.th.line, bg, br);
+                self.label(r, letter, self.th.accent, Align::Center);
+            }
+        }
+        self.mark(r);
+    }
+
     /// Ширина строки — раскладке ряда её надо знать заранее.
     pub fn text_w(&mut self, s: &str) -> i32 {
         self.font.width(s)

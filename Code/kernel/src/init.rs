@@ -225,6 +225,7 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
             || kind == "bind"
             || kind == "desktop"
             || kind == "ui"
+            || kind == "device"
             || kind == "packages"
             || kind == "channel"
         {
