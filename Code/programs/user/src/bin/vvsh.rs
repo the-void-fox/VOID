@@ -2252,6 +2252,7 @@ keys = [\n\
 #\n\
 # Свой вариант пишется так:\n\
 #   wm_keys = [ bind(\"wm\", \"Super+Return\", \"spawn-term\"),\n\
+#               bind(\"wm\", \"Super+D\", \"launcher-toggle\"),\n\
 #               bind(\"wm\", \"Super+Space\", \"switch-layout\"), … ]\n\
 wm_keys = []\n\
 \n\

@@ -6,7 +6,9 @@
 //! задачу, а фантазию о ней. Поэтому тулкит появился **переписыванием бара** и содержит ровно те
 //! виджеты, которые бару понадобились: остров, текст, пилюля, кнопка, разделитель. Следующий
 //! потребитель (меню, Веха 145) добавит свои — и это будет вторая проверка того, что здесь
-//! библиотека, а не «вынесенные функции панели».
+//! библиотека, а не «вынесенные функции панели». Третьим пришла строка запуска (Веха 146,
+//! [[launcher]]) и принесла `field` и `entry`: поле ввода и строку списка. Проверка удалась —
+//! менять ради неё пришлось ровно два виджета, и оба по делу.
 //!
 //! ## Immediate mode
 //!
@@ -448,8 +450,97 @@ impl<'a> Ui<'a> {
         self.mark(r);
     }
 
+    /// Веха 146 — **поле ввода**: строка запуска набирает в него.
+    ///
+    /// Курсор мигает не сам: `caret` приезжает готовым, как и всё движение в тулките ([`Motion`]).
+    /// Виджет без состояния — иначе он завёл бы у себя вторую истину о набранном тексте, и
+    /// однажды она разошлась бы с той, что у программы.
+    ///
+    /// Текст выравнивается ВЛЕВО, но при переполнении показывается ХВОСТ: человек смотрит туда,
+    /// где печатает. Обрезать по началу значило бы прятать от него последнюю букву.
+    pub fn field(&mut self, r: Rect, s: &str, hint: &str, caret: bool) {
+        let rad = self.th.radius.min(r.h / 2);
+        let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.th.border));
+        self.c.rrect_bordered(r, rad, self.th.line, bg, br);
+        // Колонка под курсор отводится ВСЕГДА, даже когда его не рисуют: иначе текст съезжал бы
+        // вбок на два пикселя в тот момент, когда курсор появляется.
+        let caret_w = self.th.line.max(1);
+        let mut inner = r.inset_xy(self.th.pad, 0);
+        let caret_col = inner.cut_left(caret_w + self.th.px(2).max(1));
+        if s.is_empty() {
+            self.label(inner, hint, self.th.muted, Align::Left);
+        }
+        let tw = self.font.width(s);
+        // Хвост, а не начало: `draw_clip` сам обрезает по ширине, поэтому строку просто
+        // сдвигаем влево на то, что не поместилось.
+        let over = (tw - inner.w).max(0);
+        let base = inner.y + (inner.h - self.font.line_h()) / 2 + self.font.ascent();
+        if !s.is_empty() {
+            let col = self.tint(self.th.text);
+            let keep = self.c.clip();
+            self.c.set_clip(inner.intersect(keep));
+            self.font.draw_clip(&mut self.c, inner.x - over, base, s, col, inner.w + over);
+            self.c.set_clip(keep);
+        }
+        if caret {
+            // Пусто — курсор в своей колонке; есть текст — сразу за ним.
+            let x = if s.is_empty() {
+                caret_col.x
+            } else {
+                (inner.x + tw - over).min(inner.right() - caret_w)
+            };
+            let h = self.font.line_h();
+            let bar = Rect::new(x, base - self.font.ascent(), caret_w, h);
+            let c = self.tint(self.th.accent);
+            self.c.fill(bar, c);
+        }
+        self.mark(r);
+    }
+
+    /// Веха 146 — **строка списка**: значок, название и подпись под ним.
+    ///
+    /// `sel` — выбрана клавиатурой, `hot` — под курсором (1/256). Разные вещи, и путать их
+    /// нельзя: клавиатура ведёт выбор по списку, мышь подсвечивает то, над чем висит, и в один
+    /// момент это могут быть разные строки. Выбранная залита акцентом целиком — так же, как в
+    /// оболочке владельца (`IMG/9rpm335.png`).
+    pub fn entry(&mut self, r: Rect, name: &str, sub: &str, letter: &str, sel: u32, hot: u32) -> bool {
+        let rad = self.th.radius.min(r.h / 2);
+        let bg = self.th.text.with_a((0x14 * hot.min(256) / 256) as u8).mix(self.th.accent, sel);
+        if bg.a != 0 || sel != 0 {
+            let c = self.tint(bg);
+            self.c.rrect(r, rad, c);
+        }
+        let mut inner = r.inset_xy(self.th.pad, 0);
+        let icon = inner.cut_left(inner.h - self.th.px(8).max(4));
+        // Свой значок, а не [`Ui::avatar`]: у аватара цвета жёстко акцентные, и на залитой
+        // акцентом строке он исчезал бы целиком — что и случилось на первом же снимке.
+        let d = icon.w.min(icon.h);
+        let ring = Rect::new(icon.x + (icon.w - d) / 2, icon.y + (icon.h - d) / 2, d, d);
+        let ibg = self.th.accent.with_a(0x33).mix(self.th.on_accent.with_a(0x33), sel);
+        let ibr = self.th.accent.with_a(0x88).mix(self.th.on_accent.with_a(0x66), sel);
+        let (ibg, ibr) = (self.tint(ibg), self.tint(ibr));
+        self.c.rrect_bordered(ring, d / 2, self.th.line, ibg, ibr);
+        let icol = self.th.accent.mix(self.th.on_accent, sel);
+        self.label(ring, letter, icol, Align::Center);
+        inner.cut_left(self.th.gap);
+        // Две строки: название и подпись. Делим по высоте шрифта, а не пополам, — иначе при
+        // крупном кегле подпись выезжает за строку, а при мелком между ними зияет дыра.
+        let two = if sub.is_empty() { 0 } else { self.font.line_h() };
+        let mut top = inner;
+        let bottom = top.cut_bottom(two);
+        let fg = self.th.text.mix(self.th.on_accent, sel);
+        let dim = self.th.muted.mix(self.th.on_accent, sel / 2);
+        self.label(top, name, fg, Align::Left);
+        if two != 0 {
+            self.label(bottom, sub, dim, Align::Left);
+        }
+        self.mark(r);
+        self.clicked(r)
+    }
+
     /// Ширина строки — раскладке ряда её надо знать заранее.
     pub fn text_w(&mut self, s: &str) -> i32 {
         self.font.width(s)
     }
 }
+

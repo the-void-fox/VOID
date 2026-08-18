@@ -173,6 +173,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 140 — панель: второй клиент слоя и первый с кликами. Запускает её тоже `wm`, по
     // строке конфига `desktop bar on`.
     ("bar", include_bytes!(env!("PROG_BAR"))),
+    // Веха 146 — строка запуска: третий клиент слоя и первый, кому нужна КЛАВИАТУРА. Запускает
+    // её `wm` по аккорду (`Super+D`), а не конфиг: она живёт секундами, а не сеансом.
+    ("launcher", include_bytes!(env!("PROG_LAUNCHER"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];
