@@ -14,11 +14,18 @@ use void_user as sys;
 /// Текст активного поколения. `None` — права на store нет либо поколения ещё нет.
 pub fn generation() -> Option<String> {
     let cap = store_cap()?;
-    let name = read_root(cap, b"system/current")?;
-    let name = core::str::from_utf8(&name).ok()?.trim().to_string();
+    let name = generation_name()?;
     let mut root = b"system/".to_vec();
     root.extend_from_slice(name.as_bytes());
     String::from_utf8(read_root(cap, &root)?).ok()
+}
+
+/// ИМЯ активного поколения (`gen4`). Веха 145 — его показывает меню и им же подписана кнопка,
+/// которая меню открывает: система, которой человек пользуется, обязана уметь назвать себя.
+pub fn generation_name() -> Option<String> {
+    let cap = store_cap()?;
+    let name = read_root(cap, b"system/current")?;
+    Some(core::str::from_utf8(&name).ok()?.trim().to_string())
 }
 
 /// Право на store: по имени (Веха 99.1), иначе перебором. Проба безобидна — чтение корня ничего

@@ -60,7 +60,12 @@ impl Rasterizer for BitmapFont {
 
     fn rasterize(&mut self, ch: char, style: RenderStyle) -> RasterizedGlyph {
         if glyph::map_cp866(ch) == b' ' {
-            return RasterizedGlyph::default();
+            // Пустой глиф, но с НАСТОЯЩИМ шагом пера (Веха 145). Здесь стоял
+            // `RasterizedGlyph::default()`, у которого `advance == 0`, — и пробелы пропадали
+            // из строки вовсе: «раскладка клавиатуры» превращалась в «раскладкаклавиатуры».
+            // Терминал этого не видел, потому что рисует по СЕТКЕ и шаг берёт из метрик; первым
+            // на грабли наступило меню, у которого текст пропорциональный.
+            return RasterizedGlyph::blank((W * self.scale) as f32);
         }
         let rows = glyph::rows(ch);
         let bold = matches!(style, RenderStyle::Bold | RenderStyle::BoldItalic);

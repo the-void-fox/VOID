@@ -40,12 +40,16 @@ mod bitfont;
 #[path = "../profile.rs"]
 mod profile;
 
+pub mod anim;
 pub mod conf;
 pub mod font;
 pub mod paint;
 pub mod text;
 pub mod theme;
 
+// Реэкспорт для клиентов; сам тулкит движением не пользуется — оно принадлежит им (см. `anim`).
+#[allow(unused_imports)]
+pub use anim::Motion;
 pub use paint::{Canvas, Rgba};
 pub use text::Font;
 pub use theme::Theme;
@@ -98,8 +102,45 @@ impl Rect {
         Rect::new(self.x + self.w, self.y, w, self.h)
     }
 
+    /// Веха 145 — то же по вертикали: карточка меню это столбец, а столбец удобно резать сверху.
+    pub fn cut_top(&mut self, h: i32) -> Rect {
+        let h = h.min(self.h.max(0));
+        let r = Rect::new(self.x, self.y, self.w, h);
+        self.y += h;
+        self.h -= h;
+        r
+    }
+    pub fn cut_bottom(&mut self, h: i32) -> Rect {
+        let h = h.min(self.h.max(0));
+        self.h -= h;
+        Rect::new(self.x, self.y + self.h, self.w, h)
+    }
+
+    /// Сдвинуть целиком — выезжающая карточка едет ровно этим.
+    pub fn offset(self, dx: i32, dy: i32) -> Rect {
+        Rect::new(self.x + dx, self.y + dy, self.w, self.h)
+    }
+
     pub fn contains(self, x: i32, y: i32) -> bool {
         x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
+    }
+
+    /// Общая часть. Пустая — не пересекаются.
+    pub fn intersect(self, o: Rect) -> Rect {
+        let x = self.x.max(o.x);
+        let y = self.y.max(o.y);
+        Rect::new(x, y, self.right().min(o.right()) - x, self.bottom().min(o.bottom()) - y)
+    }
+
+    /// Насколько `o` накрывает нас по ширине — в долях 256. Этим считается цвет цифры стола под
+    /// едущей капсулой: буква перекрашивается по мере того, как капсула её накрывает, а не
+    /// скачком в момент прибытия.
+    pub fn cover_x(self, o: Rect) -> u32 {
+        if self.w <= 0 {
+            return 0;
+        }
+        let n = (self.right().min(o.right()) - self.x.max(o.x)).max(0);
+        (n * 256 / self.w).clamp(0, 256) as u32
     }
 
     /// Наименьший прямоугольник, покрывающий оба. Пустой считается «ничего».
@@ -134,11 +175,23 @@ pub struct Ui<'a> {
     /// Где НАЖАЛИ в этом кадре. Ровно один кадр: иначе один щелчок сработал бы дважды.
     click: Option<(i32, i32)>,
     dirty: Rect,
+    /// Веха 145 — ОБЩАЯ прозрачность всего, что рисуется дальше (1/256). Ею проявляется меню:
+    /// иначе выезд пришлось бы городить из полутора десятков полупрозрачных цветов, согласованных
+    /// между собой руками.
+    fade: u32,
 }
 
 impl<'a> Ui<'a> {
     pub fn new(px: &'a mut [u8], w: i32, h: i32, th: &'a Theme, font: &'a mut Font) -> Ui<'a> {
-        Ui { c: Canvas::new(px, w, h), th, font, ptr: None, click: None, dirty: Rect::ZERO }
+        Ui {
+            c: Canvas::new(px, w, h),
+            th,
+            font,
+            ptr: None,
+            click: None,
+            dirty: Rect::ZERO,
+            fade: 256,
+        }
     }
 
     /// Начать кадр: где курсор и был ли клик. Клик действует ОДИН кадр — так у immediate-mode
@@ -172,7 +225,27 @@ impl<'a> Ui<'a> {
     }
 
     fn mark(&mut self, r: Rect) {
-        self.dirty = self.dirty.union(r);
+        // Помечаем ВИДИМУЮ часть: объявить композитору кусок, отрезанный клипом, значит попросить
+        // его перерисовать то, чего мы не трогали.
+        self.dirty = self.dirty.union(r.intersect(self.c.clip()));
+    }
+
+    /// Веха 145 — рисовать только внутри `r` (см. [`Canvas::set_clip`]).
+    pub fn clip(&mut self, r: Rect) {
+        self.c.set_clip(r);
+    }
+
+    /// Веха 145 — общая прозрачность всего последующего: 256 — как задумано, 0 — невидимо.
+    pub fn fade(&mut self, a: u32) {
+        self.fade = a.min(256);
+    }
+
+    /// Цвет темы, приглушённый общей прозрачностью кадра.
+    fn tint(&self, c: Rgba) -> Rgba {
+        if self.fade >= 256 {
+            return c;
+        }
+        c.with_a((c.a as u32 * self.fade / 256) as u8)
     }
 
     /// Курсор внутри?
@@ -193,7 +266,8 @@ impl<'a> Ui<'a> {
     /// (так же выглядит оболочка, которой владелец пользуется сегодня). Полоса потребовала бы
     /// непрозрачного фона, а он спорит со скруглением окон под ней.
     pub fn island(&mut self, r: Rect) -> Rect {
-        self.c.rrect_bordered(r, self.th.radius, self.th.line, self.th.bg, self.th.border);
+        let (bg, br) = (self.tint(self.th.bg), self.tint(self.th.border));
+        self.c.rrect_bordered(r, self.th.radius, self.th.line, bg, br);
         self.mark(r);
         r.inset_xy(self.th.pad, 0)
     }
@@ -203,6 +277,7 @@ impl<'a> Ui<'a> {
         if r.is_empty() || s.is_empty() {
             return 0;
         }
+        let col = self.tint(col);
         let tw = self.font.width(s).min(r.w);
         let x = match align {
             Align::Left => r.x,
@@ -215,42 +290,122 @@ impl<'a> Ui<'a> {
         tw
     }
 
-    /// **Пилюля**: рабочий стол в панели. Активная залита акцентом — цвет виден боковым зрением,
-    /// а цифра нет.
-    pub fn pill(&mut self, r: Rect, s: &str, active: bool) -> bool {
-        let hot = self.hot(r);
-        let (bg, fg) = if active {
-            (self.th.accent, self.th.on_accent)
-        } else if hot {
-            (self.th.text.with_a(0x1f), self.th.text)
-        } else {
-            (Rgba::CLEAR, self.th.muted)
-        };
-        if bg.a != 0 {
-            self.c.rrect(r, r.h / 2, bg);
+    /// Веха 145 — **карточка**: тот же остров, но ПЛОТНЕЕ.
+    ///
+    /// Прозрачность панели — украшение: под островом обои, и сквозь тонкую полоску они читаются
+    /// как глубина. Под карточкой лежит ТЕКСТ чужого окна, а РАЗМЫТИЯ У НАС НЕТ ВОВСЕ — и те же
+    /// 10 % превращают её в грязь: на первом же снимке сквозь заголовок меню читалось «…ислить,
+    /// иначе команда» из терминала под ней. Пробовал и промежуточное (97 %): при яркости текста
+    /// в 200 уровней даже три процента дают видимую рябь.
+    ///
+    /// Поэтому карточка НЕПРОЗРАЧНА, и `ui("opacity", …)` на неё не действует. Это не игнор
+    /// настройки, а её граница: человек просил прозрачную ПАНЕЛЬ, а не нечитаемое меню. Появится
+    /// размытие ([[0018-gpu-ladder]]) — прозрачность вернётся сюда сама собой.
+    pub fn card(&mut self, r: Rect) -> Rect {
+        let bg = self.tint(self.th.bg.with_a(0xff));
+        let br = self.tint(self.th.border);
+        self.c.rrect_bordered(r, self.th.radius, self.th.line, bg, br);
+        self.mark(r);
+        r.inset_xy(self.th.pad, 0)
+    }
+
+    /// Веха 145 — **капсула активного**: одна на ряд, и она ЕДЕТ.
+    ///
+    /// Отдельный виджет, а не заливка внутри [`Ui::pill`], потому что в ряду столов активен ровно
+    /// один, и капсула у него общая: рисуй её каждая пилюля сама — переезд превратился бы в
+    /// «одна погасла, другая зажглась», то есть в мигание вместо движения. Прямоугольник сюда
+    /// приезжает уже посчитанным ([`anim::Motion`]) — виджет не знает, что он движется.
+    pub fn indicator(&mut self, r: Rect, rad: i32) {
+        if r.is_empty() {
+            return;
         }
+        let c = self.tint(self.th.accent);
+        self.c.rrect(r, rad, c);
+        self.mark(r);
+    }
+
+    /// **Пилюля**: рабочий стол в панели.
+    ///
+    /// `hot` — насколько проявлена подсветка под курсором, `on` — насколько пилюлю накрыла
+    /// капсула ([`Ui::indicator`]); оба в 1/256. Числами, а не `bool`, ровно затем, чтобы
+    /// перекраска шла вместе с движением, а не рывком в его конце.
+    pub fn pill(&mut self, r: Rect, s: &str, hot: u32, on: u32) -> bool {
+        let bg = self.th.text.with_a((0x1f * hot.min(256) / 256) as u8);
+        if bg.a != 0 {
+            let c = self.tint(bg);
+            self.c.rrect(r, r.h / 2, c);
+        }
+        let fg = self.th.muted.mix(self.th.text, hot).mix(self.th.on_accent, on);
         self.label(r, s, fg, Align::Center);
         self.mark(r);
         self.clicked(r)
     }
 
     /// Кнопка: текст в скруглённой подложке, которая проявляется под курсором.
-    pub fn button(&mut self, r: Rect, s: &str) -> bool {
-        let bg = if self.hot(r) { self.th.text.with_a(0x22) } else { Rgba::CLEAR };
+    pub fn button(&mut self, r: Rect, s: &str, hot: u32) -> bool {
+        let bg = self.th.text.with_a((0x22 * hot.min(256) / 256) as u8);
         if bg.a != 0 {
-            self.c.rrect(r, self.th.radius.min(r.h / 2), bg);
+            let c = self.tint(bg);
+            self.c.rrect(r, self.th.radius.min(r.h / 2), c);
         }
         self.label(r, s, self.th.text, Align::Center);
         self.mark(r);
         self.clicked(r)
     }
 
+    /// Веха 145 — **плитка-переключатель** меню: крупнее пилюли, с рамкой, включённая залита
+    /// акцентом. Пилюлей их не сделать: у пилюли нет ни рамки, ни своего состояния «включено» —
+    /// у неё есть общая на ряд капсула, а плиток может гореть сколько угодно сразу.
+    pub fn tile(&mut self, r: Rect, s: &str, hot: u32, on: u32) -> bool {
+        let rad = self.th.radius.min(r.h / 2);
+        let bg = self.th.text.with_a((0x14 * hot.min(256) / 256) as u8).mix(self.th.accent, on);
+        let br = self.th.border.mix(self.th.accent, on);
+        let (bg, br) = (self.tint(bg), self.tint(br));
+        self.c.rrect_bordered(r, rad, self.th.line, bg, br);
+        let fg = self.th.text.mix(self.th.on_accent, on);
+        self.label(r, s, fg, Align::Center);
+        self.mark(r);
+        self.clicked(r)
+    }
+
+    /// Веха 145 — **строка сведений**: название слева приглушённо, значение справа. Единственный
+    /// способ, которым меню что-то РАССКАЗЫВАЕТ; всё остальное в нём — кнопки.
+    pub fn row(&mut self, r: Rect, key: &str, val: &str) {
+        let kw = self.font.width(key) + self.th.gap;
+        let mut r2 = r;
+        let left = r2.cut_left(kw.min(r.w / 2));
+        self.label(left, key, self.th.muted, Align::Left);
+        self.label(r2, val, self.th.text, Align::Right);
+    }
+
     /// Вертикальный волосок между частями острова.
     pub fn sep(&mut self, r: Rect) {
         let w = self.th.line.max(1);
         let line = Rect::new(r.x + (r.w - w) / 2, r.y, w, r.h);
-        self.c.fill(line, self.th.border);
+        let c = self.tint(self.th.border);
+        self.c.fill(line, c);
         self.mark(line);
+    }
+
+    /// Веха 145 — горизонтальный волосок: карточка меню делится на разделы.
+    pub fn hsep(&mut self, r: Rect) {
+        let h = self.th.line.max(1);
+        let line = Rect::new(r.x, r.y + (r.h - h) / 2, r.w, h);
+        let c = self.tint(self.th.border);
+        self.c.fill(line, c);
+        self.mark(line);
+    }
+
+    /// Веха 145 — кнопка ОПАСНОГО действия (выключение). Отличается цветом рамки и текста, а не
+    /// формой: форма говорит «сюда можно нажать», цвет — «подумай».
+    pub fn danger(&mut self, r: Rect, s: &str, hot: u32) -> bool {
+        let rad = self.th.radius.min(r.h / 2);
+        let bg = self.th.danger.with_a((0x28 * hot.min(256) / 256) as u8);
+        let (bg, br) = (self.tint(bg), self.tint(self.th.danger.with_a(0x88)));
+        self.c.rrect_bordered(r, rad, self.th.line, bg, br);
+        self.label(r, s, self.th.danger, Align::Center);
+        self.mark(r);
+        self.clicked(r)
     }
 
     /// Ширина строки — раскладке ряда её надо знать заранее.

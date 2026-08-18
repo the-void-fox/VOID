@@ -74,11 +74,25 @@ pub struct Canvas<'a> {
     px: &'a mut [u8],
     pub w: i32,
     pub h: i32,
+    /// Веха 145 — за этот прямоугольник не пишется ни один пиксель.
+    clip: Rect,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(px: &'a mut [u8], w: i32, h: i32) -> Canvas<'a> {
-        Canvas { px, w, h }
+        Canvas { px, w, h, clip: Rect::new(0, 0, w, h) }
+    }
+
+    /// Веха 145 — ограничить рисование прямоугольником. Понадобилось ВЫЕЗЖАЮЩЕЙ карточке: она
+    /// начинает движение выше своего места и обязана быть срезанной краем панели, а не наехать
+    /// на её острова. Проверкой в [`Canvas::blend`], а не отдельным путём: клип, о котором можно
+    /// забыть в одном виджете из десяти, хуже отсутствующего.
+    pub fn set_clip(&mut self, r: Rect) {
+        self.clip = r.intersect(Rect::new(0, 0, self.w, self.h));
+    }
+
+    pub fn clip(&self) -> Rect {
+        self.clip
     }
 
     /// Весь холст — ПРОЗРАЧНЫМ. Не чёрным: чёрный это цвет, и на обоях он виден полосой.
@@ -93,7 +107,7 @@ impl<'a> Canvas<'a> {
     /// полупрозрачного» — темнее, чем надо, и щели у скруглений выдали бы это сразу.
     #[inline]
     pub fn blend(&mut self, x: i32, y: i32, c: Rgba, cov: u32) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h || cov == 0 || c.a == 0 {
+        if cov == 0 || c.a == 0 || !self.clip.contains(x, y) {
             return;
         }
         let i = ((y * self.w + x) * 4) as usize;
@@ -127,9 +141,10 @@ impl<'a> Canvas<'a> {
     /// Стереть кусок В ПРОЗРАЧНОСТЬ. Не «залить фоном»: под панелью обои, и любой цвет здесь
     /// был бы враньём о том, что там на самом деле.
     pub fn erase(&mut self, r: Rect) {
-        for y in r.y.max(0)..(r.y + r.h).min(self.h) {
-            let a = ((y * self.w + r.x.max(0)) * 4) as usize;
-            let b = ((y * self.w + (r.x + r.w).min(self.w)) * 4) as usize;
+        let r = r.intersect(self.clip);
+        for y in r.y..r.bottom() {
+            let a = ((y * self.w + r.x) * 4) as usize;
+            let b = ((y * self.w + r.right()) * 4) as usize;
             if b <= self.px.len() && a < b {
                 self.px[a..b].fill(0);
             }
@@ -161,10 +176,13 @@ impl<'a> Canvas<'a> {
             return;
         }
         let rad = rad.clamp(0, r.w.min(r.h) / 2);
-        for y in r.y.max(0)..(r.y + r.h).min(self.h) {
+        // Обходим только видимую часть: карточка, срезанная клипом наполовину, не должна стоить
+        // как целая — она рисуется каждый кадр движения.
+        let vis = r.intersect(self.clip);
+        for y in vis.y..vis.bottom() {
             // Строка вдали от углов заливается без единого корня: покрытие там известно заранее.
             let near_y = (y - r.y) < rad || (r.y + r.h - 1 - y) < rad;
-            for x in r.x.max(0)..(r.x + r.w).min(self.w) {
+            for x in vis.x..vis.right() {
                 let near_x = (x - r.x) < rad || (r.x + r.w - 1 - x) < rad;
                 let (out, inn) = if near_y && near_x {
                     let d = rrect_sd(x, y, r, rad);
