@@ -48,7 +48,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use void_user as sys;
-use void_user::win::{self, Event, Window};
+use void_user::win::{self, sym, Event, Window};
 
 // Тулкит и разбор корней store — общие модули по пути (см. `ui/mod.rs`, почему не крейт).
 // Строка запуска берёт из тулкита далеко не всё: неиспользованное здесь не ошибка.
@@ -78,15 +78,6 @@ const PROG_PREFIX: &[u8] = b"bin/riscv64/";
 const APP_PREFIX: &[u8] = b"app/x86_64/";
 #[cfg(target_arch = "riscv64")]
 const APP_PREFIX: &[u8] = b"app/riscv64/";
-
-/// Коды клавиш протокола окон (те же, что разбирает `term`).
-const SYM_RETURN: u16 = 0x101;
-const SYM_ESCAPE: u16 = 0x102;
-const SYM_BACKSPACE: u16 = 0x104;
-const SYM_UP: u16 = 0x112;
-const SYM_DOWN: u16 = 0x113;
-const SYM_PGUP: u16 = 0x116;
-const SYM_PGDN: u16 = 0x117;
 
 /// Сколько строк списка видно разом. Больше — карточка перестаёт помещаться на экран ноутбука,
 /// меньше — поиск превращается в угадывание.
@@ -138,18 +129,14 @@ fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 struct App {
     sw: i32,
     sh: i32,
-    /// Набранное.
-    text: String,
     items: Vec<Item>,
-    /// Индексы подходящих под набранное — пересчитываются на каждое нажатие.
-    hits: Vec<usize>,
+    /// Веха 148.3 — набранное, отбор, выбор, прокрутка и строка под курсором — общим виджетом
+    /// ([`ui::List`]), тем же, что у вьювера корней.
+    ls: ui::List,
     /// Показан ВТОРОЙ ярус — программы без ярлыка (среди ярлыков не нашлось ничего). Подпись
     /// внизу обязана об этом сказать: список приложений и список корней store — разные ответы на
     /// один и тот же набор букв.
     raw: bool,
-    sel: usize,
-    /// Первая видимая строка списка: список длиннее семи строк почти всегда.
-    top: usize,
     /// Прямоугольник, нарисованный в прошлом кадре: его надо стереть, иначе карточка оставит
     /// за собой хвост, пока выезжает.
     last: Rect,
@@ -161,14 +148,6 @@ struct App {
     // приходится в `event`, где их нет. Поэтому кадр оставляет после себя две величины —
     // и заодно они честнее пересчёта: во время выезда карточка ещё не на месте, и попадание
     // клика считается по тому, что НА ЭКРАНЕ, а не по тому, где карточка будет.
-    /// Полоса строк списка в прошлом кадре.
-    list: Rect,
-    /// Высота строки в прошлом кадре.
-    row_h: i32,
-    /// ВИДИМАЯ строка под курсором (не индекс программы). Подсветка меняется на её смене, а не
-    /// на каждом пикселе пути: внутри одной строки на экране не меняется ничего.
-    hot: Option<usize>,
-
     /// Право на store — им же и запускаем.
     store: Option<usize>,
     wm_ep: usize,
@@ -196,7 +175,7 @@ impl App {
 
     /// Сколько строк списка показываем сейчас: столько, сколько нашлось, но не больше [`ROWS`].
     fn rows(&self) -> i32 {
-        self.hits.len().min(ROWS) as i32
+        self.ls.hits.len().min(ROWS) as i32
     }
 
     /// Пересобрать список подходящих. Совпадение — ПОДСТРОКА без учёта регистра: полноценный
@@ -206,30 +185,29 @@ impl App {
     /// ничего, ищем среди всех корней store: спрятать программу от глаз и спрятать её от поиска —
     /// разные вещи, и вторая превратила бы отбор в ложь о содержимом системы.
     fn filter(&mut self) {
-        let q = self.text.trim().to_lowercase();
+        let q = self.ls.query.trim().to_lowercase();
         let word = q.split(' ').next().unwrap_or("").to_string();
-        self.hits.clear();
+        self.ls.hits.clear();
         self.raw = false;
         for (i, it) in self.items.iter().enumerate() {
             if it.shortcut && (word.is_empty() || it.matches(&word)) {
-                self.hits.push(i);
+                self.ls.hits.push(i);
             }
         }
-        if self.hits.is_empty() && !word.is_empty() {
+        if self.ls.hits.is_empty() && !word.is_empty() {
             self.raw = true;
             for (i, it) in self.items.iter().enumerate() {
                 if !it.shortcut && it.matches(&word) {
-                    self.hits.push(i);
+                    self.ls.hits.push(i);
                 }
             }
         }
         // Точное совпадение — наверх: набрав `term` целиком, человек хочет `term`, а не
         // `terminal-что-то`, оказавшийся в списке раньше по алфавиту.
-        if let Some(p) = self.hits.iter().position(|&i| self.items[i].root == word) {
-            self.hits.swap(0, p);
+        if let Some(p) = self.ls.hits.iter().position(|&i| self.items[i].root == word) {
+            self.ls.hits.swap(0, p);
         }
-        self.sel = 0;
-        self.top = 0;
+        self.ls.refiltered();
     }
 
     /// Сколько ярлыков всего — знаменатель для подписи внизу.
@@ -238,25 +216,17 @@ impl App {
     }
 
     /// Держать выбранную строку в видимом окне списка.
-    fn scroll_to_sel(&mut self) {
-        if self.sel < self.top {
-            self.top = self.sel;
-        } else if self.sel >= self.top + ROWS {
-            self.top = self.sel + 1 - ROWS;
-        }
-    }
-
     /// Что запустится по Enter: выбранная строка, а если список пуст — набранное как есть.
     fn target(&self) -> Option<(String, Vec<u8>)> {
-        let mut words = self.text.split_whitespace();
+        let mut words = self.ls.query.split_whitespace();
         let first = words.next().unwrap_or("");
         let mut args: Vec<u8> = Vec::new();
         for w in words {
             args.extend_from_slice(w.as_bytes());
             args.push(0);
         }
-        match self.hits.get(self.sel) {
-            Some(&i) => Some((self.items[i].root.clone(), args)),
+        match self.ls.current() {
+            Some(i) => Some((self.items[i].root.clone(), args)),
             None if !first.is_empty() => Some((first.to_string(), args)),
             None => None,
         }
@@ -275,18 +245,18 @@ impl App {
 
         let field = u.font.line_h() + th.px(14);
         let fr = inner.cut_top(field);
-        u.field(fr, &self.text, "имя программы", true);
+        u.field(fr, &self.ls.query, "имя программы", true);
         inner.cut_top(th.gap);
 
         let row = 2 * u.font.line_h() + th.px(14);
-        // Раскладку списка оставляем на память: в событии ни темы, ни шрифта нет.
-        self.row_h = row;
-        self.list = Rect::new(inner.x, inner.y, inner.w, row * self.rows());
+        // Раскладку списка оставляем списку: в событии ни темы, ни шрифта нет.
+        let rows = self.rows() as usize;
+        self.ls.measure(Rect::new(inner.x, inner.y, inner.w, row * self.rows()), row, rows);
         let mut hit = None;
         for k in 0..self.rows() as usize {
             let rr = inner.cut_top(row);
-            let Some(&i) = self.hits.get(self.top + k) else { continue };
-            let sel = if self.top + k == self.sel { 256 } else { 0 };
+            let Some(&i) = self.ls.hits.get(self.ls.top + k) else { continue };
+            let sel = if self.ls.top + k == self.ls.sel { 256 } else { 0 };
             let hot = if u.hot(rr) { 256 } else { 0 };
             let it = &self.items[i];
             // Буква значка — из имени для человека: у «Терминала» это «Т», а не «t» от корня.
@@ -294,7 +264,7 @@ impl App {
                 c.to_uppercase().collect::<String>()
             });
             if u.entry(rr, &it.title, &it.info, &letter, sel, hot) {
-                self.sel = self.top + k;
+                self.ls.sel = self.ls.top + k;
                 hit = Some(i);
             }
         }
@@ -303,15 +273,15 @@ impl App {
         // ярусами (Веха 146.1) у неё появилась вторая обязанность — сказать, КАКОЙ список сейчас
         // перед глазами: ярлыки или корни store.
         let foot = inner.cut_top(u.font.line_h() + th.px(4));
-        let n = self.hits.len();
-        let s = if n == 0 && !self.text.trim().is_empty() {
-            alloc::format!("Enter запустит «{}»", self.text.trim())
+        let n = self.ls.hits.len();
+        let s = if n == 0 && !self.ls.query.trim().is_empty() {
+            alloc::format!("Enter запустит «{}»", self.ls.query.trim())
         } else if self.raw {
             // Знаменатель — ВСЕ программы store, а не «те, у кого нет ярлыка»: человек ищет в
             // системе, а не в остатке от отбора, и второе число должно отвечать на «сколько их
             // всего».
             alloc::format!("{} из {} программ store", n, self.items.len())
-        } else if self.text.trim().is_empty() {
+        } else if self.ls.query.trim().is_empty() {
             alloc::format!("ярлыков: {}", n)
         } else {
             alloc::format!("{} из {} ярлыков", n, self.shortcuts())
@@ -322,75 +292,43 @@ impl App {
     }
 }
 
-impl App {
-    /// ВИДИМАЯ строка под точкой — по раскладке ПРОШЛОГО кадра (см. поля `list`/`row_h`).
-    fn row_at(&self, p: Option<(i32, i32)>) -> Option<usize> {
-        let (x, y) = p?;
-        if self.row_h <= 0 || !self.list.contains(x, y) {
-            return None;
-        }
-        let k = ((y - self.list.y) / self.row_h) as usize;
-        (k < ROWS && self.top + k < self.hits.len()).then_some(k)
-    }
-}
-
 impl ui::Client for App {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
         match e {
-            Event::Key { sym, mods: _, ch, down } if down => {
-                match sym {
-                    SYM_ESCAPE => self.closing = true,
-                    SYM_RETURN => {
+            Event::Key { sym: code, mods: _, ch, down } if down => {
+                // Escape и Enter — НАШИ: у строки запуска они закрывают и запускают, а не
+                // очищают поиск и не двигают выбор (у вьювера корней ровно наоборот).
+                match code {
+                    sym::ESCAPE => {
+                        self.closing = true;
+                        return ui::Scope::All;
+                    }
+                    sym::RETURN => {
                         if let Some((name, args)) = self.target() {
                             launch(self.store, self.wm_ep, &name, &args);
                         }
                         self.closing = true;
+                        return ui::Scope::All;
                     }
-                    SYM_BACKSPACE => {
-                        self.text.pop();
+                    _ => {}
+                }
+                match self.ls.key(code, ch) {
+                    ui::Hit::None => ui::Scope::No,
+                    ui::Hit::Moved => ui::Scope::All,
+                    ui::Hit::Query => {
                         self.filter();
-                    }
-                    SYM_UP => {
-                        self.sel = self.sel.saturating_sub(1);
-                        self.scroll_to_sel();
-                    }
-                    SYM_DOWN => {
-                        self.sel = (self.sel + 1).min(self.hits.len().saturating_sub(1));
-                        self.scroll_to_sel();
-                    }
-                    SYM_PGUP => {
-                        self.sel = self.sel.saturating_sub(ROWS);
-                        self.scroll_to_sel();
-                    }
-                    SYM_PGDN => {
-                        self.sel = (self.sel + ROWS).min(self.hits.len().saturating_sub(1));
-                        self.scroll_to_sel();
-                    }
-                    _ => {
-                        // Печатающая клавиша — и только она: управляющие символы в строку
-                        // поиска попадать не должны, иначе Tab и Ctrl-что-нибудь молча
-                        // «набирались» бы невидимыми знаками.
-                        match char::from_u32(ch as u32) {
-                            Some(c) if !c.is_control() => {
-                                self.text.push(c);
-                                self.filter();
-                            }
-                            // Клавиша, которой мы не знаем, не меняет на экране ничего.
-                            _ => return ui::Scope::No,
-                        }
+                        ui::Scope::All
                     }
                 }
-                ui::Scope::All
             }
             Event::Motion { .. } => {
                 // Веха 148.3 — подсветка меняется на СМЕНЕ СТРОКИ, а не на каждом пикселе пути,
                 // и перерисовывается при этом полоса списка, а не вся карточка.
-                let hot = self.row_at(input.ptr);
-                if hot == self.hot {
-                    return ui::Scope::No;
+                if self.ls.motion(input.ptr) {
+                    ui::Scope::Part(self.ls.row_rect(0).union(self.ls.row_rect(ROWS - 1)))
+                } else {
+                    ui::Scope::No
                 }
-                self.hot = hot;
-                ui::Scope::Part(self.list)
             }
             Event::Button { x, y, down: true, .. } => {
                 // Попадание считаем по карточке ПРОШЛОГО кадра: во время выезда она ещё не на
@@ -506,17 +444,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut app = App {
         sw: sw as i32,
         sh: sh as i32,
-        text: String::new(),
         items,
-        hits: Vec::new(),
+        ls: ui::List::default(),
         raw: false,
-        sel: 0,
-        top: 0,
         last: Rect::ZERO,
         mo: Motion::new(ui::anim::duration_from_config(&generation)),
-        list: Rect::ZERO,
-        row_h: 0,
-        hot: None,
         store,
         wm_ep: win::endpoint().unwrap_or(sys::NO_CAP),
         closing: false,

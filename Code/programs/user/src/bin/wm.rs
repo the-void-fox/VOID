@@ -261,7 +261,7 @@ bind wm Super+Shift+Q quit
 ";
 
 /// Код клавиши Super — тот же, что кладёт ядро (`ps2.rs::keysym`).
-const SYM_SUPER: u16 = 0x133;
+use win::sym::SUPER as SYM_SUPER;
 
 /// Разобранная строка раскладки.
 struct Bind {
@@ -284,19 +284,19 @@ fn parse_combo(tok: &str) -> Option<(u16, u8)> {
         }
     }
     let sym = match last {
-        "Return" | "Enter" => 0x101,
-        "Escape" | "Esc" => 0x102,
-        "Tab" => 0x103,
-        "Backspace" => 0x104,
-        "Delete" => 0x105,
-        "Left" => 0x110,
-        "Right" => 0x111,
-        "Up" => 0x112,
-        "Down" => 0x113,
-        "Home" => 0x114,
-        "End" => 0x115,
-        "PageUp" => 0x116,
-        "PageDown" => 0x117,
+        "Return" | "Enter" => win::sym::RETURN,
+        "Escape" | "Esc" => win::sym::ESCAPE,
+        "Tab" => win::sym::TAB,
+        "Backspace" => win::sym::BACKSPACE,
+        "Delete" => win::sym::DELETE,
+        "Left" => win::sym::LEFT,
+        "Right" => win::sym::RIGHT,
+        "Up" => win::sym::UP,
+        "Down" => win::sym::DOWN,
+        "Home" => win::sym::HOME,
+        "End" => win::sym::END,
+        "PageUp" => win::sym::PAGE_UP,
+        "PageDown" => win::sym::PAGE_DOWN,
         "Space" => b' ' as u16,
         // Имена как в конфиге niri: `=` и `-` в строке аккорда путались бы с разделителем `+`.
         "Equal" => b'=' as u16,

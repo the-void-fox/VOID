@@ -371,20 +371,20 @@ fn win_key(sym: u16, mods: u8, ch: u16) -> KeyEvent {
         m |= ModMask::ALT;
     }
     let keysym = match sym {
-        0x101 => Keysym::RETURN,
-        0x102 => Keysym::ESCAPE,
-        0x103 => Keysym::TAB,
-        0x104 => Keysym::BACKSPACE,
-        0x105 => Keysym::DELETE,
+        sys::win::sym::RETURN => Keysym::RETURN,
+        sys::win::sym::ESCAPE => Keysym::ESCAPE,
+        sys::win::sym::TAB => Keysym::TAB,
+        sys::win::sym::BACKSPACE => Keysym::BACKSPACE,
+        sys::win::sym::DELETE => Keysym::DELETE,
         0x106 => Keysym::INSERT,
-        0x110 => Keysym::LEFT,
-        0x111 => Keysym::RIGHT,
-        0x112 => Keysym::UP,
-        0x113 => Keysym::DOWN,
-        0x114 => Keysym::HOME,
-        0x115 => Keysym::END,
-        0x116 => Keysym::PAGE_UP,
-        0x117 => Keysym::PAGE_DOWN,
+        sys::win::sym::LEFT => Keysym::LEFT,
+        sys::win::sym::RIGHT => Keysym::RIGHT,
+        sys::win::sym::UP => Keysym::UP,
+        sys::win::sym::DOWN => Keysym::DOWN,
+        sys::win::sym::HOME => Keysym::HOME,
+        sys::win::sym::END => Keysym::END,
+        sys::win::sym::PAGE_UP => Keysym::PAGE_UP,
+        sys::win::sym::PAGE_DOWN => Keysym::PAGE_DOWN,
         c => Keysym(c as u32),
     };
     let mut k = KeyEvent::new(keysym, m);

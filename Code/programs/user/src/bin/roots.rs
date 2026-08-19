@@ -49,7 +49,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use void_user as sys;
-use void_user::win::{Event, Window};
+use void_user::win::{sym, Event, Window};
 
 #[allow(dead_code)]
 #[path = "../ui/mod.rs"]
@@ -64,14 +64,6 @@ use ui::{Align, Font, Rect, Theme, Ui};
 #[global_allocator]
 static ALLOC: sys::heap::Heap<{ 16 * 1024 * 1024 }> = sys::heap::Heap::new();
 
-const SYM_ESCAPE: u16 = 0x102;
-const SYM_BACKSPACE: u16 = 0x104;
-const SYM_UP: u16 = 0x112;
-const SYM_DOWN: u16 = 0x113;
-const SYM_HOME: u16 = 0x114;
-const SYM_END: u16 = 0x115;
-const SYM_PGUP: u16 = 0x116;
-const SYM_PGDN: u16 = 0x117;
 
 /// Сколько байт объекта читаем ради превью. Больше незачем: показываем мы всё равно экран, а
 /// корень программы это мегабайты — тянуть их целиком значит платить за то, чего не покажем.
@@ -121,17 +113,11 @@ struct App {
     w: i32,
     h: i32,
     items: Vec<Item>,
-    hits: Vec<usize>,
-    query: String,
-    sel: usize,
-    top: usize,
+    /// Веха 148.3 — набранное, отбор, выбор и прокрутка — общим виджетом ([`ui::List`]).
+    ls: ui::List,
     detail: Option<Detail>,
     /// Для какого корня прочитаны подробности — чтобы не читать их снова на каждый кадр.
     detail_of: Option<usize>,
-    /// Веха 148.2 — НОМЕР ВИДИМОЙ СТРОКИ под курсором (не номер корня: при прокрутке под
-    /// курсором оказывается другой корень, а подсвечена та же строка). Пока он не сменился,
-    /// движение мыши не меняет на экране ничего — и кадра не стоит.
-    hot: Option<usize>,
     /// Веха 148.3 — раскладка ПРОШЛОГО кадра. Считать её в событии больше нечем: тема и шрифт
     /// приезжают вместе с холстом, а решать «изменилось ли что-то» надо до него.
     lay: Lay,
@@ -162,43 +148,21 @@ impl App {
         Lay { head, foot, col, list, bar, body, row_h, rows }
     }
 
-    /// Какая ВИДИМАЯ строка списка под точкой — по раскладке ПРОШЛОГО кадра. `None` — точка не
-    /// над строкой или там пусто.
-    fn row_at(&self, p: Option<(i32, i32)>) -> Option<usize> {
-        let (x, y) = p?;
-        let lay = &self.lay;
-        if lay.row_h <= 0 || !lay.list.contains(x, y) {
-            return None;
-        }
-        let k = ((y - lay.list.y) / lay.row_h) as usize;
-        (k < lay.rows && self.top + k < self.hits.len()).then_some(k)
-    }
-
     /// Пересобрать список подходящих под набранное. Подстрока без учёта регистра — то же
     /// правило, что в строке запуска ([[launcher]]): два разных поиска в одной системе человек
     /// запоминать не обязан.
     fn filter(&mut self) {
-        let q = self.query.trim().to_lowercase();
-        self.hits = (0..self.items.len())
+        let q = self.ls.query.trim().to_lowercase();
+        self.ls.hits = (0..self.items.len())
             .filter(|&i| q.is_empty() || self.items[i].name.to_lowercase().contains(&q))
             .collect();
-        self.sel = 0;
-        self.top = 0;
+        self.ls.refiltered();
         self.detail_of = None;
-    }
-
-    /// Держать выбранное в видимой части списка.
-    fn scroll_to_sel(&mut self, rows: usize) {
-        if self.sel < self.top {
-            self.top = self.sel;
-        } else if self.sel >= self.top + rows {
-            self.top = self.sel + 1 - rows;
-        }
     }
 
     /// Прочитать подробности выбранного корня, если они ещё не прочитаны.
     fn sync_detail(&mut self) {
-        let Some(&i) = self.hits.get(self.sel) else {
+        let Some(i) = self.ls.current() else {
             self.detail = None;
             self.detail_of = None;
             return;
@@ -217,30 +181,30 @@ impl App {
         // Окно, а не слой: фон рисуем сами (см. `Ui::background`).
         u.background(th.bg);
 
-        u.field(lay.head, &self.query, "поиск по имени корня", true);
+        u.field(lay.head, &self.ls.query, "поиск по имени корня", true);
 
         if let Some(t) = u.scrollbar(
             lay.bar.inset_xy(th.px(1), th.px(2)),
-            self.top,
+            self.ls.top,
             lay.rows,
-            self.hits.len(),
+            self.ls.hits.len(),
             u.held(),
         ) {
-            self.top = t;
+            self.ls.top = t;
         }
 
-        let was = self.sel;
+        let was = self.ls.sel;
         let mut list = lay.list;
         for k in 0..lay.rows {
             let rr = list.cut_top(lay.row_h);
-            let Some(&i) = self.hits.get(self.top + k) else { continue };
-            let sel = if self.top + k == self.sel { 256 } else { 0 };
+            let Some(&i) = self.ls.hits.get(self.ls.top + k) else { continue };
+            let sel = if self.ls.top + k == self.ls.sel { 256 } else { 0 };
             let hot = if u.hot(rr) { 256 } else { 0 };
             if u.entry(rr, &self.items[i].name, "", "", sel, hot) {
-                self.sel = self.top + k;
+                self.ls.sel = self.ls.top + k;
             }
         }
-        let picked = self.sel != was;
+        let picked = self.ls.sel != was;
 
         // ── правая половина: что за корнем ────────────────────────────────────────────────
         let (body, foot) = (lay.body, lay.foot);
@@ -252,8 +216,8 @@ impl App {
         }
         let inner = u.card(body);
         let mut d = inner.inset_xy(0, th.pad);
-        match (self.hits.get(self.sel), &self.detail) {
-            (Some(&i), Some(det)) => {
+        match (self.ls.current(), &self.detail) {
+            (Some(i), Some(det)) => {
                 u.label(d.cut_top(font_h + th.px(4)), &self.items[i].name, th.text, Align::Left);
                 d.cut_top(th.px(6));
                 // Content-id ЦЕЛИКОМ и в две строки: он и есть настоящее имя объекта, и показать
@@ -279,7 +243,7 @@ impl App {
                     u.label(d.cut_top(font_h), line, th.text, Align::Left);
                 }
             }
-            (Some(&i), None) => {
+            (Some(i), None) => {
                 u.label(d.cut_top(font_h), &self.items[i].name, th.text, Align::Left);
                 u.label(d.cut_top(font_h * 2), "объект не читается", th.muted, Align::Left);
             }
@@ -288,10 +252,10 @@ impl App {
             }
         }
 
-        let s = if self.query.trim().is_empty() {
+        let s = if self.ls.query.trim().is_empty() {
             alloc::format!("корней в store: {}", self.items.len())
         } else {
-            alloc::format!("{} из {} корней", self.hits.len(), self.items.len())
+            alloc::format!("{} из {} корней", self.ls.hits.len(), self.items.len())
         };
         u.label(foot, &s, th.muted, Align::Right);
         picked
@@ -393,77 +357,51 @@ fn human(n: usize) -> String {
 
 impl ui::Client for App {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
-        let rows = self.lay.rows;
         match e {
-            Event::Key { sym, ch, down, .. } if down => {
-                let last = self.hits.len().saturating_sub(1);
-                match sym {
-                    SYM_UP => self.sel = self.sel.saturating_sub(1),
-                    SYM_DOWN => self.sel = (self.sel + 1).min(last),
-                    SYM_PGUP => self.sel = self.sel.saturating_sub(rows),
-                    SYM_PGDN => self.sel = (self.sel + rows).min(last),
-                    SYM_HOME => self.sel = 0,
-                    SYM_END => self.sel = last,
-                    SYM_BACKSPACE => {
-                        self.query.pop();
-                        self.filter();
+            Event::Key { sym: code, ch, down, .. } if down => {
+                // Escape очищает поиск, а не закрывает окно: закрытие — дело композитора
+                // (`Super+Q`), и приложение, которое умирает от Escape, теряет набранное раньше,
+                // чем человек успевает передумать. Всё остальное — обычная навигация списка.
+                if code == sym::ESCAPE {
+                    if self.ls.query.is_empty() {
+                        return ui::Scope::No;
                     }
-                    // Escape очищает поиск, а не закрывает окно: закрытие — дело композитора
-                    // (`Super+Q`), и приложение, которое умирает от Escape, теряет набранное
-                    // раньше, чем человек успевает передумать.
-                    SYM_ESCAPE => {
-                        self.query.clear();
-                        self.filter();
-                    }
-                    _ => match char::from_u32(ch as u32) {
-                        Some(c) if !c.is_control() => {
-                            self.query.push(c);
-                            self.filter();
-                        }
-                        // Клавиша, которой мы не знаем, не меняет на экране ничего.
-                        _ => return ui::Scope::No,
-                    },
+                    self.ls.query.clear();
+                    self.filter();
+                    return ui::Scope::All;
                 }
-                self.scroll_to_sel(rows);
-                ui::Scope::All
+                match self.ls.key(code, ch) {
+                    ui::Hit::None => ui::Scope::No,
+                    ui::Hit::Moved => ui::Scope::All,
+                    ui::Hit::Query => {
+                        self.filter();
+                        ui::Scope::All
+                    }
+                }
             }
-            // Веха 148 — колесо крутит СПИСОК, а не выбор: выбранное остаётся на месте, пока
-            // человек смотрит, что рядом. Так же ведут себя списки везде, где их крутят мышью.
             Event::Wheel { delta, .. } => {
-                let step = 3usize;
-                let max = self.hits.len().saturating_sub(rows);
-                let was = self.top;
-                self.top = if delta > 0 {
-                    self.top.saturating_sub(step)
+                if self.ls.wheel(delta) {
+                    ui::Scope::Part(self.lay.col)
                 } else {
-                    (self.top + step).min(max)
-                };
-                // Список упёрся в край — крутить его дальше некуда, и кадра это не стоит.
-                if self.top == was {
-                    return ui::Scope::No;
+                    ui::Scope::No
                 }
-                ui::Scope::Part(self.lay.col)
             }
             Event::Motion { .. } => {
                 // Движение с зажатой кнопкой — это протяжка: полоса едет за рукой.
                 if input.held.is_some() {
                     return ui::Scope::Part(self.lay.col);
                 }
-                // Веха 148.2 — подсветка меняется на СМЕНЕ СТРОКИ, а не на каждом пикселе пути.
-                // Внутри одной строки на экране не меняется ничего, и кадр там — чистый убыток:
-                // ровно из-за него подсветка и отставала от курсора.
-                let hot = self.row_at(input.ptr);
-                if hot == self.hot {
-                    return ui::Scope::No;
+                if self.ls.motion(input.ptr) {
+                    ui::Scope::Part(self.lay.col)
+                } else {
+                    ui::Scope::No
                 }
-                self.hot = hot;
-                ui::Scope::Part(self.lay.col)
             }
             Event::Button { .. } => ui::Scope::All,
             Event::Resize { w, h } => {
                 self.w = w as i32;
                 self.h = h as i32;
-                self.scroll_to_sel(rows);
+                self.ls.scroll_to_sel();
                 ui::Scope::All
             }
             _ => ui::Scope::No,
@@ -473,6 +411,7 @@ impl ui::Client for App {
     fn draw(&mut self, u: &mut Ui) -> ui::Scope {
         let th = u.th.clone();
         self.lay = self.measure(u.font, &th);
+        self.ls.measure(self.lay.list, self.lay.row_h, self.lay.rows);
         self.sync_detail();
         let lay = core::mem::take(&mut self.lay);
         let picked = self.paint(u, &th, &lay);
@@ -515,13 +454,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         w: w as i32,
         h: h as i32,
         items,
-        hits: Vec::new(),
-        query: String::new(),
-        sel: 0,
-        top: 0,
+        ls: ui::List::default(),
         detail: None,
         detail_of: None,
-        hot: None,
         lay: Lay::default(),
         store,
     };

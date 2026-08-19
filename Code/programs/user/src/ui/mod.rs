@@ -59,6 +59,7 @@ pub mod anim;
 pub mod app;
 pub mod conf;
 pub mod font;
+pub mod list;
 pub mod paint;
 pub mod text;
 pub mod theme;
@@ -68,6 +69,8 @@ pub mod theme;
 pub use anim::Motion;
 #[allow(unused_imports)]
 pub use app::{Client, Input, Scope};
+#[allow(unused_imports)]
+pub use list::{Hit, List};
 pub use paint::{Align, Canvas, Rect, Rgba};
 pub use text::Font;
 pub use theme::Theme;
