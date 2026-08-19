@@ -37,7 +37,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         .and_then(|s| core::str::from_utf8(s).ok())
         .unwrap_or("winbox");
 
-    let (w, h) = (360u16, 220u16);
+    let (mut w, mut h) = (360u16, 220u16);
     let Some(mut window) = Window::create(w, h, name) else {
         sys::write_console("[winbox] композитора нет (WM в окружении) — окно не открыть\n".as_bytes());
         sys::exit(1);
@@ -63,6 +63,20 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 if (sym == b'c' as u16 && mods & 2 != 0) || sym == b'q' as u16 {
                     window.destroy();
                     sys::exit(0);
+                }
+            }
+            // Веха 146.2 — РАЗМЕР НАЗНАЧАЕТ РАСКЛАДКА, а не клиент. Просьба при создании (360×220)
+            // — это пожелание; настоящий размер приезжает событием, и первое из них приходит
+            // сразу после рождения окна.
+            //
+            // Игнорировать его «до поры» нельзя: композитор растягивает буфер до размера окна, и
+            // клиент, оставшийся со старым буфером, живёт в ДРУГИХ координатах, чем его же
+            // пиксели на экране. Отсюда и растянутая клетка, и повреждение не в том месте.
+            Some(Event::Resize { w: nw, h: nh }) if (nw, nh) != (w, h) => {
+                if window.resize_buf(nw, nh) {
+                    (w, h) = (nw, nh);
+                    draw(window.pixels(), w, h, shade);
+                    window.damage(0, 0, w, h);
                 }
             }
             Some(Event::Close) => {
