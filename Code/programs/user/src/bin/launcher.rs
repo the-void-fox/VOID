@@ -21,16 +21,23 @@
 //! Композитор запускает её по аккорду и получает переключатель бесплатно: открыта — просим
 //! закрыться, закрыта — запускаем ([`wm`], действие `launcher-toggle`).
 //!
-//! ## Что она показывает
+//! ## Что она показывает (Веха 146.1 — ЯРЛЫКИ)
 //!
-//! Корни store `bin/<арх>/*` — то есть ВСЁ, что система умеет запустить, без прикрас. Здесь нет
-//! списка «настоящих приложений»: такого знания в системе пока нет вовсе, и подделать его
-//! зашитым перечнем значило бы соврать о содержимом store. Поиск делает шум неважным: набрал
-//! «te» — остался `term`. Отбор по смыслу появится тогда, когда появятся ДАННЫЕ для него
-//! (описание программы рядом с ней в store) — записано в [[known-gaps]].
+//! Список — это **ярлыки**: корни store `app/<арх>/*`, данные о программе рядом с самой
+//! программой (человеческое имя и подпись). Ярлык заводит себе та программа, которая ОТКРЫВАЕТ
+//! ОКНО: запуск `bench` из строки запуска не даёт на экране ничего — ни окна, ни вывода, — и
+//! показывать его среди приложений значило бы обещать то, чего не будет.
 //!
-//! Набранное, не совпавшее ни с чем, запускается КАК ЕСТЬ: это строка запуска, а не только
-//! список. Слова после первого уезжают программе аргументами.
+//! Первая версия (Веха 146) показывала все корни `bin/<арх>/*`, потому что данных для отбора в
+//! системе не существовало. Зашитый перечень «настоящих приложений» соврал бы о содержимом store;
+//! ярлык не врёт — его пишет автор программы, и он сеется в store вместе с ней ([[shortcuts]]).
+//!
+//! Спрятанное не потеряно, и это важнее самого отбора:
+//!
+//! - **набранное ищется и среди программ без ярлыка** — но только если среди ярлыков не нашлось
+//!   ничего. Так шум не лезет в глаза, а `bench` находится ровно тогда, когда его ищут;
+//! - **набранное, не совпавшее ни с чем, запускается КАК ЕСТЬ**: это строка запуска, а не только
+//!   список. Слова после первого уезжают программе аргументами.
 
 #![no_std]
 #![no_main]
@@ -64,6 +71,13 @@ const PROG_PREFIX: &[u8] = b"bin/x86_64/";
 #[cfg(target_arch = "riscv64")]
 const PROG_PREFIX: &[u8] = b"bin/riscv64/";
 
+/// Корни ЯРЛЫКОВ этой архитектуры (`app/<арх>/<имя>`, Веха 146.1) — данные о программе рядом с
+/// программой. Сеет их ядро оттуда же, откуда программы (`seed_programs`).
+#[cfg(target_arch = "x86_64")]
+const APP_PREFIX: &[u8] = b"app/x86_64/";
+#[cfg(target_arch = "riscv64")]
+const APP_PREFIX: &[u8] = b"app/riscv64/";
+
 /// Коды клавиш протокола окон (те же, что разбирает `term`).
 const SYM_RETURN: u16 = 0x101;
 const SYM_ESCAPE: u16 = 0x102;
@@ -84,12 +98,44 @@ fn say(s: &str) {
     sys::write_console(s.as_bytes());
 }
 
-/// Одна запись списка.
+/// Одна запись списка — программа store, с ярлыком или без.
 struct Item {
-    name: String,
-    /// Откуда она взялась — показывается подписью. Сегодня всегда «система»: пакеты профиля
-    /// приносят свои `bin/` файлами, а не корнями store, и им нужен обход ФС (см. заметку).
-    from: &'static str,
+    /// Корень программы в store (`term`) — то, что на самом деле запускается. Имя для человека
+    /// берётся из ярлыка и может быть каким угодно, а запускается всегда ЭТО.
+    root: String,
+    /// Как её зовут для человека («Терминал»). Без ярлыка — тот же корень: выдумывать имя
+    /// программе не из чего.
+    title: String,
+    /// Подпись под названием.
+    info: String,
+    /// Есть ли ярлык. Программы без ярлыка в списке не показываются, пока их не ищут по имени.
+    shortcut: bool,
+}
+
+impl Item {
+    /// Подходит ли под набранное. Ярлык ищется и по имени для человека, и по корню: «терм» и
+    /// «term» обязаны находить одно и то же — иначе человеку пришлось бы помнить, на каком языке
+    /// названа программа.
+    fn matches(&self, word: &str) -> bool {
+        self.root.to_lowercase().contains(word) || self.title.to_lowercase().contains(word)
+    }
+}
+
+/// Значение ключа манифеста ярлыка: строки вида `<ключ> <значение>`.
+///
+/// Свой разбор, а не `ui::conf::entry`: там строка конфига поколения — `<вид> <ключ> <значение>`,
+/// потому что в одном тексте живут записи разных видов. Здесь весь файл — про одну программу, и
+/// вид был бы третьим словом, которое всегда одинаково.
+fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    for line in text.lines() {
+        let Some(v) = line.trim().strip_prefix(key) else { continue };
+        let Some(v) = v.strip_prefix(' ') else { continue };
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
 }
 
 struct App {
@@ -100,6 +146,10 @@ struct App {
     items: Vec<Item>,
     /// Индексы подходящих под набранное — пересчитываются на каждое нажатие.
     hits: Vec<usize>,
+    /// Показан ВТОРОЙ ярус — программы без ярлыка (среди ярлыков не нашлось ничего). Подпись
+    /// внизу обязана об этом сказать: список приложений и список корней store — разные ответы на
+    /// один и тот же набор букв.
+    raw: bool,
     sel: usize,
     /// Первая видимая строка списка: список длиннее семи строк почти всегда.
     top: usize,
@@ -137,22 +187,40 @@ impl App {
 
     /// Пересобрать список подходящих. Совпадение — ПОДСТРОКА без учёта регистра: полноценный
     /// нечёткий поиск здесь был бы преждевременным, а подстрока честно объяснима человеку.
+    ///
+    /// Ярусов два (Веха 146.1). Сначала ЯРЛЫКИ — то, что откроет окно. Если среди них не нашлось
+    /// ничего, ищем среди всех корней store: спрятать программу от глаз и спрятать её от поиска —
+    /// разные вещи, и вторая превратила бы отбор в ложь о содержимом системы.
     fn filter(&mut self) {
         let q = self.text.trim().to_lowercase();
         let word = q.split(' ').next().unwrap_or("").to_string();
         self.hits.clear();
+        self.raw = false;
         for (i, it) in self.items.iter().enumerate() {
-            if word.is_empty() || it.name.to_lowercase().contains(&word) {
+            if it.shortcut && (word.is_empty() || it.matches(&word)) {
                 self.hits.push(i);
+            }
+        }
+        if self.hits.is_empty() && !word.is_empty() {
+            self.raw = true;
+            for (i, it) in self.items.iter().enumerate() {
+                if !it.shortcut && it.matches(&word) {
+                    self.hits.push(i);
+                }
             }
         }
         // Точное совпадение — наверх: набрав `term` целиком, человек хочет `term`, а не
         // `terminal-что-то`, оказавшийся в списке раньше по алфавиту.
-        if let Some(p) = self.hits.iter().position(|&i| self.items[i].name == word) {
+        if let Some(p) = self.hits.iter().position(|&i| self.items[i].root == word) {
             self.hits.swap(0, p);
         }
         self.sel = 0;
         self.top = 0;
+    }
+
+    /// Сколько ярлыков всего — знаменатель для подписи внизу.
+    fn shortcuts(&self) -> usize {
+        self.items.iter().filter(|it| it.shortcut).count()
     }
 
     /// Держать выбранную строку в видимом окне списка.
@@ -174,7 +242,7 @@ impl App {
             args.push(0);
         }
         match self.hits.get(self.sel) {
-            Some(&i) => Some((self.items[i].name.clone(), args)),
+            Some(&i) => Some((self.items[i].root.clone(), args)),
             None if !first.is_empty() => Some((first.to_string(), args)),
             None => None,
         }
@@ -203,21 +271,33 @@ impl App {
             let Some(&i) = self.hits.get(self.top + k) else { continue };
             let sel = if self.top + k == self.sel { 256 } else { 0 };
             let hot = if u.hot(rr) { 256 } else { 0 };
-            let letter = self.items[i].name.get(..1).unwrap_or("?").to_uppercase();
-            if u.entry(rr, &self.items[i].name, self.items[i].from, &letter, sel, hot) {
+            let it = &self.items[i];
+            // Буква значка — из имени для человека: у «Терминала» это «Т», а не «t» от корня.
+            let letter = it.title.chars().next().map_or(String::from("?"), |c| {
+                c.to_uppercase().collect::<String>()
+            });
+            if u.entry(rr, &it.title, &it.info, &letter, sel, hot) {
                 self.sel = self.top + k;
                 hit = Some(i);
             }
         }
 
-        // Счётчик внизу — не украшение: он единственный отвечает на «а всё ли я вижу».
+        // Подпись внизу — не украшение: она единственная отвечает на «а всё ли я вижу». С двумя
+        // ярусами (Веха 146.1) у неё появилась вторая обязанность — сказать, КАКОЙ список сейчас
+        // перед глазами: ярлыки или корни store.
         let foot = inner.cut_top(u.font.line_h() + th.px(4));
         let n = self.hits.len();
-        let total = self.items.len();
-        let s = if n == total {
-            alloc::format!("{} программ", total)
+        let s = if n == 0 && !self.text.trim().is_empty() {
+            alloc::format!("Enter запустит «{}»", self.text.trim())
+        } else if self.raw {
+            // Знаменатель — ВСЕ программы store, а не «те, у кого нет ярлыка»: человек ищет в
+            // системе, а не в остатке от отбора, и второе число должно отвечать на «сколько их
+            // всего».
+            alloc::format!("{} из {} программ store", n, self.items.len())
+        } else if self.text.trim().is_empty() {
+            alloc::format!("ярлыков: {}", n)
         } else {
-            alloc::format!("{} из {}", n, total)
+            alloc::format!("{} из {} ярлыков", n, self.shortcuts())
         };
         u.label(foot, &s, th.muted, Align::Right);
         u.fade(256);
@@ -241,18 +321,45 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut items: Vec<Item> = Vec::new();
     if let Some(scap) = store {
         if let Some(text) = roots::text(scap) {
-            for s in roots::suffixes(&text, PROG_PREFIX) {
-                if let Ok(name) = core::str::from_utf8(s) {
-                    items.push(Item { name: name.to_string(), from: "система" });
-                }
+            // Сперва ЯРЛЫКИ: их немного, и по ним потом узнаются программы, у которых ярлык есть.
+            for s in roots::suffixes(&text, APP_PREFIX) {
+                let Ok(root) = core::str::from_utf8(s) else { continue };
+                let mut name = APP_PREFIX.to_vec();
+                name.extend_from_slice(s);
+                // Ярлык без читаемого содержимого — не повод прятать программу: показываем её
+                // корнем, как если бы ярлыка не было вовсе.
+                let text = ui::conf::read_root(scap, &name).unwrap_or_default();
+                let text = String::from_utf8(text).unwrap_or_default();
+                items.push(Item {
+                    root: root.to_string(),
+                    title: field(&text, "name").unwrap_or(root).to_string(),
+                    info: field(&text, "info").unwrap_or("приложение").to_string(),
+                    shortcut: true,
+                });
             }
+            items.sort_by(|a, b| a.title.cmp(&b.title));
+            let apps = items.len();
+            // Дальше — ВСЕ корни программ. Те, у кого ярлык уже есть, вторыми не заводятся.
+            for s in roots::suffixes(&text, PROG_PREFIX) {
+                let Ok(root) = core::str::from_utf8(s) else { continue };
+                if items.iter().any(|it| it.root == root) {
+                    continue;
+                }
+                items.push(Item {
+                    root: root.to_string(),
+                    title: root.to_string(),
+                    info: String::from("программа store, без ярлыка"),
+                    shortcut: false,
+                });
+            }
+            // Порядок корней в списке store — порядок хэш-таблицы, а не алфавит.
+            items[apps..].sort_by(|a, b| a.root.cmp(&b.root));
         }
     }
-    items.sort_by(|a, b| a.name.cmp(&b.name));
     if items.is_empty() {
         // Не молча: пустой список без объяснения человек читает как «система сломалась», а это
         // всего лишь отказ по правам на store.
-        say("launcher: корни bin/* не читаются — списка не будет, но набрать имя можно\n");
+        say("launcher: корни store не читаются — списка не будет, но набрать имя можно\n");
     }
 
     let mut app = App {
@@ -261,6 +368,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         text: String::new(),
         items,
         hits: Vec::new(),
+        raw: false,
         sel: 0,
         top: 0,
         ptr: None,
@@ -269,6 +377,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         mo: Motion::new(ui::anim::duration_from_config(&generation)),
     };
     app.filter();
+    // Веха 146.1 — движение открытия НАЧИНАЕТСЯ ОТ НУЛЯ, и сказать это надо ЗДЕСЬ.
+    //
+    // [`Motion`] заводит число там, где его впервые спросили: первый же `val(A_OPEN, 256)` создал
+    // бы слот сразу на 256, и карточка появлялась бы готовой — что и происходило всю Веху 146.
+    // Панели этот случай не встречался: её меню рождается ЗАКРЫТЫМ, и слот заводится на нуле сам.
+    app.mo.set(A_OPEN, 0);
 
     let Some(mut surf) = Window::layer(win::Layer::POPUP, sw, sh, "строка запуска") else {
         say("launcher: композитор не дал поверхность слоя\n");
@@ -303,7 +417,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             app.click = None;
             redraw = false;
             if let Some(i) = hit {
-                let name = app.items[i].name.clone();
+                let name = app.items[i].root.clone();
                 launch(store, wm_ep, &name, &[]);
                 closing = true;
             }

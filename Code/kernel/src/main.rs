@@ -180,12 +180,27 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];
 
+// Веха 146.1 — ЯРЛЫКИ: `static APPS: &[(&str, &[u8])]` с содержимым `programs/user/apps/*.app`.
+// Список собирает `build.rs` обходом каталога (см. `stage_apps`), а не рукой здесь: ярлык, который
+// забыли где-то прописать, молча не появился бы в системе.
+include!(concat!(env!("OUT_DIR"), "/apps.rs"));
+
 /// Арх-корень программы (Веха 26): `hello`/`bin/hello` → `bin/<arch>/<имя>`. Программы и
 /// пользователь vsh говорят «bin/hello», не зная архитектуры; резолвит её ядро — так один
 /// store (и один диск) несёт бинари нескольких архитектур бок о бок.
 pub fn prog_root(name: &str) -> alloc::string::String {
     let short = name.strip_prefix("bin/").unwrap_or(name);
     alloc::format!("bin/{}/{}", arch::ARCH_NAME, short)
+}
+
+/// Веха 146.1 — корень ЯРЛЫКА: `app/<arch>/<имя>` рядом с `bin/<arch>/<имя>`.
+///
+/// Отдельное пространство имён, а не суффикс у корня программы: ярлык — это ДАННЫЕ о программе, и
+/// перечислить их все должно быть одним обходом списка корней ([[roots]]), не читая ни одного
+/// объекта. Арх-измерение то же, что у программ, по той же причине: оконных программ на riscv нет
+/// вовсе, и ярлык, показывающий несуществующее, был бы враньём.
+pub fn app_root(name: &str) -> alloc::string::String {
+    alloc::format!("app/{}/{}", arch::ARCH_NAME, name)
 }
 
 use core::fmt::Write;
@@ -625,6 +640,22 @@ fn seed_programs() {
             migrated += 1; // legacy-корень снят — байты уйдут ближайшим GC
         }
     }
+    // Веха 146.1 — ярлыки: сеются РЯДОМ с программами и ровно тогда, когда программа есть. Корень
+    // ярлыка без программы снимается: `install` живёт только на носителе, и его ярлык (появись он)
+    // обязан исчезнуть вместе с ним, иначе строка запуска показывала бы то, чего в store нет.
+    let mut apps = 0usize;
+    for (name, bytes) in APPS {
+        let root_name = app_root(name);
+        if object::root(&prog_root(name)).is_none() {
+            object::del_root(&root_name);
+            continue;
+        }
+        let id = object::put(bytes);
+        if object::root(&root_name) != Some(id) {
+            object::set_root(&root_name, id);
+        }
+        apps += 1;
+    }
     println!(
         "  [seed] программы в store ({} корней bin/{}/*): {} актуально, {} посеяно, {} обновлено{}",
         fresh + sown + updated,
@@ -634,6 +665,9 @@ fn seed_programs() {
         updated,
         if install_media { " (+install — носитель)" } else { "" },
     );
+    if apps > 0 {
+        println!("  [seed] ярлыки программ (app/{}/*): {}", arch::ARCH_NAME, apps);
+    }
     if migrated > 0 {
         println!("  [seed] мигрировано со старых корней bin/*: {}", migrated);
     }

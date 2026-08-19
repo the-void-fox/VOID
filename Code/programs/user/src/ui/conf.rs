@@ -66,8 +66,9 @@ pub fn store_cap() -> Option<usize> {
         .or_else(|| (0..8).map(sys::start_cap).find(|&c| readable(c)))
 }
 
-/// Содержимое именованного корня store.
-fn read_root(cap: usize, name: &[u8]) -> Option<Vec<u8>> {
+/// Содержимое именованного корня store. Публично с Вехи 146.1: тем же путём строка запуска читает
+/// ЯРЛЫКИ (`app/<арх>/<имя>`) — данные о программе, лежащие рядом с ней.
+pub fn read_root(cap: usize, name: &[u8]) -> Option<Vec<u8>> {
     let mut id = [0u8; 32];
     if sys::obj_get_root(cap, name, &mut id) != 32 {
         return None;

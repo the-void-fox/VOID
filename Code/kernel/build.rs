@@ -39,7 +39,62 @@ fn main() {
     println!("cargo:rerun-if-changed={}", linker.display());
 
     build_user_programs(&dir, prog_target, arch == "x86_64");
+    stage_apps(&dir, arch == "x86_64");
     stage_c_drivers(&dir, &arch);
+}
+
+/// Веха 146.1 — ЯРЛЫКИ: `programs/user/apps/<имя>.app` (человеческое имя программы и подпись) в
+/// семена ядра, откуда они сеются в store корнями `app/<arch>/<имя>` рядом с самой программой.
+///
+/// Список ярлыков здесь НЕ перечислен руками — берётся обходом каталога. Перечень означал бы, что
+/// ярлык можно завести, забыв его где-то прописать, и он молча не появился бы в системе. Зато
+/// перечнем проверяется обратное: ярлык без программы — опечатка в имени файла, и сборка о ней
+/// говорит вслух, а не сеет корень, ведущий в никуда.
+///
+/// Арх-фильтр тот же, что у программ: на riscv нет оконных программ, значит нет и их ярлыков.
+fn stage_apps(kernel_dir: &PathBuf, x86: bool) {
+    let workspace_dir = kernel_dir.parent().expect("kernel/.. — Code/");
+    let apps_dir = workspace_dir.join("programs").join("user").join("apps");
+    println!("cargo:rerun-if-changed={}", apps_dir.display());
+
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&apps_dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("app") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("имя файла ярлыка")
+                .to_string();
+            assert!(
+                PROGRAMS.contains(&name.as_str()) || PROGRAMS_X86.contains(&name.as_str()),
+                "ярлык {}.app не соответствует ни одной программе (PROGRAMS/PROGRAMS_X86)",
+                name
+            );
+            if PROGRAMS_X86.contains(&name.as_str()) && !x86 {
+                continue; // программы нет на этой архитектуре — не будет и ярлыка
+            }
+            found.push((name, path));
+        }
+    }
+    // Порядок сборки не должен зависеть от порядка выдачи каталога: иначе байты ядра менялись бы
+    // от сборки к сборке без единой правки в исходниках.
+    found.sort();
+
+    let mut src = String::from(
+        "/// Веха 146.1 — ярлыки программ (`programs/user/apps/*.app`), собранные build.rs.\n\
+         static APPS: &[(&str, &[u8])] = &[\n",
+    );
+    for (name, path) in &found {
+        src.push_str(&format!("    ({:?}, include_bytes!({:?})),\n", name, path.display()));
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    src.push_str("];\n");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("apps.rs");
+    std::fs::write(&out, src).expect("не записать список ярлыков");
 }
 
 /// Веха 132 — C-ДРАЙВЕРЫ, собранные nix'ом (портированный код Linux), в семена ядра.
