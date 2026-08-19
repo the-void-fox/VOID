@@ -10,6 +10,19 @@
 //! [[launcher]]) и принесла `field` и `entry`: поле ввода и строку списка. Проверка удалась —
 //! менять ради неё пришлось ровно два виджета, и оба по делу.
 //!
+//! ## Три яруса (Веха 148.3)
+//!
+//! | ярус | что в нём | кому годится |
+//! |---|---|---|
+//! | [`paint`] | [`Rgba`], [`Rect`], [`Canvas`], а рядом [`theme`] и [`anim`] | **всем, у кого есть буфер пикселей** — включая композитор |
+//! | [`Ui`] (здесь) | виджеты, ввод кадра, damage | клиентам |
+//! | [`app`] | цикл: события пачкой, сон, объём кадра | клиентам |
+//!
+//! Ярусы выделены не ради красоты. Композитор — не клиент самому себе, верхние два ему не нужны
+//! вовсе; а пока нижний лежал вперемешку с ними, он завёл СВОЙ холст, свой прямоугольник, свою
+//! кривую и свою палитру — и три цвета из пяти в них разошлись молча. Граница проходит по
+//! вопросу «нужна ли поверхность композитора»: [`paint`] — нет, [`Ui`] и [`app`] — да.
+//!
 //! ## Immediate mode
 //!
 //! Дерева виджетов нет. Программа каждый кадр говорит, что и где нарисовать, а виджет тут же
@@ -43,6 +56,7 @@ mod bitfont;
 mod profile;
 
 pub mod anim;
+pub mod app;
 pub mod conf;
 pub mod font;
 pub mod paint;
@@ -52,120 +66,11 @@ pub mod theme;
 // Реэкспорт для клиентов; сам тулкит движением не пользуется — оно принадлежит им (см. `anim`).
 #[allow(unused_imports)]
 pub use anim::Motion;
-pub use paint::{Canvas, Rgba};
+#[allow(unused_imports)]
+pub use app::{Client, Input, Scope};
+pub use paint::{Align, Canvas, Rect, Rgba};
 pub use text::Font;
 pub use theme::Theme;
-
-/// Прямоугольник в координатах поверхности.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-}
-
-impl Rect {
-    pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Rect {
-        Rect { x, y, w, h }
-    }
-
-    pub const ZERO: Rect = Rect::new(0, 0, 0, 0);
-
-    pub fn right(self) -> i32 {
-        self.x + self.w
-    }
-    pub fn bottom(self) -> i32 {
-        self.y + self.h
-    }
-    pub fn is_empty(self) -> bool {
-        self.w <= 0 || self.h <= 0
-    }
-
-    /// Сжать со всех сторон.
-    pub fn inset(self, n: i32) -> Rect {
-        self.inset_xy(n, n)
-    }
-    pub fn inset_xy(self, dx: i32, dy: i32) -> Rect {
-        Rect::new(self.x + dx, self.y + dy, self.w - 2 * dx, self.h - 2 * dy)
-    }
-
-    /// Отрезать полосу слева/справа: раскладка панели — это ряд, а ряд удобно резать.
-    pub fn cut_left(&mut self, w: i32) -> Rect {
-        let w = w.min(self.w.max(0));
-        let r = Rect::new(self.x, self.y, w, self.h);
-        self.x += w;
-        self.w -= w;
-        r
-    }
-    pub fn cut_right(&mut self, w: i32) -> Rect {
-        let w = w.min(self.w.max(0));
-        self.w -= w;
-        Rect::new(self.x + self.w, self.y, w, self.h)
-    }
-
-    /// Веха 145 — то же по вертикали: карточка меню это столбец, а столбец удобно резать сверху.
-    pub fn cut_top(&mut self, h: i32) -> Rect {
-        let h = h.min(self.h.max(0));
-        let r = Rect::new(self.x, self.y, self.w, h);
-        self.y += h;
-        self.h -= h;
-        r
-    }
-    pub fn cut_bottom(&mut self, h: i32) -> Rect {
-        let h = h.min(self.h.max(0));
-        self.h -= h;
-        Rect::new(self.x, self.y + self.h, self.w, h)
-    }
-
-    /// Сдвинуть целиком — выезжающая карточка едет ровно этим.
-    pub fn offset(self, dx: i32, dy: i32) -> Rect {
-        Rect::new(self.x + dx, self.y + dy, self.w, self.h)
-    }
-
-    pub fn contains(self, x: i32, y: i32) -> bool {
-        x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
-    }
-
-    /// Общая часть. Пустая — не пересекаются.
-    pub fn intersect(self, o: Rect) -> Rect {
-        let x = self.x.max(o.x);
-        let y = self.y.max(o.y);
-        Rect::new(x, y, self.right().min(o.right()) - x, self.bottom().min(o.bottom()) - y)
-    }
-
-    /// Насколько `o` накрывает нас по ширине — в долях 256. Этим считается цвет цифры стола под
-    /// едущей капсулой: буква перекрашивается по мере того, как капсула её накрывает, а не
-    /// скачком в момент прибытия.
-    pub fn cover_x(self, o: Rect) -> u32 {
-        if self.w <= 0 {
-            return 0;
-        }
-        let n = (self.right().min(o.right()) - self.x.max(o.x)).max(0);
-        (n * 256 / self.w).clamp(0, 256) as u32
-    }
-
-    /// Наименьший прямоугольник, покрывающий оба. Пустой считается «ничего».
-    pub fn union(self, o: Rect) -> Rect {
-        if self.is_empty() {
-            return o;
-        }
-        if o.is_empty() {
-            return self;
-        }
-        let x = self.x.min(o.x);
-        let y = self.y.min(o.y);
-        Rect::new(x, y, self.right().max(o.right()) - x, self.bottom().max(o.bottom()) - y)
-    }
-}
-
-/// Выравнивание текста внутри отведённого места.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Align {
-    Left,
-    Center,
-    Right,
-}
 
 /// Кадр интерфейса: холст, тема, шрифт и ввод этого кадра.
 pub struct Ui<'a> {
@@ -176,6 +81,9 @@ pub struct Ui<'a> {
     ptr: Option<(i32, i32)>,
     /// Где НАЖАЛИ в этом кадре. Ровно один кадр: иначе один щелчок сработал бы дважды.
     click: Option<(i32, i32)>,
+    /// Где ДЕРЖАТ левую кнопку (Веха 148.3). Клик и зажатие — разные вещи: клик живёт один кадр,
+    /// зажатие тянется, пока кнопку не отпустят, и протяжка полосы прокрутки — это оно.
+    held: Option<(i32, i32)>,
     dirty: Rect,
     /// Веха 145 — ОБЩАЯ прозрачность всего, что рисуется дальше (1/256). Ею проявляется меню:
     /// иначе выезд пришлось бы городить из полутора десятков полупрозрачных цветов, согласованных
@@ -191,16 +99,21 @@ impl<'a> Ui<'a> {
             font,
             ptr: None,
             click: None,
+            held: None,
             dirty: Rect::ZERO,
             fade: 256,
         }
     }
 
-    /// Начать кадр: где курсор и был ли клик. Клик действует ОДИН кадр — так у immediate-mode
-    /// не заводится состояния, которое надо гасить.
-    pub fn input(&mut self, ptr: Option<(i32, i32)>, click: Option<(i32, i32)>) {
+    /// Начать кадр: где курсор, был ли клик и держат ли кнопку. Клик действует ОДИН кадр — так
+    /// у immediate-mode не заводится состояния, которое надо гасить. Зовёт это [`app::run`];
+    /// программе остаётся спрашивать [`Ui::hot`], [`Ui::clicked`] и [`Ui::held`].
+    pub fn input(
+        &mut self, ptr: Option<(i32, i32)>, click: Option<(i32, i32)>, held: Option<(i32, i32)>,
+    ) {
         self.ptr = ptr;
         self.click = click;
+        self.held = held;
     }
 
     /// Прямоугольник, который изменился с начала кадра. Пустой — не рисовали ничего.
@@ -273,6 +186,18 @@ impl<'a> Ui<'a> {
     /// Клик этого кадра внутри?
     pub fn clicked(&self, r: Rect) -> bool {
         self.click.is_some_and(|(x, y)| r.contains(x, y))
+    }
+
+    /// Где держат левую кнопку (`None` — не держат). Нужно [`Ui::scrollbar`]: состояние
+    /// «схвачено» принадлежит вводу, а не виджету — у immediate-mode памяти нет.
+    pub fn held(&self) -> Option<(i32, i32)> {
+        self.held
+    }
+
+    /// Был ли в этом кадре клик — и где. Нужно тому, кто решает не «попал ли он в меня», а
+    /// «случился ли он вообще»: у панели щелчок мимо всех островов закрывает меню.
+    pub fn click(&self) -> Option<(i32, i32)> {
+        self.click
     }
 
     // ── виджеты ──────────────────────────────────────────────────────────────

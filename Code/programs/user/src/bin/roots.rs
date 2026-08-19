@@ -99,28 +99,10 @@ struct Detail {
     binary: bool,
 }
 
-/// Веха 148.2 — **что перерисовываем в этом кадре**.
-///
-/// Появилось от жалобы владельца: подсветка под курсором отставала от самого курсора. Причина
-/// была не в «медленном рисовании», а в том, что КАЖДОЕ движение мыши стоило полного кадра —
-/// 5 мс рисования и ещё 3 мс на объявление повреждения (замер). Мышь шлёт события десятками в
-/// секунду, композитор копит их до шестнадцати, и подсветка честно показывала то место, где
-/// курсор был восемь кадров назад.
-///
-/// Порядок значим: `No < List < All` — сгребая пачку событий, берём наибольшее.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Need {
-    /// Ничего не изменилось — кадра не будет вовсе.
-    No,
-    /// Изменилась только левая колонка (подсветка, прокрутка): рисуем и объявляем ТОЛЬКО её.
-    List,
-    /// Изменилось всё окно (выбор, поиск, размер).
-    All,
-}
-
 /// Веха 148.2 — **раскладка кадра**. Считается ОДНИМ кодом и для рисования, и для попадания
 /// мышью: разойдись они — и подсветка встала бы не туда, куда попадает клик (композитор на этих
 /// граблях уже стоял, Веха 123).
+#[derive(Default)]
 struct Lay {
     head: Rect,
     foot: Rect,
@@ -146,21 +128,19 @@ struct App {
     detail: Option<Detail>,
     /// Для какого корня прочитаны подробности — чтобы не читать их снова на каждый кадр.
     detail_of: Option<usize>,
-    ptr: Option<(i32, i32)>,
     /// Веха 148.2 — НОМЕР ВИДИМОЙ СТРОКИ под курсором (не номер корня: при прокрутке под
     /// курсором оказывается другой корень, а подсвечена та же строка). Пока он не сменился,
     /// движение мыши не меняет на экране ничего — и кадра не стоит.
     hot: Option<usize>,
-    click: Option<(i32, i32)>,
-    /// Веха 148.1 — где сейчас ДЕРЖАТ левую кнопку. Этим тащат полосу прокрутки: состояние
-    /// «схвачено» принадлежит программе, а не виджету ([[void-ui]]).
-    held: Option<(i32, i32)>,
+    /// Веха 148.3 — раскладка ПРОШЛОГО кадра. Считать её в событии больше нечем: тема и шрифт
+    /// приезжают вместе с холстом, а решать «изменилось ли что-то» надо до него.
+    lay: Lay,
     store: Option<usize>,
 }
 
 impl App {
     /// Разрезать окно на места виджетов.
-    fn lay(&self, font: &Font, th: &Theme) -> Lay {
+    fn measure(&self, font: &Font, th: &Theme) -> Lay {
         let font_h = font.line_h();
         let row_h = font_h + th.px(10);
         let mut all = Rect::new(0, 0, self.w, self.h).inset(th.pad);
@@ -182,9 +162,12 @@ impl App {
         Lay { head, foot, col, list, bar, body, row_h, rows }
     }
 
-    /// Какая ВИДИМАЯ строка списка под точкой. `None` — точка не над строкой или там пусто.
-    fn row_at(&self, lay: &Lay, x: i32, y: i32) -> Option<usize> {
-        if !lay.list.contains(x, y) {
+    /// Какая ВИДИМАЯ строка списка под точкой — по раскладке ПРОШЛОГО кадра. `None` — точка не
+    /// над строкой или там пусто.
+    fn row_at(&self, p: Option<(i32, i32)>) -> Option<usize> {
+        let (x, y) = p?;
+        let lay = &self.lay;
+        if lay.row_h <= 0 || !lay.list.contains(x, y) {
             return None;
         }
         let k = ((y - lay.list.y) / lay.row_h) as usize;
@@ -229,7 +212,7 @@ impl App {
 
     /// Нарисовать кадр. `true` — выбор сменился прямо в нём (клик по строке), и кадр надо
     /// собрать заново: подсветка и подробности считаются ДО того, как виджет ответит на клик.
-    fn draw(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) -> bool {
+    fn paint(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) -> bool {
         let font_h = u.font.line_h();
         // Окно, а не слой: фон рисуем сами (см. `Ui::background`).
         u.background(th.bg);
@@ -241,7 +224,7 @@ impl App {
             self.top,
             lay.rows,
             self.hits.len(),
-            self.held,
+            u.held(),
         ) {
             self.top = t;
         }
@@ -408,11 +391,101 @@ fn human(n: usize) -> String {
     }
 }
 
+impl ui::Client for App {
+    fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
+        let rows = self.lay.rows;
+        match e {
+            Event::Key { sym, ch, down, .. } if down => {
+                let last = self.hits.len().saturating_sub(1);
+                match sym {
+                    SYM_UP => self.sel = self.sel.saturating_sub(1),
+                    SYM_DOWN => self.sel = (self.sel + 1).min(last),
+                    SYM_PGUP => self.sel = self.sel.saturating_sub(rows),
+                    SYM_PGDN => self.sel = (self.sel + rows).min(last),
+                    SYM_HOME => self.sel = 0,
+                    SYM_END => self.sel = last,
+                    SYM_BACKSPACE => {
+                        self.query.pop();
+                        self.filter();
+                    }
+                    // Escape очищает поиск, а не закрывает окно: закрытие — дело композитора
+                    // (`Super+Q`), и приложение, которое умирает от Escape, теряет набранное
+                    // раньше, чем человек успевает передумать.
+                    SYM_ESCAPE => {
+                        self.query.clear();
+                        self.filter();
+                    }
+                    _ => match char::from_u32(ch as u32) {
+                        Some(c) if !c.is_control() => {
+                            self.query.push(c);
+                            self.filter();
+                        }
+                        // Клавиша, которой мы не знаем, не меняет на экране ничего.
+                        _ => return ui::Scope::No,
+                    },
+                }
+                self.scroll_to_sel(rows);
+                ui::Scope::All
+            }
+            // Веха 148 — колесо крутит СПИСОК, а не выбор: выбранное остаётся на месте, пока
+            // человек смотрит, что рядом. Так же ведут себя списки везде, где их крутят мышью.
+            Event::Wheel { delta, .. } => {
+                let step = 3usize;
+                let max = self.hits.len().saturating_sub(rows);
+                let was = self.top;
+                self.top = if delta > 0 {
+                    self.top.saturating_sub(step)
+                } else {
+                    (self.top + step).min(max)
+                };
+                // Список упёрся в край — крутить его дальше некуда, и кадра это не стоит.
+                if self.top == was {
+                    return ui::Scope::No;
+                }
+                ui::Scope::Part(self.lay.col)
+            }
+            Event::Motion { .. } => {
+                // Движение с зажатой кнопкой — это протяжка: полоса едет за рукой.
+                if input.held.is_some() {
+                    return ui::Scope::Part(self.lay.col);
+                }
+                // Веха 148.2 — подсветка меняется на СМЕНЕ СТРОКИ, а не на каждом пикселе пути.
+                // Внутри одной строки на экране не меняется ничего, и кадр там — чистый убыток:
+                // ровно из-за него подсветка и отставала от курсора.
+                let hot = self.row_at(input.ptr);
+                if hot == self.hot {
+                    return ui::Scope::No;
+                }
+                self.hot = hot;
+                ui::Scope::Part(self.lay.col)
+            }
+            Event::Button { .. } => ui::Scope::All,
+            Event::Resize { w, h } => {
+                self.w = w as i32;
+                self.h = h as i32;
+                self.scroll_to_sel(rows);
+                ui::Scope::All
+            }
+            _ => ui::Scope::No,
+        }
+    }
+
+    fn draw(&mut self, u: &mut Ui) -> ui::Scope {
+        let th = u.th.clone();
+        self.lay = self.measure(u.font, &th);
+        self.sync_detail();
+        let lay = core::mem::take(&mut self.lay);
+        let picked = self.paint(u, &th, &lay);
+        self.lay = lay;
+        // Выбор сменился щелчком — просим кадр ЦЕЛИКОМ: подробности справа теперь другие, а
+        // считались они до того, как виджет ответил на клик.
+        if picked { ui::Scope::All } else { ui::Scope::No }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
-    let generation = ui::conf::generation().unwrap_or_default();
-    let th = Theme::from_config(&generation);
-    let mut font = Font::load(th.font.as_deref(), th.font_px);
+    let (_generation, th, mut font) = ui::app::boot();
 
     let store = ui::conf::store_cap();
     let mut items: Vec<Item> = Vec::new();
@@ -432,7 +505,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let (mut w, mut h) = (900u16, 620u16);
+    let (w, h) = (900u16, 620u16);
     let Some(mut surf) = Window::create(w, h, "корни store") else {
         say("roots: композитора нет (WM в окружении)\n");
         sys::exit(1);
@@ -448,153 +521,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         top: 0,
         detail: None,
         detail_of: None,
-        ptr: None,
         hot: None,
-        click: None,
-        held: None,
+        lay: Lay::default(),
         store,
     };
     app.filter();
 
-    let mut need = Need::All;
-    loop {
-        if need != Need::No {
-            let lay = app.lay(&font, &th);
-            // Второй проход — не перестраховка: клик по строке меняет выбор, а подсветка и
-            // подробности считаются ДО того, как виджет ответит на клик. Без него выбранное
-            // менялось бы кадром позже собственного щелчка (та же причина, что у панели с меню).
-            for pass in 0..2 {
-                app.sync_detail();
-                let (fw, fh) = (app.w, app.h);
-                let mut u = Ui::new(surf.pixels(), fw, fh, &th, &mut font);
-                // Веха 148.2 — изменилась только колонка списка: и рисуем, и объявляем
-                // повреждение ТОЛЬКО по ней. Остальное в буфере уже нарисовано и не менялось —
-                // перерисовывать его значит платить впустую.
-                if need == Need::List {
-                    u.clip(lay.col);
-                }
-                u.input(app.ptr, app.click);
-                let picked = app.draw(&mut u, &th, &lay);
-                let d = u.dirty();
-                if !d.is_empty() {
-                    surf.damage(d.x as u16, d.y as u16, d.w as u16, d.h as u16);
-                }
-                app.click = None;
-                if !picked || pass == 1 {
-                    break;
-                }
-                // Выбор сменился щелчком — второй проход рисует уже ВСЁ окно: подробности
-                // справа теперь другие.
-                need = Need::All;
-            }
-            need = Need::No;
-        }
-
-        // Веха 148.2 — СГРЕБАЕМ всю пачку событий, накопившуюся, пока мы рисовали, и только
-        // потом рисуем один кадр. Мышь шлёт движения десятками в секунду; отвечать на каждое
-        // отдельным кадром — это гарантированно отставать от руки на всю пачку.
-        let Some(first) = surf.next_event() else { continue };
-        let mut ev = Some(first);
-        while let Some(e) = ev {
-            let lay = app.lay(&font, &th);
-            let rows = lay.rows;
-            match e {
-                Event::Key { sym, ch, down, .. } if down => {
-                    let last = app.hits.len().saturating_sub(1);
-                    let mut hit = true;
-                    match sym {
-                        SYM_UP => app.sel = app.sel.saturating_sub(1),
-                        SYM_DOWN => app.sel = (app.sel + 1).min(last),
-                        SYM_PGUP => app.sel = app.sel.saturating_sub(rows),
-                        SYM_PGDN => app.sel = (app.sel + rows).min(last),
-                        SYM_HOME => app.sel = 0,
-                        SYM_END => app.sel = last,
-                        SYM_BACKSPACE => {
-                            app.query.pop();
-                            app.filter();
-                        }
-                        // Escape очищает поиск, а не закрывает окно: закрытие — дело композитора
-                        // (`Super+Q`), и приложение, которое умирает от Escape, теряет набранное
-                        // раньше, чем человек успевает передумать.
-                        SYM_ESCAPE => {
-                            app.query.clear();
-                            app.filter();
-                        }
-                        _ => match char::from_u32(ch as u32) {
-                            Some(c) if !c.is_control() => {
-                                app.query.push(c);
-                                app.filter();
-                            }
-                            _ => hit = false,
-                        },
-                    }
-                    if hit {
-                        app.scroll_to_sel(rows);
-                        need = need.max(Need::All);
-                    }
-                }
-                // Веха 148 — колесо крутит СПИСОК, а не выбор: выбранное остаётся на месте, пока
-                // человек смотрит, что рядом. Так же ведут себя списки везде, где их крутят мышью.
-                Event::Wheel { delta, .. } => {
-                    let step = 3usize;
-                    let max = app.hits.len().saturating_sub(rows);
-                    let was = app.top;
-                    app.top = if delta > 0 {
-                        app.top.saturating_sub(step)
-                    } else {
-                        (app.top + step).min(max)
-                    };
-                    // Список упёрся в край — крутить его дальше некуда, и кадра это не стоит.
-                    if app.top != was {
-                        need = need.max(Need::List);
-                    }
-                }
-                Event::Motion { x, y } => {
-                    let p = if x == 0xffff { None } else { Some((x as i32, y as i32)) };
-                    app.ptr = p;
-                    // Движение с зажатой кнопкой — это протяжка: полоса едет за рукой.
-                    if app.held.is_some() {
-                        app.held = p;
-                        need = need.max(Need::List);
-                    }
-                    // Веха 148.2 — подсветка меняется на СМЕНЕ СТРОКИ, а не на каждом пикселе
-                    // пути. Внутри одной строки на экране не меняется ничего, и кадр там —
-                    // чистый убыток: ровно из-за него подсветка и отставала от курсора.
-                    let hot = p.and_then(|(x, y)| app.row_at(&lay, x, y));
-                    if hot != app.hot {
-                        app.hot = hot;
-                        need = need.max(Need::List);
-                    }
-                }
-                Event::Button { x, y, down, buttons } => {
-                    let p = (x as i32, y as i32);
-                    if down {
-                        app.click = Some(p);
-                        // Левая кнопка ЗАЖАТА — дальше ею тащат полосу прокрутки.
-                        if buttons & 1 != 0 {
-                            app.held = Some(p);
-                        }
-                    } else {
-                        app.held = None;
-                    }
-                    need = need.max(Need::All);
-                }
-                Event::Resize { w: nw, h: nh } => {
-                    if (nw, nh) != (w, h) && surf.resize_buf(nw, nh) {
-                        (w, h) = (nw, nh);
-                        app.w = nw as i32;
-                        app.h = nh as i32;
-                        app.scroll_to_sel(app.lay(&font, &th).rows);
-                        need = need.max(Need::All);
-                    }
-                }
-                Event::Close => {
-                    surf.destroy();
-                    sys::exit(0);
-                }
-                _ => {}
-            }
-            ev = surf.poll_event();
-        }
-    }
+    ui::app::run(&mut surf, &th, &mut font, &mut app);
+    sys::exit(0);
 }
+

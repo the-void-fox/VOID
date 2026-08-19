@@ -59,6 +59,7 @@ mod ui;
 #[path = "../roots.rs"]
 mod roots;
 
+use ui::app::say;
 use ui::{Align, Font, Motion, Rect, Theme, Ui};
 
 /// Полноэкранный кадр 1280×800 RGBA — 4 МиБ; остальное на список и шрифт.
@@ -93,10 +94,6 @@ const ROWS: usize = 7;
 
 /// Идентификатор анимации открытия в [`Motion`] (у клиента их может быть много, у нас одна).
 const A_OPEN: u32 = 1;
-
-fn say(s: &str) {
-    sys::write_console(s.as_bytes());
-}
 
 /// Одна запись списка — программа store, с ярлыком или без.
 struct Item {
@@ -153,13 +150,30 @@ struct App {
     sel: usize,
     /// Первая видимая строка списка: список длиннее семи строк почти всегда.
     top: usize,
-    /// Где курсор мыши (в координатах поверхности).
-    ptr: Option<(i32, i32)>,
-    click: Option<(i32, i32)>,
     /// Прямоугольник, нарисованный в прошлом кадре: его надо стереть, иначе карточка оставит
     /// за собой хвост, пока выезжает.
     last: Rect,
     mo: Motion,
+
+    // ── Веха 148.3: измерено в кадре, спрошено в событии ──────────────────────────────────
+    //
+    // Раскладку знает только `draw` (ей нужны тема и шрифт), а решать «изменилось ли что-то»
+    // приходится в `event`, где их нет. Поэтому кадр оставляет после себя две величины —
+    // и заодно они честнее пересчёта: во время выезда карточка ещё не на месте, и попадание
+    // клика считается по тому, что НА ЭКРАНЕ, а не по тому, где карточка будет.
+    /// Полоса строк списка в прошлом кадре.
+    list: Rect,
+    /// Высота строки в прошлом кадре.
+    row_h: i32,
+    /// ВИДИМАЯ строка под курсором (не индекс программы). Подсветка меняется на её смене, а не
+    /// на каждом пикселе пути: внутри одной строки на экране не меняется ничего.
+    hot: Option<usize>,
+
+    /// Право на store — им же и запускаем.
+    store: Option<usize>,
+    wm_ep: usize,
+    /// Уходим: движение доигрывает до конца, и только потом поверхность исчезает.
+    closing: bool,
 }
 
 impl App {
@@ -251,7 +265,7 @@ impl App {
     /// Нарисовать кадр. Возвращает строку, по которой ЩЁЛКНУЛИ, — запускает её вызывающий:
     /// рисование не должно уметь запускать программы, иначе одно и то же действие оказалось бы
     /// в двух местах (клавиатура — в цикле, мышь — здесь).
-    fn draw(&mut self, u: &mut Ui, th: &Theme, t: u32) -> Option<usize> {
+    fn card(&mut self, u: &mut Ui, th: &Theme, t: u32) -> Option<usize> {
         let r = self.card_rect(th, &*u.font, t);
         u.clear(self.last.union(r));
         self.last = r;
@@ -265,6 +279,9 @@ impl App {
         inner.cut_top(th.gap);
 
         let row = 2 * u.font.line_h() + th.px(14);
+        // Раскладку списка оставляем на память: в событии ни темы, ни шрифта нет.
+        self.row_h = row;
+        self.list = Rect::new(inner.x, inner.y, inner.w, row * self.rows());
         let mut hit = None;
         for k in 0..self.rows() as usize {
             let rr = inner.cut_top(row);
@@ -305,15 +322,139 @@ impl App {
     }
 }
 
+impl App {
+    /// ВИДИМАЯ строка под точкой — по раскладке ПРОШЛОГО кадра (см. поля `list`/`row_h`).
+    fn row_at(&self, p: Option<(i32, i32)>) -> Option<usize> {
+        let (x, y) = p?;
+        if self.row_h <= 0 || !self.list.contains(x, y) {
+            return None;
+        }
+        let k = ((y - self.list.y) / self.row_h) as usize;
+        (k < ROWS && self.top + k < self.hits.len()).then_some(k)
+    }
+}
+
+impl ui::Client for App {
+    fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
+        match e {
+            Event::Key { sym, mods: _, ch, down } if down => {
+                match sym {
+                    SYM_ESCAPE => self.closing = true,
+                    SYM_RETURN => {
+                        if let Some((name, args)) = self.target() {
+                            launch(self.store, self.wm_ep, &name, &args);
+                        }
+                        self.closing = true;
+                    }
+                    SYM_BACKSPACE => {
+                        self.text.pop();
+                        self.filter();
+                    }
+                    SYM_UP => {
+                        self.sel = self.sel.saturating_sub(1);
+                        self.scroll_to_sel();
+                    }
+                    SYM_DOWN => {
+                        self.sel = (self.sel + 1).min(self.hits.len().saturating_sub(1));
+                        self.scroll_to_sel();
+                    }
+                    SYM_PGUP => {
+                        self.sel = self.sel.saturating_sub(ROWS);
+                        self.scroll_to_sel();
+                    }
+                    SYM_PGDN => {
+                        self.sel = (self.sel + ROWS).min(self.hits.len().saturating_sub(1));
+                        self.scroll_to_sel();
+                    }
+                    _ => {
+                        // Печатающая клавиша — и только она: управляющие символы в строку
+                        // поиска попадать не должны, иначе Tab и Ctrl-что-нибудь молча
+                        // «набирались» бы невидимыми знаками.
+                        match char::from_u32(ch as u32) {
+                            Some(c) if !c.is_control() => {
+                                self.text.push(c);
+                                self.filter();
+                            }
+                            // Клавиша, которой мы не знаем, не меняет на экране ничего.
+                            _ => return ui::Scope::No,
+                        }
+                    }
+                }
+                ui::Scope::All
+            }
+            Event::Motion { .. } => {
+                // Веха 148.3 — подсветка меняется на СМЕНЕ СТРОКИ, а не на каждом пикселе пути,
+                // и перерисовывается при этом полоса списка, а не вся карточка.
+                let hot = self.row_at(input.ptr);
+                if hot == self.hot {
+                    return ui::Scope::No;
+                }
+                self.hot = hot;
+                ui::Scope::Part(self.list)
+            }
+            Event::Button { x, y, down: true, .. } => {
+                // Попадание считаем по карточке ПРОШЛОГО кадра: во время выезда она ещё не на
+                // месте, и «где она будет» — не тот ответ, которого ждёт рука.
+                if self.last.contains(x as i32, y as i32) {
+                    // Строка под курсором отзовётся в `draw` — она же и запустится.
+                    ui::Scope::All
+                } else {
+                    // Клик мимо карточки закрывает — ровно тот жест, ради которого поверхность
+                    // и растянута на весь экран.
+                    self.closing = true;
+                    ui::Scope::All
+                }
+            }
+            Event::Resize { w, h } => {
+                self.sw = w as i32;
+                self.sh = h as i32;
+                ui::Scope::All
+            }
+            _ => ui::Scope::No,
+        }
+    }
+
+    fn draw(&mut self, u: &mut Ui) -> ui::Scope {
+        // Движение открытия: цель 256, пока живём, и 0, когда уходим. Закрытие доигрывает до
+        // конца — иначе карточка исчезала бы рывком ровно в тот момент, когда человек на неё
+        // смотрит.
+        self.mo.begin(sys::monotonic_ns());
+        let t = self.mo.val(A_OPEN, if self.closing { 0 } else { 256 }) as u32;
+        let th = u.th.clone();
+        if let Some(i) = self.card(u, &th, t) {
+            let name = self.items[i].root.clone();
+            launch(self.store, self.wm_ep, &name, &[]);
+            self.closing = true;
+            // Движение закрытия начинается ЗДЕСЬ, а не со следующего кадра. Цель этого кадра
+            // (`val` выше) была ещё «открыто», и без этой строки `done` увидел бы неподвижную
+            // карточку и убрал бы поверхность мгновенно — вместо ухода получился бы обрыв.
+            self.mo.val(A_OPEN, 0);
+        }
+        ui::Scope::No
+    }
+
+    fn wake(&mut self) -> Option<u32> {
+        // Пока что-то едет — просыпаться кадрами; иначе спать до события.
+        (self.mo.moving() || self.closing).then_some(ui::anim::FRAME_MS)
+    }
+
+    fn tick(&mut self) -> ui::Scope {
+        if self.mo.moving() || self.closing { ui::Scope::All } else { ui::Scope::No }
+    }
+
+    fn done(&self) -> bool {
+        // Уходим не по нажатию, а когда движение ДОИГРАЛО: иначе карточка исчезает рывком.
+        self.closing && !self.mo.moving()
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let Some((sw, sh)) = win::screen() else {
         say("launcher: композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
-    let generation = ui::conf::generation().unwrap_or_default();
-    let th = Theme::from_config(&generation);
-    let mut font = Font::load(th.font.as_deref(), th.font_px);
+    let (generation, th, mut font) = ui::app::boot();
 
     // Список — ДО поверхности: пустая карточка, которая через мгновение наполняется, выглядит
     // подвисшей, а прочитать корни store быстрее, чем нарисовать первый кадр.
@@ -371,10 +512,14 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         raw: false,
         sel: 0,
         top: 0,
-        ptr: None,
-        click: None,
         last: Rect::ZERO,
         mo: Motion::new(ui::anim::duration_from_config(&generation)),
+        list: Rect::ZERO,
+        row_h: 0,
+        hot: None,
+        store,
+        wm_ep: win::endpoint().unwrap_or(sys::NO_CAP),
+        closing: false,
     };
     app.filter();
     // Веха 146.1 — движение открытия НАЧИНАЕТСЯ ОТ НУЛЯ, и сказать это надо ЗДЕСЬ.
@@ -389,118 +534,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::exit(1);
     };
 
-    let wm_ep = win::endpoint().unwrap_or(sys::NO_CAP);
-    let mut closing = false;
-    let mut redraw = true;
-    loop {
-        // Движение открытия: цель 256, пока живём, и 0, когда уходим. Закрытие доигрывает до
-        // конца — иначе карточка исчезала бы рывком ровно в тот момент, когда человек на неё
-        // смотрит.
-        let now = sys::monotonic_ns();
-        app.mo.begin(now);
-        let t = app.mo.val(A_OPEN, if closing { 0 } else { 256 }) as u32;
-        if closing && !app.mo.moving() {
-            surf.destroy();
-            sys::exit(0);
-        }
-
-        if redraw || app.mo.moving() {
-            let (w, h) = (app.sw, app.sh);
-            let mut u = Ui::new(surf.pixels(), w, h, &th, &mut font);
-            u.input(app.ptr, app.click);
-            let hit = app.draw(&mut u, &th, t);
-            let d = u.dirty();
-            if !d.is_empty() {
-                // `damage` у нас и есть commit: композитор берёт кадр из общего буфера.
-                surf.damage(d.x as u16, d.y as u16, d.w as u16, d.h as u16);
-            }
-            app.click = None;
-            redraw = false;
-            if let Some(i) = hit {
-                let name = app.items[i].root.clone();
-                launch(store, wm_ep, &name, &[]);
-                closing = true;
-            }
-        }
-
-        // Спим до события, а пока идёт движение — до следующего кадра. Опрос в цикле стоил бы
-        // системе простоя (Веха 139.3), а движение без своего срока шло бы рывками.
-        let ev = if app.mo.moving() {
-            surf.next_event_timeout(ui::anim::FRAME_MS)
-        } else {
-            surf.next_event()
-        };
-        let Some(ev) = ev else { continue };
-        match ev {
-            Event::Key { sym, mods: _, ch, down } if down => {
-                redraw = true;
-                match sym {
-                    SYM_ESCAPE => closing = true,
-                    SYM_RETURN => {
-                        if let Some((name, args)) = app.target() {
-                            launch(store, wm_ep, &name, &args);
-                        }
-                        closing = true;
-                    }
-                    SYM_BACKSPACE => {
-                        app.text.pop();
-                        app.filter();
-                    }
-                    SYM_UP => {
-                        app.sel = app.sel.saturating_sub(1);
-                        app.scroll_to_sel();
-                    }
-                    SYM_DOWN => {
-                        app.sel = (app.sel + 1).min(app.hits.len().saturating_sub(1));
-                        app.scroll_to_sel();
-                    }
-                    SYM_PGUP => {
-                        app.sel = app.sel.saturating_sub(ROWS);
-                        app.scroll_to_sel();
-                    }
-                    SYM_PGDN => {
-                        app.sel = (app.sel + ROWS).min(app.hits.len().saturating_sub(1));
-                        app.scroll_to_sel();
-                    }
-                    _ => {
-                        // Печатающая клавиша — и только она: управляющие символы в строку
-                        // поиска попадать не должны, иначе Tab и Ctrl-что-нибудь молча
-                        // «набирались» бы невидимыми знаками.
-                        match char::from_u32(ch as u32) {
-                            Some(c) if !c.is_control() => {
-                                app.text.push(c);
-                                app.filter();
-                            }
-                            _ => redraw = false,
-                        }
-                    }
-                }
-            }
-            Event::Motion { x, y } => {
-                app.ptr = if x == 0xffff { None } else { Some((x as i32, y as i32)) };
-                redraw = true;
-            }
-            Event::Button { x, y, buttons: _, down } if down => {
-                let r = app.card_rect(&th, &font, 256);
-                if r.contains(x as i32, y as i32) {
-                    // Строка под курсором отзовётся в `draw` — она же и запустится.
-                    app.click = Some((x as i32, y as i32));
-                    redraw = true;
-                } else {
-                    // Клик мимо карточки закрывает — ровно тот жест, ради которого поверхность
-                    // и растянута на весь экран.
-                    closing = true;
-                }
-            }
-            Event::Close => closing = true,
-            Event::Resize { w, h } => {
-                app.sw = w as i32;
-                app.sh = h as i32;
-                redraw = true;
-            }
-            _ => {}
-        }
-    }
+    ui::app::run(&mut surf, &th, &mut font, &mut app);
+    sys::exit(0);
 }
 
 /// Запустить программу — ЧЕРЕЗ СТОРОЖА (`run`, Веха 147).

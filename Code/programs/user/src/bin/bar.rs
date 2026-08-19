@@ -147,55 +147,79 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     if year_now() < 2000 {
         say("bar: часов у машины нет — время идёт с загрузки (см. SYS_TIME)\n");
     }
-    bar.frame(&mut surf, &th, &mut font, None);
 
-    let mut minute = minute_now();
-    loop {
+    ui::app::run(&mut surf, &th, &mut font, &mut bar);
+    sys::exit(0);
+}
+
+impl ui::Client for Bar {
+    fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
+        match e {
+            // Состояние сменилось — спросить композитор ПЕРЕД кадром. Не здесь: событий подряд
+            // может прийти несколько, а ответ на все один.
+            Event::Status => {
+                self.stale = true;
+                ui::Scope::All
+            }
+            // Отвечаем ТОЛЬКО на нажатие: реагировать и на отпускание значило бы два
+            // переключения на один щелчок.
+            Event::Button { x, y, down: true, .. } => {
+                self.ptr = Some((x as i32, y as i32));
+                ui::Scope::All
+            }
+            Event::Motion { .. } => {
+                // Курсор мог уйти с панели — цикл говорит это через `None` (Веха 144). Пока он
+                // стоит на месте, кадра не надо: подписи островов не изменились бы всё равно.
+                if input.ptr == self.ptr {
+                    return ui::Scope::No;
+                }
+                self.ptr = input.ptr;
+                ui::Scope::All
+            }
+            Event::Resize { w, h } => {
+                self.screen(w as i32, h as i32);
+                ui::Scope::All
+            }
+            _ => ui::Scope::No,
+        }
+    }
+
+    /// Перед кадром: спросить состояние и подогнать размер поверхности.
+    fn before(&mut self, surf: &mut Window) -> ui::Scope {
+        if core::mem::take(&mut self.stale) {
+            self.fetch(surf);
+        }
+        let was = self.grown;
+        self.sync_surface(surf);
+        // Буфер сменился — в нём нет ничего, и кадр обязан быть полным.
+        if self.grown != was { ui::Scope::All } else { ui::Scope::No }
+    }
+
+    fn draw(&mut self, u: &mut Ui) -> ui::Scope {
+        self.paint(u);
+        ui::Scope::No
+    }
+
+    /// После кадра: исполнить решённое. `true` от [`Bar::act`] означает «нужен новый кадр ПРЯМО
+    /// СЕЙЧАС» — клик по кнопке меню меняет РАЗМЕР поверхности, и рисовать надо уже в новую.
+    fn after(&mut self, surf: &Window) -> ui::Scope {
+        if self.act(surf) { ui::Scope::All } else { ui::Scope::No }
+    }
+
+    fn wake(&mut self) -> Option<u32> {
         // Пока что-то движется — просыпаться кадрами; иначе спать до минуты. Композитор будит
         // раньше своим событием, и это ровно то, чего мы ждём.
-        let wait = if bar.busy() { ui::anim::FRAME_MS } else { ms_to_next_minute() };
-        match surf.next_event_timeout(wait) {
-            // Состояние сменилось — спросить и перерисовать.
-            Some(Event::Status) => {
-                bar.fetch(&surf);
-                bar.frame(&mut surf, &th, &mut font, None);
-            }
-            // Клик. Отвечаем ТОЛЬКО на нажатие: реагировать и на отпускание значило бы два
-            // переключения на один щелчок.
-            Some(Event::Button { x, y, down: true, .. }) => {
-                bar.ptr = Some((x as i32, y as i32));
-                bar.frame(&mut surf, &th, &mut font, Some((x as i32, y as i32)));
-            }
-            Some(Event::Motion { x, y }) => {
-                // Курсор УШЁЛ с панели — композитор говорит это координатами вне поверхности
-                // (Веха 144). Без такого сообщения подсветка под курсором залипала бы навсегда:
-                // событий «мыши больше нет над тобой» до этого не существовало.
-                let ptr = (x != u16::MAX).then_some((x as i32, y as i32));
-                if ptr != bar.ptr {
-                    bar.ptr = ptr;
-                    bar.frame(&mut surf, &th, &mut font, None);
-                }
-            }
-            Some(Event::Resize { w, h }) if (w, h) != (surf.width, surf.height) => {
-                if surf.resize_buf(w, h) {
-                    bar.screen(w as i32, h as i32);
-                    bar.frame(&mut surf, &th, &mut font, None);
-                }
-            }
-            Some(Event::Close) => {
-                surf.destroy();
-                sys::exit(0);
-            }
-            // Срок вышел (или пришло что-то нам ненужное) — перерисовать, если сменилась минута
-            // ИЛИ если идёт движение: это и есть кадр анимации.
-            _ => {
-                let m = minute_now();
-                if m != minute || bar.busy() {
-                    minute = m;
-                    bar.frame(&mut surf, &th, &mut font, None);
-                }
-            }
+        Some(if self.busy() { ui::anim::FRAME_MS } else { ms_to_next_minute() })
+    }
+
+    /// Срок вышел: перерисовать, если сменилась минута ИЛИ если идёт движение (кадр анимации).
+    fn tick(&mut self) -> ui::Scope {
+        let m = minute_now();
+        if m != self.minute || self.busy() {
+            self.minute = m;
+            return ui::Scope::All;
         }
+        ui::Scope::No
     }
 }
 
@@ -231,6 +255,11 @@ struct Bar {
     h: i32,
     sw: i32,
     sh: i32,
+    /// Веха 148.3 — композитор сказал, что состояние сменилось, а спросить его мы ещё не успели.
+    /// Флагом, а не запросом на месте: событий подряд приходит несколько, а ответ на все один.
+    stale: bool,
+    /// Минута, которую показывают часы. Ею решается, стоит ли кадра истёкший срок.
+    minute: u64,
     space: u8,
     spaces: u8,
     /// Раскладка клавиатуры: 0 — US, 1 — RU (Веха 143).
@@ -309,6 +338,8 @@ impl Bar {
             h,
             sw,
             sh,
+            stale: false,
+            minute: minute_now(),
             space: 0,
             spaces: 1,
             layout: 0,
@@ -384,19 +415,6 @@ impl Bar {
         }
     }
 
-    /// Кадр целиком: подогнать размер поверхности, нарисовать, исполнить решённое.
-    ///
-    /// Второй проход — не перестраховка: клик по кнопке меню меняет РАЗМЕР поверхности, а рисовать
-    /// в неё надо уже после этого. Без него меню появлялось бы на кадр позже собственного клика.
-    fn frame(&mut self, surf: &mut Window, th: &Theme, font: &mut Font, click: Option<(i32, i32)>) {
-        self.sync_surface(surf);
-        self.draw(surf, th, font, click);
-        if self.act(surf) {
-            self.sync_surface(surf);
-            self.draw(surf, th, font, None);
-        }
-    }
-
     /// Поверхность растёт на весь экран, когда открывается меню, и сжимается, когда оно ушло.
     ///
     /// Отдельным шагом, а не внутри рисования: смена буфера — разговор с композитором (`OP_REBUF`),
@@ -462,10 +480,12 @@ impl Bar {
         core::mem::take(&mut self.again)
     }
 
-    fn draw(&mut self, surf: &mut Window, th: &Theme, font: &mut Font, click: Option<(i32, i32)>) {
+    fn paint(&mut self, u: &mut Ui) {
         self.mo.begin(sys::monotonic_ns());
         let confirm_was = self.confirm;
-        let (w, h) = (surf.width as i32, surf.height as i32);
+        let (th, click) = (u.th.clone(), u.click());
+        let th = &th;
+        let (w, h) = (u.c.w, u.c.h);
         let margin = th.px(6);
         let isle_h = self.h - 2 * margin;
         let clock = clock_text();
@@ -483,7 +503,7 @@ impl Bar {
         let mut spaces_w = 2 * th.pad;
         for i in 0..self.spaces {
             let label = alloc::format!("{}", i + 1);
-            let pw = (font.width(&label) + th.px(14)).max(isle_h - th.px(8));
+            let pw = (u.font.width(&label) + th.px(14)).max(isle_h - th.px(8));
             if i > 0 {
                 spaces_w += pill_gap;
             }
@@ -494,12 +514,12 @@ impl Bar {
 
         // Кнопка меню — самая правая: это «начало» оболочки, и звать её надо там, где рука её
         // ищет. Надпись — имя поколения: система называет себя тем, чем она сейчас является.
-        let sys_w = font.width(&self.gen) + 2 * th.pad;
+        let sys_w = u.font.width(&self.gen) + 2 * th.pad;
         let s_isle = Rect::new(w - margin - sys_w, margin, sys_w, isle_h);
 
-        let lang_w = font.width(lang) + th.px(12);
-        let clock_w = font.width(&clock);
-        let date_w = font.width(&date);
+        let lang_w = u.font.width(lang) + th.px(12);
+        let clock_w = u.font.width(&clock);
+        let date_w = u.font.width(&date);
         let r_w = 2 * th.pad + lang_w + th.px(8) + th.line + th.px(8) + clock_w + th.px(6) + date_w;
         let r_isle = Rect::new(s_isle.x - margin - r_w, margin, r_w, isle_h);
 
@@ -518,7 +538,7 @@ impl Bar {
         let t_isle = if self.shown.is_empty() || room < th.px(60) {
             Rect::ZERO
         } else {
-            let tw = (font.width(&self.shown) + 2 * th.pad).min(room);
+            let tw = (u.font.width(&self.shown) + 2 * th.pad).min(room);
             let x = ((w - tw) / 2).clamp(l_isle.right() + margin, r_isle.x - margin - tw);
             Rect::new(x, margin, tw, isle_h)
         };
@@ -555,11 +575,11 @@ impl Bar {
 
         // ── карточка меню ──────────────────────────────────────────────────────────────────
         let menu_t = self.mo.val(A_MENU, if self.open { 256 } else { 0 }).clamp(0, 256) as u32;
-        let card = self.card_rect(th, font, menu_t);
+        let card = self.card_rect(th, u.font, menu_t);
         let card_clip = Rect::new(0, self.h - margin, w, h - (self.h - margin));
         // Место считается ДО опроса движения: `self.mo` берётся изменяемо, а прямоугольник —
         // из `self`, и в одном выражении эти два заимствования спорят.
-        let pow_r = self.power_rect(th, font, card);
+        let pow_r = self.power_rect(th, &*u.font, card);
         let pow_hot = self.mo.val(A_POWER, if hot(pow_r) { 256 } else { 0 }) as u32;
         let uptime = uptime_text();
 
@@ -609,8 +629,6 @@ impl Bar {
             return;
         }
 
-        let mut u = Ui::new(surf.pixels(), w, h, th, font);
-        u.input(self.ptr, click);
         // Стереть старое место острова вместе с новым: остров, ставший уже, оставил бы за собой
         // кусок себя прежнего — на прозрачной поверхности это не «след», а мусор поверх обоев.
         // Карточка стирается не здесь, а под своим клипом: она одна умеет вылезать за панель.
@@ -678,7 +696,7 @@ impl Bar {
             u.clear(self.isles[I_CARD].rect.union(want[I_CARD].rect));
             if menu_t > 0 {
                 u.fade(menu_t);
-                self.draw_card(&mut u, th, card, &uptime, &clock, pow_hot);
+                self.draw_card(u, th, card, &uptime, &clock, pow_hot);
                 u.fade(256);
             }
             u.clip(Rect::new(0, 0, w, h));
@@ -706,11 +724,7 @@ impl Bar {
         // разбудить панель было нечему.
         self.again |= self.confirm != confirm_was;
 
-        let d = u.dirty();
         self.isles = want;
-        if !d.is_empty() {
-            surf.damage(d.x as u16, d.y as u16, d.w as u16, d.h as u16);
-        }
     }
 
     // ── меню ───────────────────────────────────────────────────────────────────────────────
