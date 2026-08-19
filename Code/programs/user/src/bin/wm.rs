@@ -44,6 +44,21 @@ use alloc::vec::Vec;
 use void_user as sys;
 use void_user::win;
 
+// Веха 148.3 — НИЖНИЙ ярус тулкита: холст, прямоугольник, тема и кривая движения. Верхние два
+// (`Ui` с виджетами и `app` с циклом) композитору не нужны и не используются: он не клиент
+// самому себе. Раньше это значило «своё всё» — свой холст плитки, своя палитра, своя кривая, — и
+// три цвета из пяти успели разойтись молча.
+#[allow(dead_code)]
+#[path = "../ui/mod.rs"]
+mod ui;
+
+use ui::{Rgba, Theme};
+
+/// Цвет темы в тройку, которой рисует композитор (альфа у него своя, попиксельная).
+fn tri(c: Rgba) -> (u8, u8, u8) {
+    (c.r, c.g, c.b)
+}
+
 /// Кадр 1280×800 RGBA (4 МиБ) + копии содержимого окон.
 #[global_allocator]
 static ALLOC: sys::heap::Heap<{ 32 * 1024 * 1024 }> = sys::heap::Heap::new();
@@ -59,12 +74,11 @@ const FB_VA: usize = 0x5000_0000;
 const BUILD: &str = env!("VOID_BUILD");
 
 // ── вид (ADR 0016: один палитра-источник, приложения цветов не знают) ────────
-const C_DESKTOP: (u8, u8, u8) = (0x0d, 0x11, 0x17);
-/// Веха 137 — рамка полосы стола в обзоре и её же вариант для стола в фокусе.
-const C_BAND: (u8, u8, u8) = (0x1e, 0x28, 0x33);
-const C_BAND_ON: (u8, u8, u8) = (0x2f, 0x4a, 0x6b);
-const C_BORDER: (u8, u8, u8) = (0x30, 0x36, 0x3d);
-const C_ACCENT: (u8, u8, u8) = (0x4c, 0x7d, 0xfd);
+//
+// Веха 148.3 — источник этот наконец ОДИН: цвета приезжают из `ui::Theme`, то есть из конфига
+// поколения. До неё здесь стояли свои константы под тем же заголовком про «один источник», и
+// заголовок был неправдой: `ui("accent", "#ff0000")` перекрашивал панель, а рамку фокуса, фон
+// стола и плитку запуска не трогал вовсе.
 
 // ── анимации (Веха 125) ──────────────────────────────────────────────────────
 //
@@ -151,15 +165,10 @@ impl Slide {
 const POP: i32 = 232;
 
 /// Ease-out кубический: `1 − (1−t)³`, всё в 1/1024.
-fn ease_out(t: i32) -> i32 {
-    let inv = (1024 - t.clamp(0, 1024)) as i64;
-    (1024 - (inv * inv * inv) / (1024 * 1024)) as i32
-}
-
-/// Линейная доля пути между `a` и `b` (`p` — 0..1024).
-fn lerp(a: i32, b: i32, p: i32) -> i32 {
-    a + (b - a) * p / 1024
-}
+// Кривая и доля пути — из тулкита (`ui::anim`). Копия жила здесь до Вехи 148.3, и в самом
+// тулките рядом с ней стояла честная пометка «копия формулы композитора: две кривые дали бы две
+// разные системы». Теперь кривая одна.
+use ui::anim::{ease_out, lerp};
 
 /// То, ЧТО РИСУЕТСЯ, — в отличие от того, что назначила раскладка. Между ними и живёт анимация.
 #[derive(Clone, Copy, PartialEq)]
@@ -438,6 +447,12 @@ fn main_loop() -> ! {
         (info.rgb[2].0 as u32, 8 - info.rgb[2].1.clamp(1, 8) as u32),
     ];
     let rgb8 = rgb.iter().all(|&(_, drop)| drop == 0);
+
+    // Конфиг поколения читаем ОДИН раз: из него и раскладка клавиш, и обои, и — с Вехи 148.3 —
+    // ПАЛИТРА. Читать его надо до первой заливки: фон стола красится уже из темы.
+    let generation = read_generation(store).unwrap_or_default();
+    let theme = Theme::from_config(&generation);
+
     let mut wm = Wm {
         info,
         rgb,
@@ -482,14 +497,12 @@ fn main_loop() -> ! {
         anim: ANIM_MS,
         drag: None,
         slide: None,
+        th: theme,
     };
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
-    wm.fill_rect(0, 0, info.width as i32, info.height as i32, C_DESKTOP);
+    wm.fill_rect(0, 0, info.width as i32, info.height as i32, tri(wm.th.desktop));
     wm.draw_cursor();
-
-    // Конфиг поколения читаем ОДИН раз: из него и раскладка клавиш, и обои.
-    let generation = read_generation(store).unwrap_or_default();
     // Веха 142 — скорость анимаций из конфига (`desktop anim <мс>`). Значение чужое, поэтому
     // потолок ставим свой: срок длиннее секунды делает систему не плавной, а задумчивой.
     if let Some(ms) = desktop_num(&generation, "anim") {
@@ -1028,6 +1041,9 @@ struct Wm {
     /// Веха 142 — длительность ПЕРЕЕЗДА окна в мс; остальные сроки — доли от неё
     /// ([`D_OPEN`], [`D_CLOSE`], [`D_OV`]). Ноль означает «без анимаций»: рывком, но честно.
     anim: u64,
+    /// Веха 148.3 — палитра системы из конфига поколения. Одна на композитор, панель и родные
+    /// программы: до неё композитор держал свою и три цвета из пяти успели разойтись.
+    th: Theme,
     /// Веха 142 — идёт перетаскивание мышью с Super (ЛКМ — переставить, ПКМ — ширина).
     drag: Option<Drag>,
     /// Веха 142.1 — идёт переезд между столами.
@@ -1689,7 +1705,7 @@ impl Wm {
 
     /// Собрать одну строку экрана: стол → нижние слои → окна → верхние слои → курсор.
     fn compose_row(&self, out: &mut [u32], yy: i32, x0: i32) {
-        let desktop = self.pack(C_DESKTOP);
+        let desktop = self.pack(tri(self.th.desktop));
         out.fill(desktop);
         let x1 = x0 + out.len() as i32;
 
@@ -1786,7 +1802,7 @@ impl Wm {
             if ex <= sx {
                 return;
             }
-            let border = self.unpack(self.pack(if active { C_ACCENT } else { C_BORDER }));
+            let border = self.unpack(self.pack(tri(if active { self.th.accent } else { self.th.border })));
             let (cw, ch) = (fw - 2 * bord, fh - 2 * bord);
             let src_row = (yy - fy - bord) * win.bh / ch.max(1);
             let px = win.px();
@@ -1924,7 +1940,7 @@ impl Wm {
                     continue;
                 }
                 let edge = yy == ry || yy == ry + rh - 1;
-                let c = if active { C_BAND_ON } else { C_BAND };
+                let c = tri(if active { self.th.band_on } else { self.th.band });
                 let (lo, hi) = (rx.max(x0), (rx + rw).min(x1));
                 for x in lo..hi {
                     let i = (x - x0) as usize;
@@ -1974,7 +1990,7 @@ impl Wm {
     fn draw_cursor_row(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
         let cy = yy - self.cursor.1;
         if cy >= 0 && cy < CUR_H {
-            let fill = self.pack(if self.buttons != 0 { C_ACCENT } else { (255, 255, 255) });
+            let fill = self.pack(if self.buttons != 0 { tri(self.th.accent) } else { (255, 255, 255) });
             let edge = self.pack((0, 0, 0));
             for (col, ch) in CURSOR[cy as usize].bytes().enumerate() {
                 if ch == b' ' {
@@ -2560,7 +2576,7 @@ impl Wm {
     // ── курсор (тот же приём, что в `term`: он не часть кадра) ────────────────────────
 
     fn draw_cursor(&self) {
-        let px_fill = self.pack(if self.buttons != 0 { C_ACCENT } else { (255, 255, 255) });
+        let px_fill = self.pack(if self.buttons != 0 { tri(self.th.accent) } else { (255, 255, 255) });
         let px_edge = self.pack((0, 0, 0));
         for (row, line) in CURSOR.iter().enumerate() {
             for (col, ch) in line.bytes().enumerate() {
@@ -3406,6 +3422,9 @@ impl Wm {
     /// собирал бы одну и ту же картинку шестьдесят раз в секунду ради полосы, которая двигается
     /// двадцать пять.
     fn render_launch(&mut self, i: usize, now: u64) -> bool {
+        // Копия темы: ниже окно берётся `&mut self.wins[i]`, и одолжить `self.th` рядом уже
+        // нельзя. Плитка перерисовывается раз в 40 мс — цена копии здесь не видна ничем.
+        let th = self.th.clone();
         let Win { launch: Some(l), own, bw, bh, w, h, .. } = &mut self.wins[i] else {
             return false;
         };
@@ -3428,7 +3447,7 @@ impl Wm {
             px.clear();
             px.resize(need, 0);
         }
-        draw_tile(px, cw, ch, l, phase, now);
+        draw_tile(px, cw, ch, l, phase, now, &th);
         *bw = cw;
         *bh = ch;
         true
@@ -3909,32 +3928,22 @@ impl Wm {
 //
 // Текста композитор до этой вехи не рисовал вовсе: заголовок окна он хранит, но показывает его
 // панель. Плитка — первое, что он обязан сказать словами, и берёт она растровый шрифт 8×16 из
-// таблицы ядра ([`sys::glyph`], тот же, что у панели). Тулкит сюда не тянем: `void-ui` живёт в
-// клиентах, а композитор — не клиент самому себе.
+// таблицы ядра ([`sys::glyph`], тот же, что у панели).
+//
+// Веха 148.3 — пиксели пишет `ui::Canvas`, цвета приходят из `ui::Theme`. Здесь стояла оговорка
+// «тулкит сюда не тянем: void-ui живёт в клиентах, а композитор не клиент самому себе», и верна
+// она ровно наполовину: `Ui` с виджетами и `app` с циклом ему правда не нужны, а холст и палитра
+// нужны — своя копия обоих обошлась в четвёртый способ писать пиксель и вторую палитру,
+// разошедшуюся с первой. ШРИФТ остаётся кернельный: `ui::Font` — это загрузка TTF из store, то
+// есть умение, которого у держателя всех оконных буферов быть не должно.
 
 /// Сколько плитка «бежит». Дальше полоса замирает и надпись говорит правду: «дольше обычного».
 /// Врать процентами нечем — мы не знаем ни сколько осталось, ни сколько всего.
 const LAUNCH_ANIM_NS: u64 = 10_000_000_000;
 
-/// Фон плитки: чуть светлее стола, чтобы место было видно и пустым.
-const C_TILE: (u8, u8, u8) = (0x14, 0x1b, 0x24);
-const C_TEXT: (u8, u8, u8) = (0xd8, 0xde, 0xe6);
-const C_MUTED: (u8, u8, u8) = (0x79, 0x85, 0x94);
-const C_DANGER: (u8, u8, u8) = (0xf1, 0x5b, 0x50);
-
-/// Залить прямоугольник в RGBA-кадре плитки.
-fn tile_fill(px: &mut [u8], bw: i32, bh: i32, r: (i32, i32, i32, i32), c: (u8, u8, u8)) {
-    let (x0, y0) = (r.0.max(0), r.1.max(0));
-    let (x1, y1) = ((r.0 + r.2).min(bw), (r.1 + r.3).min(bh));
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let p = ((y * bw + x) * 4) as usize;
-            px[p] = c.0;
-            px[p + 1] = c.1;
-            px[p + 2] = c.2;
-            px[p + 3] = 0xff;
-        }
-    }
+/// Залить прямоугольник плитки. Холст сам режет по краю и сам пишет альфу.
+fn tile_fill(c: &mut ui::Canvas, r: (i32, i32, i32, i32), col: Rgba) {
+    c.fill(ui::Rect::new(r.0, r.1, r.2, r.3), col.with_a(0xff));
 }
 
 /// Написать строку шрифтом 8×16 с увеличением `scale`. Возвращает ширину написанного.
@@ -3942,9 +3951,8 @@ fn tile_fill(px: &mut [u8], bw: i32, bh: i32, r: (i32, i32, i32, i32), c: (u8, u
 /// Обрезка — по КРАЮ ПЛИТКИ, а не по числу знаков: строка вывода умершей программы может быть
 /// какой угодно длины, и считать её длину заранее значило бы завести вторую истину о том, что
 /// поместилось.
-fn tile_text(
-    px: &mut [u8], bw: i32, bh: i32, x: i32, y: i32, s: &str, c: (u8, u8, u8), scale: i32,
-) -> i32 {
+fn tile_text(c: &mut ui::Canvas, x: i32, y: i32, s: &str, col: Rgba, scale: i32) -> i32 {
+    let bw = c.w;
     let mut cx = x;
     for ch in s.chars() {
         let rows = sys::glyph::rows(ch);
@@ -3953,9 +3961,7 @@ fn tile_text(
                 if bits & (0x80 >> bit) == 0 {
                     continue;
                 }
-                let px0 = cx + bit * scale;
-                let py0 = y + ry as i32 * scale;
-                tile_fill(px, bw, bh, (px0, py0, scale, scale), c);
+                tile_fill(c, (cx + bit * scale, y + ry as i32 * scale, scale, scale), col);
             }
         }
         cx += 8 * scale;
@@ -3967,30 +3973,31 @@ fn tile_text(
 }
 
 /// Написать строку ПО ЦЕНТРУ плитки.
-fn tile_center(px: &mut [u8], bw: i32, bh: i32, y: i32, s: &str, c: (u8, u8, u8), scale: i32) {
+fn tile_center(c: &mut ui::Canvas, y: i32, s: &str, col: Rgba, scale: i32) {
     let w = s.chars().count() as i32 * 8 * scale;
-    tile_text(px, bw, bh, (bw - w) / 2, y, s, c, scale);
+    tile_text(c, (c.w - w) / 2, y, s, col, scale);
 }
 
 /// Весь кадр плитки: «запускается» с бегунком либо итог с кодом выхода и хвостом вывода.
-fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64) {
-    tile_fill(px, bw, bh, (0, 0, bw, bh), C_TILE);
+fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, th: &Theme) {
+    let c = &mut ui::Canvas::new(px, bw, bh);
+    tile_fill(c, (0, 0, bw, bh), th.bg);
     match &l.done {
         // ── ждём окна ──────────────────────────────────────────────────────────────────
         None => {
             let long = now.saturating_sub(l.since) >= LAUNCH_ANIM_NS;
             let y = bh / 2 - 34;
-            tile_center(px, bw, bh, y, "ЗАПУСКАЕТСЯ", C_MUTED, 1);
-            tile_center(px, bw, bh, y + 24, &l.name, C_TEXT, 2);
+            tile_center(c, y, "ЗАПУСКАЕТСЯ", th.muted, 1);
+            tile_center(c, y + 24, &l.name, th.text, 2);
             // Дорожка и бегунок. Проценты не рисуем и не выдумываем: мы не знаем ни сколько
             // осталось, ни сколько всего, — знаем только, что ещё ждём.
             let track = (bw / 6).max(40).min(bw / 2);
             let (tx, ty) = ((bw - track) / 2, y + 64);
-            tile_fill(px, bw, bh, (tx, ty, track, 4), C_BORDER);
+            tile_fill(c, (tx, ty, track, 4), th.border);
             if long {
                 // Срок вышел: полоса замирает целиком, а словами говорим правду.
-                tile_fill(px, bw, bh, (tx, ty, track, 4), C_MUTED);
-                tile_center(px, bw, bh, ty + 14, "дольше обычного — окна всё нет", C_MUTED, 1);
+                tile_fill(c, (tx, ty, track, 4), th.muted);
+                tile_center(c, ty + 14, "дольше обычного — окна всё нет", th.muted, 1);
             } else {
                 let run = (track / 4).max(8);
                 // Челнок туда-обратно: бесконечная лента вправо выглядит как «загрузка идёт»,
@@ -3998,7 +4005,7 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64) 
                 let span = (track - run).max(1);
                 let p = (phase as i32) % (2 * span);
                 let off = if p < span { p } else { 2 * span - p };
-                tile_fill(px, bw, bh, (tx + off, ty, run, 4), C_ACCENT);
+                tile_fill(c, (tx + off, ty, run, 4), th.accent);
             }
         }
         // ── всё кончилось, а окна не было ──────────────────────────────────────────────
@@ -4006,11 +4013,11 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64) 
             let bad = *code != 0;
             let head = if bad { "НЕ ЗАПУСТИЛОСЬ" } else { "ЗАВЕРШИЛОСЬ БЕЗ ОКНА" };
             let pad = 14;
-            tile_text(px, bw, bh, pad, pad, head, if bad { C_DANGER } else { C_MUTED }, 1);
-            tile_text(px, bw, bh, pad, pad + 22, &l.name, C_TEXT, 2);
+            tile_text(c, pad, pad, head, if bad { th.danger } else { th.muted }, 1);
+            tile_text(c, pad, pad + 22, &l.name, th.text, 2);
             let code_line = alloc::format!("код выхода {}", code);
-            tile_text(px, bw, bh, pad, pad + 56, &code_line, C_MUTED, 1);
-            tile_fill(px, bw, bh, (pad, pad + 78, bw - 2 * pad, 1), C_BORDER);
+            tile_text(c, pad, pad + 56, &code_line, th.muted, 1);
+            tile_fill(c, (pad, pad + 78, bw - 2 * pad, 1), th.border);
             // Вывод — ПОСЛЕДНИЕ строки: смерть объясняют они, а не первые. Пустой вывод не
             // прячем за молчанием, а называем: «программа не сказала ничего» — это тоже ответ.
             let mut y = pad + 88;
@@ -4032,13 +4039,13 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64) 
             }
             let fit = ((bh - y - pad) / 18).max(0) as usize;
             if lines.is_empty() {
-                tile_text(px, bw, bh, pad, y, "вывода не было", C_MUTED, 1);
+                tile_text(c, pad, y, "вывода не было", th.muted, 1);
             }
             for line in lines.iter().skip(lines.len().saturating_sub(fit)) {
-                tile_text(px, bw, bh, pad, y, line, C_TEXT, 1);
+                tile_text(c, pad, y, line, th.text, 1);
                 y += 18;
             }
-            tile_text(px, bw, bh, pad, bh - pad - 16, "Super+Q — убрать", C_MUTED, 1);
+            tile_text(c, pad, bh - pad - 16, "Super+Q — убрать", th.muted, 1);
         }
     }
 }

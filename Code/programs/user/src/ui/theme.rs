@@ -36,6 +36,13 @@ pub struct Theme {
     pub on_accent: Rgba,
     /// Опасное действие (выключение, удаление).
     pub danger: Rgba,
+    /// Веха 148.3 — **фон рабочего стола**. Рисует его композитор, но цвет системе один: пока
+    /// он жил у композитора отдельной константой, `ui("accent", …)` перекрашивал панель и не
+    /// трогал ни рамку фокуса, ни стол.
+    pub desktop: Rgba,
+    /// Полоса стола в обзоре и её же вариант для стола в фокусе.
+    pub band: Rgba,
+    pub band_on: Rgba,
     /// Радиус скругления острова.
     pub radius: i32,
     /// Зазор между соседями.
@@ -60,8 +67,13 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// Вид системы по умолчанию. Цвета те же, что у композитора (`C_DESKTOP`, `C_BORDER`,
-    /// `C_ACCENT` в `bin/wm.rs`) — панель и окна обязаны выглядеть одной системой, а не двумя.
+    /// Вид системы по умолчанию.
+    ///
+    /// Веха 148.3 — это ЕДИНСТВЕННЫЙ источник палитры, включая композитор. Раньше здесь стояла
+    /// оговорка «цвета те же, что у композитора», и держалась она на памяти человека: три цвета
+    /// из пяти успели разойтись молча (текст `d8dee6` против `c9d1d9`, приглушённый `798594`
+    /// против `7d8590`, опасный `f15b50` против `f85149`), а `ui("accent", …)` перекрашивал
+    /// панель и не трогал ни рамку фокуса, ни плитку запуска.
     pub const VOID: Theme = Theme {
         bg: Rgba::hex(0x151b23).with_a(0xe6),
         border: Rgba::hex(0x30363d).with_a(0xcc),
@@ -70,6 +82,9 @@ impl Theme {
         accent: Rgba::hex(0x4c7dfd),
         on_accent: Rgba::hex(0x080c12),
         danger: Rgba::hex(0xf85149),
+        desktop: Rgba::hex(0x0d1117),
+        band: Rgba::hex(0x1e2833),
+        band_on: Rgba::hex(0x2f4a6b),
         radius: 10,
         gap: 8,
         pad: 10,
@@ -121,6 +136,9 @@ impl Theme {
                 "border" => color(&mut t.border),
                 "danger" => color(&mut t.danger),
                 "on-accent" => color(&mut t.on_accent),
+                "desktop" => color(&mut t.desktop),
+                "band" => color(&mut t.band),
+                "band-active" => color(&mut t.band_on),
                 "radius" => num(val, &mut t.radius, 0, 64),
                 "gap" => num(val, &mut t.gap, 0, 64),
                 "pad" => num(val, &mut t.pad, 0, 64),
