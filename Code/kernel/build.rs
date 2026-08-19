@@ -11,7 +11,7 @@ const PROGRAMS: &[&str] = &[
     "hello", "vsh", "posixfs", "mini-sh", "blk-srv", "blk-cli", "obj-srv", "obj-cli", "cap-srv",
     "cap-cli", "busy", "heap", "crash", "bench", "net-srv", "threads", "freeze", "e1000d",
     "lx_e1000", "install", "vvsh", "httpsc", "spawn-demo", "stdio-demo", "pkg", "klog", "ved",
-    "hostile",
+    "hostile", "run",
 ];
 
 /// Программы ТОЛЬКО ДЛЯ x86_64 (Веха 97). `term` рисует в пиксельный фреймбуфер, а на riscv его

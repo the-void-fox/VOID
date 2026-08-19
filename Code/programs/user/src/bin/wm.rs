@@ -748,6 +748,39 @@ struct Win {
     /// место и где оно в стопке. Заведи мы второй список, каждая из этих общих вещей
     /// существовала бы в двух копиях и разошлась бы на первой же правке.
     layer: Option<LayerCfg>,
+    /// Веха 147 — ПЛИТКА ЗАПУСКА: место в ленте, занятое под ещё не появившееся окно. `None` —
+    /// обычное окно или слой.
+    ///
+    /// Снова поле в той же структуре, а не третий список, — и довод тот же, что у слоёв: плитку
+    /// раскладывают, двигают, показывают и закрывают ровно так же, как окно. Отличий два, и оба
+    /// в одном месте каждое: клиента у неё нет (некому слать события и незачем ждать ответа), а
+    /// пиксели рисует сам композитор ([`Win::own`]).
+    launch: Option<Launch>,
+    /// Веха 147 — пиксели, нарисованные НАМИ (плитка запуска), а не присланные клиентом.
+    ///
+    /// Отдельное поле, а не `buf`: тот держит ЧУЖУЮ область, отображённую через `shm_map`, и
+    /// отпускается она `shm_unmap`. Своя память освобождается сама вместе с окном, и путать эти
+    /// два способа владения нельзя — как раз на таком «почти одинаковом» и живут двойные
+    /// освобождения.
+    own: Option<Vec<u8>>,
+}
+
+/// Веха 147 — что композитор знает о запуске, которого ещё не видно ([[launch-tile]]).
+struct Launch {
+    /// Номер запущенного процесса. По нему плитка узнаёт СВОЁ окно: первый `OP_CREATE` от этого
+    /// процесса или его потомка её и заменяет.
+    pid: usize,
+    /// Что показываем человеку — имя, названное запускающим.
+    name: String,
+    /// Когда сказали «запускаю» (монотонные наносекунды): из него и «долго запускается».
+    since: u64,
+    /// Итог: код выхода и хвост вывода. `None` — ещё ждём.
+    ///
+    /// Ровно ради этого поля веха и затевалась: плитка, которая крутится после смерти процесса,
+    /// запрещена ADR 0016 дословно.
+    done: Option<(u32, String)>,
+    /// Что уже нарисовано в [`Win::own`] — чтобы не перерисовывать плитку каждый кадр.
+    drawn: Option<(i32, i32, u32)>,
 }
 
 /// Чего поверхность слоя попросила у композитора (Веха 139) — см. [`win::Layer`].
@@ -765,7 +798,14 @@ struct LayerCfg {
 
 impl Win {
     /// Кадр клиента, как его видим мы: RGBA8888 по строкам `bw × bh`. Пусто — буфера нет.
+    ///
+    /// У плитки запуска (Веха 147) клиента нет вовсе, и кадр её рисует сам композитор — отсюда
+    /// первая ветка. Дальше по всему пути рисования разницы уже никакой: плитка проходит через
+    /// тот же `draw_win_row`, то же масштабирование и то же повреждение.
     fn px(&self) -> &[u8] {
+        if let Some(p) = &self.own {
+            return p;
+        }
         if self.buf == 0 {
             return &[];
         }
@@ -1433,6 +1473,20 @@ impl Wm {
             } else {
                 moving = true;
             }
+        }
+
+        // Веха 147 — плитки запуска. Пока плитка ЖДЁТ, композитор просыпается на кадр: по ней
+        // бежит полоса. Это единственный источник кадров без единого клиента на экране, и он
+        // ограничен сроком (`LAUNCH_ANIM_NS`) — вечно бегущая полоса и есть тот самый спиннер,
+        // который ADR 0016 запрещает.
+        for i in 0..self.wins.len() {
+            let Some(l) = &self.wins[i].launch else { continue };
+            let waiting = l.done.is_none() && now.saturating_sub(l.since) < LAUNCH_ANIM_NS;
+            if self.render_launch(i, now) {
+                let (rx, ry, rw, rh) = self.wins[i].shown.rect();
+                self.damage(rx - self.scroll_x, ry, rw, rh);
+            }
+            moving |= waiting;
         }
         moving
     }
@@ -2856,7 +2910,17 @@ impl Wm {
                 // молча — а это ровно то, чего порядочная система не делает.
                 if let Some(id) = self.focus {
                     if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                        self.send(i, [win::EV_CLOSE, 0, 0, 0, 0, 0, 0, 0], 1);
+                        // Веха 147 — у ПЛИТКИ запуска клиента нет: просить её закрыться некого,
+                        // и ждать нечего. Убираем сразу. Плитка при этом ещё ждущая — значит
+                        // человек снимает с экрана запуск, который ему больше не интересен;
+                        // сам процесс мы не трогаем (его не мы запускали).
+                        if self.wins[i].launch.is_some() {
+                            self.begin_close(id);
+                            self.sync_focus();
+                            self.relayout();
+                        } else {
+                            self.send(i, [win::EV_CLOSE, 0, 0, 0, 0, 0, 0, 0], 1);
+                        }
                     }
                 }
             }
@@ -3169,6 +3233,68 @@ impl Wm {
         self.slots &= !(1 << slot);
     }
 
+    // ── плитка запуска (Веха 147) ──────────────────────────────────────────────────────
+
+    /// Плитка, которая ждёт окна от процесса `pid` **или от его потомка**.
+    ///
+    /// Потомок — не тонкость, а обычный случай: программа вполне может открыть окно не сама, а
+    /// запустив кого-то (так делает всякий, кто «оболочка вокруг»). ADR 0016 требует этого
+    /// дословно, а средство есть с Вехи 114 — `SYS_PARENT`.
+    ///
+    /// Глубина ограничена: цепочка предков конечна, но за ней стоит ЯДРО, а не наши данные, и
+    /// зацикливаться на чужих числах композитор не должен.
+    fn tile_for(&self, pid: usize) -> Option<usize> {
+        let mut p = pid;
+        for _ in 0..8 {
+            if let Some(k) = self
+                .wins
+                .iter()
+                .position(|w| w.launch.as_ref().is_some_and(|l| l.pid == p && l.done.is_none()))
+            {
+                return Some(k);
+            }
+            match sys::parent_of(p) {
+                Some(up) if up != p => p = up,
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// Перерисовать плитку, если её кадр устарел. `true` — кадр обновился и его надо показать.
+    ///
+    /// Рисуем НЕ каждый кадр, а по трём числам: размер плитки и фаза бегунка. Иначе композитор
+    /// собирал бы одну и ту же картинку шестьдесят раз в секунду ради полосы, которая двигается
+    /// двадцать пять.
+    fn render_launch(&mut self, i: usize, now: u64) -> bool {
+        let Win { launch: Some(l), own, bw, bh, w, h, .. } = &mut self.wins[i] else {
+            return false;
+        };
+        let (cw, ch) = ((*w).max(1), (*h).max(1));
+        // Фаза бегунка: 40 мс на шаг, пока ждём и не вышел срок. `MAX` — «стоим»: и после
+        // итога, и после срока ожидания. Бесконечно бегущая полоса — то же враньё, что и
+        // спиннер после смерти: она обещает, что вот-вот.
+        let phase = if l.done.is_none() && now.saturating_sub(l.since) < LAUNCH_ANIM_NS {
+            (now.saturating_sub(l.since) / 40_000_000) as u32
+        } else {
+            u32::MAX
+        };
+        if l.drawn == Some((cw, ch, phase)) {
+            return false;
+        }
+        l.drawn = Some((cw, ch, phase));
+        let need = (cw * ch * 4) as usize;
+        let px = own.get_or_insert_with(Vec::new);
+        if px.len() != need {
+            px.clear();
+            px.resize(need, 0);
+        }
+        draw_tile(px, cw, ch, l, phase, now);
+        *bw = cw;
+        *bh = ch;
+        true
+    }
+
     // ── запросы клиентов ───────────────────────────────────────────────────────────────
 
     fn request(&mut self, m: &sys::Message, buf: &[u8]) {
@@ -3181,6 +3307,10 @@ impl Wm {
                 let title = core::str::from_utf8(&buf[4..len]).unwrap_or("окно");
                 let id = self.next_id;
                 self.next_id += 1;
+                // Веха 147 — не ждёт ли это окно ПЛИТКА? Тогда оно займёт её место в ленте, а не
+                // заведёт новую колонку: плитка для того и стоит, чтобы раскладка не прыгнула,
+                // когда окно наконец появится.
+                let tile = self.tile_for(m.sender);
                 // Каскадом: каждое следующее окно правее и ниже — иначе они лягут друг на друга
                 // и человек решит, что открылось одно.
                 let n = self.wins.len() as i32;
@@ -3214,8 +3344,35 @@ impl Wm {
                     closing: false,
                     visible: true,
                     layer: None,
+                    launch: None,
+                    own: None,
                 };
                 self.wins.push(win);
+                if let Some(k) = tile {
+                    // Плитка ДОЖДАЛАСЬ своего окна. Окно встаёт ровно на её место — и в ленте, и
+                    // на экране: `shown` наследуется, поэтому подмена не мигает и не едет.
+                    // Разворачивать окно из точки, как обычное новое, здесь было бы враньём в
+                    // другую сторону — оно не появилось, оно ПРИШЛО НА ГОТОВОЕ место.
+                    let old = self.wins[k].id;
+                    let shown = self.wins[k].shown;
+                    let n = self.wins.len() - 1;
+                    self.wins[n].shown = shown;
+                    self.wins[n].to = shown;
+                    self.wins[n].from = shown;
+                    self.wins[n].fresh = false;
+                    for c in self.cols.iter_mut() {
+                        for w in c.ids.iter_mut() {
+                            if *w == old {
+                                *w = id;
+                            }
+                        }
+                    }
+                    self.wins.remove(k);
+                    sys::reply(m.reply_cap, &id.to_le_bytes());
+                    self.sync_focus();
+                    self.relayout();
+                    return;
+                }
                 // Новое окно — НОВАЯ КОЛОНКА справа от текущей: так работает niri, и так же
                 // ведёт себя лента при `Super+Return`. Класть его в текущую колонку значило бы
                 // делить экран по вертикали без просьбы.
@@ -3290,6 +3447,8 @@ impl Wm {
                     closing: false,
                     visible: true,
                     layer: Some(spec),
+                    launch: None,
+                    own: None,
                 };
                 self.wins.push(win);
                 sys::reply(m.reply_cap, &id.to_le_bytes());
@@ -3533,6 +3692,80 @@ impl Wm {
                 sys::reply(m.reply_cap, &[]);
                 self.goto_space(n);
             }
+            // Веха 147 — НАМЕРЕНИЕ ЗАПУСТИТЬ: место в ленте занимается сразу, до окна.
+            win::OP_LAUNCHING => {
+                // Чей это запуск, говорит ЯДРО (`m.sender`), а не запрос: назвать чужой номер
+                // отсюда нельзя, а свой — не нужно. Плитка при этом заводится ДО `SYS_SPAWN`,
+                // поэтому номера запускаемого ещё и не существует.
+                let pid = m.sender;
+                let name = core::str::from_utf8(buf.get(..len).unwrap_or(&[])).unwrap_or("?");
+                let id = self.next_id;
+                self.next_id += 1;
+                let now = sys::monotonic_ns();
+                let win = Win {
+                    id,
+                    // Хозяин плитки — ТОТ, КТО ЗАПУСКАЕТ (сторож `run`), а не запускаемый: это
+                    // он с нами говорит и он же умрёт, если запуск сорвётся вместе с ним.
+                    owner: m.sender,
+                    x: 0,
+                    y: 0,
+                    w: 480,
+                    h: 320,
+                    title: String::from(name),
+                    buf: 0,
+                    buf_len: 0,
+                    cap: sys::NO_CAP,
+                    slot: 0,
+                    bw: 0,
+                    bh: 0,
+                    waiting: None,
+                    wait_until: None,
+                    watching: false,
+                    inbox: Vec::new(),
+                    shown: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
+                    from: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
+                    to: Shown { x: 0, y: 0, w: 0, h: 0, a: 0 },
+                    at: 0,
+                    dur: 0,
+                    fresh: true,
+                    closing: false,
+                    visible: true,
+                    layer: None,
+                    launch: Some(Launch {
+                        pid,
+                        name: String::from(name),
+                        since: now,
+                        done: None,
+                        drawn: None,
+                    }),
+                    own: None,
+                };
+                self.wins.push(win);
+                let at = if self.cols.is_empty() { 0 } else { self.cur + 1 };
+                self.cols.insert(at, Column { ids: vec![id], width: 1, focus: 0 });
+                self.cur = at;
+                self.tidy_spaces();
+                sys::reply(m.reply_cap, &id.to_le_bytes());
+                self.sync_focus();
+                self.relayout();
+            }
+            // Веха 147 — ЧЕМ КОНЧИЛОСЬ. Плитки нет — значит окно успело появиться, и говорить
+            // тут не о чем: программа запустилась, а что она когда-нибудь завершится, экрану
+            // сообщать незачем.
+            win::OP_LAUNCH_DONE => {
+                let pid = m.sender;
+                let code = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let tail = core::str::from_utf8(buf.get(4..len).unwrap_or(&[])).unwrap_or("");
+                sys::reply(m.reply_cap, &[]);
+                if let Some(k) = self.wins.iter().position(|w| {
+                    w.launch.as_ref().is_some_and(|l| l.pid == pid && l.done.is_none())
+                }) {
+                    if let Some(l) = &mut self.wins[k].launch {
+                        l.done = Some((code, String::from(tail)));
+                        l.drawn = None; // кадр устарел целиком
+                    }
+                }
+            }
             win::OP_DESTROY => {
                 let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 sys::reply(m.reply_cap, &[]);
@@ -3547,6 +3780,144 @@ impl Wm {
                 let _ = m.sender;
                 sys::reply(m.reply_cap, &[]);
             }
+        }
+    }
+}
+
+// ── рисование плитки запуска (Веха 147) ────────────────────────────────────────────────
+//
+// Текста композитор до этой вехи не рисовал вовсе: заголовок окна он хранит, но показывает его
+// панель. Плитка — первое, что он обязан сказать словами, и берёт она растровый шрифт 8×16 из
+// таблицы ядра ([`sys::glyph`], тот же, что у панели). Тулкит сюда не тянем: `void-ui` живёт в
+// клиентах, а композитор — не клиент самому себе.
+
+/// Сколько плитка «бежит». Дальше полоса замирает и надпись говорит правду: «дольше обычного».
+/// Врать процентами нечем — мы не знаем ни сколько осталось, ни сколько всего.
+const LAUNCH_ANIM_NS: u64 = 10_000_000_000;
+
+/// Фон плитки: чуть светлее стола, чтобы место было видно и пустым.
+const C_TILE: (u8, u8, u8) = (0x14, 0x1b, 0x24);
+const C_TEXT: (u8, u8, u8) = (0xd8, 0xde, 0xe6);
+const C_MUTED: (u8, u8, u8) = (0x79, 0x85, 0x94);
+const C_DANGER: (u8, u8, u8) = (0xf1, 0x5b, 0x50);
+
+/// Залить прямоугольник в RGBA-кадре плитки.
+fn tile_fill(px: &mut [u8], bw: i32, bh: i32, r: (i32, i32, i32, i32), c: (u8, u8, u8)) {
+    let (x0, y0) = (r.0.max(0), r.1.max(0));
+    let (x1, y1) = ((r.0 + r.2).min(bw), (r.1 + r.3).min(bh));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = ((y * bw + x) * 4) as usize;
+            px[p] = c.0;
+            px[p + 1] = c.1;
+            px[p + 2] = c.2;
+            px[p + 3] = 0xff;
+        }
+    }
+}
+
+/// Написать строку шрифтом 8×16 с увеличением `scale`. Возвращает ширину написанного.
+///
+/// Обрезка — по КРАЮ ПЛИТКИ, а не по числу знаков: строка вывода умершей программы может быть
+/// какой угодно длины, и считать её длину заранее значило бы завести вторую истину о том, что
+/// поместилось.
+fn tile_text(
+    px: &mut [u8], bw: i32, bh: i32, x: i32, y: i32, s: &str, c: (u8, u8, u8), scale: i32,
+) -> i32 {
+    let mut cx = x;
+    for ch in s.chars() {
+        let rows = sys::glyph::rows(ch);
+        for (ry, bits) in rows.iter().enumerate() {
+            for bit in 0..8 {
+                if bits & (0x80 >> bit) == 0 {
+                    continue;
+                }
+                let px0 = cx + bit * scale;
+                let py0 = y + ry as i32 * scale;
+                tile_fill(px, bw, bh, (px0, py0, scale, scale), c);
+            }
+        }
+        cx += 8 * scale;
+        if cx >= bw {
+            break;
+        }
+    }
+    cx - x
+}
+
+/// Написать строку ПО ЦЕНТРУ плитки.
+fn tile_center(px: &mut [u8], bw: i32, bh: i32, y: i32, s: &str, c: (u8, u8, u8), scale: i32) {
+    let w = s.chars().count() as i32 * 8 * scale;
+    tile_text(px, bw, bh, (bw - w) / 2, y, s, c, scale);
+}
+
+/// Весь кадр плитки: «запускается» с бегунком либо итог с кодом выхода и хвостом вывода.
+fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64) {
+    tile_fill(px, bw, bh, (0, 0, bw, bh), C_TILE);
+    match &l.done {
+        // ── ждём окна ──────────────────────────────────────────────────────────────────
+        None => {
+            let long = now.saturating_sub(l.since) >= LAUNCH_ANIM_NS;
+            let y = bh / 2 - 34;
+            tile_center(px, bw, bh, y, "ЗАПУСКАЕТСЯ", C_MUTED, 1);
+            tile_center(px, bw, bh, y + 24, &l.name, C_TEXT, 2);
+            // Дорожка и бегунок. Проценты не рисуем и не выдумываем: мы не знаем ни сколько
+            // осталось, ни сколько всего, — знаем только, что ещё ждём.
+            let track = (bw / 6).max(40).min(bw / 2);
+            let (tx, ty) = ((bw - track) / 2, y + 64);
+            tile_fill(px, bw, bh, (tx, ty, track, 4), C_BORDER);
+            if long {
+                // Срок вышел: полоса замирает целиком, а словами говорим правду.
+                tile_fill(px, bw, bh, (tx, ty, track, 4), C_MUTED);
+                tile_center(px, bw, bh, ty + 14, "дольше обычного — окна всё нет", C_MUTED, 1);
+            } else {
+                let run = (track / 4).max(8);
+                // Челнок туда-обратно: бесконечная лента вправо выглядит как «загрузка идёт»,
+                // а мы не знаем, идёт ли она.
+                let span = (track - run).max(1);
+                let p = (phase as i32) % (2 * span);
+                let off = if p < span { p } else { 2 * span - p };
+                tile_fill(px, bw, bh, (tx + off, ty, run, 4), C_ACCENT);
+            }
+        }
+        // ── всё кончилось, а окна не было ──────────────────────────────────────────────
+        Some((code, tail)) => {
+            let bad = *code != 0;
+            let head = if bad { "НЕ ЗАПУСТИЛОСЬ" } else { "ЗАВЕРШИЛОСЬ БЕЗ ОКНА" };
+            let pad = 14;
+            tile_text(px, bw, bh, pad, pad, head, if bad { C_DANGER } else { C_MUTED }, 1);
+            tile_text(px, bw, bh, pad, pad + 22, &l.name, C_TEXT, 2);
+            let code_line = alloc::format!("код выхода {}", code);
+            tile_text(px, bw, bh, pad, pad + 56, &code_line, C_MUTED, 1);
+            tile_fill(px, bw, bh, (pad, pad + 78, bw - 2 * pad, 1), C_BORDER);
+            // Вывод — ПОСЛЕДНИЕ строки: смерть объясняют они, а не первые. Пустой вывод не
+            // прячем за молчанием, а называем: «программа не сказала ничего» — это тоже ответ.
+            let mut y = pad + 88;
+            // Длинные строки ПЕРЕНОСИМ, а не обрезаем: обрезка съедает как раз конец сообщения
+            // об ошибке, то есть то место, ради которого карточку и читают.
+            let cols = (((bw - 2 * pad) / 8).max(8)) as usize;
+            let mut lines: Vec<&str> = Vec::new();
+            for line in tail.lines().filter(|s| !s.trim().is_empty()) {
+                let mut rest = line;
+                while rest.chars().count() > cols {
+                    // Режем по границе СИМВОЛА: строка приезжает от чужой программы, и байтовая
+                    // граница развалила бы кириллицу пополам.
+                    let cut = rest.char_indices().nth(cols).map_or(rest.len(), |(i, _)| i);
+                    let (head, tail_) = rest.split_at(cut);
+                    lines.push(head);
+                    rest = tail_;
+                }
+                lines.push(rest);
+            }
+            let fit = ((bh - y - pad) / 18).max(0) as usize;
+            if lines.is_empty() {
+                tile_text(px, bw, bh, pad, y, "вывода не было", C_MUTED, 1);
+            }
+            for line in lines.iter().skip(lines.len().saturating_sub(fit)) {
+                tile_text(px, bw, bh, pad, y, line, C_TEXT, 1);
+                y += 18;
+            }
+            tile_text(px, bw, bh, pad, bh - pad - 16, "Super+Q — убрать", C_MUTED, 1);
         }
     }
 }
