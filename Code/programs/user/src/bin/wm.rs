@@ -2806,6 +2806,21 @@ impl Wm {
 
         // Колесо: в обзоре — просто крутить столы, вне обзора — с Super (просьба владельца).
         // Без модификатора вне обзора колесо принадлежит программе: прокрутка страницы важнее.
+        // Веха 148 — колесо БЕЗ Super и вне обзора принадлежит программе. Так было задумано с
+        // Вехи 123.1, но доставки клиенту не существовало, и колесо в окне просто пропадало.
+        if e.wheel != 0 && !self.overview && !self.super_held {
+            if let Some(i) = self.layer_at(self.cursor.0, self.cursor.1).or_else(|| {
+                self.wins.iter().rposition(|w| {
+                    w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)
+                })
+            }) {
+                let (ox, oy) = self.wins[i].content_at();
+                let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
+                let ev = [win::EV_WHEEL, lx as u8, (lx >> 8) as u8, ly as u8, (ly >> 8) as u8,
+                          e.wheel as u8, 0, 0];
+                self.send(i, ev, 6);
+            }
+        }
         if e.wheel != 0 && (self.overview || self.super_held) {
             let step = if e.wheel > 0 { -1i32 } else { 1i32 };
             let mut to = self.space as i32 + step;

@@ -220,6 +220,21 @@ impl<'a> Ui<'a> {
         self.mark(r);
     }
 
+    /// Веха 148 — **фон ОКНА**: залить поверхность непрозрачным цветом темы.
+    ///
+    /// Слою (панель, меню) нужна прозрачность: под ним обои, и композитор смешивает его пиксели
+    /// по альфе (`LAYER_ALPHA`). У окна альфы нет вовсе — композитор копирует его пиксели как
+    /// есть. Поэтому полупрозрачные цвета тулкита (подсветка под курсором — белый с альфой 8 %)
+    /// в окне превращались в СПЛОШНОЙ белый, и текст на такой строке пропадал: нашлось на первом
+    /// же снимке вьювера корней.
+    ///
+    /// Смешивать надо с чем-то, и это «что-то» окно обязано нарисовать само — здесь.
+    pub fn background(&mut self, c: Rgba) {
+        let r = Rect::new(0, 0, self.c.w, self.c.h);
+        self.c.fill(r, c.with_a(0xff));
+        self.mark(r);
+    }
+
     /// Вся поверхность прозрачна.
     pub fn clear_all(&mut self) {
         self.c.clear();
@@ -511,6 +526,21 @@ impl<'a> Ui<'a> {
             self.c.rrect(r, rad, c);
         }
         let mut inner = r.inset_xy(self.th.pad, 0);
+        // Пустая буква — строка БЕЗ значка (Веха 148): у корня store значка нет и взяться ему
+        // неоткуда, а кружок с двумя знаками хэша выглядит мусором, а не опознавательным знаком.
+        if letter.is_empty() {
+            let two = if sub.is_empty() { 0 } else { self.font.line_h() };
+            let mut top = inner;
+            let bottom = top.cut_bottom(two);
+            let fg = self.th.text.mix(self.th.on_accent, sel);
+            self.label(top, name, fg, Align::Left);
+            if two != 0 {
+                let dim = self.th.muted.mix(self.th.on_accent, sel / 2);
+                self.label(bottom, sub, dim, Align::Left);
+            }
+            self.mark(r);
+            return self.clicked(r);
+        }
         let icon = inner.cut_left(inner.h - self.th.px(8).max(4));
         // Свой значок, а не [`Ui::avatar`]: у аватара цвета жёстко акцентные, и на залитой
         // акцентом строке он исчезал бы целиком — что и случилось на первом же снимке.
@@ -536,6 +566,29 @@ impl<'a> Ui<'a> {
         }
         self.mark(r);
         self.clicked(r)
+    }
+
+    /// Веха 148 — **полоса прокрутки**: где мы в списке, который не помещается.
+    ///
+    /// Показывается ТОЛЬКО когда есть что прокручивать: полоса при полностью видимом списке —
+    /// это украшение, которое врёт («тут ещё что-то есть»). Не кликается: тянуть её мышью пока
+    /// незачем — колесо и клавиши делают то же самое, а перетаскивание требует состояния
+    /// («схвачено»), которого у immediate-mode виджета нет.
+    pub fn scrollbar(&mut self, r: Rect, top: usize, visible: usize, total: usize) {
+        if total <= visible || r.is_empty() || visible == 0 {
+            return;
+        }
+        let track = self.tint(self.th.text.with_a(0x14));
+        self.c.rrect(r, r.w / 2, track);
+        // Бегунок: доля видимого, но не тоньше своей ширины — иначе на длинном списке он
+        // превращается в невидимую точку.
+        let h = (r.h * visible as i32 / total as i32).max(r.w * 2);
+        let span = (r.h - h).max(0);
+        let last = (total - visible) as i32;
+        let y = r.y + span * (top as i32).min(last) / last.max(1);
+        let knob = self.tint(self.th.text.with_a(0x55));
+        self.c.rrect(Rect::new(r.x, y, r.w, h), r.w / 2, knob);
+        self.mark(r);
     }
 
     /// Ширина строки — раскладке ряда её надо знать заранее.
