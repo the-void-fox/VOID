@@ -99,6 +99,9 @@ struct App {
     detail_of: Option<usize>,
     ptr: Option<(i32, i32)>,
     click: Option<(i32, i32)>,
+    /// Веха 148.1 — где сейчас ДЕРЖАТ левую кнопку. Этим тащат полосу прокрутки: состояние
+    /// «схвачено» принадлежит программе, а не виджету ([[void-ui]]).
+    held: Option<(i32, i32)>,
     store: Option<usize>,
 }
 
@@ -151,7 +154,9 @@ impl App {
         self.detail = self.store.and_then(|cap| read_detail(cap, &self.items[i].name));
     }
 
-    fn draw(&mut self, u: &mut Ui, th: &Theme) {
+    /// Нарисовать кадр. `true` — выбор сменился прямо в нём (клик по строке), и кадр надо
+    /// собрать заново: подсветка и подробности считаются ДО того, как виджет ответит на клик.
+    fn draw(&mut self, u: &mut Ui, th: &Theme) -> bool {
         let font_h = u.font.line_h();
         let rows = self.rows(&*u.font, th);
         let row_h = self.row_h(&*u.font, th);
@@ -175,8 +180,13 @@ impl App {
         body.cut_left(th.gap);
 
         let bar = list.cut_right(th.px(6));
-        u.scrollbar(bar.inset_xy(th.px(1), th.px(2)), self.top, rows, self.hits.len());
+        if let Some(t) =
+            u.scrollbar(bar.inset_xy(th.px(1), th.px(2)), self.top, rows, self.hits.len(), self.held)
+        {
+            self.top = t;
+        }
 
+        let was = self.sel;
         for k in 0..rows {
             let rr = list.cut_top(row_h);
             let Some(&i) = self.hits.get(self.top + k) else { continue };
@@ -186,6 +196,7 @@ impl App {
                 self.sel = self.top + k;
             }
         }
+        let picked = self.sel != was;
 
         // ── правая половина: что за корнем ────────────────────────────────────────────────
         let inner = u.card(body);
@@ -232,6 +243,7 @@ impl App {
             alloc::format!("{} из {} корней", self.hits.len(), self.items.len())
         };
         u.label(foot, &s, th.muted, Align::Right);
+        picked
     }
 }
 
@@ -370,6 +382,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         detail_of: None,
         ptr: None,
         click: None,
+        held: None,
         store,
     };
     app.filter();
@@ -377,16 +390,24 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut redraw = true;
     loop {
         if redraw {
-            app.sync_detail();
-            let (fw, fh) = (app.w, app.h);
-            let mut u = Ui::new(surf.pixels(), fw, fh, &th, &mut font);
-            u.input(app.ptr, app.click);
-            app.draw(&mut u, &th);
-            let d = u.dirty();
-            if !d.is_empty() {
-                surf.damage(d.x as u16, d.y as u16, d.w as u16, d.h as u16);
+            // Второй проход — не перестраховка: клик по строке меняет выбор, а подсветка и
+            // подробности считаются ДО того, как виджет ответит на клик. Без него выбранное
+            // менялось бы кадром позже собственного щелчка (та же причина, что у панели с меню).
+            for pass in 0..2 {
+                app.sync_detail();
+                let (fw, fh) = (app.w, app.h);
+                let mut u = Ui::new(surf.pixels(), fw, fh, &th, &mut font);
+                u.input(app.ptr, app.click);
+                let picked = app.draw(&mut u, &th);
+                let d = u.dirty();
+                if !d.is_empty() {
+                    surf.damage(d.x as u16, d.y as u16, d.w as u16, d.h as u16);
+                }
+                app.click = None;
+                if !picked || pass == 1 {
+                    break;
+                }
             }
-            app.click = None;
             redraw = false;
         }
 
@@ -437,11 +458,25 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 redraw = true;
             }
             Event::Motion { x, y } => {
-                app.ptr = if x == 0xffff { None } else { Some((x as i32, y as i32)) };
+                let p = if x == 0xffff { None } else { Some((x as i32, y as i32)) };
+                app.ptr = p;
+                // Движение с зажатой кнопкой — это протяжка: полоса едет за рукой.
+                if app.held.is_some() {
+                    app.held = p;
+                }
                 redraw = true;
             }
-            Event::Button { x, y, down, .. } if down => {
-                app.click = Some((x as i32, y as i32));
+            Event::Button { x, y, down, buttons } => {
+                let p = (x as i32, y as i32);
+                if down {
+                    app.click = Some(p);
+                    // Левая кнопка ЗАЖАТА — дальше ею тащат полосу прокрутки.
+                    if buttons & 1 != 0 {
+                        app.held = Some(p);
+                    }
+                } else {
+                    app.held = None;
+                }
                 redraw = true;
             }
             Event::Resize { w: nw, h: nh } => {
