@@ -31,8 +31,17 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
 
 Окружение (сеть — Веха 135, см. блок ниже): VOID_QEMU_ACCEL, VOID_QEMU_MEM, VOID_QEMU_CPU,
 VOID_QEMU_NIC, VOID_QEMU_NET, VOID_QEMU_PCAP.
+
+Сама машина (чипсет, диск, память, энтропия, сеть) описана в `tools/qemu-machine.sh` — общим
+файлом с `run.sh`, чтобы прогон со снимками шёл на ТОМ ЖЕ стенде, что и обычный запуск.
 """
 import json, os, socket, struct, subprocess, sys, time, zlib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Описание СТЕНДА — общее с `run.sh`. До этого машину описывали два места, и совпадали они лишь
+# по памяти человека: «замер на том же стенде, на котором работаем» не проверялось ничем, а
+# отличие стенда в глаза не бросается — гость поднимается, снимки выходят, числа получаются.
+MACHINE_SH = os.path.join(HERE, "qemu-machine.sh")
 
 img, script, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
 os.makedirs(outdir, exist_ok=True)
@@ -46,7 +55,10 @@ if os.path.exists(qmp_path):
 # на реальном темпе (гонки, переполнение кучи, анимации), требует `VOID_QEMU_ACCEL=kvm` —
 # см. notes/void-qemu-run.md.
 accel = os.environ.get("VOID_QEMU_ACCEL", "")
-mem = os.environ.get("VOID_QEMU_MEM", "512M")
+# Пусто — «возьми умолчание стенда». Своё умолчание здесь стояло (512 МиБ) и расходилось с тем,
+# с которым система работает (1280 МиБ): найденное на одной машине могло не воспроизвестись на
+# другой, а выглядело это как «у меня не повторяется».
+mem = os.environ.get("VOID_QEMU_MEM", "")
 # Модель процессора. По умолчанию QEMU даёт `qemu64` — там нет ни SMEP, ни половины того, что
 # есть на любом живом железе. Всё, что зависит от возможностей процессора, обязано проверяться с
 # `VOID_QEMU_CPU=host` (под KVM) или `max`, иначе код просто не исполнится и «проверка» соврёт.
@@ -69,67 +81,43 @@ cpu = os.environ.get("VOID_QEMU_CPU", "")
 # подключается, и дальше это честный кусок провода (кадр в кадр, без чужого стека посередине).
 # Привилегий не требует. `tap:<имя>` — выход в настоящую сеть машины; tap должен быть заведён
 # заранее и принадлежать пользователю (см. notes/void-qemu-run.md).
-nic = os.environ.get("VOID_QEMU_NIC", "virtio")
-net = os.environ.get("VOID_QEMU_NET", "user")
+#
+# Сами ключи QEMU собирает общее описание стенда — те же самые и для `run.sh`. Здесь остаётся
+# только прочитать, чего от нас хотят; пустое значение означает «умолчание стенда».
+nic = os.environ.get("VOID_QEMU_NIC", "")
+net = os.environ.get("VOID_QEMU_NET", "")
 pcap = os.environ.get("VOID_QEMU_PCAP", "")
 delay_us = os.environ.get("VOID_QEMU_DELAY_US", "")
 
-NIC_DEV = {
-    "virtio": "virtio-net-pci,netdev=net0,disable-legacy=on",
-    "e1000": "e1000,netdev=net0",
-}
 # Умолчание QEMU для первой карты — 52:54:00:12:34:56, ОДИНАКОВОЕ у всех машин. Пока машина одна,
 # это незаметно; на общем сегменте два одинаковых MAC ломают всё сразу (см. netlab.py).
 mac = os.environ.get("VOID_QEMU_MAC", "")
 
 
-def netdev_args():
-    """Строки `-netdev`/`-device`/`-object` под выбранный стенд."""
-    if net == "none" or nic == "none":
-        # `-nic none` обязателен: без КАКИХ-ЛИБО сетевых ключей QEMU молча добавляет карту сам
-        # (SLIRP по умолчанию). Проверено — «none» давал гостю сеть и адрес по DHCP, то есть
-        # ровно то, что просили выключить.
-        return ["-nic", "none"]
-    kind, _, arg = net.partition(":")
-    if kind == "user":
-        backend = "user,id=net0"
-    elif kind == "seg":
-        backend = f"stream,id=net0,server=on,addr.type=unix,addr.path={arg}"
-    elif kind == "join":
-        backend = f"stream,id=net0,server=off,addr.type=unix,addr.path={arg}"
-    elif kind == "tap":
-        # script=no/downscript=no: поднимать tap — дело хозяина стенда, не QEMU.
-        backend = f"tap,id=net0,ifname={arg},script=no,downscript=no"
-    else:
-        sys.exit(f"VOID_QEMU_NET: не понимаю '{net}'")
-    if nic not in NIC_DEV:
-        sys.exit(f"VOID_QEMU_NIC: не понимаю '{nic}' (есть: {', '.join(NIC_DEV)}, none)")
-    dev = NIC_DEV[nic] + (f",mac={mac}" if mac else "")
-    args = ["-netdev", backend, "-device", dev]
-    if pcap:
-        args += ["-object", f"filter-dump,id=dump0,netdev=net0,file={pcap}"]
-    # Задержка канала. Локально RTT ~0.3 мс, и на таком проводе НЕ ВИДНО всего, что зависит от
-    # произведения «полоса × задержка»: окна, ретрансмиссий, размера порции. Настоящая сеть — это
-    # десятки миллисекунд, и там ошибки в окне стоят порядков скорости.
-    if delay_us:
-        args += ["-object", f"filter-buffer,id=lag0,netdev=net0,interval={delay_us}"]
-    return args
+def stand(*args):
+    """Кусок стенда из общего описания (`tools/qemu-machine.sh`) — по аргументу на строку.
+
+    Через общий файл, а не своим списком: устройства машины должны быть ОДНИ И ТЕ ЖЕ у прогона
+    со снимками и у обычного запуска, иначе замер сделан не на той машине, на которой работают.
+    Отдельный процесс здесь ничего не стоит — прогон и так идёт секундами.
+    """
+    r = subprocess.run(["bash", MACHINE_SH, *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(r.stderr.strip() or f"стенд: не вышло собрать '{' '.join(args)}'")
+    return r.stdout.splitlines()
 
 
 qemu = [
-    "qemu-system-x86_64", "-machine", "q35", "-m", mem,
+    "qemu-system-x86_64",
+    *stand("machine", img, mem),
     *(["-accel", accel] if accel else []),
     *(["-cpu", cpu] if cpu else []),
-    "-device", "ich9-ahci,id=a",
-    "-drive", f"if=none,id=d,file={img},format=raw",
-    "-device", "ide-hd,drive=d,bus=a.0", "-boot", "c",
     # VOID_QEMU_SNAPSHOT=1 — писать не в образ, а во временный слой поверх него. Нужно, когда
     # один образ гонят СРАЗУ НЕСКОЛЬКО машин (netlab.py): иначе вторая падает на «Failed to get
     # write lock» — QEMU честно не даёт двум писать в один диск. Побочно это делает прогон
     # повторяемым: store каждый раз стартует с одного и того же поколения.
     *(["-snapshot"] if os.environ.get("VOID_QEMU_SNAPSHOT") else []),
-    *netdev_args(),
-    "-device", "virtio-rng-pci,disable-legacy=on",
+    *stand("net", net, nic, mac, pcap, delay_us),
     "-display", "none",
     "-serial", "stdio",
     "-qmp", f"unix:{qmp_path},server,nowait",

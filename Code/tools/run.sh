@@ -11,8 +11,11 @@
 #   Code/tools/run.sh -- -device …     всё после `--` уходит в QEMU как есть
 #
 # Ключи: --fresh · --debug · --riscv · --no-build · --headless · --snapshot · --tcg
-#        --net user|none|tap:<имя> · --mem 1280M · --img путь · --size 700
+#        --net user|none|tap:<имя>|seg:<путь>|join:<путь> · --mem 1280M · --img путь · --size 700
 #        --script <сценарий> <каталог> · --build-only
+#
+# Стенд (машина, диск, память, сеть) описан в `tools/qemu-machine.sh` — одним местом на этот
+# запуск и на сценарный прогон. Оттуда же читаются VOID_QEMU_NIC/MAC/PCAP/DELAY_US.
 #
 # ── Зачем скрипт, если есть `cargo run` ──────────────────────────────────────────────────────
 #
@@ -43,6 +46,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 code="$(cd "$here/.." && pwd)"
 repo="$(cd "$code/.." && pwd)"
 
+# Описание СТЕНДА — общее с сценарным прогоном (`screenrun.py`). Отсюда берутся машина, память,
+# диск, энтропия и сеть; здесь остаётся только то, чем окно честно отличается от прогона со
+# снимками. Раньше список устройств был написан в обоих местах, и совпадал он лишь по памяти
+# человека — а замер на другом стенде не значит ничего.
+# shellcheck source=qemu-machine.sh
+. "$here/qemu-machine.sh"
+
 arch=x86
 profile=release
 fresh=0
@@ -50,7 +60,7 @@ build=1
 headless=0
 snapshot=0
 tcg=0
-mem="${VOID_QEMU_MEM:-1280M}"
+mem="${VOID_QEMU_MEM:-$VOID_QEMU_MEM_DEFAULT}"
 net="${VOID_QEMU_NET:-user}"
 img="${VOID_IMG:-$code/target/void.img}"
 size_mb=700
@@ -232,11 +242,13 @@ if [ -n "$script" ]; then
 fi
 
 # ── QEMU ─────────────────────────────────────────────────────────────────────────────────────
-qemu=(qemu-system-x86_64 -machine q35 -m "$mem"
-      -device ich9-ahci,id=a
-      -drive "if=none,id=d,file=$img,format=raw"
-      -device ide-hd,drive=d,bus=a.0 -boot c
-      -device virtio-rng-pci,disable-legacy=on)
+#
+# Машина и сеть приходят из общего описания стенда; своего списка устройств здесь больше нет.
+# Карту, MAC, pcap и задержку канала стенд берёт из окружения (VOID_QEMU_NIC/MAC/PCAP/DELAY_US) —
+# те же переменные, что и у сценарного прогона.
+machine_args=$(void_qemu_machine "$img" "$mem") || exit 2
+mapfile -t qemu <<<"$machine_args"
+qemu=(qemu-system-x86_64 "${qemu[@]}")
 
 # Без KVM QEMU эмулирует каждую инструкцию: композитор рисует кадр сотни миллисекунд, и любые
 # выводы о скорости в таком прогоне — про эмулятор, а не про VOID.
@@ -246,13 +258,9 @@ else
     [ "$tcg" = 0 ] && say "БЕЗ KVM (/dev/kvm недоступен): всё будет медленным, скорость мерить бессмысленно"
 fi
 
-case "$net" in
-    none)  qemu+=(-nic none) ;; # без этого QEMU молча добавит карту сам (SLIRP)
-    user)  qemu+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-legacy=on) ;;
-    tap:*) qemu+=(-netdev "tap,id=net0,ifname=${net#tap:},script=no,downscript=no"
-                  -device virtio-net-pci,netdev=net0,disable-legacy=on) ;;
-    *)     echo "--net: понимаю user, none, tap:<имя> (сегмент двух машин — tools/netlab.py)"; exit 2 ;;
-esac
+net_args=$(void_qemu_net "$net") || exit 2
+mapfile -t qemu_net <<<"$net_args"
+qemu+=("${qemu_net[@]}")
 
 # Писать во временный слой, а не в образ: прогон становится повторяемым (store каждый раз
 # стартует с одного поколения) и не мешает второй машине держать тот же файл.
