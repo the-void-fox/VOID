@@ -126,7 +126,23 @@ impl<'a> Canvas<'a> {
             return;
         }
         let da = self.px[i + 3] as u32;
-        let k = da * (255 - sa) / 255; // вклад того, что уже нарисовано
+        // Веха 148.2 — НЕПРОЗРАЧНАЯ подложка отдельным путём, и это не микрооптимизация.
+        //
+        // Общая формула делит дважды на каждый канал (`/255` и `/oa`), а деление стоит десятков
+        // тактов. В ОКНЕ же под каждым пикселем лежит непрозрачный фон (`Ui::background`), то есть
+        // `da = 255` — и вся формула сворачивается: `oa` заведомо 255, остаётся одно деление на
+        // константу, а его компилятор превращает в умножение. Это горячий путь СГЛАЖЕННОГО
+        // ТЕКСТА: каждая буква — сотня краевых пикселей, и на кадре их сотни тысяч.
+        if da >= 255 {
+            let k = 255 - sa;
+            let mix = |s: u8, d: u8| div255(s as u32 * sa + d as u32 * k) as u8;
+            self.px[i] = mix(c.r, self.px[i]);
+            self.px[i + 1] = mix(c.g, self.px[i + 1]);
+            self.px[i + 2] = mix(c.b, self.px[i + 2]);
+            self.px[i + 3] = 0xff;
+            return;
+        }
+        let k = div255(da * (255 - sa)); // вклад того, что уже нарисовано
         let oa = sa + k;
         if oa == 0 {
             return;
@@ -136,6 +152,24 @@ impl<'a> Canvas<'a> {
         self.px[i + 1] = mix(c.g, self.px[i + 1]);
         self.px[i + 2] = mix(c.b, self.px[i + 2]);
         self.px[i + 3] = oa as u8;
+    }
+
+    /// Строка пикселей ОДНИМ цветом без смешивания. Только для непрозрачного цвета — на нём
+    /// смешивание сводится к записи, и вся арифметика лишняя.
+    #[inline]
+    fn row_solid(&mut self, y: i32, x0: i32, x1: i32, c: Rgba) {
+        if x1 <= x0 {
+            return;
+        }
+        let a = ((y * self.w + x0) * 4) as usize;
+        let b = ((y * self.w + x1) * 4) as usize;
+        if b > self.px.len() {
+            return;
+        }
+        let p = [c.r, c.g, c.b, 0xff];
+        for px in self.px[a..b].chunks_exact_mut(4) {
+            px.copy_from_slice(&p);
+        }
     }
 
     /// Стереть кусок В ПРОЗРАЧНОСТЬ. Не «залить фоном»: под панелью обои, и любой цвет здесь
@@ -153,8 +187,21 @@ impl<'a> Canvas<'a> {
 
     /// Прямоугольник без скруглений.
     pub fn fill(&mut self, r: Rect, c: Rgba) {
-        for y in r.y..r.y + r.h {
-            for x in r.x..r.x + r.w {
+        let vis = r.intersect(self.clip);
+        if vis.is_empty() {
+            return;
+        }
+        // Веха 148.2 — непрозрачное заливается СТРОКАМИ. Фон окна это полмиллиона пикселей, и
+        // каждый из них шёл через `blend` с проверкой клипа и арифметикой альфы: 2.6 мс из
+        // 5.2 мс кадра вьювера уходило ровно сюда (замер).
+        if c.a == 0xff {
+            for y in vis.y..vis.bottom() {
+                self.row_solid(y, vis.x, vis.right(), c);
+            }
+            return;
+        }
+        for y in vis.y..vis.bottom() {
+            for x in vis.x..vis.right() {
                 self.blend(x, y, c, 256);
             }
         }
@@ -179,7 +226,27 @@ impl<'a> Canvas<'a> {
         // Обходим только видимую часть: карточка, срезанная клипом наполовину, не должна стоить
         // как целая — она рисуется каждый кадр движения.
         let vis = r.intersect(self.clip);
+        // Веха 148.2 — СЕРЕДИНА без скруглений: строки дальше `rad` от верха и низа — это ровно
+        // рамка слева, рамка справа и заливка между ними. Считать там знаковое расстояние и
+        // смешивать по пикселю незачем: карточка подробностей во вьювере — это триста тысяч
+        // пикселей, и почти все они здесь.
+        let (my0, my1) = (r.y + rad, r.bottom() - rad);
+        let straight = rad >= t && my1 > my0;
+        if straight {
+            let (y0, y1) = (my0.max(vis.y), my1.min(vis.bottom()));
+            if y1 > y0 {
+                if t > 0 {
+                    self.fill(Rect::new(r.x, y0, t, y1 - y0), border);
+                    self.fill(Rect::new(r.right() - t, y0, t, y1 - y0), border);
+                }
+                self.fill(Rect::new(r.x + t, y0, r.w - 2 * t, y1 - y0), fill);
+            }
+        }
         for y in vis.y..vis.bottom() {
+            // Середину уже залили полосами — второй раз по ней не идём.
+            if straight && y >= my0 && y < my1 {
+                continue;
+            }
             // Строка вдали от углов заливается без единого корня: покрытие там известно заранее.
             let near_y = (y - r.y) < rad || (r.y + r.h - 1 - y) < rad;
             for x in vis.x..vis.right() {
@@ -276,11 +343,19 @@ impl<'a> Canvas<'a> {
 
     /// Серая маска глифа (или иконки) цветом `c`. Нужна тексту: растеризатор отдаёт покрытие.
     pub fn mask(&mut self, x: i32, y: i32, w: i32, h: i32, mask: &[u8], c: Rgba) {
-        for row in 0..h {
-            for col in 0..w {
-                let v = mask[(row * w + col) as usize];
+        // Веха 148.2 — клип проверяем ОДИН РАЗ на глиф, а не на каждый его пиксель. Так буква,
+        // целиком лежащая вне клипа, не стоит ничего: на этом и держится перерисовка одной
+        // колонки окна вместо всего кадра ([[store-viewer]]).
+        let vis = Rect::new(x, y, w, h).intersect(self.clip);
+        if vis.is_empty() {
+            return;
+        }
+        for py in vis.y..vis.bottom() {
+            let row = py - y;
+            for px in vis.x..vis.right() {
+                let v = mask[(row * w + (px - x)) as usize];
                 if v != 0 {
-                    self.blend(x + col, y + row, c, v as u32 + 1);
+                    self.blend(px, py, c, v as u32 + 1);
                 }
             }
         }
@@ -301,6 +376,14 @@ fn rrect_sd(px: i32, py: i32, r: Rect, rad: i32) -> i32 {
     let len = isqrt(mx * mx + my * my);
     let inside = qx.max(qy).min(0);
     (len + inside - 2 * rad) * 128
+}
+
+/// Деление на 255 без деления (точное для `0..=255*255`). Стандартный приём: `v/255` это
+/// `(v + v/256 + 1) / 256`, а деление на степень двойки — сдвиг.
+#[inline]
+fn div255(v: u32) -> u32 {
+    let v = v + 128;
+    (v + (v >> 8)) >> 8
 }
 
 /// Целочисленный квадратный корень (тот же алгоритм, что в композиторе): плавающей точки в
