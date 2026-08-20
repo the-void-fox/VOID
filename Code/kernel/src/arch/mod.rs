@@ -164,6 +164,7 @@ pub struct BlkDevice {
 /// Все адреса — уже отображённая архом память (MMIO). Каждая архитектура конструирует
 /// только СВОЙ вариант (mmio — riscv, pci — x86), но матчит драйвер оба — отсюда allow.
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub enum BlkTransport {
     /// virtio-mmio (QEMU virt): база слота регистров.
     Mmio { base: usize },

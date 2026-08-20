@@ -84,6 +84,7 @@ mod shm;
 mod sched;
 mod sync;
 mod timer;
+mod virtio;
 mod virtio_blk;
 mod virtio_net;
 mod virtio_rng;
