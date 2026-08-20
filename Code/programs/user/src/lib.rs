@@ -42,6 +42,9 @@ pub mod win;
 /// Веха 140 — растровый шрифт 8×16 из таблицы ядра: минимум для тех, кто рисует текст, но не
 /// является терминалом (бар). Без кучи и без крейтов ereb.
 pub mod glyph;
+/// Веха 148.5 — аргументы и окружение процесса: разобранные один раз и без ловушки с длиной,
+/// на которой панику ловили тринадцать мест, включая сам обработчик паники.
+pub mod argv;
 
 
 // Веха 95 — источник случайности для криптографии. `getrandom` на bare-metal системного
@@ -163,10 +166,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let mut out = Buf { b: [0; 256], n: 0 };
     let _ = out.write_str("  [паника] ");
     // Имя программы из argv[0] — иначе по журналу не понять, КТО именно упал.
+    //
+    // Веха 148.5 — через [`argv::name_into`], и это не украшательство. Здесь стояло
+    // `abuf[..n]` при буфере в 64 байта, а `args` возвращает ПОЛНУЮ длину argv: программа с
+    // длинными аргументами роняла обработчик паники, и процесс исчезал молча — ни строки о том,
+    // что он вообще падал. Место, обязанное объяснить падение, само же его и прятало.
     let mut abuf = [0u8; 64];
-    let n = args(&mut abuf);
-    let name = abuf[..n].split(|&b| b == 0).next().unwrap_or(&[]);
-    if let Ok(s) = core::str::from_utf8(name) {
+    let n = argv::name_into(&mut abuf);
+    if let Ok(s) = core::str::from_utf8(&abuf[..n]) {
         let _ = out.write_str(s);
         let _ = out.write_str(": ");
     }
@@ -794,16 +801,7 @@ pub fn set_env(blob: &[u8]) -> bool {
 /// ядре значило бы завести общий изменяемый корень имён — ровно то, от чего уходит
 /// capability-модель. Поэтому шелл СООБЩАЕТ его детям, а путь собирает [`posix::resolve`].
 pub fn cwd(out: &mut [u8]) -> usize {
-    let mut buf = [0u8; 512];
-    let n = env(&mut buf).min(buf.len());
-    for entry in buf[..n].split(|&b| b == 0) {
-        if let Some(v) = entry.strip_prefix(b"CWD=") {
-            let k = v.len().min(out.len());
-            out[..k].copy_from_slice(&v[..k]);
-            return k;
-        }
-    }
-    0
+    argv::env_raw(b"CWD", out).unwrap_or(0)
 }
 
 /// `SYS_STARTCAP(i)`: i-й стартовый capability процесса (преоткрытые права — как preopen'ы
@@ -835,37 +833,16 @@ pub fn mmio_map(mmio_cap: usize, va: usize) -> bool {
 ///
 /// `None` — имени нет (старый конфиг или право безымянное); вызывающий откатывается на индекс.
 pub fn cap_named(name: &str) -> Option<usize> {
-    let mut buf = [0u8; 512];
-    let n = env(&mut buf).min(buf.len());
     let mut key = [0u8; 40];
     let pre = b"CAP_";
-    if pre.len() + name.len() + 1 > key.len() {
+    if pre.len() + name.len() > key.len() {
         return None;
     }
     key[..pre.len()].copy_from_slice(pre);
     key[pre.len()..pre.len() + name.len()].copy_from_slice(name.as_bytes());
-    key[pre.len() + name.len()] = b'=';
-    let klen = pre.len() + name.len() + 1;
-    for entry in buf[..n].split(|&b| b == 0) {
-        if entry.len() > klen && entry[..klen] == key[..klen] {
-            let mut v = 0usize;
-            let mut any = false;
-            for &d in &entry[klen..] {
-                if d.is_ascii_digit() {
-                    v = v * 10 + (d - b'0') as usize;
-                    any = true;
-                } else {
-                    any = false;
-                    break;
-                }
-            }
-            if any {
-                let c = start_cap(v);
-                return (c != NO_CAP).then_some(c);
-            }
-        }
-    }
-    None
+    let idx = argv::env_num(&key[..pre.len() + name.len()])?;
+    let c = start_cap(idx);
+    (c != NO_CAP).then_some(c)
 }
 
 /// Веха 98 — `SYS_SPAWN(exec_cap, имя, аргументы)`: запустить программу из store и **сразу

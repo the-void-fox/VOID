@@ -28,14 +28,8 @@ static ALLOC: sys::heap::Heap<{ 512 * 1024 }> = sys::heap::Heap::new();
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
-    let mut argbuf = [0u8; 128];
-    let n = sys::args(&mut argbuf);
-    let tail = argbuf[..n]
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .nth(1)
-        .and_then(|s| core::str::from_utf8(s).ok())
-        .and_then(|s| s.parse::<usize>().ok());
+    let argv = sys::argv::Argv::take();
+    let tail = argv.str(0).and_then(|s| s.parse::<usize>().ok());
 
     let mut buf = vec![0u8; CAP];
     let (got, lost) = sys::klog(&mut buf);

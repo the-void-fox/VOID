@@ -18,12 +18,9 @@ use void_user as sys;
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     sys::write(b"[hello] I'm an ELF loaded by content-id from the object store, not baked into the kernel image!\n");
 
-    let mut buf = [0u8; 256];
-    let n = sys::args(&mut buf).min(buf.len());
-    let mut argv = buf[..n].split(|&b| b == 0).filter(|s| !s.is_empty());
-    let _name = argv.next(); // argv[0] — имя программы, его не показываем
+    let argv = sys::argv::Argv::take();
     let mut got_args = false;
-    for a in argv {
+    for a in argv.rest() {
         if !got_args {
             sys::write(b"[hello] argv:");
             got_args = true;
@@ -33,6 +30,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     }
     if got_args {
         sys::write(b"\n[hello] env: ");
+        let mut buf = [0u8; 512];
         let n = sys::env(&mut buf).min(buf.len());
         let mut first = true;
         for e in buf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()) {

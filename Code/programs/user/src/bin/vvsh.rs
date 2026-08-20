@@ -191,10 +191,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Каталог объявляем СРАЗУ, а не только при `cd`: программа, запущенная первой командой,
     // должна понимать относительный путь так же, как двадцатой.
     publish_cwd(b"/");
-    let mut abuf = [0u8; 256];
-    let n = sys::args(&mut abuf).min(abuf.len());
-    let mut argv = abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty());
-    let _name = argv.next();
+    let args = sys::argv::Argv::take();
+    let mut argv = args.rest();
     let sub = argv.next().unwrap_or(&[]);
 
     if sub == b"eval" {

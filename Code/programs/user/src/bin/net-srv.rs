@@ -395,12 +395,8 @@ impl Cfg {
     /// Разобрать argv (`SYS_ARGS(0)`, записи через NUL; [0] — имя программы).
     fn from_args() -> Self {
         let mut cfg = Cfg::new();
-        let mut buf = [0u8; 512];
-        let n = sys::args(&mut buf);
-        for (i, tok) in buf[..n].split(|&b| b == 0).enumerate() {
-            if i == 0 || tok.is_empty() {
-                continue; // argv[0] — имя программы
-            }
+        let argv = sys::argv::Argv::take();
+        for tok in argv.rest() {
             let Some(eq) = tok.iter().position(|&b| b == b'=') else {
                 warn_arg(tok);
                 continue;

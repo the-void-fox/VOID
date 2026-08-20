@@ -539,10 +539,9 @@ fn main_loop() -> ! {
 
     // Клиенты — из argv. Право на себя отдаём под именем `WM`: терминал даёт детям `STDIO`,
     // мы даём окна, и путать эти два хоста нельзя.
-    let mut abuf = [0u8; 256];
-    let n = sys::args(&mut abuf);
+    let argv = sys::argv::Argv::take();
     let mut spawned = 0usize;
-    for prog in abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1) {
+    for prog in argv.rest() {
         // Аргумента у клиента из `apps` быть не может, и это не наше ограничение: конфиг
         // поколения — текст, разбираемый по ПРОБЕЛАМ (`init::apply_with`), поэтому `arg:img wall`
         // доедет сюда двумя токенами. Обои этой стены не заметили: у них своя строка конфига

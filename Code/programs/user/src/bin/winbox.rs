@@ -29,13 +29,8 @@ const PALETTE: [(u8, u8, u8); 4] =
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Своё имя — из argv: два одинаковых клиента должны различаться в заголовке.
-    let mut abuf = [0u8; 128];
-    let n = sys::args(&mut abuf);
-    let name = abuf[..n]
-        .split(|&b| b == 0)
-        .next()
-        .and_then(|s| core::str::from_utf8(s).ok())
-        .unwrap_or("winbox");
+    let argv = sys::argv::Argv::take();
+    let name = argv.name_str("winbox");
 
     let (mut w, mut h) = (360u16, 220u16);
     let Some(mut window) = Window::create(w, h, name) else {

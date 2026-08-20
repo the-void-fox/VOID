@@ -38,9 +38,8 @@ const WIN_MAX: (u32, u32) = (1000, 700);
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Нулевым словом в argv идёт ИМЯ программы (так его читает `winbox`, чтобы подписать окно);
     // наш аргумент — первый после него.
-    let mut abuf = [0u8; 256];
-    let n = sys::args(&mut abuf);
-    let spec = abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).nth(1).unwrap_or(&[]);
+    let argv = sys::argv::Argv::take();
+    let spec = argv.get(0).unwrap_or(&[]);
     if spec.is_empty() {
         sys::write("img: img <корень store | content-id>\n".as_bytes());
         sys::exit(2);

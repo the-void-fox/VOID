@@ -72,30 +72,7 @@ pub fn endpoint() -> Option<usize> {
 
 /// Разобрать окружение и достать право по индексу из `STDIO=`.
 fn probe() -> Option<usize> {
-    let mut buf = [0u8; 512];
-    let n = super::env(&mut buf);
-    let n = n.min(buf.len());
-    let mut idx = None;
-    for entry in buf[..n].split(|&b| b == 0) {
-        if let Some(v) = entry.strip_prefix(b"STDIO=") {
-            let mut val = 0usize;
-            let mut any = false;
-            for &d in v {
-                if d.is_ascii_digit() {
-                    val = val * 10 + (d - b'0') as usize;
-                    any = true;
-                } else {
-                    any = false;
-                    break;
-                }
-            }
-            if any {
-                idx = Some(val);
-            }
-            break;
-        }
-    }
-    let cap = super::start_cap(idx?);
+    let cap = super::start_cap(super::argv::env_num(b"STDIO")?);
     (cap != super::NO_CAP).then_some(cap)
 }
 

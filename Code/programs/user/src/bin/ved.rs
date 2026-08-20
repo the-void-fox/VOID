@@ -562,14 +562,8 @@ fn fail(msg: &str) -> ! {
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
-    let mut argbuf = [0u8; 512];
-    let n = sys::args(&mut argbuf);
-    let path = argbuf[..n]
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .nth(1)
-        .and_then(|s| core::str::from_utf8(s).ok())
-        .map(|s| s.to_string());
+    let argv = sys::argv::Argv::take();
+    let path = argv.str(0).map(|s| s.to_string());
     let Some(path) = path else {
         sys::write("ved: экранный редактор\n\n".as_bytes());
         sys::write("  ved <файл>   открыть (нет файла — создастся при сохранении)\n".as_bytes());

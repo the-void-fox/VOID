@@ -132,9 +132,8 @@ use profile::{GEN_MAGIC, PROFILE};
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
-    let mut argbuf = [0u8; 512];
-    let n = sys::args(&mut argbuf);
-    let mut it = argbuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1);
+    let argv = sys::argv::Argv::take();
+    let mut it = argv.rest();
     let (cmd, rest, third) = (it.next(), it.next(), it.next());
 
     let code = match (cmd, rest) {

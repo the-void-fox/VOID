@@ -762,32 +762,8 @@ pub const TITLE_MAX: usize = 60;
 /// родитель, а не права, выданные системой на старте. У вторых имя начинается с `CAP_`
 /// (`CAP_STORE`, `CAP_FB` — их кладёт init), у первых — нет.
 pub fn endpoint() -> Option<usize> {
-    let mut buf = [0u8; 512];
-    let n = crate::env(&mut buf).min(buf.len());
-    let mut key = [0u8; 16];
-    key[..ENV.len()].copy_from_slice(ENV.as_bytes());
-    key[ENV.len()] = b'=';
-    let klen = ENV.len() + 1;
-    for entry in buf[..n].split(|&b| b == 0) {
-        if entry.len() <= klen || entry[..klen] != key[..klen] {
-            continue;
-        }
-        let mut idx = 0usize;
-        let mut any = false;
-        for &d in &entry[klen..] {
-            if !d.is_ascii_digit() {
-                any = false;
-                break;
-            }
-            idx = idx * 10 + (d - b'0') as usize;
-            any = true;
-        }
-        if any {
-            let cap = crate::start_cap(idx);
-            return (cap != crate::NO_CAP).then_some(cap);
-        }
-    }
-    None
+    let cap = crate::start_cap(crate::argv::env_num(ENV.as_bytes())?);
+    (cap != crate::NO_CAP).then_some(cap)
 }
 
 /// Веха 129 — окно ВА-окна под общие буферы кадров: между кучей процесса (`0x6000_0000`) и его

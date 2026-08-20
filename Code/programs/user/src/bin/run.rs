@@ -72,9 +72,8 @@ fn store_cap() -> Option<usize> {
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // argv: [0] — мы сами, [1] — что запускать, дальше — его аргументы.
-    let mut abuf = [0u8; 512];
-    let n = sys::args(&mut abuf);
-    let mut words = abuf[..n].split(|&b| b == 0).filter(|s| !s.is_empty()).skip(1);
+    let argv = sys::argv::Argv::take();
+    let mut words = argv.rest();
     let Some(name) = words.next() else {
         say("run: run <программа> [аргументы]\n");
         sys::exit(2);
