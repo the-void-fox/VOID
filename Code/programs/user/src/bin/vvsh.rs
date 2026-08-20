@@ -1146,7 +1146,7 @@ fn sh_ping(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.clone(),
         _ => return Err(EvalError::new("ping: (ping \"A.B.C.D\")")),
     };
-    let ip = match parse_ipv4(ipstr.as_bytes()) {
+    let ip = match sys::net_cli::parse_ipv4(ipstr.as_bytes()) {
         Some(x) => x,
         None => return Err(EvalError::new("ping: неверный IP (нужно A.B.C.D)")),
     };
@@ -1233,7 +1233,7 @@ fn sh_tcp_connect(args: &[Value]) -> Result<Value, EvalError> {
         (Some(Value::Str(h)), Some(Value::Int(p))) if *p > 0 && *p < 65536 => (h.clone(), *p as u16),
         _ => return Err(EvalError::new("tcp-connect: (tcp-connect \"A.B.C.D\" порт)")),
     };
-    let ip = match parse_ipv4(host.as_bytes()) {
+    let ip = match sys::net_cli::parse_ipv4(host.as_bytes()) {
         Some(x) => x,
         None => return Err(EvalError::new("tcp-connect: нужен адрес A.B.C.D (имя — через resolve)")),
     };
@@ -1655,37 +1655,6 @@ fn sh_init_config(_args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::nil())
 }
 
-/// Разобрать IPv4 «A.B.C.D» в 4 байта (для `ping`). `None` — не разобрать.
-fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
-    let mut octets = [0u8; 4];
-    let mut idx = 0usize;
-    let mut val: u32 = 0;
-    let mut digits = 0;
-    for &b in s {
-        if b == b'.' {
-            if digits == 0 || idx >= 3 {
-                return None;
-            }
-            octets[idx] = val as u8;
-            idx += 1;
-            val = 0;
-            digits = 0;
-        } else if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as u32;
-            if val > 255 {
-                return None;
-            }
-            digits += 1;
-        } else {
-            return None;
-        }
-    }
-    if idx != 3 || digits == 0 {
-        return None;
-    }
-    octets[3] = val as u8;
-    Some(octets)
-}
 
 // ── редактор строки (S2c ч.2): история ↑/↓, курсор ←/→/Home/End, backspace/Delete ──
 // Байт-ориентированный (курсор в колонках=байтах — ASCII точен; многобайтные символы редактируются

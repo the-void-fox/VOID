@@ -335,7 +335,7 @@ fn once(
     sink: &mut Sink,
 ) -> Result<Step, &'static str> {
     // Адрес: цифровой пропускаем как есть, имя — через DNS (Веха 92).
-    let ip = match parse_ipv4(u.host()) {
+    let ip = match sys::net_cli::parse_ipv4(u.host()) {
         Some(ip) => ip,
         None => {
             let name = core::str::from_utf8(u.host()).map_err(|_| "имя хоста не UTF-8")?;
@@ -520,35 +520,6 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| eq_ascii_ci(w, needle))
 }
 
-fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
-    let mut o = [0u8; 4];
-    let mut idx = 0;
-    let mut val: u32 = 0;
-    let mut digits = 0;
-    for &b in s {
-        if b == b'.' {
-            if digits == 0 || idx >= 3 {
-                return None;
-            }
-            o[idx] = val as u8;
-            idx += 1;
-            val = 0;
-            digits = 0;
-        } else if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as u32;
-            if val > 255 {
-                return None;
-            }
-            digits += 1;
-        } else {
-            return None;
-        }
-    }
-    (idx == 3 && digits > 0).then(|| {
-        o[3] = val as u8;
-        o
-    })
-}
 
 fn resolve(net_ep: usize, name: &str) -> Result<[u8; 4], &'static str> {
     let mut rep = [0u8; 5];

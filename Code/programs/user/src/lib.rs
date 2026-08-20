@@ -568,6 +568,33 @@ pub fn obj_get_root(store_cap: usize, name: &[u8], id_out: &mut [u8; 32]) -> usi
     ).0
 }
 
+/// Веха 148.6 — разрешить **спецификацию объекта**: то, чем человек и конфиг называют объект в
+/// одну строку — либо КОРЕНЬ store (`f/etc/wall.png`), либо сам content-id шестьюдесятью
+/// четырьмя шестнадцатеричными знаками. `None` — корня нет.
+///
+/// Правило «64 hex-знака значат content-id, всё прочее — имя корня» жило в двух местах (`obj` и
+/// `net-srv`) и в обоих было набрано заново. Стоит его где-то уточнить — скажем, разрешить
+/// сокращённый id по первым шестнадцати знакам, как это делает `git`, — и одна и та же строка
+/// станет означать в двух программах разное.
+///
+/// Корень удобнее (его переназначает новая загрузка), id строже (его нельзя подменить) — и
+/// выбор между ними принадлежит тому, кто пишет строку, а не тому, кто её читает.
+pub fn obj_resolve(store_cap: usize, spec: &[u8]) -> Option<[u8; 32]> {
+    let mut id = [0u8; 32];
+    if spec.len() == 64 && spec.iter().all(|b| b.is_ascii_hexdigit()) {
+        let hex = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => c - b'A' + 10,
+        };
+        for (i, pair) in spec.chunks(2).enumerate() {
+            id[i] = hex(pair[0]) << 4 | hex(pair[1]);
+        }
+        return Some(id);
+    }
+    (obj_get_root(store_cap, spec, &mut id) == 32).then_some(id)
+}
+
 /// `SYS_OBJ_DEL_ROOT`: отвязать корень (объект уйдёт в GC, если недостижим). 0/1/MAX.
 pub fn obj_del_root(store_cap: usize, name: &[u8]) -> usize {
     abi::syscall(SYS_OBJ_DEL_ROOT, store_cap, name.as_ptr() as usize, name.len(), 0, 0, 0, 0).0

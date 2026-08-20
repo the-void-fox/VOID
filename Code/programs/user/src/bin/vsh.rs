@@ -70,37 +70,6 @@ fn print_help(ep: usize) {
     help_row(ep, b"poweroff", "то же самое, явно");
 }
 
-/// Разобрать IPv4 в точечной записи «A.B.C.D» в 4 байта. `None` — не разобрать.
-fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
-    let mut octets = [0u8; 4];
-    let mut idx = 0usize;
-    let mut val: u32 = 0;
-    let mut digits = 0;
-    for &b in s {
-        if b == b'.' {
-            if digits == 0 || idx >= 3 {
-                return None;
-            }
-            octets[idx] = val as u8;
-            idx += 1;
-            val = 0;
-            digits = 0;
-        } else if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as u32;
-            if val > 255 {
-                return None;
-            }
-            digits += 1;
-        } else {
-            return None;
-        }
-    }
-    if idx != 3 || digits == 0 {
-        return None;
-    }
-    octets[3] = val as u8;
-    Some(octets)
-}
 
 /// Напечатать usize десятично (форматтера в no_std-бинаре нет).
 fn put_dec(ep: usize, mut v: usize) {
@@ -700,7 +669,7 @@ pub extern "C" fn _start(ep: usize, xcap: usize) -> ! {
         if let Some(ipstr) = cmd.strip_prefix(b"ping ") {
             // Веха 34: `ping A.B.C.D` — вызвать сетевой сервер (эндпоинт из старт-cap слота 2),
             // тот делает ARP+ICMP и возвращает RTT. Стек живёт в userspace, не в ядре.
-            match parse_ipv4(ipstr) {
+            match sys::net_cli::parse_ipv4(ipstr) {
                 Some(ip) => {
                     let netep = sys::start_cap(2);
                     if netep == sys::NO_CAP {

@@ -23,19 +23,9 @@ use void_user as sys;
 /// Ошибка — строкой, годной для показа человеку: у всех отказов тут одна и та же судьба —
 /// сообщение и выход, а разбирать их по видам некому.
 pub fn read(store: usize, spec: &[u8]) -> Result<Vec<u8>, &'static str> {
-    let mut id = [0u8; 32];
-    if spec.len() == 64 && spec.iter().all(|b| b.is_ascii_hexdigit()) {
-        let hex = |c: u8| match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            _ => c - b'A' + 10,
-        };
-        for (i, pair) in spec.chunks(2).enumerate() {
-            id[i] = hex(pair[0]) << 4 | hex(pair[1]);
-        }
-    } else if sys::obj_get_root(store, spec, &mut id) != 32 {
+    let Some(id) = sys::obj_resolve(store, spec) else {
         return Err("нет такого корня в store");
-    }
+    };
 
     // Первое чтение — с длиной: `obj_get_ex` говорит, сколько всего байт в объекте, даже если
     // в буфер влезло меньше. Манифест блоба заведомо короче 512 байт.

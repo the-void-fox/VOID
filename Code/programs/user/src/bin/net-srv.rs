@@ -1192,22 +1192,12 @@ fn default_gateway(iface: &mut Interface) -> Option<Ipv4Address> {
 /// Формат — какой раздают в интернете: строки `0.0.0.0 имя` (hosts) или голые имена, `#` —
 /// комментарий.
 fn load_blocklist(store_cap: usize, spec: &[u8], bl: &mut Blocklist) -> (usize, usize) {
-    let mut id = [0u8; 32];
-    if spec.len() == 64 && spec.iter().all(|b| b.is_ascii_hexdigit()) {
-        // Content-id прямо в конфиге: список прибит НАВСЕГДА к своему содержимому. Корень удобнее
-        // (его можно переназначить новой загрузкой), id — строже (его нельзя подменить).
-        let hex = |c: u8| match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            _ => c - b'A' + 10,
-        };
-        for (i, pair) in spec.chunks(2).enumerate() {
-            id[i] = hex(pair[0]) << 4 | hex(pair[1]);
-        }
-    } else if sys::obj_get_root(store_cap, spec, &mut id) != 32 {
+    // Корень или content-id прямо в конфиге — разбирает [`sys::obj_resolve`]: правило «64 hex
+    // значат id» общее у всех, кто читает объект по имени из строки.
+    let Some(id) = sys::obj_resolve(store_cap, spec) else {
         sys::write("[net-srv] список блокировки: нет такого корня\n".as_bytes());
         return (0, 0);
-    }
+    };
 
     // Объект бывает двух видов: БЛОБ (`fetch` режет всё длиннее 16 КиБ на куски и связывает их
     // узлом — так приезжают настоящие списки) или простой объект, положенный целиком.
@@ -1517,36 +1507,12 @@ fn serve_no_device() -> ! {
     }
 }
 
-/// Разобрать «A.B.C.D» (ровно четыре октета).
+
+/// «A.B.C.D» в адрес smoltcp. Сам разбор общий с остальными программами
+/// ([`sys::net_cli::parse_ipv4`], Веха 148.6) — здесь только обёртка в тип, которого больше
+/// ни у кого нет: сервер единственный, кто линкует smoltcp.
 fn parse_ipv4(s: &[u8]) -> Option<Ipv4Address> {
-    let mut octets = [0u8; 4];
-    let mut idx = 0usize;
-    let mut val: u32 = 0;
-    let mut digits = 0;
-    for &b in s {
-        if b == b'.' {
-            if digits == 0 || idx >= 3 {
-                return None;
-            }
-            octets[idx] = val as u8;
-            idx += 1;
-            val = 0;
-            digits = 0;
-        } else if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as u32;
-            if val > 255 {
-                return None;
-            }
-            digits += 1;
-        } else {
-            return None;
-        }
-    }
-    if idx != 3 || digits == 0 {
-        return None;
-    }
-    octets[3] = val as u8;
-    Some(Ipv4Address::from(octets))
+    Some(Ipv4Address::from(sys::net_cli::parse_ipv4(s)?))
 }
 
 /// Разобрать «A.B.C.D/NN» (без `/NN` — маска /24, как в домашних сетях).
