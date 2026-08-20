@@ -232,6 +232,13 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// Байт флагов сообщения ([`LAYER_ALPHA`], [`LAYER_KBD`]). Собирается здесь, а не у
+    /// отправителя: разбирает его композитор теми же именами, и два места на одно число —
+    /// ровно то, из-за чего заводили [`wire`].
+    pub fn flags(&self) -> u8 {
+        (if self.alpha { LAYER_ALPHA } else { 0 }) | (if self.kbd { LAYER_KBD } else { 0 })
+    }
+
     /// Обои: фоновый слой во весь экран, места у окон не занимает. Альфы не просят — под ними
     /// нет ничего, кроме цвета стола, а смешивание полного экрана стоит кадра.
     pub const WALLPAPER: Layer =
@@ -347,38 +354,396 @@ pub enum Event {
     Wheel { x: u16, y: u16, delta: i8 },
 }
 
-/// Прочитать u16 из ответа (little-endian), не выходя за его край.
-fn rd16(b: &[u8], i: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]))
-}
-
 impl Event {
+    /// Веха 144 — курсор УШЁЛ с поверхности: движение в точку, которой не бывает.
+    ///
+    /// Признак назван здесь, а не двумя `0xffff` у композитора и одним `u16::MAX` у тулкита:
+    /// это ОДНО соглашение, и держаться оно должно в одном месте.
+    pub const GONE: Event = Event::Motion { x: u16::MAX, y: u16::MAX };
+
     /// Разобрать байты ответа. `None` — пустой или непонятный ответ.
     pub fn parse(b: &[u8]) -> Option<Event> {
-        match *b.first()? {
-            EV_MOTION => Some(Event::Motion { x: rd16(b, 1)?, y: rd16(b, 3)? }),
-            EV_BUTTON => Some(Event::Button {
-                x: rd16(b, 1)?,
-                y: rd16(b, 3)?,
-                buttons: *b.get(5)?,
-                down: *b.get(6)? != 0,
-            }),
-            EV_KEY => Some(Event::Key {
-                sym: rd16(b, 1)?,
-                mods: *b.get(3)?,
-                ch: rd16(b, 4)?,
-                down: *b.get(6)? != 0,
-            }),
-            EV_CLOSE => Some(Event::Close),
-            EV_RESIZE => Some(Event::Resize { w: rd16(b, 1)?, h: rd16(b, 3)? }),
-            EV_STATUS => Some(Event::Status),
-            EV_WHEEL => Some(Event::Wheel {
-                x: rd16(b, 1)?,
-                y: rd16(b, 3)?,
-                delta: *b.get(5)? as i8,
-            }),
-            _ => None,
+        let mut r = wire::Rd::new(b);
+        Some(match r.u8()? {
+            EV_MOTION => Event::Motion { x: r.u16()?, y: r.u16()? },
+            EV_BUTTON => Event::Button {
+                x: r.u16()?,
+                y: r.u16()?,
+                buttons: r.u8()?,
+                down: r.u8()? != 0,
+            },
+            EV_KEY => Event::Key {
+                sym: r.u16()?,
+                mods: r.u8()?,
+                ch: r.u16()?,
+                down: r.u8()? != 0,
+            },
+            EV_CLOSE => Event::Close,
+            EV_RESIZE => Event::Resize { w: r.u16()?, h: r.u16()? },
+            EV_STATUS => Event::Status,
+            EV_WHEEL => Event::Wheel { x: r.u16()?, y: r.u16()?, delta: r.u8()? as i8 },
+            _ => return None,
+        })
+    }
+
+    /// Уложить событие в байты — то же самое наоборот (композитор).
+    ///
+    /// Стоит рядом с [`Event::parse`] намеренно: пока пишущий и читающий живут в разных файлах,
+    /// поле, сдвинутое на одной стороне, на другой читается как правдоподобное число.
+    /// Возвращает длину; больше семи байт событие не бывает.
+    pub fn encode(&self, b: &mut [u8]) -> usize {
+        let mut w = wire::Wr::new(b);
+        match *self {
+            Event::Motion { x, y } => {
+                w.u8(EV_MOTION).u16(x).u16(y);
+            }
+            Event::Button { x, y, buttons, down } => {
+                w.u8(EV_BUTTON).u16(x).u16(y).u8(buttons).u8(down as u8);
+            }
+            Event::Key { sym, mods, ch, down } => {
+                w.u8(EV_KEY).u16(sym).u8(mods).u16(ch).u8(down as u8);
+            }
+            Event::Close => {
+                w.u8(EV_CLOSE);
+            }
+            Event::Resize { w: rw, h } => {
+                w.u8(EV_RESIZE).u16(rw).u16(h);
+            }
+            Event::Status => {
+                w.u8(EV_STATUS);
+            }
+            Event::Wheel { x, y, delta } => {
+                w.u8(EV_WHEEL).u16(x).u16(y).u8(delta as u8);
+            }
         }
+        w.len()
+    }
+}
+
+/// Веха 148.4 — **раскладка сообщений: одно описание на обе стороны**.
+///
+/// До неё её знали двое и по-разному. Клиент паковал поля у себя (`req[0..2]`, `req[2..4]`, …),
+/// композитор распаковывал у себя (`u16::from_le_bytes([buf[0], buf[1]])`), и НИГДЕ эта
+/// раскладка не была объявлена: общими были только номера операций. Расходится такое молча —
+/// поле, сдвинутое на одной стороне, на другой читается как правдоподобное число, а не как
+/// отказ.
+///
+/// Заодно ушла целая порода отказов. Композитор брал поля по индексу, не глядя на длину
+/// сообщения, а приёмный буфер у него ОДИН на все запросы: короткий или обрезанный запрос
+/// читался вперемешку с хвостом предыдущего. «Закрой окно» без номера означало закрытие
+/// случайного чужого окна. Теперь недлинное сообщение просто не разбирается.
+///
+/// Чего здесь нет намеренно: одно-полевых запросов (`OP_SPACE`, `OP_DESTROY`, `OP_WATCH`,
+/// `OP_POLL`, `OP_LAUNCHING`). У них нет ПОРЯДКА полей — расходиться нечему; им хватает [`id`]
+/// и [`Rd`], чтобы не читать за краем.
+pub mod wire {
+    use super::{Layer, LAYER_ALPHA, LAYER_KBD, LAYER_OVERLAY, ST_OVERVIEW, TITLE_MAX};
+
+    /// Читатель полей сообщения (little-endian), не выходящий за его край.
+    pub struct Rd<'a> {
+        b: &'a [u8],
+        i: usize,
+    }
+
+    impl<'a> Rd<'a> {
+        pub fn new(b: &'a [u8]) -> Rd<'a> {
+            Rd { b, i: 0 }
+        }
+
+        pub fn u8(&mut self) -> Option<u8> {
+            let v = *self.b.get(self.i)?;
+            self.i += 1;
+            Some(v)
+        }
+
+        pub fn u16(&mut self) -> Option<u16> {
+            let s = self.b.get(self.i..self.i + 2)?;
+            self.i += 2;
+            Some(u16::from_le_bytes([s[0], s[1]]))
+        }
+
+        pub fn u32(&mut self) -> Option<u32> {
+            let s = self.b.get(self.i..self.i + 4)?;
+            self.i += 4;
+            Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        }
+
+        /// Остаток сообщения — хвост переменной длины (заголовок, имя, вывод).
+        pub fn tail(&self) -> &'a [u8] {
+            self.b.get(self.i..).unwrap_or(&[])
+        }
+    }
+
+    /// Писатель полей. Буфер даёт ВЫЗЫВАЮЩИЙ: у клиента он на стеке (библиотека шимов живёт без
+    /// кучи), а размеры у сообщений разные — от восьми байт до хвоста вывода в 768.
+    ///
+    /// За край буфера не пишет: не влезшее просто не поедет, и [`Wr::len`] это покажет.
+    pub struct Wr<'a> {
+        b: &'a mut [u8],
+        n: usize,
+    }
+
+    impl<'a> Wr<'a> {
+        pub fn new(b: &'a mut [u8]) -> Wr<'a> {
+            Wr { b, n: 0 }
+        }
+
+        pub fn u8(&mut self, v: u8) -> &mut Self {
+            self.put(&[v])
+        }
+
+        pub fn u16(&mut self, v: u16) -> &mut Self {
+            self.put(&v.to_le_bytes())
+        }
+
+        pub fn u32(&mut self, v: u32) -> &mut Self {
+            self.put(&v.to_le_bytes())
+        }
+
+        pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
+            self.put(v)
+        }
+
+        fn put(&mut self, v: &[u8]) -> &mut Self {
+            let n = v.len().min(self.b.len() - self.n);
+            self.b[self.n..self.n + n].copy_from_slice(&v[..n]);
+            self.n += n;
+            self
+        }
+
+        /// Сколько байт уложено — столько и отправлять.
+        pub fn len(&self) -> usize {
+            self.n
+        }
+    }
+
+    /// `[id u32]` — тело запроса, состоящего из одного номера окна: `OP_DESTROY`, `OP_WATCH`,
+    /// `OP_POLL`, а также ответ `OP_CREATE`/`OP_LAYER`/`OP_LAUNCHING`.
+    pub fn id(b: &[u8]) -> Option<u32> {
+        Rd::new(b).u32()
+    }
+
+    /// `OP_CREATE`: `[w u16, h u16, заголовок…]` → `[id u32]`.
+    pub struct Create<'a> {
+        pub w: u16,
+        pub h: u16,
+        /// Байты, а не `&str`: годность их в UTF-8 — вопрос не раскладки, а того, кто заголовок
+        /// показывает.
+        pub title: &'a [u8],
+    }
+
+    impl<'a> Create<'a> {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u16(self.w).u16(self.h).bytes(cut(self.title));
+            w.len()
+        }
+
+        pub fn decode(b: &'a [u8]) -> Option<Create<'a>> {
+            let mut r = Rd::new(b);
+            let (w, h) = (r.u16()?, r.u16()?);
+            Some(Create { w, h, title: r.tail() })
+        }
+    }
+
+    /// `OP_LAYER`: `[слой u8, якорь u8, w u16, h u16, зона u16, флаги u8, заголовок…]` →
+    /// `[id u32]`.
+    ///
+    /// Заголовок идёт ХВОСТОМ, поэтому у слоя перед ним на пять байт больше, чем у окна:
+    /// разбирается такое с одного прохода, не зная заранее, какой длины сообщение.
+    pub struct LayerReq<'a> {
+        pub spec: Layer,
+        pub w: u16,
+        pub h: u16,
+        pub title: &'a [u8],
+    }
+
+    impl<'a> LayerReq<'a> {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let l = &self.spec;
+            let mut w = Wr::new(b);
+            w.u8(l.layer)
+                .u8(l.anchor)
+                .u16(self.w)
+                .u16(self.h)
+                .u16(l.exclusive)
+                .u8(l.flags())
+                .bytes(cut(self.title));
+            w.len()
+        }
+
+        pub fn decode(b: &'a [u8]) -> Option<LayerReq<'a>> {
+            let mut r = Rd::new(b);
+            let (layer, anchor) = (r.u8()?, r.u8()?);
+            let (w, h) = (r.u16()?, r.u16()?);
+            let exclusive = r.u16()?;
+            // Веха 144 — байт флагов НЕОБЯЗАТЕЛЕН: старый клиент его не шлёт. Раньше это
+            // сторожили длиной сообщения на той стороне; теперь сторожит сам разбор.
+            let flags = r.u8().unwrap_or(0);
+            Some(LayerReq {
+                spec: Layer {
+                    layer: layer.min(LAYER_OVERLAY),
+                    anchor,
+                    exclusive,
+                    alpha: flags & LAYER_ALPHA != 0,
+                    kbd: flags & LAYER_KBD != 0,
+                },
+                w,
+                h,
+                title: r.tail(),
+            })
+        }
+    }
+
+    /// `OP_COMMIT`: `[id u32, x u16, y u16, w u16, h u16]` — прямоугольник изменений.
+    pub struct Commit {
+        pub id: u32,
+        pub x: u16,
+        pub y: u16,
+        pub w: u16,
+        pub h: u16,
+    }
+
+    impl Commit {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u32(self.id).u16(self.x).u16(self.y).u16(self.w).u16(self.h);
+            w.len()
+        }
+
+        pub fn decode(b: &[u8]) -> Option<Commit> {
+            let mut r = Rd::new(b);
+            Some(Commit {
+                id: r.u32()?,
+                x: r.u16()?,
+                y: r.u16()?,
+                w: r.u16()?,
+                h: r.u16()?,
+            })
+        }
+    }
+
+    /// `OP_REBUF`: `[id u32, w u16, h u16]` + право на новую область.
+    pub struct Rebuf {
+        pub id: u32,
+        pub w: u16,
+        pub h: u16,
+    }
+
+    impl Rebuf {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u32(self.id).u16(self.w).u16(self.h);
+            w.len()
+        }
+
+        pub fn decode(b: &[u8]) -> Option<Rebuf> {
+            let mut r = Rd::new(b);
+            Some(Rebuf { id: r.u32()?, w: r.u16()?, h: r.u16()? })
+        }
+    }
+
+    /// `OP_EVENT`: `[id u32]` и НЕОБЯЗАТЕЛЬНЫЙ срок `[ms u32]` хвостом (Веха 140).
+    ///
+    /// Необязательность здесь не небрежность, а совместимость: клиент без срока ждёт бессрочно,
+    /// как ждали все до бара.
+    pub struct EventReq {
+        pub id: u32,
+        pub ms: Option<u32>,
+    }
+
+    impl EventReq {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u32(self.id);
+            if let Some(ms) = self.ms {
+                w.u32(ms);
+            }
+            w.len()
+        }
+
+        pub fn decode(b: &[u8]) -> Option<EventReq> {
+            let mut r = Rd::new(b);
+            Some(EventReq { id: r.u32()?, ms: r.u32() })
+        }
+    }
+
+    /// `OP_LAUNCH_DONE`: `[код u32, хвост вывода…]` (Веха 147).
+    pub struct LaunchDone<'a> {
+        pub code: u32,
+        pub tail: &'a [u8],
+    }
+
+    impl<'a> LaunchDone<'a> {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u32(self.code).bytes(self.tail);
+            w.len()
+        }
+
+        pub fn decode(b: &'a [u8]) -> Option<LaunchDone<'a>> {
+            let mut r = Rd::new(b);
+            Some(LaunchDone { code: r.u32()?, tail: r.tail() })
+        }
+    }
+
+    /// Ответ `OP_SCREEN`: `[w u16, h u16]`.
+    pub struct Screen {
+        pub w: u16,
+        pub h: u16,
+    }
+
+    impl Screen {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u16(self.w).u16(self.h);
+            w.len()
+        }
+
+        pub fn decode(b: &[u8]) -> Option<Screen> {
+            let mut r = Rd::new(b);
+            Some(Screen { w: r.u16()?, h: r.u16()? })
+        }
+    }
+
+    /// Ответ `OP_STATUS`: `[стол u8, столов u8, раскладка u8, флаги u8, заголовок…]` (Веха 140,
+    /// раскладка — 143, флаги — 145).
+    pub struct Status<'a> {
+        pub space: u8,
+        pub spaces: u8,
+        pub layout: u8,
+        pub overview: bool,
+        pub title: &'a [u8],
+    }
+
+    impl<'a> Status<'a> {
+        pub fn encode(&self, b: &mut [u8]) -> usize {
+            let mut w = Wr::new(b);
+            w.u8(self.space)
+                .u8(self.spaces)
+                .u8(self.layout)
+                .u8(if self.overview { ST_OVERVIEW } else { 0 })
+                .bytes(cut(self.title));
+            w.len()
+        }
+
+        pub fn decode(b: &'a [u8]) -> Option<Status<'a>> {
+            let mut r = Rd::new(b);
+            let (space, spaces, layout, flags) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
+            Some(Status {
+                space,
+                spaces,
+                layout,
+                overview: flags & ST_OVERVIEW != 0,
+                title: r.tail(),
+            })
+        }
+    }
+
+    /// Обрезать заголовок по потолку протокола. Режем ЗДЕСЬ, у отправителя: обрезка, случившаяся
+    /// молча на приёмной стороне, отправителю не видна вовсе.
+    fn cut(t: &[u8]) -> &[u8] {
+        &t[..t.len().min(TITLE_MAX)]
     }
 }
 
@@ -525,10 +890,12 @@ fn new_frame_buf(width: u16, height: u16) -> Option<FrameBuf> {
 pub fn screen() -> Option<(u16, u16)> {
     let ep = endpoint()?;
     let mut rep = [0u8; 4];
-    if crate::call(ep, OP_SCREEN, &[], &mut rep) != 4 {
+    let n = crate::call(ep, OP_SCREEN, &[], &mut rep);
+    if n == crate::NO_CAP {
         return None;
     }
-    Some((u16::from_le_bytes([rep[0], rep[1]]), u16::from_le_bytes([rep[2], rep[3]])))
+    let s = wire::Screen::decode(&rep[..n.min(rep.len())])?;
+    Some((s.w, s.h))
 }
 
 /// Веха 147 — сказать композитору «я запустил вот это, жди окна» ([`OP_LAUNCHING`]).
@@ -551,13 +918,13 @@ pub fn launching(name: &str) -> bool {
 pub fn launch_done(code: usize, tail: &[u8]) -> bool {
     let Some(ep) = endpoint() else { return false };
     let mut req = [0u8; 4 + TAIL_MAX];
-    req[..4].copy_from_slice(&(code as u32).to_le_bytes());
     // Приёмный буфер композитора — килобайт: длинный хвост режем ЗДЕСЬ, чтобы обрезка была
     // видна отправителю, а не случилась молча на той стороне. Берём КОНЕЦ вывода: последние
     // строки перед смертью и объясняют смерть.
     let n = tail.len().min(TAIL_MAX);
-    req[4..4 + n].copy_from_slice(&tail[tail.len() - n..]);
-    crate::call(ep, OP_LAUNCH_DONE, &req[..4 + n], &mut []) != crate::NO_CAP
+    let msg = wire::LaunchDone { code: code as u32, tail: &tail[tail.len() - n..] };
+    let len = msg.encode(&mut req);
+    crate::call(ep, OP_LAUNCH_DONE, &req[..len], &mut []) != crate::NO_CAP
 }
 
 /// Сколько байт вывода уезжает в карточку итога.
@@ -591,37 +958,24 @@ impl Window {
             crate::write_console("[win] окна нет: право на буфер не урезалось\n".as_bytes());
             return None;
         }
-        // Заголовок идёт ХВОСТОМ, поэтому у слоя перед ним на пять байт больше: разбирать
-        // такое сообщение можно с одного прохода, не зная заранее, какой оно длины.
         let mut req = [0u8; 9 + TITLE_MAX];
-        let (op, head) = match spec {
-            None => {
-                req[0..2].copy_from_slice(&width.to_le_bytes());
-                req[2..4].copy_from_slice(&height.to_le_bytes());
-                (OP_CREATE, 4)
-            }
-            Some(l) => {
-                req[0] = l.layer;
-                req[1] = l.anchor;
-                req[2..4].copy_from_slice(&width.to_le_bytes());
-                req[4..6].copy_from_slice(&height.to_le_bytes());
-                req[6..8].copy_from_slice(&l.exclusive.to_le_bytes());
-                req[8] = if l.alpha { LAYER_ALPHA } else { 0 }
-                    | if l.kbd { LAYER_KBD } else { 0 };
-                (OP_LAYER, 9)
-            }
-        };
         let t = title.as_bytes();
-        let n = t.len().min(TITLE_MAX);
-        req[head..head + n].copy_from_slice(&t[..n]);
+        let (op, len) = match spec {
+            None => (OP_CREATE, wire::Create { w: width, h: height, title: t }.encode(&mut req)),
+            Some(spec) => (
+                OP_LAYER,
+                wire::LayerReq { spec, w: width, h: height, title: t }.encode(&mut req),
+            ),
+        };
         let mut rep = [0u8; 4];
-        if crate::call_full(ep, op, &req[..head + n], &mut rep, ro).0 != 4 {
+        let n = crate::call_full(ep, op, &req[..len], &mut rep, ro).0;
+        let Some(id) = (n != crate::NO_CAP).then(|| wire::id(&rep[..n.min(4)])).flatten() else {
             crate::write_console("[win] окна нет: композитор не ответил номером окна\n".as_bytes());
             return None;
-        }
+        };
         Some(Window {
             ep,
-            id: u32::from_le_bytes(rep),
+            id,
             width,
             height,
             buf: fb.va,
@@ -649,11 +1003,9 @@ impl Window {
         let Some(fb) = new_frame_buf(width, height) else { return false };
         let ro = crate::cap_derive(fb.cap, RIGHT_SHARE);
         let mut req = [0u8; 8];
-        req[0..4].copy_from_slice(&self.id.to_le_bytes());
-        req[4..6].copy_from_slice(&width.to_le_bytes());
-        req[6..8].copy_from_slice(&height.to_le_bytes());
+        let len = wire::Rebuf { id: self.id, w: width, h: height }.encode(&mut req);
         if ro == crate::NO_CAP
-            || crate::call_full(self.ep, OP_REBUF, &req, &mut [], ro).0 == crate::NO_CAP
+            || crate::call_full(self.ep, OP_REBUF, &req[..len], &mut [], ro).0 == crate::NO_CAP
         {
             // Не вышло — старый буфер остаётся рабочим, новый отпускаем целиком.
             crate::shm_unmap(fb.cap, fb.va);
@@ -704,12 +1056,8 @@ impl Window {
     /// Сказать «кадр готов» и объявить изменившийся прямоугольник.
     pub fn damage(&self, x: u16, y: u16, w: u16, h: u16) -> bool {
         let mut req = [0u8; 12];
-        req[0..4].copy_from_slice(&self.id.to_le_bytes());
-        req[4..6].copy_from_slice(&x.to_le_bytes());
-        req[6..8].copy_from_slice(&y.to_le_bytes());
-        req[8..10].copy_from_slice(&w.to_le_bytes());
-        req[10..12].copy_from_slice(&h.to_le_bytes());
-        crate::call(self.ep, OP_COMMIT, &req, &mut []) != crate::NO_CAP
+        let len = wire::Commit { id: self.id, x, y, w, h }.encode(&mut req);
+        crate::call(self.ep, OP_COMMIT, &req[..len], &mut []) != crate::NO_CAP
     }
 
     /// Ждать событие. Ответ отложенный: пока событий нет, клиент спит в `SYS_CALL` — ровно так
@@ -735,10 +1083,9 @@ impl Window {
     /// стола) идёт с той же частотой, что и движение окон.
     pub fn next_event_timeout(&self, ms: u32) -> Option<Event> {
         let mut req = [0u8; 8];
-        req[0..4].copy_from_slice(&self.id.to_le_bytes());
-        req[4..8].copy_from_slice(&ms.to_le_bytes());
+        let len = wire::EventReq { id: self.id, ms: Some(ms) }.encode(&mut req);
         let mut rep = [0u8; 16];
-        let n = crate::call(self.ep, OP_EVENT, &req, &mut rep);
+        let n = crate::call(self.ep, OP_EVENT, &req[..len], &mut rep);
         if n == 0 || n == crate::NO_CAP {
             return None;
         }
@@ -755,16 +1102,17 @@ impl Window {
     pub fn status(&self, title: &mut [u8]) -> Option<Status> {
         let mut rep = [0u8; 4 + TITLE_MAX];
         let n = crate::call(self.ep, OP_STATUS, &[], &mut rep);
-        if n == crate::NO_CAP || n < 4 {
+        if n == crate::NO_CAP {
             return None;
         }
-        let t = (n - 4).min(title.len());
-        title[..t].copy_from_slice(&rep[4..4 + t]);
+        let s = wire::Status::decode(&rep[..n.min(rep.len())])?;
+        let t = s.title.len().min(title.len());
+        title[..t].copy_from_slice(&s.title[..t]);
         Some(Status {
-            space: rep[0],
-            spaces: rep[1],
-            layout: rep[2],
-            overview: rep[3] & ST_OVERVIEW != 0,
+            space: s.space,
+            spaces: s.spaces,
+            layout: s.layout,
+            overview: s.overview,
             title_len: t,
         })
     }

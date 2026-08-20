@@ -738,7 +738,7 @@ struct Win {
     /// обоям состояние стола не нужно, и будить их на каждую смену фокуса не за что.
     watching: bool,
     /// События, накопленные до того, как клиент спросил.
-    inbox: Vec<[u8; 8]>,
+    inbox: Vec<win::Event>,
     /// Что рисуется сейчас (Веха 125). Между `shown` и рамкой из раскладки и живёт анимация.
     shown: Shown,
     /// Откуда началось нынешнее движение и куда идёт.
@@ -824,6 +824,33 @@ struct LayerCfg {
     alpha: bool,
     /// Веха 146 — поверхности нужна клавиатура (`win::LAYER_KBD`): клавиши идут ей, а не окну.
     kbd: bool,
+}
+
+/// Разобрать тело запроса — или ответить пусто и уйти (Веха 148.4).
+///
+/// Не разобралось — значит сообщение короче, чем говорит его операция. Отвечаем ПУСТО, а не
+/// молчим: молчание повесило бы вызвавшего навсегда, а падать из-за чужого кривого запроса
+/// композитору нельзя вовсе — вместе с ним пропадёт экран.
+macro_rules! body {
+    ($m:expr, $e:expr) => {
+        match $e {
+            Some(v) => v,
+            None => {
+                sys::reply($m.reply_cap, &[]);
+                return;
+            }
+        }
+    };
+}
+
+/// Отправить событие ответом на отложенный `OP_EVENT` или на `OP_POLL`.
+///
+/// Байтами событие становится ровно здесь и ровно одним способом — [`win::Event::encode`],
+/// который лежит рядом с разбором на клиентской стороне.
+fn reply_event(cap: usize, e: win::Event) {
+    let mut b = [0u8; 8];
+    let n = e.encode(&mut b);
+    sys::reply(cap, &b[..n]);
 }
 
 impl Win {
@@ -2234,8 +2261,7 @@ impl Wm {
         }
         for (id, w, h) in resized {
             if let Some(k) = self.win_at(id) {
-                let ev = [win::EV_RESIZE, w as u8, (w >> 8) as u8, h as u8, (h >> 8) as u8, 0, 0, 0];
-                self.send(k, ev, 5);
+                self.send(k, win::Event::Resize { w: w as u16, h: h as u16 });
             }
         }
         self.damage(0, 0, self.info.width as i32, screen_h);
@@ -2832,9 +2858,7 @@ impl Wm {
             }) {
                 let (ox, oy) = self.wins[i].content_at();
                 let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
-                let ev = [win::EV_WHEEL, lx as u8, (lx >> 8) as u8, ly as u8, (ly >> 8) as u8,
-                          e.wheel as u8, 0, 0];
-                self.send(i, ev, 6);
+                self.send(i, win::Event::Wheel { x: lx, y: ly, delta: e.wheel as i8 });
             }
         }
         if e.wheel != 0 && (self.overview || self.super_held) {
@@ -2868,8 +2892,7 @@ impl Wm {
         let now_id = under.map(|i| self.wins[i].id);
         if self.hover != now_id {
             if let Some(k) = self.hover.and_then(|h| self.wins.iter().position(|w| w.id == h)) {
-                let ev = [win::EV_MOTION, 0xff, 0xff, 0xff, 0xff, 0, 0, 0];
-                self.send(k, ev, 5);
+                self.send(k, win::Event::GONE);
             }
             self.hover = now_id;
         }
@@ -2877,13 +2900,15 @@ impl Wm {
             let (ox, oy) = self.wins[i].content_at();
             let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
             if was != e.buttons {
-                let ev = [win::EV_BUTTON, lx as u8, (lx >> 8) as u8, ly as u8, (ly >> 8) as u8,
-                          e.buttons, (e.buttons != 0) as u8, 0];
-                self.send(i, ev, 7);
+                let ev = win::Event::Button {
+                    x: lx,
+                    y: ly,
+                    buttons: e.buttons,
+                    down: e.buttons != 0,
+                };
+                self.send(i, ev);
             } else {
-                let ev = [win::EV_MOTION, lx as u8, (lx >> 8) as u8, ly as u8, (ly >> 8) as u8,
-                          0, 0, 0];
-                self.send(i, ev, 5);
+                self.send(i, win::Event::Motion { x: lx, y: ly });
             }
         }
     }
@@ -2923,19 +2948,9 @@ impl Wm {
         // Аккорды разобраны ВЫШЕ и работают по-прежнему. Это осознанный выбор, а не упущение:
         // строка запуска не должна отнимать у человека управление системой, пока она открыта.
         // Экрану блокировки будет нужно обратное — записано в [[known-gaps]].
+        let ev = win::Event::Key { sym: e.sym, mods: e.mods, ch: e.ch, down: e.down };
         if let Some(i) = self.wins.iter().rposition(|w| w.grabs_kbd() && w.visible) {
-            let ch = e.ch;
-            let ev = [
-                win::EV_KEY,
-                e.sym as u8,
-                (e.sym >> 8) as u8,
-                e.mods,
-                ch as u8,
-                (ch >> 8) as u8,
-                e.down as u8,
-                0,
-            ];
-            self.send(i, ev, 7);
+            self.send(i, ev);
             return;
         }
         // Веха 127: клавиша уходит в окно ЦЕЛИКОМ — код, модификаторы, символ. Прежде здесь
@@ -2944,18 +2959,7 @@ impl Wm {
         // клавиши терминала.
         let Some(id) = self.focus else { return };
         let Some(i) = self.wins.iter().position(|w| w.id == id) else { return };
-        let ch = e.ch;
-        let ev = [
-            win::EV_KEY,
-            e.sym as u8,
-            (e.sym >> 8) as u8,
-            e.mods,
-            ch as u8,
-            (ch >> 8) as u8,
-            e.down as u8,
-            0,
-        ];
-        self.send(i, ev, 7);
+        self.send(i, ev);
     }
 
     /// Выполнить действие раскладки.
@@ -2988,7 +2992,7 @@ impl Wm {
             // наш ребёнок, но убитая молча она не отличалась бы от упавшей.
             "launcher-toggle" => {
                 if let Some(i) = self.wins.iter().rposition(|w| w.grabs_kbd() && w.visible) {
-                    self.send(i, [win::EV_CLOSE, 0, 0, 0, 0, 0, 0, 0], 1);
+                    self.send(i, win::Event::Close);
                 } else if sys::spawn_with_endpoint(store, b"launcher", &[], me, b"WM\0").is_none() {
                     sys::write_console("[wm] строка запуска не запустилась\n".as_bytes());
                 }
@@ -3008,7 +3012,7 @@ impl Wm {
                             self.sync_focus();
                             self.relayout();
                         } else {
-                            self.send(i, [win::EV_CLOSE, 0, 0, 0, 0, 0, 0, 0], 1);
+                            self.send(i, win::Event::Close);
                         }
                     }
                 }
@@ -3218,7 +3222,7 @@ impl Wm {
         self.status = now;
         for i in 0..self.wins.len() {
             if self.wins[i].watching {
-                self.send(i, [win::EV_STATUS, 0, 0, 0, 0, 0, 0, 0], 1);
+                self.send(i, win::Event::Status);
             }
         }
     }
@@ -3252,11 +3256,14 @@ impl Wm {
     }
 
     /// Отдать событие клиенту: сразу, если он ждёт, иначе в очередь.
-    fn send(&mut self, i: usize, ev: [u8; 8], len: usize) {
+    ///
+    /// Веха 148.4 — событие здесь СОБЫТИЕ, а не восемь байт с длиной в восьмом. Байтами оно
+    /// становится в одном месте — [`win::Event::encode`], рядом с разбором на той стороне.
+    fn send(&mut self, i: usize, ev: win::Event) {
         match self.wins[i].waiting.take() {
             Some(cap) => {
                 self.wins[i].wait_until = None; // ждать больше нечего — срок снимаем вместе с ним
-                sys::reply(cap, &ev[..len]);
+                reply_event(cap, ev);
             }
             None => {
                 // Веха 148.2 — ДВИЖЕНИЯ СЛИПАЮТСЯ. Если последним в очереди уже лежит движение,
@@ -3267,13 +3274,10 @@ impl Wm {
                 //
                 // Заменяем ТОЛЬКО последнее: так порядок с нажатиями и клавишами не рушится —
                 // движение, стоящее перед кнопкой, остаётся перед ней.
-                if ev[0] == win::EV_MOTION {
+                if matches!(ev, win::Event::Motion { .. }) {
                     if let Some(last) = self.wins[i].inbox.last_mut() {
-                        if last[0] == win::EV_MOTION {
-                            let mut rec = [0u8; 8];
-                            rec[..len].copy_from_slice(&ev[..len]);
-                            rec[7] = len as u8;
-                            *last = rec;
+                        if matches!(last, win::Event::Motion { .. }) {
+                            *last = ev;
                             return;
                         }
                     }
@@ -3282,12 +3286,9 @@ impl Wm {
                 // их сотнями значит показывать клиенту прошлое), а клавиши терять нельзя —
                 // человек их уже нажал. Строка, вставленная в консоль целиком, приезжает
                 // десятками байт разом, и потолок в 16 съедал её середину.
-                let cap = if ev[0] == win::EV_KEY { 256 } else { 16 };
+                let cap = if matches!(ev, win::Event::Key { .. }) { 256 } else { 16 };
                 if self.wins[i].inbox.len() < cap {
-                    let mut rec = [0u8; 8];
-                    rec[..len].copy_from_slice(&ev[..len]);
-                    rec[7] = len as u8;
-                    self.wins[i].inbox.push(rec);
+                    self.wins[i].inbox.push(ev);
                 }
             }
         }
@@ -3360,8 +3361,8 @@ impl Wm {
         self.damage(old.0, old.1, old.2, old.3);
         self.damage(rx, ry, rw, rh);
         if (rw, rh) != (p.w, p.h) {
-            let ev = [win::EV_RESIZE, rw as u8, (rw >> 8) as u8, rh as u8, (rh >> 8) as u8, 0, 0, 0];
-            self.send(i, ev, 5);
+            let ev = win::Event::Resize { w: rw as u16, h: rh as u16 };
+            self.send(i, ev);
         }
     }
 
@@ -3458,11 +3459,18 @@ impl Wm {
     fn request(&mut self, m: &sys::Message, buf: &[u8]) {
         let op = m.op & 0xff;
         let len = m.len.min(buf.len());
+        // Тело запроса — РОВНО присланные байты, и разбирается оно описанием протокола
+        // (`win::wire`), а не индексами здесь. Веха 148.4; до неё поля брались по смещению без
+        // оглядки на длину, а приёмный буфер один на все запросы — короткий запрос читался
+        // вперемешку с хвостом предыдущего, и `OP_DESTROY` без номера закрывал случайное чужое
+        // окно. `OP_CREATE` короче четырёх байт вовсе ронял композитор, то есть весь экран.
+        let req = &buf[..len];
         match op {
             win::OP_CREATE => {
-                let w = u16::from_le_bytes([buf[0], buf[1]]).clamp(32, 1600) as i32;
-                let h = u16::from_le_bytes([buf[2], buf[3]]).clamp(32, 1200) as i32;
-                let title = core::str::from_utf8(&buf[4..len]).unwrap_or("окно");
+                let c = body!(m, win::wire::Create::decode(req));
+                let w = c.w.clamp(32, 1600) as i32;
+                let h = c.h.clamp(32, 1200) as i32;
+                let title = core::str::from_utf8(c.title).unwrap_or("окно");
                 let id = self.next_id;
                 self.next_id += 1;
                 // Веха 147 — не ждёт ли это окно ПЛИТКА? Тогда оно займёт её место в ленте, а не
@@ -3548,22 +3556,20 @@ impl Wm {
             // Веха 139 — ПОВЕРХНОСТЬ СЛОЯ: обои, бар, панель. Отличий от окна ровно два — место
             // назначает не раскладка, а якорь, и в ленту она не встаёт.
             win::OP_LAYER => {
+                let l = body!(m, win::wire::LayerReq::decode(req));
                 let spec = LayerCfg {
-                    layer: buf[0].min(win::LAYER_OVERLAY),
-                    anchor: buf[1],
+                    layer: l.spec.layer,
+                    anchor: l.spec.anchor,
                     // Занятая зона не может превышать экран: клиент присылает что угодно.
-                    exclusive: (u16::from_le_bytes([buf[6], buf[7]]) as i32)
+                    exclusive: (l.spec.exclusive as i32)
                         .min(self.info.height as i32)
                         .min(self.info.width as i32),
-                    // Веха 144 — байт флагов. Читаем его по ДЛИНЕ сообщения, а не по индексу:
-                    // приёмный буфер фиксированный, и за `len` в нём лежит мусор от прошлого
-                    // запроса — прочитав его, мы бы включали смешивание случайным клиентам.
-                    alpha: len > 8 && buf[8] & win::LAYER_ALPHA != 0,
-                    kbd: len > 8 && buf[8] & win::LAYER_KBD != 0,
+                    alpha: l.spec.alpha,
+                    kbd: l.spec.kbd,
                 };
-                let w = u16::from_le_bytes([buf[2], buf[3]]).max(1) as i32;
-                let h = u16::from_le_bytes([buf[4], buf[5]]).max(1) as i32;
-                let title = core::str::from_utf8(buf.get(9..len).unwrap_or(&[])).unwrap_or("слой");
+                let w = l.w.max(1) as i32;
+                let h = l.h.max(1) as i32;
+                let title = core::str::from_utf8(l.title).unwrap_or("слой");
                 let id = self.next_id;
                 self.next_id += 1;
                 let (buf, buf_len, slot) = self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0));
@@ -3618,9 +3624,7 @@ impl Wm {
                 // ещё не успело перерисоваться (Веха 126.1).
                 if (rw, rh) != (w, h) {
                     let k = self.wins.len() - 1;
-                    let ev = [win::EV_RESIZE, rw as u8, (rw >> 8) as u8, rh as u8, (rh >> 8) as u8,
-                              0, 0, 0];
-                    self.send(k, ev, 5);
+                    self.send(k, win::Event::Resize { w: rw as u16, h: rh as u16 });
                 }
                 self.damage(rx, ry, rw, rh);
                 // Зона могла отнять место у ленты — пересчёт раскладки внутри.
@@ -3630,9 +3634,12 @@ impl Wm {
             // права на сам фреймбуфер у них нет и быть не должно.
             win::OP_SCREEN => {
                 let mut rep = [0u8; 4];
-                rep[0..2].copy_from_slice(&(self.info.width as u16).to_le_bytes());
-                rep[2..4].copy_from_slice(&(self.info.height as u16).to_le_bytes());
-                sys::reply(m.reply_cap, &rep);
+                let s = win::wire::Screen {
+                    w: self.info.width as u16,
+                    h: self.info.height as u16,
+                };
+                let n = s.encode(&mut rep);
+                sys::reply(m.reply_cap, &rep[..n]);
             }
             // Веха 129 — НОВЫЙ буфер под изменившийся размер.
             //
@@ -3642,9 +3649,8 @@ impl Wm {
             // композитор показывал ПУСТУЮ область. На панели это видно прямо: открываешь меню,
             // и она на миг пропадает.
             win::OP_REBUF => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let w = u16::from_le_bytes([buf[4], buf[5]]) as i32;
-                let h = u16::from_le_bytes([buf[6], buf[7]]) as i32;
+                let r = body!(m, win::wire::Rebuf::decode(req));
+                let (id, w, h) = (r.id, r.w as i32, r.h as i32);
                 if let Some(i) = self.wins.iter().position(|x| x.id == id) {
                     // Второй `OP_REBUF` без кадра между ними: предыдущий запас не показали и уже
                     // не покажем — отпускаем, иначе слот окна ВА утёк бы.
@@ -3659,9 +3665,9 @@ impl Wm {
                 sys::reply(m.reply_cap, &[]);
             }
             win::OP_COMMIT => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let c = body!(m, win::wire::Commit::decode(req));
                 sys::reply(m.reply_cap, &[]);
-                if let Some(i) = self.wins.iter().position(|w| w.id == id) {
+                if let Some(i) = self.wins.iter().position(|w| w.id == c.id) {
                     // Веха 147.1 — вот он, первый кадр в новом буфере: показываем его целиком
                     // (буфер + место поверхности) ДО разбора повреждения, иначе прямоугольник
                     // считался бы в координатах уже неактуального кадра.
@@ -3679,10 +3685,8 @@ impl Wm {
                         let to = Shown { x: rx, y: ry, w: rw, h: rh, a: 256 };
                         self.wins[i].start(to, d, sys::monotonic_ns());
                     }
-                    let dx = u16::from_le_bytes([buf[4], buf[5]]) as i32;
-                    let dy = u16::from_le_bytes([buf[6], buf[7]]) as i32;
-                    let dw = u16::from_le_bytes([buf[8], buf[9]]) as i32;
-                    let dh = u16::from_le_bytes([buf[10], buf[11]]) as i32;
+                    let (dx, dy) = (c.x as i32, c.y as i32);
+                    let (dw, dh) = (c.w as i32, c.h as i32);
                     // Прямоугольник клиента — в КООРДИНАТАХ ЭКРАНА, а это не то же самое, что его
                     // место в раскладке. Считать надо от ПОКАЗАННОГО положения (`shown`) за
                     // вычетом сдвига ленты: лента длиннее экрана и по нему ездит.
@@ -3735,23 +3739,20 @@ impl Wm {
             }
             // Неблокирующий опрос: у клиента свой реактор, спать в нашем вызове он не может.
             win::OP_POLL => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let id = body!(m, win::wire::id(req));
                 let ev = self.wins.iter_mut().find(|w| w.id == id).and_then(|w| {
                     (!w.inbox.is_empty()).then(|| w.inbox.remove(0))
                 });
                 match ev {
-                    Some(rec) => {
-                        let n = (rec[7] as usize).min(7);
-                        sys::reply(m.reply_cap, &rec[..n]);
-                    }
+                    Some(e) => reply_event(m.reply_cap, e),
                     None => {
                         sys::reply(m.reply_cap, &[]);
                     }
                 }
             }
             win::OP_EVENT => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let Some(i) = self.wins.iter().position(|w| w.id == id) else {
+                let r = body!(m, win::wire::EventReq::decode(req));
+                let Some(i) = self.wins.iter().position(|w| w.id == r.id) else {
                     sys::reply(m.reply_cap, &[]);
                     return;
                 };
@@ -3765,55 +3766,52 @@ impl Wm {
                 };
                 match first {
                     // Есть накопленное — отвечаем сразу.
-                    Some(rec) => {
-                        let n = rec[7] as usize;
-                        sys::reply(m.reply_cap, &rec[..n.min(7)]);
-                    }
+                    Some(e) => reply_event(m.reply_cap, e),
                     // Пусто — ответ ОТКЛАДЫВАЕТСЯ: клиент спит в `SYS_CALL`, как в чтении stdin.
                     None => {
                         self.wins[i].waiting = Some(m.reply_cap);
                         // Веха 140 — необязательный СРОК хвостом запроса: часам в баре надо
                         // проснуться через минуту, а минута — не событие. Нет хвоста — ждём
                         // бессрочно, как ждали все клиенты до бара.
-                        self.wins[i].wait_until = (len >= 8).then(|| {
-                            let ms = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
-                            sys::monotonic_ns() + ms * 1_000_000
-                        });
+                        self.wins[i].wait_until =
+                            r.ms.map(|ms| sys::monotonic_ns() + ms as u64 * 1_000_000);
                     }
                 }
             }
             // Веха 140 — СОСТОЯНИЕ рабочего места для бара: стол, сколько столов, заголовок окна
             // в фокусе. Заголовок здесь, а не в событии, потому что событие — семь байт.
             win::OP_STATUS => {
-                let mut rep = Vec::with_capacity(4 + win::TITLE_MAX);
-                rep.push(self.space as u8);
-                rep.push(self.space_count().min(255) as u8);
-                // Веха 143 — раскладка третьим байтом. Спрашивать её у ядра самой панели не
-                // годится: `SYS_KEYMAP` отвечает всем, но панель узнаёт об ИЗМЕНЕНИИ только от
-                // композитора, и брать два разных источника для одного числа значит развести их.
-                rep.push(sys::keymap().min(255) as u8);
-                // Веха 145 — флаги. Сегодня в них один бит: идёт ли обзор. Панели он нужен не
-                // для вида — в обзоре мышь слоям не отдают вовсе, и открытое меню осталось бы
-                // на экране навсегда: закрывать его кликом было бы нечем.
-                rep.push(if self.overview { win::ST_OVERVIEW } else { 0 });
-                if let Some(id) = self.focus {
-                    if let Some(w) = self.wins.iter().find(|w| w.id == id) {
-                        let t = w.title.as_bytes();
-                        rep.extend_from_slice(&t[..t.len().min(win::TITLE_MAX)]);
-                    }
-                }
-                sys::reply(m.reply_cap, &rep);
+                let title = self
+                    .focus
+                    .and_then(|id| self.wins.iter().find(|w| w.id == id))
+                    .map_or(&[][..], |w| w.title.as_bytes());
+                let s = win::wire::Status {
+                    space: self.space as u8,
+                    spaces: self.space_count().min(255) as u8,
+                    // Веха 143 — раскладка. Спрашивать её у ядра самой панели не годится:
+                    // `SYS_KEYMAP` отвечает всем, но панель узнаёт об ИЗМЕНЕНИИ только от
+                    // композитора, и два источника одного числа однажды разойдутся.
+                    layout: sys::keymap().min(255) as u8,
+                    // Веха 145 — идёт ли обзор. Панели это нужно не для вида: в обзоре мышь
+                    // слоям не отдают вовсе, и открытое меню осталось бы на экране навсегда —
+                    // закрывать его кликом было бы нечем.
+                    overview: self.overview,
+                    title,
+                };
+                let mut rep = [0u8; 4 + win::TITLE_MAX];
+                let n = s.encode(&mut rep);
+                sys::reply(m.reply_cap, &rep[..n]);
             }
             // Веха 140 — подписка на `EV_STATUS`.
             win::OP_WATCH => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let id = body!(m, win::wire::id(req));
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
                     self.wins[i].watching = true;
                 }
                 sys::reply(m.reply_cap, &[]);
                 // Первое состояние — сразу: иначе бар до первой смены стола показывал бы пустоту.
                 if let Some(i) = self.wins.iter().position(|w| w.id == id) {
-                    self.send(i, [win::EV_STATUS, 0, 0, 0, 0, 0, 0, 0], 1);
+                    self.send(i, win::Event::Status);
                 }
             }
             // Веха 144 — переключить раскладку (клик по буквам в баре). Тем же вызовом, что и
@@ -3827,7 +3825,7 @@ impl Wm {
             // Веха 140 — переключить стол (клик по столу в баре). Тем же путём, что аккорд
             // `Super+N`: второй способ сделать то же самое разошёлся бы с первым.
             win::OP_SPACE => {
-                let n = buf[0] as usize;
+                let n = body!(m, win::wire::Rd::new(req).u8()) as usize;
                 sys::reply(m.reply_cap, &[]);
                 self.goto_space(n);
             }
@@ -3837,7 +3835,7 @@ impl Wm {
                 // отсюда нельзя, а свой — не нужно. Плитка при этом заводится ДО `SYS_SPAWN`,
                 // поэтому номера запускаемого ещё и не существует.
                 let pid = m.sender;
-                let name = core::str::from_utf8(buf.get(..len).unwrap_or(&[])).unwrap_or("?");
+                let name = core::str::from_utf8(req).unwrap_or("?");
                 let id = self.next_id;
                 self.next_id += 1;
                 let now = sys::monotonic_ns();
@@ -3894,8 +3892,8 @@ impl Wm {
             // сообщать незачем.
             win::OP_LAUNCH_DONE => {
                 let pid = m.sender;
-                let code = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let tail = core::str::from_utf8(buf.get(4..len).unwrap_or(&[])).unwrap_or("");
+                let d = body!(m, win::wire::LaunchDone::decode(req));
+                let (code, tail) = (d.code, core::str::from_utf8(d.tail).unwrap_or(""));
                 sys::reply(m.reply_cap, &[]);
                 if let Some(k) = self.wins.iter().position(|w| {
                     w.launch.as_ref().is_some_and(|l| l.pid == pid && l.done.is_none())
@@ -3907,7 +3905,7 @@ impl Wm {
                 }
             }
             win::OP_DESTROY => {
-                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let id = body!(m, win::wire::id(req));
                 sys::reply(m.reply_cap, &[]);
                 if self.win_at(id).is_some() {
                     self.begin_close(id);
