@@ -33,6 +33,12 @@ const DEV_NET_TRANSITIONAL: u16 = 0x1000;
 const DEV_RNG_MODERN: u16 = 0x1044;
 const DEV_RNG_TRANSITIONAL: u16 = 0x1005;
 
+const VENDOR_INTEL: u16 = 0x8086;
+/// Веха 49 — Intel PRO/1000: 0x100e (82540EM, то что даёт QEMU `-device e1000`), 0x10d3
+/// (82574L, «e1000e»), 0x100f (82545EM). Список один на поиск карты и на настройку её INTx:
+/// разойдясь, они дали бы «карта есть, а прерывания у неё нет».
+const E1000_IDS: [u16; 3] = [0x100e, 0x10d3, 0x100f];
+
 #[inline]
 fn outl(port: u16, v: u32) {
     unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack)) }
@@ -45,47 +51,158 @@ fn inl(port: u16) -> u32 {
     v
 }
 
-/// Адрес конфиг-регистра `off` устройства `dev` (шина 0, функция 0) для порта 0xCF8.
-fn cfg_addr(dev: u32, off: u32) -> u32 {
-    0x8000_0000 | dev << 11 | (off & 0xfc)
-}
+// ─── адрес функции на шине и доступ к её конфигу ─────────────────────────────
+//
+// Веха 148.9 — ОДИН тип вместо трёх семейств аксессоров. Их было три, и различались они ровно
+// сборкой адреса: `cfg_r32` знала шину 0 и функцию 0 (`dev << 11`), `…f` умела функцию
+// (`slot << 8`), `…b` — ещё и шину (`bus << 16 | slot << 8`). Это одно и то же число, записанное
+// трижды: `dev << 11` есть `(dev << 3) << 8`, а функция и шина просто добавляют свои поля.
+// Цена копий была не в байтах, а в развилке на каждом новом месте: «а этому устройству каким
+// семейством ходить?» — и ответ «тем, где шину видно» приходил уже после того, как карту за
+// мостом PCIe не нашли.
 
-fn cfg_r32(dev: u32, off: u32) -> u32 {
-    outl(CFG_ADDR, cfg_addr(dev, off));
-    inl(CFG_DATA)
-}
+/// Функция на шине PCI: `bus:dev.func`, упакованные как у самого железа.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Bdf(u16);
 
-fn cfg_w32(dev: u32, off: u32, v: u32) {
-    outl(CFG_ADDR, cfg_addr(dev, off));
-    outl(CFG_DATA, v);
-}
-
-fn cfg_r16(dev: u32, off: u32) -> u16 {
-    (cfg_r32(dev, off & !3) >> ((off & 3) * 8)) as u16
-}
-
-fn cfg_r8(dev: u32, off: u32) -> u8 {
-    (cfg_r32(dev, off & !3) >> ((off & 3) * 8)) as u8
-}
-
-/// Записать 16 бит через чтение-модификацию dword'а (порт 0xCFC — 32-битный).
-fn cfg_w16(dev: u32, off: u32, v: u16) {
-    let (a, sh) = (off & !3, (off & 3) * 8);
-    let old = cfg_r32(dev, a);
-    cfg_w32(dev, a, (old & !(0xffff << sh)) | (v as u32) << sh);
-}
-
-/// Прочитать адрес memory-BAR `idx` (64-битные — из пары регистров). 0 — не назначен/IO.
-fn bar_addr(dev: u32, idx: u8) -> usize {
-    let lo = cfg_r32(dev, 0x10 + 4 * idx as u32);
-    if lo & 1 != 0 {
-        return 0; // I/O BAR — не используем
+impl Bdf {
+    fn new(bus: u32, dev: u32, func: u32) -> Bdf {
+        Bdf((bus << 8 | dev << 3 | func) as u16)
     }
-    let mut addr = (lo & !0xf) as u64;
-    if lo & 0x4 != 0 {
-        addr |= (cfg_r32(dev, 0x14 + 4 * idx as u32) as u64) << 32;
+
+    fn bus(self) -> u32 {
+        self.0 as u32 >> 8
     }
-    addr as usize
+
+    fn dev(self) -> u32 {
+        self.0 as u32 >> 3 & 0x1f
+    }
+
+    fn func(self) -> u32 {
+        self.0 as u32 & 7
+    }
+
+    /// Адрес регистра `off` для порта 0xCF8. Смещение выравнивается по dword'у — порт данных
+    /// 0xCFC 32-битный, и других обращений у механизма конфигурации нет.
+    fn addr(self, off: u32) -> u32 {
+        0x8000_0000 | (self.0 as u32) << 8 | (off & 0xfc)
+    }
+
+    fn r32(self, off: u32) -> u32 {
+        outl(CFG_ADDR, self.addr(off));
+        inl(CFG_DATA)
+    }
+
+    fn w32(self, off: u32, v: u32) {
+        outl(CFG_ADDR, self.addr(off));
+        outl(CFG_DATA, v);
+    }
+
+    fn r16(self, off: u32) -> u16 {
+        (self.r32(off) >> ((off & 3) * 8)) as u16
+    }
+
+    fn r8(self, off: u32) -> u8 {
+        (self.r32(off) >> ((off & 3) * 8)) as u8
+    }
+
+    /// 16 бит пишутся чтением-модификацией dword'а — по той же причине, по какой адрес
+    /// выравнивается.
+    fn w16(self, off: u32, v: u16) {
+        let sh = (off & 3) * 8;
+        let old = self.r32(off);
+        self.w32(off, (old & !(0xffff << sh)) | (v as u32) << sh);
+    }
+
+    /// Идентификаторы `(vendor, device)`. `None` — на этот адрес никто не отвечает.
+    fn id(self) -> Option<(u16, u16)> {
+        let id = self.r32(0);
+        let vendor = id as u16;
+        (vendor != 0xffff && vendor != 0).then(|| (vendor, (id >> 16) as u16))
+    }
+
+    /// `(class, subclass, prog-if)` — чем устройство себя объявляет.
+    fn class(self) -> (u8, u8, u8) {
+        let cc = self.r32(0x08);
+        ((cc >> 24) as u8, (cc >> 16) as u8, (cc >> 8) as u8)
+    }
+
+    /// Физическая база memory-BAR `idx` (64-битные — из пары регистров). `0` — окно не назначено
+    /// прошивкой либо BAR в пространстве ввода-вывода: регистров там нет, отображать нечего.
+    fn bar(self, idx: u8) -> usize {
+        let lo = self.r32(0x10 + 4 * idx as u32);
+        if lo & 1 != 0 {
+            return 0;
+        }
+        let mut addr = (lo & !0xf) as u64;
+        if lo & 0x4 != 0 {
+            addr |= (self.r32(0x14 + 4 * idx as u32) as u64) << 32;
+        }
+        addr as usize
+    }
+
+    /// Память + bus-master (DMA). Верхняя половина dword'а команды — status (биты RW1C);
+    /// запись прочитанного их сбрасывает, и это безвредно.
+    fn enable(self) {
+        self.w16(0x04, self.r16(0x04) | 0x6);
+    }
+}
+
+// ─── обход шины ──────────────────────────────────────────────────────────────
+
+/// Только шина 0 — q35 и всё, что на ней стоит.
+const BUS0: u32 = 0;
+/// Все шины: на живой машине почти всё интересное сидит за мостами PCIe, каждый со своей.
+const ALL_BUSES: u32 = 255;
+
+/// Обойти шины `0..=last_bus` и вернуть первое, на чём `f` дала ответ.
+///
+/// Одно место, где записано правило «функции 1..7 существуют только у многофункционального
+/// устройства» (бит 7 header type). Прежде оно было переписано в четырёх обходах, и все четыре
+/// расходились в мелочах: `dump` читал header type РАНЬШЕ, чем проверял, отвечает ли функция 0,
+/// а поиск virtio смотрел вообще только функцию 0 — устройство на функции 1 для него не
+/// существовало.
+///
+/// Перебор, а не спуск по мостам: спуск точнее, но требует разбора secondary/subordinate у
+/// каждого моста, а ошибка в нём выглядит как «устройства нет» — то есть как раз то, что ищем.
+/// Несуществующая шина отвечает одними единицами, так что перебор пропустить ничего не может.
+fn find<T>(last_bus: u32, mut f: impl FnMut(Bdf) -> Option<T>) -> Option<T> {
+    for bus in 0..=last_bus {
+        for dev in 0..32u32 {
+            let first = Bdf::new(bus, dev, 0);
+            if first.id().is_none() {
+                continue; // нет функции 0 — устройства в слоте нет вовсе
+            }
+            let funcs = if first.r8(0x0e) & 0x80 != 0 { 8 } else { 1 };
+            for func in 0..funcs {
+                let d = Bdf::new(bus, dev, func);
+                if d.id().is_none() {
+                    continue;
+                }
+                if let Some(v) = f(d) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Обойти всё, ни на чём не останавливаясь.
+fn for_each(last_bus: u32, mut f: impl FnMut(Bdf)) {
+    find(last_bus, |d| {
+        f(d);
+        None::<()>
+    });
+}
+
+/// Первая функция с такими идентификаторами. Список device id, а не один: одна и та же карта
+/// приезжает под несколькими (`e1000` — три, virtio — modern и transitional).
+fn find_id(last_bus: u32, vendor: u16, devices: &[u16]) -> Option<Bdf> {
+    find(last_bus, |d| {
+        let (v, dev) = d.id()?;
+        (v == vendor && devices.contains(&dev)).then_some(d)
+    })
 }
 
 // ─── опись шины (Веха 130) ───────────────────────────────────────────────────
@@ -97,22 +214,6 @@ fn bar_addr(dev: u32, idx: u8) -> usize {
 //
 // Опись идёт в ЖУРНАЛ ЯДРА, а не в serial: у ноутбука COM-порта нет, и `bin/klog` — единственный
 // способ прочитать сказанное ядром (ровно для этого журнал и заводился, Веха 116).
-
-/// Адрес конфиг-регистра с УЧЁТОМ ШИНЫ. Обе прежние версии (`cfg_addr`, `cfg_addr_f`) знают
-/// только шину 0 — на q35 этого достаточно, а на живой машине почти всё интересное сидит за
-/// мостами PCIe, каждый со своей шиной.
-fn cfg_addr_bdf(bus: u32, slot: u32, off: u32) -> u32 {
-    0x8000_0000 | bus << 16 | slot << 8 | (off & 0xfc)
-}
-
-fn cfg_r32b(bus: u32, slot: u32, off: u32) -> u32 {
-    outl(CFG_ADDR, cfg_addr_bdf(bus, slot, off));
-    inl(CFG_DATA)
-}
-
-fn cfg_r8b(bus: u32, slot: u32, off: u32) -> u8 {
-    (cfg_r32b(bus, slot, off & !3) >> ((off & 3) * 8)) as u8
-}
 
 /// Имя класса устройства по (class, subclass) — только то, что различаешь глазами при
 /// bring-up'е. Незнакомое печатается кодом: врать именем хуже, чем сказать «не знаю».
@@ -177,57 +278,34 @@ fn vendor_name(v: u16) -> &'static str {
 /// Напечатать ВСЁ, что отвечает на шине PCI: адрес, идентификаторы, класс, подсистему и первый
 /// назначенный BAR. Это первое, что смотришь на незнакомой машине.
 ///
-/// Обход перебором шин 0..=255 вместо спуска по мостам. Спуск точнее, но требует разбора
-/// secondary/subordinate у каждого моста, а ошибка в нём выглядит как «устройства нет» — то есть
-/// как раз то, что мы ищем. Перебор же не может ничего пропустить: несуществующая шина отвечает
-/// одними единицами. Цена — восемь тысяч чтений портов на загрузку, единицы миллисекунд.
+/// Цена обхода — восемь тысяч чтений портов на загрузку, единицы миллисекунд.
 pub fn dump() {
     let mut count = 0usize;
     // Сетевые карты собираем отдельной строкой: на ноутбуке опись — это два десятка строк, а
     // вопрос сейчас ровно один. Пусть ответ будет виден сразу, а не выискивался глазами.
     let mut nets = [(0u16, 0u16, 0u8); 8];
     let mut nnet = 0usize;
-    for bus in 0..=255u32 {
-        for dev in 0..32u32 {
-            // Функции 1..7 существуют только у многофункциональных устройств (бит 7 header type).
-            let multi = cfg_r8b(bus, dev << 3, 0x0e) & 0x80 != 0;
-            let funcs = if multi { 8 } else { 1 };
-            for func in 0..funcs {
-                let slot = dev << 3 | func;
-                let id = cfg_r32b(bus, slot, 0);
-                let (vendor, device) = (id as u16, (id >> 16) as u16);
-                if vendor == 0xffff || vendor == 0 {
-                    continue;
-                }
-                let cls = cfg_r32b(bus, slot, 0x08);
-                let (class, sub, progif) = ((cls >> 24) as u8, (cls >> 16) as u8, (cls >> 8) as u8);
-                let sub_id = cfg_r32b(bus, slot, 0x2c);
-                let irq = cfg_r8b(bus, slot, 0x3c);
-                // Первый ненулевой BAR: по нему видно, отдала ли прошивка устройству окно
-                // памяти (без окна драйвер писать не по чему).
-                let mut bar = 0u32;
-                for i in 0..6u32 {
-                    let b = cfg_r32b(bus, slot, 0x10 + 4 * i);
-                    if b != 0 && b & 1 == 0 {
-                        bar = b & !0xf;
-                        break;
-                    }
-                }
-                crate::println!(
-                    "  [pci] {:02x}:{:02x}.{} {:04x}:{:04x} {:5} {:16} класс {:02x}{:02x}{:02x} подсист {:04x}:{:04x} bar {:#010x} irq {}",
-                    bus, dev, func, vendor, device, vendor_name(vendor),
-                    class_name(class, sub), class, sub, progif,
-                    sub_id as u16, (sub_id >> 16) as u16, bar, irq,
-                );
-                count += 1;
-                // Класс 02 — Ethernet и родня, 0d/80 — беспроводное.
-                if (class == 0x02 || (class == 0x0d && sub == 0x80)) && nnet < nets.len() {
-                    nets[nnet] = (vendor, device, sub);
-                    nnet += 1;
-                }
-            }
+    for_each(ALL_BUSES, |d| {
+        let Some((vendor, device)) = d.id() else { return };
+        let (class, sub, progif) = d.class();
+        let sub_id = d.r32(0x2c);
+        let irq = d.r8(0x3c);
+        // Первый ненулевой BAR: по нему видно, отдала ли прошивка устройству окно памяти
+        // (без окна драйвер писать не по чему).
+        let bar = (0..6u8).map(|i| d.bar(i)).find(|&b| b != 0).unwrap_or(0);
+        crate::println!(
+            "  [pci] {:02x}:{:02x}.{} {:04x}:{:04x} {:5} {:16} класс {:02x}{:02x}{:02x} подсист {:04x}:{:04x} bar {:#010x} irq {}",
+            d.bus(), d.dev(), d.func(), vendor, device, vendor_name(vendor),
+            class_name(class, sub), class, sub, progif,
+            sub_id as u16, (sub_id >> 16) as u16, bar, irq,
+        );
+        count += 1;
+        // Класс 02 — Ethernet и родня, 0d/80 — беспроводное.
+        if (class == 0x02 || (class == 0x0d && sub == 0x80)) && nnet < nets.len() {
+            nets[nnet] = (vendor, device, sub);
+            nnet += 1;
         }
-    }
+    });
     crate::println!("  [pci] устройств на шине: {}", count);
     if nnet == 0 {
         crate::println!("  [pci] СЕТЕВЫХ КАРТ НЕ НАЙДЕНО");
@@ -251,39 +329,17 @@ pub fn dump() {
 /// единиц и обратное чтение) значит на мгновение снять устройство с его адреса — на живой
 /// машине с работающей прошивкой это лишний риск ради числа, которое мы и так знаем.
 pub fn probe_bar0(vendor_want: u16, device_want: u16, len: usize) -> Option<usize> {
-    for bus in 0..=255u32 {
-        for dev in 0..32u32 {
-            let multi = cfg_r8b(bus, dev << 3, 0x0e) & 0x80 != 0;
-            for func in 0..if multi { 8 } else { 1 } {
-                let slot = dev << 3 | func;
-                let id = cfg_r32b(bus, slot, 0);
-                let (vendor, device) = (id as u16, (id >> 16) as u16);
-                if vendor != vendor_want || device != device_want {
-                    continue;
-                }
-                // Память + bus-master: без первого не отвечают регистры, без второго карта не
-                // сможет ходить в память сама (кольца дескрипторов — следующая веха).
-                let cmd = cfg_r32b(bus, slot, 0x04);
-                outl(CFG_ADDR, cfg_addr_bdf(bus, slot, 0x04));
-                outl(CFG_DATA, cmd | 0x6);
-
-                let lo = cfg_r32b(bus, slot, 0x10);
-                if lo & 1 != 0 {
-                    return None; // BAR0 в пространстве ввода-вывода — регистров там нет
-                }
-                let mut base = (lo & !0xf) as usize;
-                if lo & 0x4 != 0 {
-                    base |= (cfg_r32b(bus, slot, 0x14) as usize) << 32;
-                }
-                if base == 0 {
-                    return None; // прошивка окна не назначила — отображать нечего
-                }
-                unsafe { paging::map_mmio(base, len) };
-                return Some(base);
-            }
-        }
-    }
-    None
+    let d = find_id(ALL_BUSES, vendor_want, &[device_want])?;
+    // Память + bus-master: без первого не отвечают регистры, без второго карта не сможет ходить
+    // в память сама (кольца дескрипторов — следующая веха).
+    d.enable();
+    // 0 — либо BAR0 в пространстве ввода-вывода (регистров там нет), либо прошивка окна не
+    // назначила: отображать нечего.
+    let base = d.bar(0);
+    (base != 0).then(|| {
+        unsafe { paging::map_mmio(base, len) };
+        base
+    })
 }
 
 /// Веха 133.2 — включить INTx устройства `vendor:device` (на любой шине) и замаршрутизировать
@@ -295,90 +351,57 @@ pub fn probe_bar0(vendor_want: u16, device_want: u16, len: usize) -> Option<usiz
 /// userspace-драйвер в системе один, и лишнее пробуждение стоит ему одного холостого чтения
 /// регистра причины. Появится второй драйвер — придётся разбирать `_PRT` по-настоящему.
 pub fn intx_irq_setup(vendor_want: u16, device_want: u16) -> Option<u8> {
-    for bus in 0..=255u32 {
-        for dev in 0..32u32 {
-            let multi = cfg_r8b(bus, dev << 3, 0x0e) & 0x80 != 0;
-            for func in 0..if multi { 8 } else { 1 } {
-                let slot = dev << 3 | func;
-                let id = cfg_r32b(bus, slot, 0);
-                if id as u16 != vendor_want || (id >> 16) as u16 != device_want {
-                    continue;
-                }
-                // Снять Interrupt Disable (бит 10 команды) — иначе карта дёргать линию не станет.
-                let cmd = cfg_r32b(bus, slot, 0x04);
-                outl(CFG_ADDR, cfg_addr_bdf(bus, slot, 0x04));
-                outl(CFG_DATA, cmd & !(1 << 10));
-                for gsi in 16..24 {
-                    super::ioapic::route_level_low(gsi, trap::VEC_USERDRV);
-                }
-                return Some(trap::VEC_USERDRV);
-            }
-        }
+    let d = find_id(ALL_BUSES, vendor_want, &[device_want])?;
+    // Снять Interrupt Disable (бит 10 команды) — иначе карта дёргать линию не станет.
+    d.w16(0x04, d.r16(0x04) & !(1 << 10));
+    for gsi in 16..24 {
+        super::ioapic::route_level_low(gsi, trap::VEC_USERDRV);
     }
-    None
+    Some(trap::VEC_USERDRV)
 }
 
 /// Найти virtio-blk на шине 0 и подготовить его: BAR-окна отображены, MSI-X взведён.
 pub fn probe_virtio_blk() -> Option<BlkDevice> {
-    for dev in 0..32u32 {
-        let id = cfg_r32(dev, 0);
-        let (vendor, device) = (id as u16, (id >> 16) as u16);
-        if vendor == VENDOR_VIRTIO && (device == DEV_BLK_MODERN || device == DEV_BLK_TRANSITIONAL) {
-            return setup(dev);
-        }
-    }
-    None
+    let d = find_id(BUS0, VENDOR_VIRTIO, &[DEV_BLK_MODERN, DEV_BLK_TRANSITIONAL])?;
+    let transport = setup_transport(d)?;
+    // Без MSI-X диск не поддерживаем: async I/O без прерывания не собрать.
+    setup_msix(d, trap::VEC_BLK).then_some(BlkDevice { transport, irq: trap::VEC_BLK as u32 })
 }
 
 /// Найти virtio-net на шине 0 (Веха 34) и подготовить транспорт БЕЗ MSI-X: сеть
 /// работает опросом колец, прерывание не программируется (отложено до потребности).
 pub fn probe_virtio_net() -> Option<NetDevice> {
-    for dev in 0..32u32 {
-        let id = cfg_r32(dev, 0);
-        let (vendor, device) = (id as u16, (id >> 16) as u16);
-        if vendor == VENDOR_VIRTIO && (device == DEV_NET_MODERN || device == DEV_NET_TRANSITIONAL) {
-            // Веха 91: сети тоже нужен MSI-X. Не вышло взвести - карта остаётся на опросе.
-            let transport = setup_transport(dev)?;
-            let irq = setup_msix(dev, trap::VEC_NET).then_some(trap::VEC_NET as u32).unwrap_or(0);
-            return Some(NetDevice { transport, irq });
-        }
-    }
-    None
+    let d = find_id(BUS0, VENDOR_VIRTIO, &[DEV_NET_MODERN, DEV_NET_TRANSITIONAL])?;
+    // Веха 91: сети тоже нужен MSI-X. Не вышло взвести — карта остаётся на опросе.
+    let transport = setup_transport(d)?;
+    let irq = setup_msix(d, trap::VEC_NET).then_some(trap::VEC_NET as u32).unwrap_or(0);
+    Some(NetDevice { transport, irq })
 }
 
 /// Найти virtio-rng на PCI. Прерывания ему не заводим: запросы энтропии редкие и синхронные,
 /// драйвер ждёт завершения в used-кольце.
 pub fn probe_virtio_rng() -> Option<BlkTransport> {
-    for dev in 0..32u32 {
-        let id = cfg_r32(dev, 0);
-        let (vendor, device) = (id as u16, (id >> 16) as u16);
-        if vendor == VENDOR_VIRTIO && (device == DEV_RNG_MODERN || device == DEV_RNG_TRANSITIONAL) {
-            return setup_transport(dev);
-        }
-    }
-    None
+    setup_transport(find_id(BUS0, VENDOR_VIRTIO, &[DEV_RNG_MODERN, DEV_RNG_TRANSITIONAL])?)
 }
 
 /// Пройти vendor-capabilities virtio, отобразить BAR-окна структур, вернуть транспорт.
 /// Общее для blk и net: разговор по virtqueue одинаков, отличается лишь MSI-X (у сети нет).
-fn setup_transport(dev: u32) -> Option<BlkTransport> {
-    // Command: memory space + bus master (DMA колец). Верхняя половина dword'а —
-    // status (биты RW1C); запись прочитанного их сбрасывает — безвредно.
-    cfg_w16(dev, 0x04, cfg_r16(dev, 0x04) | 0x6);
+fn setup_transport(d: Bdf) -> Option<BlkTransport> {
+    d.enable(); // память + bus master (DMA колец)
 
     let (mut common, mut notify_base, mut notify_mult) = (0usize, 0usize, 0u32);
     let (mut isr, mut device_cfg) = (0usize, 0usize);
 
     // Пройти список capabilities (status.bit4 у virtio-устройств QEMU всегда есть).
-    let mut ptr = cfg_r8(dev, 0x34) as u32 & !3;
+    let mut ptr = d.r8(0x34) as u32 & !3;
     while ptr != 0 {
         // Vendor-capability virtio: тип структуры + [BAR, смещение, длина].
-        if cfg_r8(dev, ptr) == 0x09 {
-            let cfg_type = cfg_r8(dev, ptr + 3);
-            let bar = cfg_r8(dev, ptr + 4);
-            let off = cfg_r32(dev, ptr + 8) as usize;
-            let len = cfg_r32(dev, ptr + 12) as usize;
-            let base = bar_addr(dev, bar);
+        if d.r8(ptr) == 0x09 {
+            let cfg_type = d.r8(ptr + 3);
+            let bar = d.r8(ptr + 4);
+            let off = d.r32(ptr + 8) as usize;
+            let len = d.r32(ptr + 12) as usize;
+            let base = d.bar(bar);
             if base != 0 && len != 0 {
                 let addr = base + off;
                 unsafe { paging::map_mmio(addr, len) };
@@ -386,7 +409,7 @@ fn setup_transport(dev: u32) -> Option<BlkTransport> {
                     1 => common = addr,
                     2 => {
                         notify_base = addr;
-                        notify_mult = cfg_r32(dev, ptr + 16);
+                        notify_mult = d.r32(ptr + 16);
                     }
                     3 => isr = addr,
                     4 => device_cfg = addr,
@@ -394,7 +417,7 @@ fn setup_transport(dev: u32) -> Option<BlkTransport> {
                 }
             }
         }
-        ptr = cfg_r8(dev, ptr + 1) as u32 & !3;
+        ptr = d.r8(ptr + 1) as u32 & !3;
     }
 
     if common == 0 || notify_base == 0 || isr == 0 || device_cfg == 0 {
@@ -404,73 +427,26 @@ fn setup_transport(dev: u32) -> Option<BlkTransport> {
 }
 
 // ─── AHCI (Веха 47) ──────────────────────────────────────────────────────────
-// Конфиг-доступ С УЧЁТОМ ФУНКЦИИ: на Intel-PCH SATA-контроллер сидит на 00:1f.2 —
-// функция 2, которую обычный virtio-скан (только функция 0) не видит. Индекс `slot`
-// = dev<<3|func; адрес = enable | slot<<8 | off (равно dev<<11|func<<8 у железа PCI).
-fn cfg_addr_f(slot: u32, off: u32) -> u32 {
-    0x8000_0000 | slot << 8 | (off & 0xfc)
-}
-fn cfg_r32f(slot: u32, off: u32) -> u32 {
-    outl(CFG_ADDR, cfg_addr_f(slot, off));
-    inl(CFG_DATA)
-}
-fn cfg_r16f(slot: u32, off: u32) -> u16 {
-    (cfg_r32f(slot, off & !3) >> ((off & 3) * 8)) as u16
-}
-fn cfg_r8f(slot: u32, off: u32) -> u8 {
-    (cfg_r32f(slot, off & !3) >> ((off & 3) * 8)) as u8
-}
-fn cfg_w16f(slot: u32, off: u32, v: u16) {
-    let (a, sh) = (off & !3, (off & 3) * 8);
-    let old = cfg_r32f(slot, a);
-    outl(CFG_ADDR, cfg_addr_f(slot, a));
-    outl(CFG_DATA, (old & !(0xffff << sh)) | (v as u32) << sh);
-}
+//
+// Ради этого случая и заводилось второе семейство аксессоров: на Intel-PCH SATA-контроллер сидит
+// на 00:1f.2 — ФУНКЦИЯ 2, которую тогдашний virtio-скан (только функция 0) не видел. Теперь
+// функцию видит общий обход, и отдельного семейства не нужно.
 
 /// Веха 47 — найти AHCI-контроллер (SATA) с ПОДКЛЮЧЁННЫМ диском. Скан шины 0, ВСЕ функции
 /// (класс 01/06/01 = Mass Storage / SATA / AHCI). У кандидата включаем память+bus-master,
 /// берём ABAR (BAR5), отображаем, включаем AHCI (GHC.AE) и ищем порт с устройством
 /// (PxSSTS.DET==3). Возвращает `(ABAR, номер порта)`; None — AHCI с диском не нашли (тогда
 /// драйвер откатится на virtio-blk). Много-контроллерный случай QEMU (встроенный ich9 без
-/// диска на 1f.2 + добавленный с диском) разрулён проверкой наличия диска в самом порту.
+/// диска на 1f.2 + добавленный с диском) разрулён проверкой наличия диска в самом порту:
+/// обход идёт дальше, пока `setup_ahci` не ответит.
 pub fn probe_ahci() -> Option<(usize, u32)> {
-    for dev in 0..32u32 {
-        for func in 0..8u32 {
-            let slot = dev << 3 | func;
-            let id = cfg_r32f(slot, 0);
-            if id == 0xffff_ffff {
-                if func == 0 {
-                    break; // нет функции 0 — устройства в слоте нет вовсе
-                }
-                continue;
-            }
-            let cc = cfg_r32f(slot, 0x08); // [31:24] class, [23:16] subclass, [15:8] prog-if
-            if (cc >> 24) as u8 == 0x01 && (cc >> 16) as u8 == 0x06 && (cc >> 8) as u8 == 0x01 {
-                if let Some(res) = setup_ahci(slot) {
-                    return Some(res);
-                }
-            }
-            // Одно-функциональное устройство (бит 7 header-type = 0) — функции 1..7 не сканируем.
-            if func == 0 && cfg_r8f(slot, 0x0e) & 0x80 == 0 {
-                break;
-            }
-        }
-    }
-    None
+    find(BUS0, |d| (d.class() == (0x01, 0x06, 0x01)).then(|| setup_ahci(d))?)
 }
 
-/// Включить контроллер AHCI на `slot`, отобразить ABAR, найти порт с диском.
-fn setup_ahci(slot: u32) -> Option<(usize, u32)> {
-    cfg_w16f(slot, 0x04, cfg_r16f(slot, 0x04) | 0x6); // память + bus master (DMA)
-    let lo = cfg_r32f(slot, 0x24); // BAR5 = 0x10 + 4*5
-    if lo & 1 != 0 {
-        return None; // ABAR обязан быть memory-BAR
-    }
-    let mut abar = (lo & !0xf) as u64;
-    if lo & 0x4 != 0 {
-        abar |= (cfg_r32f(slot, 0x28) as u64) << 32; // 64-битный BAR — верхняя половина
-    }
-    let abar = abar as usize;
+/// Включить контроллер AHCI, отобразить ABAR, найти порт с диском.
+fn setup_ahci(d: Bdf) -> Option<(usize, u32)> {
+    d.enable(); // память + bus master (DMA)
+    let abar = d.bar(5); // ABAR обязан быть memory-BAR; 0 — не он либо окна нет
     if abar == 0 {
         return None;
     }
@@ -499,61 +475,32 @@ fn setup_ahci(slot: u32) -> Option<(usize, u32)> {
 /// INTx может уйти туда; лишние маршруты безвредны, драйвер всё равно сверяется с ICR). Возвращает
 /// вектор. `None` — e1000 нет.
 pub fn e1000_irq_setup() -> Option<u8> {
-    for dev in 0..32u32 {
-        let id = cfg_r32(dev, 0);
-        let (vendor, device) = (id as u16, (id >> 16) as u16);
-        if vendor == 0x8086 && (device == 0x100e || device == 0x10d3 || device == 0x100f) {
-            cfg_w16(dev, 0x04, cfg_r16(dev, 0x04) & !(1 << 10)); // снять Interrupt Disable — вкл INTx
-            // PCI INTx под IOAPIC приходит на GSI 16..23 (PIRQA..H), не на ISA-номер из Interrupt
-            // Line. Точное соответствие слот→PIRQ дал бы ACPI _PRT (не парсим) — маршрутизируем все
-            // четыре PCI-линии на наш вектор level/active-low: какую бы карта ни дёрнула, поймаем.
-            for gsi in 16..24 {
-                super::ioapic::route_level_low(gsi, trap::VEC_USERDRV);
-            }
-            return Some(trap::VEC_USERDRV);
-        }
+    let d = find_id(BUS0, VENDOR_INTEL, &E1000_IDS)?;
+    d.w16(0x04, d.r16(0x04) & !(1 << 10)); // снять Interrupt Disable — включить INTx
+    // PCI INTx под IOAPIC приходит на GSI 16..23 (PIRQA..H), не на ISA-номер из Interrupt Line.
+    // Точное соответствие слот→PIRQ дал бы ACPI _PRT (не парсим) — маршрутизируем все четыре
+    // PCI-линии на наш вектор level/active-low: какую бы карта ни дёрнула, поймаем.
+    for gsi in 16..24 {
+        super::ioapic::route_level_low(gsi, trap::VEC_USERDRV);
     }
-    None
+    Some(trap::VEC_USERDRV)
 }
 
 /// Веха 50 — найти контроллер USB **xHCI** (класс 0x0c/0x03/0x30 — Serial Bus / USB / xHCI),
 /// как probe_ahci — по ВСЕМ функциям (на Intel-PCH xHCI на 00:14.0, но бывает и функция != 0).
 /// Включаем память+bus-master, отображаем BAR0 (регистры, 64 КиБ), отдаём базу. `None` — нет.
 pub fn probe_xhci() -> Option<usize> {
-    for dev in 0..32u32 {
-        for func in 0..8u32 {
-            let slot = dev << 3 | func;
-            let id = cfg_r32f(slot, 0);
-            if id == 0xffff_ffff {
-                if func == 0 {
-                    break;
-                }
-                continue;
-            }
-            let cc = cfg_r32f(slot, 0x08);
-            if (cc >> 24) as u8 == 0x0c && (cc >> 16) as u8 == 0x03 && (cc >> 8) as u8 == 0x30 {
-                cfg_w16f(slot, 0x04, cfg_r16f(slot, 0x04) | 0x6); // память + bus master
-                let lo = cfg_r32f(slot, 0x10); // BAR0
-                if lo & 1 != 0 {
-                    return None;
-                }
-                let mut base = (lo & !0xf) as u64;
-                if lo & 0x4 != 0 {
-                    base |= (cfg_r32f(slot, 0x14) as u64) << 32;
-                }
-                let base = base as usize;
-                if base == 0 {
-                    return None;
-                }
-                unsafe { paging::map_mmio(base, 0x10000) };
-                return Some(base);
-            }
-            if func == 0 && cfg_r8f(slot, 0x0e) & 0x80 == 0 {
-                break;
-            }
+    find(BUS0, |d| {
+        if d.class() != (0x0c, 0x03, 0x30) {
+            return None;
         }
-    }
-    None
+        d.enable(); // память + bus master
+        let base = d.bar(0); // регистры контроллера
+        (base != 0).then(|| {
+            unsafe { paging::map_mmio(base, 0x10000) };
+            base
+        })
+    })
 }
 
 /// Веха 49 — найти сетевую карту Intel e1000 (PRO/1000) на шине 0. Vendor 0x8086, device
@@ -561,46 +508,28 @@ pub fn probe_xhci() -> Option<usize> {
 /// Включаем память+bus-master, отдаём базу BAR0 (MMIO с регистрами). `None` — карты нет
 /// (тогда драйвер откатится на virtio-net). Опрос, без прерываний — как virtio-net.
 pub fn probe_e1000() -> Option<usize> {
-    const VENDOR_INTEL: u16 = 0x8086;
-    for dev in 0..32u32 {
-        let id = cfg_r32(dev, 0);
-        let (vendor, device) = (id as u16, (id >> 16) as u16);
-        if vendor == VENDOR_INTEL && (device == 0x100e || device == 0x10d3 || device == 0x100f) {
-            cfg_w16(dev, 0x04, cfg_r16(dev, 0x04) | 0x6); // память + bus master (DMA колец)
-            let base = bar_addr(dev, 0); // BAR0 — регистры карты (MMIO)
-            if base == 0 {
-                return None;
-            }
-            unsafe { paging::map_mmio(base, 0x20000) }; // 128 КиБ регистрового окна
-            return Some(base);
-        }
-    }
-    None
+    let d = find_id(BUS0, VENDOR_INTEL, &E1000_IDS)?;
+    d.enable(); // память + bus master (DMA колец)
+    let base = d.bar(0); // BAR0 — регистры карты (MMIO)
+    (base != 0).then(|| {
+        unsafe { paging::map_mmio(base, 0x20000) }; // 128 КиБ регистрового окна
+        base
+    })
 }
 
-/// Включить virtio-blk и взвести его MSI-X (диску прерывание нужно — async I/O).
-fn setup(dev: u32) -> Option<BlkDevice> {
-    let transport = setup_transport(dev)?;
-
-    if !setup_msix(dev, trap::VEC_BLK) {
-        return None; // без MSI-X диск не поддерживаем: async I/O без прерывания не собрать
-    }
-    Some(BlkDevice { transport, irq: trap::VEC_BLK as u32 })
-}
-
-/// Веха 91 - взвести MSI-X функции `dev` на вектор `vec` (запись 0 таблицы -> LAPIC, dest id 0,
+/// Веха 91 - взвести MSI-X функции `d` на вектор `vec` (запись 0 таблицы -> LAPIC, dest id 0,
 /// fixed/edge, без маски) и включить MSI-X. `false` - у устройства нет такой capability.
 /// Общее для диска и сети: механика одна, отличается только вектор.
-fn setup_msix(dev: u32, vec: u8) -> bool {
+fn setup_msix(d: Bdf, vec: u8) -> bool {
     let (mut msix_ptr, mut msix_table) = (0u32, 0usize);
-    let mut ptr = cfg_r8(dev, 0x34) as u32 & !3;
+    let mut ptr = d.r8(0x34) as u32 & !3;
     while ptr != 0 {
-        if cfg_r8(dev, ptr) == 0x11 {
+        if d.r8(ptr) == 0x11 {
             msix_ptr = ptr;
-            let t = cfg_r32(dev, ptr + 4);
-            msix_table = bar_addr(dev, (t & 7) as u8) + (t & !7) as usize;
+            let t = d.r32(ptr + 4);
+            msix_table = d.bar((t & 7) as u8) + (t & !7) as usize;
         }
-        ptr = cfg_r8(dev, ptr + 1) as u32 & !3;
+        ptr = d.r8(ptr + 1) as u32 & !3;
     }
     if msix_ptr == 0 {
         return false;
@@ -613,7 +542,7 @@ fn setup_msix(dev: u32, vec: u8) -> bool {
         e.add(2).write_volatile(vec as u32); // data: fixed, edge, вектор
         e.add(3).write_volatile(0); // vector control: размаскирован
     }
-    let ctrl = cfg_r16(dev, msix_ptr + 2);
-    cfg_w16(dev, msix_ptr + 2, (ctrl | 0x8000) & !0x4000);
+    let ctrl = d.r16(msix_ptr + 2);
+    d.w16(msix_ptr + 2, (ctrl | 0x8000) & !0x4000);
     true
 }
