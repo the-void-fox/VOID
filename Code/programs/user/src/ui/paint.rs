@@ -127,6 +127,28 @@ impl Rect {
         let y = self.y.min(o.y);
         Rect::new(x, y, self.right().max(o.right()) - x, self.bottom().max(o.bottom()) - y)
     }
+
+    /// `self` МИНУС `hole` — до четырёх полос: сверху, снизу, слева и справа от дырки.
+    ///
+    /// Пустые прямоугольники в ответе значат «этой полосы нет»; отсеивать их — дело зовущего
+    /// (`filter(|r| !r.is_empty())`), зато сам разбор не выделяет памяти и годится там, где кучи
+    /// нет. Не пересекаются — `self` возвращается целиком первой полосой.
+    ///
+    /// Веха 149: композитор считал этим дополнение экрана к окнам (щели, поля, панель) — своей
+    /// копией на кортежах. Тулкиту то же самое нужно всякий раз, когда что-то рисуется ВОКРУГ
+    /// чего-то.
+    pub fn subtract(self, hole: Rect) -> [Rect; 4] {
+        let h = self.intersect(hole);
+        if h.is_empty() {
+            return [self, Rect::ZERO, Rect::ZERO, Rect::ZERO];
+        }
+        [
+            Rect::new(self.x, self.y, self.w, h.y - self.y),
+            Rect::new(self.x, h.bottom(), self.w, self.bottom() - h.bottom()),
+            Rect::new(self.x, h.y, h.x - self.x, h.h),
+            Rect::new(h.right(), h.y, self.right() - h.right(), h.h),
+        ]
+    }
 }
 
 /// Выравнивание текста внутри отведённого места.

@@ -52,7 +52,7 @@ use void_user::win;
 #[path = "../ui/mod.rs"]
 mod ui;
 
-use ui::{Rgba, Theme};
+use ui::{Rect, Rgba, Theme};
 
 /// Цвет темы в тройку, которой рисует композитор (альфа у него своя, попиксельная).
 fn tri(c: Rgba) -> (u8, u8, u8) {
@@ -196,8 +196,8 @@ impl Shown {
             a: lerp(self.a as i32, to.a as i32, p).clamp(0, 256) as u32,
         }
     }
-    fn rect(&self) -> (i32, i32, i32, i32) {
-        (self.x, self.y, self.w, self.h)
+    fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
     }
 }
 
@@ -438,7 +438,7 @@ fn main_loop() -> ! {
         info,
         rgb,
         rgb8,
-        work: (0, 0, info.width as i32, info.height as i32),
+        work: Rect::new(0, 0, info.width as i32, info.height as i32),
         wins: Vec::new(),
         next_id: 1,
         cursor: (info.width as i32 / 2, info.height as i32 / 2),
@@ -918,11 +918,6 @@ impl Win {
         true
     }
 
-    /// Прямоугольник рамки.
-    fn frame(&self) -> (i32, i32, i32, i32) {
-        let (b, _) = self.deco();
-        (self.x, self.y, self.w + 2 * b, self.h + 2 * b)
-    }
     /// Левый верхний угол СОДЕРЖИМОГО.
     fn content_at(&self) -> (i32, i32) {
         let (b, _) = self.deco();
@@ -930,9 +925,7 @@ impl Win {
     }
     /// Попадание — по ВИДИМОМУ положению: человек целится в то, что нарисовано.
     fn hit_frame(&self, px: i32, py: i32, scroll: i32) -> bool {
-        let (fx, fy, fw, fh) = self.shown.rect();
-        let fx = fx - scroll;
-        px >= fx && px < fx + fw && py >= fy && py < fy + fh
+        self.shown.rect().offset(-scroll, 0).contains(px, py)
     }
 }
 
@@ -985,14 +978,14 @@ struct Wm {
     info: sys::VideoInfo,
     /// Веха 139 — РАБОЧАЯ ОБЛАСТЬ `(x, y, w, h)`: экран минус зоны, занятые слоями (бар).
     /// Лента живёт в ней, а не на экране; без слоёв с занятой зоной она равна экрану.
-    work: (i32, i32, i32, i32),
+    work: Rect,
     /// Веха 137 — полосы столов в обзоре: `(x, y, w, h, активный)` в координатах обзора.
     /// Нужны, чтобы стол было ВИДНО, когда на нём нет окон: с динамическими столами последний
     /// всегда пустой, и без полосы про него неоткуда узнать — ровно то возражение, из-за
     /// которого динамические столы и откладывали.
     /// Полосы столов в обзоре: `(x, y, w, h, номер стола)`. Номер, а не признак «активный»:
     /// по нему же считается клик по пустому месту стола (Веха 142).
-    ov_bands: Vec<(i32, i32, i32, i32, usize)>,
+    ov_bands: Vec<(Rect, usize)>,
     /// Порядок = z-order: последнее окно рисуется поверх и получает клики первым.
     wins: Vec<Win>,
     /// Лента колонок слева направо.
@@ -1019,7 +1012,7 @@ struct Wm {
     slots: u32,
     /// Что перерисовать в конце оборота (Веха 120.2). Раньше каждое событие рисовало САМО, и
     /// перетаскивание превращалось в тридцать перерисовок на один оборот цикла.
-    damage: Vec<(i32, i32, i32, i32)>,
+    damage: Vec<Rect>,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
     /// ТЕНЕВОЙ КАДР (Веха 126): весь экран в обычной памяти. Кадр собирается здесь, а на экран
     /// уходит блитом. Затевалось ради разрывов, а понадобилось ради СТОИМОСТИ: прокрутка ленты
@@ -1149,51 +1142,6 @@ fn rrect_sd(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32, r: i32) -> i32 {
     let len = isqrt(mx * mx + my * my); // тоже в удвоенных
     let inside = qx.max(qy).min(0);
     (len + inside - 2 * r) * 128 // ×128 = перевод удвоенных в 1/256
-}
-
-/// Пересечение двух прямоугольников (x, y, w, h). `None` — не пересекаются.
-fn intersect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> Option<(i32, i32, i32, i32)> {
-    let x0 = a.0.max(b.0);
-    let y0 = a.1.max(b.1);
-    let x1 = (a.0 + a.2).min(b.0 + b.2);
-    let y1 = (a.1 + a.3).min(b.1 + b.3);
-    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
-}
-
-/// Веха 142.1 — `a` минус `b`: до четырёх прямоугольников в `out` (полосы сверху, снизу, слева,
-/// справа от дырки). Не пересекаются — значит `a` целиком.
-fn subtract_rect(
-    a: (i32, i32, i32, i32),
-    b: (i32, i32, i32, i32),
-    out: &mut Vec<(i32, i32, i32, i32)>,
-) {
-    let Some(h) = intersect(a, b) else {
-        out.push(a);
-        return;
-    };
-    let (ax, ay, aw, ah) = a;
-    let (hx, hy, hw, hh) = h;
-    if hy > ay {
-        out.push((ax, ay, aw, hy - ay));
-    }
-    if hy + hh < ay + ah {
-        out.push((ax, hy + hh, aw, ay + ah - hy - hh));
-    }
-    if hx > ax {
-        out.push((ax, hy, hx - ax, hh));
-    }
-    if hx + hw < ax + aw {
-        out.push((hx + hw, hy, ax + aw - hx - hw, hh));
-    }
-}
-
-/// Охватывающий прямоугольник двух.
-fn union(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
-    let x0 = a.0.min(b.0);
-    let y0 = a.1.min(b.1);
-    let x1 = (a.0 + a.2).max(b.0 + b.2);
-    let y1 = (a.1 + a.3).max(b.1 + b.3);
-    (x0, y0, x1 - x0, y1 - y0)
 }
 
 impl Wm {
@@ -1346,32 +1294,31 @@ impl Wm {
     /// перерисовок на один оборот цикла — по числу событий в пачке, — и окно продолжало ехать
     /// уже после того, как человек отпустил кнопку: очередь событий отставала от руки.
     /// Теперь событие меняет только СОСТОЯНИЕ, а рисуется всё один раз в конце оборота.
-    fn damage(&mut self, x: i32, y: i32, w: i32, h: i32) {
+    fn damage(&mut self, r: Rect) {
         // Пиксель запаса со всех сторон: сглаженный край живёт на границе прямоугольника, и
         // ровно по границе его обрезало бы — отсюда оставшиеся «кусочки обводки».
-        let (x, y, w, h) = (x - 1, y - 1, w + 2, h + 2);
-        let Some(r) = intersect(
-            (x, y, w, h),
-            (0, 0, self.info.width as i32, self.info.height as i32),
-        ) else {
+        let r = r.inset(-1).intersect(self.screen());
+        if r.is_empty() {
             return;
-        };
+        }
         // Пересекающиеся области сливаем: рисовать одни и те же пиксели дважды за оборот незачем.
         for d in self.damage.iter_mut() {
-            if intersect(*d, r).is_some() {
-                *d = union(*d, r);
+            if !d.intersect(r).is_empty() {
+                *d = d.union(r);
                 return;
             }
         }
         if self.damage.len() >= DAMAGE_MAX {
-            let mut all = r;
-            for d in self.damage.drain(..) {
-                all = union(all, d);
-            }
+            let all = self.damage.drain(..).fold(r, Rect::union);
             self.damage.push(all);
             return;
         }
         self.damage.push(r);
+    }
+
+    /// Весь экран — прямоугольник, которым обрезается всё остальное.
+    fn screen(&self) -> Rect {
+        Rect::new(0, 0, self.info.width as i32, self.info.height as i32)
     }
 
     /// Продвинуть все анимации на текущий момент; `true` — что-то ещё движется.
@@ -1384,20 +1331,19 @@ impl Wm {
         let mut done: Vec<u32> = Vec::new();
         for i in 0..self.wins.len() {
             let sc = self.scroll_x;
-            let was = self.wins[i].shown.rect();
-            let was = (was.0 - sc, was.1, was.2, was.3);
+            let was = self.wins[i].shown.rect().offset(-sc, 0);
             if self.wins[i].tick(now) {
                 moving |= self.wins[i].dur != 0;
-                let r = self.wins[i].shown.rect();
-                self.damage(was.0, was.1, was.2, was.3);
-                self.damage(r.0 - sc, r.1, r.2, r.3);
+                let now_at = self.wins[i].shown.rect().offset(-sc, 0);
+                self.damage(was);
+                self.damage(now_at);
             } else if self.wins[i].closing {
                 // Помечаем ВЕСЬ путь сжатия, а не последний кадр: окно уменьшалось из полного
                 // размера, и стереть нужно всё, что оно занимало. Последний кадр покрывает лишь
                 // поджатый прямоугольник — остальное осталось бы призраком на экране (нашлось
                 // проверкой: область просто не перерисовывалась).
-                let r = union(self.wins[i].from.rect(), self.wins[i].shown.rect());
-                self.damage(r.0 - sc, r.1, r.2, r.3);
+                let r = self.wins[i].from.rect().union(self.wins[i].shown.rect());
+                self.damage(r.offset(-sc, 0));
                 done.push(self.wins[i].id);
             }
         }
@@ -1453,7 +1399,7 @@ impl Wm {
                 self.shadow = sh;
                 // Открывшаяся полоса + запас на сглаженные края.
                 let strip = if dx > 0 { (sw - n as i32 - 2, n as i32 + 2) } else { (0, n as i32 + 2) };
-                self.damage(strip.0, 0, strip.1, shh);
+                self.damage(Rect::new(strip.0, 0, strip.1, shh));
                 // Веха 142.1 — и ВСЁ, ЧТО С ЛЕНТОЙ НЕ ЕДЕТ. Сдвиг памяти двигает кадр целиком, а
                 // едет в нём только лента: обои, панель и курсор стоят на месте. Их сдвинутые
                 // пиксели никто не чинил до конца анимации, и это владелец увидел так: «курсор
@@ -1464,10 +1410,10 @@ impl Wm {
                 // заводили), а ровно дополнение к окнам: щели между колонками, поля, панель.
                 self.damage_outside_windows();
                 let (cx, cy) = self.cursor;
-                self.damage(cx - n as i32 - 2, cy - 2, CUR_W + 2 * n as i32 + 4, CUR_H + 4);
+                self.damage(Rect::new(cx - n as i32 - 2, cy - 2, CUR_W + 2 * n as i32 + 4, CUR_H + 4));
                 self.present_all = true;
             } else {
-                self.damage(0, 0, sw, shh);
+                self.damage(Rect::new(0, 0, sw, shh));
             }
         }
 
@@ -1476,7 +1422,7 @@ impl Wm {
         // и едут они в РАЗНЫЕ стороны.
         if let Some(sl) = &self.slide {
             let done = now.saturating_sub(sl.at) >= sl.dur;
-            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+            self.damage(Rect::new(0, 0, self.info.width as i32, self.info.height as i32));
             if done {
                 // Уходящие окна больше не рисуем — раскладка вернёт им `visible = false`.
                 self.slide = None;
@@ -1510,7 +1456,7 @@ impl Wm {
         if self.ov_dur != 0 {
             let t = ((now.saturating_sub(self.ov_at)) * 1024 / self.ov_dur).min(1024) as i32;
             self.ov_t = lerp(self.ov_from, self.ov_to, ease_out(t));
-            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+            self.damage(Rect::new(0, 0, self.info.width as i32, self.info.height as i32));
             if t >= 1024 {
                 self.ov_t = self.ov_to;
                 self.ov_dur = 0;
@@ -1532,8 +1478,8 @@ impl Wm {
             let Some(l) = &self.wins[i].launch else { continue };
             let waiting = l.done.is_none() && now.saturating_sub(l.since) < LAUNCH_ANIM_NS;
             if self.render_launch(i, now) {
-                let (rx, ry, rw, rh) = self.wins[i].shown.rect();
-                self.damage(rx - self.scroll_x, ry, rw, rh);
+                let r = self.wins[i].shown.rect().offset(-self.scroll_x, 0);
+                self.damage(r);
             }
             moving |= waiting;
         }
@@ -1556,7 +1502,7 @@ impl Wm {
                 self.overview = false;
                 self.ov.clear();
             }
-            self.damage(0, 0, self.info.width as i32, self.info.height as i32);
+            self.damage(Rect::new(0, 0, self.info.width as i32, self.info.height as i32));
         }
     }
 
@@ -1602,11 +1548,11 @@ impl Wm {
         // не «оживление», а поломка на экране; а бар, доигрывающий анимацию после смерти
         // хозяина, всё это время держал бы занятую зону, и лента дёргалась бы дважды.
         if self.wins[k].layer.is_some() {
-            let (rx, ry, rw, rh) = self.wins[k].shown.rect();
+            let r = self.wins[k].shown.rect();
             self.drop_next(k);
             self.drop_buf(k);
             self.wins.remove(k);
-            self.damage(rx, ry, rw, rh);
+            self.damage(r);
             self.recompute_work();
             return;
         }
@@ -1632,26 +1578,25 @@ impl Wm {
     /// Если остаток дробится слишком мелко (окон много), честнее пометить экран целиком: два
     /// десятка мелких прямоугольников обходятся дороже одного большого.
     fn damage_outside_windows(&mut self) {
-        let (sw, shh) = (self.info.width as i32, self.info.height as i32);
-        let mut rest: Vec<(i32, i32, i32, i32)> = vec![(0, 0, sw, shh)];
+        let screen = self.screen();
+        let mut rest: Vec<Rect> = vec![screen];
         for i in 0..self.wins.len() {
             if !self.wins[i].visible || !self.wins[i].tiled() {
                 continue;
             }
-            let (wx, wy, ww, wh) = self.wins[i].shown.rect();
-            let hole = (wx - self.scroll_x, wy, ww, wh);
+            let hole = self.wins[i].shown.rect().offset(-self.scroll_x, 0);
             let mut next = Vec::with_capacity(rest.len() + 3);
             for r in rest {
-                subtract_rect(r, hole, &mut next);
+                next.extend(r.subtract(hole).into_iter().filter(|s| !s.is_empty()));
             }
             rest = next;
             if rest.len() > 24 {
-                self.damage(0, 0, sw, shh);
+                self.damage(screen);
                 return;
             }
         }
-        for (x, y, w, h) in rest {
-            self.damage(x, y, w, h);
+        for r in rest {
+            self.damage(r);
         }
     }
 
@@ -1661,8 +1606,8 @@ impl Wm {
             return;
         }
         let rects = core::mem::take(&mut self.damage);
-        for (x, y, w, h) in &rects {
-            self.repaint(*x, *y, *w, *h);
+        for r in &rects {
+            self.repaint(*r);
         }
         // На экран — либо те же области, либо весь кадр (после сдвига памяти изменилось всё).
         let pitch = self.info.width as usize;
@@ -1674,10 +1619,10 @@ impl Wm {
                 self.write_row(0, yy, &sh[off..off + pitch]);
             }
         } else {
-            for (x, y, w, h) in &rects {
-                for yy in *y..*y + *h {
-                    let off = yy as usize * pitch + *x as usize;
-                    self.write_row(*x, yy, &sh[off..off + *w as usize]);
+            for r in &rects {
+                for yy in r.y..r.bottom() {
+                    let off = yy as usize * pitch + r.x as usize;
+                    self.write_row(r.x, yy, &sh[off..off + r.w as usize]);
                 }
             }
         }
@@ -1692,22 +1637,19 @@ impl Wm {
     /// потом поверх рисовались окна: пиксель под окном писался ДВАЖДЫ, и глаз успевал поймать
     /// промежуточное состояние — при перетаскивании это выглядело как мигание окна. Теперь
     /// каждый пиксель экрана пишется ровно один раз за кадр.
-    fn repaint(&mut self, x: i32, y: i32, w: i32, h: i32) {
-        let Some((x0, y0, w, h)) = intersect(
-            (x, y, w, h),
-            (0, 0, self.info.width as i32, self.info.height as i32),
-        ) else {
+    fn repaint(&mut self, r: Rect) {
+        let r = r.intersect(self.screen());
+        if r.is_empty() {
             return;
-        };
+        }
         // Собираем в ТЕНЕВОЙ кадр; на экран он уйдёт блитом в `flush`.
         let mut sh = core::mem::take(&mut self.shadow);
         let pitch = self.info.width as usize;
-        for yy in y0..y0 + h {
-            let off = yy as usize * pitch + x0 as usize;
-            self.compose_row(&mut sh[off..off + w as usize], yy, x0);
+        for yy in r.y..r.bottom() {
+            let off = yy as usize * pitch + r.x as usize;
+            self.compose_row(&mut sh[off..off + r.w as usize], yy, r.x);
         }
         self.shadow = sh;
-
     }
 
     /// Собрать одну строку экрана: стол → нижние слои → окна → верхние слои → курсор.
@@ -1746,11 +1688,10 @@ impl Wm {
             // Рисуем ПО АНИМИРОВАННОМУ прямоугольнику, а не по тому, что назначила раскладка
             // (Веха 125). Отсюда следствие: содержимое приходится масштабировать — во время
             // переезда и сжатия окно на экране не совпадает со своим буфером.
-            let (sxr, fy, fw, fh) = win.shown.rect();
             let active = self.focus == Some(win.id);
             let leaving = self.slide.as_ref().is_some_and(|s| s.ids.contains(&win.id));
             let (sc, dy) = if leaving { (sl_scroll, dy_out) } else { (self.scroll_x, dy_in) };
-            let rect = (sxr - sc, fy + dy, fw, fh);
+            let rect = win.shown.rect().offset(-sc, dy);
             self.draw_win_row(out, yy, x0, x1, rect, win, active, win.shown.a);
         }
 
@@ -1792,7 +1733,7 @@ impl Wm {
         yy: i32,
         x0: i32,
         x1: i32,
-        (fx, fy, fw, fh): (i32, i32, i32, i32),
+        Rect { x: fx, y: fy, w: fw, h: fh }: Rect,
         win: &Win,
         active: bool,
         alpha: u32,
@@ -1939,10 +1880,10 @@ impl Wm {
         // Полосы столов — ПОД окнами и только в самом обзоре (`ov_t`): на переходе они бы
         // разъезжались вместе с камерой и мигали по краям кадра.
         if self.ov_t > 512 {
-            for &(px, py, pw, ph, sp) in &self.ov_bands {
+            for &(band, sp) in &self.ov_bands {
                 let active = sp == self.space;
-                let (rx, ry) = (px * a / 1024 + bx, py * a / 1024 + by);
-                let (rw, rh) = ((pw * a / 1024).max(2), (ph * a / 1024).max(2));
+                let (rx, ry) = (band.x * a / 1024 + bx, band.y * a / 1024 + by);
+                let (rw, rh) = ((band.w * a / 1024).max(2), (band.h * a / 1024).max(2));
                 if yy < ry || yy >= ry + rh {
                     continue;
                 }
@@ -1961,7 +1902,7 @@ impl Wm {
         for it in &self.ov {
             let Some(k) = self.win_at(it.id) else { continue };
             let win = &self.wins[k];
-            let rect = (
+            let rect = Rect::new(
                 it.x * a / 1024 + bx,
                 it.y * a / 1024 + by,
                 (it.w * a / 1024).max(2 * BORDER + 2),
@@ -2039,7 +1980,7 @@ impl Wm {
     /// как перенос, а не как переключатель. Для ШИРИНЫ шаг мельче: ступеней всего четыре
     /// ([`WIDTHS`]), и проходить экран ради последней было бы утомительно.
     fn drag_steps(&self, resize: bool) -> (i32, i32) {
-        let (_, _, ow, oh) = self.work;
+        let (ow, oh) = (self.work.w, self.work.h);
         if resize {
             return ((ow / 10).max(40), i32::MAX);
         }
@@ -2049,7 +1990,7 @@ impl Wm {
 
     fn col_width(&self, c: &Column) -> i32 {
         let (n, d) = WIDTHS[c.width.min(WIDTHS.len() - 1)];
-        (self.work.2 - GAP) * n / d - GAP
+        (self.work.w - GAP) * n / d - GAP
     }
 
     /// Веха 139 — где лежит поверхность слоя: якорь + запрошенный размер → прямоугольник экрана.
@@ -2060,7 +2001,7 @@ impl Wm {
     ///
     /// Считается от ЭКРАНА, а не от рабочей области: слой сам её и определяет, и считать его
     /// место от неё значило бы бесконечно уточнять само себя.
-    fn layer_rect(&self, l: &LayerCfg, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    fn layer_rect(&self, l: &LayerCfg, w: i32, h: i32) -> Rect {
         let (sw, sh) = (self.info.width as i32, self.info.height as i32);
         let axis = |anchor_lo: bool, anchor_hi: bool, size: i32, screen: i32| match (
             anchor_lo, anchor_hi,
@@ -2076,7 +2017,7 @@ impl Wm {
         let (y, rh) = axis(
             l.anchor & win::ANCHOR_TOP != 0, l.anchor & win::ANCHOR_BOTTOM != 0, h, sh,
         );
-        (x, y, rw, rh)
+        Rect::new(x, y, rw, rh)
     }
 
     /// Веха 139 — пересчитать РАБОЧУЮ ОБЛАСТЬ: экран минус зоны, занятые слоями.
@@ -2110,7 +2051,7 @@ impl Wm {
         }
         // Панель во весь экран не должна оставлять раскладку с отрицательной шириной: окну
         // всегда есть куда лечь, даже если это выглядит тесно.
-        let work = (x0, y0, (x1 - x0).max(MIN_WORK), (y1 - y0).max(MIN_WORK));
+        let work = Rect::new(x0, y0, (x1 - x0).max(MIN_WORK), (y1 - y0).max(MIN_WORK));
         if work != self.work {
             self.work = work;
             self.relayout();
@@ -2122,11 +2063,11 @@ impl Wm {
     /// Чистая функция, ничего не меняющая, — и это важно: по ней живут ДВА потребителя,
     /// раскладка экрана и обзор. Две копии одной арифметики разъехались бы на первой же правке
     /// (обзор показывал бы не то, что получится при выходе из него).
-    fn strip_layout(&self, cols: &[Column]) -> (Vec<(u32, i32, i32, i32, i32)>, i32) {
+    fn strip_layout(&self, cols: &[Column]) -> (Vec<(u32, Rect)>, i32) {
         // Веха 139 — считаем от РАБОЧЕЙ ОБЛАСТИ. Её начало входит прямо в координаты ленты, а не
         // прибавляется где-то потом: иначе смещение пришлось бы помнить и рисованию, и попаданию
         // мыши, и обзору — трём местам сразу, то есть трём случаям разойтись.
-        let (ox, oy, _, oh) = self.work;
+        let (ox, oy, oh) = (self.work.x, self.work.y, self.work.h);
         let mut out = Vec::new();
         let mut x = ox + GAP;
         for c in cols {
@@ -2136,7 +2077,7 @@ impl Wm {
             for (wi, id) in c.ids.iter().enumerate() {
                 let y = oy + GAP + wi as i32 * (cell + GAP);
                 let h = if wi + 1 == c.ids.len() { oy + oh - GAP - y } else { cell };
-                out.push((*id, x, y, cw, h));
+                out.push((*id, Rect::new(x, y, cw, h)));
             }
             x += cw + GAP;
         }
@@ -2167,7 +2108,7 @@ impl Wm {
 
         // Куда уехала лента: колонка в фокусе обязана быть видна целиком; если она шире рабочей
         // области, показываем её левый край.
-        let (ox, _, ow, _) = self.work;
+        let (ox, ow) = (self.work.x, self.work.w);
         let mut x = ox + GAP;
         let mut want = self.scroll_to;
         for (i, c) in self.cols.iter().enumerate() {
@@ -2196,16 +2137,16 @@ impl Wm {
         }
 
         let mut resized: Vec<(u32, i32, i32)> = Vec::new();
-        for (id, fx, fy, fw, fh) in frames {
+        for (id, f) in frames {
             let Some(k) = self.win_at(id) else { continue };
             self.wins[k].visible = true;
             // Клиенту назначается размер СОДЕРЖИМОГО: рамку и заголовок рисуем мы.
-            let (cw2, ch2) = ((fw - 2 * BORDER).max(32), (fh - 2 * BORDER).max(32));
-            self.wins[k].x = fx;
-            self.wins[k].y = fy;
+            let (cw2, ch2) = ((f.w - 2 * BORDER).max(32), (f.h - 2 * BORDER).max(32));
+            self.wins[k].x = f.x;
+            self.wins[k].y = f.y;
             let target = Shown {
-                x: fx,
-                y: fy,
+                x: f.x,
+                y: f.y,
                 w: cw2 + 2 * BORDER,
                 h: ch2 + 2 * BORDER,
                 a: 256,
@@ -2244,7 +2185,7 @@ impl Wm {
                 self.send(k, win::Event::Resize { w: w as u16, h: h as u16 });
             }
         }
-        self.damage(0, 0, self.info.width as i32, screen_h);
+        self.damage(Rect::new(0, 0, self.info.width as i32, screen_h));
     }
 
     /// Пересчитать раскладку ОБЗОРА (Вехи 123, 123.1).
@@ -2280,7 +2221,7 @@ impl Wm {
                 .focused_id()
                 .and_then(|id| {
                     let (frames, _) = self.strip_layout(&self.cols);
-                    frames.iter().find(|f| f.0 == id).map(|f| (f.1 + f.3 / 2) * OV_NUM / OV_DEN)
+                    frames.iter().find(|f| f.0 == id).map(|f| (f.1.x + f.1.w / 2) * OV_NUM / OV_DEN)
                 })
                 .unwrap_or(sw / 2);
             self.aim_camera((focus_x - sw / 2, cam_y));
@@ -2297,18 +2238,18 @@ impl Wm {
             if by + band_h < 0 || by > sh {
                 continue; // полоса целиком за кадром — считать её нечего
             }
-            self.ov_bands.push((0, by, sw, band_h, sp));
+            self.ov_bands.push((Rect::new(0, by, sw, band_h), sp));
             let cols: &[Column] =
                 if sp == self.space { &self.cols } else { &self.spaces[sp].cols };
             let (frames, _) = self.strip_layout(cols);
-            for (id, fx, fy, fw, fh) in frames {
+            for (id, f) in frames {
                 self.ov.push(OvItem {
                     id,
                     space: sp,
-                    x: fx * OV_NUM / OV_DEN - cam_x,
-                    y: by + fy * OV_NUM / OV_DEN,
-                    w: (fw * OV_NUM / OV_DEN).max(1),
-                    h: (fh * OV_NUM / OV_DEN).max(1),
+                    x: f.x * OV_NUM / OV_DEN - cam_x,
+                    y: by + f.y * OV_NUM / OV_DEN,
+                    w: (f.w * OV_NUM / OV_DEN).max(1),
+                    h: (f.h * OV_NUM / OV_DEN).max(1),
                 });
             }
         }
@@ -2336,7 +2277,7 @@ impl Wm {
                 self.aim_camera(to);
             }
         }
-        self.damage(0, 0, sw, sh);
+        self.damage(Rect::new(0, 0, sw, sh));
     }
 
     /// Сколько столов существует СЕЙЧАС (Веха 137). Активный тоже занимает свой слот в
@@ -2572,11 +2513,19 @@ impl Wm {
     /// Смена фокуса меняет ровно их. Перерисовывать ради цвета рамки всё окно значит переписать
     /// сотни тысяч пикселей вместо нескольких тысяч — а фокус переезжает на каждый клик.
     fn damage_chrome(&mut self, i: usize) {
-        let (fx, fy, fw, fh) = self.wins[i].frame();
-        self.damage(fx, fy, fw, BORDER);
-        self.damage(fx, fy + fh - BORDER, fw, BORDER);
-        self.damage(fx, fy, BORDER, fh);
-        self.damage(fx + fw - BORDER, fy, BORDER, fh);
+        // Рамка — это дополнение окна до его же прямоугольника, поджатого на толщину рамки:
+        // четыре полосы, которые считает `Rect::subtract`. Прежде они выписывались руками.
+        //
+        // Прямоугольник берётся ПОКАЗАННЫЙ и в ЭКРАННЫХ координатах — тех же, в которых окно
+        // рисуется. Прежний брал назначенный раскладкой и не вычитал прокрутку ленты, то есть
+        // помечал место в координатах ЛЕНТЫ; на прокрученной ленте это чужое место. Заметить это
+        // на экране не удалось ни в одном собранном сценарии (смену фокуса догоняют другие
+        // пометки), поэтому здесь не исправление наблюдаемой поломки, а приведение к одной
+        // системе координат.
+        let f = self.wins[i].shown.rect().offset(-self.scroll_x, 0);
+        for strip in f.subtract(f.inset(BORDER)) {
+            self.damage(strip);
+        }
     }
 
     // ── курсор (тот же приём, что в `term`: он не часть кадра) ────────────────────────
@@ -2628,13 +2577,14 @@ impl Wm {
                 }
                 self.sync_focus();
                 self.leave_overview();
-            } else if let Some(&(_, by, _, bh, sp)) =
-                self.ov_bands.iter().find(|b| self.cursor.1 >= b.1 && self.cursor.1 < b.1 + b.3)
+            } else if let Some(&(_, sp)) = self
+                .ov_bands
+                .iter()
+                .find(|(band, _)| self.cursor.1 >= band.y && self.cursor.1 < band.bottom())
             {
                 // Веха 142 — клик мимо окон, но по ПОЛОСЕ стола: перейти на этот стол и выйти.
                 // Пустой стол иначе выбрать мышью было нечем — на нём нет ни одного окна, а
                 // именно туда чаще всего и уходят из обзора, чтобы начать с чистого места.
-                let _ = (by, bh);
                 if sp != self.space {
                     self.switch_space(sp);
                     self.sync_focus();
@@ -2664,8 +2614,8 @@ impl Wm {
         if self.super_held && pressed & 0x18 != 0 {
             let name = if pressed & 0x08 != 0 { "focus-column-left" } else { "focus-column-right" };
             self.action_inner(name, 0, 0);
-            self.damage(old.0, old.1, CUR_W, CUR_H);
-            self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
+            self.damage(Rect::new(old.0, old.1, CUR_W, CUR_H));
+            self.damage(Rect::new(self.cursor.0, self.cursor.1, CUR_W, CUR_H));
             return;
         }
         // Тащат ТОЛЬКО левой и правой: остальные кнопки к месту окна отношения не имеют.
@@ -2681,8 +2631,8 @@ impl Wm {
                 }
             }
             self.drag = Some(Drag { resize: e.buttons & 2 != 0, ax: 0, ay: 0 });
-            self.damage(old.0, old.1, CUR_W, CUR_H);
-            self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
+            self.damage(Rect::new(old.0, old.1, CUR_W, CUR_H));
+            self.damage(Rect::new(self.cursor.0, self.cursor.1, CUR_W, CUR_H));
             return;
         }
         if let Some(mut d) = self.drag.take() {
@@ -2715,8 +2665,8 @@ impl Wm {
                 }
                 self.drag = Some(d);
             }
-            self.damage(old.0, old.1, CUR_W, CUR_H);
-            self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
+            self.damage(Rect::new(old.0, old.1, CUR_W, CUR_H));
+            self.damage(Rect::new(self.cursor.0, self.cursor.1, CUR_W, CUR_H));
             return;
         }
 
@@ -2823,8 +2773,8 @@ impl Wm {
         // областей — а новое место в них не попадало. При медленном движении области
         // пересекались и всё выглядело целым; при быстром курсор терял куски, а на большом
         // скачке пропадал совсем. Ровно это владелец и увидел.
-        self.damage(old.0, old.1, CUR_W, CUR_H);
-        self.damage(self.cursor.0, self.cursor.1, CUR_W, CUR_H);
+        self.damage(Rect::new(old.0, old.1, CUR_W, CUR_H));
+        self.damage(Rect::new(self.cursor.0, self.cursor.1, CUR_W, CUR_H));
 
         // Колесо: в обзоре — просто крутить столы, вне обзора — с Super (просьба владельца).
         // Без модификатора вне обзора колесо принадлежит программе: прокрутка страницы важнее.
@@ -3330,18 +3280,18 @@ impl Wm {
         // `LayerCfg`. Иначе панель, выросшая на экран ради меню, увела бы под себя все окна.
         let Some(l) = self.wins[i].layer else { return };
         let old = self.wins[i].shown.rect();
-        let (rx, ry, rw, rh) = self.layer_rect(&l, p.w, p.h);
+        let r = self.layer_rect(&l, p.w, p.h);
         let win = &mut self.wins[i];
-        (win.x, win.y, win.w, win.h) = (rx, ry, rw, rh);
-        let to = Shown { x: rx, y: ry, w: rw, h: rh, a: win.shown.a };
+        (win.x, win.y, win.w, win.h) = (r.x, r.y, r.w, r.h);
+        let to = Shown { x: r.x, y: r.y, w: r.w, h: r.h, a: win.shown.a };
         win.shown = to;
         win.from = to;
         win.to = to;
         win.dur = 0;
-        self.damage(old.0, old.1, old.2, old.3);
-        self.damage(rx, ry, rw, rh);
-        if (rw, rh) != (p.w, p.h) {
-            let ev = win::Event::Resize { w: rw as u16, h: rh as u16 };
+        self.damage(old);
+        self.damage(r);
+        if (r.w, r.h) != (p.w, p.h) {
+            let ev = win::Event::Resize { w: r.w as u16, h: r.h as u16 };
             self.send(i, ev);
         }
     }
@@ -3553,16 +3503,16 @@ impl Wm {
                 let id = self.next_id;
                 self.next_id += 1;
                 let (buf, buf_len, slot) = self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0));
-                let (rx, ry, rw, rh) = self.layer_rect(&spec, w, h);
+                let r = self.layer_rect(&spec, w, h);
                 // Проявляются только ОБОИ (нижний слой): см. ниже, у поля `shown`.
                 let fade = spec.layer == win::LAYER_BG;
                 let win = Win {
                     id,
                     owner: m.sender,
-                    x: rx,
-                    y: ry,
-                    w: rw,
-                    h: rh,
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: r.h,
                     title: String::from(title),
                     buf,
                     buf_len,
@@ -3581,9 +3531,9 @@ impl Wm {
                     // непрозрачность: знак считается полторы секунды (см. [[logo]]), и до этого
                     // момента стол уже нарисован — без проявления картинка возникает рывком,
                     // будто что-то моргнуло. Бар этого не требует: он появляется сразу.
-                    shown: Shown { x: rx, y: ry, w: rw, h: rh, a: if fade { 0 } else { 256 } },
-                    from: Shown { x: rx, y: ry, w: rw, h: rh, a: if fade { 0 } else { 256 } },
-                    to: Shown { x: rx, y: ry, w: rw, h: rh, a: 256 },
+                    shown: Shown { x: r.x, y: r.y, w: r.w, h: r.h, a: if fade { 0 } else { 256 } },
+                    from: Shown { x: r.x, y: r.y, w: r.w, h: r.h, a: if fade { 0 } else { 256 } },
+                    to: Shown { x: r.x, y: r.y, w: r.w, h: r.h, a: 256 },
                     at: 0,
                     dur: 0,
                     // «Свежая» поверхность — та, что ещё ни разу не нарисовала себя. Для обоев
@@ -3602,11 +3552,11 @@ impl Wm {
                 // сказать ему об этом тем же событием, что и окнам: пусть заведёт буфер под то,
                 // что ему на самом деле дали. До ответа рисуем растянутым — как и окно, которое
                 // ещё не успело перерисоваться (Веха 126.1).
-                if (rw, rh) != (w, h) {
+                if (r.w, r.h) != (w, h) {
                     let k = self.wins.len() - 1;
-                    self.send(k, win::Event::Resize { w: rw as u16, h: rh as u16 });
+                    self.send(k, win::Event::Resize { w: r.w as u16, h: r.h as u16 });
                 }
-                self.damage(rx, ry, rw, rh);
+                self.damage(r);
                 // Зона могла отнять место у ленты — пересчёт раскладки внутри.
                 self.recompute_work();
             }
@@ -3660,9 +3610,9 @@ impl Wm {
                     // то есть ровно тем, от чего проявление и заводили.
                     if self.wins[i].fresh && !self.wins[i].tiled() {
                         self.wins[i].fresh = false;
-                        let (rx, ry, rw, rh) = self.wins[i].shown.rect();
+                        let r = self.wins[i].shown.rect();
                         let d = self.anim * D_OPEN / 100;
-                        let to = Shown { x: rx, y: ry, w: rw, h: rh, a: 256 };
+                        let to = Shown { x: r.x, y: r.y, w: r.w, h: r.h, a: 256 };
                         self.wins[i].start(to, d, sys::monotonic_ns());
                     }
                     let (dx, dy) = (c.x as i32, c.y as i32);
@@ -3676,18 +3626,18 @@ impl Wm {
                     // сдвигало, и повреждения всех последующих кадров уходили за край экрана.
                     // Выглядело это так, будто новое окно рождается ЧЁРНЫМ: рамку рисовала
                     // раскладка, а содержимое не перерисовывалось уже никогда.
-                    let (fx, fy, fw, fh) = self.wins[i].shown.rect();
+                    let f = self.wins[i].shown.rect();
                     // Слой не ездит с лентой и не уменьшается обзором: его прямоугольник —
                     // сразу экранный, и прямоугольник клиента ложится в него как есть.
                     let tiled = self.wins[i].tiled();
                     let sc = if self.overview || !tiled { 0 } else { self.scroll_x };
                     let (b, _) = self.wins[i].deco();
                     let (want_w, want_h) = (self.wins[i].w + 2 * b, self.wins[i].h + 2 * b);
-                    if (self.overview && tiled) || fw != want_w || fh != want_h {
+                    if (self.overview && tiled) || f.w != want_w || f.h != want_h {
                         // Окно в движении (растёт, едет, уменьшено обзором) — его пиксели легли на
                         // экран масштабированными, и попасть в них прямоугольником клиента нельзя.
                         // Помечаем окно целиком: кадр анимации всё равно перерисовывает его.
-                        self.damage(fx - sc, fy, fw, fh);
+                        self.damage(f.offset(-sc, 0));
                     } else {
                         // Прямоугольник приезжает в координатах БУФЕРА КЛИЕНТА, а на экран его
                         // пиксели легли растянутыми до размера содержимого окна
@@ -3713,7 +3663,7 @@ impl Wm {
                             let y1 = (((dy + dh) * ch + bh - 1) / bh + 1).clamp(y0, ch);
                             (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
                         };
-                        self.damage(fx - sc + b + rx, fy + b + ry, rw, rh);
+                        self.damage(Rect::new(f.x - sc + b + rx, f.y + b + ry, rw, rh));
                     }
                 }
             }
@@ -3920,8 +3870,8 @@ impl Wm {
 const LAUNCH_ANIM_NS: u64 = 10_000_000_000;
 
 /// Залить прямоугольник плитки. Холст сам режет по краю и сам пишет альфу.
-fn tile_fill(c: &mut ui::Canvas, r: (i32, i32, i32, i32), col: Rgba) {
-    c.fill(ui::Rect::new(r.0, r.1, r.2, r.3), col.with_a(0xff));
+fn tile_fill(c: &mut ui::Canvas, r: Rect, col: Rgba) {
+    c.fill(r, col.with_a(0xff));
 }
 
 /// Написать строку шрифтом 8×16 с увеличением `scale`. Возвращает ширину написанного.
@@ -3939,7 +3889,7 @@ fn tile_text(c: &mut ui::Canvas, x: i32, y: i32, s: &str, col: Rgba, scale: i32)
                 if bits & (0x80 >> bit) == 0 {
                     continue;
                 }
-                tile_fill(c, (cx + bit * scale, y + ry as i32 * scale, scale, scale), col);
+                tile_fill(c, Rect::new(cx + bit * scale, y + ry as i32 * scale, scale, scale), col);
             }
         }
         cx += 8 * scale;
@@ -3959,7 +3909,7 @@ fn tile_center(c: &mut ui::Canvas, y: i32, s: &str, col: Rgba, scale: i32) {
 /// Весь кадр плитки: «запускается» с бегунком либо итог с кодом выхода и хвостом вывода.
 fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, th: &Theme) {
     let c = &mut ui::Canvas::new(px, bw, bh);
-    tile_fill(c, (0, 0, bw, bh), th.bg);
+    tile_fill(c, Rect::new(0, 0, bw, bh), th.bg);
     match &l.done {
         // ── ждём окна ──────────────────────────────────────────────────────────────────
         None => {
@@ -3971,10 +3921,10 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
             // осталось, ни сколько всего, — знаем только, что ещё ждём.
             let track = (bw / 6).max(40).min(bw / 2);
             let (tx, ty) = ((bw - track) / 2, y + 64);
-            tile_fill(c, (tx, ty, track, 4), th.border);
+            tile_fill(c, Rect::new(tx, ty, track, 4), th.border);
             if long {
                 // Срок вышел: полоса замирает целиком, а словами говорим правду.
-                tile_fill(c, (tx, ty, track, 4), th.muted);
+                tile_fill(c, Rect::new(tx, ty, track, 4), th.muted);
                 tile_center(c, ty + 14, "дольше обычного — окна всё нет", th.muted, 1);
             } else {
                 let run = (track / 4).max(8);
@@ -3983,7 +3933,7 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
                 let span = (track - run).max(1);
                 let p = (phase as i32) % (2 * span);
                 let off = if p < span { p } else { 2 * span - p };
-                tile_fill(c, (tx + off, ty, run, 4), th.accent);
+                tile_fill(c, Rect::new(tx + off, ty, run, 4), th.accent);
             }
         }
         // ── всё кончилось, а окна не было ──────────────────────────────────────────────
@@ -3995,7 +3945,7 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
             tile_text(c, pad, pad + 22, &l.name, th.text, 2);
             let code_line = alloc::format!("код выхода {}", code);
             tile_text(c, pad, pad + 56, &code_line, th.muted, 1);
-            tile_fill(c, (pad, pad + 78, bw - 2 * pad, 1), th.border);
+            tile_fill(c, Rect::new(pad, pad + 78, bw - 2 * pad, 1), th.border);
             // Вывод — ПОСЛЕДНИЕ строки: смерть объясняют они, а не первые. Пустой вывод не
             // прячем за молчанием, а называем: «программа не сказала ничего» — это тоже ответ.
             let mut y = pad + 88;
