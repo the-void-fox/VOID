@@ -108,17 +108,12 @@ impl Theme {
         let mut t = Theme::VOID;
         // Масштаб читается ПЕРВЫМ проходом: им умножаются все размеры, включая те, что придут
         // следующими строками. Иначе порядок строк в конфиге менял бы результат.
-        if let Some(v) = value(text, "scale").and_then(|v| v.parse::<u32>().ok()) {
+        if let Some(v) = void_conf::num::<u32>(text, "ui", "scale") {
             t.scale = v.clamp(50, 400);
         }
         let mut opacity = None;
-        for line in text.lines() {
-            let Some(rest) = line.trim().strip_prefix("ui ") else { continue };
-            let rest = rest.trim();
-            let (key, val) = match rest.split_once(char::is_whitespace) {
-                Some((k, v)) => (k, v.trim()),
-                None => continue,
-            };
+        for e in void_conf::of(text, "ui") {
+            let (key, val) = (e.key(), e.tail());
             let color = |slot: &mut Rgba| {
                 if let Some(c) = Rgba::parse(val) {
                     // Восьмизначная запись задаёт альфу сама, шестизначная её не трогает: иначе
@@ -169,19 +164,6 @@ impl Theme {
         t.font_px = (t.font_px * t.scale / 100).max(8);
         t
     }
-}
-
-/// Значение ключа `ui <key> <value>` — первое вхождение.
-fn value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("ui ") else { continue };
-        let Some(v) = rest.trim().strip_prefix(key) else { continue };
-        let v = v.trim();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    None
 }
 
 fn num(val: &str, slot: &mut i32, lo: i32, hi: i32) {

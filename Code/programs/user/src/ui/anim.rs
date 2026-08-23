@@ -55,14 +55,10 @@ pub fn lerp(a: i32, b: i32, p: i32) -> i32 {
 /// Читается ТА ЖЕ строка, что у композитора, а не своя `ui("anim", …)`: скорость движения — одно
 /// свойство системы, и два числа на него разъехались бы (см. заголовок модуля).
 pub fn duration_from_config(text: &str) -> u64 {
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("desktop ") else { continue };
-        let Some(v) = rest.trim().strip_prefix("anim") else { continue };
-        if let Ok(n) = v.trim().parse::<u64>() {
-            return n.min(ANIM_MAX);
-        }
+    match void_conf::num::<u64>(text, "desktop", "anim") {
+        Some(n) => n.min(ANIM_MAX),
+        None => ANIM_MS,
     }
-    ANIM_MS
 }
 
 /// Одно движущееся число.

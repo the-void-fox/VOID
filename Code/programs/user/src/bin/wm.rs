@@ -348,28 +348,7 @@ fn load_binds(text: &str) -> (Vec<Bind>, bool) {
 /// `arg:` в самом конфиге (`init::apply_with` режет строку на токены) — здесь конец пути, и
 /// резать его второй раз незачем.
 fn wallpaper_name(text: &str) -> Option<&str> {
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("desktop wallpaper") {
-            let name = rest.trim();
-            if !name.is_empty() {
-                return Some(name);
-            }
-        }
-    }
-    None
-}
-
-/// Веха 142 — ЧИСЛОВАЯ настройка рабочего стола: строка `desktop <имя> <число>`. Сегодня это
-/// только `anim`, но разбор общий: следующая настройка не должна приносить с собой свой парсер.
-fn desktop_num(text: &str, key: &str) -> Option<u64> {
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("desktop ") else { continue };
-        let Some(v) = rest.trim().strip_prefix(key) else { continue };
-        if let Ok(n) = v.trim().parse::<u64>() {
-            return Some(n);
-        }
-    }
-    None
+    void_conf::get(text, "desktop", "wallpaper")
 }
 
 /// Веха 140 — просит ли конфиг поколения ПАНЕЛЬ: строка `desktop bar on`.
@@ -378,14 +357,16 @@ fn desktop_num(text: &str, key: &str) -> Option<u64> {
 /// конфиг значило бы дать человеку рассогласовать одно с другим. Захочется другой кегль — тогда и
 /// появится настройка, сразу для обоих чисел.
 fn bar_wanted(text: &str) -> bool {
-    text.lines().any(|l| l.trim() == "desktop bar on")
+    void_conf::on(text, "desktop", "bar")
 }
 
 fn parse_binds(text: &str) -> Vec<Bind> {
     let mut out = Vec::new();
-    for line in text.lines() {
-        let mut w = line.split_whitespace();
-        if w.next() != Some("bind") || w.next() != Some("wm") {
+    for e in void_conf::of(text, "bind") {
+        // Первое поле `bind` — РЕЖИМ, и он же делит схемы: `wm` наша, `normal`/`pane` — терминала
+        // (тот читает тот же текст и берёт свои).
+        let mut w = e.words();
+        if w.next() != Some("wm") {
             continue;
         }
         let (Some(combo), Some(action)) = (w.next(), w.next()) else { continue };
@@ -505,7 +486,7 @@ fn main_loop() -> ! {
     wm.draw_cursor();
     // Веха 142 — скорость анимаций из конфига (`desktop anim <мс>`). Значение чужое, поэтому
     // потолок ставим свой: срок длиннее секунды делает систему не плавной, а задумчивой.
-    if let Some(ms) = desktop_num(&generation, "anim") {
+    if let Some(ms) = void_conf::num::<u64>(&generation, "desktop", "anim") {
         wm.anim = ms.min(ANIM_MAX);
         sys::write_console(alloc::format!("[wm] анимации: {} мс\n", wm.anim).as_bytes());
     }

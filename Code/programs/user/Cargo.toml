@@ -23,6 +23,9 @@ description = "Базовый userspace VOID: библиотека syscall-ши�
 [dependencies]
 vvsh-core = { path = "../../libs/vvsh-core" }
 void-nar = { path = "../../libs/void-nar" }
+# Веха 148.8 — грамматика конфига поколения. Тот же крейт, что у ядра: текст один, и разбирать
+# его тулкиту, композитору, терминалу и `pkg` полагается ровно так же, как ядру.
+void-conf = { path = "../../libs/void-conf" }
 # Веха 108.3 — формат дерева пакета: пишет его `pkg`, показывает `posixfs`, читает ядро.
 void-tree = { path = "../../libs/void-tree" }
 

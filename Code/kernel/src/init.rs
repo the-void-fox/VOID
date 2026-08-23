@@ -206,35 +206,23 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
     let mut services: Vec<(String, usize)> = known; // имя → pid (для endpoint:)
     let env = alloc::format!("ARCH={}\0SYSTEM=void\0", arch::ARCH_NAME);
 
-    for line in config.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut tok = line.split_whitespace();
-        let kind = tok.next().unwrap_or("");
-        // Веха 100 — строки, адресованные не ядру, а ПРОГРАММЕ: настройки терминала и его
-        // клавиши (`terminal …`, `bind …`). Конфиг поколения один — у системы одна история и
-        // один откат, — а читателей несколько: ядро берёт свои строки, `term` читает то же
-        // поколение из store и берёт свои. Молча пропускаем: это не ошибка конфига.
-        // Вехи 112–113 — `packages …`/`channel …` тоже не ядру: объявленные пакеты собирает
-        // `pkg sync`, а ядру на загрузке до них дела нет (они уже лежат в store, если собрались).
-        // Веха 139 — `desktop …` (обои и прочий рабочий стол) читает композитор, не ядро.
-        // Веха 144 — `ui …` (цвета, скругления, кегль, масштаб) читает тулкит оболочки.
-        if kind == "terminal"
-            || kind == "bind"
-            || kind == "desktop"
-            || kind == "ui"
-            || kind == "device"
-            || kind == "packages"
-            || kind == "channel"
-        {
-            continue;
-        }
-        if kind != "service" && kind != "shell" {
+    for entry in void_conf::entries(config) {
+        let kind = entry.kind;
+        // Веха 100 — конфиг поколения ОДИН, а читателей много: у системы одна история и один
+        // откат, поэтому настройки терминала, композитора, тулкита и пакетов живут в том же
+        // тексте. Ядро берёт свои строки, прочие пропускает молча — это не ошибка конфига.
+        //
+        // Веха 148.8 — какие строки чьи, знает не ядро, а СЛОВАРЬ ([`void_conf::KINDS`]).
+        // Раньше список чужих видов был записан здесь, и каждый новый вид требовал правки ЯДРА:
+        // до неё система на каждой загрузке звала его «неизвестной директивой».
+        let Some(k) = void_conf::kind(kind) else {
             println!("  [init] неизвестная директива '{}' (пропуск)", kind);
             continue;
+        };
+        if !k.kernel {
+            continue;
         }
+        let mut tok = entry.words();
         let Some(name) = tok.next() else { continue };
         let Some(pid) = spawn(name) else { continue };
 

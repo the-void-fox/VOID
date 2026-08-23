@@ -7,6 +7,9 @@ description = "Микроядро VOID (bare-metal RISC-V, S-mode)."
 
 [dependencies]
 void-abi = { path = "../libs/void-abi" }
+# Веха 148.8 — грамматика конфига поколения: по этому тексту `init` поднимает всю систему,
+# а словарь видов записей общий с `vvsh-core` (кто его пишет) и с userspace (кто его читает).
+void-conf = { path = "../libs/void-conf" }
 void-store = { path = "../libs/void-store" }
 # Веха 108.3 — формат дерева пакета: персоналия Linux читает файлы прямо из store.
 void-tree = { path = "../libs/void-tree" }

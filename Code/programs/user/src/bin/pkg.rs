@@ -1606,12 +1606,9 @@ fn system_config(scap: usize, gen: &str) -> Result<String, String> {
 /// `service`. Объявленное множество — их объединение.
 fn declared_packages(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("packages ") else { continue };
-        for name in rest.split_whitespace() {
-            if !out.iter().any(|n| n == name) {
-                out.push(name.to_string());
-            }
+    for name in void_conf::of(text, "packages").flat_map(|e| e.words()) {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
         }
     }
     out

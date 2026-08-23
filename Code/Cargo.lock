@@ -85,10 +85,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "void-conf"
+version = "0.0.1"
+
+[[package]]
 name = "void-kernel"
 version = "0.0.1"
 dependencies = [
  "void-abi",
+ "void-conf",
  "void-store",
  "void-tree",
 ]

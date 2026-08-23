@@ -34,26 +34,19 @@ pub fn normalize_config(v: &Value) -> Result<String, EvalError> {
             Value::Sym(s) => &**s,
             _ => return Err(EvalError::new("kind записи — символ")),
         };
-        // Записи терминала — с фиксированным числом полей, и проверять его надо ЗДЕСЬ: смысл
-        // этапа сборки в том, чтобы опечатка стала ошибкой `rebuild`, а не молчаливо
-        // пропущенной строкой в уже загруженной системе.
-        match (kind, entry.len()) {
-            ("bind", n) if n != 4 => {
-                return Err(EvalError::new("bind: (bind режим клавиша действие)"))
+        // Число полей записи проверяется ЗДЕСЬ: смысл этапа сборки в том, чтобы опечатка стала
+        // ошибкой `rebuild`, а не молчаливо пропущенной строкой в уже загруженной системе.
+        //
+        // Веха 148.8 — сколько полей у вида, знает СЛОВАРЬ (`void_conf::KINDS`), а не эта
+        // функция: тот же словарь читает ядро («чья это строка»), и разъехаться им теперь не на
+        // чем. Вид, которого в словаре нет, здесь не отвергается: конфиг вправе нести строки для
+        // программ, о которых ядро не знает вовсе, — а вот ядро о таком скажет в журнал.
+        if let Some(k) = void_conf::kind(kind) {
+            if let Some(want) = k.values {
+                if entry.len() != want + 1 {
+                    return Err(EvalError::new(alloc::format!("{}: {}", kind, k.form)));
+                }
             }
-            ("terminal", n) if n != 3 => {
-                return Err(EvalError::new("terminal: (terminal ключ значение)"))
-            }
-            ("desktop", n) if n != 3 => {
-                return Err(EvalError::new("desktop: (desktop ключ значение)"))
-            }
-            ("ui", n) if n != 3 => return Err(EvalError::new("ui: (ui ключ значение)")),
-            ("device", n) if n != 3 => {
-                return Err(EvalError::new("device: (device ключ значение)"))
-            }
-            // Канал один: «откуда система берёт софт» — решение, а не список предпочтений.
-            ("channel", n) if n != 2 => return Err(EvalError::new("channel: (channel url)")),
-            _ => {}
         }
         let name = match &entry[1] {
             Value::Str(s) => &**s,

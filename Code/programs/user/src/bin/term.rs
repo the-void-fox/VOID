@@ -156,16 +156,15 @@ impl Out {
     }
 }
 
-/// Настройки по умолчанию — тем же текстом, каким их задаёт конфиг поколения. Так «как оно
+/// СХЕМА КЛАВИШ по умолчанию — тем же текстом, каким её задаёт конфиг поколения. Так «как оно
 /// устроено из коробки» читается глазами, а разбор остаётся ОДИН: две ветки, «зашитая» и
 /// «из конфига», разъехались бы при первой же правке схемы.
 ///
-/// Без `repl` vvsh печатает справку и выходит — панель умирала мгновенно, и выглядело это как
-/// «мультиплексор не работает».
+/// Только клавиши. До Вехи 148.8 здесь стояли ещё три строки `terminal …` — и они ПЕРЕБИВАЛИ
+/// конфиг: применяется этот текст ПОСЛЕ поколения (и только если поколение не назвало ни одной
+/// клавиши), так что `terminal("font-size", 13)` в системе без своих `bind` молча не работал.
+/// Умолчания кегля, шелла и его аргументов теперь названы один раз — в [`Conf::load`].
 const DEFAULT_CONF: &str = "\
-terminal font-size 18
-terminal shell bin/vvsh
-terminal shell-args repl
 bind normal C-a mode-pane
 bind pane C-a literal-prefix
 bind pane | split-v
@@ -458,7 +457,8 @@ struct Conf {
 }
 
 impl Conf {
-    /// Собрать настройки: конфиг активного поколения, а чего в нём нет — из [`DEFAULT_CONF`].
+    /// Собрать настройки: конфиг активного поколения поверх умолчаний, а схему клавиш — из
+    /// [`DEFAULT_CONF`], если поколение не назвало ни одной.
     fn load() -> Conf {
         let mut c = Conf {
             binds: Vec::new(),
@@ -466,6 +466,8 @@ impl Conf {
             font_px: 18,
             font: None,
             shell: b"bin/vvsh".to_vec(),
+            // Без `repl` vvsh печатает справку и выходит — панель умирала мгновенно, и выглядело
+            // это как «мультиплексор не работает».
             shell_args: b"repl".to_vec(),
         };
         if let Some(text) = read_generation() {
@@ -485,10 +487,10 @@ impl Conf {
     /// Разобрать строки конфига. Чужие строки (`service`, `shell`, …) и непонятные пропускаются:
     /// текст поколения общий, и ругаться на строки соседа терминалу не на что.
     fn apply(&mut self, text: &str) {
-        for line in text.lines() {
-            let mut w = line.split_whitespace();
-            match w.next() {
-                Some("bind") => {
+        for e in void_conf::entries(text) {
+            let mut w = e.words();
+            match e.kind {
+                "bind" => {
                     let (Some(m), Some(k), Some(a)) = (w.next(), w.next(), w.next()) else {
                         continue;
                     };
@@ -503,9 +505,13 @@ impl Conf {
                         action: a.to_string(),
                     });
                 }
-                Some("terminal") => {
-                    let (Some(key), Some(val)) = (w.next(), w.next()) else { continue };
-                    match key {
+                // Значение берётся ХВОСТОМ, а не первым словом: в конфиге это одна строка в
+                // кавычках, и пробел внутри неё законен (`shell-args "repl -i"`, имя файла
+                // шрифта с пробелом, путь). До Вехи 148.8 хвост склеивался обратно вручную и
+                // только у `shell-args` — у прочих ключей конец значения просто пропадал.
+                "terminal" => {
+                    let val = e.tail();
+                    match e.key() {
                         // Кегль ограничен с обеих сторон: слишком мелкий нечитаем, слишком
                         // крупный оставляет от экрана десяток знакомест.
                         "font-size" => {
@@ -518,14 +524,7 @@ impl Conf {
                         // конфиге не появлялись хэши store (тот же довод, что у `packages`).
                         "font" => self.font = Some(val.to_string()),
                         "shell" => self.shell = val.as_bytes().to_vec(),
-                        "shell-args" => {
-                            let mut args = val.to_string();
-                            for extra in w {
-                                args.push(' ');
-                                args.push_str(extra);
-                            }
-                            self.shell_args = args.into_bytes();
-                        }
+                        "shell-args" => self.shell_args = val.as_bytes().to_vec(),
                         _ => {}
                     }
                 }

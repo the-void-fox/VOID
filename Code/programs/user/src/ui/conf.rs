@@ -4,6 +4,9 @@
 //! хранит текст. Никакого «файла настроек интерфейса» рядом нет намеренно: вид системы обязан
 //! откатываться вместе с системой ([[0017-settings-from-config]]), а второй источник правды
 //! разошёлся бы с первым на первом же откате.
+//!
+//! Здесь только «ОТКУДА взять текст»: право на store, активное поколение, корень. На «КАК читается
+//! строка» отвечает крейт `void-conf` (Веха 148.8) — тот же самый, каким разбирает конфиг ядро.
 
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -28,30 +31,12 @@ pub fn generation_name() -> Option<String> {
     Some(core::str::from_utf8(&name).ok()?.trim().to_string())
 }
 
-/// Значение записи конфига: строка `<вид> <ключ> <значение>` (Веха 145.1).
-///
-/// Общий разбор на все виды, а не свой у каждого читателя: строки конфига устроены одинаково, и
-/// третий парсер той же формы разошёлся бы с первыми двумя на первой же правке (у темы такой уже
-/// есть — `theme::value`, и он разбирает ровно это же).
-pub fn entry<'a>(text: &'a str, kind: &str, key: &str) -> Option<&'a str> {
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix(kind) else { continue };
-        let Some(rest) = rest.strip_prefix(' ') else { continue };
-        let Some(v) = rest.trim().strip_prefix(key) else { continue };
-        let v = v.trim();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    None
-}
-
 /// Веха 145.1 — «кто эта машина»: `device name` и `device avatar`.
 ///
 /// Пользователей в VOID нет вовсе, поэтому на вопрос «чьё это устройство» отвечает имя
 /// УСТРОЙСТВА. Показывает его меню оболочки ([[menu]]).
 pub fn device(text: &str, key: &str) -> Option<String> {
-    entry(text, "device", key).map(|v| v.to_string())
+    void_conf::get(text, "device", key).map(|v| v.to_string())
 }
 
 /// Право на store: по имени (Веха 99.1), иначе перебором. Проба безобидна — чтение корня ничего
