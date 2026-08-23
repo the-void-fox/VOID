@@ -70,7 +70,7 @@ use ereb_input::{Action, Bindings, KeyEvent, Keysym, ModMask, Mode};
 use ereb_mux::{neighbor, Area, Direction, PaneId, PaneRect, SplitDirection, SplitTree};
 use ereb_render::{GlyphCache, GridRenderer, Palette, Surface, TtfFont};
 use void_user as sys;
-use void_user::{stdio, Wait};
+use void_user::{stdio, win, Wait};
 
 /// Куча: кадр 1280×800 RGBA (4 МиБ), прочитанный шрифт, гриды панелей, кэш глифов.
 #[global_allocator]
@@ -164,8 +164,14 @@ impl Out {
 /// конфиг: применяется этот текст ПОСЛЕ поколения (и только если поколение не назвало ни одной
 /// клавиши), так что `terminal("font-size", 13)` в системе без своих `bind` молча не работал.
 /// Умолчания кегля, шелла и его аргументов теперь названы один раз — в [`Conf::load`].
+/// Веха 150 — сколько байт вставляется за раз. Буфер на стеке: `term` живёт с кучей, но класть
+/// туда мегабайтный текст незачем — вставка в командную строку длиннее нескольких килобайт это
+/// уже не вставка, а файл, и его место в store, а не в argv. Обрезка ГОВОРИТСЯ в журнал.
+const PASTE_MAX: usize = 4096;
+
 const DEFAULT_CONF: &str = "\
 bind normal C-a mode-pane
+bind normal C-S-v paste
 bind pane C-a literal-prefix
 bind pane | split-v
 bind pane - split-h
@@ -173,6 +179,7 @@ bind pane o next-pane
 bind pane x close
 bind pane q quit
 bind pane r reload
+bind pane v paste
 bind pane h go-left
 bind pane j go-down
 bind pane k go-up
@@ -360,13 +367,13 @@ fn decode(state: &mut KeyScan, b: u8) -> Option<KeyEvent> {
 /// букве, а управляющий байт соберёт [`encode`].
 fn win_key(sym: u16, mods: u8, ch: u16) -> KeyEvent {
     let mut m = ModMask::empty();
-    if mods & 1 != 0 {
+    if mods & win::modk::SHIFT != 0 {
         m |= ModMask::SHIFT;
     }
-    if mods & 2 != 0 {
+    if mods & win::modk::CTRL != 0 {
         m |= ModMask::CTRL;
     }
-    if mods & 4 != 0 {
+    if mods & win::modk::ALT != 0 {
         m |= ModMask::ALT;
     }
     let keysym = match sym {
@@ -997,6 +1004,17 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 // в программу как обычный байт. Иначе префикс мультиплексора молча съедал бы
                 // аккорд, который человек адресовал шеллу или редактору.
                 if !mux {
+                    // …кроме БУФЕРА ОБМЕНА (Веха 150). Вставка — единственное, что остаётся за
+                    // терминалом и в окне: программа за ним про буфер не знает вовсе, а
+                    // `Ctrl+Shift+V` ей ничего не значит (Shift не меняет байт `Ctrl+V`).
+                    // Смотрим ту же схему из конфига, но принимаем ровно ОДНО действие: всё
+                    // прочее уходит программе, и второго мультиплексора в окне не заводится.
+                    let act = ereb_input::translate(&key, &conf.table, Mode::Normal);
+                    if matches!(&act, Action::Custom(c) if c == "paste") {
+                        paste_clipboard(&mut panes, focus);
+                        redraw = true;
+                        continue;
+                    }
                     for b in encode(&key) {
                         push_input(&mut panes, focus, b);
                     }
@@ -1030,6 +1048,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                         _ => 0,
                                     };
                                 }
+                            }
+                            // Веха 150 — ВСТАВИТЬ из буфера обмена ([`paste_clipboard`]).
+                            // Режим панелей после неё сбрасывается, как после любой команды.
+                            "paste" => {
+                                paste_clipboard(&mut panes, focus);
                             }
                             "split-v" | "split-h" => {
                                 let dir = if cmd == "split-v" {
@@ -1452,6 +1475,36 @@ fn resize_all(panes: &mut [Pane], rects: &[PaneRect]) {
 
 /// Положить клавишу в ящик фокусной панели. Ответ уйдёт в шаге 3 реактора — там же, где
 /// обслуживаются запросы, пришедшие РАНЬШЕ клавиш.
+/// Веха 150 — ВСТАВИТЬ из буфера обмена в очередь ввода фокусной панели.
+///
+/// Байты лежат в store, композитор назвал только их content-id: читаем своим правом на store и
+/// кладём как будто набранные. Перевод строки НЕ пропускаем — вставить многострочный текст в
+/// шелл значит выполнить всё, кроме последней строки, а этого никто не просил; заменяем пробелом,
+/// как делает большинство терминалов и по той же причине.
+fn paste_clipboard(panes: &mut [Pane], focus: usize) -> usize {
+    // Право на store берём тем же способом, что и конфиг: по имени, а не вышло — перебором
+    // ([`store_cap`]). Иначе вставка работала бы у одних поколений и молча не работала у других.
+    let Some(cap) = store_cap() else {
+        log_line("term: вставка не вышла — права на store нет");
+        return 0;
+    };
+    let mut buf = [0u8; PASTE_MAX];
+    let Some((_, got, full)) = sys::win::clip_read(cap, &mut buf) else {
+        log_line("term: вставлять нечего (буфер обмена пуст)");
+        return 0;
+    };
+    for &b in &buf[..got] {
+        push_input(panes, focus, if b == b'\n' || b == b'\r' { b' ' } else { b });
+    }
+    if full > got {
+        log_line(&alloc::format!(
+            "term: вставлено {} из {} байт — буфер вставки {} байт",
+            got, full, PASTE_MAX
+        ));
+    }
+    got
+}
+
 fn push_input(panes: &mut [Pane], focus: usize, byte: u8) {
     if let Some(p) = panes.get_mut(focus) {
         // Набрал что-то — вернулись вниз. Так ведут себя все терминалы, и по делу: человек,

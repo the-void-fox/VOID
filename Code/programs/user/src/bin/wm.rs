@@ -394,10 +394,10 @@ fn parse_combo(tok: &str) -> Option<(u16, u8)> {
     let mut last = tok;
     for part in tok.split('+') {
         match part {
-            "Super" | "Mod" => mods |= 8,
-            "Shift" => mods |= 1,
-            "Ctrl" | "Control" => mods |= 2,
-            "Alt" => mods |= 4,
+            "Super" | "Mod" => mods |= win::modk::SUPER,
+            "Shift" => mods |= win::modk::SHIFT,
+            "Ctrl" | "Control" => mods |= win::modk::CTRL,
+            "Alt" => mods |= win::modk::ALT,
             other => last = other,
         }
     }
@@ -496,6 +496,12 @@ fn parse_binds(text: &str) -> Vec<Bind> {
 }
 
 /// Активное поколение конфига — тем же способом, каким его читает терминал.
+/// Content-id, на который указывает корень store. `None` — корня нет.
+fn read_root_id(scap: usize, name: &[u8]) -> Option<[u8; 32]> {
+    let mut id = [0u8; 32];
+    (sys::obj_get_root(scap, name, &mut id) == 32).then_some(id)
+}
+
 fn read_generation(scap: usize) -> Option<String> {
     let mut id = [0u8; 32];
     if sys::obj_get_root(scap, b"system/current", &mut id) != 32 {
@@ -557,6 +563,11 @@ fn main_loop() -> ! {
         rgb,
         rgb8,
         work: At::new(0, 0, info.width as i32, info.height as i32),
+        // Веха 150 — буфер обмена ПЕРЕЖИВАЕТ ПЕРЕЗАГРУЗКУ: он лежит корнем в store, и здесь мы
+        // его просто поднимаем. Вид после загрузки считаем текстом: других видов сегодня нет, а
+        // когда появятся — рядом ляжет их признак.
+        clip: read_root_id(store, b"clip/current").map(|id| (win::CLIP_TEXT, id)),
+        store,
         wins: Vec::new(),
         next_id: 1,
         cursor: Pt::new(info.width as i32 / 2, info.height as i32 / 2),
@@ -1220,6 +1231,15 @@ struct Wm {
     ov_to: i32,
     ov_at: u64,
     ov_dur: u64,
+    /// Веха 150 — БУФЕР ОБМЕНА: вид и content-id того, что в нём лежит. `None` — пуст.
+    ///
+    /// Здесь только ИМЯ содержимого: байты лежат в store, и композитор их не возит и не хранит
+    /// (ADR 0016). Корень `clip/current` на них держит он же — иначе сборка мусора store забрала
+    /// бы скопированное как недостижимое, а заодно буфер не пережил бы перезагрузку.
+    clip: Option<(u8, [u8; 32])>,
+    /// Право на store: нужно, чтобы двигать корень буфера обмена. Хранится полем, а не тянется
+    /// параметром через полдюжины вызовов, — композитору оно нужно и так, с самого запуска.
+    store: usize,
     /// Начало полосы СВОЕГО стола в координатах обзора — точка, в которую наезжает камера.
     /// Считается там же, где сам обзор: иначе разошлось бы с ним при первой же правке.
     ov_band_y: i32,
@@ -3035,7 +3055,7 @@ impl Wm {
         }
         // Аккорд с Super, которому не нашлось действия, программе не отдаём: иначе промах по
         // раскладке печатал бы букву посреди текста.
-        if e.mods & 8 != 0 {
+        if e.mods & win::modk::SUPER != 0 {
             return;
         }
         // Веха 146 — поверхность слоя, попросившая клавиатуру (`win::LAYER_KBD`), забирает
@@ -3731,6 +3751,34 @@ impl Wm {
                 // Зона могла отнять место у ленты — пересчёт раскладки внутри.
                 self.recompute_work();
             }
+            // Веха 150 — БУФЕР ОБМЕНА. Композитор держит ИМЯ содержимого, а не содержимое:
+            // байты положил в store сам копирующий, и через IPC они не едут ни разу (ADR 0016).
+            //
+            // Почему это дело композитора, а не отдельной службы: буфер обмена — вопрос «кто
+            // сейчас на экране и кто у кого забирает», а на него отвечает тот, кто держит фокус.
+            // Отдельная служба знала бы про фокус только с чужих слов.
+            win::OP_CLIP_SET => {
+                let c = body!(m, win::wire::Clip::decode(req));
+                // Корень ДВИГАЕМ ПЕРВЫМ делом: без него объект недостижим, и ближайшая сборка
+                // мусора store унесла бы скопированное. Не вышло — не принимаем вовсе: сказать
+                // «принято» и потерять текст хуже, чем отказать сразу.
+                if sys::obj_set_root(self.store, b"clip/current", &c.id) != 0 {
+                    sys::reply(m.reply_cap, &[]);
+                    return;
+                }
+                self.clip = Some((c.kind, c.id));
+                sys::reply(m.reply_cap, &[1]);
+            }
+            win::OP_CLIP_GET => match self.clip {
+                Some((kind, id)) => {
+                    let mut rep = [0u8; 33];
+                    let n = win::wire::Clip { kind, id }.encode(&mut rep);
+                    sys::reply(m.reply_cap, &rep[..n]);
+                }
+                None => {
+                    sys::reply(m.reply_cap, &[]);
+                }
+            },
             // Веха 139 — размер экрана. Обоям и бару он нужен ДО того, как они заведут буфер, а
             // права на сам фреймбуфер у них нет и быть не должно.
             win::OP_SCREEN => {

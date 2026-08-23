@@ -15,7 +15,7 @@
 extern crate alloc;
 
 use void_user as sys;
-use void_user::win::{Event, Window};
+use void_user::win::{self, Event, Window};
 
 #[path = "../obj.rs"]
 mod obj;
@@ -121,7 +121,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     loop {
         match window.next_event() {
             Some(Event::Key { sym, mods, .. }) => {
-                if (sym == b'c' as u16 && mods & 2 != 0) || sym == b'q' as u16 {
+                if (sym == b'c' as u16 && mods & win::modk::CTRL != 0) || sym == b'q' as u16 {
                     window.destroy();
                     sys::exit(0);
                 }

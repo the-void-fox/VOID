@@ -2199,6 +2199,7 @@ who = [\n\
 #   режимы:   normal · pane\n\
 #   клавиши:  C-a (Ctrl+A) · буква · | · - · Left Right Up Down Enter Tab Esc Space PageUp PageDown\n\
 #   действия: mode-pane mode-normal literal-prefix split-v split-h next-pane close quit\n\
+#             paste — вставить из буфера обмена (Веха 150)\n\
 #             reload · scroll-up scroll-down scroll-top scroll-bottom · go-left go-right go-up go-down\n\
 keys = [\n\
 \x20 bind(\"normal\", \"C-a\", \"mode-pane\"),\n\
@@ -2211,6 +2212,7 @@ keys = [\n\
 \x20 bind(\"pane\", \"x\", \"close\"),\n\
 \x20 bind(\"pane\", \"q\", \"quit\"),\n\
 \x20 bind(\"pane\", \"r\", \"reload\"),\n\
+\x20 bind(\"pane\", \"v\", \"paste\"),\n\
 \x20 bind(\"pane\", \"h\", \"go-left\"),\n\
 \x20 bind(\"pane\", \"j\", \"go-down\"),\n\
 \x20 bind(\"pane\", \"k\", \"go-up\"),\n\

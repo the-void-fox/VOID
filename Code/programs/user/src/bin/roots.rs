@@ -49,7 +49,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use void_user as sys;
-use void_user::win::{sym, Event, Window};
+use void_user::win::{self, sym, Event, Window};
 
 #[allow(dead_code)]
 #[path = "../ui/mod.rs"]
@@ -122,6 +122,10 @@ struct App {
     /// приезжают вместе с холстом, а решать «изменилось ли что-то» надо до него.
     lay: Lay,
     store: Option<usize>,
+    /// Веха 150 — что было скопировано последним нажатием `Ctrl+C`. Держим ради подвала: у
+    /// копирования обязан быть ВИДИМЫЙ ответ, иначе непонятно, случилось ли что-нибудь вообще.
+    /// `None` — ничего не копировали (или уже нажали что-то ещё).
+    copied: Option<String>,
 }
 
 impl App {
@@ -252,12 +256,15 @@ impl App {
             }
         }
 
-        let s = if self.ls.query.trim().is_empty() {
-            alloc::format!("корней в store: {}", self.items.len())
-        } else {
-            alloc::format!("{} из {} корней", self.ls.hits.len(), self.items.len())
+        let s = match &self.copied {
+            Some(name) => alloc::format!("скопировано: {}", name),
+            None if self.ls.query.trim().is_empty() => {
+                alloc::format!("корней в store: {}  ·  Ctrl+C — скопировать имя", self.items.len())
+            }
+            None => alloc::format!("{} из {} корней", self.ls.hits.len(), self.items.len()),
         };
-        u.label(foot, &s, th.muted, Align::Right);
+        let col = if self.copied.is_some() { th.accent } else { th.muted };
+        u.label(foot, &s, col, Align::Right);
         picked
     }
 }
@@ -358,7 +365,27 @@ fn human(n: usize) -> String {
 impl ui::Client for App {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
         match e {
+            // Веха 150 — СКОПИРОВАТЬ имя выбранного корня. `Ctrl+C`, как везде; сам буфер —
+            // объект store, а композитору уезжает только его content-id ([`win::clip_put`]).
+            //
+            // Копируем ИМЯ, а не содержимое: имя — это то, что человек понесёт в терминал
+            // (`cat <имя>`), а содержимое у него и так перед глазами справа.
+            Event::Key { sym: code, mods, down, .. }
+                if down && code == b'c' as u16 && mods & win::modk::CTRL != 0 =>
+            {
+                let Some(i) = self.ls.current() else { return ui::Scope::No };
+                let name = self.items[i].name.clone();
+                self.copied = match self.store {
+                    Some(cap) if win::clip_put(cap, win::CLIP_TEXT, name.as_bytes()) => Some(name),
+                    // Права на store нет либо композитор отказал — молчать нельзя: человек
+                    // нажал и вправе знать, что не вышло.
+                    _ => Some(String::from("не вышло скопировать")),
+                };
+                ui::Scope::All
+            }
             Event::Key { sym: code, ch, down, .. } if down => {
+                // Любая другая клавиша снимает отметку о копировании: подвал снова про список.
+                self.copied = None;
                 // Escape очищает поиск, а не закрывает окно: закрытие — дело композитора
                 // (`Super+Q`), и приложение, которое умирает от Escape, теряет набранное раньше,
                 // чем человек успевает передумать. Всё остальное — обычная навигация списка.
@@ -459,6 +486,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         detail_of: None,
         lay: Lay::default(),
         store,
+        copied: None,
     };
     app.filter();
 

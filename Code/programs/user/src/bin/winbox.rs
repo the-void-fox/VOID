@@ -16,7 +16,7 @@
 extern crate alloc;
 
 use void_user as sys;
-use void_user::win::{Event, Window};
+use void_user::win::{self, Event, Window};
 
 #[global_allocator]
 static ALLOC: sys::heap::Heap<{ 4 * 1024 * 1024 }> = sys::heap::Heap::new();
@@ -55,7 +55,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             Some(Event::Key { sym, mods, .. }) => {
                 // Ctrl-C или 'q' — уйти. Прощаемся с композитором, а не просто умираем:
                 // окно должно исчезнуть в тот же миг, а не когда нас заметят мёртвыми.
-                if (sym == b'c' as u16 && mods & 2 != 0) || sym == b'q' as u16 {
+                if (sym == b'c' as u16 && mods & win::modk::CTRL != 0) || sym == b'q' as u16 {
                     window.destroy();
                     sys::exit(0);
                 }
