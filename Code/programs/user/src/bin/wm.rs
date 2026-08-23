@@ -918,14 +918,37 @@ impl Win {
         true
     }
 
-    /// Левый верхний угол СОДЕРЖИМОГО.
-    fn content_at(&self) -> (i32, i32) {
-        let (b, _) = self.deco();
-        (self.x + b, self.y + b)
-    }
     /// Попадание — по ВИДИМОМУ положению: человек целится в то, что нарисовано.
     fn hit_frame(&self, px: i32, py: i32, scroll: i32) -> bool {
         self.shown.rect().offset(-scroll, 0).contains(px, py)
+    }
+
+    /// Веха 149.1 — точка экрана → точка в БУФЕРЕ клиента.
+    ///
+    /// Считается от НАРИСОВАННОГО прямоугольника (`shown` минус прокрутка ленты) — от того же,
+    /// по которому решается попадание. До этой вехи здесь стоял `content_at()`, то есть место
+    /// окна В ЛЕНТЕ, и получалось так: попадание считалось в экранных координатах, а точка,
+    /// которую композитор называл клиенту, — в координатах ленты. Пока лента стоит на нуле, это
+    /// одно и то же; стоит ей уехать (третья колонка, широкая колонка, `Super+F`) — и клиент
+    /// получает точку, сдвинутую на всю прокрутку. Владелец увидел это так: **кнопки вьювера
+    /// корней рисуются в окне, а нажимаются там, где окно было раньше**. Ровно та же ловушка уже
+    /// ловила damage-прямоугольник клиента — там она записана в коде ниже.
+    ///
+    /// Заодно переводим масштаб: на экран содержимое кладётся растянутым из буфера
+    /// (`bw × bh` → `cw × ch`, см. `draw_win_row`), и пока буфер не догнал новый размер — а между
+    /// `EV_RESIZE` и `OP_REBUF` так бывает у любого клиента, — это две разные системы координат.
+    ///
+    /// Обрезка по буферу не косметика: `hit_frame` пускает сюда и точку НА РАМКЕ, а `-1`,
+    /// приведённый к `u16`, даёт `0xffff` — код «курсор ушёл с поверхности» (`Event::GONE`).
+    /// Движение по левому краю окна читалось клиентом как уход мыши.
+    fn client_point(&self, px: i32, py: i32, scroll: i32) -> (u16, u16) {
+        let (b, _) = self.deco();
+        let f = self.shown.rect().offset(-scroll, 0);
+        let (cw, ch) = ((f.w - 2 * b).max(1), (f.h - 2 * b).max(1));
+        let (bw, bh) = (self.bw.max(1), self.bh.max(1));
+        let lx = (px - f.x - b) * bw / cw;
+        let ly = (py - f.y - b) * bh / ch;
+        (lx.clamp(0, bw - 1) as u16, ly.clamp(0, bh - 1) as u16)
     }
 }
 
@@ -2786,8 +2809,8 @@ impl Wm {
                     w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)
                 })
             }) {
-                let (ox, oy) = self.wins[i].content_at();
-                let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
+                let sc = if self.wins[i].tiled() { self.scroll_x } else { 0 };
+                let (lx, ly) = self.wins[i].client_point(self.cursor.0, self.cursor.1, sc);
                 self.send(i, win::Event::Wheel { x: lx, y: ly, delta: e.wheel as i8 });
             }
         }
@@ -2809,9 +2832,18 @@ impl Wm {
 
         // Событие поверхности под курсором: слою, если он там, иначе окну ленты. Один и тот же
         // код на оба случая — разница только в том, ЧТО нашлось под курсором (Веха 140).
-        let under = on_layer
-            .or_else(|| self.wins.iter().rposition(|w| w.visible && w.tiled()
-                && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)));
+        //
+        // Веха 149.1 — в ОБЗОРЕ окно ленты под курсором не ищем вовсе. Там окна нарисованы не по
+        // `shown`, а по списку обзора (уменьшенные, со своей камерой), и попадание по `shown`
+        // назвало бы и не то окно, и не ту точку в нём. В обзоре указатель принадлежит обзору:
+        // наведение переносит фокус, клик выбирает окно — это выше по этой же функции.
+        let under = on_layer.or_else(|| {
+            (!self.overview).then(|| {
+                self.wins.iter().rposition(|w| {
+                    w.visible && w.tiled() && w.hit_frame(self.cursor.0, self.cursor.1, self.scroll_x)
+                })
+            })?
+        });
         // Веха 144 — сказать прежней поверхности, что курсор УШЁЛ. Событие то же самое
         // (`EV_MOTION`), но с координатами вне поверхности: `0xffff` не бывает настоящей точкой,
         // а заводить отдельное событие ради одного признака значило бы раздувать протокол.
@@ -2827,8 +2859,8 @@ impl Wm {
             self.hover = now_id;
         }
         if let Some(i) = under {
-            let (ox, oy) = self.wins[i].content_at();
-            let (lx, ly) = ((self.cursor.0 - ox) as u16, (self.cursor.1 - oy) as u16);
+            let sc = if self.wins[i].tiled() { self.scroll_x } else { 0 };
+            let (lx, ly) = self.wins[i].client_point(self.cursor.0, self.cursor.1, sc);
             if was != e.buttons {
                 let ev = win::Event::Button {
                     x: lx,
