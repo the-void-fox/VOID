@@ -254,8 +254,8 @@ struct Drag {
 struct Saving {
     /// Скольких спросили. Ответили все — дальше ждать нечего.
     asked: usize,
-    /// Кто и чем ответил: номер окна и командная строка, которой его звать обратно.
-    got: Vec<(u32, String)>,
+    /// Сколько уже ответило. Сами ответы лежат в окнах ([`Win::run`]).
+    got: usize,
     /// До какого времени ждём молчащих (монотонные нс).
     until: u64,
     /// Гасить ли машину, когда допишем. Сохранение бывает и просто так — по просьбе человека.
@@ -266,6 +266,15 @@ struct Saving {
 /// про терпение человека, который нажал «выключить»: молчащая программа не имеет права держать
 /// машину включённой, и цена её молчания — только её собственное невосстановление.
 const SAVE_WAIT_NS: u64 = 500_000_000;
+
+/// Веха 151.1 — как часто СВЕРЯТЬ сеанс с тем, что на экране. Не «как часто писать»: пишем только
+/// при РАЗНИЦЕ, а на неподвижном столе её нет, и диск не трогается вовсе.
+///
+/// Пять секунд — потому что мерой здесь человек, а не машина: за пять секунд он успевает
+/// передвинуть окно или перейти на другой стол, но не успевает сделать этого столько раз, чтобы
+/// накопились лишние коммиты. Веха 33 отучила систему от привычки писать на каждый чих, и
+/// заводить эту привычку заново ради раскладки было бы обидно.
+const SESSION_TICK_NS: u64 = 5_000_000_000;
 
 /// Веха 150.1 — ГРУЗ, который сейчас тащат мышью ([`win::OP_DRAG`]).
 ///
@@ -694,6 +703,8 @@ fn main_loop() -> ! {
         carry: None,
         dropped: None,
         saving: None,
+        session_last: String::new(),
+        session_at: 0,
         store,
         wins: Vec::new(),
         next_id: 1,
@@ -912,6 +923,9 @@ fn main_loop() -> ! {
         // Веха 151 — идёт сбор сеанса: ответили все или вышел срок? Здесь же, в конце оборота,
         // по той же причине, что и сроки ожидания: к этому месту учтены ответы клиентов.
         wm.tick_save(sys::monotonic_ns());
+        // Веха 151.1 — и сверка сеанса с тем, что на экране: раз в пять секунд, запись — только
+        // при разнице.
+        wm.tick_session(sys::monotonic_ns());
 
         // Кадр — ОДИН на оборот, в самом конце: к этому месту учтены все события пачки, все
         // ответы клиентов и все ушедшие окна. Пока рисовало каждое событие само, рука обгоняла
@@ -1026,6 +1040,21 @@ struct Win {
     /// в одном месте каждое: клиента у неё нет (некому слать события и незачем ждать ответа), а
     /// пиксели рисует сам композитор ([`Win::own`]).
     launch: Option<Launch>,
+    /// Веха 151.1 — ЧЕМ ВЕРНУТЬ это окно: последний ответ на «сохранись» ([`win::OP_PERSIST`]).
+    ///
+    /// Помним, а не спрашиваем каждый раз, ровно ради того, чтобы сеанс писался ПО ХОДУ ДЕЛА:
+    /// перекладывание окон и смена фокуса стоят десятков байт, и платить за них опросом всех
+    /// клиентов было бы нелепо. Спрашиваем один раз — когда окно появилось.
+    run: Option<String>,
+    /// Веха 151.1 — последний СНИМОК кадра: `(content-id шестнадцатеричным, ширина, высота)`.
+    ///
+    /// Обновляется только при полном сохранении (снимок — мегабайты), а переписывание раскладки
+    /// несёт прежний. Картинка при этом может отстать от содержимого — и это верный размен:
+    /// живое окно заменит её через секунду после загрузки.
+    snap: Option<(String, i32, i32)>,
+    /// Веха 151.1 — спрашивали ли уже это окно. Молчуна не переспрашиваем: `winbox` и прочие
+    /// демо на «сохранись» не отвечают вовсе, и долбить их каждые пять секунд незачем.
+    asked: bool,
     /// Веха 147 — пиксели, нарисованные НАМИ (плитка запуска), а не присланные клиентом.
     ///
     /// Отдельное поле, а не `buf`: тот держит ЧУЖУЮ область, отображённую через `shm_map`, и
@@ -1392,6 +1421,11 @@ struct Wm {
     carry: Option<Payload>,
     /// Веха 151 — идёт сбор сеанса. `None` — не идёт.
     saving: Option<Saving>,
+    /// Веха 151.1 — что записано в `session/current` НАШИМИ руками. Сверяем с этим, чтобы не
+    /// писать одно и то же: на неподвижном столе сеанс не стоит ни байта записи.
+    session_last: String,
+    /// Когда сверялись в прошлый раз (монотонные нс).
+    session_at: u64,
     /// Веха 150.1 — уронённое, которое ещё не забрали: `(окно, вид, content-id)`.
     ///
     /// Живёт между `EV_DROP` и `OP_DROP` и отдаётся ровно один раз — тому окну, в которое
@@ -2902,6 +2936,34 @@ impl Wm {
         }
     }
 
+    /// Веха 151 — заменить номер окна во ВСЕХ лентах: плитка уступает место пришедшему окну.
+    ///
+    /// «Во всех» — потому что лент по хранению две штуки: активная вынута в поля `Wm`, прочие
+    /// лежат в `spaces`. То же самое различие, ради которого существует [`Wm::unlink`], — и
+    /// ровно на нём эта веха и споткнулась.
+    ///
+    /// **Как это выглядело.** До Вехи 151 плитки заводились только на активном столе: их создаёт
+    /// `run`, а запускают его с того стола, где стоит человек, — поэтому замена, знавшая одну
+    /// ленту, была верной и ошибки не содержала. Восстановление сеанса ставит плитки СРАЗУ НА ВСЕ
+    /// столы, и окно, пришедшее на чужой стол, оказывалось в `wins`, но ни в одной ленте:
+    /// невидимое, недостижимое и живое. Владелец увидел это так: «окна с другого стола не
+    /// открываются» — хотя программы честно запускались, а в журнале стояло «сеанс поднят».
+    fn relink(&mut self, old: u32, new: u32) {
+        fn rename(cols: &mut [Column], old: u32, new: u32) {
+            for c in cols.iter_mut() {
+                for w in c.ids.iter_mut() {
+                    if *w == old {
+                        *w = new;
+                    }
+                }
+            }
+        }
+        rename(&mut self.cols, old, new);
+        for s in self.spaces.iter_mut() {
+            rename(&mut s.cols, old, new);
+        }
+    }
+
     /// Убрать окно из ленты ЛЮБОГО стола; пустая колонка исчезает.
     ///
     /// Ищем везде, а не только на активном: программа с соседнего стола вправе завершиться, и
@@ -3024,11 +3086,12 @@ impl Wm {
             })
             .collect();
         for &i in &ids {
+            self.wins[i].asked = true;
             self.send(i, win::Event::Save);
         }
         self.saving = Some(Saving {
             asked: ids.len(),
-            got: Vec::new(),
+            got: 0,
             until: sys::monotonic_ns() + SAVE_WAIT_NS,
             power,
         });
@@ -3041,24 +3104,73 @@ impl Wm {
         let ready = self
             .saving
             .as_ref()
-            .is_some_and(|s| s.got.len() >= s.asked || now >= s.until);
+            .is_some_and(|s| s.got >= s.asked || now >= s.until);
         if ready {
             self.finish_save();
         }
     }
 
-    /// Записать сеанс в store и, если просили, погасить машину.
-    fn finish_save(&mut self) {
-        let Some(s) = self.saving.take() else { return };
-        let text = self.session_text(&s.got);
+    /// Веха 151.1 — СЕАНС ПО ХОДУ ДЕЛА: сверить запись с тем, что на экране, и переписать при
+    /// разнице. Зовётся раз за оборот, работает раз в [`SESSION_TICK_NS`].
+    ///
+    /// Здесь и живёт ответ на «а если погас свет»: раскладка стоит сотню байт, поэтому её можно
+    /// писать по ходу, и стол вернётся таким, каким был секунды назад, а не таким, каким его
+    /// сохранили руками. Дорогое — снимки и опрос клиентов — сюда не попадает: снимок это
+    /// мегабайты, и обновлять его каждые пять секунд значило бы вернуть ту самую привычку писать
+    /// на каждый чих, от которой систему отучала Веха 33.
+    fn tick_session(&mut self, now: u64) {
+        if self.saving.is_some() || now < self.session_at + SESSION_TICK_NS {
+            return;
+        }
+        self.session_at = now;
+        // Окно, которого ещё не спрашивали, спросим — но ровно один раз. Ответ приедет своим
+        // чередом и попадёт в следующую сверку; молчун (демо без сохранения) больше не побеспокоен.
+        let fresh: Vec<usize> = (0..self.wins.len())
+            .filter(|&i| {
+                let w = &self.wins[i];
+                w.tiled() && w.launch.is_none() && !w.closing && !w.asked && w.run.is_none()
+            })
+            .collect();
+        for i in fresh {
+            self.wins[i].asked = true;
+            self.send(i, win::Event::Save);
+        }
+        let text = self.session_text();
+        if text == self.session_last {
+            return;
+        }
+        self.write_session(&text);
+    }
+
+    /// Положить текст сеанса в store и переставить корень. `false` — не вышло.
+    fn write_session(&mut self, text: &str) -> bool {
         let mut id = [0u8; 32];
         let ok = sys::obj_put(self.store, text.as_bytes(), &mut id) == 0
             && sys::obj_set_root(self.store, b"session/current", &id) == 0;
+        if ok {
+            self.session_last = String::from(text);
+        }
+        ok
+    }
+
+    /// Записать сеанс в store и, если просили, погасить машину.
+    fn finish_save(&mut self) {
+        let Some(s) = self.saving.take() else { return };
+        // Полное сохранение — единственное место, где обновляются СНИМКИ: они мегабайты.
+        for i in 0..self.wins.len() {
+            if self.wins[i].tiled() && self.wins[i].launch.is_none() && self.wins[i].run.is_some() {
+                if let Some(snap) = self.put_shot(&self.wins[i]) {
+                    self.wins[i].snap = Some(snap);
+                }
+            }
+        }
+        let text = self.session_text();
+        let ok = self.write_session(&text);
         sys::write_console(
             alloc::format!(
-                "[wm] сеанс {}: окон {} из {} спрошенных, {} байт\n",
+                "[wm] сеанс {}: ответили {} из {} спрошенных, {} байт\n",
                 if ok { "записан" } else { "НЕ записан" },
-                s.got.len(),
+                s.got,
                 s.asked,
                 text.len(),
             )
@@ -3093,21 +3205,21 @@ impl Wm {
     /// Текстом, а не двоичной раскладкой, ровно по той причине, по какой текстом сделан конфиг:
     /// сеанс надо уметь ПРОЧИТАТЬ снаружи, когда стол вернулся не таким, каким его оставили
     /// (`void-store-import … cat session/current`). Цена — сотня байт на окно.
-    fn session_text(&self, got: &[(u32, String)]) -> String {
+    fn session_text(&self) -> String {
         let mut out = String::new();
         out.push_str(&alloc::format!("session space {}\n", self.space));
         let mut n = 0usize;
         for sp in 0..self.space_count() {
             for (ci, c) in self.strip_of(sp).iter().enumerate() {
                 for (ri, &id) in c.ids.iter().enumerate() {
-                    // Не ответил — не записываем. Выдумать за программу, чем её звать, нечем.
-                    let Some((_, run)) = got.iter().find(|(w, _)| *w == id) else { continue };
                     let Some(k) = self.win_at(id) else { continue };
                     let w = &self.wins[k];
-                    // Снимок последнего кадра — обычный объект store, дедуп даром. Кадр берётся
-                    // ТОТ ЖЕ, что рисуется на экране (`px`), поэтому «сохранённое» и «увиденное»
-                    // не могут разойтись.
-                    let shot = self.put_shot(w);
+                    // Не ответил — не записываем. Выдумать за программу, чем её звать, нечем.
+                    let Some(run) = w.run.as_deref() else { continue };
+                    let (shot, bw, bh) = match &w.snap {
+                        Some((s, bw, bh)) => (s.as_str(), *bw, *bh),
+                        None => ("-", 0, 0),
+                    };
                     out.push_str(&alloc::format!(
                         "window {} space {} col {} row {} width {} focus {} bw {} bh {} shot {} run {}\n",
                         n,
@@ -3116,9 +3228,9 @@ impl Wm {
                         ri,
                         c.width,
                         (self.focus == Some(id)) as u8,
-                        w.bw,
-                        w.bh,
-                        shot.as_deref().unwrap_or("-"),
+                        bw,
+                        bh,
+                        shot,
                         run,
                     ));
                     n += 1;
@@ -3138,6 +3250,9 @@ impl Wm {
         let Some(text) = read_root_text(store, b"session/current") else {
             return Vec::new();
         };
+        // Веха 151.1 — то, что прочитали, и есть «последнее записанное»: пока стол не изменился,
+        // переписывать нечего, и первая же сверка это увидит.
+        self.session_last = text.clone();
         let want_space = void_conf::num::<usize>(&text, "session", "space").unwrap_or(0);
         let mut names: Vec<String> = Vec::new();
         let mut last: Option<(usize, usize)> = None;
@@ -3162,6 +3277,10 @@ impl Wm {
                 continue;
             };
             names.push(String::from(prog));
+            sys::write_console(
+                alloc::format!("[wm] сеанс: зову «{}» (стол {}, колонка {})\n", r.run, r.space, r.col)
+                    .as_bytes(),
+            );
             // Снимок прошлого кадра. Нет его — плитка просто нарисует обычный бегунок запуска:
             // место всё равно занято, и стол не прыгнет, когда окно придёт.
             let need = (r.bw * r.bh * 4) as usize;
@@ -3215,6 +3334,13 @@ impl Wm {
                     drawn: None,
                     shot: has_shot,
                 }),
+                // Веха 151.1 — плитка помнит запись, из которой родилась: и команду, и снимок.
+                // Иначе первое же переписывание раскладки (оно идёт по ходу дела, не спрашивая
+                // клиентов) стёрло бы из сеанса окна, которые ещё не успели ответить, — то есть
+                // загрузка сама бы и уничтожила то, что только что подняла.
+                run: Some(r.run.clone()),
+                snap: r.shot.clone().map(|s| (s, r.bw, r.bh)),
+                asked: false,
                 own,
             };
             self.wins.push(win);
@@ -3264,15 +3390,18 @@ impl Wm {
         }
     }
 
-    /// Положить кадр окна в store, вернуть его имя шестнадцатеричной строкой. `None` — кадра нет.
-    fn put_shot(&self, w: &Win) -> Option<String> {
+    /// Положить кадр окна в store: `(имя, ширина, высота)`. `None` — кадра нет.
+    ///
+    /// Кадр берётся ТОТ ЖЕ, что рисуется на экране (`px`), поэтому «сохранённое» и «увиденное»
+    /// не могут разойтись. Дедуп при этом даром: не изменившееся окно второго объекта не создаёт.
+    fn put_shot(&self, w: &Win) -> Option<(String, i32, i32)> {
         let px = w.px();
         let need = (w.bw * w.bh * 4) as usize;
         if need == 0 || px.len() < need {
             return None;
         }
         let mut id = [0u8; 32];
-        (sys::obj_put(self.store, &px[..need], &mut id) == 0).then(|| hex32(&id))
+        (sys::obj_put(self.store, &px[..need], &mut id) == 0).then(|| (hex32(&id), w.bw, w.bh))
     }
 
     // ── ввод ───────────────────────────────────────────────────────────────────────────
@@ -3488,6 +3617,22 @@ impl Wm {
                         self.cur = ci;
                         self.cols[ci].focus = wi;
                         self.sync_focus();
+                        // …и ПОДВИНУТЬ ЛЕНТУ, чтобы фокусная колонка влезла целиком.
+                        //
+                        // Здесь этого не было, и разница вылезала ровно там, где её труднее
+                        // всего заметить: клик по наполовину видимому окну камеру двигал
+                        // (ниже по этой же функции стоит `relayout`), а НАВЕДЕНИЕ — нет.
+                        // А фокус у нас ходит за указателем (Веха 121.1), то есть в жизни
+                        // работает как раз наведение: человек ведёт мышь к торчащему из-за
+                        // края окну, оно получает фокус — и остаётся торчать.
+                        //
+                        // Гоняться за указателем это не заставляет: подвижка минимальна
+                        // (`relayout` трогает прокрутку, только если колонка не влезла), а
+                        // колонка, которую подвинули под курсор, становится видна ЦЕЛИКОМ —
+                        // значит следующее движение внутри неё не двигает ничего. Тот же
+                        // довод, что у камеры обзора в Вехе 124: у минимальной подвижки есть
+                        // неподвижная точка, у центрирования её нет.
+                        self.relayout();
                     }
                 }
             }
@@ -4196,6 +4341,9 @@ impl Wm {
                     layer: None,
                     next: None,
                     launch: None,
+                    run: None,
+                    snap: None,
+                    asked: false,
                     own: None,
                 };
                 self.wins.push(win);
@@ -4204,20 +4352,30 @@ impl Wm {
                     // на экране: `shown` наследуется, поэтому подмена не мигает и не едет.
                     // Разворачивать окно из точки, как обычное новое, здесь было бы враньём в
                     // другую сторону — оно не появилось, оно ПРИШЛО НА ГОТОВОЕ место.
+                    //
+                    // Веха 151 — но только если плитка стоит на АКТИВНОМ столе. Плитка чужого
+                    // стола не раскладывалась ни разу (раскладка обходит одну ленту — активную),
+                    // и её `shown` — нули: унаследовав их, окно выехало бы из угла экрана в тот
+                    // миг, когда на его стол впервые перейдут. Пусть лучше появится как новое —
+                    // для человека оно там и правда появляется впервые.
                     let old = self.wins[k].id;
+                    let on_active = self.locate(old).is_some();
                     let shown = self.wins[k].shown;
+                    // Веха 151.1 — окно НАСЛЕДУЕТ запись сеанса у своей плитки: команду и снимок.
+                    // Плитка знала, чем её позвали, — а пришедшее окно об этом не знает ничего,
+                    // и спросить его мы успеем позже.
+                    let (run, snap) = {
+                        let t = &mut self.wins[k];
+                        (t.run.take(), t.snap.take())
+                    };
                     let n = self.wins.len() - 1;
                     self.wins[n].shown = shown;
                     self.wins[n].to = shown;
                     self.wins[n].from = shown;
-                    self.wins[n].fresh = false;
-                    for c in self.cols.iter_mut() {
-                        for w in c.ids.iter_mut() {
-                            if *w == old {
-                                *w = id;
-                            }
-                        }
-                    }
+                    self.wins[n].fresh = !on_active;
+                    self.wins[n].run = run;
+                    self.wins[n].snap = snap;
+                    self.relink(old, id);
                     self.wins.remove(k);
                     sys::reply(m.reply_cap, &id.to_le_bytes());
                     self.sync_focus();
@@ -4300,6 +4458,9 @@ impl Wm {
                     layer: Some(spec),
                     next: None,
                     launch: None,
+                    run: None,
+                    snap: None,
+                    asked: false,
                     own: None,
                 };
                 self.wins.push(win);
@@ -4351,13 +4512,19 @@ impl Wm {
             // называет себя само, но проверяем мы его — хозяина окна говорит ядро.
             win::OP_PERSIST => {
                 let p = body!(m, win::wire::Persist::decode(req));
+                let run = core::str::from_utf8(p.run).unwrap_or("").trim();
                 let mine = self
                     .win_at(p.id)
-                    .is_some_and(|k| self.wins[k].owner == m.sender && self.wins[k].tiled());
-                let run = core::str::from_utf8(p.run).unwrap_or("").trim();
-                match self.saving.as_mut() {
-                    Some(s) if mine && !run.is_empty() => {
-                        s.got.push((p.id, String::from(run)));
+                    .filter(|&k| self.wins[k].owner == m.sender && self.wins[k].tiled());
+                match mine {
+                    Some(k) if !run.is_empty() => {
+                        // Ответ помнит ОКНО, а не сбор: сеанс переписывается и по ходу дела,
+                        // когда никто ничего не спрашивал (Веха 151.1), и брать команду тогда
+                        // было бы неоткуда.
+                        self.wins[k].run = Some(String::from(run));
+                        if let Some(s) = self.saving.as_mut() {
+                            s.got += 1;
+                        }
                         sys::reply(m.reply_cap, &[1]);
                     }
                     _ => {
@@ -4686,6 +4853,9 @@ impl Wm {
                         drawn: None,
                         shot: false,
                     }),
+                    run: None,
+                    snap: None,
+                    asked: false,
                     own: None,
                 };
                 self.wins.push(win);

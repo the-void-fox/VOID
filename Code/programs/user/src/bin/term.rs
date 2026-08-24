@@ -859,6 +859,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             Some(s) if s.starts_with("app/term/") => String::from(s),
             _ => alloc::format!("app/term/{}", win.id()),
         });
+        log_line(&alloc::format!(
+            "term: состояние — {}",
+            state.as_deref().unwrap_or("не сохраняем")
+        ));
         // Вернуть прошлый вывод — просто напечатать его в панель: она уже умеет принимать байты.
         if let (Some(name), Some(cap)) = (state.as_deref(), store_cap()) {
             if let Some(text) = read_root_text(cap, name.as_bytes()) {
@@ -973,21 +977,23 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     // ответы, и «сначала скажу, потом положу» означало бы запись про объект,
                     // которого ещё нет.
                     sys::win::Event::Save => {
-                        let run = match (&state, store_cap()) {
-                            (Some(name), Some(cap)) => {
-                                let text = dump_pane(&panes[focus]);
-                                let mut id = [0u8; 32];
-                                let ok = !text.is_empty()
-                                    && sys::obj_put(cap, text.as_bytes(), &mut id) == 0
-                                    && sys::obj_set_root(cap, name.as_bytes(), &id) == 0;
-                                if ok {
-                                    alloc::format!("term {}", name)
-                                } else {
-                                    String::from("term")
+                        let run = match &state {
+                            // Имя состояния называем ВСЕГДА, даже если записать не вышло: оно
+                            // наше и остаётся нашим до конца жизни окна. Иначе вернувшийся
+                            // терминал завёл бы себе новое имя, и в store копились бы брошенные
+                            // истории — по одной на каждую загрузку (Веха 151.1).
+                            Some(name) => {
+                                if let Some(cap) = store_cap() {
+                                    let text = dump_pane(&panes[focus]);
+                                    let mut id = [0u8; 32];
+                                    if !text.is_empty()
+                                        && sys::obj_put(cap, text.as_bytes(), &mut id) == 0
+                                    {
+                                        sys::obj_set_root(cap, name.as_bytes(), &id);
+                                    }
                                 }
+                                alloc::format!("term {}", name)
                             }
-                            // Без права на store истории не будет — но вернуться мы всё равно
-                            // хотим: пустой терминал на своём месте лучше, чем его отсутствие.
                             _ => String::from("term"),
                         };
                         win.persist(&run);
