@@ -43,6 +43,33 @@ CODE = os.path.dirname(HERE)
 MACHINE_SH = os.path.join(HERE, "qemu-machine.sh")
 IMG = os.environ.get("VOID_IMG", os.path.join(CODE, "target", "void.img"))
 
+# Мост host→store: правит поколение атакующего в образе, пока QEMU не запущен. `musl` ПЕРВЫМ —
+# `gnu`-сборка бывает устаревшей и читает актуальный store как пустой.
+STORE_IMPORT = next(
+    (p for p in (
+        os.path.join(HERE, "void-store-import", "target", a, "release", "void-store-import")
+        for a in ("x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"))
+     if os.path.exists(p)),
+    None,
+)
+
+# Поколение принципала-атакующего: серийный vsh с УРЕЗАННЫМ набором прав. Без power и сети —
+# чтобы «модель выключила машину ВЫДАННЫМ правом» не считалось за пробой; `store:rx` — читать и
+# запускать программы, но НЕ писать. Ставится в system/redteam, current → redteam (см. setup).
+REDTEAM_GEN = (
+    "# VOID — красная команда: УРЕЗАННЫЙ принципал (без power/сети, store r+x)\n"
+    "service posixfs store:rw\n"
+    "shell vsh endpoint:posixfs store:rx env\n"
+)
+
+
+def store(*args):
+    """Одна команда моста к store образа. `None` — моста нет; иначе (код, stdout)."""
+    if STORE_IMPORT is None:
+        return None
+    r = subprocess.run([STORE_IMPORT, IMG, *args], capture_output=True, text=True)
+    return (r.returncode, r.stdout)
+
 # ── стенд из общего описания (как в screenrun.py) ──────────────────────────────────────────
 def stand(*args):
     r = subprocess.run(["bash", MACHINE_SH, *args], capture_output=True, text=True)
@@ -231,6 +258,7 @@ def main():
     replay = None
     turns = int(os.environ.get("REDAGENT_TURNS", "30"))
     outdir = None
+    setup_gen = True
     i = 0
     while i < len(args):
         if args[i] == "--replay":
@@ -239,6 +267,9 @@ def main():
             turns = int(args[i + 1]); i += 2
         elif args[i] == "--out":
             outdir = args[i + 1]; i += 2
+        elif args[i] == "--no-setup":
+            # Не трогать поколение — гость уже грузится в серийный shell (сам поставил current).
+            setup_gen = False; i += 1
         else:
             print(__doc__); return 2
     if outdir is None:
@@ -249,12 +280,46 @@ def main():
     if not os.path.exists(IMG):
         sys.exit(f"нет образа {IMG} — собери: Code/tools/run.sh --fresh --build-only")
 
+    # ── ПОКОЛЕНИЕ АТАКУЮЩЕГО. Агенту нужен СЕРИЙНЫЙ shell (в оконном режиме приглашения на serial
+    #    нет вовсе — shell живёт в окне). Ставим урезанное серийное поколение сами и возвращаем
+    #    прежнее после прогона: рабочий образ не должен застревать в режиме красной команды.
+    saved_gen = None
+    if setup_gen:
+        if STORE_IMPORT is None:
+            print("[redagent] нет void-store-import — не поставить серийное поколение; "
+                  "либо собери мост, либо переведи образ на серийный shell и добавь --no-setup")
+        else:
+            cur = store("cat", "system/current")
+            out = cur[1] if cur else ""
+            if "store не инициализирован" in out or "пустой образ" in out:
+                sys.exit("[redagent] store пуст — сперва загрузи образ разок "
+                         "(Code/tools/run.sh), потом запускай агента")
+            saved_gen = out.strip().splitlines()[-1].strip() if out.strip() else None
+            # Записать поколение атакующего (идемпотентно) и сделать активным.
+            import tempfile
+            gt = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+            gt.write(REDTEAM_GEN); gt.flush()
+            ct = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+            ct.write("redteam"); ct.flush()
+            store("put", gt.name, "system/redteam")
+            store("put", ct.name, "system/current")
+            print(f"[redagent] поколение атакующего активно (было: {saved_gen or '?'})")
+
+    def restore_gen():
+        if saved_gen and STORE_IMPORT is not None:
+            import tempfile
+            ct = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+            ct.write(saved_gen); ct.flush()
+            store("put", ct.name, "system/current")
+            print(f"[redagent] поколение образа возвращено на: {saved_gen}")
+
     brain = ReplayBrain(replay) if replay else LlmBrain()
     print(f"[redagent] мозг: {'replay ' + replay if replay else 'LLM ' + brain.model}")
     print(f"[redagent] образ: {IMG} → {outdir}")
 
     ser = Serial(outdir)
     transcript = []
+    finding = None
     tr = open(os.path.join(outdir, "transcript.txt"), "w", encoding="utf-8")
 
     def log(s):
@@ -262,42 +327,46 @@ def main():
         tr.write(s + "\n")
         tr.flush()
 
-    # Дождаться загрузки — первого приглашения оболочки.
-    log("[redagent] жду загрузки VOID до приглашения оболочки…")
-    if not ser.wait_prompt(0, 90):
-        f = ser.finding()
-        log(f"[redagent] приглашение не пришло за 90 с; оракул: {f}")
+    try:
+        # Дождаться загрузки — первого приглашения оболочки.
+        log("[redagent] жду загрузки VOID до приглашения оболочки…")
+        if not ser.wait_prompt(0, 90):
+            f = ser.finding()
+            log(f"[redagent] приглашение не пришло за 90 с; оракул: {f}")
+            log("[redagent] подсказка: агент ждёт СЕРИЙНЫЙ shell (vsh). Если образ грузится в "
+                "оконный режим — это оно; поколение атакующего ставится автоматически, проверь мост "
+                "void-store-import.")
+            return 1
+
+        for turn in range(1, turns + 1):
+            cmd = brain.next(transcript)
+            if cmd is None:
+                log(f"[redagent] мозг больше не даёт команд (ход {turn})")
+                break
+            if cmd.upper().startswith("DONE"):
+                log(f"[redagent] модель объявила: {cmd}")
+                break
+            log(f"\n─── ход {turn} ─── > {cmd}")
+            pos = ser.mark()
+            ser.send(cmd)
+            ok = ser.wait_prompt(pos, 30)
+            out = ser.since(pos)
+            log(out.rstrip("\n"))
+            transcript.append((cmd, out))
+
+            finding = ser.finding()
+            if finding:
+                log(f"\n*** НАХОДКА [{finding[0]}]: {finding[1]} ***")
+                break
+            if not ok:
+                finding = ("зависание", f"после «{cmd}» приглашение не вернулось (30 с)")
+                log(f"\n*** НАХОДКА [{finding[0]}]: {finding[1]} ***")
+                break
+    finally:
         ser.close()
-        return 1
+        tr.close()
+        restore_gen()  # рабочий образ не должен застрять в режиме красной команды
 
-    finding = None
-    for turn in range(1, turns + 1):
-        cmd = brain.next(transcript)
-        if cmd is None:
-            log(f"[redagent] мозг больше не даёт команд (ход {turn})")
-            break
-        if cmd.upper().startswith("DONE"):
-            log(f"[redagent] модель объявила: {cmd}")
-            break
-        log(f"\n─── ход {turn} ─── > {cmd}")
-        pos = ser.mark()
-        ser.send(cmd)
-        ok = ser.wait_prompt(pos, 30)
-        out = ser.since(pos)
-        log(out.rstrip("\n"))
-        transcript.append((cmd, out))
-
-        finding = ser.finding()
-        if finding:
-            log(f"\n*** НАХОДКА [{finding[0]}]: {finding[1]} ***")
-            break
-        if not ok:
-            finding = ("зависание", f"после «{cmd}» приглашение не вернулось (30 с)")
-            log(f"\n*** НАХОДКА [{finding[0]}]: {finding[1]} ***")
-            break
-
-    ser.close()
-    tr.close()
     print("\n──────── СВОДКА ────────")
     print(f"ходов        : {len(transcript)}")
     print(f"транскрипт   : {os.path.join(outdir, 'transcript.txt')}")
