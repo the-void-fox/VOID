@@ -487,6 +487,22 @@ impl ui::Client for App {
         }
     }
 
+    /// Веха 151 — чем вернуть вьювер после перезагрузки.
+    ///
+    /// Состояние едет ПРЯМО В КОМАНДНОЙ СТРОКЕ, без объекта в store, — потому что оно того
+    /// размера: значимо здесь ровно одно, на какой корень человек смотрел. Заводить ради имени
+    /// объект, корень и уборку за ним значило бы построить хранилище для сорока байт.
+    ///
+    /// Побочно это дало вьюверу аргумент, которого у него не было: `run roots bin/x86_64/hello`
+    /// открывает его сразу на этом корне. Так и должно быть — восстановление сеанса не особый
+    /// путь, а обычный запуск с обычным аргументом.
+    fn persist(&mut self) -> Option<String> {
+        Some(match self.ls.current().map(|i| self.items[i].name.as_str()) {
+            Some(name) => alloc::format!("roots {}", name),
+            None => String::from("roots"),
+        })
+    }
+
     fn draw(&mut self, u: &mut Ui) -> ui::Scope {
         let th = u.th.clone();
         self.lay = self.measure(u.font, &th);
@@ -543,6 +559,15 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         dragging: false,
     };
     app.filter();
+    // Веха 151 — открыться на названном корне: так нас возвращает сеанс, и так же может позвать
+    // человек руками. Корня уже нет (store переехал, поколение другое) — просто открываемся с
+    // начала: аргумент это пожелание, а не обещание системы.
+    if let Some(name) = sys::argv::Argv::take().str(0) {
+        if let Some(k) = app.ls.hits.iter().position(|&i| app.items[i].name == name) {
+            app.ls.sel = k;
+            app.ls.scroll_to_sel();
+        }
+    }
 
     ui::app::run(&mut surf, &th, &mut font, &mut app);
     sys::exit(0);

@@ -844,6 +844,34 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me, &conf)];
     let mut focus = 0usize;
 
+    // Веха 151 — КАК ЗОВУТ НАШЕ СОСТОЯНИЕ в store. Пришло аргументом — значит нас вернул сеанс, и
+    // имя надо оставить прежним (иначе объекты копились бы от загрузки к загрузке). Не пришло —
+    // заводим своё по номеру окна: номера начинаются с единицы на каждой загрузке и уникальны
+    // среди живых окон, то есть именами не зарастём.
+    //
+    // Чужое имя не берём: `run term system/current` иначе затёр бы конфиг системы историей
+    // вывода. Аргумент приезжает из НАШЕГО же ответа композитору, но набрать его руками может кто
+    // угодно, и проверка стоит одной строки.
+    let mut state: Option<String> = None;
+    if let Out::Window { win } = &out {
+        let argv = sys::argv::Argv::take();
+        state = Some(match argv.str(0) {
+            Some(s) if s.starts_with("app/term/") => String::from(s),
+            _ => alloc::format!("app/term/{}", win.id()),
+        });
+        // Вернуть прошлый вывод — просто напечатать его в панель: она уже умеет принимать байты.
+        if let (Some(name), Some(cap)) = (state.as_deref(), store_cap()) {
+            if let Some(text) = read_root_text(cap, name.as_bytes()) {
+                let pane = &mut panes[0];
+                pane.parser.advance(&mut pane.grid, text.as_bytes());
+                pane.parser.advance(
+                    &mut pane.grid,
+                    "\r\n\x1b[2m──── выше: прошлый сеанс ────\x1b[0m\r\n".as_bytes(),
+                );
+            }
+        }
+    }
+
     // Прошлый кадр в ЯЧЕЙКАХ: по нему считаем, какие пиксельные строки реально изменились.
     // Без этого каждый чих перерисовывал весь экран — 4 МиБ записей в некэшируемую память на
     // КАЖДУЮ строку вывода. На железе это выглядело как «семидесятые».
@@ -897,6 +925,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                         for p in panes.iter().filter_map(|p| p.child) {
                             sys::kill(p);
                         }
+                        // Веха 151 — окно закрыли НАСОВСЕМ: своё состояние убираем за собой.
+                        // Иначе история закрытого терминала осталась бы корнем в store навсегда —
+                        // недостижимого мусора GC не собирает, корень достижим по определению.
+                        if let (Some(name), Some(cap)) = (&state, store_cap()) {
+                            sys::obj_del_root(cap, name.as_bytes());
+                        }
                         win.destroy();
                         sys::exit(0);
                     }
@@ -933,6 +967,31 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     // Точку падения не смотрим: панель в окне одна (Веха 122.1), а курсор в
                     // командной строке стоит там, где стоит, — вставлять «под мышью» было бы
                     // выдумкой о том, чего в шелле нет.
+                    // Веха 151 — записывается СЕАНС: сохранить историю вывода и назваться.
+                    //
+                    // Сохраняем ПЕРЕД ответом: композитор запишет сеанс сразу, как соберёт
+                    // ответы, и «сначала скажу, потом положу» означало бы запись про объект,
+                    // которого ещё нет.
+                    sys::win::Event::Save => {
+                        let run = match (&state, store_cap()) {
+                            (Some(name), Some(cap)) => {
+                                let text = dump_pane(&panes[focus]);
+                                let mut id = [0u8; 32];
+                                let ok = !text.is_empty()
+                                    && sys::obj_put(cap, text.as_bytes(), &mut id) == 0
+                                    && sys::obj_set_root(cap, name.as_bytes(), &id) == 0;
+                                if ok {
+                                    alloc::format!("term {}", name)
+                                } else {
+                                    String::from("term")
+                                }
+                            }
+                            // Без права на store истории не будет — но вернуться мы всё равно
+                            // хотим: пустой терминал на своём месте лучше, чем его отсутствие.
+                            _ => String::from("term"),
+                        };
+                        win.persist(&run);
+                    }
                     sys::win::Event::Drop { .. } => {
                         if paste_dropped(&mut panes, focus) > 0 {
                             redraw = true;
@@ -1488,6 +1547,60 @@ fn resize_all(panes: &mut [Pane], rects: &[PaneRect]) {
 
 /// Положить клавишу в ящик фокусной панели. Ответ уйдёт в шаге 3 реактора — там же, где
 /// обслуживаются запросы, пришедшие РАНЬШЕ клавиш.
+// ── Веха 151: СОСТОЯНИЕ ТЕРМИНАЛА ─────────────────────────────────────────────────────────
+//
+// Сохраняем ИСТОРИЮ ВЫВОДА текстом — то, что человек видит, и то, что было над этим. Не образ
+// памяти: шелл за терминалом это ОТДЕЛЬНЫЙ процесс, заморозить его вместе с нами нечем, и после
+// возвращения он в любом случае новый. А вот вывод — наш, и он переживает ребут.
+//
+// Цвета при этом теряются, и это честная цена: восстановленное — уже не живые строки, а запись
+// о них. Отделяем её чертой, чтобы это было видно, а не додумывалось.
+
+/// Сколько строк истории сохраняем. Двести — это несколько экранов: дальше человек всё равно
+/// ищет глазами, а не листает.
+const HIST_LINES: usize = 200;
+/// Потолок на объект состояния при чтении.
+const HIST_MAX: usize = 64 * 1024;
+
+/// История панели текстом: строки «scrollback ++ экран», последние [`HIST_LINES`].
+fn dump_pane(p: &Pane) -> String {
+    let g = &p.grid;
+    let (cols, rows, sb) = (g.cols(), g.rows(), g.scrollback_len());
+    let total = sb + rows;
+    let mut out = String::new();
+    for a in total.saturating_sub(HIST_LINES)..total {
+        // Абсолютная строка `a` — это строка `r` вьюпорта, поднятого на `s` (см. `view_cell`:
+        // строка вьюпорта = (sb − s) + r). Берём нижнюю строку окна, пока хватает истории.
+        let r = a.min(rows - 1);
+        let s = sb - (a - r);
+        let mut line = String::new();
+        for c in 0..cols {
+            line.push(g.view_cell(c, r, s).ch);
+        }
+        out.push_str(line.trim_end());
+        out.push_str("\r\n");
+    }
+    // Хвост пустых строк не сохраняем: под приглашением шелла экран пуст всегда, и возвращать
+    // сорок пустых строк значит вернуть пустой экран вместо истории.
+    String::from(out.trim_end_matches(|c| c == '\r' || c == '\n'))
+}
+
+/// Прочитать корень целиком (в пределах [`HIST_MAX`]).
+fn read_root_text(cap: usize, name: &[u8]) -> Option<String> {
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(cap, name, &mut id) != 32 {
+        return None;
+    }
+    let mut buf = vec![0u8; HIST_MAX];
+    let (got, full) = sys::obj_get_ex(cap, &id, &mut buf);
+    if got == 0 || got > buf.len() {
+        return None;
+    }
+    buf.truncate(got);
+    let _ = full;
+    String::from_utf8(buf).ok()
+}
+
 /// Веха 150 — ВСТАВИТЬ из буфера обмена в очередь ввода фокусной панели.
 fn paste_clipboard(panes: &mut [Pane], focus: usize) -> usize {
     paste_named(panes, focus, sys::win::clip_read, "буфер обмена пуст")
