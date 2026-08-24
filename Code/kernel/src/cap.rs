@@ -101,6 +101,11 @@ struct Entry {
 struct Slot {
     generation: u32,
     entry: Option<Entry>,
+    /// Веха 152.3 — слот поднят из `.cspace` ([`load`]) и ещё НЕ усыновлён живым наделением.
+    /// Такой слот — власть ПРОШЛОЙ загрузки: пока процесс новой не подтвердил его своим
+    /// поколением ([`clamp_persisted`]), он не должен давать власть сверх выданной. Свежий минт
+    /// этого боута — `false`: он и есть выданное.
+    persisted: bool,
 }
 
 /// Домен защиты: имя + его личное capability-пространство (c-space).
@@ -190,10 +195,11 @@ fn alloc_slot(dom: &mut Domain, entry: Entry) -> Cap {
     for (i, s) in dom.slots.iter_mut().enumerate() {
         if s.entry.is_none() {
             s.entry = Some(entry);
+            s.persisted = false; // свежий минт — не наследство прошлой загрузки
             return Cap::new(i as u32, s.generation);
         }
     }
-    dom.slots.push(Slot { generation: 1, entry: Some(entry) });
+    dom.slots.push(Slot { generation: 1, entry: Some(entry), persisted: false });
     Cap::new((dom.slots.len() - 1) as u32, 1)
 }
 
@@ -472,6 +478,78 @@ pub fn derive(dom: DomainId, cap: Cap, mask: Rights) -> Result<Cap, CapError> {
     Ok(alloc_slot(&mut cs.domains[dom], Entry { target, rights }))
 }
 
+/// Та же цель ли (по СОДЕРЖИМОМУ, не по слоту): нужна [`clamp_persisted`], чтобы сверять
+/// наследованную власть с выданной по КОНКРЕТНОЙ цели (не «любой root», а «этот root»).
+fn target_eq(a: &Target, b: &Target) -> bool {
+    match (a, b) {
+        (Target::Store, Target::Store) => true,
+        (Target::Dma, Target::Dma) => true,
+        (Target::Power, Target::Power) => true,
+        (Target::Root(x), Target::Root(y)) => x == y,
+        (Target::Value(x), Target::Value(y)) => x.0 == y.0,
+        (Target::Endpoint(x), Target::Endpoint(y)) => x == y,
+        (Target::Reply(x), Target::Reply(y)) => x == y,
+        (Target::Device(x), Target::Device(y)) => x == y,
+        (Target::Mmio { base: b1, len: l1 }, Target::Mmio { base: b2, len: l2 }) => {
+            b1 == b2 && l1 == l2
+        }
+        (Target::Shm(x), Target::Shm(y)) => x == y,
+        (Target::Irq { vector: v1 }, Target::Irq { vector: v2 }) => v1 == v2,
+        _ => false,
+    }
+}
+
+/// Веха 152.3 — **потолок наделения**: персистентное право не может дать процессу власть
+/// СВЕРХ той, что дало ему поколение (конфиг/родитель).
+///
+/// Находка №1 красной команды ([[redteam]]): c-space привязан к ИМЕНИ, а `.cspace` переживает
+/// перезагрузку, — значит привилегированный тёзка (`store:rwg`), персистнувший домен, оставлял
+/// урезанному тёзке (`store:rx`) на СЛЕДУЮЩЕЙ загрузке власть, которой тому не давали (перебором
+/// дескрипторов, без гранта). Корень: имена не уникальны по привилегии, а наследование таблицы
+/// было молчаливым.
+///
+/// Правка: **авторитетно НАДЕЛЕНИЕ, а не имя.** Зовётся, когда наделение процесса собрано
+/// (`start_caps`). Для каждого слота, поднятого из `.cspace` и ещё не усыновлённого:
+/// - покрыт наделением (та же цель, права — надмножество) → усыновить (снять флаг: теперь его
+///   держит живой процесс, и обычный mint/derive этого боута работает как прежде);
+/// - НЕ покрыт → отозвать (освободить слот, бумкнуть поколение). Так `.cspace` может лишь
+///   ВОССТАНОВИТЬ власть, которую поколение и так даёт, но никогда её не расширить.
+///
+/// Власть ВНУТРИ одной загрузки безопасна аттенуацией (derive/grant только сужают), поэтому
+/// тёзки-накопители дают лишь DUP (лишние ссылки на ту же власть), не эскалацию — их не трогаем.
+pub fn clamp_persisted(dom: DomainId, endowment: &[Cap]) {
+    let mut cs = CSPACE.lock();
+    // Наделённая власть — (цель, права) каждого честно выданного дескриптора. Клонируем, чтобы
+    // отпустить заимствование `cs` перед мутацией слотов ниже.
+    let mut allowed: Vec<(Target, Rights)> = Vec::new();
+    for &c in endowment {
+        if let Ok(e) = resolve(&cs, dom, c) {
+            allowed.push((e.target.clone(), e.rights));
+        }
+    }
+    let Some(d) = cs.domains.get_mut(dom) else { return };
+    for s in d.slots.iter_mut() {
+        if !s.persisted {
+            continue;
+        }
+        match &s.entry {
+            None => s.persisted = false,
+            Some(e) => {
+                let covered = allowed
+                    .iter()
+                    .any(|(t, r)| target_eq(t, &e.target) && e.rights.0 & !r.0 == 0);
+                if covered {
+                    s.persisted = false; // усыновлено живым наделением
+                } else {
+                    s.entry = None;
+                    s.generation = s.generation.wrapping_add(1);
+                    s.persisted = false;
+                }
+            }
+        }
+    }
+}
+
 // ─── Веха 21.3: персистентный c-space ────────────────────────────────────────
 
 /// Спец-корень store, под которым лежит сериализованный c-space.
@@ -605,7 +683,11 @@ pub fn load() -> usize {
                 };
                 Some(Entry { target, rights })
             };
-            slots.push(Slot { generation, entry });
+            // Веха 152.3 — долговечное право прошлой загрузки: помечаем персистентным, пока
+            // живой процесс не подтвердит его своим наделением ([`clamp_persisted`]). Пустой
+            // слот усыновлять нечего.
+            let persisted = entry.is_some();
+            slots.push(Slot { generation, entry, persisted });
         }
         cs.domains.push(Domain { name, slots });
     }

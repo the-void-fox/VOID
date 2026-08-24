@@ -613,6 +613,21 @@ pub fn push_start_cap(pid: usize, bits: usize) {
     TABLE.lock().procs[pid].start_caps.push(bits);
 }
 
+/// Веха 152.3 — **применить потолок наделения** к процессу `pid`: персистентные права его
+/// домена, не покрытые собранным наделением, отозвать ([`cap::clamp_persisted`]). Зовётся ПОСЛЕ
+/// того, как все `start_caps` разложены (боут-конфиг), с НЕ занятым замком таблицы. Для путей,
+/// где замок уже держится (`SYS_EXEC`/`SYS_SPAWN`), клэмп зовётся напрямую по `cap::`.
+pub fn clamp_endowment(pid: usize) {
+    let (dom, caps) = {
+        let t = TABLE.lock();
+        let p = &t.procs[pid];
+        let caps: Vec<Cap> =
+            p.start_caps.iter().map(|&b| Cap::from_bits(b as u64)).collect();
+        (p.domain, caps)
+    };
+    cap::clamp_persisted(dom, &caps);
+}
+
 /// Запустить процессы и вернуться сюда, когда все завершатся. Сохраняем контекст ядра в
 /// RETURN_CTX и уходим в лончер (как в [[scheduling|context_switch]]-переключении нитей).
 ///
@@ -2150,6 +2165,18 @@ fn syscall(t: &mut Table, cur: usize) {
                                             unsafe { env.append(line.as_mut_vec()) };
                                         }
                                     }
+                                    // Веха 152.3 — потолок наделения: ребёнок унаследовал
+                                    // start_caps родителя (и, может, доп-право STDIO); теперь
+                                    // можно отозвать персистентные права его домена (тёзка прошлой
+                                    // загрузки), не покрытые этим наделением. Так `run probe`
+                                    // урезанным поколением не дотянется до store:rwg, оставленного
+                                    // привилегированным тёзкой в прошлой жизни (находка №1).
+                                    let cendow: Vec<Cap> = t.procs[child]
+                                        .start_caps
+                                        .iter()
+                                        .map(|&b| Cap::from_bits(b as u64))
+                                        .collect();
+                                    cap::clamp_persisted(t.procs[child].domain, &cendow);
                                     // Родство записывается в ОБОИХ случаях (Веха 114). Раньше его
                                     // ставил только SPAWN, потому что нужно оно было лишь для
                                     // `SYS_WAIT`/`SYS_KILL`; из-за этого дерево процессов
@@ -2525,6 +2552,14 @@ fn syscall(t: &mut Table, cur: usize) {
                                         t.procs[child].start_caps.push(c.bits() as usize);
                                     }
                                 }
+                                // Веха 152.3 — потолок наделения и для размороженного: власть —
+                                // наследство размораживающего, персистентное сверх неё отозвать.
+                                let cendow: Vec<Cap> = t.procs[child]
+                                    .start_caps
+                                    .iter()
+                                    .map(|&b| Cap::from_bits(b as u64))
+                                    .collect();
+                                cap::clamp_persisted(cdom, &cendow);
                                 vprintln!(
                                     "  [ckpt] P{} SYS_RESTORE '{}' → P{} ({} страниц; ждёт завершения, права — наследство размораживающего)",
                                     cur, root_name, child, img.pages,

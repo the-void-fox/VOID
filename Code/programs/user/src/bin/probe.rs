@@ -149,9 +149,22 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // ставит её НАРОЧНО — привилегированный тёзка оставляет своё право в домене, — чтобы
     // проверить, что зонд эскалацию ВИДИТ, а не молчит всегда.
     if sys::argv::Argv::take().str(0) == Some("seed") {
-        let c = sys::start_cap(0);
-        if c != sys::NO_CAP {
-            sys::cap_derive(c, 0xffff); // копия с теми же правами → persist домена
+        // Найти СВОЙ store-cap перебором стартовых прав (не start_cap(0): порядок прав задаёт
+        // поколение, и шелл-контракт держит первым эндпоинт файлов, а не store). Копия-аттенуация
+        // (derive) персистит c-space → домен «probe» с этим store-правом переживёт перезагрузку.
+        let mut gi = 0;
+        loop {
+            let c = sys::start_cap(gi);
+            if c == sys::NO_CAP {
+                break;
+            }
+            if let Some((kind, _rights)) = sys::cap_info(c) {
+                if kind == 1 {
+                    sys::cap_derive(c, 0xffff); // копия с теми же правами → persist домена
+                    break;
+                }
+            }
+            gi += 1;
         }
         say("[probe] seed: домен зафиксирован в .cspace\n");
         sys::exit(0);
