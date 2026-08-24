@@ -126,7 +126,19 @@ struct App {
     /// копирования обязан быть ВИДИМЫЙ ответ, иначе непонятно, случилось ли что-нибудь вообще.
     /// `None` — ничего не копировали (или уже нажали что-то ещё).
     copied: Option<String>,
+    /// Веха 150.1 — где нажали кнопку и какой корень под ней: `(x, y, элемент)`. `None` — кнопку
+    /// не держат либо нажали мимо строк.
+    ///
+    /// Запоминаем ТОЧКУ НАЖАТИЯ, потому что перетаскиванию нужен ПОРОГ: без него любой щелчок по
+    /// строке был бы перетаскиванием, и ярлык вспыхивал бы под курсором на каждый выбор.
+    press: Option<(i32, i32, usize)>,
+    /// Тащим прямо сейчас — второй раз в том же нажатии не начинаем.
+    dragging: bool,
 }
+
+/// Сколько пикселей руки отделяют ЩЕЛЧОК от ПРОТЯЖКИ. Рука дрожит на пару точек даже тогда, когда
+/// человек уверен, что не двигал её, — поэтому порог есть у всех и везде примерно такой.
+const DRAG_START: i32 = 6;
 
 impl App {
     /// Разрезать окно на места виджетов.
@@ -176,6 +188,22 @@ impl App {
         }
         self.detail_of = Some(i);
         self.detail = self.store.and_then(|cap| read_detail(cap, &self.items[i].name));
+    }
+
+    /// Веха 150.1 — не пора ли начать ТАЩИТЬ выбранный корень.
+    ///
+    /// Груз тот же, что у `Ctrl+C`, — ИМЯ корня: имя человек и несёт в терминал, а содержимое у
+    /// него перед глазами справа. Композитор откажет, если кнопку уже отпустили или курсор ушёл с
+    /// нашего окна ([`win::OP_DRAG`]), и это не беда: перетаскивание просто не началось.
+    fn start_drag(&mut self, ptr: Option<(i32, i32)>) {
+        let (Some((px, py, i)), Some((x, y))) = (self.press, ptr) else { return };
+        if self.dragging || (x - px).abs() + (y - py).abs() < DRAG_START {
+            return;
+        }
+        let name = self.items[i].name.clone();
+        self.dragging = self
+            .store
+            .is_some_and(|cap| win::drag(cap, win::CLIP_TEXT, name.as_bytes(), &name));
     }
 
     /// Нарисовать кадр. `true` — выбор сменился прямо в нём (клик по строке), и кадр надо
@@ -259,7 +287,10 @@ impl App {
         let s = match &self.copied {
             Some(name) => alloc::format!("скопировано: {}", name),
             None if self.ls.query.trim().is_empty() => {
-                alloc::format!("корней в store: {}  ·  Ctrl+C — скопировать имя", self.items.len())
+                alloc::format!(
+                    "корней в store: {}  ·  Ctrl+C — скопировать имя, мышью — перетащить",
+                    self.items.len()
+                )
             }
             None => alloc::format!("{} из {} корней", self.ls.hits.len(), self.items.len()),
         };
@@ -414,7 +445,10 @@ impl ui::Client for App {
                 }
             }
             Event::Motion { .. } => {
-                // Движение с зажатой кнопкой — это протяжка: полоса едет за рукой.
+                // Движение с зажатой кнопкой — это либо протяжка полосы, либо начало
+                // перетаскивания корня. Разбирает их место нажатия: по строке списка — тащим,
+                // по полосе прокрутки — крутим ([`App::press`] заводится только над строкой).
+                self.start_drag(input.ptr);
                 if input.held.is_some() {
                     return ui::Scope::Part(self.lay.col);
                 }
@@ -424,7 +458,25 @@ impl ui::Client for App {
                     ui::Scope::No
                 }
             }
-            Event::Button { .. } => ui::Scope::All,
+            Event::Button { x, y, down, buttons } => {
+                if down && buttons & 1 != 0 {
+                    // Запоминаем корень ПОД НАЖАТИЕМ, а не выбранный: выбор меняет этот же
+                    // щелчок, и меняет он его кадром позже — потащили бы прошлое.
+                    let p = Some((x as i32, y as i32));
+                    self.press = self
+                        .ls
+                        .row_at(p)
+                        .and_then(|k| self.ls.hits.get(self.ls.top + k).copied())
+                        .map(|i| (x as i32, y as i32, i));
+                    // Сбрасываем и здесь: отпускание кнопки к нам не приходит, если курсор к
+                    // тому времени ушёл в чужое окно, — а именно так перетаскивание и кончается.
+                    self.dragging = false;
+                } else if !down {
+                    self.press = None;
+                    self.dragging = false;
+                }
+                ui::Scope::All
+            }
             Event::Resize { w, h } => {
                 self.w = w as i32;
                 self.h = h as i32;
@@ -487,6 +539,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         lay: Lay::default(),
         store,
         copied: None,
+        press: None,
+        dragging: false,
     };
     app.filter();
 
