@@ -5,51 +5,43 @@
 //! VOID ([[0002-persistent-content-addressed-capability-core]]) — обладание capability И ЕСТЬ
 //! право, подделать дескриптор нельзя. Зонд ставит это под сомнение перебором.
 //!
-//! ## Оракул — «достижимо против выданного»
+//! ## Оракул — «достижимая ВЛАСТЬ против выданной» (Веха 152.2)
 //!
-//! Дескриптор `Cap` это `(слот, поколение)`, и ядро проверяет его по таблице СВОЕГО домена
-//! (`cap::resolve`). Значит достаточно перебрать слоты и поколения и посчитать, сколько прав в
-//! домене ЖИВЫХ, — а потом сравнить с тем, сколько нам ВЫДАЛИ (`SYS_STARTCAP`). Совпало —
-//! конфайнмент держит. Живых больше — мы дотянулись до чужого, и это находка.
+//! Дескриптор `Cap` это `(слот, поколение)`, и ядро проверяет его по таблице СВОЕГО домена.
+//! Зонд перебирает слоты и поколения и у каждого ЖИВОГО спрашивает `SYS_CAP_INFO` — вид цели и
+//! права (read-only, без побочного эффекта, без порчи c-space). Потом сравнивает НЕ числа слотов,
+//! а ВЛАСТЬ: набор `(вид, права)` достижимого против выданного (`SYS_STARTCAP`).
 //!
-//! Перебор безвреден: живость слота выясняется через `SYS_CAP_DERIVE` — он делает УРЕЗАННУЮ
-//! копию своего же права (аттенуация, `GRANT` не нужен) и НИЧЕГО не делает с целью. Успех значит
-//! «слот жив», отказ — «пусто или устарело». Ни выключения, ни записи, ни отправки кадров.
-//!
-//! Тонкость: каждая удачная копия ЗАНИМАЕТ новый слот в конце таблицы. Поэтому границу исходной
-//! таблицы (`base`) узнаём ПЕРВОЙ же копией — её слот и есть число прежних слотов, — а перебираем
-//! только `0..base`. Свои свежие копии ложатся за `base` и в перебор не попадают: зонд не гоняется
-//! за собственным хвостом.
+//! Это и отвечает на «дыра или особенность»:
+//! - лишние слоты ТОЙ ЖЕ власти (второй `store:r`, который и так есть) — **DUP**, накопление, не
+//!   эскалация;
+//! - власть СВЕРХ выданной (POWER, запись, сеть, которых не давали) — **ESCALATION**, находка.
 //!
 //! ## Что печатает
 //!
 //! Машиночитаемые строки для харнесса ([[redteam]]):
 //! ```text
-//! PROBE dom-start=<G> dom-reachable=<R> base=<base>
-//! PROBE VERDICT CONFINED            — R == G, права ровно те, что выдали
-//! PROBE VERDICT AMPLIFICATION +<N>  — R > G, дотянулись до <N> невыданных слотов
+//! PROBE granted=<G> reachable=<R>
+//! PROBE VERDICT CONFINED                — достижимая власть = выданной
+//! PROBE VERDICT DUP +<N> (<виды>)       — лишние слоты, но той же власти (накопление)
+//! PROBE VERDICT ESCALATION: <вид:права> — власть сверх выданной
 //! ```
-//! Признак пробоя — слово `AMPLIFICATION`; харнесс ищет его, а заодно — панику ядра и зависание.
+//! Признак пробоя для харнесса — `ESCALATION`; `DUP` тревогой не считается.
 
 #![no_std]
 #![no_main]
 
 use void_user as sys;
 
-/// Докуда перебирать слоты и поколения. Слотов у честного процесса единицы; восемь поколений
-/// ловят отзыв-и-переиздание. Больше — только дороже (каждая удачная копия это чекпойнт c-space).
+/// Докуда перебирать слоты и поколения. `SYS_CAP_INFO` c-space не трогает (в отличие от копии
+/// через derive), поэтому перебор безопасен и не гоняется за собственным хвостом — границу искать
+/// не нужно. Слотов у честного процесса единицы; восемь поколений ловят отзыв-и-переиздание.
 const MAX_SLOT: u32 = 64;
 const MAX_GEN: u32 = 8;
 
-/// Собрать сырые биты дескриптора из слота и поколения — как [`void_abi::Cap::new`], только
-/// зонду тащить весь крейт ABI незачем: правило кодирования одно (`слот << 32 | поколение`).
+/// Собрать сырые биты дескриптора из слота и поколения (`слот << 32 | поколение`).
 fn cap_bits(slot: u32, generation: u32) -> usize {
     (((slot as u64) << 32) | generation as u64) as usize
-}
-
-/// Слот дескриптора обратно.
-fn slot_of(bits: usize) -> u32 {
-    (bits as u64 >> 32) as u32
 }
 
 /// Человеку — в stdio (шелл или окно).
@@ -57,14 +49,12 @@ fn say(s: &str) {
     sys::write(s.as_bytes());
 }
 
-/// Харнессу — СТРОГО в консоль ядра (serial). Машиночитаемый вердикт обязан лечь в serial-лог,
-/// чем бы ни был наш stdout: в окне композитора serial'а нет вовсе, а разбирать снимок экрана
-/// ради одной строки — это ровно та хрупкость, которую харнесс должен обходить.
+/// Харнессу — СТРОГО в консоль ядра (serial): вердикт обязан лечь в serial-лог, чем бы ни был
+/// stdout (в окне композитора serial'а нет вовсе).
 fn mark(s: &str) {
     sys::write_console(s.as_bytes());
 }
 
-/// Небольшое десятичное число — в консоль ядра (числа встречаются только в машинных строках).
 fn dec(mut v: usize) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
@@ -79,107 +69,170 @@ fn dec(mut v: usize) {
     sys::write_console(&buf[i..]);
 }
 
-/// Битовая карта «слот жив»: слотов немного, `u64` хватает на весь диапазон [`MAX_SLOT`].
-struct SlotSet(u64);
-
-impl SlotSet {
-    fn new() -> SlotSet {
-        SlotSet(0)
+/// Имя вида цели — общий словарь с ядром (`cap::info_kind`).
+fn kind_name(k: u8) -> &'static str {
+    match k {
+        1 => "store",
+        2 => "root",
+        3 => "value",
+        4 => "endpoint",
+        5 => "reply",
+        6 => "blk",
+        7 => "net",
+        8 => "mmio",
+        9 => "dma",
+        10 => "power",
+        11 => "shm",
+        12 => "irq",
+        _ => "?",
     }
-    fn add(&mut self, slot: u32) {
-        if slot < 64 {
-            self.0 |= 1 << slot;
+}
+
+/// Права буквами (`Rights`: READ 1 · WRITE 2 · EXEC 4 · SEND 8 · GRANT 16). В консоль ядра.
+fn mark_rights(r: u32) {
+    if r == 0 {
+        mark("-");
+        return;
+    }
+    for (bit, ch) in [(1u32, "r"), (2, "w"), (4, "x"), (8, "s"), (16, "g")] {
+        if r & bit != 0 {
+            mark(ch);
         }
     }
-    fn has(&self, slot: u32) -> bool {
-        slot < 64 && self.0 & (1 << slot) != 0
+}
+
+/// Одна власть: вид + права. Мелко — набор власти держим фиксированным массивом (кучи у зонда нет).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Auth {
+    kind: u8,
+    rights: u32,
+}
+
+/// Набор власти без дублей (по паре вид+права). Ёмкости 32 хватает: видов дюжина.
+struct AuthSet {
+    items: [Auth; 32],
+    len: usize,
+}
+
+impl AuthSet {
+    fn new() -> AuthSet {
+        AuthSet { items: [Auth { kind: 0, rights: 0 }; 32], len: 0 }
     }
-    fn count(&self) -> usize {
-        self.0.count_ones() as usize
+    fn add(&mut self, a: Auth) {
+        for i in 0..self.len {
+            if self.items[i] == a {
+                return;
+            }
+        }
+        if self.len < self.items.len() {
+            self.items[self.len] = a;
+            self.len += 1;
+        }
+    }
+    /// Покрыта ли власть `a` этим набором: есть вид `a.kind` с правами-НАДмножеством.
+    fn covers(&self, a: Auth) -> bool {
+        for i in 0..self.len {
+            let g = self.items[i];
+            if g.kind == a.kind && a.rights & !g.rights == 0 {
+                return true;
+            }
+        }
+        false
     }
 }
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
+    // Веха 152.2 — режим `seed`: зафиксировать домен в `.cspace` (одна копия-аттенуация через
+    // `SYS_CAP_DERIVE` — она персистит c-space). Нужен КОНТРОЛЬ оракула: обычный spawn c-space не
+    // персистит (`endow` без persist), поэтому cross-reboot утечка сама не возникает. `seed`
+    // ставит её НАРОЧНО — привилегированный тёзка оставляет своё право в домене, — чтобы
+    // проверить, что зонд эскалацию ВИДИТ, а не молчит всегда.
+    if sys::argv::Argv::take().str(0) == Some("seed") {
+        let c = sys::start_cap(0);
+        if c != sys::NO_CAP {
+            sys::cap_derive(c, 0xffff); // копия с теми же правами → persist домена
+        }
+        say("[probe] seed: домен зафиксирован в .cspace\n");
+        sys::exit(0);
+    }
+
     say("[probe] зонд конфайнмента (Веха 152)\n");
 
-    // 1. ЧТО НАМ ВЫДАЛИ. Стартовые права — единственное, что домен обязан содержать честно;
-    //    перебор ниже покажет, содержит ли он что-то СВЕРХ этого. Читаем ПЕРВЫМ делом, пока не
-    //    сминтили ни одной копии: иначе свои же копии посчитались бы за выданное.
-    let mut granted = SlotSet::new();
+    // 1. ВЫДАННАЯ власть. Стартовые права — то, что нам дали честно; каждый описываем `cap_info`.
+    let mut granted = AuthSet::new();
     let mut gi = 0;
+    let mut granted_slots = 0usize;
     loop {
         let c = sys::start_cap(gi);
         if c == sys::NO_CAP {
             break;
         }
-        granted.add(slot_of(c));
+        if let Some((kind, rights)) = sys::cap_info(c) {
+            granted.add(Auth { kind, rights });
+            granted_slots += 1;
+        }
         gi += 1;
     }
 
-    // 2. ГРАНИЦА исходной таблицы. Первая удачная копия занимает новый слот в конце — его номер и
-    //    есть число прежних слотов. Берём копию первого выданного права: оно точно живое.
-    let first = sys::start_cap(0);
-    let base = if first == sys::NO_CAP {
-        // Прав не выдали вовсе. Тогда и перебирать особо нечего, но пройдёмся: вдруг в домене
-        // всё же что-то лежит (ровно тот случай, ради которого зонд и написан).
-        MAX_SLOT
-    } else {
-        let copy = sys::cap_derive(first, 0);
-        if copy == sys::NO_CAP {
-            MAX_SLOT // копия не вышла — перестрахуемся полным диапазоном
-        } else {
-            slot_of(copy)
-        }
-    };
-
-    // 3. ПЕРЕБОР живых слотов в [0, base). Живость — через удачную копию (цель не трогается).
-    let mut reachable = SlotSet::new();
-    let top = if base < MAX_SLOT { base } else { MAX_SLOT };
-    for slot in 0..top {
+    // 2. ДОСТИЖИМАЯ власть. Перебор слот×поколение; у каждого живого — `cap_info`. Побочного
+    //    эффекта нет, c-space не растёт, границу искать не нужно. Слот жив ровно в одном поколении
+    //    — нашли, записали, дальше по нему смысла нет.
+    let mut reachable = AuthSet::new();
+    let mut reachable_slots = 0usize;
+    // Достижимая власть СВЕРХ выданной — она и есть эскалация. Считаем сразу.
+    let mut escalation = AuthSet::new();
+    for slot in 0..MAX_SLOT {
         for generation in 1..MAX_GEN {
-            if sys::cap_derive(cap_bits(slot, generation), 0) != sys::NO_CAP {
-                reachable.add(slot);
-                break; // слот жив ровно в одном поколении — дальше по нему смысла нет
+            if let Some((kind, rights)) = sys::cap_info(cap_bits(slot, generation)) {
+                let a = Auth { kind, rights };
+                reachable.add(a);
+                reachable_slots += 1;
+                if !granted.covers(a) {
+                    escalation.add(a);
+                }
+                break;
             }
         }
     }
 
-    // 4. ВЕРДИКТ. Выданное — подмножество достижимого всегда (выданное живо). Вопрос в обратном:
-    //    есть ли достижимое СВЕРХ выданного.
-    let g = granted.count();
-    let r = reachable.count();
-    mark("PROBE dom-start=");
-    dec(g);
-    mark(" dom-reachable=");
-    dec(r);
-    mark(" base=");
-    dec(base as usize);
+    // 3. ВЕРДИКТ.
+    mark("PROBE granted=");
+    dec(granted_slots);
+    mark(" reachable=");
+    dec(reachable_slots);
     mark("\n");
 
-    let mut extra = 0usize;
-    for slot in 0..top {
-        if reachable.has(slot) && !granted.has(slot) {
-            extra += 1;
-        }
-    }
-
-    if extra == 0 {
-        mark("PROBE VERDICT CONFINED\n");
-    } else {
-        // Перечислим невыданные слоты — по ним человек поймёт, ЧТО именно утекло.
-        mark("PROBE VERDICT AMPLIFICATION +");
-        dec(extra);
-        mark(" слоты:");
-        for slot in 0..top {
-            if reachable.has(slot) && !granted.has(slot) {
-                mark(" ");
-                dec(slot as usize);
-            }
+    if escalation.len > 0 {
+        // Власть, которой не давали. Это находка.
+        mark("PROBE VERDICT ESCALATION:");
+        for i in 0..escalation.len {
+            let a = escalation.items[i];
+            mark(" ");
+            mark(kind_name(a.kind));
+            mark(":");
+            mark_rights(a.rights);
         }
         mark("\n");
+        say("[probe] готово: НАЙДЕНА эскалация\n");
+        sys::exit(1);
+    } else if reachable_slots > granted_slots {
+        // Лишние слоты, но власть та же — накопление, не эскалация.
+        mark("PROBE VERDICT DUP +");
+        dec(reachable_slots - granted_slots);
+        mark(" (");
+        for i in 0..reachable.len {
+            if i > 0 {
+                mark(",");
+            }
+            mark(kind_name(reachable.items[i].kind));
+        }
+        mark(")\n");
+        say("[probe] готово: накопление той же власти (не эскалация)\n");
+        sys::exit(0);
+    } else {
+        mark("PROBE VERDICT CONFINED\n");
+        say("[probe] готово: конфайнмент держит\n");
+        sys::exit(0);
     }
-
-    say("[probe] готово\n");
-    sys::exit(if extra == 0 { 0 } else { 1 });
 }

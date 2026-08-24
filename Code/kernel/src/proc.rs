@@ -3043,6 +3043,24 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_CAP_INFO(cap) -> (вид << 16 | права) | MAX (Веха 152.2): ОПИСАТЬ дескриптор.
+        //
+        // Read-only интроспекция для зонда конфайнмента ([[redteam]]): отличить «дотянулся до
+        // store-read, которое и так есть» от «дотянулся до POWER, которого не давали». Это не
+        // действие правом, а его описание — узнать вид можно только про cap, который уже держишь,
+        // так что новой власти это не даёт, лишь называет уже достижимую. Гейта прав нет по той же
+        // причине, что у прочей интроспекции (`SYS_TIME`, `SYS_CONSIZE`): вид cap-а не секрет.
+        58 => {
+            let c = t.procs[cur].frame.arg(0);
+            let dom = t.procs[cur].domain;
+            let result = match cap::info(dom, Cap::from_bits(c as u64)) {
+                Ok((kind, rights)) => (kind as usize) << 16 | rights.0 as usize,
+                Err(_) => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_CONSIZE() -> (колонок, строк) (Веха 120): размер КОНСОЛИ ЯДРА в знакоместах.
         //
         // Нужен ровно там, где нет хоста stdio: программа, рисующая во весь экран (`bin/ved`),

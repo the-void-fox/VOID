@@ -51,7 +51,9 @@ shot 01-probe
 
 # Признаки пробоя в serial-логе. Каждый — (регэксп, короткое имя класса).
 FINDINGS = [
-    (re.compile(r"PROBE VERDICT AMPLIFICATION.*"), "усиление-прав"),
+    # Веха 152.2 — находка = ЭСКАЛАЦИЯ (власть сверх выданной). DUP (лишние слоты той же власти)
+    # тревогой НЕ считается — это накопление c-space, а не пробой.
+    (re.compile(r"PROBE VERDICT ESCALATION.*"), "усиление-прав"),
     (re.compile(r"\[PANIC\].*"), "паника-ядра"),
     (re.compile(r"FATAL TRAP.*"), "фатальный-трап"),
 ]

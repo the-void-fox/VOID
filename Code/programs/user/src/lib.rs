@@ -130,6 +130,8 @@ const SYS_CONSIZE: usize = 52;
 const SYS_SETENV: usize = 53;
 /// Веха 143 — раскладка клавиатуры: `0` спросить, `1` следующая.
 const SYS_KEYMAP: usize = 57;
+/// Веха 152.2 — описать дескриптор: вид цели и права (read-only интроспекция).
+const SYS_CAP_INFO: usize = 58;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -1115,6 +1117,15 @@ pub fn irq_wait(irq_cap: usize) -> bool {
 /// `GRANT` не нужен. Возвращает новый дескриптор или MAX.
 pub fn cap_derive(cap: usize, mask: usize) -> usize {
     abi::syscall(SYS_CAP_DERIVE, cap, mask, 0, 0, 0, 0, 0).0
+}
+
+/// Веха 152.2 — `SYS_CAP_INFO`: описать дескриптор. `None` — недействителен/устарел; иначе
+/// `(вид, права)`. Виды (общий словарь с ядром, `cap::info_kind`): 1 store · 2 root · 3 value ·
+/// 4 endpoint · 5 reply · 6 blk · 7 net · 8 mmio · 9 dma · 10 power · 11 shm · 12 irq. Права —
+/// битовая маска `Rights` (READ 1 · WRITE 2 · EXEC 4 · SEND 8 · GRANT 16). Побочного эффекта нет.
+pub fn cap_info(cap: usize) -> Option<(u8, u32)> {
+    let r = abi::syscall(SYS_CAP_INFO, cap, 0, 0, 0, 0, 0, 0).0;
+    (r != NO_CAP).then(|| ((r >> 16) as u8, (r & 0xffff) as u32))
 }
 
 /// `SYS_MAP`: лениво зарезервировать `len` байт кучи (роль mmap/sbrk). Физические страницы

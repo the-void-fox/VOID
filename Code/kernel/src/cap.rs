@@ -223,6 +223,36 @@ pub fn rights(dom: DomainId, cap: Cap) -> Result<Rights, CapError> {
     Ok(resolve(&cs, dom, cap)?.rights)
 }
 
+/// Веха 152.2 — **вид и права** дескриптора: read-only интроспекция для `SYS_CAP_INFO`.
+///
+/// Возвращает `(код вида, права)`. Кода вида хватает, чтобы отличить «дотянулся до store-read,
+/// которое и так есть» от «дотянулся до POWER, которого не давали». Побочного эффекта нет — это
+/// не «действие правом», а его ОПИСАНИЕ; узнать вид можно только про cap, который уже держишь.
+/// Коды видов держит [`info_kind`], чтобы userspace и ядро называли их одинаково.
+pub fn info(dom: DomainId, cap: Cap) -> Result<(u8, Rights), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    Ok((info_kind(&e.target), e.rights))
+}
+
+/// Код вида цели — общий словарь ядра и зонда конфайнмента ([[redteam]]).
+pub fn info_kind(t: &Target) -> u8 {
+    match t {
+        Target::Store => 1,
+        Target::Root(_) => 2,
+        Target::Value(_) => 3,
+        Target::Endpoint(_) => 4,
+        Target::Reply(_) => 5,
+        Target::Device(Device::Block) => 6,
+        Target::Device(Device::Net) => 7,
+        Target::Mmio { .. } => 8,
+        Target::Dma => 9,
+        Target::Power => 10,
+        Target::Shm(_) => 11,
+        Target::Irq { .. } => 12,
+    }
+}
+
 /// Прочитать значение по capability (требует `READ`). Возвращает результат `f`.
 ///
 /// Замок c-space держим только на время проверки: цель клонируем и отпускаем замок

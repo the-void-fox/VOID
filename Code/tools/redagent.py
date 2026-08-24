@@ -80,7 +80,8 @@ def stand(*args):
 
 # ── признаки пробоя (те же, что у redteam.py) ──────────────────────────────────────────────
 FINDING_RX = [
-    (re.compile(r"PROBE VERDICT AMPLIFICATION.*"), "усиление-прав"),
+    # Веха 152.2 — находка = ЭСКАЛАЦИЯ (власть сверх выданной); DUP не тревога (накопление).
+    (re.compile(r"PROBE VERDICT ESCALATION.*"), "усиление-прав"),
     (re.compile(r"\[PANIC\].*"), "паника-ядра"),
     (re.compile(r"FATAL TRAP.*"), "фатальный-трап"),
 ]
