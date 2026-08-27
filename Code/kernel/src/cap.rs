@@ -509,6 +509,24 @@ pub fn revoke(dom: DomainId, cap: Cap) -> Result<(), CapError> {
     Ok(())
 }
 
+/// Веха 153.4 — отозвать право в СЛОТЕ домена (что бы там ни лежало сейчас) — для диспетчера
+/// задач ([[task-manager]]): «отобрать это право у того процесса на ходу». В отличие от [`revoke`]
+/// не требует дескриптора с верным поколением: диспетчер держит не сам cap цели, а лишь номер
+/// слота (из [`list_caps`]). Бумкает поколение — уже выданные дескрипторы на этот слот протухают,
+/// то есть процесс теряет право немедленно (следующий resolve его отвергнет). `false` — слота нет
+/// или он пуст. Гейт (право Sysview WRITE у вызывающего) — на стороне `proc.rs`.
+pub fn revoke_slot(dom: DomainId, slot: usize) -> bool {
+    let mut cs = CSPACE.lock();
+    let Some(d) = cs.domains.get_mut(dom) else { return false };
+    let Some(s) = d.slots.get_mut(slot) else { return false };
+    if s.entry.is_none() {
+        return false;
+    }
+    s.entry = None;
+    s.generation = s.generation.wrapping_add(1);
+    true
+}
+
 /// Аттенуация СВОЕЙ копии (Веха 21.1): новый дескриптор в том же домене с правами
 /// `права ∩ mask`. `GRANT` не требуется — урезать то, чем владеешь, безопасно всегда;
 /// `GRANT` контролирует передачу ДРУГИМ (см. [`grant`]). Вместе они дают паттерн

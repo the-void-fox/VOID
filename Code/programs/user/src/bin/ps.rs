@@ -210,32 +210,68 @@ fn print_caps(sysview: usize, pid: usize) {
     }
 }
 
-/// Разобрать первый аргумент как десятичный pid. `None` — аргумента нет/не число.
-fn arg_pid() -> Option<usize> {
-    let argv = sys::argv::Argv::take();
-    let a = argv.rest().next()?;
+/// Разобрать десятичное число из байтов. `None` — пусто или не число.
+fn parse_dec(a: &[u8]) -> Option<usize> {
+    if a.is_empty() {
+        return None;
+    }
     let mut v: usize = 0;
-    let mut got = false;
     for &b in a {
         if !b.is_ascii_digit() {
             return None;
         }
         v = v * 10 + (b - b'0') as usize;
-        got = true;
     }
-    got.then_some(v)
+    Some(v)
+}
+
+/// Отозвать право (`ps revoke <pid> <slot>`) — под правом Sysview WRITE.
+fn do_revoke(sysview: usize, pid: usize, slot: usize) {
+    if sys::proc_revoke(sysview, pid, slot) {
+        w("отозвано: P");
+        put_num(pid);
+        w(" слот ");
+        put_num(slot);
+        w("\n");
+    } else {
+        w("ps: отзыв не удался (нет права WRITE, неверный pid или пустой слот)\n");
+        sys::exit(1);
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let sysview = find_sysview();
     if sysview == sys::NO_CAP {
-        w("ps: нет права обзора (sysview) — список процессов недоступен\n");
+        w("ps: нет права обзора (sysview) — обзор процессов недоступен\n");
         sys::exit(1);
     }
-    match arg_pid() {
-        Some(pid) => print_caps(sysview, pid),
-        None => print_list(sysview),
+    // Собрать до трёх аргументов (argv[0] — имя программы, дальше — наши).
+    let argv = sys::argv::Argv::take();
+    let mut a: [&[u8]; 3] = [b"", b"", b""];
+    let mut n = 0;
+    for arg in argv.rest() {
+        if n < a.len() {
+            a[n] = arg;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        print_list(sysview); // `ps`
+    } else if a[0] == b"revoke" {
+        // `ps revoke <pid> <slot>`
+        match (parse_dec(a[1]), parse_dec(a[2])) {
+            (Some(pid), Some(slot)) => do_revoke(sysview, pid, slot),
+            _ => {
+                w("ps: revoke <pid> <slot>\n");
+                sys::exit(2);
+            }
+        }
+    } else if let Some(pid) = parse_dec(a[0]) {
+        print_caps(sysview, pid); // `ps <pid>`
+    } else {
+        w("ps: аргумент не понят (ps | ps <pid> | ps revoke <pid> <slot>)\n");
+        sys::exit(2);
     }
     sys::exit(0);
 }

@@ -135,6 +135,7 @@ const SYS_CAP_INFO: usize = 58;
 const SYS_PROC_LIST: usize = 59;
 const SYS_PROC_CAPS: usize = 60;
 const SYS_PROC_STAT: usize = 61;
+const SYS_PROC_REVOKE: usize = 62;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -731,6 +732,13 @@ pub fn proc_stat(sysview_cap: usize, pid: usize) -> Option<ProcStat> {
         bytes_recv: g(24),
         holds_screen: (u16::from_le_bytes([b[32], b[33]]) & 0x01) != 0,
     })
+}
+
+/// Веха 153.4 — ОТОЗВАТЬ право в слоте `slot` процесса `pid` под правом управления
+/// (`sysview_cap`, WRITE): скальпель вместо топора — отобрать, например, сеть на ходу. Слот берут
+/// из [`proc_caps`]. `true` — отозвано; `false` — нет права/неверный pid/пустой слот.
+pub fn proc_revoke(sysview_cap: usize, pid: usize, slot: usize) -> bool {
+    abi::syscall(SYS_PROC_REVOKE, sysview_cap, pid, slot, 0, 0, 0, 0).0 == 0
 }
 
 /// `SYS_TIME(0)` — настенное время, наносекунды Unix (UTC). Веха 86: часы читаются у прошивки

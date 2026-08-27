@@ -3326,6 +3326,36 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_PROC_REVOKE(sysview_cap, pid, slot) -> 0 | MAX (Веха 153.4): отозвать право в слоте
+        // c-space процесса `pid` — под правом Sysview WRITE (не READ: это ДЕЙСТВИЕ, а не обзор).
+        // Скальпель вместо топора ([[task-manager]]): не «убить процесс», а «отобрать у него сеть
+        // на ходу» — слот с endpoint→net-srv, и он теряет её немедленно (cap::revoke_slot бумкает
+        // поколение → висящий дескриптор протухает). MAX — нет права / неверный pid / пустой слот.
+        62 => {
+            let (scap, pid, slot) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::sysview(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) if pid < t.procs.len() && t.procs[pid].state != State::Finished => {
+                    let tdom = t.procs[pid].domain;
+                    if cap::revoke_slot(tdom, slot) {
+                        vprintln!(
+                            "  [proc] P{} PROC_REVOKE P{} слот {} — право отозвано",
+                            cur, pid, slot
+                        );
+                        0
+                    } else {
+                        usize::MAX // слота нет или он пуст
+                    }
+                }
+                _ => usize::MAX, // нет права Sysview WRITE или неверный pid
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_CONSIZE() -> (колонок, строк) (Веха 120): размер КОНСОЛИ ЯДРА в знакоместах.
         //
         // Нужен ровно там, где нет хоста stdio: программа, рисующая во весь экран (`bin/ved`),
