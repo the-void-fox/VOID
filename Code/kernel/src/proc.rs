@@ -261,6 +261,17 @@ struct Proc {
     parent: usize,
     /// Веха 98 — код выхода, сохранённый до `SYS_WAIT`. `None` — процесс ещё жив.
     exit_code: Option<usize>,
+    /// Веха 153 — content-id ИСПОЛНЯЕМОГО образа (тот объект store, из которого поднят ELF).
+    /// Диспетчер задач показывает ЕГО, а не имя ([[task-manager]]): имя у нас не удостоверение
+    /// (`args[0]` — что угодно), а хэш — точное «что именно исполняется», подделать нельзя
+    /// (другой код → другой хэш). `None` — образ вне store (сид ядра до Вехи 23 не встречается;
+    /// linux-личность из пакета — id берётся из `lxfs`).
+    image: Option<ContentId>,
+    /// Веха 153 — процесс поднят init'ом из конфига ПОКОЛЕНИЯ (`service`/`shell`), а не запущен
+    /// рукой пользователя. Это и есть честный признак «системного» ([[task-manager]]): не флаг,
+    /// приклеенный к процессу, а ПРОИСХОЖДЕНИЕ. Ставит только [`crate::init`]; всё, что поднято
+    /// через `SYS_EXEC`/`SYS_SPAWN`, — `false`.
+    system: bool,
     /// Веха 108.3 — открытые файлы личности Linux (дескрипторы с 3; 0/1/2 — консоль). Читаются
     /// прямо из объектного store ([`crate::lxfs`]), потому что ходить из syscall'а по IPC к
     /// файловому серверу нечем. Пусто у всех, кроме linux-процессов.
@@ -424,6 +435,8 @@ fn create_process_locked(
         zombie: false,
         parent: usize::MAX,
         exit_code: None,
+        image: None,   // Веха 153: проставит вызыватель (init::spawn или ветка SYS_EXEC/SPAWN)
+        system: false, // Веха 153: истинно только у поднятых init'ом из конфига поколения
         lx_fds: Vec::new(),
     };
     if idx == t.procs.len() {
@@ -471,6 +484,10 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         zombie: false, // ждут НИТЬ через THREAD_JOIN, а не через SYS_WAIT — зомби не нужен
         parent: usize::MAX,
         exit_code: None,
+        // Веха 153 — нить наследует образ и «системность» лидера: это одна единица защиты и
+        // происхождения (нить не «другая программа», у неё тот же content-id и тот же исток).
+        image: t.procs[leader].image,
+        system: t.procs[leader].system,
         lx_fds: Vec::new(),
     });
     idx
@@ -611,6 +628,18 @@ pub fn push_arg(pid: usize, arg: &str) -> bool {
 /// копиями при `SYS_EXEC`. Регистры `a0`/`a1` остаются быстрым путём для первых двух прав.
 pub fn push_start_cap(pid: usize, bits: usize) {
     TABLE.lock().procs[pid].start_caps.push(bits);
+}
+
+/// Веха 153 — проставить ПРОИСХОЖДЕНИЕ процесса: content-id образа (что именно исполняется) и
+/// признак «системный» (поднят init'ом из конфига поколения). Зовётся из [`crate::init`] после
+/// [`spawn_elf`], вне синхронного контекста syscall'а, поэтому берёт замок сам. Диспетчер задач
+/// читает оба поля ([[task-manager]]); ветка `SYS_EXEC`/`SYS_SPAWN` ставит только `image`.
+pub fn set_origin(pid: usize, image: ContentId, system: bool) {
+    let mut t = TABLE.lock();
+    if let Some(p) = t.procs.get_mut(pid) {
+        p.image = Some(image);
+        p.system = system;
+    }
 }
 
 /// Веха 152.3 — **применить потолок наделения** к процессу `pid`: персистентные права его
@@ -2041,14 +2070,20 @@ fn syscall(t: &mut Table, cur: usize) {
                         // Веха 109 — АБСОЛЮТНЫЙ путь запускается из дерева пакета: так работает
                         // PATH профиля (`/nix/store/<путь>/bin/<имя>`). Всё прочее — по-прежнему
                         // корень store `bin/<arch>/<имя>`.
-                        let elf_bytes = if name.starts_with('/') {
-                            crate::lxfs::lookup(name.as_bytes())
-                                .and_then(|m| crate::lxfs::read_all(&m))
+                        // Веха 153 — рядом с байтами берём content-id ОБРАЗА: диспетчер задач
+                        // показывает хэш, не имя. У родного запуска из store он точный; у образа
+                        // из дерева пакета (личность Linux) единого хэша нет — там `None`.
+                        let (elf_bytes, image): (Option<Vec<u8>>, Option<ContentId>) =
+                        if name.starts_with('/') {
+                            (crate::lxfs::lookup(name.as_bytes())
+                                .and_then(|m| crate::lxfs::read_all(&m)), None)
                         } else {
                             let full = crate::prog_root(name);
                             // Байты ELF копируем из store и сразу отпускаем его замок.
-                            crate::object::root(&full)
-                                .and_then(|id| crate::object::with(&id, |b| b.map(Vec::from)))
+                            match crate::object::root(&full) {
+                                Some(id) => (crate::object::with(&id, |b| b.map(Vec::from)), Some(id)),
+                                None => (None, None),
+                            }
                         };
                         match elf_bytes {
                             Some(bytes) => {
@@ -2097,6 +2132,10 @@ fn syscall(t: &mut Table, cur: usize) {
                                     }
                                 };
                                 if let Some(child) = child {
+                                    // Веха 153 — что именно исполняется (хэш образа); «системным»
+                                    // ребёнок SYS_EXEC/SPAWN не становится (истоком системного
+                                    // может быть только init из конфига поколения).
+                                    t.procs[child].image = image;
                                     // Стартовые capability наследуются копиями (`cap::endow`) —
                                     // и родному ребёнку, и linux-процессу (тому — на будущее,
                                     // под файловую персоналию; stdio он шлёт напрямую в консоль).
@@ -3091,6 +3130,82 @@ fn syscall(t: &mut Table, cur: usize) {
             let result = match cap::info(dom, Cap::from_bits(c as u64)) {
                 Ok((kind, rights)) => (kind as usize) << 16 | rights.0 as usize,
                 Err(_) => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_PROC_LIST(sysview_cap, buf_ptr, buf_len) -> число процессов | MAX (Веха 153):
+        // перечислить ЖИВЫЕ процессы (лидеры групп — нить не отдельная программа) под правом
+        // Sysview READ. Запись — 64 байта: pid u16, родитель u16 (0xFFFF — никто), флаги u16
+        // (bit0 системный, bit1 linux, bit2 есть-хэш), состояние u8, длина имени u8, content-id
+        // образа [32] и имя [24] (что ИМЕННО исполняется — хэш; имя рядом лишь для человека,
+        // удостоверением оно у нас не является, [[task-manager]]). Возвращается ПОЛНОЕ число
+        // процессов: если оно больше buf_len/64, клиент недосчитался и перезапросит бо́льшим
+        // буфером (уловка SYS_OBJ_LIST_ROOTS). Без cap ядро молчит — ambient-доступа к списку нет.
+        59 => {
+            let (scap, bptr, blen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::sysview(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(()) if ensure_heap_range(t, cur, bptr, blen) => {
+                    const REC: usize = 64;
+                    let cap_recs = blen / REC;
+                    let mut written = 0usize;
+                    let mut total = 0usize;
+                    for i in 0..t.procs.len() {
+                        let p = &t.procs[i];
+                        // Мёртвый слот или НИТЬ (делит домен/образ лидера) — не отдельная строка.
+                        if p.state == State::Finished || p.group != i {
+                            continue;
+                        }
+                        total += 1;
+                        if written >= cap_recs {
+                            continue; // буфер полон — досчитываем total, но не пишем
+                        }
+                        let mut rec = [0u8; REC];
+                        rec[0..2].copy_from_slice(&(i as u16).to_le_bytes());
+                        let parent =
+                            if p.parent == usize::MAX { 0xFFFFu16 } else { p.parent as u16 };
+                        rec[2..4].copy_from_slice(&parent.to_le_bytes());
+                        let mut flags = 0u16;
+                        if p.system { flags |= 0x01; }
+                        if p.linux { flags |= 0x02; }
+                        if p.image.is_some() { flags |= 0x04; }
+                        rec[4..6].copy_from_slice(&flags.to_le_bytes());
+                        rec[6] = match p.state {
+                            State::Runnable => 0,
+                            State::RecvWait => 1,
+                            State::ReplyWait => 2,
+                            State::StdinWait => 3,
+                            State::ExecWait(_) => 4,
+                            State::JoinWait(_) => 5,
+                            State::FutexWait => 6,
+                            State::IrqWait => 7,
+                            State::Sleeping => 8,
+                            State::Finished => 9,
+                        };
+                        // Имя = argv[0] до NUL, обрезанное до 24 байт.
+                        let name: &[u8] = p.args.split(|&b| b == 0).next().unwrap_or(&[]);
+                        let nlen = name.len().min(24);
+                        rec[7] = nlen as u8;
+                        if let Some(ContentId(id)) = p.image {
+                            rec[8..40].copy_from_slice(&id);
+                        }
+                        rec[40..40 + nlen].copy_from_slice(&name[..nlen]);
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut((bptr + written * REC) as *mut u8, REC)
+                        };
+                        dst.copy_from_slice(&rec);
+                        written += 1;
+                    }
+                    vprintln!("  [proc] P{} PROC_LIST → {} из {} (по cap)", cur, written, total);
+                    total
+                }
+                Ok(()) => usize::MAX, // право есть, а фреймов под буфер нет
+                Err(_) => usize::MAX, // нет права Sysview — молчим
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);

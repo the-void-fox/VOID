@@ -124,7 +124,12 @@ fn spawn(name: &str) -> Option<usize> {
     let bytes = object::with(&id, |b| b.map(<[u8]>::to_vec))?;
     let pname: &'static str = Box::leak(name.to_string().into_boxed_str());
     match proc::spawn_elf(pname, &bytes, 0) {
-        Ok(pid) => Some(pid),
+        Ok(pid) => {
+            // Веха 153 — поднятое init'ом из конфига поколения СИСТЕМНОЕ по происхождению;
+            // заодно фиксируем content-id образа, чтобы диспетчер показывал хэш, не имя.
+            proc::set_origin(pid, id, true);
+            Some(pid)
+        }
         Err(e) => {
             println!("  [init] '{}': негодный ELF: {:?}", name, e);
             None
@@ -147,6 +152,13 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         // Веха 101 — право выключить машину. Обычно у шелла: `exit`/`poweroff` должны
         // действительно снимать питание, а не только закрывать программу.
         Some(cap::mint(dom, cap::Target::Power, Rights::WRITE).bits() as usize)
+    } else if token == "sysview" {
+        // Веха 153 — право ОБЗОРА процессов (только READ): видеть, что запущено и что оно может.
+        // По умолчанию нет ни у кого; обычно стоит у диспетчера задач ([[task-manager]]).
+        Some(cap::mint(dom, cap::Target::Sysview, Rights::READ).bits() as usize)
+    } else if let Some(r) = token.strip_prefix("sysview:") {
+        // `sysview:rw` — обзор ПЛЮС управление (отзыв чужих прав на ходу, рубильник сети).
+        Some(cap::mint(dom, cap::Target::Sysview, parse_rights(r)).bits() as usize)
     } else if token == "dma" {
         // Веха 51 — право выделять DMA-память (userspace-драйверу под кольца/буферы).
         Some(cap::mint(dom, cap::Target::Dma, Rights::WRITE).bits() as usize)

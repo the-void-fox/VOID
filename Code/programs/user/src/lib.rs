@@ -132,6 +132,7 @@ const SYS_SETENV: usize = 53;
 const SYS_KEYMAP: usize = 57;
 /// Веха 152.2 — описать дескриптор: вид цели и права (read-only интроспекция).
 const SYS_CAP_INFO: usize = 58;
+const SYS_PROC_LIST: usize = 59;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -665,6 +666,22 @@ pub fn shm_map(shm_cap: usize, va: usize) -> Option<usize> {
 /// каждого соседа, и не отпущенная область осталась бы висеть до смерти процесса.
 pub fn shm_unmap(shm_cap: usize, va: usize) -> bool {
     abi::syscall(SYS_SHM_UNMAP, shm_cap, va, 0, 0, 0, 0, 0).0 == 0
+}
+
+/// Веха 153 — размер одной записи `SYS_PROC_LIST` в байтах (см. [`proc_list`]).
+pub const PROC_REC: usize = 64;
+
+/// Веха 153 — перечислить ЖИВЫЕ процессы под правом обзора (`sysview_cap`, требует READ).
+/// Заполняет `buf` записями по [`PROC_REC`] байт и возвращает ПОЛНОЕ число процессов: если оно
+/// больше `buf.len() / PROC_REC`, часть не поместилась — перезапроси бо́льшим буфером. `None` —
+/// нет права (ambient-доступа к списку процессов нет, [[task-manager]]).
+///
+/// Раскладка записи (LE): `pid u16`, `parent u16` (0xFFFF — никто), `flags u16`
+/// (bit0 системный, bit1 linux, bit2 есть content-id), `state u8`, `name_len u8`,
+/// `image [32]` (content-id образа), `name [24]`.
+pub fn proc_list(sysview_cap: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = abi::syscall(SYS_PROC_LIST, sysview_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r)
 }
 
 /// `SYS_TIME(0)` — настенное время, наносекунды Unix (UTC). Веха 86: часы читаются у прошивки

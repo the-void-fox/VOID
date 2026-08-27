@@ -89,6 +89,13 @@ pub enum Target {
     /// ядро замаршрутизировало IRQ устройства (IOAPIC → LAPIC). Так userspace-драйвер спит до
     /// прерывания вместо опроса. Эфемерно (маршрутизация ставится на загрузке).
     Irq { vector: u8 },
+    /// Веха 153 — **обзор и управление процессами** ([[task-manager]]): `READ` — видеть, ЧТО
+    /// запущено и что оно может (перечислить процессы, их права ГРАФОМ, счётчики IPC); `WRITE` —
+    /// отзывать чужие права на ходу и щёлкать рубильником сети. Ambient-доступа к списку
+    /// процессов у нас нет (в отличие от `/proc`): «видеть запущенное» — само по себе capability,
+    /// и по умолчанию его нет ни у кого, кроме диспетчера задач. init минтит его из конфига
+    /// поколения (токен `sysview`); эфемерно — не переживает перезагрузку, минтится заново.
+    Sysview,
 }
 
 /// Запись в c-space: цель + права на неё.
@@ -256,6 +263,7 @@ pub fn info_kind(t: &Target) -> u8 {
         Target::Power => 10,
         Target::Shm(_) => 11,
         Target::Irq { .. } => 12,
+        Target::Sysview => 13,
     }
 }
 
@@ -278,7 +286,7 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power
-        | Target::Shm(_) => return Err(CapError::WrongKind),
+        | Target::Shm(_) | Target::Sysview => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -299,7 +307,7 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
             Target::Root(name) => name,
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
             | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-            | Target::Power | Target::Shm(_) => return Err(CapError::WrongKind),
+            | Target::Power | Target::Shm(_) | Target::Sysview => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -419,6 +427,22 @@ pub fn irq(dom: DomainId, cap: Cap, need: Rights) -> Result<u8, CapError> {
     }
 }
 
+/// Веха 153 — проверить право **обзора/управления процессами** (требует `need`: `READ` для
+/// перечисления/графа/счётчиков, `WRITE` для отзыва прав и рубильника сети). Без такого cap
+/// ядро не выдаёт наружу НИЧЕГО о чужих процессах — «видеть запущенное» само есть право
+/// ([[task-manager]]).
+pub fn sysview(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::Sysview => Ok(()),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
 // ─── передача и отзыв ──────────────────────────────────────────────────────
 
 /// Передать capability из домена `from` в домен `to`, сузив права маской `mask`
@@ -495,6 +519,7 @@ fn target_eq(a: &Target, b: &Target) -> bool {
         }
         (Target::Shm(x), Target::Shm(y)) => x == y,
         (Target::Irq { vector: v1 }, Target::Irq { vector: v2 }) => v1 == v2,
+        (Target::Sysview, Target::Sysview) => true,
         _ => false,
     }
 }
@@ -599,7 +624,7 @@ pub fn persist() {
                         // памяти (живут в RAM и умирают вместе с ней).
                         Target::Endpoint(_) | Target::Reply(_)
                         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-                        | Target::Power | Target::Shm(_) => 0,
+                        | Target::Power | Target::Shm(_) | Target::Sysview => 0,
                     },
                     None => 0,
                 };
