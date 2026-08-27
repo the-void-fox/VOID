@@ -192,6 +192,22 @@ fn print_caps(sysview: usize, pid: usize) {
     if total > shown {
         w("ps: показаны не все права (буфер мал)\n");
     }
+    // «Что делает сейчас» — учёт IPC (Веха 153.3). Счётчики накопительные.
+    if let Some(st) = sys::proc_stat(sysview, pid) {
+        w("  IPC: сделал ");
+        put_num(st.calls_made as usize);
+        w(" вызовов (");
+        put_num(st.bytes_sent as usize);
+        w(" Б) · принял ");
+        put_num(st.calls_recv as usize);
+        w(" (");
+        put_num(st.bytes_recv as usize);
+        w(" Б)");
+        if st.holds_screen {
+            w(" · держит ЭКРАН");
+        }
+        w("\n");
+    }
 }
 
 /// Разобрать первый аргумент как десятичный pid. `None` — аргумента нет/не число.

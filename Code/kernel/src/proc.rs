@@ -272,6 +272,15 @@ struct Proc {
     /// приклеенный к процессу, а ПРОИСХОЖДЕНИЕ. Ставит только [`crate::init`]; всё, что поднято
     /// через `SYS_EXEC`/`SYS_SPAWN`, — `false`.
     system: bool,
+    /// Веха 153.3 — счётчики IPC для диспетчера («что оно делает СЕЙЧАС», [[task-manager]]).
+    /// Весь ввод-вывод VOID идёт через IPC к службам по правам, поэтому активность не оценивают
+    /// снаружи (как «Диск 2%» в Windows) — её просто СЧИТАЮТ на самих опосредованных вызовах.
+    /// `made`/`sent` — как КЛИЕНТ (сделал CALL, отправил байт запроса); `recv`/`brecv` — как
+    /// СЕРВЕР (пришёл CALL, принял байт). Диспетчер вычитает два замера и получает скорость.
+    calls_made: u64,
+    bytes_sent: u64,
+    calls_recv: u64,
+    bytes_recv: u64,
     /// Веха 108.3 — открытые файлы личности Linux (дескрипторы с 3; 0/1/2 — консоль). Читаются
     /// прямо из объектного store ([`crate::lxfs`]), потому что ходить из syscall'а по IPC к
     /// файловому серверу нечем. Пусто у всех, кроме linux-процессов.
@@ -437,6 +446,10 @@ fn create_process_locked(
         exit_code: None,
         image: None,   // Веха 153: проставит вызыватель (init::spawn или ветка SYS_EXEC/SPAWN)
         system: false, // Веха 153: истинно только у поднятых init'ом из конфига поколения
+        calls_made: 0,
+        bytes_sent: 0,
+        calls_recv: 0,
+        bytes_recv: 0,
         lx_fds: Vec::new(),
     };
     if idx == t.procs.len() {
@@ -488,6 +501,12 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         // происхождения (нить не «другая программа», у неё тот же content-id и тот же исток).
         image: t.procs[leader].image,
         system: t.procs[leader].system,
+        // Нить считает свой IPC отдельно (свой кадр, свои CALL); диспетчер показывает лидеров,
+        // поэтому активность нитей в его сводку не скатывается — приемлемо (нитей у нас единицы).
+        calls_made: 0,
+        bytes_sent: 0,
+        calls_recv: 0,
+        bytes_recv: 0,
         lx_fds: Vec::new(),
     });
     idx
@@ -1519,6 +1538,15 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             match cap::endpoint(dom, Cap::from_bits(ecap as u64)) {
                 Ok(dest) => {
+                    // Веха 153.3 — учёт IPC для диспетчера: клиент сделал вызов, сервер принял.
+                    // Считаем при ПРИЁМЕ вызова (а не при доставке), чтобы и отложенный в mailbox
+                    // счёлся: адресат уже назначен, а «сделал CALL» — факт со стороны клиента.
+                    t.procs[cur].calls_made = t.procs[cur].calls_made.wrapping_add(1);
+                    t.procs[cur].bytes_sent = t.procs[cur].bytes_sent.wrapping_add(slen as u64);
+                    if dest < t.procs.len() {
+                        t.procs[dest].calls_recv = t.procs[dest].calls_recv.wrapping_add(1);
+                        t.procs[dest].bytes_recv = t.procs[dest].bytes_recv.wrapping_add(slen as u64);
+                    }
                     vprintln!("  [ipc] P{} CALL P{} (по cap) op={} ({} байт)", cur, dest, op, slen);
                     t.procs[cur].recv_buf = rbuf;
                     t.procs[cur].recv_cap = rcap;
@@ -3253,6 +3281,43 @@ fn syscall(t: &mut Table, cur: usize) {
                         cur, pid, written, caps.len()
                     );
                     caps.len()
+                }
+                Ok(()) => usize::MAX, // неверный pid / мёртвый / нет фреймов буфера
+                Err(_) => usize::MAX, // нет права Sysview
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_PROC_STAT(sysview_cap, pid, buf_ptr) -> 0 | MAX (Веха 153.3): «что процесс делает
+        // СЕЙЧАС» под правом Sysview READ. 64 Б в буфер: calls_made u64, bytes_sent u64,
+        // calls_recv u64, bytes_recv u64, flags u16 (bit0 — держит ЭКРАН), дальше резерв. Это не
+        // эвристика и не выборка (как «Диск 2%» снаружи), а учёт самих опосредованных вызовов —
+        // правда по построению; скорость диспетчер считает вычитанием двух замеров.
+        61 => {
+            let (scap, pid, bptr) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::sysview(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(())
+                    if pid < t.procs.len()
+                        && t.procs[pid].state != State::Finished
+                        && ensure_heap_range(t, cur, bptr, 64) =>
+                {
+                    let holds_screen = arch::video_owner() == Some(pid);
+                    let p = &t.procs[pid];
+                    let mut rec = [0u8; 64];
+                    rec[0..8].copy_from_slice(&p.calls_made.to_le_bytes());
+                    rec[8..16].copy_from_slice(&p.bytes_sent.to_le_bytes());
+                    rec[16..24].copy_from_slice(&p.calls_recv.to_le_bytes());
+                    rec[24..32].copy_from_slice(&p.bytes_recv.to_le_bytes());
+                    let flags: u16 = if holds_screen { 0x01 } else { 0 };
+                    rec[32..34].copy_from_slice(&flags.to_le_bytes());
+                    let dst = unsafe { core::slice::from_raw_parts_mut(bptr as *mut u8, 64) };
+                    dst.copy_from_slice(&rec);
+                    0
                 }
                 Ok(()) => usize::MAX, // неверный pid / мёртвый / нет фреймов буфера
                 Err(_) => usize::MAX, // нет права Sysview

@@ -134,6 +134,7 @@ const SYS_KEYMAP: usize = 57;
 const SYS_CAP_INFO: usize = 58;
 const SYS_PROC_LIST: usize = 59;
 const SYS_PROC_CAPS: usize = 60;
+const SYS_PROC_STAT: usize = 61;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -697,6 +698,39 @@ pub const PROC_CAP_REC: usize = 12;
 pub fn proc_caps(sysview_cap: usize, pid: usize, buf: &mut [u8]) -> Option<usize> {
     let r = abi::syscall(SYS_PROC_CAPS, sysview_cap, pid, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0).0;
     (r != usize::MAX).then_some(r)
+}
+
+/// Веха 153.3 — «что процесс делает сейчас»: счётчики IPC (см. [`proc_stat`]). Счётчики
+/// НАКОПИТЕЛЬНЫЕ — скорость даёт разность двух замеров.
+pub struct ProcStat {
+    /// Как клиент: сделано вызовов `SYS_CALL` и отправлено байт запроса.
+    pub calls_made: u64,
+    pub bytes_sent: u64,
+    /// Как сервер: принято вызовов и байт запроса.
+    pub calls_recv: u64,
+    pub bytes_recv: u64,
+    /// Держит ли ЭКРАН (владелец фреймбуфера).
+    pub holds_screen: bool,
+}
+
+/// Веха 153.3 — снять счётчики IPC процесса `pid` под правом обзора (`sysview_cap`, READ).
+/// `None` — нет права или неверный pid.
+pub fn proc_stat(sysview_cap: usize, pid: usize) -> Option<ProcStat> {
+    let mut b = [0u8; 64];
+    let r = abi::syscall(SYS_PROC_STAT, sysview_cap, pid, b.as_mut_ptr() as usize, 0, 0, 0, 0).0;
+    if r == usize::MAX {
+        return None;
+    }
+    let g = |o: usize| {
+        u64::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]])
+    };
+    Some(ProcStat {
+        calls_made: g(0),
+        bytes_sent: g(8),
+        calls_recv: g(16),
+        bytes_recv: g(24),
+        holds_screen: (u16::from_le_bytes([b[32], b[33]]) & 0x01) != 0,
+    })
 }
 
 /// `SYS_TIME(0)` — настенное время, наносекунды Unix (UTC). Веха 86: часы читаются у прошивки
