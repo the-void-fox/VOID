@@ -133,6 +133,7 @@ const SYS_KEYMAP: usize = 57;
 /// Веха 152.2 — описать дескриптор: вид цели и права (read-only интроспекция).
 const SYS_CAP_INFO: usize = 58;
 const SYS_PROC_LIST: usize = 59;
+const SYS_PROC_CAPS: usize = 60;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -681,6 +682,20 @@ pub const PROC_REC: usize = 64;
 /// `image [32]` (content-id образа), `name [24]`.
 pub fn proc_list(sysview_cap: usize, buf: &mut [u8]) -> Option<usize> {
     let r = abi::syscall(SYS_PROC_LIST, sysview_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r)
+}
+
+/// Веха 153.2 — размер одной записи [`proc_caps`] в байтах.
+pub const PROC_CAP_REC: usize = 12;
+
+/// Веха 153.2 — перечислить c-space процесса `pid` под правом обзора (`sysview_cap`, READ) —
+/// для ГРАФА «кто чей эндпоинт держит». Заполняет `buf` записями по [`PROC_CAP_REC`] байт,
+/// возвращает ПОЛНОЕ число прав (усечение видно клиенту). `None` — нет права или неверный pid.
+///
+/// Раскладка записи (LE): `слот u16`, `вид u8`, `_pad u8`, `права u32`, `aux u16` (id связанного
+/// процесса у endpoint/reply — ребро графа; иначе 0xFFFF), `_pad u16`.
+pub fn proc_caps(sysview_cap: usize, pid: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = abi::syscall(SYS_PROC_CAPS, sysview_cap, pid, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0).0;
     (r != usize::MAX).then_some(r)
 }
 

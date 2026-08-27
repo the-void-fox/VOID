@@ -443,6 +443,26 @@ pub fn sysview(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
     }
 }
 
+/// Веха 153.2 — перечислить ЖИВЫЕ слоты домена для диспетчера задач ([[task-manager]]):
+/// `(слот, вид, права, aux)`. `aux` — id СВЯЗАННОГО процесса у `Endpoint`/`Reply` (это и строит
+/// ГРАФ «кто чей эндпоинт держит»: слот `Endpoint(Y)` в домене X = ребро «X может позвать Y»),
+/// иначе `u16::MAX`. Гейт права Sysview — на вызывающем (в `proc.rs`), сама функция лишь читает.
+pub fn list_caps(dom: DomainId) -> Vec<(u16, u8, u32, u16)> {
+    let cs = CSPACE.lock();
+    let mut out = Vec::new();
+    let Some(d) = cs.domains.get(dom) else { return out };
+    for (i, s) in d.slots.iter().enumerate() {
+        if let Some(e) = &s.entry {
+            let aux = match &e.target {
+                Target::Endpoint(p) | Target::Reply(p) => *p as u16,
+                _ => u16::MAX,
+            };
+            out.push((i as u16, info_kind(&e.target), e.rights.0 as u32, aux));
+        }
+    }
+    out
+}
+
 // ─── передача и отзыв ──────────────────────────────────────────────────────
 
 /// Передать capability из домена `from` в домен `to`, сузив права маской `mask`

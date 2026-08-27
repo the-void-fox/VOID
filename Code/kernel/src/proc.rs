@@ -3211,6 +3211,56 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_PROC_CAPS(sysview_cap, pid, buf_ptr, buf_len) -> число прав | MAX (Веха 153.2):
+        // перечислить c-space процесса `pid` под правом Sysview READ — для ГРАФА «кто чей эндпоинт
+        // держит». Важен не перечень прав (успокаивающая ложь), а СВЯЗИ: процесс без права на сеть
+        // всё равно может позвать того, у кого оно есть (confused deputy). Запись — 12 байт: слот
+        // u16, вид u8, _pad u8, права u32, aux u16 (id связанного процесса у Endpoint/Reply — ребро
+        // графа; иначе 0xFFFF), _pad u16. Полное число прав; MAX — нет права обзора или неверный pid.
+        60 => {
+            let (scap, pid, bptr, blen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::sysview(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(())
+                    if pid < t.procs.len()
+                        && t.procs[pid].state != State::Finished
+                        && ensure_heap_range(t, cur, bptr, blen) =>
+                {
+                    const REC: usize = 12;
+                    let cap_recs = blen / REC;
+                    let caps = cap::list_caps(t.procs[pid].domain);
+                    let mut written = 0usize;
+                    for &(slot, kind, rights, aux) in &caps {
+                        if written >= cap_recs {
+                            break;
+                        }
+                        let mut rec = [0u8; REC];
+                        rec[0..2].copy_from_slice(&slot.to_le_bytes());
+                        rec[2] = kind;
+                        rec[4..8].copy_from_slice(&rights.to_le_bytes());
+                        rec[8..10].copy_from_slice(&aux.to_le_bytes());
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut((bptr + written * REC) as *mut u8, REC)
+                        };
+                        dst.copy_from_slice(&rec);
+                        written += 1;
+                    }
+                    vprintln!(
+                        "  [proc] P{} PROC_CAPS P{} → {} из {} прав",
+                        cur, pid, written, caps.len()
+                    );
+                    caps.len()
+                }
+                Ok(()) => usize::MAX, // неверный pid / мёртвый / нет фреймов буфера
+                Err(_) => usize::MAX, // нет права Sysview
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_CONSIZE() -> (колонок, строк) (Веха 120): размер КОНСОЛИ ЯДРА в знакоместах.
         //
         // Нужен ровно там, где нет хоста stdio: программа, рисующая во весь экран (`bin/ved`),
