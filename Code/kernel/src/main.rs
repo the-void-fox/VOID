@@ -192,6 +192,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 148 — ПЕРВОЕ РОДНОЕ ПРИЛОЖЕНИЕ: вьювер корней store. Клиент композитора, значит
     //x86-only, как и все, кому нужен экран.
     ("roots", include_bytes!(env!("PROG_ROOTS"))),
+    // Веха 153 — диспетчер задач: право обзора процессов (Sysview) в лицо пользователю. Тоже
+    // клиент композитора, значит x86-only.
+    ("taskmgr", include_bytes!(env!("PROG_TASKMGR"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];
