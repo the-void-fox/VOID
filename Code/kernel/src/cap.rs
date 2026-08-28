@@ -123,8 +123,16 @@ struct Slot {
 
 /// Домен защиты: имя + его личное capability-пространство (c-space).
 struct Domain {
+    /// Имя-личность программы. **Пустое — домен СВОБОДЕН** (тумба): его место в таблице занимает
+    /// следующий проситель. Освобождаем именно так, а не удалением из вектора: `DomainId` — это
+    /// индекс, и сдвиг вектора переадресовал бы права живых процессов на чужие таблицы.
     name: &'static str,
     slots: Vec<Slot>,
+    /// Веха 156 — доменом СЕЙЧАС владеет живой процесс. Пока владеет, его тёзке домен не отдаём.
+    live: bool,
+    /// Веха 156 — c-space ВТОРОГО живого тёзки: не личность программы, а временная таблица.
+    /// Не персистится и умирает вместе с процессом (домен становится тумбой).
+    transient: bool,
 }
 
 /// Все домены системы. Отдельная таблица прав на домен — суть модели.
@@ -154,13 +162,70 @@ pub enum CapError {
 /// Создать домен защиты, вернуть его id. Если домен с таким именем уже есть (восстановлен
 /// из `.cspace` — Веха 21.3), ПЕРЕИСПОЛЬЗОВАТЬ его: имя домена и есть персистентная личность,
 /// по ней процесс новой загрузки находит права, выданные ему в прошлой.
+///
+/// Для ПРОЦЕССОВ зовётся не это, а [`claim_domain`]: живой тёзка не должен получить чужую
+/// таблицу прав. Здесь остаются домены ядра и демо — они не «живут» и тёзок не имеют.
 pub fn create_domain(name: &'static str) -> DomainId {
     let mut cs = CSPACE.lock();
-    if let Some(i) = cs.domains.iter().position(|d| d.name == name) {
+    if let Some(i) = cs.domains.iter().position(|d| d.name == name && !d.transient) {
         return i;
     }
-    cs.domains.push(Domain { name, slots: Vec::new() });
-    cs.domains.len() - 1
+    push_domain(&mut cs, name, false, false)
+}
+
+/// Завести домен в свободной тумбе (или в конце таблицы) и вернуть его id.
+fn push_domain(cs: &mut CSpace, name: &'static str, live: bool, transient: bool) -> DomainId {
+    let d = Domain { name, slots: Vec::new(), live, transient };
+    match cs.domains.iter().position(|x| x.name.is_empty()) {
+        Some(i) => {
+            cs.domains[i] = d;
+            i
+        }
+        None => {
+            cs.domains.push(d);
+            cs.domains.len() - 1
+        }
+    }
+}
+
+/// Веха 156 — **занять домен под ЖИВОЙ процесс** (единственный путь для `create_process_locked`).
+///
+/// До вехи домен искался по имени и отдавался кому угодно — а значит ДВА РАБОТАЮЩИХ процесса
+/// одной программы делили одну таблицу прав. Это видно было глазами в диспетчере задач: у одного
+/// диспетчера в графе стояли эндпоинты другого, и «отнять» отбирало право у обоих сразу. Хуже
+/// того, право, выданное одному экземпляру по политике (обзор процессов от композитора),
+/// оказывалось в таблице второго, которому его не давали.
+///
+/// Правило: **имя — личность ПРОГРАММЫ, но таблица прав — у ПРОЦЕССА.**
+/// - канонический домен имени свободен → занять его (так персистентность Вехи 21.3 работает как
+///   работала: процесс новой загрузки находит права, выданные в прошлой);
+/// - канонический занят живым тёзкой → завести ВРЕМЕННЫЙ c-space, который умрёт вместе с
+///   процессом и не попадёт в `.cspace`: у второго экземпляра нет прошлого, за которое его можно
+///   было бы наделить.
+pub fn claim_domain(name: &'static str) -> DomainId {
+    let mut cs = CSPACE.lock();
+    match cs.domains.iter().position(|d| d.name == name && !d.transient) {
+        Some(i) if !cs.domains[i].live => {
+            cs.domains[i].live = true;
+            i
+        }
+        Some(_) => push_domain(&mut cs, name, true, true),
+        None => push_domain(&mut cs, name, true, false),
+    }
+}
+
+/// Веха 156 — процесс умер: отпустить его домен. Канонический освобождается для следующего
+/// тёзки (права остаются — это персистентная личность программы, Веха 21.3), временный
+/// становится ТУМБОЙ: его таблица уходит вместе с процессом, которому она принадлежала.
+pub fn release_domain(dom: DomainId) {
+    let mut cs = CSPACE.lock();
+    let Some(d) = cs.domains.get_mut(dom) else { return };
+    d.live = false;
+    if d.transient {
+        d.slots = Vec::new();
+        d.name = "";
+        d.transient = false;
+    }
 }
 
 /// Веха 89 — **отозвать все права, указывающие на умерший процесс**: эндпоинты и reply-права
@@ -671,8 +736,13 @@ pub fn persist() {
     let bytes = {
         let cs = CSPACE.lock();
         let mut b: Vec<u8> = Vec::new();
-        b.extend_from_slice(&(cs.domains.len() as u32).to_le_bytes());
-        for d in &cs.domains {
+        // Веха 156 — пишем только ЛИЧНОСТИ: тумбы (пустое имя) и временные c-space вторых живых
+        // тёзок в `.cspace` не едут. Иначе после перезагрузки в таблице оказались бы два домена
+        // с одним именем, и следующий процесс занял бы случайный из них.
+        let keep: Vec<&Domain> =
+            cs.domains.iter().filter(|d| !d.name.is_empty() && !d.transient).collect();
+        b.extend_from_slice(&(keep.len() as u32).to_le_bytes());
+        for d in keep {
             b.push(d.name.len() as u8);
             b.extend_from_slice(d.name.as_bytes());
             b.extend_from_slice(&(d.slots.len() as u32).to_le_bytes());
@@ -782,7 +852,9 @@ pub fn load() -> usize {
             // каждый боут (mmio/power — свежий минт этого поколения, не наследство из store).
             slots.push(Slot { generation, entry, persisted, noinherit: false });
         }
-        cs.domains.push(Domain { name, slots });
+        // Веха 156 — поднятый домен никем не занят: живым его сделает первый же процесс с этим
+        // именем (`claim_domain`), и он же тогда получит права прошлой загрузки.
+        cs.domains.push(Domain { name, slots, live: false, transient: false });
     }
     cs.domains.len()
 }

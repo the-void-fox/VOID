@@ -418,28 +418,9 @@ impl App {
         d.cut_top(th.px(2));
         u.label(d.cut_top(font_h), "права (граф эндпоинтов):", th.muted, Align::Left);
 
-        // Веха 155 — сказать вслух, что таблица прав ОБЩАЯ. Ядро заводит c-space по ИМЕНИ
-        // программы (`cap::create_domain`), поэтому два экземпляра одного диспетчера смотрят в
-        // одну таблицу: ниже будут и чужие права, а «отнять» отберёт их у обоих сразу. Молчать
-        // об этом нельзя — вся ценность этого окна в том, что показанное соответствует правде.
-        let twins: Vec<u16> =
-            self.procs.iter().filter(|p| p.name == name && p.pid != pid).map(|p| p.pid).collect();
-        if !twins.is_empty() {
-            let mut s = String::from("общая таблица с ");
-            for (k, t) in twins.iter().enumerate() {
-                if k > 0 {
-                    s.push_str(", ");
-                }
-                s.push_str(&alloc::format!("P{}", t));
-            }
-            u.label(d.cut_top(font_h), &s, th.accent, Align::Left);
-            u.label(
-                d.cut_top(font_h + th.px(2)),
-                "(c-space заводится по имени)",
-                th.muted,
-                Align::Left,
-            );
-        }
+        // Веха 155 здесь предупреждала, что таблица прав ОБЩАЯ у тёзок (ядро заводило c-space по
+        // имени программы). Веха 156 это починила — таблица у каждого процесса своя, — и
+        // предупреждение снято: строка, которая больше не может быть правдой, хуже её отсутствия.
 
         let mut acted: Option<u16> = None; // слот, у которого нажали «отнять»
         let btn_w = th.px(96);

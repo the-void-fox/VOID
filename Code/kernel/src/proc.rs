@@ -406,7 +406,10 @@ fn create_process_locked(
     arg: usize,
 ) -> usize {
     let frame = TrapFrame::new_user(entry, USER_STACK_TOP_VA, arg);
-    let domain = cap::create_domain(name);
+    // Веха 156 — ЗАНЯТЬ домен, а не найти по имени: пока тёзка жив, его таблица прав чужая.
+    // Свободна личность программы — берём её (права прошлой загрузки при ней), занята —
+    // получаем свой временный c-space (см. [`cap::claim_domain`]).
+    let domain = cap::claim_domain(name);
     // Веха 89: занять освободившийся слот, если он есть (права на него уже отозваны при
     // утилизации группы), иначе вырасти. Индекс — он же лидер собственной группы.
     let idx = t.free_slots.pop().unwrap_or(t.procs.len());
@@ -1203,6 +1206,10 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
             continue;
         }
         roots.push(arch::space_root(t.procs[leader].space));
+        // Веха 156 — группа умерла целиком: отпустить её домен. Нити делят c-space лидера, поэтому
+        // отпускается он один раз, а не по разу на нить. Канонический домен ждёт следующего тёзку
+        // с правами прошлой жизни, временный — исчезает вместе с процессом.
+        cap::release_domain(t.procs[leader].domain);
         for i in 0..n {
             if t.procs[i].group == leader {
                 t.procs[i].space = RECLAIMED;
