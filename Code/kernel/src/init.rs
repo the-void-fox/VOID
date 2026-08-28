@@ -259,8 +259,7 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
         if !k.kernel {
             continue;
         }
-        let mut tok = entry.words();
-        let Some(name) = tok.next() else { continue };
+        let Some(name) = entry.words().next() else { continue };
         let Some(pid) = spawn(name) else { continue };
 
         // Права по порядку: собрать дескрипторы, разложить в a0/a1 + стартовую таблицу.
@@ -268,26 +267,45 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
         let mut names: Vec<alloc::string::String> = Vec::new();
         let mut want_env = false;
         let mut nargs = 0usize;
-        for t in tok {
-            if t == "env" {
-                want_env = true;
-            } else if let Some(a) = t.strip_prefix("arg:") {
-                // Веха 92: НЕ capability, а настройка — уходит в argv процесса. Права отвечают
-                // на «что процессу можно», аргументы — на «как ему себя вести»; смешивать их в
-                // одном токене было бы враньём про cap-модель.
-                if proc::push_arg(pid, a) {
-                    nargs += 1;
-                } else {
-                    println!("  [init] arg:{} — argv переполнен (пропуск)", a);
+        // Веха 157.1 — ДВА ПРОХОДА: сперва наследуемые права, потом помеченные `!`.
+        //
+        // Порядок здесь — это позиции в стартовой таблице, а ребёнок получает НЕ всю таблицу
+        // родителя, а её наследуемую часть, СЖАТУЮ (пропущенные права не оставляют дырок).
+        // Значит право с пометкой `!`, стоящее в конфиге раньше обычного, сдвигало бы у ребёнка
+        // всё, что за ним, — а имена прав в окружении (`CAP_STORE=1`) ребёнок наследует от
+        // родителя ЧИСЛАМИ. Тот же класс отказа, что уже случился в Вехе 99.1: `vvsh` принял
+        // фреймбуфер за файловый сервер. Пока `!`-права стоят в конфиге последними, беды нет;
+        // порядок токенов — дело владельца, и полагаться на его аккуратность здесь нельзя.
+        for pass in 0..2 {
+            for t in entry.words().skip(1) {
+                if t == "env" || t.starts_with("arg:") {
+                    if pass == 1 {
+                        continue; // не-права разбираются один раз, первым проходом
+                    }
+                    if t == "env" {
+                        want_env = true;
+                    } else if let Some(a) = t.strip_prefix("arg:") {
+                        // Веха 92: НЕ capability, а настройка — уходит в argv процесса. Права
+                        // отвечают на «что процессу можно», аргументы — на «как ему себя вести»;
+                        // смешивать их в одном токене было бы враньём про cap-модель.
+                        if proc::push_arg(pid, a) {
+                            nargs += 1;
+                        } else {
+                            println!("  [init] arg:{} — argv переполнен (пропуск)", a);
+                        }
+                    }
+                    continue;
                 }
-            } else {
                 // Веха 154 — суффикс `!`: право минтуется процессу как обычно, но помечается
                 // «не наследуемым» — дети при spawn'е его не получат (см. `cap::set_noinherit`).
-                // Так `mmio:fb!`/`power!` остаются у композитора, но не текут в каждое окно.
+                // Так `mmio:fb!`/`power:wg!` остаются у композитора, но не текут в каждое окно.
                 let (tok_c, noinherit) = match t.strip_suffix('!') {
                     Some(base) => (base, true),
                     None => (t, false),
                 };
+                if noinherit != (pass == 1) {
+                    continue;
+                }
                 if let Some(bits) = mint_cap(pid, tok_c, &services) {
                     if noinherit {
                         cap::set_noinherit(proc::domain(pid), void_abi::Cap::from_bits(bits as u64));
