@@ -579,11 +579,8 @@ fn hex64(id: &[u8; 32]) -> String {
 /// у композитора помечено «не наследуется» (Веха 154), а диспетчер просит его отдельно — и
 /// получает, если конфиг поколения назвал диспетчер по имени (`desktop sysview taskmgr`).
 fn find_sysview() -> (usize, bool) {
-    if let Some((c, rights)) = sys::start_cap_of_kind(13) {
-        return (c, rights & 0x02 != 0); // WRITE — можно отзывать
-    }
-    let c = sys::win::grant(13);
-    (c, sys::cap_info(c).is_some_and(|(_, r)| r & 0x02 != 0))
+    let c = sys::win::cap_or_grant(13);
+    (c, sys::cap_info(c).is_some_and(|(_, r)| r & 0x02 != 0)) // WRITE — можно отзывать
 }
 
 impl ui::Client for App {

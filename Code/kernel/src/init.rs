@@ -95,10 +95,16 @@ const DEFAULT_GEN4: &str = "\
 # композитор лишь сверяет имя просителя с ней, спрашивая имя у ЯДРА, а не у просителя. `g` нужен,
 # чтобы право вообще можно было передать по IPC; уезжает оно урезанным (без `g`), `!` — чтобы
 # окна не наследовали его пачкой.
+#
+# Веха 157 — `power:wg!` и `desktop power`: тем же порядком раздаётся ВЫКЛЮЧЕНИЕ. Панели оно
+# нужно под кнопку меню, шеллу — под `poweroff`; до Вехи 154 оба получали его наследством от
+# композитора — то есть вместе с ними его имело каждое открытое окно.
 service posixfs store:rw
 service net-srv dev:net:rw
-shell wm endpoint:posixfs store:rwx mmio:fb! power! sysview:rwg! env arg:term
+shell wm endpoint:posixfs store:rwx mmio:fb! power:wg! sysview:rwg! env arg:term
 desktop sysview taskmgr
+desktop power bar
+desktop power bin/vvsh
 ";
 
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.
@@ -166,6 +172,11 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         // Веха 101 — право выключить машину. Обычно у шелла: `exit`/`poweroff` должны
         // действительно снимать питание, а не только закрывать программу.
         Some(cap::mint(dom, cap::Target::Power, Rights::WRITE).bits() as usize)
+    } else if let Some(r) = token.strip_prefix("power:") {
+        // Веха 157 — `power:wg` — выключение ПЛЮС право передать его дальше. Нужно держателю-
+        // раздатчику: композитор гасит машину сам, а панели и шеллу отдаёт это право по просьбе
+        // (`desktop power <имя>`), потому что с Вехи 154 наследством оно им уже не достаётся.
+        Some(cap::mint(dom, cap::Target::Power, parse_rights(r)).bits() as usize)
     } else if token == "sysview" {
         // Веха 153 — право ОБЗОРА процессов (только READ): видеть, что запущено и что оно может.
         // По умолчанию нет ни у кого; обычно стоит у диспетчера задач ([[task-manager]]).
@@ -348,8 +359,12 @@ fn cap_name(token: &str) -> alloc::string::String {
         d
     } else if token == "dma" {
         "dma"
-    } else if token == "power" {
+    } else if token == "power" || token.starts_with("power:") {
+        // Веха 157 — имя одно и то же, сколько бы прав ни назвал токен: `power` и `power:wg` —
+        // одно и то же полномочие, просто второе можно ещё и передать.
         "power"
+    } else if token == "sysview" || token.starts_with("sysview:") {
+        "sysview"
     } else {
         ""
     };

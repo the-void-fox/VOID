@@ -1586,10 +1586,16 @@ fn sh_store_probe(args: &[Value]) -> Result<Value, EvalError> {
 /// одностороннее действие над всей системой, и оно названо правом, а не считается общедоступным.
 fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
     sys::write("выключаю машину…\n".as_bytes());
-    if let Some(pc) = sys::cap_named("POWER") {
+    // Веха 157 — в тексте право приходит из конфига стартовым, а в ОКНЕ его приходится просить у
+    // композитора: с Вехи 154 выключение помечено «не наследуется», и шелл, запущенный терминалом,
+    // получал бы его только вместе со всеми окнами разом.
+    let pc = sys::win::cap_or_grant(10);
+    if pc != sys::NO_CAP {
         sys::power_off(pc);
     }
-    Err(EvalError::new("poweroff: нет права `power` в конфиге поколения"))
+    Err(EvalError::new(
+        "poweroff: нет права `power` — в оконном режиме нужна строка `desktop power bin/vvsh`",
+    ))
 }
 
 fn sh_switch(args: &[Value]) -> Result<Value, EvalError> {
@@ -2156,6 +2162,14 @@ apps = [\"term\"]\n\
 # Пусто (\"\") — не отдавать никому: диспетчер тогда честно скажет в окне, что смотреть не дано.\n\
 sysview = \"taskmgr\"\n\
 \n\
+# КТО МОЖЕТ ВЫКЛЮЧИТЬ МАШИНУ (Веха 157). Тем же порядком, что и обзор процессов: право держит\n\
+# композитор (он гасит систему по Super+Shift+Q) и отдаёт названным здесь программам.\n\
+#\n\
+# Панели оно нужно под кнопку выключения в меню, шеллу — под команду `poweroff`. Имена — как их\n\
+# видит ЯДРО (их же показывает диспетчер задач): шелл терминала запускается как `bin/vvsh`.\n\
+# Пустой список — выключение остаётся только у композитора, то есть только с клавиатуры.\n\
+poweroff = [\"bar\", \"bin/vvsh\"]\n\
+\n\
 # ОБОИ (Веха 139): имя объекта store с картинкой — PNG или JPEG. Пусто — просто цвет стола.\n\
 # Картинка заполняет экран С ОБРЕЗКОЙ: пропорции сохраняются, лишнее срезается поровну с краёв.\n\
 #\n\
@@ -2262,9 +2276,10 @@ sysviewcap = if sysview == \"\" { [] } else { \"sysview:rwg!\" }\n\
 # Рисуют окна в свой буфер, гасит систему сам композитор — эти права им не нужны.\n\
 if mode == \"wm\" {\n\
 \x20 append(\n\
-\x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb!\", \"power!\", sysviewcap,\n\
+\x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb!\", \"power:wg!\", sysviewcap,\n\
 \x20          \"env\", map(|a| \"arg:\" + a, apps))],\n\
 \x20   if sysview == \"\" { [] } else { [desktop(\"sysview\", sysview)] },\n\
+\x20   map(|p| desktop(\"power\", p), poweroff),\n\
 \x20   if wallpaper == \"\" { [] } else { [desktop(\"wallpaper\", wallpaper)] },\n\
 \x20   if bar { [desktop(\"bar\", \"on\")] } else { [] },\n\
 \x20   [desktop(\"anim\", anim)],\n\
