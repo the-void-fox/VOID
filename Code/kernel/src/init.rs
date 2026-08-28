@@ -82,9 +82,13 @@ shell term endpoint:posixfs store:rwx mmio:fb power env
 /// набирая конфиг в редакторе по serial. Выбор по-прежнему за владельцем: `switch gen4`.
 const DEFAULT_GEN4: &str = "\
 # VOID — оконный режим: композитор + терминал окном (Веха 129)
+# Веха 154 — `mmio:fb!` и `power!`: композитор владеет экраном и выключением, но НЕ раздаёт их
+# клиентам. До пометки каждое окно наследовало прямой фреймбуфер (можно рисовать поверх чужих
+# окон и читать их пиксели) и право выключить машину — при том, что рисуют окна в свой shm-буфер,
+# а гасит систему сам wm. Суффикс `!` = «право остаётся у меня, детям не наследуется».
 service posixfs store:rw
 service net-srv dev:net:rw
-shell wm endpoint:posixfs store:rwx mmio:fb power env arg:term
+shell wm endpoint:posixfs store:rwx mmio:fb! power! env arg:term
 ";
 
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.
@@ -255,11 +259,23 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
                 } else {
                     println!("  [init] arg:{} — argv переполнен (пропуск)", a);
                 }
-            } else if let Some(bits) = mint_cap(pid, t, &services) {
-                // Веха 99.1 — запоминаем ИМЯ права вместе с его позицией: ниже они уйдут в
-                // окружение процесса. Позиция сама по себе — плохой контракт (см. ниже).
-                names.push(cap_name(t));
-                caps.push(bits);
+            } else {
+                // Веха 154 — суффикс `!`: право минтуется процессу как обычно, но помечается
+                // «не наследуемым» — дети при spawn'е его не получат (см. `cap::set_noinherit`).
+                // Так `mmio:fb!`/`power!` остаются у композитора, но не текут в каждое окно.
+                let (tok_c, noinherit) = match t.strip_suffix('!') {
+                    Some(base) => (base, true),
+                    None => (t, false),
+                };
+                if let Some(bits) = mint_cap(pid, tok_c, &services) {
+                    if noinherit {
+                        cap::set_noinherit(proc::domain(pid), void_abi::Cap::from_bits(bits as u64));
+                    }
+                    // Веха 99.1 — запоминаем ИМЯ права вместе с его позицией: ниже они уйдут в
+                    // окружение процесса. Позиция сама по себе — плохой контракт (см. ниже).
+                    names.push(cap_name(tok_c));
+                    caps.push(bits);
+                }
             }
         }
         if let Some(&a0) = caps.first() {

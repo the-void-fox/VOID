@@ -113,6 +113,12 @@ struct Slot {
     /// поколением ([`clamp_persisted`]), он не должен давать власть сверх выданной. Свежий минт
     /// этого боута — `false`: он и есть выданное.
     persisted: bool,
+    /// Веха 154 — право остаётся у ЭТОГО процесса, но НЕ наследуется его детьми при spawn'е.
+    /// Тому, кто владеет экраном (`mmio:fb`) или гасит машину (`power`), незачем раздавать это
+    /// всем окнам, которые он открывает: наследование прав — копиями (`proc.rs`), и без пометки
+    /// каждый клиент композитора получал прямой фреймбуфер и выключение впридачу. Не персистится
+    /// (восстановление даёт `false`): пометку заново ставит init из конфига поколения каждый боут.
+    noinherit: bool,
 }
 
 /// Домен защиты: имя + его личное capability-пространство (c-space).
@@ -203,10 +209,11 @@ fn alloc_slot(dom: &mut Domain, entry: Entry) -> Cap {
         if s.entry.is_none() {
             s.entry = Some(entry);
             s.persisted = false; // свежий минт — не наследство прошлой загрузки
+            s.noinherit = false; // Веха 154 — переиспользованный слот наследуется, пока не помечен
             return Cap::new(i as u32, s.generation);
         }
     }
-    dom.slots.push(Slot { generation: 1, entry: Some(entry), persisted: false });
+    dom.slots.push(Slot { generation: 1, entry: Some(entry), persisted: false, noinherit: false });
     Cap::new((dom.slots.len() - 1) as u32, 1)
 }
 
@@ -527,6 +534,27 @@ pub fn revoke_slot(dom: DomainId, slot: usize) -> bool {
     true
 }
 
+/// Веха 154 — пометить право «не наследуемым»: оно остаётся у своего домена, но spawn НЕ
+/// скопирует его детям ([`inheritable`]). Ставит init для `mmio:fb!`/`power!` в конфиге поколения.
+/// Тихо игнорирует несуществующий/протухший слот.
+pub fn set_noinherit(dom: DomainId, cap: Cap) {
+    let mut cs = CSPACE.lock();
+    let Some(d) = cs.domains.get_mut(dom) else { return };
+    let Some(s) = d.slots.get_mut(cap.slot() as usize) else { return };
+    if s.generation == cap.generation() && s.entry.is_some() {
+        s.noinherit = true;
+    }
+}
+
+/// Веха 154 — наследуется ли право ребёнку при spawn'е. `false` — либо помечено `set_noinherit`,
+/// либо слот пуст/протух (наследовать нечего). Читает spawn перед [`endow`] дочернего домена.
+pub fn inheritable(dom: DomainId, cap: Cap) -> bool {
+    let cs = CSPACE.lock();
+    let Some(d) = cs.domains.get(dom) else { return false };
+    let Some(s) = d.slots.get(cap.slot() as usize) else { return false };
+    s.generation == cap.generation() && s.entry.is_some() && !s.noinherit
+}
+
 /// Аттенуация СВОЕЙ копии (Веха 21.1): новый дескриптор в том же домене с правами
 /// `права ∩ mask`. `GRANT` не требуется — урезать то, чем владеешь, безопасно всегда;
 /// `GRANT` контролирует передачу ДРУГИМ (см. [`grant`]). Вместе они дают паттерн
@@ -750,7 +778,9 @@ pub fn load() -> usize {
             // живой процесс не подтвердит его своим наделением ([`clamp_persisted`]). Пустой
             // слот усыновлять нечего.
             let persisted = entry.is_some();
-            slots.push(Slot { generation, entry, persisted });
+            // Веха 154 — пометка «не наследуется» не персистится: её ставит init из конфига
+            // каждый боут (mmio/power — свежий минт этого поколения, не наследство из store).
+            slots.push(Slot { generation, entry, persisted, noinherit: false });
         }
         cs.domains.push(Domain { name, slots });
     }

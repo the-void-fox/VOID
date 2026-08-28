@@ -2169,9 +2169,15 @@ fn syscall(t: &mut Table, cur: usize) {
                                     // под файловую персоналию; stdio он шлёт напрямую в консоль).
                                     let cdom = t.procs[child].domain;
                                     for bits in t.procs[cur].start_caps.clone() {
-                                        if let Ok(c) =
-                                            cap::endow(dom, Cap::from_bits(bits as u64), cdom)
-                                        {
+                                        let pc = Cap::from_bits(bits as u64);
+                                        // Веха 154 — право с пометкой «не наследуется»
+                                        // (`mmio:fb!`/`power!`) остаётся у родителя: композитор
+                                        // держит экран и выключение при себе, а не раздаёт их
+                                        // каждому окну, которое открывает.
+                                        if !cap::inheritable(dom, pc) {
+                                            continue;
+                                        }
+                                        if let Ok(c) = cap::endow(dom, pc, cdom) {
                                             t.procs[child].start_caps.push(c.bits() as usize);
                                         }
                                     }
