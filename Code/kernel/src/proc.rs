@@ -1591,12 +1591,19 @@ fn syscall(t: &mut Table, cur: usize) {
         // Веха 21.1: `a3` — право, передаваемое С ОТВЕТОМ (нужен `GRANT`); клиент получит его
         // дескриптор в a1 своего CALL. Паттерн «сервер-раздатчик»: клиент просит доступ,
         // сервер отвечает УРЕЗАННОЙ копией своего права (CAP_DERIVE → REPLY).
+        //
+        // Веха 155: `a4` — МАСКА прав на передаваемое право (0 — «как есть», как было до вехи).
+        // Без неё «урезанной копии» из абзаца выше не получалось: передача требует `GRANT`, а
+        // копия ехала маской `MAX`, то есть С ЭТИМ ЖЕ `GRANT`. Раздатчик не мог отдать право,
+        // которое нельзя раздать дальше, — а именно так композитор отдаёт диспетчеру обзор
+        // процессов ([[task-manager]]): смотреть и отзывать — да, вручать третьим — нет.
         6 => {
             let (rcap, src, len) = {
                 let f = &t.procs[cur].frame;
                 (f.arg(0), f.arg(1), f.arg(2))
             };
             let scap = t.procs[cur].frame.arg(3); // право в ответе (MAX — нет)
+            let smask = t.procs[cur].frame.arg(4); // маска прав на него (0 — как есть)
             let dom = t.procs[cur].domain;
             // Как в CALL: передаваемое право проверяем до доставки — нет GRANT, нет REPLY.
             if scap != usize::MAX {
@@ -1641,7 +1648,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                 dom,
                                 Cap::from_bits(scap as u64),
                                 t.procs[dest].domain,
-                                Rights(u32::MAX),
+                                if smask == 0 { Rights(u32::MAX) } else { Rights(smask as u32) },
                             ) {
                                 tcap = nc.bits() as usize;
                                 vprintln!(

@@ -483,6 +483,14 @@ pub fn reply_full(reply_cap: usize, buf: &[u8], cap: usize) -> usize {
     abi::syscall(SYS_REPLY, reply_cap, buf.as_ptr() as usize, buf.len(), cap, 0, 0, 0).0
 }
 
+/// Веха 155 — `SYS_REPLY` с передачей УРЕЗАННОЙ копии права: клиент получит `права ∩ mask`.
+/// Само передаваемое право у сервера обязано иметь `GRANT` (иначе ядро отклонит ответ), но
+/// копия уезжает уже без него — если `GRANT` не назван в маске. Так раздатчик отдаёт полномочие,
+/// не отдавая права раздавать его дальше.
+pub fn reply_granting(reply_cap: usize, buf: &[u8], cap: usize, mask: u32) -> usize {
+    abi::syscall(SYS_REPLY, reply_cap, buf.as_ptr() as usize, buf.len(), cap, mask as usize, 0, 0).0
+}
+
 /// `SYS_REPLY` без права — обычный ответ сервера.
 pub fn reply(reply_cap: usize, buf: &[u8]) -> usize {
     reply_full(reply_cap, buf, NO_CAP)
@@ -1195,11 +1203,30 @@ pub fn cap_derive(cap: usize, mask: usize) -> usize {
 
 /// Веха 152.2 — `SYS_CAP_INFO`: описать дескриптор. `None` — недействителен/устарел; иначе
 /// `(вид, права)`. Виды (общий словарь с ядром, `cap::info_kind`): 1 store · 2 root · 3 value ·
-/// 4 endpoint · 5 reply · 6 blk · 7 net · 8 mmio · 9 dma · 10 power · 11 shm · 12 irq. Права —
-/// битовая маска `Rights` (READ 1 · WRITE 2 · EXEC 4 · SEND 8 · GRANT 16). Побочного эффекта нет.
+/// 4 endpoint · 5 reply · 6 blk · 7 net · 8 mmio · 9 dma · 10 power · 11 shm · 12 irq ·
+/// 13 sysview. Права — битовая маска [`abi::Rights`] (READ 1 · WRITE 2 · GRANT 4 · SEND 8 ·
+/// EXEC 16). Побочного эффекта нет.
 pub fn cap_info(cap: usize) -> Option<(u8, u32)> {
     let r = abi::syscall(SYS_CAP_INFO, cap, 0, 0, 0, 0, 0, 0).0;
     (r != NO_CAP).then(|| ((r >> 16) as u8, (r & 0xffff) as u32))
+}
+
+/// Веха 155 — найти среди СТАРТОВЫХ прав первое право нужного ВИДА (`cap_info`): `(дескриптор,
+/// права)` или `None`. Ищут так те, кому важно ЧТО у них есть, а не в каком порядке это выдал
+/// конфиг: имя в окружении объявляют не всякому праву, а порядок в конфиге — дело владельца.
+pub fn start_cap_of_kind(kind: u8) -> Option<(usize, u32)> {
+    for i in 0..16 {
+        let c = start_cap(i);
+        if c == NO_CAP {
+            break;
+        }
+        if let Some((k, rights)) = cap_info(c) {
+            if k == kind {
+                return Some((c, rights));
+            }
+        }
+    }
+    None
 }
 
 /// `SYS_MAP`: лениво зарезервировать `len` байт кучи (роль mmap/sbrk). Физические страницы

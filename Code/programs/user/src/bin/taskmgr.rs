@@ -239,6 +239,14 @@ impl App {
     /// Нарисовать кадр. `true` — состояние изменилось прямо в кадре (клик), нужен ещё проход.
     fn paint(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) -> bool {
         u.background(th.bg);
+        // Веха 155 — права нет: сказать это ВСЛУХ. Пустые вкладки на месте списка процессов —
+        // худший из возможных ответов: они выглядят как «ничего не работает», хотя означают
+        // «мне не дано смотреть». Разница здесь принципиальная: у VOID отсутствие права — не
+        // сбой, а нормальное состояние, и объяснить его должен тот, кто в него упёрся.
+        if self.sysview == sys::NO_CAP {
+            self.paint_denied(u, th, lay);
+            return false;
+        }
         let mut dirty = false;
 
         // ── вкладки ───────────────────────────────────────────────────────────────────────
@@ -319,6 +327,47 @@ impl App {
         dirty
     }
 
+    /// Веха 155 — окно без права обзора: что именно не дано и чем это выдаётся.
+    fn paint_denied(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) {
+        let font_h = u.font.line_h();
+        let mut all = Rect::new(0, 0, self.w, self.h).inset(th.pad);
+        all.cut_top(lay.tabs.h + th.gap);
+        let inner = u.card(all);
+        let mut d = inner.inset(th.pad);
+        u.label(d.cut_top(font_h + th.px(6)), "нет права обзора процессов", th.text, Align::Left);
+        u.hsep(d.cut_top(th.px(6)));
+        d.cut_top(th.px(4));
+        // Строки КОРОТКИЕ намеренно: ширину окна назначает композитор (колонка ленты), и текст,
+        // сверстанный под 820 точек запроса, обрезался бы многоточием ровно там, где важное.
+        // Кавычек-ёлочек здесь нет намеренно: в шрифте оболочки их глифов нет, и на экране они
+        // выходят посторонними буквами (проверено — «все» читалось как «овсе»).
+        for line in [
+            "Диспетчер показывает не всю систему,",
+            "а ровно то, что выдано ему самому.",
+            "Права `sysview` у него нет — поэтому",
+            "списки пусты. Это не значит, что",
+            "никого нет: это значит, что смотреть",
+            "не дано.",
+            "",
+            "Выдать — в конфиге поколения:",
+            "  shell wm … sysview:rwg!",
+            "     право обзора композитору,",
+            "     детям НЕ наследуется",
+            "  desktop sysview taskmgr",
+            "     кому он отдаёт его по просьбе",
+            "",
+            "Затем `rebuild` и перезагрузка.",
+            "Без второй строки не отдаст никому —",
+            "это правильное состояние по умолчанию.",
+        ] {
+            if d.h < font_h {
+                break;
+            }
+            let col = if line.starts_with("  ") { th.accent } else { th.muted };
+            u.label(d.cut_top(font_h + th.px(2)), line, col, Align::Left);
+        }
+    }
+
     /// Правая половина: content-id, происхождение, счётчики и граф прав с кнопками отзыва.
     fn paint_detail(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) -> bool {
         let font_h = u.font.line_h();
@@ -368,6 +417,29 @@ impl App {
         u.hsep(d.cut_top(th.px(6)));
         d.cut_top(th.px(2));
         u.label(d.cut_top(font_h), "права (граф эндпоинтов):", th.muted, Align::Left);
+
+        // Веха 155 — сказать вслух, что таблица прав ОБЩАЯ. Ядро заводит c-space по ИМЕНИ
+        // программы (`cap::create_domain`), поэтому два экземпляра одного диспетчера смотрят в
+        // одну таблицу: ниже будут и чужие права, а «отнять» отберёт их у обоих сразу. Молчать
+        // об этом нельзя — вся ценность этого окна в том, что показанное соответствует правде.
+        let twins: Vec<u16> =
+            self.procs.iter().filter(|p| p.name == name && p.pid != pid).map(|p| p.pid).collect();
+        if !twins.is_empty() {
+            let mut s = String::from("общая таблица с ");
+            for (k, t) in twins.iter().enumerate() {
+                if k > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&alloc::format!("P{}", t));
+            }
+            u.label(d.cut_top(font_h), &s, th.accent, Align::Left);
+            u.label(
+                d.cut_top(font_h + th.px(2)),
+                "(c-space заводится по имени)",
+                th.muted,
+                Align::Left,
+            );
+        }
 
         let mut acted: Option<u16> = None; // слот, у которого нажали «отнять»
         let btn_w = th.px(96);
@@ -516,20 +588,21 @@ fn hex64(id: &[u8; 32]) -> String {
     s
 }
 
-/// Найти своё право обзора среди стартовых по ВИДУ (Sysview = 13) и его права.
+/// Найти своё право обзора: сперва среди СТАРТОВЫХ по ВИДУ (Sysview = 13), а если его там нет —
+/// попросить у композитора (Веха 155). Возвращает `(дескриптор, можно ли отзывать)`.
+///
+/// Два источника, потому что диспетчер запускают двумя способами. Из конфига поколения
+/// (`shell taskmgr sysview:rw …`) право приезжает стартовым — как у любого сервиса. Но обычно
+/// его открывают из меню, то есть спавнит его композитор, а ребёнок получает копию прав РОДИТЕЛЯ:
+/// выдать право так значило бы выдать его каждому окну разом. Поэтому в оконном режиме право
+/// у композитора помечено «не наследуется» (Веха 154), а диспетчер просит его отдельно — и
+/// получает, если конфиг поколения назвал диспетчер по имени (`desktop sysview taskmgr`).
 fn find_sysview() -> (usize, bool) {
-    let mut i = 0;
-    while i < 16 {
-        let c = sys::start_cap(i);
-        if c == sys::NO_CAP {
-            break;
-        }
-        if let Some((13, rights)) = sys::cap_info(c) {
-            return (c, rights & 0x02 != 0); // WRITE
-        }
-        i += 1;
+    if let Some((c, rights)) = sys::start_cap_of_kind(13) {
+        return (c, rights & 0x02 != 0); // WRITE — можно отзывать
     }
-    (sys::NO_CAP, false)
+    let c = sys::win::grant(13);
+    (c, sys::cap_info(c).is_some_and(|(_, r)| r & 0x02 != 0))
 }
 
 impl ui::Client for App {
@@ -587,9 +660,10 @@ impl ui::Client for App {
         Some(String::from(if self.tab_system { "taskmgr" } else { "taskmgr user" }))
     }
 
-    /// Обновляемся дважды в секунду: счётчики IPC и список процессов живые.
+    /// Обновляемся дважды в секунду: счётчики IPC и список процессов живые. Без права смотреть
+    /// не на что — тогда и будильник не заводим: спящее окно не должно будить систему впустую.
     fn wake(&mut self) -> Option<u32> {
-        Some(500)
+        (self.sysview != sys::NO_CAP).then_some(500)
     }
 
     fn tick(&mut self) -> ui::Scope {
@@ -615,7 +689,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     let (sysview, can_write) = find_sysview();
     if sysview == sys::NO_CAP {
-        say("taskmgr: нет права обзора (sysview) — диспетчеру не выдано право видеть процессы\n");
+        say("taskmgr: нет права обзора (sysview) — ни в старте, ни от композитора\n");
+        say("taskmgr: выдаётся строкой `desktop sysview taskmgr` в конфиге поколения\n");
     }
 
     let (w, h) = (820u16, 560u16);
