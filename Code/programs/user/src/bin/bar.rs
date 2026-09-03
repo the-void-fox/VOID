@@ -117,6 +117,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Кто эта машина — вслух, по той же причине, что и шрифт: «почему в меню написано VOID, а не
     // моё имя» — вопрос, ответ на который панель знает, а человек нет.
     say(&alloc::format!(
+        "bar: раскладка {} — слева: {} · середина: {} · справа: {}\n",
+        if bar.from_conf { "из bar.vv" } else { "по умолчанию (в конфиге нет строк bar)" },
+        slot_names(&bar.left),
+        slot_names(&bar.center),
+        slot_names(&bar.right),
+    ));
+    say(&alloc::format!(
         "bar: устройство «{}», аватар {}\n",
         bar.device,
         bar.avatar_root.as_deref().unwrap_or("не задан (знак системы в кружке)"),
@@ -295,7 +302,15 @@ struct Bar {
     /// Где курсор в координатах поверхности. `None` — не над ней.
     ptr: Option<(i32, i32)>,
     /// Острова прошлого кадра.
-    isles: [Isle; 6],
+    isles: [Isle; SLOTS + 1],
+    /// Веха 160 — раскладка ряда из `bar.vv`: что стоит слева, посередине и справа.
+    left: Vec<Slot>,
+    center: Vec<Slot>,
+    right: Vec<Slot>,
+    /// Раскладка пришла ИЗ КОНФИГА, а не подставлена умолчанием. Разница видна только в
+    /// журнале — на экране «как в bar.vv» и «как по умолчанию» выглядят одинаково, пока их
+    /// не развели, и отличить одно от другого снаружи нечем.
+    from_conf: bool,
     /// Веха 159 — право обзора МАШИНЫ (`desktop sysview bar`), последний замер и то, что
     /// из него показано. `NO_CAP` — права не дали: остров метрик тогда не рождается вовсе.
     ///
@@ -332,9 +347,6 @@ struct Bar {
     av_px: u32,
     /// Сколько корней в store и полностью ли влез список (иначе «37+»).
     roots: (u32, bool),
-    /// Место переключателя раскладки в панели — оно известно только тому кадру, который его
-    /// нарисовал, а подсветка нужна следующему.
-    lang_at: Rect,
     /// Что решил последний кадр.
     go: Option<u8>,
     flip: bool,
@@ -347,18 +359,111 @@ struct Bar {
     mo: Motion,
 }
 
-/// Индексы островов в [`Bar::isles`].
-const I_CLOCK: usize = 0;
-const I_METRIC: usize = 1;
-const I_SPACES: usize = 2;
-const I_TITLE: usize = 3;
-const I_SYS: usize = 4;
-const I_CARD: usize = 5;
+/// Веха 160 — ОСТРОВ ПАНЕЛИ как выбор человека: что стоит и в каком порядке, решает `bar.vv`
+/// (строки `bar группа остров`). До этой вехи порядок был зашит в код, и «убрать часы» или
+/// «переставить столы вправо» стоило пересборки системы.
+///
+/// Числа этого перечисления — индексы в [`Bar::isles`]: остров сравнивает свою подпись с
+/// прошлым кадром по нему, и вторая таблица «кто под каким номером» была бы обязана совпадать
+/// с этой (на таких вторых таблицах панель уже стояла — см. `pills` до тулкита).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slot {
+    Clock = 0,
+    Lang = 1,
+    Metrics = 2,
+    Spaces = 3,
+    Title = 4,
+    Gen = 5,
+}
+
+/// Сколько всего островов знает панель. Карточка меню идёт следом отдельным индексом: она не
+/// остров ряда — её нельзя ни переставить, ни убрать, она принадлежит кнопке поколения.
+const SLOTS: usize = 6;
+
+impl Slot {
+    fn parse(s: &str) -> Option<Slot> {
+        Some(match s {
+            "clock" => Slot::Clock,
+            "lang" => Slot::Lang,
+            "metrics" => Slot::Metrics,
+            "spaces" => Slot::Spaces,
+            "title" => Slot::Title,
+            "gen" => Slot::Gen,
+            _ => return None,
+        })
+    }
+    fn at(self) -> usize {
+        self as usize
+    }
+}
+
+/// Раскладка панели из конфига поколения.
+///
+/// Конфиг БЕЗ единой строки `bar` — это поколение старше Вехи 160: там раскладку никто не
+/// выбирал, и брать её пустой значило бы стереть панель после обновления системы. Поэтому
+/// умолчание применяется ко всем трём группам сразу, а не к каждой по отдельности: пустая
+/// группа в новом конфиге — законный выбор («часов мне не надо»), и путать её с «не сказано»
+/// нельзя.
+fn layout_from(text: &str) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>, bool) {
+    let mut any = false;
+    let (mut l, mut c, mut r) = (Vec::new(), Vec::new(), Vec::new());
+    for e in void_conf::of(text, "bar") {
+        any = true;
+        let Some(slot) = Slot::parse(e.tail().trim()) else { continue };
+        let group = match e.key() {
+            "left" => &mut l,
+            "center" => &mut c,
+            "right" => &mut r,
+            _ => continue,
+        };
+        // Один остров дважды — это опечатка, и второй его экземпляр нарисовался бы поверх
+        // первого своим же прямоугольником: у острова одна запись в таблице подписей.
+        if !group.contains(&slot) {
+            group.push(slot);
+        }
+    }
+    if any {
+        (l, c, r, true)
+    } else {
+        (
+            alloc::vec![Slot::Clock, Slot::Lang, Slot::Metrics, Slot::Spaces],
+            alloc::vec![Slot::Title],
+            alloc::vec![Slot::Gen],
+            false,
+        )
+    }
+}
+
+/// Имена островов группы через пробел — для журнала. Пустая группа так и говорит: «пусто».
+fn slot_names(v: &[Slot]) -> String {
+    if v.is_empty() {
+        return String::from("пусто");
+    }
+    let mut s = String::new();
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(match x {
+            Slot::Clock => "clock",
+            Slot::Lang => "lang",
+            Slot::Metrics => "metrics",
+            Slot::Spaces => "spaces",
+            Slot::Title => "title",
+            Slot::Gen => "gen",
+        });
+    }
+    s
+}
+
+/// Карточка меню в [`Bar::isles`] — сразу за островами ряда.
+const I_CARD: usize = SLOTS;
 
 impl Bar {
     fn new(th: &Theme, line_h: i32, sw: i32, sh: i32, anim_ms: u64, gen_text: &str) -> Bar {
         // Имя устройства из конфига; без него — «VOID». Пустым его оставлять нельзя: шапка меню
         // без единого слова выглядит недорисованной.
+        let (left, center, right, from_conf) = layout_from(gen_text);
         let named = ui::conf::device(gen_text, "name");
         let device = named.clone().unwrap_or_else(|| "VOID".to_string());
         let avatar = ui::conf::device(gen_text, "avatar");
@@ -383,7 +488,11 @@ impl Bar {
             title: String::new(),
             shown: String::new(),
             ptr: None,
-            isles: [Isle::default(); 6],
+            isles: [Isle::default(); SLOTS + 1],
+            left,
+            center,
+            right,
+            from_conf,
             sysview: sys::NO_CAP,
             prev: sys::SysInfo::default(),
             cpu: 0,
@@ -401,7 +510,6 @@ impl Bar {
             // Кружок в две строки высотой минус поле — тот же расчёт, что у шапки карточки.
             av_px: (2 * (line_h + th.px(6)) - 2 * th.px(2)).max(8) as u32,
             roots: (0, true),
-            lang_at: Rect::ZERO,
             go: None,
             flip: false,
             toggle: false,
@@ -413,7 +521,7 @@ impl Bar {
 
     /// Забыть нарисованное: следующий кадр перерисует всё (смена размера поверхности).
     fn forget(&mut self) {
-        self.isles = [Isle::default(); 6];
+        self.isles = [Isle::default(); SLOTS + 1];
         self.fresh = true;
     }
 
@@ -552,33 +660,87 @@ impl Bar {
             spaces_w += pw;
             widths.push((label, pw));
         }
-        // Кнопка меню — самая правая: это «начало» оболочки, и звать её надо там, где рука её
-        // ищет. Надпись — имя поколения: система называет себя тем, чем она сейчас является.
-        let sys_w = u.font.width(&self.gen) + 2 * th.pad;
-        let s_isle = Rect::new(w - margin - sys_w, margin, sys_w, isle_h);
-
-        // Веха 158.3 — ЛЕВАЯ ГРУППА по макету: время и дата, метрики, столы. До этого часы жили
-        // справа, а слева были только столы; в макете справа не остаётся ничего, кроме кнопки
-        // поколения, и это правильнее по руке: время читают, а к меню тянутся.
-        let lang_w = u.font.width(lang) + th.px(12);
+        // ── ширины островов ────────────────────────────────────────────────────────────────
+        //
+        // Ширина НОЛЬ значит «острова нет»: заголовка при пустом окне, метрик без права обзора.
+        // Это не то же самое, что не назвать остров в конфиге, — там его нет по воле человека,
+        // здесь ему нечего показать сейчас.
+        let lang_w = u.font.width(lang) + 2 * th.pad;
         let clock_w = u.font.width(&clock);
         let date_w = u.font.width(&date);
-        let r_w = 2 * th.pad + clock_w + th.px(6) + date_w + th.px(8) + th.line + th.px(8) + lang_w;
-        let r_isle = Rect::new(margin, margin, r_w, isle_h);
-
-        // Веха 159 — МЕТРИКИ. Острова нет вовсе, если нет права обзора: пустая рамка или
-        // прочерки обещали бы числа, которых не будет.
         let ico = isle_h - 2 * th.px(5);
         let num_w = u.font.width("100%");
-        let m_isle = if self.sysview == sys::NO_CAP {
-            Rect::ZERO
-        } else {
-            let mw = 2 * th.pad + 2 * (ico + th.px(4) + num_w) + th.px(10);
-            Rect::new(r_isle.right() + margin, margin, mw, isle_h)
+        let title_w = u.font.width(&self.shown) + 2 * th.pad;
+        let gen_w = u.font.width(&self.gen) + 2 * th.pad;
+        // Все ширины сняты со шрифта ЗАРАНЕЕ: измерение строки просит шрифт изменяемо (глиф
+        // может лечь в кэш), а замыкание, которое так делает, нельзя звать из `map`.
+        let width = |s: Slot| -> i32 {
+            match s {
+                Slot::Clock => 2 * th.pad + clock_w + th.px(6) + date_w,
+                Slot::Lang => lang_w,
+                // Веха 159 — метрик нет вовсе без права обзора: прочерк обещал бы число,
+                // которого не будет, а пустое место не обещает ничего.
+                Slot::Metrics if self.sysview == sys::NO_CAP => 0,
+                Slot::Metrics => 2 * th.pad + 2 * (ico + th.px(4) + num_w) + th.px(10),
+                Slot::Spaces => spaces_w,
+                Slot::Title if self.shown.is_empty() => 0,
+                Slot::Title => title_w,
+                Slot::Gen => gen_w,
+            }
         };
 
-        let sp_x = if m_isle.is_empty() { r_isle.right() } else { m_isle.right() } + margin;
-        let l_isle = Rect::new(sp_x, margin, spaces_w, isle_h);
+        // ── расстановка: слева направо, справа налево, остаток — середине ──────────────────
+        let mut at = [Rect::ZERO; SLOTS];
+        let mut x = margin;
+        for &s in &self.left {
+            let iw = width(s);
+            if iw <= 0 {
+                continue;
+            }
+            at[s.at()] = Rect::new(x, margin, iw, isle_h);
+            x += iw + margin;
+        }
+        let left_end = x - margin;
+        let mut xr = w - margin;
+        for &s in self.right.iter().rev() {
+            let iw = width(s);
+            if iw <= 0 {
+                continue;
+            }
+            xr -= iw;
+            at[s.at()] = Rect::new(xr, margin, iw, isle_h);
+            xr -= margin;
+        }
+        let right_start = xr + margin;
+
+        // Середина живёт ОСТАТКОМ. Ужимается при этом только заголовок: он один умеет быть
+        // любой длины, и резать вместо него часы значило бы получить «19:4» на узком экране.
+        let room = right_start - left_end - 2 * margin;
+        let mut mid: Vec<(Slot, i32)> = self.center.iter().map(|&s| (s, width(s))).collect();
+        mid.retain(|&(_, iw)| iw > 0);
+        let gaps = margin * (mid.len() as i32 - 1).max(0);
+        let mut total: i32 = mid.iter().map(|&(_, iw)| iw).sum::<i32>() + gaps;
+        if total > room {
+            if let Some(t) = mid.iter_mut().find(|(s, _)| *s == Slot::Title) {
+                t.1 = (t.1 - (total - room)).max(0);
+                total = mid.iter().map(|&(_, iw)| iw).sum::<i32>() + gaps;
+            }
+        }
+        if total > 0 && room >= th.px(60) && total <= room {
+            let mut cx = ((w - total) / 2).clamp(left_end + margin, right_start - margin - total);
+            for (s, iw) in mid {
+                at[s.at()] = Rect::new(cx, margin, iw, isle_h);
+                cx += iw + margin;
+            }
+        }
+        let (r_isle, m_isle, l_isle, s_isle) = (
+            at[Slot::Clock.at()],
+            at[Slot::Metrics.at()],
+            at[Slot::Spaces.at()],
+            at[Slot::Gen.at()],
+        );
+        let lang_isle = at[Slot::Lang.at()];
+        let t_isle = at[Slot::Title.at()];
 
         // Заголовок меняется в ДВА ТАКТА: старый гаснет, подменяется и загорается новый. Смена
         // текста на полной яркости читается как рывок — рядом с едущим окном это особенно заметно.
@@ -589,16 +751,6 @@ impl Bar {
         let fading = !self.shown.is_empty() && self.shown != self.title;
         let title_a = self.mo.val(A_TITLE, if fading { 0 } else { 256 }).clamp(0, 256) as u32;
 
-        // Заголовок посередине — тем местом, что осталось между островами. Пустой заголовок
-        // острова не рождает: пустая карточка посреди панели выглядела бы поломкой.
-        let room = s_isle.x - l_isle.right() - 2 * margin;
-        let t_isle = if self.shown.is_empty() || room < th.px(60) {
-            Rect::ZERO
-        } else {
-            let tw = (u.font.width(&self.shown) + 2 * th.pad).min(room);
-            let x = ((w - tw) / 2).clamp(l_isle.right() + margin, s_isle.x - margin - tw);
-            Rect::new(x, margin, tw, isle_h)
-        };
 
         // ── движение ───────────────────────────────────────────────────────────────────────
         let mut pills = Vec::with_capacity(widths.len());
@@ -626,8 +778,7 @@ impl Bar {
             .enumerate()
             .map(|(i, r)| self.mo.val(A_PILL + i as u32, if hot(*r) { 256 } else { 0 }) as u32)
             .collect();
-        let lang_r = self.lang_at;
-        let lang_hot = self.mo.val(A_LANG, if hot(lang_r) { 256 } else { 0 }) as u32;
+        let lang_hot = self.mo.val(A_LANG, if hot(lang_isle) { 256 } else { 0 }) as u32;
         let sys_hot = self.mo.val(A_SYS, if hot(s_isle) { 256 } else { 0 }) as u32;
 
         // ── карточка меню ──────────────────────────────────────────────────────────────────
@@ -641,16 +792,12 @@ impl Bar {
         let uptime = uptime_text();
 
         // ── что перерисовывать ─────────────────────────────────────────────────────────────
+        // Порядок в таблице — порядок [`Slot`], а не порядок на экране: подпись сравнивается
+        // с прошлым кадром по индексу острова, и переставленный конфигом остров обязан
+        // сравниваться сам с собой, а не с соседом.
         let want = [
-            Isle {
-                rect: r_isle,
-                sig: sig(&[
-                    self.layout as u64,
-                    sig_str(&clock),
-                    sig_str(&date),
-                    lang_hot as u64,
-                ]),
-            },
+            Isle { rect: r_isle, sig: sig(&[sig_str(&clock), sig_str(&date)]) },
+            Isle { rect: lang_isle, sig: sig(&[self.layout as u64, lang_hot as u64]) },
             Isle { rect: m_isle, sig: sig(&[self.cpu as u64, self.ram as u64]) },
             Isle {
                 rect: l_isle,
@@ -682,7 +829,7 @@ impl Bar {
         // Клик всегда рисует всё: он меняет и то, что под курсором, и то, что было активным, —
         // а «что именно» знает уже сам виджет, а не эта таблица.
         let all = click.is_some();
-        let redraw: [bool; 6] = core::array::from_fn(|i| all || want[i] != self.isles[i]);
+        let redraw: [bool; SLOTS + 1] = core::array::from_fn(|i| all || want[i] != self.isles[i]);
         if !redraw.iter().any(|&x| x) {
             return;
         }
@@ -697,14 +844,14 @@ impl Bar {
             // целиком на каждое тиканье часов значило бы трогать весь ряд ради двух цифр.
             u.panel(w, self.strip);
         } else {
-            for i in I_CLOCK..I_CARD {
+            for i in 0..I_CARD {
                 if redraw[i] {
                     u.wipe(self.isles[i].rect.union(want[i].rect));
                 }
             }
         }
 
-        if redraw[I_SPACES] {
+        if redraw[Slot::Spaces.at()] && !l_isle.is_empty() {
             u.island(l_isle);
             // Капсула — ОДНА на ряд и едет; пилюли только подписывают её собой.
             u.indicator(ind, ind.h / 2);
@@ -720,31 +867,32 @@ impl Bar {
             }
         }
 
-        if redraw[I_TITLE] && !t_isle.is_empty() {
+        if redraw[Slot::Title.at()] && !t_isle.is_empty() {
             u.fade(title_a);
             let inner = u.island(t_isle);
             u.label(inner, &self.shown, th.text, Align::Center);
             u.fade(256);
         }
 
-        if redraw[I_CLOCK] {
-            // Порядок по макету: сперва время, потом дата приглушённой. Раскладка — за
-            // разделителем в хвосте острова: её переключают редко, а смотрят на часы.
+        if redraw[Slot::Clock.at()] && !r_isle.is_empty() {
+            // Порядок по макету: сперва время, потом дата приглушённой.
             let mut inner = u.island(r_isle);
             u.label(inner.cut_left(clock_w), &clock, th.text, Align::Left);
             inner.cut_left(th.px(6));
-            u.label(inner.cut_left(date_w), &date, th.muted, Align::Left);
-            inner.cut_left(th.px(8));
-            u.sep(inner.cut_left(th.line).inset_xy(0, th.px(5)));
-            inner.cut_left(th.px(8));
-            let lang_at = inner;
-            if u.button(lang_at, lang, lang_hot) {
-                self.flip = true;
-            }
-            self.lang_at = lang_at;
+            u.label(inner, &date, th.muted, Align::Left);
         }
 
-        if redraw[I_METRIC] && !m_isle.is_empty() {
+        if redraw[Slot::Lang.at()] && !lang_isle.is_empty() {
+            // Раскладка — свой остров (Веха 160): её можно переставить или убрать, не трогая
+            // часы. В макете её нет вовсе, но клавиатура двуязычная, и молча терять переключение
+            // ради точности картинки — плохой размен.
+            let inner = u.island(lang_isle);
+            if u.button(inner, lang, lang_hot) | u.clicked(lang_isle) {
+                self.flip = true;
+            }
+        }
+
+        if redraw[Slot::Metrics.at()] && !m_isle.is_empty() {
             let mut inner = u.island(m_isle);
             let iy = m_isle.y + (isle_h - ico) / 2;
             for (art, val) in [(ui::icon::CPU, self.cpu), (ui::icon::RAM, self.ram)] {
@@ -757,7 +905,7 @@ impl Bar {
             }
         }
 
-        if redraw[I_SYS] {
+        if redraw[Slot::Gen.at()] && !s_isle.is_empty() {
             let inner = u.island(s_isle);
             // Нажимается ВЕСЬ остров, а не только надпись: целиться в четыре буквы, когда рядом
             // есть очевидная карточка, — это заставлять человека мериться с пикселями.

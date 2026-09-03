@@ -447,6 +447,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("bind", b_bind),
     ("desktop", b_desktop),
     ("ui", b_ui),
+    ("bar", b_bar),
     ("device", b_device),
     ("packages", b_packages),
     ("channel", b_channel),
@@ -663,6 +664,17 @@ fn b_desktop(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("desktop", args)
 }
 
+/// `(bar группа остров)` — РАСКЛАДКА ПАНЕЛИ (Веха 160), читает `bar`: по строке на остров,
+/// порядок строк внутри группы и есть порядок слева направо.
+///
+/// Отдельный вид, а не `desktop`, по тому же правилу, по которому `ui` отделён от `desktop`:
+/// `desktop bar on` решает, ЕСТЬ ли панель (это дело композитора — он отводит ей место), а
+/// `bar left clock` — какая она (это дело самой панели). Свалить их в одну запись значило бы,
+/// что композитор обязан молча пропускать строки не про него.
+fn b_bar(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("bar", args)
+}
+
 /// `(ui ключ значение)` — вид оболочки (Веха 144), читает тулкит `void-ui`: цвета, скругление,
 /// отступы, кегль, масштаб и имя файла шрифта.
 ///
@@ -746,12 +758,12 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
-/// `desktop` — композитор, `ui` — тулкит оболочки, `device` — «кто эта машина»,
+/// `desktop` — композитор, `ui` — тулкит оболочки, `bar` — панель, `device` — «кто эта машина»,
 /// `packages`/`channel` — `pkg`: конфиг поколения один, читателей несколько, и каждый берёт
 /// свои строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
             "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
-                | "packages" | "channel"))
+                | "packages" | "channel" | "bar"))
 }

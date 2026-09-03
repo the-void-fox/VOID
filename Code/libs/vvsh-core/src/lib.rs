@@ -54,6 +54,44 @@ mod tests {
         eval_program(&forms).expect("вычисление")
     }
 
+    /// Веха 160 — РАСКЛАДКА ПАНЕЛИ доезжает до конфига: `bar.vv` пишется списками, а на выходе
+    /// обязаны быть строки `bar группа остров` в том же порядке. Проверка на хосте, потому что
+    /// на живой системе «панель выглядит как раньше» означает и «конфиг применился», и «конфиг
+    /// не применился, сработало умолчание» — эти два случая снаружи не различить.
+    #[test]
+    fn bar_layout_reaches_config() {
+        let src = "\
+left = [\"clock\", \"metrics\"]
+center = [\"title\"]
+right = [\"gen\"]
+system(
+  append(
+    map(|i| bar(\"left\", i), left),
+    map(|i| bar(\"center\", i), center),
+    map(|i| bar(\"right\", i), right),
+  )
+)";
+        assert_eq!(
+            build_config(src).expect("конфиг"),
+            "bar left clock\nbar left metrics\nbar center title\nbar right gen\n"
+        );
+    }
+
+    /// Пустая группа — законный выбор, а не ошибка: панель без часов это по-прежнему панель.
+    #[test]
+    fn bar_layout_may_be_empty() {
+        let src = "system(map(|i| bar(\"left\", i), []))";
+        assert_eq!(build_config(src).expect("конфиг"), "");
+    }
+
+    /// Число полей у `bar` проверяет СЛОВАРЬ видов: опечатка обязана падать на `rebuild`,
+    /// а не пропадать молча в загруженной системе.
+    #[test]
+    fn bar_wants_two_fields() {
+        assert!(build_config("system([bar(\"left\")])").is_err());
+        assert!(build_config("system([bar(\"left\", \"clock\", \"lang\")])").is_err());
+    }
+
     #[test]
     fn arithmetic() {
         assert_eq!(eval_str("1 + 2 + 3"), Value::Int(6));

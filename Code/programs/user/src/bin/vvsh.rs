@@ -259,11 +259,12 @@ fn run_init_config() {
     // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` (1.5 КиБ) однажды доехал
     // наполовину и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не
     // бывало; виноватым тогда выглядел конфиг, а не запись.
-    let files: [(&[u8], &str); 6] = [
+    let files: [(&[u8], &str); 7] = [
         (b"/etc/system/net.vv", NET_VV),
         (b"/etc/system/services.vv", SERVICES_VV),
         (b"/etc/system/networking.vv", NETWORKING_VV),
         (b"/etc/system/terminal.vv", TERMINAL_VV),
+        (b"/etc/system/bar.vv", BAR_VV),
         (b"/etc/system/packages.vv", PACKAGES_VV),
         (DEFAULT_PATH, DEFAULT_VV),
     ];
@@ -282,7 +283,8 @@ fn run_init_config() {
     }
     sys::write(
         "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (true/false),\n\
-         terminal.vv (режим экрана, клавиши), packages.vv (пакеты) → `rebuild`.\n\
+         terminal.vv (режим экрана, клавиши), bar.vv (что в панели), packages.vv (пакеты)\n\
+         → `rebuild`.\n\
          Править — редактором: `ved /etc/system/terminal.vv` (^S сохранить, ^Q выход).\n"
             .as_bytes(),
     );
@@ -2310,6 +2312,35 @@ if mode == \"wm\" {\n\
 /// обязана его иметь»: `rebuild` соберёт его в поколение профиля, а откат системы уберёт вместе
 /// с поколением. `pkg install` при этом никуда не девается — это по-прежнему способ поставить
 /// что-то разово, не объявляя.
+const BAR_VV: &str = "# bar.vv — ЧТО СТОИТ В ПАНЕЛИ и в каком порядке (Веха 160).\n\
+#\n\
+# Три группы: `left` прижата к левому краю, `right` — к правому, `center` живёт посередине тем\n\
+# местом, что осталось между ними. Порядок в списке — порядок слева направо.\n\
+#\n\
+# Острова:\n\
+#   clock   — время и дата (UTC: часовых поясов в VOID нет, а врать про местное хуже)\n\
+#   lang    — раскладка клавиатуры, нажатие переключает\n\
+#   metrics — загрузка процессора и занятая память (Веха 159). Нужно право обзора:\n\
+#             строка `sysview` в terminal.vv должна называть `bar`, иначе острова не будет\n\
+#   spaces  — рабочие столы, нажатие переключает\n\
+#   title   — заголовок окна в фокусе\n\
+#   gen     — имя поколения, нажатие открывает меню оболочки\n\
+#\n\
+# Убрать остров — вычеркнуть из списка. Пустая группа — законна: панель без часов и без столов\n\
+# это по-прежнему панель. Незнакомое имя пропускается, но `rebuild` о нём скажет.\n\
+#\n\
+# Сама панель включается не здесь, а строкой `bar = true` в terminal.vv: там решают, ЕСТЬ ли\n\
+# она, а здесь — какая.\n\
+left = [\"clock\", \"lang\", \"metrics\", \"spaces\"]\n\
+center = [\"title\"]\n\
+right = [\"gen\"]\n\
+\n\
+append(\n\
+\x20 map(|i| bar(\"left\", i), left),\n\
+\x20 map(|i| bar(\"center\", i), center),\n\
+\x20 map(|i| bar(\"right\", i), right),\n\
+)\n";
+
 const PACKAGES_VV: &str = "# packages.vv — пакеты, которые система обязана иметь, и канал, откуда\n\
 # они берутся.\n\
 #\n\
@@ -2330,12 +2361,13 @@ append(\n\
 
 const DEFAULT_VV: &str = "# default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
 # Собери систему из модулей: сеть — net.vv (true/false), терминал и его клавиши — terminal.vv,\n\
-# пакеты — packages.vv.\n\
+# раскладка панели — bar.vv, пакеты — packages.vv.\n\
 # Затем: run vvsh rebuild\n\
 net = import(\"net.vv\")\n\
 system(\n\
 \x20 import(\"services.vv\"),\n\
 \x20 if net { import(\"networking.vv\") } else { [] },\n\
 \x20 import(\"terminal.vv\"),\n\
+\x20 import(\"bar.vv\"),\n\
 \x20 import(\"packages.vv\"),\n\
 )\n";
