@@ -119,15 +119,16 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     say(&alloc::format!(
         "bar: устройство «{}», аватар {}\n",
         bar.device,
-        bar.avatar_root.as_deref().unwrap_or("не задан (буква в кружке)"),
+        bar.avatar_root.as_deref().unwrap_or("не задан (знак системы в кружке)"),
     ));
 
     let spec = win::Layer {
         layer: win::LAYER_TOP,
         anchor: win::ANCHOR_TOP | win::ANCHOR_LEFT | win::ANCHOR_RIGHT,
-        // Занятая зона равна высоте ПАНЕЛИ и больше не меняется никогда: меню растит поверхность,
-        // но не зону — иначе окна разъезжались бы на каждое открытие меню.
-        exclusive: bar.h as u16,
+        // Занятая зона равна ПОЛОСЕ панели и больше не меняется никогда: меню растит поверхность,
+        // но не зону — иначе окна разъезжались бы на каждое открытие меню. Вогнутые уголки под
+        // полосой тоже места не занимают: они ЛОЖАТСЯ на верхние углы стола, в этом их смысл.
+        exclusive: bar.strip as u16,
         // Веха 144 — острова скруглены, значит углы у них прозрачные. Без этого флага композитор
         // скопировал бы кадр как есть и нарисовал вокруг островов чёрный прямоугольник.
         alpha: true,
@@ -253,6 +254,9 @@ const A_PILL: u32 = 16;
 /// Что панель показывает и где у неё что нарисовано.
 struct Bar {
     h: i32,
+    /// Веха 158.2 — высота ПОЛОСЫ панели. Меньше `h`: под полосой живут ещё вогнутые уголки,
+    /// они рисуются на нашей поверхности, но места у окон НЕ занимают (зона равна полосе).
+    strip: i32,
     sw: i32,
     sh: i32,
     /// Веха 148.3 — композитор сказал, что состояние сменилось, а спросить его мы ещё не успели.
@@ -333,9 +337,14 @@ impl Bar {
         let avatar = ui::conf::device(gen_text, "avatar");
         // Высота считается ОТ ШРИФТА и от темы: разъехаться им нельзя (см. `bar_wanted` в `wm`).
         let isle_h = line_h + 2 * th.px(5);
-        let h = isle_h + 2 * th.px(6);
+        // Поля вокруг островов — по макету: остров 21 в полосе 25, то есть по два пикселя
+        // сверху и снизу. Было шесть, и панель выходила заметно выше нарисованной.
+        let strip = isle_h + 2 * th.px(2);
+        // Поверхность выше полосы ровно на уголки: они рисуются на ней, но зону не занимают.
+        let h = strip + ui::panel_fillet(strip);
         Bar {
             h,
+            strip,
             sw,
             sh,
             stale: false,
@@ -488,8 +497,8 @@ impl Bar {
         let (th, click) = (u.th.clone(), u.click());
         let th = &th;
         let (w, h) = (u.c.w, u.c.h);
-        let margin = th.px(6);
-        let isle_h = self.h - 2 * margin;
+        let margin = th.px(2);
+        let isle_h = self.strip - 2 * margin;
         let clock = clock_text();
         let date = date_text();
         let lang = if self.layout == 0 { "EN" } else { "RU" };
@@ -578,7 +587,7 @@ impl Bar {
         // ── карточка меню ──────────────────────────────────────────────────────────────────
         let menu_t = self.mo.val(A_MENU, if self.open { 256 } else { 0 }).clamp(0, 256) as u32;
         let card = self.card_rect(th, u.font, menu_t);
-        let card_clip = Rect::new(0, self.h - margin, w, h - (self.h - margin));
+        let card_clip = Rect::new(0, self.strip - margin, w, h - (self.strip - margin));
         // Место считается ДО опроса движения: `self.mo` берётся изменяемо, а прямоугольник —
         // из `self`, и в одном выражении эти два заимствования спорят.
         let pow_r = self.power_rect(th, &*u.font, card);
@@ -636,10 +645,14 @@ impl Bar {
         // Карточка стирается не здесь, а под своим клипом: она одна умеет вылезать за панель.
         if core::mem::take(&mut self.fresh) {
             u.clear_all();
+            // Веха 158.2 — полоса панели со стыками у краёв экрана. Только на свежей
+            // поверхности: дальше её возвращает под острова `wipe`, а перерисовывать полосу
+            // целиком на каждое тиканье часов значило бы трогать весь ряд ради двух цифр.
+            u.panel(w, self.strip);
         } else {
             for i in I_SPACES..I_CARD {
                 if redraw[i] {
-                    u.clear(self.isles[i].rect.union(want[i].rect));
+                    u.wipe(self.isles[i].rect.union(want[i].rect));
                 }
             }
         }
@@ -806,7 +819,9 @@ impl Bar {
         let margin = th.px(6);
         // Выезд: подняться на палец и опуститься. Больший ход читается как «упало сверху».
         let lift = th.px(18) * (256 - t as i32) / 256;
-        Rect::new(self.sw - margin - w, self.h - lift, w, h)
+        // От низа ПОЛОСЫ, а не поверхности: под полосой у нас теперь ещё вогнутые уголки, и
+        // считать от них значило бы отодвинуть карточку от панели на их радиус.
+        Rect::new(self.sw - margin - w, self.strip - lift, w, h)
     }
 
     /// Место круглой кнопки выключения. Считается ТЕМ ЖЕ кодом, что и рисование
