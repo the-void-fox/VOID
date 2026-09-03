@@ -59,6 +59,7 @@ pub mod anim;
 pub mod app;
 pub mod conf;
 pub mod font;
+pub mod icon;
 pub mod list;
 pub mod paint;
 pub mod text;
@@ -367,27 +368,32 @@ impl<'a> Ui<'a> {
         let (fill, br) = (self.tint(fill), self.tint(col.with_a(if armed { 0xff } else { 0x99 })));
         self.c.rrect_bordered(r, d / 2, self.th.line, fill, br);
         let ink = if armed { self.th.on_accent } else { col };
-        let thick = self.th.px(2).max(2);
         let ink = self.tint(ink);
-        self.c.power(r.inset(self.th.px(7).max(4)), thick, ink);
+        // Веха 158 — знак из макета (`assets/icons/power.svg`), а не рисованный на месте. Рисовать
+        // его руками имело смысл, пока рисовать вектор было нечем; теперь есть, и держать вторую
+        // «кнопку выключения», которая отличается от макета толщиной черты, незачем.
+        self.c.vg(r.inset(self.th.px(5).max(3)), icon::POWER, ink);
         self.mark(r);
         self.clicked(r)
     }
 
-    /// Веха 145.1 — **аватар устройства**: картинка в кружке, а без картинки — буква в кружке.
+    /// Веха 145.1 — **аватар устройства**: картинка в кружке, а без картинки — ЗНАК СИСТЕМЫ.
     ///
     /// Запасной путь не украшение: аватар приходит объектом store, и на свежей системе его нет —
-    /// пустая дырка в карточке выглядела бы поломкой, а буква именем.
-    pub fn avatar(&mut self, r: Rect, img: Option<(&[u8], i32, i32)>, letter: &str) {
+    /// пустая дырка в карточке выглядела бы поломкой.
+    ///
+    /// Веха 158 — запасным стал ЗНАК СИСТЕМЫ (перечёркнутый глаз), а не первая буква имени.
+    /// Буква отвечала на вопрос «как зовут машину», на который тут же, в двух сантиметрах,
+    /// отвечает подпись рядом; знак отвечает на вопрос «что это за система» — и в макете шапка
+    /// меню начинается именно им. Параметра под букву поэтому больше нет.
+    pub fn avatar(&mut self, r: Rect, img: Option<(&[u8], i32, i32)>) {
         let d = r.w.min(r.h);
         let r = Rect::new(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d);
         match img {
             Some((px, iw, ih)) => self.c.image(r, px, iw, ih, d / 2),
             None => {
-                let bg = self.tint(self.th.accent.with_a(0x33));
-                let br = self.tint(self.th.accent.with_a(0x88));
-                self.c.rrect_bordered(r, d / 2, self.th.line, bg, br);
-                self.label(r, letter, self.th.accent, Align::Center);
+                self.c.rrect(r, d / 2, self.tint(self.th.band));
+                self.c.vg(r.inset(self.th.px(3).max(2)), icon::LOGO, self.tint(self.th.muted));
             }
         }
         self.mark(r);

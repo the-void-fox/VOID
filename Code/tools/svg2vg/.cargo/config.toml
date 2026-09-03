@@ -1,0 +1,7 @@
+# Хостовый таргет: этот конфиг ПЕРЕКРЫВАЕТ build.target из Code/.cargo/config.toml (там таргет
+# ядра). Тот же приём, что у void-store-import и logo-preview.
+#
+# Без статической musl-сборки, в отличие от void-store-import: svg2vg запускают из nix-shell'а
+# репозитория, где `cc` есть, а гонять его на чужой машине незачем.
+[build]
+target = "x86_64-unknown-linux-gnu"

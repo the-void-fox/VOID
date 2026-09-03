@@ -286,13 +286,13 @@ struct Bar {
     /// Имя активного поколения — оно же надпись на кнопке меню: система, которой ты пользуешься,
     /// называет себя сама.
     gen: String,
-    /// Веха 145.1 — КТО ЭТА МАШИНА: имя устройства, его первая буква (запасной аватар) и корень
-    /// store с картинкой. Пользователей в VOID нет, поэтому «чьё это» — про устройство.
+    /// Веха 145.1 — КТО ЭТА МАШИНА: имя устройства и корень store с картинкой. Пользователей в
+    /// VOID нет, поэтому «чьё это» — про устройство. Без картинки в кружке рисуется знак системы
+    /// (Веха 158), а не первая буква имени: имя и так написано рядом.
     device: String,
     /// Имя пришло ИЗ КОНФИГА, а не подставлено. Нужно шапке: под безымянной машиной писать
     /// «VOID <сборка>» вторым «VOID» подряд — это выглядеть сломанным, а не скромным.
     named: bool,
-    letter: String,
     avatar_root: Option<String>,
     /// Распакованный аватар под размер кружка и признак «пробовали уже». Пробуем ОДИН раз и по
     /// первому открытию меню: распаковка картинки на старте панели задержала бы весь экран.
@@ -355,7 +355,6 @@ impl Bar {
             gen: ui::conf::generation_name().unwrap_or_else(|| "VOID".to_string()),
             device: device.clone(),
             named: named.is_some(),
-            letter: device.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default(),
             avatar_root: avatar,
             avatar: None,
             avatar_tried: false,
@@ -855,7 +854,7 @@ impl Bar {
         let mut head = c.cut_top(2 * row);
         let av = head.cut_left(2 * row);
         let img = self.avatar.as_ref().map(|a| (&a.px[..], a.w as i32, a.h as i32));
-        u.avatar(av.inset(th.px(2)), img, &self.letter);
+        u.avatar(av.inset(th.px(2)), img);
         head.cut_left(th.gap);
         let name = Rect::new(head.x, head.y, head.w, row);
         let sub = Rect::new(head.x, head.y + row, head.w, row);

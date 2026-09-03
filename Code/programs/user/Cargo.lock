@@ -1110,10 +1110,15 @@ dependencies = [
  "void-img",
  "void-nar",
  "void-tree",
+ "void-vec",
  "vte",
  "vvsh-core",
  "webpki-roots 0.26.11",
 ]
+
+[[package]]
+name = "void-vec"
+version = "0.0.1"
 
 [[package]]
 name = "vte"

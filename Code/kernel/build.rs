@@ -161,6 +161,19 @@ fn build_user_programs(kernel_dir: &PathBuf, target: &str, x86: bool) {
     println!("cargo:rerun-if-changed={}", program_dir.join("Cargo.toml").display());
     println!("cargo:rerun-if-changed={}", program_dir.join("linker.ld").display());
     println!("cargo:rerun-if-changed={}", program_dir.join("build.rs").display());
+    // Веха 158 — и ИКОНКИ: они лежат вне `programs/user` (`Code/assets/icons/*.vg`) и приезжают
+    // в бинари по `include_bytes!`. Без этой строки правка иконки не меняла ни одного файла,
+    // который cargo сторожит: программы не пересобирались, ядро вставало прежнее, и на экране
+    // была старая картинка — так и попались, потратив на это две загрузки QEMU.
+    //
+    // Каталог целиком, а не по файлам: список иконок будет расти, а «забыли дописать новую»
+    // — это ровно та же тихая ошибка ещё раз.
+    println!("cargo:rerun-if-changed={}", workspace_dir.join("assets").display());
+    // Крейты-зависимости вне workspace ядра: их правку внешний cargo тоже не видит, потому что
+    // собирает их ВЛОЖЕННЫЙ вызов, о котором он не знает.
+    for lib in ["void-vec", "void-img", "vvsh-core", "void-tree"] {
+        println!("cargo:rerun-if-changed={}", workspace_dir.join("libs").join(lib).join("src").display());
+    }
 
     // CARGO — путь к бинарнику cargo, которым нас сейчас собирают (переменная окружения build-
     // скрипта); используем ЕГО ЖЕ, а не «cargo» из PATH, чтобы гарантированно совпал toolchain.

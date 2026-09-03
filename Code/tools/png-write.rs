@@ -1,15 +1,11 @@
-//! Хостовый предпросмотр знака VOID (Веха 141): `logo-preview [файл.png [ширина высота]]`.
+//! Запись PNG для хостовых утилит: `write_png(путь, RGBA8888, ширина, высота)`.
 //!
-//! Рисует ТЕМ ЖЕ `programs/user/src/logo.rs`, что едет в систему, — файл включён по пути, копии
-//! нет. Без этого каждая правка геометрии стоила бы сборки ядра, обновления образа и загрузки
-//! QEMU; здесь она стоит секунду.
+//! Несжатый (deflate «stored»): полсотни строк против целого крейта ради картинок, которые
+//! смотрит один человек и которые никуда, кроме его экрана, не едут.
 //!
-//! PNG пишется несжатым (deflate «stored»): полсотни строк против крейта ради картинки, которую
-//! смотрит один человек.
-extern crate alloc;
-
-#[path = "../../../programs/user/src/logo.rs"]
-mod logo;
+//! Файл общий и включается по `#[path]` — в `logo-preview` и в `svg2vg`. Две копии кодировщика
+//! разошлись бы ровно тогда, когда в одной из них нашли бы ошибку.
+#![allow(dead_code)]
 
 use std::io::Write;
 
@@ -46,7 +42,7 @@ fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
     out.extend_from_slice(&crc32(&c).to_be_bytes());
 }
 
-fn write_png(path: &str, px: &[u8], w: u32, h: u32) {
+pub fn write_png(path: &str, px: &[u8], w: u32, h: u32) {
     let mut raw = Vec::with_capacity((h * (1 + w * 4)) as usize);
     for y in 0..h {
         raw.push(0);
@@ -72,16 +68,4 @@ fn write_png(path: &str, px: &[u8], w: u32, h: u32) {
     chunk(&mut png, b"IDAT", &z);
     chunk(&mut png, b"IEND", &[]);
     std::fs::File::create(path).unwrap().write_all(&png).unwrap();
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let out = args.get(1).cloned().unwrap_or_else(|| "preview.png".into());
-    let w: u32 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(1280);
-    let h: u32 = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(800);
-    let mut px = vec![0u8; (w * h * 4) as usize];
-    let t = std::time::Instant::now();
-    logo::wallpaper(&mut px, w, h, &logo::Palette::VOID);
-    eprintln!("{w}×{h} за {:?}", t.elapsed());
-    write_png(&out, &px, w, h);
 }

@@ -8,7 +8,7 @@
 # как и `void-store-import`. Зависимостей нет вовсе — PNG пишется несжатым (deflate «stored»),
 # полсотни строк против целого крейта ради картинки, которую смотрит один человек.
 [package]
-name = "logo-preview"
+name = "backdrop-preview"
 version = "0.0.1"
 edition = "2021"
 authors = ["voidfox"]

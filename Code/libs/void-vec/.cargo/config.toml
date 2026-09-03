@@ -1,0 +1,5 @@
+# Ближний конфиг побеждает Code/.cargo/config.toml (там build.target — таргет ядра).
+# void-vec host-тестируем: `cargo test` здесь гоняет растеризатор без QEMU. При сборке как
+# зависимость programs/user действует таргет ТОГО крейта (конфиг берётся по CWD вызова).
+[build]
+target = "x86_64-unknown-linux-gnu"
