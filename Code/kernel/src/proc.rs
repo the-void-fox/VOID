@@ -33,7 +33,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use void_abi::{Cap, ContentId, Rights};
 
@@ -331,6 +331,17 @@ static TABLE: SpinLock<Table> =
 
 /// Контекст ядра, в который возвращаемся, когда все процессы завершились.
 static mut RETURN_CTX: Context = Context::EMPTY;
+
+/// Веха 159 — размер записи `SYS_SYSINFO` в байтах. Тот же в `void_user::SYSINFO_REC`.
+const SYSINFO_REC: usize = 48;
+
+/// Веха 159 — сколько тиков машина ПРОСТОЯЛА с загрузки (см. [`wait_stdin`]).
+///
+/// Загрузка процессора считается из него вычитанием, а не выборкой «сколько процессов сейчас
+/// готовы» и не усреднением, как `loadavg`: простой — это ровно одно место в ядре, где
+/// исполнять некого, и время в нём измеряется тем же счётчиком, что и всё остальное. Число
+/// поэтому честное по построению, а не правдоподобное.
+static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Веха 52 — «пришло прерывание userspace-драйвера» (вектор `VEC_USERDRV`). Обработчик IRQ
 /// выставляет флаг БЕЗ замка таблицы процессов (иначе дедлок с прерванным контекстом), а
@@ -811,6 +822,11 @@ fn wait_stdin(saved_sie: usize) -> bool {
     } else {
         arch::irq_mask_stdin(saved_sie);
     }
+    // Веха 159 — ОТСЮДА считается простой машины. Это единственное место, где ядру нечего
+    // исполнять: всё остальное время процессор занят кем-то из процессов или самим ядром.
+    // Значит «загрузка» — не оценка и не выборка, а `1 - простой/время`, посчитанное по
+    // тем же тикам, которыми живёт таймер.
+    let idle_from = arch::now_ticks();
     while !arch::console_has_input()
         // Веха 115: движение мыши — тоже повод проснуться, Веха 119: и событие клавиатуры.
         // Но только если их ЖДУТ (`wants_input`): непрочитанное событие иначе становится
@@ -840,6 +856,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
         arch::enable_interrupts();
         arch::irq_save_disable();
     }
+    IDLE_TICKS.fetch_add(arch::now_ticks().saturating_sub(idle_from), Ordering::Relaxed);
     let mut t = TABLE.lock();
     // Веха 115 — движение мыши будит тех же, кого будит клавиша: для реактора терминала это
     // такое же событие ввода, и спать сквозь него значило бы двигать курсор рывками по таймеру.
@@ -3371,6 +3388,49 @@ fn syscall(t: &mut Table, cur: usize) {
                     }
                 }
                 _ => usize::MAX, // нет права Sysview WRITE или неверный pid
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_SYSINFO(sysview_cap, buf_ptr, buf_len) -> 0 | MAX (Веха 159): числа ПРО МАШИНУ,
+        // а не про процесс, под правом Sysview READ. 48 Б в буфер:
+        //   0..8   всего памяти, байт          8..16  занято памяти, байт
+        //   16..24 время с загрузки, нс        24..32 из него ПРОСТОЙ, нс
+        //   32..34 живых процессов, u16        34..48 резерв (нули)
+        //
+        // Загрузка процессора отсюда считается ВЫЧИТАНИЕМ двух замеров: `1 - Δпростой/Δвремя`.
+        // Мгновенного числа ядро не отдаёт намеренно — «сейчас» у загрузки не бывает, бывает
+        // только «за промежуток», и выбирать промежуток должен тот, кто рисует.
+        //
+        // Под правом, а не свободно (в отличие от `SYS_TIME`): сколько памяти занято и сколько
+        // машина простаивает — это наблюдение за системой, то же самое, что список процессов.
+        // Панель получает право обзора так же, как диспетчер, — строкой конфига.
+        63 => {
+            let (scap, bptr, blen) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::sysview(dom, Cap::from_bits(scap as u64), Rights::READ) {
+                Ok(()) if blen >= SYSINFO_REC && ensure_heap_range(t, cur, bptr, blen) => {
+                    // Нить отдельным процессом не считается — тот же уговор, что у PROC_LIST.
+                    let live = (0..t.procs.len())
+                        .filter(|&i| t.procs[i].state != State::Finished && t.procs[i].group == i)
+                        .count()
+                        .min(0xffff);
+                    let mut rec = [0u8; SYSINFO_REC];
+                    rec[0..8].copy_from_slice(&(crate::frame::usable_bytes() as u64).to_le_bytes());
+                    rec[8..16].copy_from_slice(&(crate::frame::used_bytes() as u64).to_le_bytes());
+                    rec[16..24].copy_from_slice(&crate::clock::uptime_ns().to_le_bytes());
+                    let idle = crate::clock::ticks_to_ns(IDLE_TICKS.load(Ordering::Relaxed));
+                    rec[24..32].copy_from_slice(&idle.to_le_bytes());
+                    rec[32..34].copy_from_slice(&(live as u16).to_le_bytes());
+                    let dst = unsafe { core::slice::from_raw_parts_mut(bptr as *mut u8, SYSINFO_REC) };
+                    dst.copy_from_slice(&rec);
+                    0
+                }
+                _ => usize::MAX, // нет права Sysview READ, тесный буфер или он не наш
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);

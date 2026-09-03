@@ -99,10 +99,14 @@ const DEFAULT_GEN4: &str = "\
 # Веха 157 — `power:wg!` и `desktop power`: тем же порядком раздаётся ВЫКЛЮЧЕНИЕ. Панели оно
 # нужно под кнопку меню, шеллу — под `poweroff`; до Вехи 154 оба получали его наследством от
 # композитора — то есть вместе с ними его имело каждое открытое окно.
+#
+# Веха 159 — панель просит `sysview` под метрики: загрузка процессора и занятая память — такое
+# же наблюдение за системой, как список процессов, и брать их без права неоткуда.
 service posixfs store:rw
 service net-srv dev:net:rw
 shell wm endpoint:posixfs store:rwx mmio:fb! power:wg! sysview:rwg! env arg:term
 desktop sysview taskmgr
+desktop sysview bar
 desktop power bar
 desktop power bin/vvsh
 ";

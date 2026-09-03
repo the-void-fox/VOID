@@ -145,6 +145,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     }
 
     bar.fetch(&surf);
+    // Право обзора — ПОСЛЕ поверхности: просьба идёт композитору по IPC, и до того как он
+    // выдал нам слой, отвечать на неё ему нечем.
+    bar.take_sysview();
     if year_now() < 2000 {
         say("bar: часов у машины нет — время идёт с загрузки (см. SYS_TIME)\n");
     }
@@ -210,13 +213,24 @@ impl ui::Client for Bar {
     fn wake(&mut self) -> Option<u32> {
         // Пока что-то движется — просыпаться кадрами; иначе спать до минуты. Композитор будит
         // раньше своим событием, и это ровно то, чего мы ждём.
-        Some(if self.busy() { ui::anim::FRAME_MS } else { ms_to_next_minute() })
+        //
+        // Веха 159 — с метриками спать до минуты нельзя: загрузка процессора считается МЕЖДУ
+        // замерами, и без второго замера её не существует. Секунда — цена этого: одно
+        // пробуждение в секунду против шестидесяти кадров, которые панель и так рисует, когда
+        // что-то движется. Перерисовки при этом чаще не станет — остров сравнивает подпись, и
+        // при тех же числах ни один пиксель не тронется.
+        Some(match () {
+            _ if self.busy() => ui::anim::FRAME_MS,
+            _ if self.sysview != sys::NO_CAP => ms_to_next_minute().min(METRIC_MS),
+            _ => ms_to_next_minute(),
+        })
     }
 
-    /// Срок вышел: перерисовать, если сменилась минута ИЛИ если идёт движение (кадр анимации).
+    /// Срок вышел: перерисовать, если сменилась минута, изменились метрики ИЛИ идёт движение.
     fn tick(&mut self) -> ui::Scope {
         let m = minute_now();
-        if m != self.minute || self.busy() {
+        let metrics = self.sample();
+        if m != self.minute || metrics || self.busy() {
             self.minute = m;
             return ui::Scope::All;
         }
@@ -251,6 +265,9 @@ const A_POWER: u32 = 9;
 /// Подсветка пилюль столов: `A_PILL + номер стола`.
 const A_PILL: u32 = 16;
 
+/// Веха 159 — как часто панель переспрашивает числа про машину, мс.
+const METRIC_MS: u32 = 1000;
+
 /// Что панель показывает и где у неё что нарисовано.
 struct Bar {
     h: i32,
@@ -278,7 +295,16 @@ struct Bar {
     /// Где курсор в координатах поверхности. `None` — не над ней.
     ptr: Option<(i32, i32)>,
     /// Острова прошлого кадра.
-    isles: [Isle; 5],
+    isles: [Isle; 6],
+    /// Веха 159 — право обзора МАШИНЫ (`desktop sysview bar`), последний замер и то, что
+    /// из него показано. `NO_CAP` — права не дали: остров метрик тогда не рождается вовсе.
+    ///
+    /// Показывать «—» вместо чисел было бы хуже пустоты: пустое место не обещает ничего, а
+    /// прочерк обещает число, которого не будет.
+    sysview: usize,
+    prev: sys::SysInfo,
+    cpu: u32,
+    ram: u32,
     /// Кадра ещё не было: холст надо очистить ЦЕЛИКОМ.
     fresh: bool,
     /// Меню: открыто ли (цель) и растянута ли поверхность на весь экран (факт).
@@ -322,11 +348,12 @@ struct Bar {
 }
 
 /// Индексы островов в [`Bar::isles`].
-const I_SPACES: usize = 0;
-const I_TITLE: usize = 1;
-const I_CLOCK: usize = 2;
-const I_SYS: usize = 3;
-const I_CARD: usize = 4;
+const I_CLOCK: usize = 0;
+const I_METRIC: usize = 1;
+const I_SPACES: usize = 2;
+const I_TITLE: usize = 3;
+const I_SYS: usize = 4;
+const I_CARD: usize = 5;
 
 impl Bar {
     fn new(th: &Theme, line_h: i32, sw: i32, sh: i32, anim_ms: u64, gen_text: &str) -> Bar {
@@ -356,7 +383,11 @@ impl Bar {
             title: String::new(),
             shown: String::new(),
             ptr: None,
-            isles: [Isle::default(); 5],
+            isles: [Isle::default(); 6],
+            sysview: sys::NO_CAP,
+            prev: sys::SysInfo::default(),
+            cpu: 0,
+            ram: 0,
             fresh: true,
             open: false,
             grown: false,
@@ -382,7 +413,7 @@ impl Bar {
 
     /// Забыть нарисованное: следующий кадр перерисует всё (смена размера поверхности).
     fn forget(&mut self) {
-        self.isles = [Isle::default(); 5];
+        self.isles = [Isle::default(); 6];
         self.fresh = true;
     }
 
@@ -521,18 +552,33 @@ impl Bar {
             spaces_w += pw;
             widths.push((label, pw));
         }
-        let l_isle = Rect::new(margin, margin, spaces_w, isle_h);
-
         // Кнопка меню — самая правая: это «начало» оболочки, и звать её надо там, где рука её
         // ищет. Надпись — имя поколения: система называет себя тем, чем она сейчас является.
         let sys_w = u.font.width(&self.gen) + 2 * th.pad;
         let s_isle = Rect::new(w - margin - sys_w, margin, sys_w, isle_h);
 
+        // Веха 158.3 — ЛЕВАЯ ГРУППА по макету: время и дата, метрики, столы. До этого часы жили
+        // справа, а слева были только столы; в макете справа не остаётся ничего, кроме кнопки
+        // поколения, и это правильнее по руке: время читают, а к меню тянутся.
         let lang_w = u.font.width(lang) + th.px(12);
         let clock_w = u.font.width(&clock);
         let date_w = u.font.width(&date);
-        let r_w = 2 * th.pad + lang_w + th.px(8) + th.line + th.px(8) + clock_w + th.px(6) + date_w;
-        let r_isle = Rect::new(s_isle.x - margin - r_w, margin, r_w, isle_h);
+        let r_w = 2 * th.pad + clock_w + th.px(6) + date_w + th.px(8) + th.line + th.px(8) + lang_w;
+        let r_isle = Rect::new(margin, margin, r_w, isle_h);
+
+        // Веха 159 — МЕТРИКИ. Острова нет вовсе, если нет права обзора: пустая рамка или
+        // прочерки обещали бы числа, которых не будет.
+        let ico = isle_h - 2 * th.px(5);
+        let num_w = u.font.width("100%");
+        let m_isle = if self.sysview == sys::NO_CAP {
+            Rect::ZERO
+        } else {
+            let mw = 2 * th.pad + 2 * (ico + th.px(4) + num_w) + th.px(10);
+            Rect::new(r_isle.right() + margin, margin, mw, isle_h)
+        };
+
+        let sp_x = if m_isle.is_empty() { r_isle.right() } else { m_isle.right() } + margin;
+        let l_isle = Rect::new(sp_x, margin, spaces_w, isle_h);
 
         // Заголовок меняется в ДВА ТАКТА: старый гаснет, подменяется и загорается новый. Смена
         // текста на полной яркости читается как рывок — рядом с едущим окном это особенно заметно.
@@ -545,12 +591,12 @@ impl Bar {
 
         // Заголовок посередине — тем местом, что осталось между островами. Пустой заголовок
         // острова не рождает: пустая карточка посреди панели выглядела бы поломкой.
-        let room = r_isle.x - l_isle.right() - 2 * margin;
+        let room = s_isle.x - l_isle.right() - 2 * margin;
         let t_isle = if self.shown.is_empty() || room < th.px(60) {
             Rect::ZERO
         } else {
             let tw = (u.font.width(&self.shown) + 2 * th.pad).min(room);
-            let x = ((w - tw) / 2).clamp(l_isle.right() + margin, r_isle.x - margin - tw);
+            let x = ((w - tw) / 2).clamp(l_isle.right() + margin, s_isle.x - margin - tw);
             Rect::new(x, margin, tw, isle_h)
         };
 
@@ -597,6 +643,16 @@ impl Bar {
         // ── что перерисовывать ─────────────────────────────────────────────────────────────
         let want = [
             Isle {
+                rect: r_isle,
+                sig: sig(&[
+                    self.layout as u64,
+                    sig_str(&clock),
+                    sig_str(&date),
+                    lang_hot as u64,
+                ]),
+            },
+            Isle { rect: m_isle, sig: sig(&[self.cpu as u64, self.ram as u64]) },
+            Isle {
                 rect: l_isle,
                 sig: sig(&[
                     self.spaces as u64,
@@ -606,15 +662,6 @@ impl Bar {
                 ]),
             },
             Isle { rect: t_isle, sig: sig(&[sig_str(&self.shown), title_a as u64]) },
-            Isle {
-                rect: r_isle,
-                sig: sig(&[
-                    self.layout as u64,
-                    sig_str(&clock),
-                    sig_str(&date),
-                    lang_hot as u64,
-                ]),
-            },
             Isle { rect: s_isle, sig: sig(&[sig_str(&self.gen), sys_hot as u64]) },
             Isle {
                 rect: if menu_t == 0 { Rect::ZERO } else { card },
@@ -635,7 +682,7 @@ impl Bar {
         // Клик всегда рисует всё: он меняет и то, что под курсором, и то, что было активным, —
         // а «что именно» знает уже сам виджет, а не эта таблица.
         let all = click.is_some();
-        let redraw: [bool; 5] = core::array::from_fn(|i| all || want[i] != self.isles[i]);
+        let redraw: [bool; 6] = core::array::from_fn(|i| all || want[i] != self.isles[i]);
         if !redraw.iter().any(|&x| x) {
             return;
         }
@@ -650,7 +697,7 @@ impl Bar {
             // целиком на каждое тиканье часов значило бы трогать весь ряд ради двух цифр.
             u.panel(w, self.strip);
         } else {
-            for i in I_SPACES..I_CARD {
+            for i in I_CLOCK..I_CARD {
                 if redraw[i] {
                     u.wipe(self.isles[i].rect.union(want[i].rect));
                 }
@@ -681,18 +728,33 @@ impl Bar {
         }
 
         if redraw[I_CLOCK] {
+            // Порядок по макету: сперва время, потом дата приглушённой. Раскладка — за
+            // разделителем в хвосте острова: её переключают редко, а смотрят на часы.
             let mut inner = u.island(r_isle);
-            let lang_at = inner.cut_left(lang_w);
+            u.label(inner.cut_left(clock_w), &clock, th.text, Align::Left);
+            inner.cut_left(th.px(6));
+            u.label(inner.cut_left(date_w), &date, th.muted, Align::Left);
+            inner.cut_left(th.px(8));
+            u.sep(inner.cut_left(th.line).inset_xy(0, th.px(5)));
+            inner.cut_left(th.px(8));
+            let lang_at = inner;
             if u.button(lang_at, lang, lang_hot) {
                 self.flip = true;
             }
             self.lang_at = lang_at;
-            inner.cut_left(th.px(8));
-            u.sep(inner.cut_left(th.line).inset_xy(0, th.px(5)));
-            inner.cut_left(th.px(8));
-            u.label(inner.cut_left(clock_w), &clock, th.text, Align::Left);
-            inner.cut_left(th.px(6));
-            u.label(inner, &date, th.muted, Align::Left);
+        }
+
+        if redraw[I_METRIC] && !m_isle.is_empty() {
+            let mut inner = u.island(m_isle);
+            let iy = m_isle.y + (isle_h - ico) / 2;
+            for (art, val) in [(ui::icon::CPU, self.cpu), (ui::icon::RAM, self.ram)] {
+                let ix = inner.cut_left(ico).x;
+                u.c.vg(Rect::new(ix, iy, ico, ico), art, th.muted);
+                inner.cut_left(th.px(4));
+                let text = alloc::format!("{val}%");
+                u.label(inner.cut_left(num_w), &text, th.text, Align::Left);
+                inner.cut_left(th.px(10));
+            }
         }
 
         if redraw[I_SYS] {
@@ -743,6 +805,43 @@ impl Bar {
     }
 
     // ── меню ───────────────────────────────────────────────────────────────────────────────
+
+    /// Веха 159 — взять право обзора машины и сделать первый замер.
+    ///
+    /// Через КОМПОЗИТОРА (`win::cap_or_grant`), а не наследством: панель — его ребёнок, но
+    /// право обзора не наследуется, и отдаёт он его только тому, кого назвал конфиг
+    /// (`desktop sysview bar`). Не дали — панель говорит об этом вслух и живёт без метрик.
+    fn take_sysview(&mut self) {
+        let c = sys::win::cap_or_grant(13);
+        if c == sys::NO_CAP {
+            say("bar: права обзора нет — метрик не будет (строка `desktop sysview bar` в конфиге)\n");
+            return;
+        }
+        self.sysview = c;
+        if let Some(i) = sys::sysinfo(c) {
+            self.prev = i;
+            self.ram = i.ram_percent();
+        }
+    }
+
+    /// Новый замер. `true` — показанные числа изменились, нужен кадр.
+    fn sample(&mut self) -> bool {
+        if self.sysview == sys::NO_CAP {
+            return false;
+        }
+        let Some(now) = sys::sysinfo(self.sysview) else { return false };
+        // Слишком близкие замеры не считаем: на промежутке короче полусекунды разница времён
+        // сравнима с квантом вытеснения, и «загрузка» скакала бы от 0 до 100 на ровном месте.
+        if now.uptime_ns.saturating_sub(self.prev.uptime_ns) < 500_000_000 {
+            return false;
+        }
+        let (cpu, ram) = (now.cpu_percent(&self.prev), now.ram_percent());
+        self.prev = now;
+        let changed = (cpu, ram) != (self.cpu, self.ram);
+        self.cpu = cpu;
+        self.ram = ram;
+        changed
+    }
 
     /// Веха 145.1 — распаковать аватар устройства. Один раз за жизнь панели и по первому открытию
     /// меню: картинку выбирает человек, она может быть на мегабайты, и платить за неё при старте

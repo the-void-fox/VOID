@@ -136,6 +136,7 @@ const SYS_PROC_LIST: usize = 59;
 const SYS_PROC_CAPS: usize = 60;
 const SYS_PROC_STAT: usize = 61;
 const SYS_PROC_REVOKE: usize = 62;
+const SYS_SYSINFO: usize = 63;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -693,6 +694,66 @@ pub const PROC_REC: usize = 64;
 pub fn proc_list(sysview_cap: usize, buf: &mut [u8]) -> Option<usize> {
     let r = abi::syscall(SYS_PROC_LIST, sysview_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
     (r != usize::MAX).then_some(r)
+}
+
+/// Веха 159 — размер записи [`sysinfo`] в байтах (тот же в ядре).
+pub const SYSINFO_REC: usize = 48;
+
+/// Веха 159 — числа ПРО МАШИНУ: память, время работы и простой.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SysInfo {
+    /// Вся память, которой распоряжается ядро, и занятая её часть — в байтах.
+    pub ram_total: u64,
+    pub ram_used: u64,
+    /// Время с загрузки и та его часть, что машина ПРОСТОЯЛА, — в наносекундах.
+    pub uptime_ns: u64,
+    pub idle_ns: u64,
+    /// Живых процессов (нити отдельно не считаются).
+    pub procs: u16,
+}
+
+impl SysInfo {
+    /// Загрузка процессора в процентах МЕЖДУ двумя замерами.
+    ///
+    /// Мгновенной загрузки не бывает — бывает только «за промежуток», поэтому её и нельзя
+    /// спросить одним вызовом: `prev` обязателен. Промежуток выбирает тот, кто рисует; панели
+    /// хватает секунды, диспетчеру — полсекунды.
+    pub fn cpu_percent(&self, prev: &SysInfo) -> u32 {
+        let dt = self.uptime_ns.saturating_sub(prev.uptime_ns);
+        if dt == 0 {
+            return 0;
+        }
+        let idle = self.idle_ns.saturating_sub(prev.idle_ns).min(dt);
+        (((dt - idle) * 100) / dt) as u32
+    }
+
+    /// Занятая память в процентах.
+    pub fn ram_percent(&self) -> u32 {
+        if self.ram_total == 0 {
+            return 0;
+        }
+        ((self.ram_used * 100) / self.ram_total) as u32
+    }
+}
+
+/// Веха 159 — спросить числа про машину под правом обзора (требует READ).
+///
+/// `None` — права нет. Ambient-доступа к этим числам нет намеренно: сколько памяти занято и
+/// сколько машина простаивает — такое же наблюдение за системой, как список процессов.
+pub fn sysinfo(sysview_cap: usize) -> Option<SysInfo> {
+    let mut buf = [0u8; SYSINFO_REC];
+    let r = abi::syscall(SYS_SYSINFO, sysview_cap, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0).0;
+    if r == usize::MAX {
+        return None;
+    }
+    let u64at = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    Some(SysInfo {
+        ram_total: u64at(0),
+        ram_used: u64at(8),
+        uptime_ns: u64at(16),
+        idle_ns: u64at(24),
+        procs: u16::from_le_bytes([buf[32], buf[33]]),
+    })
 }
 
 /// Веха 153.2 — размер одной записи [`proc_caps`] в байтах.
