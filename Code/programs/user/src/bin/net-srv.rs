@@ -54,8 +54,8 @@ use smoltcp::wire::{
 };
 
 use sys::net_cli::{
-    MAX_CHUNK, OP_PING, OP_RESOLVE, OP_TCP_CLOSE, OP_TCP_CONNECT, OP_TCP_RECV, OP_TCP_SEND, ST_BAD,
-    ST_BLOCKED, ST_EOF, ST_ERR, ST_OK, ST_TIMEOUT,
+    MAX_CHUNK, OP_NET_SWITCH, OP_PING, OP_RESOLVE, OP_TCP_CLOSE, OP_TCP_CONNECT, OP_TCP_RECV,
+    OP_TCP_SEND, ST_BAD, ST_BLOCKED, ST_EOF, ST_ERR, ST_OFF, ST_OK, ST_TIMEOUT,
 };
 
 /// Идентификатор наших echo-запросов (ICMP ident) — по нему стек отдаёт нам ответы. Сокету с
@@ -608,6 +608,9 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         ))
     });
     let mut pings = PingPool { handles: icmp_handles, cur: 0 };
+    // Веха 166 — служит ли сервер клиентам. Флаг живёт в СЕАНСЕ: перезапуск сервера — это уже
+    // не «человек передумал», а новая жизнь, и начинать её выключенным было бы ловушкой.
+    let mut link_on = true;
     let dns_handle = sockets.add(dns_socket);
     let dhcp_handle = cfg.dhcp.then(|| sockets.add(dhcp_socket));
     let mut bufs = tcp_rx.iter_mut().zip(tcp_tx.iter_mut());
@@ -739,6 +742,31 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
             continue;
         };
         let body = &req[..m.len.min(req.len())];
+        // Веха 166 — ВЫКЛЮЧАТЕЛЬ. Пока он выключен, сервер не обслуживает никого: ни пинга, ни
+        // имён, ни TCP. Само железо при этом живёт (кадры принимаются, аренда DHCP не теряется),
+        // и включение возвращает сеть тем же процессам без перезапуска — ради этого выключатель
+        // и стоит здесь, а не в диспетчере (см. `OP_NET_SWITCH`).
+        //
+        // Спросить и щёлкнуть может ЛЮБОЙ, у кого есть канал к серверу. Это названо вслух и
+        // осознано: тот же клиент и так может занять все сокеты пинга или залить сервер
+        // запросами — отказ в обслуживании ему был доступен и раньше, только грязным способом.
+        // Право на щелчок отдельным видом появится тогда же, когда станет чем его предъявлять:
+        // передача права-удостоверения по IPC требует `GRANT`, а его композитор намеренно
+        // не отдаёт никому ([[void-cap-inherit]]).
+        if m.op == OP_NET_SWITCH {
+            if let Some(&b) = body.first() {
+                link_on = b != 0;
+                let word =
+                    if link_on { "[net-srv] сеть включена\n" } else { "[net-srv] сеть выключена\n" };
+                sys::write_console(word.as_bytes());
+            }
+            sys::reply(m.reply_cap, &[if link_on { ST_OK } else { ST_OFF }]);
+            continue;
+        }
+        if !link_on {
+            sys::reply(m.reply_cap, &[ST_OFF]);
+            continue;
+        }
         match m.op {
             OP_PING if body.len() >= 4 => {
                 let target = Ipv4Address::new(body[0], body[1], body[2], body[3]);

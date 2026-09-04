@@ -195,6 +195,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 153 — диспетчер задач: право обзора процессов (Sysview) в лицо пользователю. Тоже
     // клиент композитора, значит x86-only.
     ("taskmgr", include_bytes!(env!("PROG_TASKMGR"))),
+    // Веха 166 — файловый менеджер: дерево файлов от `posixfs` в лицо человеку. Клиент
+    // композитора, значит x86-only, как и все, кому нужен экран.
+    ("fm", include_bytes!(env!("PROG_FM"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

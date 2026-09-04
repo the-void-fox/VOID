@@ -28,6 +28,18 @@ pub const POWER: &[u8] = include_bytes!("../../../../assets/icons/power.vg");
 pub const CPU: &[u8] = include_bytes!("../../../../assets/icons/cpu.vg");
 /// Занятая память.
 pub const RAM: &[u8] = include_bytes!("../../../../assets/icons/ram.vg");
+/// Веха 166 — знаки ФАЙЛОВОГО МЕНЕДЖЕРА, из пакета владельца (Material Symbols Rounded 24,
+/// `Reference/Design/Assets`, вес 400 — он один и подходит к нашему дизайну). Взяты как есть,
+/// без правок: пакет отобран владельцем именно под эту оболочку.
+pub const FOLDER: &[u8] = include_bytes!("../../../../assets/icons/folder.vg");
+pub const FILE: &[u8] = include_bytes!("../../../../assets/icons/file.vg");
+pub const BACK: &[u8] = include_bytes!("../../../../assets/icons/back.vg");
+pub const FORWARD: &[u8] = include_bytes!("../../../../assets/icons/forward.vg");
+pub const UP: &[u8] = include_bytes!("../../../../assets/icons/up.vg");
+pub const STAR: &[u8] = include_bytes!("../../../../assets/icons/star.vg");
+pub const SEARCH: &[u8] = include_bytes!("../../../../assets/icons/search.vg");
+pub const MENU: &[u8] = include_bytes!("../../../../assets/icons/menu.vg");
+
 /// Веха 165 — ОТНЯТЬ ПРАВО: перечёркнутая рамка. В макете диспетчера на месте кнопки «отнять»
 /// стоит знак — строка права коротка, и слово в ней занимает больше места, чем сама строка.
 ///

@@ -436,6 +436,37 @@ impl<'a> Ui<'a> {
         self.clicked(r)
     }
 
+    /// Веха 166 — **ТУМБЛЕР**: подпись и переключатель с двумя положениями.
+    ///
+    /// Отличается от [`Ui::button`] не видом, а обещанием. Кнопка ДЕЛАЕТ и ничего не говорит о
+    /// том, что было раньше; тумблер ПОКАЗЫВАЕТ состояние и обещает, что его можно вернуть. Там,
+    /// где вернуть нельзя, тумблер — вранье, и рисовать его нельзя (в диспетчере он появился
+    /// ровно тогда, когда ядро научилось вручать право обратно, Веха 166).
+    ///
+    /// `on` — 0..256, а не `bool`: положение приезжает готовым, как и всё движение в тулките
+    /// ([`Motion`]), и ползунок может ехать, а не прыгать.
+    pub fn toggle(&mut self, r: Rect, label: &str, on: u32, hot: u32) -> bool {
+        let on = on.min(256);
+        // Переключатель справа, подпись слева — так его читают слева направо: «сеть … включена».
+        let h = (r.h - self.th.px(4)).max(self.th.px(10));
+        let w = 2 * h;
+        let sw = Rect::new(r.right() - w, r.y + (r.h - h) / 2, w, h);
+        let mut text = r;
+        text.cut_right(w + self.th.gap);
+        let fg = self.th.muted.mix(self.th.text, on);
+        self.label(text, label, fg, Align::Left);
+        // Дорожка гаснет вместе с положением, ползунок всегда светлый: по нему и видно, где он.
+        let track = self.th.band_on.mix(self.th.accent, on);
+        let track = self.tint(track.mix(self.th.text, hot.min(256) / 8));
+        self.c.rrect(sw, h / 2, track);
+        let d = h - self.th.px(4);
+        let x = sw.x + self.th.px(2) + (sw.w - d - 2 * self.th.px(2)) * on as i32 / 256;
+        let knob = self.tint(self.th.text.mix(self.th.on_accent, on / 2));
+        self.c.rrect(Rect::new(x, sw.y + self.th.px(2), d, d), d / 2, knob);
+        self.mark(r);
+        self.clicked(r)
+    }
+
     /// Веха 145 — **строка сведений**: название слева приглушённо, значение справа. Единственный
     /// способ, которым меню что-то РАССКАЗЫВАЕТ; всё остальное в нём — кнопки.
     ///

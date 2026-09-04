@@ -102,13 +102,19 @@ const DEFAULT_GEN4: &str = "\
 #
 # Веха 159 — панель просит `sysview` под метрики: загрузка процессора и занятая память — такое
 # же наблюдение за системой, как список процессов, и брать их без права неоткуда.
+#
+# Веха 166 — `endpoint:net-srv:sg!` и `desktop net`: тем же порядком раздаётся КАНАЛ К СЕТИ. В
+# оконном режиме его не было ни у кого вовсе — сеть работала, а дотянуться до неё из окна было
+# нечем. Композитор сам в сеть не ходит: право у него, чтобы отдать названному (диспетчеру —
+# под выключатель сети). `!` — чтобы канал не достался каждому окну наследством.
 service posixfs store:rw
 service net-srv dev:net:rw
-shell wm endpoint:posixfs store:rwx mmio:fb! power:wg! sysview:rwg! env arg:term
+shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! env arg:term
 desktop sysview taskmgr
 desktop sysview bar
 desktop power bar
 desktop power bin/vvsh
+desktop net taskmgr
 ";
 
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.

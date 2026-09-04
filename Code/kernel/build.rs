@@ -20,7 +20,7 @@ const PROGRAMS: &[&str] = &[
 /// давала такой кусок поверх кэша store. Это же и есть довод перенести шрифт в store отдельным
 /// объектом-деревом (Веха 94 умеет), а не носить его в ELF.
 const PROGRAMS_X86: &[&str] =
-    &["term", "wm", "winbox", "img", "wall", "bar", "launcher", "roots", "taskmgr"];
+    &["term", "wm", "winbox", "img", "wall", "bar", "launcher", "roots", "taskmgr", "fm"];
 
 /// Веха 132 — C-драйверы (портированный код Linux, сборка nix'ом). Едут семенами В ЯДРЕ, как и
 /// программы на Rust: до store целевой машины иначе не добраться (см. `stage_c_drivers`).

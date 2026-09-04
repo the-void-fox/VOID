@@ -341,6 +341,20 @@ pub fn info(dom: DomainId, cap: Cap) -> Result<(u8, Rights), CapError> {
     Ok((info_kind(&e.target), e.rights))
 }
 
+/// Веха 166 — то же плюс **с кем связан** эндпоинт: `(вид, права, aux)`, где `aux` — процесс на
+/// том конце (`u16::MAX`, если вид не про связь). Та же величина, что в [`list_caps`], и по той
+/// же причине: без неё «эндпоинт» — это вид без адресата, а держатель нескольких эндпоинтов
+/// (а их держит каждое окно) не может отличить свой канал к серверу сети от канала к композитору.
+pub fn info_ex(dom: DomainId, cap: Cap) -> Result<(u8, Rights, u16), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    let aux = match &e.target {
+        Target::Endpoint(p) | Target::Reply(p) => *p as u16,
+        _ => u16::MAX,
+    };
+    Ok((info_kind(&e.target), e.rights, aux))
+}
+
 /// Код вида цели — общий словарь ядра и зонда конфайнмента ([[redteam]]).
 pub fn info_kind(t: &Target) -> u8 {
     match t {

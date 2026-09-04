@@ -267,7 +267,7 @@ impl Walk<'_, '_> {
         let Some(f) = p.fill() else { return };
         let Some(rgba) = self.color(f.paint(), alpha * f.opacity().get()) else { return };
         let eo = matches!(f.rule(), usvg::FillRule::EvenOdd);
-        self.emit(p.data(), rgba, eo);
+        self.emit(p.data(), p.abs_transform(), rgba, eo);
     }
 
     fn stroke(&mut self, p: &usvg::Path, alpha: f32) {
@@ -281,7 +281,10 @@ impl Walk<'_, '_> {
         };
         // Обводка всегда по ненулевому обходу: у контура, который построил штриховальщик,
         // внутренние петли обязаны заливаться, а по чётности они бы выедали дырки.
-        self.emit(&outline, rgba, false);
+        //
+        // Штрихуем в СВОИХ координатах и переводим уже контур: толщина линии живёт в них же, и
+        // штриховать после перевода значило бы штриховать не той толщиной.
+        self.emit(&outline, p.abs_transform(), rgba, false);
     }
 
     /// Цвет с домноженной прозрачностью. `None` — краска, которой формат не знает.
@@ -304,7 +307,23 @@ impl Walk<'_, '_> {
         Some([c.red, c.green, c.blue, a])
     }
 
-    fn emit(&mut self, path: &tiny_skia_path::Path, rgba: [u8; 4], evenodd: bool) {
+    /// Выложить контур в `.vg`, переведя его в координаты вьюбокса.
+    ///
+    /// `ts` — АБСОЛЮТНОЕ преобразование фигуры: то, что накопили группы над ней, плюс то, чем
+    /// usvg разворачивает сам `viewBox`. Без него конвертер молча врал на двух очень обычных
+    /// случаях: у иконки с `viewBox="0 -960 960 960"` (так выложены Material Symbols) все
+    /// координаты отрицательные, и файл выходил пустым на вид; у выгрузки со сдвинутой группой
+    /// фигура уезжала на её сдвиг. «Всё это разворачивает usvg» в шапке было правдой лишь
+    /// наполовину: развернуть-то он разворачивает, но в преобразование узла, а не в точки.
+    fn emit(
+        &mut self, path: &tiny_skia_path::Path, ts: tiny_skia_path::Transform, rgba: [u8; 4],
+        evenodd: bool,
+    ) {
+        let Some(path) = path.clone().transform(ts) else {
+            self.skip("вырожденное преобразование фигуры (нулевой масштаб?)");
+            return;
+        };
+        let path = &path;
         if self.first_box.is_none() {
             self.first_box = Some(path.bounds());
         }

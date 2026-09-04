@@ -3241,8 +3241,13 @@ fn syscall(t: &mut Table, cur: usize) {
         58 => {
             let c = t.procs[cur].frame.arg(0);
             let dom = t.procs[cur].domain;
-            let result = match cap::info(dom, Cap::from_bits(c as u64)) {
-                Ok((kind, rights)) => (kind as usize) << 16 | rights.0 as usize,
+            // Веха 166 — в старших битах едет ещё и АДРЕСАТ эндпоинта (`aux`), а не только вид
+            // с правами. Раскладка выбрана так, чтобы старые читатели ничего не заметили: они
+            // берут `>> 16` в `u8` и младшие 16 бит, то есть выше 32-го бита не смотрят вовсе.
+            let result = match cap::info_ex(dom, Cap::from_bits(c as u64)) {
+                Ok((kind, rights, aux)) => {
+                    (aux as usize) << 32 | (kind as usize) << 16 | rights.0 as usize
+                }
                 Err(_) => usize::MAX,
             };
             let f = &mut t.procs[cur].frame;
