@@ -89,6 +89,16 @@ static ALLOC: sys::heap::Heap<{ 24 * 1024 * 1024 }> = sys::heap::Heap::new();
 /// установлено», и брать это из чужих рук ему неоткуда.
 const BUILD: &str = env!("VOID_BUILD");
 
+/// Сборка КОРОТКО — только слепок (`aa1ceb8+`), без даты. Дата сборки повторяет соседнюю строку
+/// «дата» через день-два и при этом делает строку самой длинной в карточке, то есть задаёт её
+/// ширину. Слепок опознаёт сборку однозначно, дата — нет.
+fn build_short() -> &'static str {
+    match BUILD.split_once(' ') {
+        Some((hash, _)) => hash,
+        None => BUILD,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let Some((sw, sh)) = win::screen() else {
@@ -335,9 +345,6 @@ struct Bar {
     /// VOID нет, поэтому «чьё это» — про устройство. Без картинки в кружке рисуется знак системы
     /// (Веха 158), а не первая буква имени: имя и так написано рядом.
     device: String,
-    /// Имя пришло ИЗ КОНФИГА, а не подставлено. Нужно шапке: под безымянной машиной писать
-    /// «VOID <сборка>» вторым «VOID» подряд — это выглядеть сломанным, а не скромным.
-    named: bool,
     avatar_root: Option<String>,
     /// Распакованный аватар под размер кружка и признак «пробовали уже». Пробуем ОДИН раз и по
     /// первому открытию меню: распаковка картинки на старте панели задержала бы весь экран.
@@ -464,8 +471,7 @@ impl Bar {
         // Имя устройства из конфига; без него — «VOID». Пустым его оставлять нельзя: шапка меню
         // без единого слова выглядит недорисованной.
         let (left, center, right, from_conf) = layout_from(gen_text);
-        let named = ui::conf::device(gen_text, "name");
-        let device = named.clone().unwrap_or_else(|| "VOID".to_string());
+        let device = ui::conf::device(gen_text, "name").unwrap_or_else(|| "VOID".to_string());
         let avatar = ui::conf::device(gen_text, "avatar");
         // Высота считается ОТ ШРИФТА и от темы: разъехаться им нельзя (см. `bar_wanted` в `wm`).
         let isle_h = line_h + 2 * th.px(5);
@@ -503,12 +509,12 @@ impl Bar {
             confirm: false,
             gen: ui::conf::generation_name().unwrap_or_else(|| "VOID".to_string()),
             device: device.clone(),
-            named: named.is_some(),
             avatar_root: avatar,
             avatar: None,
             avatar_tried: false,
-            // Кружок в две строки высотой минус поле — тот же расчёт, что у шапки карточки.
-            av_px: (2 * (line_h + th.px(6)) - 2 * th.px(2)).max(8) as u32,
+            // Сторона знака в шапке — ровно две строки текста: тот же расчёт, что в
+            // [`Bar::metrics`] (`head - 2*pad`), и разъехаться им нельзя.
+            av_px: (2 * line_h).max(8) as u32,
             roots: (0, true),
             go: None,
             flip: false,
@@ -918,7 +924,15 @@ impl Bar {
         if redraw[I_CARD] {
             // Карточка режется краем панели: она выезжает ИЗ-ПОД неё, а не поверх её островов.
             u.clip(card_clip);
-            u.clear(self.isles[I_CARD].rect.union(want[I_CARD].rect));
+            // Стереть надо и УГОЛКИ карточки: они торчат за её прямоугольник (слева сверху и
+            // справа снизу), и без запаса от прошлого кадра остался бы их след.
+            let fil = ui::panel_fillet(self.strip);
+            let gone = self.isles[I_CARD].rect.union(want[I_CARD].rect);
+            u.clear(Rect::new(gone.x - fil, gone.y, gone.w + fil, gone.h + fil));
+            // Веха 162 — и вернуть уголки САМОЙ ПОЛОСЫ: карточка прижата к правому краю экрана,
+            // то есть накрывает правый стык полосы со столом. Под клипом это стоит двух уголков,
+            // а не перерисовки ряда: выше `strip - margin` клип не пускает.
+            u.panel(w, self.strip);
             if menu_t > 0 {
                 u.fade(menu_t);
                 self.draw_card(u, th, card, &uptime, &clock, pow_hot);
@@ -1047,42 +1061,84 @@ impl Bar {
         }
     }
 
-    /// Высота строки сведений и высота плитки — считаются от шрифта, как и всё остальное.
+    /// Меры карточки: строка сведений, высота ШАПКИ и поле внутри коробки.
+    ///
+    /// Шапка — ровно две строки текста плюс поля, как в макете (там 37 при содержимом 31): имя
+    /// машины и время работы под ним. Всё остальное считается от них, чтобы карточка оставалась
+    /// соразмерной себе при любом кегле.
     fn metrics(th: &Theme, font: &Font) -> (i32, i32, i32) {
         let row = font.line_h() + th.px(6);
-        let sep = th.px(11);
-        let tile = font.line_h() + th.px(12);
-        (row, sep, tile)
+        let pad = th.px(3);
+        let head = 2 * font.line_h() + 2 * pad;
+        (row, head, pad)
+    }
+
+    /// Сколько строк в коробке сведений. Число живёт одним местом: по нему считается и высота
+    /// карточки, и то, что в неё влезает.
+    const INFO_ROWS: i32 = 6;
+
+    /// Самая широкая пара «подпись — значение» из тех, что окажутся в коробке сведений. Ширину
+    /// карточки задаёт она, а не выбранные наугад две строки: строка, которую забыли посчитать,
+    /// налезает значением на подпись — обе выравниваются по своим краям и молча встречаются
+    /// посередине.
+    fn widest_row(font: &mut Font, gap: i32) -> i32 {
+        [
+            ("сборка", build_short()),
+            ("поколение", "gen00"),
+            ("время", "00:00"),
+            ("дата", "00.00.0000"),
+            ("столов", "00, сейчас 00"),
+            ("корней в store", "00000+"),
+        ]
+        .iter()
+        .map(|(k, v)| font.width(k) + gap + font.width(v))
+        .max()
+        .unwrap_or(0)
     }
 
     /// Где сейчас карточка меню. `t` — насколько она проявилась (0..256): выезд это сдвиг вверх,
     /// гаснущий вместе с прозрачностью, а не «появилась целиком».
+    ///
+    /// Веха 162 — карточка прижата к ПРАВОМУ КРАЮ ЭКРАНА и к низу полосы, без полей: по макету
+    /// это не отдельное окошко, а продолжение панели вниз ([`ui::Ui::dropdown`]). Поля были бы
+    /// видны насквозь как щель между меню и краем, а вогнутому стыку не на чем стоять.
     fn card_rect(&self, th: &Theme, font: &mut Font, t: u32) -> Rect {
-        let (row, sep, btn) = Self::metrics(th, &*font);
-        let w = (font.width("корней в store") + font.width("00:00 · 00.00.0000") + th.gap
-            + 2 * th.pad)
-            .max(th.px(240));
-        let h = 2 * th.pad + 2 * row + sep + 5 * row + sep + btn;
-        let margin = th.px(6);
+        let (row, head, pad) = Self::metrics(th, &*font);
+        let m = th.px(5); // поле полотна вокруг коробок — из макета
+        let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));
+        let h = 2 * m + head + m + (2 * pad + Self::INFO_ROWS * row);
         // Выезд: подняться на палец и опуститься. Больший ход читается как «упало сверху».
         let lift = th.px(18) * (256 - t as i32) / 256;
         // От низа ПОЛОСЫ, а не поверхности: под полосой у нас теперь ещё вогнутые уголки, и
         // считать от них значило бы отодвинуть карточку от панели на их радиус.
-        Rect::new(self.sw - margin - w, self.strip - lift, w, h)
+        Rect::new(self.sw - w, self.strip - lift, w, h)
     }
 
-    /// Место круглой кнопки выключения. Считается ТЕМ ЖЕ кодом, что и рисование
-    /// ([`Bar::draw_card`] режет тот же прямоугольник теми же кусками): два расчёта «где что» —
-    /// это два случая разойтись, на которых система уже стояла (обзор, Веха 123).
+    /// Коробки макета внутри карточки: шапка и сведения. ОДИН расчёт на всех — рисование и
+    /// попадания берут места отсюда, а не считают их каждый по-своему.
+    fn boxes(&self, th: &Theme, font: &Font, card: Rect) -> (Rect, Rect) {
+        let (_, head, _) = Self::metrics(th, font);
+        let m = th.px(5);
+        let mut c = card.inset(m);
+        let top = c.cut_top(head);
+        c.cut_top(m); // зазор между коробками
+        (top, c)
+    }
+
+    /// Место круглой кнопки выключения — в шапке, справа, как в макете. Считается ТЕМ ЖЕ кодом,
+    /// что и рисование ([`Bar::draw_card`] режет те же коробки): два расчёта «где что» — это два
+    /// случая разойтись, на которых система уже стояла (обзор, Веха 123).
     fn power_rect(&self, th: &Theme, font: &Font, card: Rect) -> Rect {
         if card.is_empty() || !self.open {
             return Rect::ZERO;
         }
-        let (row, sep, btn) = Self::metrics(th, font);
-        let mut c = card.inset_xy(th.pad, th.pad);
-        c.cut_top(2 * row + sep + 5 * row + sep);
-        let foot = c.cut_top(btn);
-        Rect::new(foot.right() - btn, foot.y, btn, btn)
+        let (_, head, pad) = Self::metrics(th, font);
+        let (top, _) = self.boxes(th, font, card);
+        let ico = head - 2 * pad;
+        // 23 из 31 в макете: кнопка чуть меньше строки, иначе круг упирается в края коробки.
+        let btn = (ico - th.px(8)).max(th.px(14));
+        let inner = top.inset(pad);
+        Rect::new(inner.right() - btn, inner.y + (ico - btn) / 2, btn, btn)
     }
 
     /// Карточка центра управления.
@@ -1098,7 +1154,12 @@ impl Bar {
     ///
     /// «Карточки владельца» из плана здесь нет и не будет: владельцев в VOID не существует —
     /// система сознательно без юзеров и root. Вместо человека — УСТРОЙСТВО: его имя и аватар из
-    /// конфига (`device("name", …)`, `device("avatar", …)`), а под ними сборка системы.
+    /// конфига (`device("name", …)`, `device("avatar", …)`), а под ним время работы.
+    ///
+    /// Веха 162 — раскладка по макету: ПОЛОТНО цвета полосы, на нём две коробки. Шапка (иконка,
+    /// имя, время работы, выключение) и сведения. Средний ряд из трёх переключателей в макете
+    /// есть, а здесь его нет: за ним нет ни звука, ни Wi-Fi, ни яркости — рисовать кнопку, под
+    /// которой ничего, запрещено тем же правилом, что и пустой ползунок громкости.
     fn draw_card(
         &mut self,
         u: &mut Ui,
@@ -1108,29 +1169,54 @@ impl Bar {
         clock: &str,
         pow_hot: u32,
     ) {
-        let (row, sep, btn) = Self::metrics(th, &*u.font);
-        u.card(card);
-        let mut c = card.inset_xy(th.pad, th.pad);
+        let (row, head_h, pad) = Self::metrics(th, &*u.font);
+        // Полотно, а не карточка: меню — продолжение полосы вниз, с вогнутыми стыками по бокам.
+        u.dropdown(card, ui::panel_fillet(self.strip));
+        let (top, info) = self.boxes(th, &*u.font, card);
 
         // ── шапка: кто эта машина ──────────────────────────────────────────────────────────
-        let mut head = c.cut_top(2 * row);
-        let av = head.cut_left(2 * row);
-        let img = self.avatar.as_ref().map(|a| (&a.px[..], a.w as i32, a.h as i32));
-        u.avatar(av.inset(th.px(2)), img);
-        head.cut_left(th.gap);
-        let name = Rect::new(head.x, head.y, head.w, row);
-        let sub = Rect::new(head.x, head.y + row, head.w, row);
-        u.label(name, &self.device, th.text, Align::Left);
-        let sub_text =
-            if self.named { alloc::format!("VOID {BUILD}") } else { BUILD.to_string() };
-        u.label(sub, &sub_text, th.muted, Align::Left);
-        u.hsep(c.cut_top(sep));
+        u.card(top);
+        let mut h = top.inset(pad);
+        let ico = head_h - 2 * pad;
+        let art = h.cut_left(ico);
+        match self.avatar.as_ref() {
+            // Своя картинка из конфига — кружком, как было.
+            Some(a) => u.avatar(art, Some((&a.px[..], a.w as i32, a.h as i32))),
+            // Без неё — знак системы прямо на коробке: в макете это перечёркнутый глаз без
+            // подложки, и подложка тут не «фон иконки», а лишний кружок вокруг неё.
+            None => u.c.vg(art, ui::icon::LOGO, th.muted),
+        }
+        h.cut_left(th.px(4));
+        let round = self.power_rect(th, &*u.font, card);
+        h.cut_right(round.w + th.px(4));
+        let line = u.font.line_h();
+        u.label(Rect::new(h.x, h.y, h.w, line), &self.device, th.text, Align::Left);
+        // Вторая строка шапки — время работы, а на втором шаге выключения ПРЕДУПРЕЖДЕНИЕ: место
+        // одно, и подпись у кнопки, которая сейчас погасит машину, важнее уптайма.
+        let (sub, col) = if self.confirm {
+            ("нажми ещё раз", th.danger)
+        } else {
+            (uptime, th.muted)
+        };
+        u.label(Rect::new(h.x, h.y + line, h.w, line), sub, col, Align::Left);
+        if u.power_button(round, pow_hot, self.confirm) {
+            if self.confirm {
+                self.power = true;
+            } else {
+                self.confirm = true;
+            }
+        }
 
         // ── сведения ───────────────────────────────────────────────────────────────────────
+        u.card(info);
+        let mut c = info.inset(pad);
         let (year, mo, d, _, _, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
+        u.row(c.cut_top(row), "сборка", build_short());
         u.row(c.cut_top(row), "поколение", &self.gen);
-        u.row(c.cut_top(row), "работает", uptime);
-        u.row(c.cut_top(row), "время", &alloc::format!("{clock} · {d:02}.{mo:02}.{year}"));
+        // Время и дата — РАЗНЫМИ строками: вместе они были самой длинной строкой карточки и
+        // растягивали её вдвое против макета ради одного значения.
+        u.row(c.cut_top(row), "время", clock);
+        u.row(c.cut_top(row), "дата", &alloc::format!("{d:02}.{mo:02}.{year}"));
         u.row(
             c.cut_top(row),
             "столов",
@@ -1145,24 +1231,6 @@ impl Bar {
                 alloc::format!("{}+", self.roots.0)
             },
         );
-        u.hsep(c.cut_top(sep));
-
-        // ── выключение ─────────────────────────────────────────────────────────────────────
-        let mut foot = c.cut_top(btn);
-        let round = foot.cut_right(btn);
-        foot.cut_right(th.gap); // подпись не должна упираться в кнопку
-        if self.confirm {
-            // Подпись только на втором шаге: у кнопки со знаком её быть не должно, а у кнопки,
-            // которая сейчас выключит машину, — обязана.
-            u.label(foot, "нажми ещё раз", th.danger, Align::Right);
-        }
-        if u.power_button(round, pow_hot, self.confirm) {
-            if self.confirm {
-                self.power = true;
-            } else {
-                self.confirm = true;
-            }
-        }
     }
 }
 
