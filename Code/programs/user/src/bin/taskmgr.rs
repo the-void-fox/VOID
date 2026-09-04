@@ -91,6 +91,11 @@ struct App {
     tab_system: bool,
     caps: Vec<Capp>,
     stat: Option<sys::ProcStat>,
+    /// Веха 163 — ПРОШЛЫЙ замер того же процесса и сколько прошло по часам, нс. Из этой пары и
+    /// нового замера получается доля процессора; одного замера для неё не хватает никогда.
+    prev: Option<(sys::ProcStat, u64)>,
+    prev_pid: Option<u16>,
+    prev_at: Option<u64>,
     /// Для какого pid прочитаны подробности (чтобы не читать каждый кадр — только при смене
     /// выбора и по таймеру обновления).
     detail_pid: Option<u16>,
@@ -170,7 +175,25 @@ impl App {
         }
         self.detail_pid = Some(pid);
         self.caps = read_caps(self.sysview, pid);
-        self.stat = sys::proc_stat(self.sysview, pid as usize);
+        // Веха 163 — прошлый замер того же процесса сохраняем ДО нового: доля процессора это
+        // разность двух, и мгновенной её не бывает. Замер чужого процесса не годится — при
+        // смене выбора прошлое забывается, и первая доля показывается только со второго тика.
+        let now = sys::monotonic_ns();
+        let fresh = sys::proc_stat(self.sysview, pid as usize);
+        self.prev = match (self.stat.take(), self.prev_at) {
+            (Some(old), Some(at)) if self.prev_pid == Some(pid) => Some((old, now.saturating_sub(at))),
+            _ => None,
+        };
+        self.prev_pid = Some(pid);
+        self.prev_at = Some(now);
+        self.stat = fresh;
+    }
+
+    /// Доля процессора выбранного процесса за прошедший промежуток, `None` — замер всего один.
+    fn cpu_percent(&self) -> Option<u32> {
+        let now = self.stat.as_ref()?;
+        let (old, dt) = self.prev.as_ref()?;
+        Some(now.cpu_percent(old, *dt))
     }
 
     /// Разрезать окно на места виджетов.
@@ -403,7 +426,22 @@ impl App {
         let par = if ppid == 0xFFFF { String::from("—") } else { alloc::format!("P{}", ppid) };
         u.row(d.cut_top(font_h + th.px(2)), "родитель", &par);
         u.row(d.cut_top(font_h + th.px(2)), "состояние", state_full(state));
+        // Веха 163 — что процесс СТОИТ машине. Доля появляется со ВТОРОГО замера: до него
+        // показывать нечего, и прочерк честнее нуля («0 %» значило бы «замерили и вышло ноль»).
+        // Рядом с долей — время НАКОПЛЕННОЕ: доля за полсекунды у всего, что не жжёт процессор,
+        // округляется в ноль, и без второго числа «0 %» неотличимо от «счётчик не работает».
+        let cpu_pc = self.cpu_percent();
         if let Some(st) = &self.stat {
+            let cpu = match cpu_pc {
+                Some(p) => alloc::format!("{p} % · {} всего", dur_text(st.run_ns)),
+                None => alloc::format!("— · {} всего", dur_text(st.run_ns)),
+            };
+            u.row(d.cut_top(font_h + th.px(2)), "процессор", &cpu);
+            u.row(
+                d.cut_top(font_h + th.px(2)),
+                "куча",
+                &alloc::format!("{} КиБ ({} страниц)", st.heap_bytes() / 1024, st.heap_pages),
+            );
             let a = alloc::format!("{} вызовов, {} Б", st.calls_made, st.bytes_sent);
             u.row(d.cut_top(font_h + th.px(2)), "сделал IPC", &a);
             let b = alloc::format!("{} вызовов, {} Б", st.calls_recv, st.bytes_recv);
@@ -521,6 +559,17 @@ fn rights_str(r: u32) -> String {
 }
 
 /// Короткое имя состояния (для подписи в списке).
+/// Веха 163 — длительность человеку: миллисекунды, пока их немного, дальше секунды с десятой.
+/// Наносекунды не показываем никогда — у процессорного времени такой точности нет смысла.
+fn dur_text(ns: u64) -> String {
+    let ms = ns / 1_000_000;
+    if ms < 10_000 {
+        alloc::format!("{ms} мс")
+    } else {
+        alloc::format!("{},{} с", ms / 1000, ms % 1000 / 100)
+    }
+}
+
 fn state_name(s: u8) -> &'static str {
     match s {
         0 => "работает",
@@ -687,6 +736,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         tab_system: true,
         caps: Vec::new(),
         stat: None,
+        prev: None,
+        prev_pid: None,
+        prev_at: None,
         detail_pid: None,
         lay: Lay::default(),
         net_srv_pid: None,

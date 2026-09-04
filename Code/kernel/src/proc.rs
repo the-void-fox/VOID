@@ -219,6 +219,14 @@ struct Proc {
     /// Веха 89 — сколько ФРЕЙМОВ куча этой группы реально заняла (лениво, по фолтам).
     /// Живёт у лидера группы, как и `heap_brk`; сверяется с [`page_quota`].
     pages: usize,
+    /// Веха 163 — СКОЛЬКО ВРЕМЕНИ ядро исполняло этот процесс, в тиках. Копится в [`resume`]:
+    /// каждый trap из U закрывает отрезок, начатый последним входом в U. Считается тем же
+    /// счётчиком, что уптайм и простой, и простой из отрезка вычитается — иначе процесс,
+    /// уснувший в `wait_stdin`, «жёг» бы процессор, которого он как раз и не занимал.
+    ///
+    /// Это не выборка и не эвристика: время меряется на границах, где оно и тратится. Загрузку
+    /// в процентах считает тот, кто показывает, — вычитанием двух замеров ([[task-manager]]).
+    run_ticks: u64,
     /// Веха 22.1: ленивая куча процесса — зарезервированный `SYS_MAP` диапазон
     /// [`USER_HEAP_BASE_VA`, heap_brk). Фолт внутри — выделить страницу; вне — гибель процесса.
     heap_brk: usize,
@@ -343,6 +351,15 @@ const SYSINFO_REC: usize = 48;
 /// поэтому честное по построению, а не правдоподобное.
 static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Веха 163 — незакрытый отрезок исполнения: кого мы отпустили в U, когда это было и сколько к
+/// тому мгновению накопилось простоя. Три числа рядом, потому что закрывается отрезок ОДНИМ
+/// вычитанием ([`resume`]): «прошло всего» минус «из этого простаивали».
+///
+/// `usize::MAX` в pid значит «в U никого не отпускали» — первый заход и путь без процессов.
+static LAST_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_ENTER: AtomicU64 = AtomicU64::new(0);
+static LAST_IDLE: AtomicU64 = AtomicU64::new(0);
+
 /// Веха 52 — «пришло прерывание userspace-драйвера» (вектор `VEC_USERDRV`). Обработчик IRQ
 /// выставляет флаг БЕЗ замка таблицы процессов (иначе дедлок с прерванным контекстом), а
 /// планировщик снимает его и будит спящих в `SYS_IRQ_WAIT` ([`drain_userdrv_irq`]).
@@ -438,6 +455,7 @@ fn create_process_locked(
         wake_on_key: false,
         reads_console: false,
         pages: 0,
+        run_ticks: 0,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
         args: {
             // argv по умолчанию — только имя программы; SYS_EXEC добавит аргументы вызывающего.
@@ -498,6 +516,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         wake_on_key: false,
         reads_console: false,
         pages: 0, // не используется у нити: учёт ведёт лидер
+        run_ticks: 0, // у нити СВОЙ: она исполняется отдельно от лидера
         heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
         args: Vec::new(),
         env: Vec::new(),
@@ -1260,6 +1279,30 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
 
 /// Возобновить текущий процесс (или, если он не готов, следующий готовый). Если готовых нет
 /// (все завершены или заблокированы) — вернуться в ядро (в [`run`]). Не возвращается.
+/// Веха 163 — закрыть отрезок исполнения: приписать процессу, который был в U, время от входа
+/// туда до этого мгновения ЗА ВЫЧЕТОМ простоя, случившегося внутри отрезка.
+///
+/// Вычитание обязательно: `wait_stdin` крутит ожидание ВНУТРИ системного вызова, то есть внутри
+/// отрезка того, кто уснул. Без него единственный спящий процесс показывал бы 100 % — ровно
+/// наоборот тому, что происходит.
+fn close_slice(t: &mut Table) {
+    let pid = LAST_PID.swap(usize::MAX, Ordering::Relaxed);
+    if pid == usize::MAX || pid >= t.procs.len() {
+        return;
+    }
+    let idle = IDLE_TICKS.load(Ordering::Relaxed);
+    let spent = arch::now_ticks().saturating_sub(LAST_ENTER.load(Ordering::Relaxed));
+    let idled = idle.saturating_sub(LAST_IDLE.load(Ordering::Relaxed));
+    t.procs[pid].run_ticks += spent.saturating_sub(idled);
+}
+
+/// Веха 163 — открыть отрезок: с этого мгновения процессорное время идёт процессу `pid`.
+fn open_slice(pid: usize) {
+    LAST_IDLE.store(IDLE_TICKS.load(Ordering::Relaxed), Ordering::Relaxed);
+    LAST_ENTER.store(arch::now_ticks(), Ordering::Relaxed);
+    LAST_PID.store(pid, Ordering::Relaxed);
+}
+
 fn resume() -> ! {
     // Веха 33: политика group commit живёт здесь — каждый trap из U (включая
     // вытеснение таймером каждые ~10 мс) проходит через resume, замки в этот
@@ -1276,6 +1319,11 @@ fn resume() -> ! {
     // Веха 52: пришёл IRQ userspace-драйвера — разбудить спящих в SYS_IRQ_WAIT.
     drain_userdrv_irq(&mut t);
     drain_net_irq(&mut t); // Веха 91: приехал кадр — разбудить сетевой сервер
+    // Веха 163 — закрыть отрезок исполнения того, кто сюда и привёл нас trap'ом. Время меряется
+    // ЗДЕСЬ, а не в планировщике: `resume` — единственная дверь в U, и через неё проходит всё,
+    // включая вытеснение таймером. Работа ядра по системному вызову засчитывается процессу,
+    // который её заказал, — это его процессорное время, а не ничьё.
+    close_slice(&mut t);
     let c = t.current;
     let chosen = if t.procs[c].state == State::Runnable {
         Some(c)
@@ -1285,6 +1333,7 @@ fn resume() -> ! {
     match chosen {
         Some(n) => {
             t.current = n;
+            open_slice(n);
             let frame = t.procs[n].frame;
             let space = t.procs[n].space;
             // Веха 46: вернуть фреймы групп, что полностью завершились (страницы, таблицы, корень).
@@ -3328,7 +3377,9 @@ fn syscall(t: &mut Table, cur: usize) {
         }
         // SYS_PROC_STAT(sysview_cap, pid, buf_ptr) -> 0 | MAX (Веха 153.3): «что процесс делает
         // СЕЙЧАС» под правом Sysview READ. 64 Б в буфер: calls_made u64, bytes_sent u64,
-        // calls_recv u64, bytes_recv u64, flags u16 (bit0 — держит ЭКРАН), дальше резерв. Это не
+        // calls_recv u64, bytes_recv u64, flags u16 (bit0 — держит ЭКРАН), резерв u16,
+        // страниц кучи u32 (Веха 163), процессорное время в нс u64 (Веха 163), дальше резерв.
+        // Резерв тут и пригодился: запись `PROC_LIST` занята целиком, а этой было куда расти. Это не
         // эвристика и не выборка (как «Диск 2%» снаружи), а учёт самих опосредованных вызовов —
         // правда по построению; скорость диспетчер считает вычитанием двух замеров.
         61 => {
@@ -3344,7 +3395,12 @@ fn syscall(t: &mut Table, cur: usize) {
                         && ensure_heap_range(t, cur, bptr, 64) =>
                 {
                     let holds_screen = arch::video_owner() == Some(pid);
+                    // Веха 163 — память считается У ЛИДЕРА ГРУППЫ: куча общая на все нити, и
+                    // показать её каждой значило бы посчитать одни и те же страницы дважды.
+                    let leader = t.procs[pid].group;
+                    let pages = t.procs.get(leader).map_or(0, |l| l.pages) as u32;
                     let p = &t.procs[pid];
+                    let run_ns = crate::clock::ticks_to_ns(p.run_ticks);
                     let mut rec = [0u8; 64];
                     rec[0..8].copy_from_slice(&p.calls_made.to_le_bytes());
                     rec[8..16].copy_from_slice(&p.bytes_sent.to_le_bytes());
@@ -3352,6 +3408,8 @@ fn syscall(t: &mut Table, cur: usize) {
                     rec[24..32].copy_from_slice(&p.bytes_recv.to_le_bytes());
                     let flags: u16 = if holds_screen { 0x01 } else { 0 };
                     rec[32..34].copy_from_slice(&flags.to_le_bytes());
+                    rec[36..40].copy_from_slice(&pages.to_le_bytes());
+                    rec[40..48].copy_from_slice(&run_ns.to_le_bytes());
                     let dst = unsafe { core::slice::from_raw_parts_mut(bptr as *mut u8, 64) };
                     dst.copy_from_slice(&rec);
                     0
