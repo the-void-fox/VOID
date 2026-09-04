@@ -140,6 +140,13 @@ struct App {
     /// Прямоугольник, нарисованный в прошлом кадре: его надо стереть, иначе карточка оставит
     /// за собой хвост, пока выезжает.
     last: Rect,
+    /// Веха 165 — кадр вызван ТОЛЬКО движением: ни набранное, ни выбор, ни курсор не менялись.
+    ///
+    /// Тогда трогать надо ровно ту полоску, которая открылась (или закрылась) с прошлого кадра:
+    /// раскрытие клипом ничего не двигает, и всё, что выше края, уже нарисовано правильно. С
+    /// проявлением так было НЕЛЬЗЯ — там каждый пиксель карточки менял яркость каждый кадр, и
+    /// перерисовка всей карточки была не расточительством, а единственным вариантом.
+    anim_only: bool,
     mo: Motion,
 
     // ── Веха 148.3: измерено в кадре, спрошено в событии ──────────────────────────────────
@@ -156,9 +163,8 @@ struct App {
 }
 
 impl App {
-    /// Карточка целиком. `t` — насколько открылась (0..256): выезд это подъём, гаснущий вместе
-    /// с прозрачностью, — так же, как у меню панели.
-    fn card_rect(&self, th: &Theme, font: &Font, t: u32) -> Rect {
+    /// Карточка целиком, как она выглядит ОТКРЫТОЙ. Движение — в [`App::sheet`].
+    fn card_rect(&self, th: &Theme, font: &Font) -> Rect {
         let w = (self.sw * 2 / 5).clamp(th.px(360), th.px(560));
         let field = font.line_h() + th.px(14);
         let row = 2 * font.line_h() + th.px(14);
@@ -168,9 +174,22 @@ impl App {
         let h = 2 * th.pad + field + th.gap + self.rows() * row + foot;
         // Не по центру, а выше него: список растёт вниз, и карточка, посаженная в центр, всё
         // время выглядит съехавшей.
-        let y = self.sh * 22 / 100;
-        let lift = th.px(18) * (256 - t as i32) / 256;
-        Rect::new((self.sw - w) / 2, y + lift, w, h)
+        Rect::new((self.sw - w) / 2, self.sh * 22 / 100, w, h)
+    }
+
+    /// Веха 165 — сколько карточки РАЗВЕРНУЛОСЬ (`t` — 0..256).
+    ///
+    /// Раскрытие вниз от верхнего края вместо проявления — по той же причине, что у меню панели
+    /// ([`bar`]): оболочка должна вести себя как вещество, а не как слайд. Здесь у этого есть
+    /// и вторая, измеримая сторона — та самая «рваность», на которую жаловался владелец.
+    ///
+    /// Пока карточка проявлялась, её фон был ПОЛУПРОЗРАЧНЫМ каждый кадр движения. А
+    /// полупрозрачное на пустой поверхности идёт по самой медленной ветке `blend`: деление на
+    /// каждый канал каждого пикселя. Карточка — двести тысяч пикселей; шестьдесят кадров в
+    /// секунду этого никакая машина не выдаёт, и кадры начинали пропускаться неровно. Раскрытие
+    /// клипом рисует непрозрачным (заливка строками) и ровно ту часть, которая видна.
+    fn sheet(&self, card: Rect, t: u32) -> Rect {
+        Rect::new(card.x, card.y, card.w, card.h * t.min(256) as i32 / 256)
     }
 
     /// Сколько строк списка показываем сейчас: столько, сколько нашлось, но не больше [`ROWS`].
@@ -236,11 +255,34 @@ impl App {
     /// рисование не должно уметь запускать программы, иначе одно и то же действие оказалось бы
     /// в двух местах (клавиатура — в цикле, мышь — здесь).
     fn card(&mut self, u: &mut Ui, th: &Theme, t: u32) -> Option<usize> {
-        let r = self.card_rect(th, &*u.font, t);
-        u.clear(self.last.union(r));
-        self.last = r;
-        u.fade(t);
-        let mut inner = u.card(r);
+        let full = self.card_rect(th, &*u.font);
+        let r = self.sheet(full, t);
+        let prev = core::mem::replace(&mut self.last, r);
+        if r.is_empty() {
+            u.clear(prev);
+            return None;
+        }
+        // Что изменилось с прошлого кадра. На движении — полоска у нижнего края: от меньшего
+        // низа (минус скругление: угол карточки уехал вниз и стал серединой) до большего.
+        let area = if self.anim_only && !prev.is_empty() {
+            let lo = prev.bottom().min(r.bottom()) - th.radius;
+            let hi = prev.bottom().max(r.bottom());
+            Rect::new(r.x, lo, r.w, hi - lo)
+        } else {
+            prev.union(r)
+        };
+        // Клип СУЖАЕМ, а не назначаем: снаружи он мог быть уже нашего (подсветка строки под
+        // курсором объявляет только полосу списка), и назначить свой значило бы перерисовать
+        // всю карточку на каждый переезд мыши между строками.
+        let keep = u.c.clip();
+        u.clip(keep.intersect(area));
+        u.clear(area);
+        // Подложка рисуется по РАЗВЁРНУТОМУ, содержимое — по окончательному месту под клипом:
+        // строки, которые ехали бы вместе с краем, читались бы как второе движение внутри
+        // первого. Список разворачивается ИЗ поля ввода, а не вылетает из-под него.
+        u.card(r);
+        u.clip(keep.intersect(area).intersect(r));
+        let mut inner = full.inset_xy(th.pad, 0);
         inner.cut_top(th.pad);
 
         let field = u.font.line_h() + th.px(14);
@@ -287,13 +329,16 @@ impl App {
             alloc::format!("{} из {} ярлыков", n, self.shortcuts())
         };
         u.label(foot, &s, th.muted, Align::Right);
-        u.fade(256);
+        u.clip(keep);
         hit
     }
 }
 
 impl ui::Client for App {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
+        // Пришло событие — значит изменилось не только движение: карточку надо считать заново
+        // целиком. Флаг снимается в [`ui::Client::tick`], и только там.
+        self.anim_only = false;
         match e {
             Event::Key { sym: code, mods: _, ch, down } if down => {
                 // Escape и Enter — НАШИ: у строки запуска они закрывают и запускают, а не
@@ -377,7 +422,12 @@ impl ui::Client for App {
     }
 
     fn tick(&mut self) -> ui::Scope {
-        if self.mo.moving() || self.closing { ui::Scope::All } else { ui::Scope::No }
+        if self.mo.moving() || self.closing {
+            self.anim_only = true;
+            ui::Scope::All
+        } else {
+            ui::Scope::No
+        }
     }
 
     fn done(&self) -> bool {
@@ -448,6 +498,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         ls: ui::List::default(),
         raw: false,
         last: Rect::ZERO,
+        anim_only: false,
         mo: Motion::new(ui::anim::duration_from_config(&generation)),
         store,
         wm_ep: win::endpoint().unwrap_or(sys::NO_CAP),

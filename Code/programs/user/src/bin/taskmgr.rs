@@ -162,7 +162,11 @@ struct App {
     /// Числа про машину целиком и прошлый их замер — для загрузки и графика.
     info: Option<sys::SysInfo>,
     info_prev: Option<sys::SysInfo>,
-    hist: Vec<u8>,
+    /// Веха 165 — история У КАЖДОГО устройства, а не одна на всех: в макете окошко графика стоит
+    /// рядом с каждой плиткой, и внизу — увеличенная версия ТОЙ ЖЕ кривой. Пустая история —
+    /// не «ноль», а «источника нет»: окошко у диска и видео так и остаётся пустым, и это ровно
+    /// то, что про них правда ([[void-taskmgr]]).
+    hist: Vec<Vec<u8>>,
     /// Выбранная плитка устройства.
     dev: usize,
     lay: Lay,
@@ -258,14 +262,25 @@ impl App {
         // Числа про машину целиком — и точка на графике.
         self.info_prev = self.info.take();
         self.info = sys::sysinfo(self.sysview);
+        // Замер идёт в историю ТОГО устройства, к которому относится. Загрузка процессора —
+        // разность двух замеров (первого одного не хватает никогда), занятая память — число
+        // само по себе.
         if let (Some(n), Some(p)) = (&self.info, &self.info_prev) {
-            let load = n.cpu_percent(p).min(100) as u8;
-            if self.hist.len() == HIST {
-                self.hist.remove(0);
-            }
-            self.hist.push(load);
+            self.push_hist(0, n.cpu_percent(p).min(100) as u8);
+        }
+        if let Some(n) = &self.info {
+            self.push_hist(1, n.ram_percent().min(100) as u8);
         }
         self.refilter(keep);
+    }
+
+    /// Добавить замер в историю устройства `k`, подвинув окно на минуту.
+    fn push_hist(&mut self, k: usize, v: u8) {
+        let Some(h) = self.hist.get_mut(k) else { return };
+        if h.len() == HIST {
+            h.remove(0);
+        }
+        h.push(v);
     }
 
     /// Прочитать права выбранного процесса, если ещё не прочитаны для его pid.
@@ -292,12 +307,16 @@ impl App {
         all.cut_top(th.gap);
         let mut lay = Lay { tabs, row_h, ..Lay::default() };
         if self.tab == Tab::Perf {
-            // Плитки: три в ряд, два ряда (как в макете — сетка, а не список).
-            let tile_h = 2 * font_h + th.px(20);
-            lay.tiles = all.cut_top(2 * tile_h + 3 * th.px(6));
+            // Веха 165 — высота полотна считается ТЕМ ЖЕ кодом, что и места плиток
+            // ([`App::tile_rect`]). До этой вехи их было две штуки: полотно резалось по одной
+            // формуле, плитки расставлялись по другой, — и нижний ряд вылезал за край на
+            // половину зазора. Разъехаться двум расчётам «где что» тут было ровно нечему
+            // помешать: оба выглядели правильными по отдельности.
+            lay.tiles = all.cut_top(Self::tiles_h(th, font_h));
             all.cut_top(th.gap);
-            // Подробности выбранного — ровно столько строк, сколько мы умеем показать.
-            lay.detail = all.cut_top(6 * (font_h + th.px(3)) + 2 * th.pad);
+            // Подробности лежат ПРЯМО НА ФОНЕ, без карточки: в макете под ними нет подложки —
+            // между полотном плиток и полем графика идёт голый фон окна.
+            lay.detail = all.cut_top(Self::detail_h(th, font_h));
             all.cut_top(th.gap);
             lay.graph = all;
             return lay;
@@ -325,6 +344,38 @@ impl App {
         caps.cut_left(th.gap);
         lay.capinfo = caps;
         lay
+    }
+
+    /// Сколько плиток в ряду. Три — как в макете; при более узком окне сетка не ужимается в две,
+    /// потому что ширину окна назначает лента композитора, а не человек, и «иногда две, иногда
+    /// три» читалось бы как сбой раскладки.
+    const TILE_COLS: usize = 3;
+
+    /// Высота одной плитки: имя, подпись и значение — три строки текста плюс поля.
+    fn tile_h(th: &Theme, font_h: i32) -> i32 {
+        3 * font_h + th.px(10)
+    }
+
+    /// Высота полотна плиток целиком: поля по краям, ряды и зазоры между ними.
+    fn tiles_h(th: &Theme, font_h: i32) -> i32 {
+        let rows = DEVS.len().div_ceil(Self::TILE_COLS) as i32;
+        2 * th.px(6) + rows * Self::tile_h(th, font_h) + (rows - 1) * th.px(9)
+    }
+
+    /// Высота блока подробностей: строка-заголовок и сетка пар в две колонки.
+    fn detail_h(th: &Theme, font_h: i32) -> i32 {
+        (font_h + th.px(6)) + 4 * (font_h + th.px(3))
+    }
+
+    /// Место плитки `k` внутри полотна. ЕДИНСТВЕННЫЙ расчёт: им же меряется высота полотна.
+    fn tile_rect(th: &Theme, tiles: Rect, font_h: i32, k: usize) -> Rect {
+        let (pad, gap) = (th.px(6), th.px(9));
+        let inner = tiles.inset(pad);
+        let cols = Self::TILE_COLS as i32;
+        let cw = (inner.w - (cols - 1) * gap) / cols;
+        let ch = Self::tile_h(th, font_h);
+        let (cx, cy) = ((k % Self::TILE_COLS) as i32, (k / Self::TILE_COLS) as i32);
+        Rect::new(inner.x + cx * (cw + gap), inner.y + cy * (ch + gap), cw, ch)
     }
 
     /// Прямоугольник карточки таблицы — по шапке и списку (карточка рисуется вокруг них).
@@ -518,7 +569,9 @@ impl App {
 
         let mut acted: Option<u16> = None; // слот, у которого нажали «отнять»
         let mut picked: Option<usize> = None;
-        let btn_w = th.px(76);
+        // Веха 165 — по макету отзыв это ЗНАК, а не слово: у строки права своя ширина в три
+        // десятка знаков, и подпись «отнять» рядом занимала треть её.
+        let btn_w = font_h + th.px(4);
         let row_h = font_h + th.px(6);
         for k in 0..self.caps.len() {
             if d.h < row_h {
@@ -554,7 +607,7 @@ impl App {
             u.label(rr, &txt, th.text, Align::Left);
             if self.can_write {
                 let hot = if u.hot(btn) { 256 } else { 0 };
-                if u.danger(btn, "отнять", hot) {
+                if u.icon_button(btn, ui::icon::REVOKE, hot, true) {
                     acted = Some(slot);
                 }
             }
@@ -637,110 +690,131 @@ impl App {
         false
     }
 
-    /// Вкладка производительности: плитки устройств, подробности выбранного и график загрузки.
+    /// Вкладка производительности: плитки устройств, подробности выбранного и его график.
+    ///
+    /// Веха 165 — по макету у КАЖДОЙ плитки своё окошко кривой, а внизу — та же кривая крупно.
+    /// Одного графика «загрузка процессора» на всю вкладку в макете нет и не было: он отвечал
+    /// на вопрос про процессор независимо от того, какую плитку человек выбрал.
     fn paint_perf(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) -> bool {
         let font_h = u.font.line_h();
         let mut dirty = false;
-        let inner = u.card(lay.tiles);
-        let gap = th.px(6);
-        let tw = (inner.w - 2 * gap) / 3;
-        let tile_h = (inner.h - gap) / 2;
+        u.card(lay.tiles);
         for (k, dev) in DEVS.iter().enumerate() {
-            let (cx, cy) = (k % 3, k / 3);
-            let r = Rect::new(
-                inner.x + cx as i32 * (tw + gap),
-                lay.tiles.y + gap + cy as i32 * (tile_h + gap) - gap / 2,
-                tw,
-                tile_h,
-            );
+            let r = Self::tile_rect(th, lay.tiles, font_h, k);
             let sel = k == self.dev;
             let hot = u.hot(r);
-            let bg = if sel { th.band_on } else { th.band };
-            let c = u.tint(if hot && !sel { bg.mix(th.text, 24) } else { bg });
-            u.c.rrect(r, th.radius, c);
-            let mut d = r.inset(th.px(8));
-            u.label(d.cut_top(font_h), dev.name, th.text, Align::Left);
+            // Подложки у плитки в макете нет — полотно под ней сплошное, а выбранное различается
+            // яркостью рамки окошка. Подсветка под курсором своя: макет её не рисует вовсе, но
+            // без неё непонятно, что плитка нажимается.
+            if hot && !sel {
+                let c = u.tint(th.text.with_a(0x10));
+                u.c.rrect(r, th.radius, c);
+            }
+            let mut d = r.inset(th.px(3));
+            // Окошко кривой — слева, как в макете (там 69×54 при плитке 69×63).
+            let gh = d.h;
+            let gr = d.cut_left(gh * 5 / 4);
+            d.cut_left(th.px(6));
+            let br = u.tint(if sel { th.text } else { th.muted });
+            u.c.rrect_bordered(gr, th.px(3), th.line.max(1), Rgba::CLEAR, br);
+            let hist = self.hist.get(k).map(|h| h.as_slice()).unwrap_or(&[]);
+            graph(u, th, gr.inset(th.px(2)), hist, false);
             let (val, sub, col) = self.dev_value(k);
+            let name = if sel { th.text } else { th.muted };
+            u.label(d.cut_top(font_h), dev.name, name, Align::Left);
             u.label(d.cut_top(font_h), &sub, th.muted, Align::Left);
-            u.label(r.inset(th.px(8)), &val, col, Align::Right);
+            u.label(d.cut_top(font_h), &val, col, Align::Left);
             if u.clicked(r) && !sel {
                 self.dev = k;
                 dirty = true;
             }
         }
 
-        // ── подробности выбранного ────────────────────────────────────────────────────────
-        let inner = u.card(lay.detail);
-        let mut d = inner.inset(th.pad);
+        // ── подробности выбранного: заголовок и сетка пар в две колонки ────────────────────
+        let mut d = lay.detail;
+        let head = d.cut_top(font_h + th.px(6));
+        u.label(head, DEVS[self.dev].name, th.text, Align::Left);
+        let (val, sub, col) = self.dev_value(self.dev);
+        u.label(head, &alloc::format!("{sub} · {val}"), col, Align::Right);
         let rh = font_h + th.px(3);
-        match self.dev {
-            0 => {
-                let load = match (&self.info, &self.info_prev) {
-                    (Some(n), Some(p)) => alloc::format!("{} %", n.cpu_percent(p)),
-                    _ => String::from("—"),
-                };
-                u.row(d.cut_top(rh), "загрузка (за полсекунды)", &load);
-                if let Some(n) = &self.info {
-                    u.row(d.cut_top(rh), "время работы", &dur_text(n.uptime_ns));
-                    u.row(d.cut_top(rh), "из них простой", &dur_text(n.idle_ns));
-                    u.row(d.cut_top(rh), "процессов", &alloc::format!("{}", n.procs));
+        let pairs = self.detail_rows();
+        if pairs.is_empty() {
+            // Источника нет — вместо пустой сетки причина. Строки разные у «драйвера нет» и
+            // «драйвер есть, счётчиков нет»: писать одно вместо другого значит врать в обе
+            // стороны ([[void-taskmgr]]).
+            for line in dev_help(self.dev) {
+                if d.h < font_h {
+                    break;
                 }
-                u.row(d.cut_top(rh), "архитектура", ARCH);
-                // Одно ядро — не упрощение показа, а состояние системы: SMP в VOID нет, и
-                // писать «ядер: ?» значило бы прятать это за многоточием.
-                u.row(d.cut_top(rh), "ядер", "1 (SMP пока нет)");
+                u.label(d.cut_top(rh), line, th.muted, Align::Left);
             }
-            1 => {
-                if let Some(n) = &self.info {
-                    let mib = |b: u64| alloc::format!("{} МиБ", b / (1024 * 1024));
-                    u.row(d.cut_top(rh), "всего", &mib(n.ram_total));
-                    u.row(d.cut_top(rh), "занято", &mib(n.ram_used));
-                    u.row(d.cut_top(rh), "свободно", &mib(n.ram_total.saturating_sub(n.ram_used)));
-                    u.row(d.cut_top(rh), "занято, доля", &alloc::format!("{} %", n.ram_percent()));
-                    u.row(d.cut_top(rh), "страница", "4 КиБ");
-                    u.row(d.cut_top(rh), "подкачки", "нет (и не будет)");
-                }
-            }
-            _ => {
-                for line in dev_help(self.dev) {
-                    if d.h < font_h {
-                        break;
-                    }
-                    u.label(d.cut_top(rh), line, th.muted, Align::Left);
+        } else {
+            let rows = pairs.len().div_ceil(2);
+            // Зазор между колонками — ШИРЕ обычного: в паре значение прижато вправо, а подпись
+            // соседней колонки — влево, и на обычном зазоре они встречаются в одно слово
+            // («2 % из них простой»).
+            let cgap = 3 * th.pad;
+            let colw = (d.w - cgap) / 2;
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                let (cx, cy) = (i / rows, i % rows);
+                let r = Rect::new(d.x + cx as i32 * (colw + cgap), d.y + cy as i32 * rh, colw, rh);
+                if r.bottom() <= d.bottom() {
+                    u.row(r, k, v);
                 }
             }
         }
 
-        // ── график загрузки ───────────────────────────────────────────────────────────────
+        // ── график выбранного устройства ──────────────────────────────────────────────────
         let inner = u.card(lay.graph);
-        let g = Rect::new(inner.x, lay.graph.y + th.pad, inner.w, lay.graph.h - 2 * th.pad);
-        let mut top = g;
-        u.label(top.cut_top(font_h), "загрузка процессора, последняя минута", th.muted, Align::Left);
-        top.cut_top(th.px(4));
-        if self.hist.len() < 2 {
-            u.label(top, "замеров ещё нет", th.muted, Align::Left);
+        let mut g = Rect::new(inner.x, lay.graph.y + th.pad, inner.w, lay.graph.h - 2 * th.pad);
+        let title = g.cut_top(font_h);
+        u.label(title, &alloc::format!("{}, последняя минута", DEVS[self.dev].name), th.muted, Align::Left);
+        g.cut_top(th.px(4));
+        let hist = self.hist.get(self.dev).map(|h| h.as_slice()).unwrap_or(&[]);
+        if hist.len() < 2 {
+            let why = if DEVS[self.dev].why.is_empty() { "замеров ещё нет" } else { DEVS[self.dev].why };
+            u.label(g, why, th.muted, Align::Left);
             return dirty;
         }
-        // Половина и потолок — волосками: без них плоская линия у самого низа неотличима от
-        // пустого поля, а «плоско» и «нет данных» — разные ответы.
-        let hair = u.tint(th.text.with_a(0x18));
-        for part in [0, 1] {
-            let y = top.y + top.h * part / 2;
-            u.c.fill(Rect::new(top.x, y, top.w, th.line.max(1)), hair);
-        }
-        u.label(Rect::new(top.x, top.y, top.w, font_h), "100 %", th.muted, Align::Right);
-        // Столбик на замер: график РИСУЕТ ТО, ЧТО ЗАМЕРЕНО, и не растягивается на всю ширину —
-        // иначе первые секунды после запуска выглядели бы как минута наблюдений.
-        let bw = (top.w / HIST as i32).max(1);
-        for (k, &v) in self.hist.iter().enumerate() {
-            let x = top.x + k as i32 * bw;
-            // Не меньше двух точек: ноль процентов — тоже замер, и он обязан быть виден.
-            let h = (top.h * v as i32 / 100).max(2);
-            let r = Rect::new(x, top.bottom() - h, (bw - 1).max(1), h);
-            let c = u.tint(th.accent);
-            u.c.fill(r, c);
-        }
+        u.label(title, "100 %", th.muted, Align::Right);
+        graph(u, th, g, hist, true);
         dirty
+    }
+
+    /// Пары «подпись — значение» для блока подробностей. Пусто — источника нет, и вместо сетки
+    /// надо написать, какого именно ([`dev_help`]).
+    fn detail_rows(&self) -> Vec<(String, String)> {
+        let s = |a: &str, b: String| (String::from(a), b);
+        match (self.dev, &self.info) {
+            (0, info) => {
+                let load = match (info, &self.info_prev) {
+                    (Some(n), Some(p)) => alloc::format!("{} %", n.cpu_percent(p)),
+                    _ => String::from("—"),
+                };
+                let mut v = alloc::vec![s("загрузка", load), s("архитектура", String::from(ARCH))];
+                if let Some(n) = info {
+                    v.push(s("время работы", dur_text(n.uptime_ns)));
+                    v.push(s("из них простой", dur_text(n.idle_ns)));
+                    v.push(s("процессов", alloc::format!("{}", n.procs)));
+                }
+                // Одно ядро — не упрощение показа, а состояние системы: SMP в VOID нет, и
+                // писать «ядер: ?» значило бы прятать это за многоточием.
+                v.push(s("ядер", String::from("1 (SMP нет)")));
+                v
+            }
+            (1, Some(n)) => {
+                let mib = |b: u64| alloc::format!("{} МиБ", b / (1024 * 1024));
+                alloc::vec![
+                    s("всего", mib(n.ram_total)),
+                    s("занято", mib(n.ram_used)),
+                    s("свободно", mib(n.ram_total.saturating_sub(n.ram_used))),
+                    s("занято, доля", alloc::format!("{} %", n.ram_percent())),
+                    s("страница", String::from("4 КиБ")),
+                    s("подкачки", String::from("нет (и не будет)")),
+                ]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Значение плитки: (число, подпись, цвет числа).
@@ -806,6 +880,40 @@ impl App {
             let col = if line.starts_with("  ") { th.accent } else { th.muted };
             u.label(d.cut_top(font_h + th.px(2)), line, col, Align::Left);
         }
+    }
+}
+
+/// Веха 165 — **КРИВАЯ ЗАМЕРОВ**: столбик на замер, свежие справа.
+///
+/// Одна функция и на окошко в плитке, и на большой график внизу — это одна и та же кривая,
+/// показанная в двух размерах, и рисовать её дважды разным кодом значило бы завести два ответа
+/// на вопрос «какая была загрузка».
+///
+/// График НЕ РАСТЯГИВАЕТСЯ на всю ширину: он рисует то, что замерено. Иначе первые секунды после
+/// запуска выглядели бы как минута наблюдений. В узкое окошко влезает столько последних замеров,
+/// сколько влезает, — с конца, потому что человек смотрит на «сейчас».
+fn graph(u: &mut Ui, th: &Theme, r: Rect, hist: &[u8], hair: bool) {
+    if r.w <= 0 || r.h <= 0 {
+        return;
+    }
+    if hair {
+        // Половина и потолок — волосками: без них плоская линия у самого низа неотличима от
+        // пустого поля, а «плоско» и «нет данных» — разные ответы.
+        let c = u.tint(th.text.with_a(0x18));
+        for part in [0, 1] {
+            let y = r.y + r.h * part / 2;
+            u.c.fill(Rect::new(r.x, y, r.w, th.line.max(1)), c);
+        }
+    }
+    let bw = (r.w / HIST as i32).max(1);
+    let fit = (r.w / bw).max(1) as usize;
+    let from = hist.len().saturating_sub(fit);
+    let col = u.tint(th.accent);
+    for (k, &v) in hist[from..].iter().enumerate() {
+        let x = r.x + k as i32 * bw;
+        // Не меньше точки: ноль процентов — тоже замер, и он обязан быть виден.
+        let h = (r.h * v as i32 / 100).max(1);
+        u.c.fill(Rect::new(x, r.bottom() - h, (bw - 1).max(1), h), col);
     }
 }
 
@@ -1174,7 +1282,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         detail_pid: None,
         info: None,
         info_prev: None,
-        hist: Vec::new(),
+        hist: DEVS.iter().map(|_| Vec::new()).collect(),
         dev: 0,
         lay: Lay::default(),
         net_srv_pid: None,

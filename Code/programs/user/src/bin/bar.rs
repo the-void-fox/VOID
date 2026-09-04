@@ -335,6 +335,9 @@ struct Bar {
     /// Меню: открыто ли (цель) и растянута ли поверхность на весь экран (факт).
     open: bool,
     grown: bool,
+    /// Подпись СОДЕРЖИМОГО меню прошлого кадра — без доли выезда. Ею кадр отличает «меню едет»
+    /// от «в меню изменилось написанное»: первое стоит одной полоски, второе — всего полотна.
+    card_body: u64,
     /// Выключение подтверждается ВТОРЫМ нажатием. Диалога в тулките нет, и заводить его ради
     /// одной кнопки — заводить окно поверх окна; кнопка, меняющая надпись, честнее и дешевле.
     confirm: bool,
@@ -506,6 +509,7 @@ impl Bar {
             fresh: true,
             open: false,
             grown: false,
+            card_body: 0,
             confirm: false,
             gen: ui::conf::generation_name().unwrap_or_else(|| "VOID".to_string()),
             device: device.clone(),
@@ -789,13 +793,32 @@ impl Bar {
 
         // ── карточка меню ──────────────────────────────────────────────────────────────────
         let menu_t = self.mo.val(A_MENU, if self.open { 256 } else { 0 }).clamp(0, 256) as u32;
-        let card = self.card_rect(th, u.font, menu_t);
+        // Место — окончательное, а на экране столько, сколько вытянулось. Содержимое считается
+        // по ПЕРВОМУ: строки, съезжающие вверх по мере выезда, читались бы как второе движение
+        // внутри первого, и это ровно то, чем «выехало» отличается от «уехало и приехало».
+        let card = self.card_rect(th, u.font);
+        let sheet = self.sheet(card, menu_t);
         let card_clip = Rect::new(0, self.strip - margin, w, h - (self.strip - margin));
         // Место считается ДО опроса движения: `self.mo` берётся изменяемо, а прямоугольник —
         // из `self`, и в одном выражении эти два заимствования спорят.
-        let pow_r = self.power_rect(th, &*u.font, card);
+        let pow_r = self.power_rect(th, &*u.font, card, sheet);
         let pow_hot = self.mo.val(A_POWER, if hot(pow_r) { 256 } else { 0 }) as u32;
         let uptime = uptime_text();
+
+        // Веха 165 — подпись СОДЕРЖИМОГО меню, без доли выезда. По ней кадр отличает «меню
+        // просто едет» от «в меню изменилось написанное»: в первом случае перерисовать надо
+        // одну полоску у нижнего края, во втором — всё полотно.
+        let card_body = sig(&[
+            self.confirm as u64,
+            self.space as u64,
+            self.spaces as u64,
+            self.roots.0 as u64,
+            self.avatar.is_some() as u64,
+            sig_str(&self.device),
+            sig_str(&uptime),
+            sig_str(&clock),
+            pow_hot as u64,
+        ]);
 
         // ── что перерисовывать ─────────────────────────────────────────────────────────────
         // Порядок в таблице — порядок [`Slot`], а не порядок на экране: подпись сравнивается
@@ -817,19 +840,8 @@ impl Bar {
             Isle { rect: t_isle, sig: sig(&[sig_str(&self.shown), title_a as u64]) },
             Isle { rect: s_isle, sig: sig(&[sig_str(&self.gen), sys_hot as u64]) },
             Isle {
-                rect: if menu_t == 0 { Rect::ZERO } else { card },
-                sig: sig(&[
-                    menu_t as u64,
-                    self.confirm as u64,
-                    self.space as u64,
-                    self.spaces as u64,
-                    self.roots.0 as u64,
-                    self.avatar.is_some() as u64,
-                    sig_str(&self.device),
-                    sig_str(&uptime),
-                    sig_str(&clock),
-                    pow_hot as u64,
-                ]),
+                rect: if menu_t == 0 { Rect::ZERO } else { sheet },
+                sig: sig(&[menu_t as u64, card_body]),
             },
         ];
         // Клик всегда рисует всё: он меняет и то, что под курсором, и то, что было активным, —
@@ -839,6 +851,9 @@ impl Bar {
         if !redraw.iter().any(|&x| x) {
             return;
         }
+        // Едет — и только едет: содержимое то же, поверхность не сменилась, клика не было.
+        let anim_only = !all && !self.fresh && card_body == self.card_body;
+        self.card_body = card_body;
 
         // Стереть старое место острова вместе с новым: остров, ставший уже, оставил бы за собой
         // кусок себя прежнего — на прозрачной поверхности это не «след», а мусор поверх обоев.
@@ -903,7 +918,7 @@ impl Bar {
             let iy = m_isle.y + (isle_h - ico) / 2;
             for (art, val) in [(ui::icon::CPU, self.cpu), (ui::icon::RAM, self.ram)] {
                 let ix = inner.cut_left(ico).x;
-                u.c.vg(Rect::new(ix, iy, ico, ico), art, th.muted);
+                u.icon(Rect::new(ix, iy, ico, ico), art, th.muted);
                 inner.cut_left(th.px(4));
                 let text = alloc::format!("{val}%");
                 u.label(inner.cut_left(num_w), &text, th.text, Align::Left);
@@ -922,21 +937,37 @@ impl Bar {
         }
 
         if redraw[I_CARD] {
-            // Карточка режется краем панели: она выезжает ИЗ-ПОД неё, а не поверх её островов.
-            u.clip(card_clip);
             // Стереть надо и УГОЛКИ карточки: они торчат за её прямоугольник (слева сверху и
             // справа снизу), и без запаса от прошлого кадра остался бы их след.
             let fil = ui::panel_fillet(self.strip);
-            let gone = self.isles[I_CARD].rect.union(want[I_CARD].rect);
-            u.clear(Rect::new(gone.x - fil, gone.y, gone.w + fil, gone.h + fil));
+            let was = self.isles[I_CARD].rect;
+            // Веха 165 — на чистом движении меняется ОДНА ПОЛОСКА у нижнего края: раскрытие
+            // клипом ничего не двигает, и всё, что выше края, уже нарисовано правильно. Запас
+            // вверх на скругление — угол полотна уехал вниз и стал серединой; вниз на уголок —
+            // вогнутый стык торчит за прямоугольник.
+            let touched = if anim_only && !was.is_empty() {
+                let lo = was.bottom().min(sheet.bottom()) - th.radius;
+                let hi = was.bottom().max(sheet.bottom()) + fil;
+                Rect::new(card.x - fil, lo, card.w + fil, hi - lo)
+            } else {
+                let g = was.union(want[I_CARD].rect);
+                Rect::new(g.x - fil, g.y, g.w + fil, g.h + fil)
+            };
+            // Карточка режется краем панели: она выезжает ИЗ-ПОД неё, а не поверх её островов.
+            u.clip(card_clip.intersect(touched));
+            u.clear(touched);
             // Веха 162 — и вернуть уголки САМОЙ ПОЛОСЫ: карточка прижата к правому краю экрана,
             // то есть накрывает правый стык полосы со столом. Под клипом это стоит двух уголков,
             // а не перерисовки ряда: выше `strip - margin` клип не пускает.
             u.panel(w, self.strip);
-            if menu_t > 0 {
-                u.fade(menu_t);
-                self.draw_card(u, th, card, &uptime, &clock, pow_hot);
-                u.fade(256);
+            if !sheet.is_empty() {
+                // Полотно рисуется целиком (уголки торчат за него), а СОДЕРЖИМОЕ режется по
+                // вытянутому: коробки и строки лежат на своих окончательных местах и
+                // открываются по мере того, как полотно до них доходит.
+                u.dropdown(sheet, fil);
+                u.clip(card_clip.intersect(touched).intersect(sheet));
+                self.draw_card(u, th, card, sheet, &uptime, &clock, pow_hot);
+                u.clip(card_clip.intersect(touched));
             }
             u.clip(Rect::new(0, 0, w, h));
         }
@@ -946,7 +977,9 @@ impl Bar {
         // полоска панели, и мимо неё щёлкнуть нельзя вовсе.
         if self.open && !self.toggle {
             if let Some((cx, cy)) = click {
-                let inside = card.contains(cx, cy)
+                // По ВЫТЯНУТОМУ, а не по окончательному: пока полотно едет, «внутри меню» — это
+                // то, что человек видит, а не то, где меню будет через треть секунды.
+                let inside = sheet.contains(cx, cy)
                     || l_isle.contains(cx, cy)
                     || t_isle.contains(cx, cy)
                     || r_isle.contains(cx, cy)
@@ -1096,22 +1129,41 @@ impl Bar {
         .unwrap_or(0)
     }
 
-    /// Где сейчас карточка меню. `t` — насколько она проявилась (0..256): выезд это сдвиг вверх,
-    /// гаснущий вместе с прозрачностью, а не «появилась целиком».
+    /// Где карточка меню, когда она ОТКРЫТА ЦЕЛИКОМ. Движение сюда не входит — им занят
+    /// [`Bar::sheet`].
     ///
     /// Веха 162 — карточка прижата к ПРАВОМУ КРАЮ ЭКРАНА и к низу полосы, без полей: по макету
     /// это не отдельное окошко, а продолжение панели вниз ([`ui::Ui::dropdown`]). Поля были бы
     /// видны насквозь как щель между меню и краем, а вогнутому стыку не на чем стоять.
-    fn card_rect(&self, th: &Theme, font: &mut Font, t: u32) -> Rect {
+    fn card_rect(&self, th: &Theme, font: &mut Font) -> Rect {
         let (row, head, pad) = Self::metrics(th, &*font);
         let m = th.px(5); // поле полотна вокруг коробок — из макета
         let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));
         let h = 2 * m + head + m + (2 * pad + Self::INFO_ROWS * row);
-        // Выезд: подняться на палец и опуститься. Больший ход читается как «упало сверху».
-        let lift = th.px(18) * (256 - t as i32) / 256;
         // От низа ПОЛОСЫ, а не поверхности: под полосой у нас теперь ещё вогнутые уголки, и
         // считать от них значило бы отодвинуть карточку от панели на их радиус.
-        Rect::new(self.sw - w, self.strip - lift, w, h)
+        Rect::new(self.sw - w, self.strip, w, h)
+    }
+
+    /// Веха 165 — сколько полотна ВЫТЯНУЛОСЬ из полосы: `t` (0..256) — доля хода.
+    ///
+    /// ## Почему не прозрачность
+    ///
+    /// До этой вехи меню проявлялось: подъём на палец плюс общая альфа кадра. Решение владельца —
+    /// отказаться от проявления вовсе. Довод не про вкус: панель у нас **вещество**, а не слайд.
+    /// Полоса, из которой меню растёт, никуда не девается; скругления и вогнутые стыки заведены
+    /// ровно затем, чтобы это чтение работало ([[void-figma-design]]). Проявление же говорит
+    /// «здесь появилось второе окно» — то самое, чем меню не является.
+    ///
+    /// ## И заодно оно ДЕШЕВЛЕ
+    ///
+    /// Прозрачность гнала весь кадр по медленной дороге: цвет с альфой < 255 не заливается
+    /// строками ([`ui::paint::Canvas::fill`]), а идёт по пикселю через `blend`, и на пустой
+    /// поверхности — по САМОЙ медленной его ветке, с делением на каждый канал. Двести тысяч
+    /// пикселей карточки, шестьдесят раз в секунду. Вытягивание не стоит ничего: содержимое
+    /// режется клипом, а нарисовано ровно столько, сколько видно.
+    fn sheet(&self, card: Rect, t: u32) -> Rect {
+        Rect::new(card.x, card.y, card.w, card.h * t.min(256) as i32 / 256)
     }
 
     /// Коробки макета внутри карточки: шапка и сведения. ОДИН расчёт на всех — рисование и
@@ -1128,8 +1180,12 @@ impl Bar {
     /// Место круглой кнопки выключения — в шапке, справа, как в макете. Считается ТЕМ ЖЕ кодом,
     /// что и рисование ([`Bar::draw_card`] режет те же коробки): два расчёта «где что» — это два
     /// случая разойтись, на которых система уже стояла (обзор, Веха 123).
-    fn power_rect(&self, th: &Theme, font: &Font, card: Rect) -> Rect {
-        if card.is_empty() || !self.open {
+    ///
+    /// Веха 165 — «есть ли кнопка» решает ВЫТЯНУТОЕ полотно, а не флаг «меню открыто». Флаг
+    /// гаснет в момент щелчка, а полотно ещё треть секунды уезжает — с ним вместе обязана
+    /// уезжать и кнопка, иначе она пропадает рывком за кадр до всего остального.
+    fn power_rect(&self, th: &Theme, font: &Font, card: Rect, sheet: Rect) -> Rect {
+        if card.is_empty() || sheet.is_empty() {
             return Rect::ZERO;
         }
         let (_, head, pad) = Self::metrics(th, font);
@@ -1165,13 +1221,12 @@ impl Bar {
         u: &mut Ui,
         th: &Theme,
         card: Rect,
+        sheet: Rect,
         uptime: &str,
         clock: &str,
         pow_hot: u32,
     ) {
         let (row, head_h, pad) = Self::metrics(th, &*u.font);
-        // Полотно, а не карточка: меню — продолжение полосы вниз, с вогнутыми стыками по бокам.
-        u.dropdown(card, ui::panel_fillet(self.strip));
         let (top, info) = self.boxes(th, &*u.font, card);
 
         // ── шапка: кто эта машина ──────────────────────────────────────────────────────────
@@ -1184,10 +1239,10 @@ impl Bar {
             Some(a) => u.avatar(art, Some((&a.px[..], a.w as i32, a.h as i32))),
             // Без неё — знак системы прямо на коробке: в макете это перечёркнутый глаз без
             // подложки, и подложка тут не «фон иконки», а лишний кружок вокруг неё.
-            None => u.c.vg(art, ui::icon::LOGO, th.muted),
+            None => u.icon(art, ui::icon::LOGO, th.muted),
         }
         h.cut_left(th.px(4));
-        let round = self.power_rect(th, &*u.font, card);
+        let round = self.power_rect(th, &*u.font, card, sheet);
         h.cut_right(round.w + th.px(4));
         let line = u.font.line_h();
         u.label(Rect::new(h.x, h.y, h.w, line), &self.device, th.text, Align::Left);
@@ -1199,7 +1254,11 @@ impl Bar {
             (uptime, th.muted)
         };
         u.label(Rect::new(h.x, h.y + line, h.w, line), sub, col, Align::Left);
-        if u.power_button(round, pow_hot, self.confirm) {
+        // Нажать можно только по ВИДИМОЙ кнопке. Клип режет рисование, но не попадание: пока
+        // полотно не дотянулось до шапки, кнопки выключения на экране нет — а клик по ней
+        // прошёл бы. Полсекунды невидимого выключателя под курсором — ровно тот сорт «нажал не
+        // туда», который человек себе объяснить не сможет.
+        if u.power_button(round, pow_hot, self.confirm) && round.bottom() <= sheet.bottom() {
             if self.confirm {
                 self.power = true;
             } else {
