@@ -503,10 +503,24 @@ fn expr_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
 /// связано с вызываемым (builtin/замыкание) → вызвать (это команда, вывод от неё); связано со
 /// значением и без аргументов → показать (инспекция переменной); не связано → спавн программы (PATH).
 fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
-    let words: alloc::vec::Vec<&[u8]> = src
-        .split(|&b| b == b' ' || b == b'\t')
-        .filter(|w| !w.is_empty())
-        .collect();
+    // Веха 161 — слова режет [`vvsh_core::split_words`]: пробелы разделяют, КАВЫЧКИ СКЛЕИВАЮТ и
+    // в аргумент не попадают. Раньше здесь стоял голый `split` по пробелу, и `ls "/etc"` шёл
+    // спрашивать путь `/"/etc"` — молча пустой ответ, а у `cat` ещё и «файл не найден» про файл,
+    // который был на месте.
+    let text = match core::str::from_utf8(src) {
+        Ok(t) => t,
+        Err(_) => return sys::write("vvsh: ввод не UTF-8\n".as_bytes()),
+    };
+    let owned = match vvsh_core::split_words(text) {
+        Ok(w) => w,
+        Err(m) => {
+            sys::write("vvsh: ".as_bytes());
+            sys::write(m.as_bytes());
+            sys::write(b"\n");
+            return;
+        }
+    };
+    let words: alloc::vec::Vec<&[u8]> = owned.iter().map(|w| w.as_bytes()).collect();
     if words.is_empty() {
         return;
     }
@@ -733,6 +747,16 @@ fn sh_ls(args: &[Value]) -> Result<Value, EvalError> {
             )))
         }
     };
+    // Веха 161 — «нет такого пути» обязано ЗВУЧАТЬ. Пустой список от несуществующего каталога
+    // неотличим от пустого каталога, и опечатка в пути ничем себя не выдавала: именно так
+    // `ls "/etc"` (с кавычками в аргументе) целый день выглядел как «конфиг пропал».
+    let shown = || String::from(core::str::from_utf8(&path).unwrap_or("?"));
+    match px::stat(ep, &path) {
+        Some((true, _)) => {}
+        // POSIX: `ls файл` показывает сам файл, а не ошибку.
+        Some((false, _)) => return Ok(Value::list(alloc::vec![Value::str(&shown())])),
+        None => return Err(EvalError::new(alloc::format!("ls: нет такого пути: {}", shown()))),
+    }
     // Буфер в куче и с запасом (Веха 108.2): каталог ПАКЕТА бывает в сотни имён — у glibc в
     // `lib/gconv` их 255, и на стековых 4 КиБ список снова начал бы упираться.
     let mut buf = alloc::vec![0u8; 64 * 1024];
@@ -976,7 +1000,12 @@ fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::nil())
         }
-        None => Err(EvalError::new("cat: файл не найден")),
+        // Веха 161 — путь В СООБЩЕНИИ: без него «файл не найден» винит файл, а спрашивали часто
+        // не тот путь, который человек написал (кавычки, `..`, cwd).
+        None => Err(EvalError::new(alloc::format!(
+            "cat: файл не найден: {}",
+            core::str::from_utf8(&path).unwrap_or("?")
+        ))),
     }
 }
 

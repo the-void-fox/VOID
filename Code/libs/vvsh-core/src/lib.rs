@@ -19,11 +19,13 @@ pub mod config;
 pub mod eval;
 pub mod reader;
 pub mod value;
+pub mod words;
 
 pub use config::normalize_config;
 pub use eval::{eval_program, root_env, Interp, ModuleLoader, NoLoader};
 pub use reader::{read_all, ReadError};
 pub use value::{Env, EvalError, Value};
+pub use words::split_words;
 
 use alloc::string::String;
 
