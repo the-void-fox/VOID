@@ -782,6 +782,7 @@ fn main_loop() -> ! {
         // попавшийся вид 4» — это файловый сервер.
         netcap: find_net_ep(),
         grants: grant_policy(&generation),
+        liveness_at: 0,
         wins: Vec::new(),
         next_id: 1,
         cursor: Pt::new(info.width as i32 / 2, info.height as i32 / 2),
@@ -1527,6 +1528,8 @@ struct Wm {
     netcap: usize,
     /// Веха 155/157 — что кому отдавать: `(вид права, имя программы)` из `desktop`-строк.
     grants: Vec<(u8, String)>,
+    /// Веха 166.1 — когда последний раз сверяли живость ЧУЖИХ хозяев окон по списку процессов.
+    liveness_at: u64,
     /// Начало полосы СВОЕГО стола в координатах обзора — точка, в которую наезжает камера.
     /// Считается там же, где сам обзор: иначе разошлось бы с ним при первой же правке.
     ov_band_y: i32,
@@ -4104,18 +4107,79 @@ impl Wm {
 
     /// Убрать окна процессов, которых больше нет.
     fn reap(&mut self) {
+        let mut foreign = false;
         for i in 0..self.wins.len() {
             // Закрывающееся окно уже осиротело — спрашивать про его хозяина незачем.
             if self.wins[i].closing {
                 continue;
             }
-            if matches!(sys::wait(self.wins[i].owner, true), sys::Wait::Exited(_)) {
-                let id = self.wins[i].id;
-                self.begin_close(id);
-                self.sync_focus();
-                self.relayout();
-                return; // список изменился — доберём на следующем обороте
+            match sys::wait(self.wins[i].owner, true) {
+                sys::Wait::Exited(_) => {
+                    let id = self.wins[i].id;
+                    self.begin_close(id);
+                    self.sync_focus();
+                    self.relayout();
+                    return; // список изменился — доберём на следующем обороте
+                }
+                // «Не мой ребёнок» — про него `SYS_WAIT` не знает ничего, и молчание тут не
+                // значит «жив». Такие окна проверяются обзором, ниже.
+                sys::Wait::NoChild => foreign = true,
+                sys::Wait::Running => {}
             }
+        }
+        if foreign {
+            self.reap_foreign();
+        }
+    }
+
+    /// Веха 166.1 — окна ЧУЖИХ процессов: тех, кого запустили не мы.
+    ///
+    /// `SYS_WAIT` отвечает только про СВОИХ детей, а приложение из строки запуска — ребёнок
+    /// сторожа `run`, а не наш (Веха 147). Его смерть композитор не замечал вовсе: рамка
+    /// оставалась на экране навсегда, с картинкой, за которой уже никого нет. Снаружи это
+    /// выглядит не как «программа упала», а как «программа зависла», и разобраться в разнице
+    /// человеку нечем — именно так и было увидено падение файлового менеджера.
+    ///
+    /// Спрашиваем ОБЗОРОМ (`sysview`) и не чаще раза в секунду: список процессов — это копия
+    /// килобайтов на каждый оборот цикла, а падают программы не по расписанию. Права нет —
+    /// проверки нет: композитор поднимается и без неё, просто ghost-окна живут до `Super+Q`.
+    fn reap_foreign(&mut self) {
+        if self.sysview == sys::NO_CAP {
+            return;
+        }
+        let now = sys::monotonic_ns();
+        if now.saturating_sub(self.liveness_at) < 1_000_000_000 {
+            return;
+        }
+        self.liveness_at = now;
+        let rec = sys::PROC_REC;
+        let mut buf = vec![0u8; rec * 64];
+        let Some(total) = sys::proc_list(self.sysview, &mut buf) else { return };
+        let shown = total.min(buf.len() / rec);
+        let alive = |pid: usize| {
+            (0..shown).any(|k| {
+                let r = &buf[k * rec..k * rec + rec];
+                u16::from_le_bytes([r[0], r[1]]) as usize == pid
+            })
+        };
+        // Список неполон (процессов больше, чем влезло) — не закрываем НИЧЕГО: отсутствие в
+        // обрезанном списке не значит смерть, а закрытое по ошибке окно не вернуть.
+        if total > shown {
+            return;
+        }
+        for i in 0..self.wins.len() {
+            if self.wins[i].closing || alive(self.wins[i].owner) {
+                continue;
+            }
+            let id = self.wins[i].id;
+            sys::write_console(
+                alloc::format!("[wm] окно {}: хозяин P{} умер — убираю\n", id, self.wins[i].owner)
+                    .as_bytes(),
+            );
+            self.begin_close(id);
+            self.sync_focus();
+            self.relayout();
+            return;
         }
     }
 

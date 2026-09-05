@@ -104,6 +104,11 @@ struct App {
     /// Номера записей, прошедших отбор по набранному.
     hits: Vec<usize>,
     sel: usize,
+    /// Выбор сделан ЧЕЛОВЕКОМ (щелчком или стрелками), а не подставлен нулём при входе в
+    /// каталог. Без этого различия первый значок открывался ОДНИМ щелчком, а все остальные —
+    /// двумя: `sel` при входе равен нулю, и щелчок по нулевой ячейке сразу попадал в «щёлкнули
+    /// по уже выбранному». Один и тот же жест давал разное — и объяснить это нечем.
+    picked: bool,
     top: usize,
     /// Куда возвращаться и откуда возвращаться. Две стопки, как у браузера: «назад» кладёт в
     /// «вперёд», любой новый переход «вперёд» очищает.
@@ -194,6 +199,7 @@ impl App {
         self.fwd.clear();
         self.query.clear();
         self.sel = 0;
+        self.picked = false;
         self.read();
     }
 
@@ -208,6 +214,7 @@ impl App {
         to.push(core::mem::replace(&mut self.cwd, p));
         self.query.clear();
         self.sel = 0;
+        self.picked = false;
         self.read();
     }
 
@@ -340,6 +347,7 @@ impl App {
 
         // Адрес: поле цвета фона, в нём крошки плитками. Набранное показывается ТУТ ЖЕ вместо
         // крошек — поиск и адрес отвечают на один и тот же вопрос «что я сейчас вижу».
+        let mut jump: Option<String> = None;
         let rad = th.radius.min(lay.addr.h / 2);
         let (bg, br) = (u.tint(th.band), u.tint(th.border));
         u.c.rrect_bordered(lay.addr, rad, th.line, bg, br);
@@ -360,9 +368,7 @@ impl App {
                 u.c.rrect(r, th.px(3), c);
                 u.label(r, label, if last { th.text } else { th.muted }, Align::Center);
                 if u.clicked(r) {
-                    let p = path.clone();
-                    self.go(p);
-                    dirty = true;
+                    jump = Some(path.clone());
                 }
                 a.cut_left(w);
                 if !last {
@@ -386,6 +392,10 @@ impl App {
             self.top = 0;
             dirty = true;
         }
+        if let Some(p) = jump {
+            self.go(p);
+            dirty = true;
+        }
         dirty
     }
 
@@ -402,6 +412,7 @@ impl App {
         u.label(head, "закладки", th.muted, Align::Left);
         d.cut_top(th.px(4));
         let row_h = font_h + th.px(3);
+        let mut act: Option<String> = None;
         for k in 0..self.marks.len() {
             if d.h < row_h {
                 break;
@@ -425,9 +436,14 @@ impl App {
             let t = r.inset_xy(th.px(6), 0);
             u.label(t, &label, if here { th.text } else { th.muted }, Align::Left);
             if u.clicked(r) {
-                self.go(path);
-                dirty = true;
+                act = Some(path);
             }
+        }
+        // Переход — ПОСЛЕ обхода, по той же причине, что в содержимом: `go` перечитывает
+        // каталог, и остаток ряда рисовался бы уже по другому состоянию.
+        if let Some(p) = act {
+            self.go(p);
+            dirty = true;
         }
         dirty
     }
@@ -456,6 +472,16 @@ impl App {
         }
         let total = self.hits.len();
         let end = (self.top + lay.page).min(total);
+        // На что нажали — ОТЛОЖЕННО, номером строки. Исполнять клик прямо здесь нельзя: вход в
+        // каталог перечитывает `entries` и `hits` ПОСРЕДИ обхода, и следующий же виток берёт
+        // старый номер в новом списке. Ровно на этом менеджер и падал: из корня (две записи) в
+        // `/etc` (одна) — «index out of bounds: the len is 1 but the index is 1», процесс
+        // умирал, а окно оставалось на экране и выглядело зависшим (Веха 166.1).
+        //
+        // Это тот же уговор, по которому [`ui::Client::after`] отделён от `draw`, и та же
+        // причина: кадр рисует ПО СНИМКУ состояния, и менять снимок в середине кадра — значит
+        // рисовать вторую половину по данным, которых первая не видела.
+        let mut act: Option<usize> = None;
         for k in self.top..end {
             let i = self.hits[k];
             let r = self.cell_rect(lay, k - self.top);
@@ -491,16 +517,7 @@ impl App {
                 u.label(val, &s, th.muted, Align::Right);
             }
             if u.clicked(r) {
-                // Первый щелчок ВЫБИРАЕТ, щелчок по уже выбранному — открывает. Двойной щелчок
-                // по времени завести не на чем: у событий композитора часов нет, а мерить их
-                // самим значило бы завести своё понятие «двойного» вразрез с системным.
-                if sel {
-                    self.open_sel();
-                } else {
-                    self.sel = k;
-                    self.measure_sel(i);
-                }
-                dirty = true;
+                act = Some(k);
             }
         }
         // Подвал списка живёт в самой карточке содержимого: сколько всего и не обрезано ли.
@@ -512,6 +529,22 @@ impl App {
                 th.muted,
                 Align::Right,
             );
+        }
+        // Кадр дорисован по СНИМКУ — теперь можно менять снимок. Первый щелчок ВЫБИРАЕТ, щелчок
+        // по уже выбранному — открывает. Двойного щелчка по ВРЕМЕНИ у нас нет и самодельного не
+        // будет: часов у событий композитора нет, а мерить их самим значит завести своё понятие
+        // «двойного» вразрез с системным.
+        if let Some(k) = act {
+            if self.picked && k == self.sel {
+                self.open_sel();
+            } else {
+                self.sel = k;
+                self.picked = true;
+                if let Some(&i) = self.hits.get(k) {
+                    self.measure_sel(i);
+                }
+            }
+            dirty = true;
         }
         dirty
     }
@@ -582,6 +615,7 @@ impl ui::Client for App {
                         return ui::Scope::All;
                     }
                 }
+                self.picked = true;
                 let page = self.lay.page;
                 self.scroll_to_sel(page, cols);
                 if let Some(&i) = self.hits.get(self.sel) {
@@ -661,6 +695,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         entries: Vec::new(),
         hits: Vec::new(),
         sel: 0,
+        picked: false,
         top: 0,
         back: Vec::new(),
         fwd: Vec::new(),
