@@ -341,6 +341,8 @@ struct Bar {
     /// открытии меню. Список не держим постоянно: он нужен ровно тогда, когда на него смотрят.
     notes: u8,
     notes_buf: Vec<u8>,
+    /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт. Приезжает в снимке состояния.
+    dnd: bool,
     /// Какое полотно СЕЙЧАС нарисовано. Отличается от `open` ровно на время ухода: пока оно
     /// уезжает, `open` уже `None`, а рисовать надо то же самое — иначе меню на прощание
     /// подменяет содержимое.
@@ -539,6 +541,7 @@ impl Bar {
             grown: false,
             notes: 0,
             notes_buf: Vec::new(),
+            dnd: false,
             showing: Menu::None,
             card_body: 0,
             confirm: false,
@@ -597,6 +600,7 @@ impl Bar {
         self.layout = st.layout;
         self.overview = st.overview;
         self.notes = st.notes;
+        self.dnd = st.dnd;
         self.title = String::from(core::str::from_utf8(&buf[..st.title_len]).unwrap_or(""));
         // В обзоре мышь слоям не отдают вовсе — закрыть меню было бы нечем.
         if self.overview {
@@ -864,6 +868,7 @@ impl Bar {
         // одну полоску у нижнего края, во втором — всё полотно.
         let card_body = sig(&[
             self.showing as u64,
+            self.dnd as u64,
             self.notes_buf.len() as u64,
             sig(&self.notes_buf.iter().map(|&b| b as u64).collect::<Vec<_>>()),
             self.confirm as u64,
@@ -898,7 +903,12 @@ impl Bar {
             Isle { rect: s_isle, sig: sig(&[sig_str(&self.gen), sys_hot as u64]) },
             Isle {
                 rect: n_isle,
-                sig: sig(&[self.notes as u64, notes_hot as u64, (self.open == Menu::Notes) as u64]),
+                sig: sig(&[
+                    self.notes as u64,
+                    notes_hot as u64,
+                    self.dnd as u64,
+                    (self.open == Menu::Notes) as u64,
+                ]),
             },
             Isle {
                 rect: if menu_t == 0 { Rect::ZERO } else { sheet },
@@ -1005,7 +1015,10 @@ impl Bar {
             let ir = d.cut_left(ico);
             let lit = self.notes > 0;
             let col = if self.open == Menu::Notes || lit { th.text } else { th.muted };
-            u.icon(Rect::new(ir.x, n_isle.y + (isle_h - ico) / 2, ico, ico), ui::icon::BELL, col);
+            // «Не беспокоить» видно ПО ЗНАКУ, а не по подписи: перечёркнутый колокольчик
+            // отвечает на «почему ничего не всплывает» с одного взгляда.
+            let art = if self.dnd { ui::icon::BELL_OFF } else { ui::icon::BELL };
+            u.icon(Rect::new(ir.x, n_isle.y + (isle_h - ico) / 2, ico, ico), art, col);
             if lit {
                 u.label(d, &note_text, th.text, Align::Right);
             }
@@ -1195,11 +1208,58 @@ impl Bar {
         let (_, _, pad) = Self::metrics(th, &*u.font);
         let m = th.px(5);
         let mut d = card.inset(m);
-        let note_h = 2 * font_h + 2 * pad;
-        // Список читается из буфера, снятого при открытии: он не меняется, пока смотрят, и
-        // перечитывать его каждый кадр значило бы дёргать композитор шестьдесят раз в секунду.
-        let buf = core::mem::take(&mut self.notes_buf);
         let mut drop_id: Option<u32> = None;
+        let mut dnd_click = false;
+
+        // ── шапка: знак, «Уведомления», не беспокоить и очистить ───────────────────────────
+        let head = d.cut_top(font_h + 2 * pad);
+        d.cut_top(m);
+        u.card(head);
+        let mut h = head.inset(pad);
+        let ico = h.cut_left(font_h);
+        u.icon(ico, if self.dnd { ui::icon::BELL_OFF } else { ui::icon::BELL }, th.muted);
+        h.cut_left(th.px(4));
+        // Две кнопки справа: «не беспокоить» и «убрать все». Знаками, а не словами — так в
+        // макете, и слова здесь заняли бы всю шапку целиком.
+        let btn = font_h + th.px(4);
+        let clear = h.cut_right(btn);
+        h.cut_right(th.px(2));
+        let quiet = h.cut_right(btn);
+        u.label(h, "Уведомления", th.text, Align::Left);
+        let hot = |u: &Ui, r: Rect| if u.hot(r) { 256 } else { 0 };
+        let qh = hot(u, quiet);
+        // Включённое «не беспокоить» подсвечено само по себе: кнопка-состояние обязана
+        // отвечать на «а сейчас как», не дожидаясь наведения.
+        if self.dnd {
+            let c = u.tint(th.accent.with_a(0x44));
+            u.c.rrect(quiet, th.radius.min(quiet.h / 2), c);
+        }
+        if u.icon_button(quiet, ui::icon::BELL_OFF, qh, false) {
+            dnd_click = true;
+        }
+        let ch = hot(u, clear);
+        if u.icon_button(clear, ui::icon::TRASH, ch, true) {
+            drop_id = Some(0);
+        }
+
+        // ── тело: список или пустое состояние ──────────────────────────────────────────────
+        let buf = core::mem::take(&mut self.notes_buf);
+        let total = win::notes(&buf).count();
+        if total == 0 {
+            // Пусто — так и сказано, знаком и словами (по макету). Пустая карточка без единого
+            // слова читается как «сломалось», а не как «ничего нет».
+            u.card(d);
+            let side = (font_h * 2).min(d.h - font_h - pad);
+            let ir = Rect::new(d.x + (d.w - side) / 2, d.y + pad, side, side);
+            u.icon(ir, ui::icon::BELL_OFF, th.muted);
+            u.label(
+                Rect::new(d.x, ir.bottom() + th.px(2), d.w, font_h),
+                "нет уведомлений",
+                th.muted,
+                Align::Center,
+            );
+        }
+        let note_h = 2 * font_h + 2 * pad;
         let mut shown = 0usize;
         for n in win::notes(&buf) {
             if shown >= Self::NOTES_SHOWN || d.h < note_h {
@@ -1230,23 +1290,18 @@ impl Bar {
                 drop_id = Some(n.id);
             }
         }
-        let total = win::notes(&buf).count();
         self.notes_buf = buf;
-        // Подвал: «убрать все» — и сколько не поместилось. Молча спрятанный хвост списка это
-        // ровно та ложь, которой в системе быть не должно.
-        let foot = d.cut_top(font_h + th.px(4));
-        if shown == 0 {
-            u.label(foot, "уведомлений нет", th.muted, Align::Left);
-        } else {
-            if total > shown {
-                let more = alloc::format!("ещё {}", total - shown);
-                u.label(foot, &more, th.muted, Align::Left);
-            }
-            let btn = Rect::new(foot.right() - th.px(90), foot.y, th.px(90), foot.h);
-            let hot = if u.hot(btn) { 256 } else { 0 };
-            if u.button(btn, "убрать все", hot) {
-                drop_id = Some(0);
-            }
+        // Сколько не поместилось — вслух: молча спрятанный хвост списка это ровно та ложь,
+        // которой в системе быть не должно.
+        if total > shown && d.h >= font_h {
+            let more = alloc::format!("ещё {}", total - shown);
+            u.label(d.cut_top(font_h), &more, th.muted, Align::Right);
+        }
+
+        if dnd_click {
+            let now = win::note_dnd(Some(!self.dnd)).unwrap_or(self.dnd);
+            self.dnd = now;
+            self.again = true;
         }
         if let Some(id) = drop_id {
             win::note_drop(id);
@@ -1297,10 +1352,15 @@ impl Bar {
         // Веха 168 — у полотна уведомлений свои меры: оно шире (в нём текст, а не пары
         // «подпись — значение») и ровно такой высоты, сколько накопилось.
         if self.showing == Menu::Notes {
-            let w = th.px(320).min(self.sw - th.px(20));
-            let n = win::notes(&self.notes_buf).count().min(Self::NOTES_SHOWN).max(1) as i32;
+            // Меры сняты с макета (`ScreanNotificationMenuOpen`): полотно 206 при экране 1280,
+            // шапка 35, тело 156 — то есть шапка в строку с полями, а тело под то, что есть.
+            let w = th.px(280).min(self.sw - th.px(20));
+            let n = win::notes(&self.notes_buf).count().min(Self::NOTES_SHOWN);
             let note_h = 2 * font.line_h() + 2 * pad;
-            let h = 2 * m + n * (note_h + m) + row + m;
+            let head = font.line_h() + 2 * pad;
+            // Пусто — тело в одну карточку со знаком и подписью, как в макете.
+            let body = if n == 0 { 3 * font.line_h() + 2 * pad } else { n as i32 * (note_h + m) - m };
+            let h = 2 * m + head + m + body;
             return Rect::new(self.sw - w, self.strip, w, h);
         }
         let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));

@@ -113,6 +113,8 @@ pub struct Status {
     pub layout: u8,
     /// Веха 145 — композитор показывает ОБЗОР ([`ST_OVERVIEW`]).
     pub overview: bool,
+    /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт.
+    pub dnd: bool,
     /// Веха 168 — сколько уведомлений накопилось. В снимке состояния, а не отдельным событием:
     /// панель и так просыпается на каждое его изменение, а второй канал про то же самое —
     /// это второй повод им разойтись.
@@ -272,6 +274,16 @@ pub const OP_NOTES: usize = 24;
 /// Веха 168 — **убрать**: `[id u32]`; нулевой id — убрать ВСЕ. Ответ `[сколько убрано u8]`.
 pub const OP_NOTE_DROP: usize = 25;
 
+/// Веха 168.1 — **НЕ БЕСПОКОИТЬ**: `[0|1]` → `[состояние]`; пустое тело — только спросить.
+///
+/// Гасит ВСПЛЫВАШКИ, а не уведомления: они по-прежнему копятся, и колокольчик по-прежнему их
+/// считает. «Не беспокоить» — просьба не отвлекать, а не «выбрасывай то, что мне говорят»;
+/// второе называлось бы иначе и делалось бы иначе.
+pub const OP_NOTE_DND: usize = 26;
+
+/// Веха 168.1 — режим «не беспокоить» включён ([`wire::Status`]).
+pub const ST_DND: u8 = 2;
+
 /// Уровень уведомления: обычное.
 pub const NOTE_INFO: u8 = 0;
 /// Уровень уведомления: важное (композитор показывает его иначе).
@@ -332,6 +344,18 @@ fn cut_note(s: &str) -> &str {
         cut -= 1;
     }
     &s[..cut]
+}
+
+/// Веха 168.1 — спросить или переключить «не беспокоить». `None` — композитора нет.
+pub fn note_dnd(set: Option<bool>) -> Option<bool> {
+    let ep = endpoint()?;
+    let mut rep = [0u8; 1];
+    let body: &[u8] = match set {
+        Some(v) => &[v as u8],
+        None => &[],
+    };
+    let n = crate::call(ep, OP_NOTE_DND, body, &mut rep);
+    (n == 1).then(|| rep[0] != 0)
 }
 
 /// Веха 168 — забрать уведомление (0 — все). Возвращает, сколько убрано.
@@ -719,7 +743,7 @@ impl Event {
 /// `OP_POLL`, `OP_LAUNCHING`). У них нет ПОРЯДКА полей — расходиться нечему; им хватает [`id`]
 /// и [`Rd`], чтобы не читать за краем.
 pub mod wire {
-    use super::{Layer, LAYER_ALPHA, LAYER_KBD, LAYER_OVERLAY, ST_OVERVIEW, TITLE_MAX};
+    use super::{Layer, LAYER_ALPHA, LAYER_KBD, LAYER_OVERLAY, ST_DND, ST_OVERVIEW, TITLE_MAX};
 
     /// Читатель полей сообщения (little-endian), не выходящий за его край.
     pub struct Rd<'a> {
@@ -1067,6 +1091,7 @@ pub mod wire {
         pub spaces: u8,
         pub layout: u8,
         pub overview: bool,
+        pub dnd: bool,
         pub notes: u8,
         pub title: &'a [u8],
     }
@@ -1077,7 +1102,10 @@ pub mod wire {
             w.u8(self.space)
                 .u8(self.spaces)
                 .u8(self.layout)
-                .u8(if self.overview { ST_OVERVIEW } else { 0 })
+                .u8(
+                    if self.overview { ST_OVERVIEW } else { 0 }
+                        | if self.dnd { ST_DND } else { 0 },
+                )
                 .u8(self.notes)
                 .bytes(cut(self.title));
             w.len()
@@ -1092,6 +1120,7 @@ pub mod wire {
                 spaces,
                 layout,
                 overview: flags & ST_OVERVIEW != 0,
+                dnd: flags & ST_DND != 0,
                 notes,
                 title: r.tail(),
             })
@@ -1534,6 +1563,7 @@ impl Window {
             spaces: s.spaces,
             layout: s.layout,
             overview: s.overview,
+            dnd: s.dnd,
             notes: s.notes,
             title_len: t,
         })

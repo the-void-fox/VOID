@@ -306,8 +306,10 @@ const NOTES_MAX: usize = 32;
 /// Сколько живёт всплывашка. Три секунды — столько, чтобы прочесть две строки и не больше:
 /// уведомление, висящее дольше, начинает мешать тому, ради чего человек сидит за экраном.
 const TOAST_NS: u64 = 3_000_000_000;
-/// Поля всплывашки.
-const TOAST_PAD: i32 = 8;
+/// Поля всплывашки и её скругление — то же, что у окон, только вдвое мельче: карточка меньше
+/// окна, и радиус окна на ней выглядел бы каплей.
+const TOAST_PAD: i32 = 10;
+const TOAST_RAD: i32 = RADIUS / 2;
 /// Сколько байт списка отдаём за раз. Потолок нужен не «на всякий случай»: ответ едет через
 /// приёмный буфер спрашивающего, и то, что в него не влезло, он не увидит вовсе.
 const NOTES_REPLY_MAX: usize = 8 * 1024;
@@ -807,6 +809,7 @@ fn main_loop() -> ! {
         notes: Vec::new(),
         next_note: 1,
         toast: None,
+        dnd: false,
         wins: Vec::new(),
         next_id: 1,
         cursor: Pt::new(info.width as i32 / 2, info.height as i32 / 2),
@@ -842,7 +845,7 @@ fn main_loop() -> ! {
         ov_at: 0,
         ov_dur: 0,
         ov_band_y: 0,
-        status: (0, 1, None, 0, false, 0),
+        status: (0, 1, None, 0, false, 0, false),
         anim: ANIM_MS,
         drag: None,
         slide: None,
@@ -1567,6 +1570,8 @@ struct Wm {
     next_note: u32,
     /// Какое из них сейчас висит всплывашкой и до какого времени.
     toast: Option<(u32, u64)>,
+    /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт.
+    dnd: bool,
     /// Веха 167 — модификаторы клавиатуры, как их видел последний раз. Уезжают клиенту вместе
     /// со щелчком мыши: у события мыши своих модификаторов нет ни в железе, ни в ядре.
     kmods: u8,
@@ -1580,7 +1585,7 @@ struct Wm {
     /// меняют ещё закрытие окна, обзор и раскладка, и каждый новый путь пришлось бы вспоминать.
     /// Забытая рассылка — это бар, молча показывающий прошлое.
     /// Веха 145 — пятым идёт ОБЗОР: он тоже меняет то, что бару надо знать (см. `win::ST_OVERVIEW`).
-    status: (usize, usize, Option<u32>, usize, bool, usize),
+    status: (usize, usize, Option<u32>, usize, bool, usize, bool),
 }
 
 /// Окно в обзоре: куда его уменьшили и с какого стола оно родом.
@@ -4238,6 +4243,11 @@ impl Wm {
 
     /// Веха 168 — ВСПЛЫВАШКА строкой, как курсор и ярлык: пиксель экрана пишется ровно один раз
     /// за кадр.
+    ///
+    /// Веха 168.1 — по МАКЕТУ, а не «рамка и заливка»: скруглённая карточка цвета карточек
+    /// системы, заголовок текстом, вторая строка приглушённой. Отличие важного — цвет
+    /// ЗАГОЛОВКА, а не рамка вокруг: рамка кричит всей формой, а форма у всех уведомлений
+    /// одна, и менять её значило бы делать важное другой сущностью.
     fn draw_toast_row(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
         let (Some(t), Some(b)) = (self.toast, self.toast_at()) else {
             return;
@@ -4250,13 +4260,22 @@ impl Wm {
         if ry < 0 || ry >= r.h {
             return;
         }
-        // Важное отличается ЦВЕТОМ РАМКИ, а не формой: форма говорит «это уведомление», цвет —
-        // «прочти сейчас».
-        let ink = self.pack(tri(if n.level == win::NOTE_WARN { self.th.danger } else { self.th.accent }));
-        let bg = self.pack(tri(self.th.bg));
+        let bg = tri(self.th.bg);
+        let rad = TOAST_RAD;
+        let corner = ry < rad || r.h - 1 - ry < rad;
         for xx in r.x.max(x0)..r.right().min(x1) {
-            let edge = ry == 0 || ry == r.h - 1 || xx == r.x || xx == r.right() - 1;
-            out[(xx - x0) as usize] = if edge { ink } else { bg };
+            // Скругление — тем же знаковым расстоянием, что у окон: две формулы «где угол»
+            // разошлись бы, и у всплывашки углы оказались бы не системные.
+            let cov = if corner {
+                (128 - rrect_sd(xx, yy, r.x, r.y, r.w, r.h, rad)).clamp(0, 256) as u32
+            } else {
+                256
+            };
+            if cov == 0 {
+                continue;
+            }
+            let i = (xx - x0) as usize;
+            out[i] = self.blend(out[i], bg, cov);
         }
         let gh = sys::glyph::H as i32;
         let (line, gy) = ((ry - TOAST_PAD) / gh, (ry - TOAST_PAD) % gh);
@@ -4264,7 +4283,11 @@ impl Wm {
             return;
         }
         let text = if line == 0 { &n.title } else { &n.text };
-        let col = if line == 0 { ink } else { self.pack(tri(self.th.text)) };
+        let col = self.pack(tri(match (line, n.level) {
+            (0, win::NOTE_WARN) => self.th.danger,
+            (0, _) => self.th.text,
+            _ => self.th.muted,
+        }));
         let mut cx = r.x + TOAST_PAD;
         for ch in text.chars() {
             let bits = sys::glyph::rows(ch)[gy as usize];
@@ -4346,6 +4369,7 @@ impl Wm {
             sys::keymap(),
             self.overview,
             self.notes.len(),
+            self.dnd,
         );
         if now == self.status {
             return;
@@ -5146,6 +5170,7 @@ impl Wm {
                     overview: self.overview,
                     // Веха 168 — сколько уведомлений накопилось: по этому числу панель рисует
                     // счётчик у колокольчика.
+                    dnd: self.dnd,
                     notes: self.notes.len().min(255) as u8,
                     title,
                 };
@@ -5285,8 +5310,12 @@ impl Wm {
                 self.notes.truncate(NOTES_MAX);
                 // Всплывашка — на несколько секунд. Рисует её композитор сам: поверхности у
                 // уведомления нет и не должно быть, иначе оно ловило бы клики по чужим окнам.
-                self.toast = Some((id, sys::monotonic_ns() + TOAST_NS));
-                self.damage_toast();
+                // «Не беспокоить» гасит ВСПЛЫВАШКУ, а не уведомление: счёт идёт, колокольчик
+                // считает, человек прочтёт когда захочет.
+                if !self.dnd {
+                    self.toast = Some((id, sys::monotonic_ns() + TOAST_NS));
+                    self.damage_toast();
+                }
                 sys::reply(m.reply_cap, &[1]);
             }
             // Что накопилось — списком. Читает панель, когда открывает своё меню.
@@ -5327,6 +5356,20 @@ impl Wm {
                     self.toast = None;
                 }
                 sys::reply(m.reply_cap, &[(was - self.notes.len()).min(255) as u8]);
+            }
+            // Веха 168.1 — «не беспокоить». Пустое тело — только спросить.
+            win::OP_NOTE_DND => {
+                let body = &req[..m.len.min(req.len())];
+                if let Some(&v) = body.first() {
+                    self.dnd = v != 0;
+                    // Включили — гасим то, что висит сейчас: просьба не отвлекать начинает
+                    // действовать сразу, а не со следующего уведомления.
+                    if self.dnd && self.toast.is_some() {
+                        self.damage_toast();
+                        self.toast = None;
+                    }
+                }
+                sys::reply(m.reply_cap, &[self.dnd as u8]);
             }
             win::OP_GRANT => {
                 let kind = body!(m, win::wire::Rd::new(req).u8());

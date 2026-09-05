@@ -43,6 +43,9 @@ pub const MENU: &[u8] = include_bytes!("../../../../assets/icons/menu.vg");
 /// Веха 168 — уведомления: колокольчик в панели и крестик «убрать».
 pub const BELL: &[u8] = include_bytes!("../../../../assets/icons/bell.vg");
 pub const CLOSE: &[u8] = include_bytes!("../../../../assets/icons/close.vg");
+/// Веха 168.1 — «не беспокоить» и «очистить» в шапке полотна уведомлений.
+pub const BELL_OFF: &[u8] = include_bytes!("../../../../assets/icons/bell-off.vg");
+pub const TRASH: &[u8] = include_bytes!("../../../../assets/icons/trash.vg");
 
 /// Веха 165 — ОТНЯТЬ ПРАВО: перечёркнутая рамка. В макете диспетчера на месте кнопки «отнять»
 /// стоит знак — строка права коротка, и слово в ней занимает больше места, чем сама строка.
