@@ -1136,6 +1136,71 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         if !events.is_empty() {
             worked = true;
             for key in events {
+                // Веха 167.3 — ВЫДЕЛЕНИЕ С КЛАВИАТУРЫ и копирование. Разбирается ДО всего
+                // прочего и мимо схемы аккордов, по той же причине, по какой мимо неё живёт
+                // выделение мышью: это собственная работа терминала над своим экраном, а не
+                // команда мультиплексору и не байт для программы.
+                //
+                // `Ctrl+Shift+C` именно с Shift: `Ctrl+C` — это сигнал программе (байт 0x03), и
+                // отобрать его у неё нельзя. Тот же довод, по которому вставка живёт на
+                // `Ctrl+Shift+V`.
+                {
+                    let (sh, ct) = (
+                        key.mods.contains(ModMask::SHIFT),
+                        key.mods.contains(ModMask::CTRL),
+                    );
+                    let letter = char::from_u32(key.keysym.0)
+                        .map(|c| c.to_ascii_lowercase())
+                        .unwrap_or('\0');
+                    if ct && sh && letter == 'c' {
+                        if let Some(text) = sel_text(&sel_cells, view.cols, sel) {
+                            if let Some(c) = store_cap() {
+                                sys::win::clip_put(c, sys::win::CLIP_TEXT, text.as_bytes());
+                            }
+                        }
+                        continue;
+                    }
+                    if ct && sh && letter == 'v' {
+                        paste_clipboard(&mut panes, focus);
+                        redraw = true;
+                        continue;
+                    }
+                    let dir = match key.keysym {
+                        Keysym::LEFT => Some((-1i32, 0i32)),
+                        Keysym::RIGHT => Some((1, 0)),
+                        Keysym::UP => Some((0, -1)),
+                        Keysym::DOWN => Some((0, 1)),
+                        _ => None,
+                    };
+                    if let (true, Some((dx, dy))) = (sh && !ct, dir) {
+                        // Начинать выделение неоткуда, кроме КУРСОРА: это единственная точка
+                        // экрана, про которую человек и программа думают одинаково.
+                        let (ac, ar, cc, cr) = sel.unwrap_or_else(|| {
+                            let (x, y) = caret_cell(&panes, &rects, focus);
+                            (x, y, x, y)
+                        });
+                        let nc = (cc as i32 + dx).clamp(0, view.cols as i32 - 1) as usize;
+                        let nr = (cr as i32 + dy).clamp(0, view.rows as i32 - 1) as usize;
+                        sel = Some((ac, ar, nc, nr));
+                        // Кадр, по которому потом вычитается текст, обязан быть свежим: с
+                        // клавиатуры выделяют, ничего не рисуя, и старая копия соврала бы.
+                        sel_cells = compose(&panes, &rects, focus, mode, view.cols, view.rows, &conf, mux);
+                        redraw = true;
+                        continue;
+                    }
+                    // Любая другая клавиша СНИМАЕТ выделение: человек вернулся к набору, и
+                    // подсветка на экране стала бы просто мусором.
+                    //
+                    // Кроме САМИХ МОДИФИКАТОРОВ. Нажатие `Shift` приходит отдельным событием
+                    // (ядро шлёт его, чтобы окно знало состояние клавиатуры) — и попадало под
+                    // это правило РАНЬШЕ, чем стрелка успевала что-то выделить: выделение
+                    // умирало в момент нажатия той самой клавиши, которой его строят.
+                    let modifier = (0x130..=0x133).contains(&key.keysym.0);
+                    if sel.is_some() && !modifier {
+                        sel = None;
+                        redraw = true;
+                    }
+                }
                 // В окне схема панелей НЕ применяется: `C-a` там ничего не переключает, а уходит
                 // в программу как обычный байт. Иначе префикс мультиплексора молча съедал бы
                 // аккорд, который человек адресовал шеллу или редактору.
@@ -1793,6 +1858,15 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
         .find(|r| r.id == id)
         .map(|r| (r.area.cols.max(1) as usize, r.area.rows.max(1) as usize))
         .unwrap_or((1, 1))
+}
+
+/// Где КУРСОР фокусной панели в координатах кадра. Считается тем же сложением, что и подсветка
+/// каретки (`mark_caret`): две формулы «где курсор» разошлись бы на первом же разбиении.
+fn caret_cell(panes: &[Pane], rects: &[PaneRect], focus: usize) -> (usize, usize) {
+    let Some(p) = panes.get(focus) else { return (0, 0) };
+    let Some(r) = rects.iter().find(|r| r.id == p.id) else { return (0, 0) };
+    let c = p.grid.cursor();
+    (r.area.col as usize + c.col, r.area.row as usize + c.row)
 }
 
 /// Веха 167.2 — какая ЯЧЕЙКА под точкой окна. Тем же делением, каким кадр и раскладывается.
