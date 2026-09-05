@@ -311,6 +311,80 @@ const TOAST_NS: u64 = 3_000_000_000;
 const TOAST_PAD: i32 = 10;
 const TOAST_RAD: i32 = RADIUS / 2;
 
+/// Сколько кадров помнит счётчик. Четыре секунды при шестидесяти в секунду: столько длится
+/// то, на что смотрят («открой меню», «перетащи окно»), и столько же нужно, чтобы увидеть РЫВОК.
+/// Среднее за минуту его прячет, а именно рывок и ищут.
+const FRAMES_KEPT: usize = 256;
+
+/// Веха 168.3 — **счёт кадров ЭКРАНА** (см. [`win::OP_FRAMES`]).
+///
+/// Считает не намерения клиентов, а записи во фреймбуфер: пиксель попадает на экран ровно в
+/// [`Wm::flush`], и другого места нет. Стоит это два чтения часов на кадр — в кадре их и так
+/// десятки, а без них «подлагивает» остаётся ощущением, которое нечем ни подтвердить, ни
+/// опровергнуть.
+struct Frames {
+    /// Кольцо: промежуток, сборка, вывод (мкс), пиксели, коммиты, «шло движение» — свежие по кругу.
+    ring: [(u32, u32, u32, u32, u32, u32); FRAMES_KEPT],
+    /// Куда писать следующий.
+    head: usize,
+    /// Сколько записано за всё время (по нему видно, что кольцо ещё не полное).
+    total: u64,
+    /// Когда кончился прошлый кадр.
+    last: u64,
+    /// Сколько клиентских кадров приехало ВСЕГО и сколько с прошлого кадра экрана.
+    commits: u64,
+    since: u32,
+}
+
+impl Frames {
+    fn new() -> Frames {
+        Frames {
+            ring: [(0, 0, 0, 0, 0, 0); FRAMES_KEPT],
+            head: 0,
+            total: 0,
+            last: 0,
+            commits: 0,
+            since: 0,
+        }
+    }
+
+    /// Записать кадр. `t0` — начало, `mid` — конец сборки, `t1` — конец вывода, `busy` — вёл ли
+    /// композитор собственное движение (переезд окна, лента, всплывашка).
+    fn put(&mut self, t0: u64, mid: u64, t1: u64, px: u32, busy: bool) {
+        let gap = if self.last == 0 { 0 } else { t1.saturating_sub(self.last) };
+        self.ring[self.head] = (
+            (gap / 1000) as u32,
+            (mid.saturating_sub(t0) / 1000) as u32,
+            (t1.saturating_sub(mid) / 1000) as u32,
+            px,
+            core::mem::take(&mut self.since),
+            busy as u32,
+        );
+        self.head = (self.head + 1) % FRAMES_KEPT;
+        self.total += 1;
+        self.last = t1;
+    }
+
+    /// Ответ на [`win::OP_FRAMES`]: заголовок и кольцо от старого к новому.
+    fn encode(&self, w: u32, h: u32) -> Vec<u8> {
+        let n = (self.total as usize).min(FRAMES_KEPT);
+        let mut out = Vec::with_capacity(28 + n * 24);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes());
+        out.extend_from_slice(&self.total.to_le_bytes());
+        out.extend_from_slice(&self.commits.to_le_bytes());
+        for k in 0..n {
+            let i = (self.head + FRAMES_KEPT - n + k) % FRAMES_KEPT;
+            let r = self.ring[i];
+            for v in [r.0, r.1, r.2, r.3, r.4, r.5] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
 /// Веха 168.2 — ВСПЛЫВАШКА: что висит, когда появилась и когда погаснет.
 ///
 /// Время появления пришлось запомнить ради движения: до этой вехи всплывашка возникала целиком и
@@ -822,6 +896,8 @@ fn main_loop() -> ! {
         next_note: 1,
         toast: None,
         toast_box: None,
+        frames: Frames::new(),
+        anim_busy: false,
         dnd: false,
         wins: Vec::new(),
         next_id: 1,
@@ -1118,6 +1194,17 @@ struct Win {
     /// выглядело как артефакты.
     bw: i32,
     bh: i32,
+    /// Веха 168.3 — **ЧТО КЛИЕНТ ВООБЩЕ РИСОВАЛ** в этот буфер: объединение всех его кадров, в
+    /// координатах буфера. Пусто — не рисовал ничего.
+    ///
+    /// Нужно, чтобы убрать поверхность стоило по площади нарисованного, а не по площади
+    /// поверхности. Слой панели растянут на весь экран, но закрашено в нём полотно меню и полоса;
+    /// остальное — нули, то есть прозрачность, и пересобирать под ним стол незачем: без слоя там
+    /// получится ровно тот же пиксель.
+    ///
+    /// До этой вехи закрытие меню стоило миллион точек и 11 мс сборки — единственный кадр во всём
+    /// замере, выпадавший из бюджета ([`Frames`], `bin/fps`).
+    touched: Rect,
     /// Отложенный ответ на `OP_EVENT` (клиент спит в `SYS_CALL`).
     waiting: Option<usize>,
     /// Веха 140 — СРОК отложенного ответа (монотонные наносекунды). `None` — ждать бессрочно, как
@@ -1587,6 +1674,14 @@ struct Wm {
     /// не в строке отрисовки: строке пришлось бы спрашивать время у ядра, то есть делать по
     /// системному вызову на каждую строку экрана.
     toast_box: Option<At<Screen>>,
+    /// Веха 168.3 — счёт кадров экрана и «вёл ли композитор своё движение на этом обороте».
+    ///
+    /// Флаг нужен счётчику, чтобы отличить ПРОСТОЙ от РЫВКА: между кадрами может лежать секунда
+    /// просто потому, что ничего не происходило, и считать её пропущенным кадром — врать самому
+    /// себе. Кадр «в работе» — тот, на котором либо приехало чужое содержимое, либо двигались мы
+    /// сами.
+    frames: Frames,
+    anim_busy: bool,
     /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт.
     dnd: bool,
     /// Веха 167 — модификаторы клавиатуры, как их видел последний раз. Уезжают клиенту вместе
@@ -2015,6 +2110,9 @@ impl Wm {
             }
             moving |= waiting;
         }
+        // Веха 168.3 — запоминаем для счётчика кадров: по этому флагу он отличит рывок от
+        // простоя (см. [`Frames`]).
+        self.anim_busy = moving;
         moving
     }
 
@@ -2081,6 +2179,10 @@ impl Wm {
         // хозяина, всё это время держал бы занятую зону, и лента дёргалась бы дважды.
         if self.wins[k].layer.is_some() {
             let r = self.wins[k].place(self.scroll_x);
+            // Веха 168.3 — стираем НАРИСОВАННОЕ, а не всю поверхность: строка запуска растянута
+            // на весь экран, а закрашена в ней одна карточка. Остальное прозрачно, и стол под ним
+            // уже такой, каким он останется без слоя.
+            let r = self.touched_on(k, r);
             self.drop_next(k);
             self.drop_buf(k);
             self.wins.remove(k);
@@ -2137,19 +2239,25 @@ impl Wm {
         if self.damage.is_empty() {
             return;
         }
+        // Веха 168.3 — два чтения часов на кадр: одно здесь, одно на границе сборки и вывода.
+        // Ими и меряется «подлагивает» ([`Frames`]).
+        let t0 = sys::monotonic_ns();
         let rects = core::mem::take(&mut self.damage);
         for r in &rects {
             self.repaint(*r);
         }
+        let mid = sys::monotonic_ns();
         // На экран — либо те же области, либо весь кадр (после сдвига памяти изменилось всё).
         let pitch = self.info.width as usize;
         let sh = core::mem::take(&mut self.shadow);
+        let mut px = 0u32;
         if self.present_all {
             self.present_all = false;
             for yy in 0..self.info.height as i32 {
                 let off = yy as usize * pitch;
                 self.write_row(0, yy, &sh[off..off + pitch]);
             }
+            px = (self.info.width * self.info.height) as u32;
         } else {
             for r in &rects {
                 let r = r.rect();
@@ -2157,10 +2265,12 @@ impl Wm {
                     let off = yy as usize * pitch + r.x as usize;
                     self.write_row(r.x, yy, &sh[off..off + r.w as usize]);
                 }
+                px += (r.w * r.h).max(0) as u32;
             }
         }
         self.shadow = sh;
         fence();
+        self.frames.put(t0, mid, sys::monotonic_ns(), px, self.anim_busy);
     }
 
     /// Перерисовать прямоугольник экрана. Строка собирается ЦЕЛИКОМ в памяти — стол, окна в
@@ -3481,6 +3591,7 @@ impl Wm {
                 slot: 0,
                 bw: if has_shot { r.bw } else { 0 },
                 bh: if has_shot { r.bh } else { 0 },
+                touched: Rect::ZERO,
                 waiting: None,
                 wait_until: None,
                 watching: false,
@@ -4261,6 +4372,21 @@ impl Wm {
         Some(At::new((sc.w - w - TOAST_PAD).max(0), self.work.rect().y + TOAST_PAD, w, h))
     }
 
+    /// Веха 168.3 — где на экране лежит то, что клиент ДЕЙСТВИТЕЛЬНО нарисовал в свой буфер
+    /// (`Win::touched`), если поверхность стоит на месте `place`.
+    ///
+    /// Нужно, чтобы убирать поверхность по площади нарисованного. У слоя буфер и место совпадают
+    /// (место он называет сам), поэтому перевод — просто сдвиг; на всякий случай режем по месту.
+    /// Не рисовал ничего — и стирать нечего.
+    fn touched_on(&self, i: usize, place: At<Screen>) -> At<Screen> {
+        let t = self.wins[i].touched;
+        if t.is_empty() {
+            return At::new(0, 0, 0, 0);
+        }
+        let p = place.rect();
+        At::of(Rect::new(p.x + t.x, p.y + t.y, t.w, t.h).intersect(p))
+    }
+
     fn damage_toast(&mut self) {
         if let Some(r) = self.toast_at() {
             self.damage(r);
@@ -4573,8 +4699,24 @@ impl Wm {
         win.from = to;
         win.to = to;
         win.dur = 0;
-        self.damage(old);
-        self.damage(place);
+        // Веха 168.3 — помечаем ТОЛЬКО СТАРОЕ место, а не новое.
+        //
+        // Слой панели вырастает на весь экран, когда открывается меню, и здесь стоял
+        // `damage(place)` — то есть пересборка миллиона точек ради полотна в три сотни на две.
+        // Счётчик кадров (`fps`) назвал этот кадр поимённо: 11.7 мс сборки, 100 % экрана, и
+        // ровно на нём движение и спотыкалось — весь бюджет кадра уходил в один кадр.
+        //
+        // Новое место помечать не нужно: свежие страницы общего буфера ПРОЗРАЧНЫ (ядро отдаёт их
+        // обнулёнными), а прозрачный слой поверх стола даёт тот же пиксель, что был без него.
+        // Что клиент в этот буфер нарисует, он скажет сам — прямоугольником своего кадра, и
+        // приедет он этим же сообщением, строкой ниже.
+        //
+        // Старое место — наоборот, обязательно: слой мог СЖАТЬСЯ, и то, что он занимал, надо
+        // из-под него открыть. Но и там — только НАРИСОВАННОЕ (`touched`): остальное в старом
+        // буфере было прозрачным, и стол под ним уже такой, какой нужен.
+        let was = self.touched_on(i, old);
+        self.wins[i].touched = Rect::ZERO;
+        self.damage(was);
         if (r.w, r.h) != (p.w, p.h) {
             let ev = win::Event::Resize { w: r.w as u16, h: r.h as u16 };
             self.send(i, ev);
@@ -4777,6 +4919,7 @@ impl Wm {
                     slot,
                     bw: if buf != 0 { w } else { 0 },
                     bh: if buf != 0 { h } else { 0 },
+                    touched: Rect::ZERO,
                     waiting: None,
                     wait_until: None,
                     watching: false,
@@ -4885,6 +5028,7 @@ impl Wm {
                     slot,
                     bw: if buf != 0 { w } else { 0 },
                     bh: if buf != 0 { h } else { 0 },
+                    touched: Rect::ZERO,
                     waiting: None,
                     wait_until: None,
                     watching: false,
@@ -5083,11 +5227,21 @@ impl Wm {
             win::OP_COMMIT => {
                 let c = body!(m, win::wire::Commit::decode(req));
                 sys::reply(m.reply_cap, &[]);
+                // Веха 168.3 — клиентский кадр приехал. Считаем ЗДЕСЬ, а не в `flush`: между
+                // «клиент нарисовал» и «оказалось на экране» лежит всё, что нас интересует, и
+                // сложить эти два события в одно значило бы стереть саму разницу.
+                self.frames.commits += 1;
+                self.frames.since += 1;
                 if let Some(i) = self.wins.iter().position(|w| w.id == c.id) {
                     // Веха 147.1 — вот он, первый кадр в новом буфере: показываем его целиком
                     // (буфер + место поверхности) ДО разбора повреждения, иначе прямоугольник
                     // считался бы в координатах уже неактуального кадра.
                     self.swap_buf(i);
+                    // Веха 168.3 — и запоминаем, ЧТО он нарисовал: по этому следу поверхность
+                    // потом и уберут — площадью нарисованного, а не площадью поверхности. После
+                    // смены буфера, а не до: след принадлежит буферу, а не окну.
+                    let drew = Rect::new(c.x as i32, c.y as i32, c.w as i32, c.h as i32);
+                    self.wins[i].touched = self.wins[i].touched.union(drew);
                     // Веха 142 — ПЕРВЫЙ кадр обоев: отсюда и начинается их проявление.
                     //
                     // Не с создания поверхности: обои распаковывают картинку и просят место
@@ -5286,6 +5440,7 @@ impl Wm {
                     slot: 0,
                     bw: 0,
                     bh: 0,
+                    touched: Rect::ZERO,
                     waiting: None,
                     wait_until: None,
                     watching: false,
@@ -5412,6 +5567,19 @@ impl Wm {
                     self.toast = None;
                 }
                 sys::reply(m.reply_cap, &[(was - self.notes.len()).min(255) as u8]);
+            }
+            // Веха 168.3 — счёт кадров ЭКРАНА. Отдаём как есть, без сглаживания: сгладить
+            // рывок значит его спрятать, а ищут именно его.
+            win::OP_FRAMES => {
+                // Непустое тело — СБРОС: замер начинается с чистого кольца, иначе в него попадёт
+                // всё, что человек делал до того, как решил померить.
+                if m.len > 0 && !req.is_empty() {
+                    self.frames = Frames::new();
+                    sys::reply(m.reply_cap, &[]);
+                    return;
+                }
+                let rep = self.frames.encode(self.info.width as u32, self.info.height as u32);
+                sys::reply(m.reply_cap, &rep);
             }
             // Веха 168.1 — «не беспокоить». Пустое тело — только спросить.
             win::OP_NOTE_DND => {
