@@ -58,6 +58,7 @@ mod profile;
 pub mod anim;
 pub mod app;
 pub mod conf;
+pub mod edit;
 pub mod font;
 pub mod icon;
 pub mod list;
@@ -70,6 +71,8 @@ pub mod theme;
 pub use anim::Motion;
 #[allow(unused_imports)]
 pub use app::{Client, Input, Scope};
+#[allow(unused_imports)]
+pub use edit::Edit;
 #[allow(unused_imports)]
 pub use list::{Hit, List};
 pub use paint::{Align, Canvas, Rect, Rgba};
@@ -101,6 +104,8 @@ pub struct Ui<'a> {
     /// Где ДЕРЖАТ левую кнопку (Веха 148.3). Клик и зажатие — разные вещи: клик живёт один кадр,
     /// зажатие тянется, пока кнопку не отпустят, и протяжка полосы прокрутки — это оно.
     held: Option<(i32, i32)>,
+    /// Веха 167 — модификаторы на момент щелчка: `Ctrl`/`Shift` у мыши.
+    mods: u8,
     dirty: Rect,
     /// Веха 145 — ОБЩАЯ прозрачность всего, что рисуется дальше (1/256). Ею проявляется меню:
     /// иначе выезд пришлось бы городить из полутора десятков полупрозрачных цветов, согласованных
@@ -117,6 +122,7 @@ impl<'a> Ui<'a> {
             ptr: None,
             click: None,
             held: None,
+            mods: 0,
             dirty: Rect::ZERO,
             fade: 256,
         }
@@ -127,10 +133,17 @@ impl<'a> Ui<'a> {
     /// программе остаётся спрашивать [`Ui::hot`], [`Ui::clicked`] и [`Ui::held`].
     pub fn input(
         &mut self, ptr: Option<(i32, i32)>, click: Option<(i32, i32)>, held: Option<(i32, i32)>,
+        mods: u8,
     ) {
         self.ptr = ptr;
         self.click = click;
         self.held = held;
+        self.mods = mods;
+    }
+
+    /// Модификаторы щелчка этого кадра (`Ctrl`, `Shift`): выделение мышью строится на них.
+    pub fn mods(&self) -> u8 {
+        self.mods
     }
 
     /// Прямоугольник, который изменился с начала кадра. Пустой — не рисовали ничего.
@@ -635,6 +648,69 @@ impl<'a> Ui<'a> {
             self.c.fill(bar, c);
         }
         self.mark(r);
+    }
+
+    /// Веха 167 — **ПРАВИМОЕ ПОЛЕ**: то же, что [`Ui::field`], но с курсором в нужном месте и с
+    /// подсветкой выделения.
+    ///
+    /// Состояние приезжает готовым ([`edit::Edit`]) — виджет по-прежнему без памяти. Курсор здесь
+    /// не мигает и не должен: он показывает МЕСТО, а не то, что поле живо, и мигание ради мигания
+    /// стоило бы кадра каждые полсекунды на каждом открытом поле.
+    ///
+    /// Возвращает байтовый индекс, на который пришёлся щелчок (`None` — не щёлкали): попадание
+    /// считает тот же код, который рисует, и потому курсор встаёт ровно туда, куда ткнули.
+    pub fn edit_field(&mut self, r: Rect, e: &edit::Edit, hint: &str) -> Option<usize> {
+        let rad = self.th.radius.min(r.h / 2);
+        let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.th.border));
+        self.c.rrect_bordered(r, rad, self.th.line, bg, br);
+        let caret_w = self.th.line.max(1);
+        let inner = r.inset_xy(self.th.pad, 0);
+        let s = &e.text;
+        if s.is_empty() {
+            self.label(inner, hint, self.th.muted, Align::Left);
+        }
+        // Хвост, а не начало: человек смотрит туда, где печатает. Сдвиг считается по КУРСОРУ, а
+        // не по концу строки, — иначе, уйдя стрелками в начало длинного пути, он смотрел бы на
+        // его хвост и правил вслепую.
+        let tw = self.font.width(s);
+        let cx = self.font.width(&s[..e.caret().min(s.len())]);
+        let over = (tw - inner.w).max(0).min((cx - inner.w / 2).max(0));
+        let base = inner.y + (inner.h - self.font.line_h()) / 2 + self.font.ascent();
+        let keep = self.c.clip();
+        self.c.set_clip(inner.intersect(keep));
+        // Выделение — подложкой под текстом, а не инверсией: инверсия требует второго прохода по
+        // глифам, а подложка это один прямоугольник.
+        if let Some((a, b)) = e.selection() {
+            let (xa, xb) = (self.font.width(&s[..a]), self.font.width(&s[..b]));
+            let sel = Rect::new(inner.x - over + xa, r.y + self.th.px(3), xb - xa, r.h - 2 * self.th.px(3));
+            let c = self.tint(self.th.accent.with_a(0x66));
+            self.c.rrect(sel, self.th.px(2), c);
+        }
+        if !s.is_empty() {
+            let col = self.tint(self.th.text);
+            self.font.draw_clip(&mut self.c, inner.x - over, base, s, col, inner.w + over);
+        }
+        let x = (inner.x - over + cx).min(inner.right() - caret_w);
+        let h = self.font.line_h();
+        let bar = Rect::new(x, base - self.font.ascent(), caret_w, h);
+        let c = self.tint(self.th.accent);
+        self.c.fill(bar, c);
+        self.c.set_clip(keep);
+        self.mark(r);
+        // Куда ткнули: ближайшая граница символа к точке щелчка.
+        let hit = self.click.filter(|&(cx, cy)| r.contains(cx, cy))?;
+        let want = hit.0 - inner.x + over;
+        let mut at = 0;
+        for (i, _) in s.char_indices().skip(1) {
+            if self.font.width(&s[..i]) > want {
+                break;
+            }
+            at = i;
+        }
+        if want > self.font.width(s) {
+            at = s.len();
+        }
+        Some(at)
     }
 
     /// Веха 146 — **строка списка**: значок, название и подпись под ним.

@@ -458,7 +458,7 @@ impl ui::Client for App {
                     ui::Scope::No
                 }
             }
-            Event::Button { x, y, down, buttons } => {
+            Event::Button { x, y, down, buttons, .. } => {
                 if down && buttons & 1 != 0 {
                     // Запоминаем корень ПОД НАЖАТИЕМ, а не выбранный: выбор меняет этот же
                     // щелчок, и меняет он его кадром позже — потащили бы прошлое.

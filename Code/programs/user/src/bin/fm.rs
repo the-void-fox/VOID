@@ -38,7 +38,7 @@ use void_user::win::{self as win, sym, Event, Window};
 #[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
-use ui::{Align, Font, Rect, Theme, Ui};
+use ui::{Align, Font, Rect, Rgba, Theme, Ui};
 
 /// Кадр окна плюс имена каталога: сотни записей — это сотни коротких строк.
 #[global_allocator]
@@ -92,6 +92,11 @@ struct Lay {
     row_h: i32,
     /// Сколько ячеек (строк) помещается по вертикали.
     page: usize,
+    /// Закладки: где начинается первая строка, её высота, зазор и поле колонки.
+    mark_y: i32,
+    mark_h: i32,
+    mark_gap: i32,
+    mark_pad: i32,
 }
 
 struct App {
@@ -104,11 +109,12 @@ struct App {
     /// Номера записей, прошедших отбор по набранному.
     hits: Vec<usize>,
     sel: usize,
-    /// Выбор сделан ЧЕЛОВЕКОМ (щелчком или стрелками), а не подставлен нулём при входе в
-    /// каталог. Без этого различия первый значок открывался ОДНИМ щелчком, а все остальные —
-    /// двумя: `sel` при входе равен нулю, и щелчок по нулевой ячейке сразу попадал в «щёлкнули
-    /// по уже выбранному». Один и тот же жест давал разное — и объяснить это нечем.
-    picked: bool,
+    /// Веха 167 — ВЫДЕЛЕННОЕ: номера строк в отобранном списке. Пусто — не выделено ничего, и
+    /// это не то же самое, что «выделена нулевая»: при входе в каталог `sel` равен нулю, и без
+    /// различия первый значок открывался бы одним щелчком, а все остальные — двумя.
+    marked: Vec<usize>,
+    /// Якорь диапазона для `Shift`: откуда тянется выделение.
+    anchor: usize,
     top: usize,
     /// Куда возвращаться и откуда возвращаться. Две стопки, как у браузера: «назад» кладёт в
     /// «вперёд», любой новый переход «вперёд» очищает.
@@ -117,6 +123,8 @@ struct App {
     query: String,
     /// Сетка значков (как в макете) или список с размерами.
     grid: bool,
+    /// Подпись содержимого каталога: по ней автообновление узнаёт, изменилось ли что-нибудь.
+    sig: u64,
     /// Что сказал сервер, если каталог НЕ ОТКРЫЛСЯ, и не обрезан ли список.
     err: Option<String>,
     /// Ответ на последнее действие («скопировано», «нет такого пути»). Отдельно от `err`: тот
@@ -125,12 +133,13 @@ struct App {
     cut: bool,
     marks: Vec<(String, String)>,
     lay: Lay,
-    /// Веха 166.2 — ПРАВКА ПУТИ прямо в адресной строке: `Some(текст)` — правим. Отдельного окна
-    /// «перейти к» нет и не надо: строка адреса уже показывает, где мы, и логично, что она же
-    /// принимает, куда идти.
-    edit: Option<String>,
+    /// Веха 167 — что правим прямо сейчас и чем. Правка одна на весь менеджер: набирать в двух
+    /// местах разом нельзя, а «половина букв в путь, половина в имя» — ровно это и было бы.
+    edit: Option<(What, ui::Edit)>,
     /// Контекстное меню: где открыто и по какой записи (`None` — по пустому месту).
-    menu: Option<(i32, i32, Option<usize>)>,
+    menu: Option<(i32, i32, Tgt)>,
+    /// Правка началась ЭТИМ ЖЕ щелчком (из меню): пока так, щелчок её не отменяет.
+    edit_fresh: bool,
     /// Меню открыто ЭТИМ ЖЕ щелчком: пока так, его пункты кликов не принимают. Иначе нажатие
     /// правой кнопкой открывало бы меню и тут же выбирало в нём пункт под курсором.
     menu_fresh: bool,
@@ -154,6 +163,33 @@ enum Act {
     Paste,
     Refresh,
     Delete,
+    Rename,
+    NewDir,
+    NewFile,
+    Mark,
+    Unmark,
+}
+
+/// По чему нажали правой кнопкой.
+#[derive(Clone, Copy, PartialEq)]
+enum Tgt {
+    /// Запись содержимого (номер в отобранном списке).
+    Entry(usize),
+    /// Закладка в боковой колонке.
+    Mark(usize),
+    /// Пустое место: меню про текущий каталог.
+    Empty,
+}
+
+/// Что именно правится в поле ввода.
+#[derive(Clone, Copy, PartialEq)]
+enum What {
+    /// Путь в адресной строке.
+    Path,
+    /// Имя записи (номер в отобранном списке).
+    Rename(usize),
+    /// Имя того, чего ещё нет: каталога либо файла.
+    Create { dir: bool },
 }
 
 impl App {
@@ -177,6 +213,18 @@ impl App {
     /// Перечитать текущий каталог. Порядок — каталоги вперёд, дальше по имени: так же его
     /// показывает `ls`, и человеку не приходится держать в голове два разных порядка.
     fn read(&mut self) {
+        // Что было выбрано и куда прокручено — ЗАПОМИНАЕМ ИМЕНЕМ. Автообновление зовёт `read`
+        // дважды в секунду, и сбрасывать выбор с прокруткой на каждый чужой файл значило бы
+        // сделать менеджер непригодным ровно тогда, когда в каталоге что-то происходит.
+        // Восстанавливаем ВЫДЕЛЕНИЕ, а не «строку под курсором»: без этого различия
+        // автообновление через две секунды само выделяло нулевую запись, и первый же щелчок по
+        // ней читался как второй — каталог открывался с одного нажатия.
+        let keep = self
+            .hits
+            .get(self.sel)
+            .filter(|_| !self.marked.is_empty())
+            .map(|&i| self.entries[i].name.clone());
+        let keep_top = self.top;
         self.entries.clear();
         self.err = None;
         self.cut = false;
@@ -209,7 +257,25 @@ impl App {
             });
         }
         self.entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+        // Подпись — по именам и виду: перечитали и получили то же самое значит «ничего не
+        // изменилось», и кадра не надо. Размеры в подпись не входят: их мы спрашиваем у одного
+        // файла, а не у всех, и знать о них нечего.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in &self.entries {
+            for b in e.name.as_bytes().iter().chain(&[e.dir as u8]) {
+                h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        self.sig = h;
         self.refilter();
+        if let Some(name) = keep {
+            if let Some(k) = self.hits.iter().position(|&i| self.entries[i].name == name) {
+                self.sel = k;
+                self.anchor = k;
+                self.marked = alloc::vec![k];
+                self.top = keep_top.min(self.max_top());
+            }
+        }
     }
 
     /// Пересобрать отбор по набранному, сохранив выбор в пределах списка.
@@ -232,7 +298,8 @@ impl App {
         self.query.clear();
         self.flash = None;
         self.sel = 0;
-        self.picked = false;
+        self.marked.clear();
+        self.anchor = 0;
         self.read();
     }
 
@@ -248,7 +315,8 @@ impl App {
         self.query.clear();
         self.flash = None;
         self.sel = 0;
-        self.picked = false;
+        self.marked.clear();
+        self.anchor = 0;
         self.read();
     }
 
@@ -311,6 +379,11 @@ impl App {
         // Боковая колонка — фиксированной ширины, как в макете; остальное содержимому.
         let side_w = th.px(150).min(all.w / 3);
         lay.side = all.cut_left(side_w);
+        // Строки закладок — из тех же чисел, что и рисование: заголовок, поле, зазор.
+        lay.mark_pad = th.px(7);
+        lay.mark_h = font_h + th.px(3);
+        lay.mark_gap = th.px(3);
+        lay.mark_y = lay.side.y + lay.mark_pad + (font_h + th.px(4)) + th.px(4);
         all.cut_left(m);
         lay.body = all;
 
@@ -352,8 +425,14 @@ impl App {
         dirty |= self.paint_body(u, th, lay);
         // Меню — ПОСЛЕДНИМ: оно лежит поверх всего, и рисовать его раньше значит рисовать под.
         dirty |= self.paint_menu(u, th);
-        // Щелчок мимо адресной строки бросает правку: человек передумал, а не ошибся.
-        if self.edit.is_some() {
+        // Щелчок мимо адресной строки бросает правку ПУТИ: человек передумал, а не ошибся.
+        //
+        // Только пути и только не в тот же кадр, в который правка началась. Оба ограничения
+        // выстраданы: без первого щелчок мимо сбрасывал бы набор ИМЕНИ (а он начинается из
+        // меню, то есть щелчком заведомо не по адресной строке), без второго — тот же самый
+        // щелчок, что выбрал пункт «создать каталог», её же и отменял. Поле появлялось и
+        // исчезало в одном кадре, снаружи это выглядело как «пункт меню не работает».
+        if matches!(self.edit, Some((What::Path, _))) && !self.edit_fresh {
             if let Some((cx, cy)) = u.click() {
                 if !lay.addr.contains(cx, cy) {
                     self.edit = None;
@@ -361,6 +440,7 @@ impl App {
                 }
             }
         }
+        self.edit_fresh = false;
         dirty
     }
 
@@ -394,6 +474,7 @@ impl App {
         // Адрес: поле цвета фона, в нём крошки плитками. Набранное показывается ТУТ ЖЕ вместо
         // крошек — поиск и адрес отвечают на один и тот же вопрос «что я сейчас вижу».
         let mut jump: Option<String> = None;
+        let mut caret_to: Option<usize> = None;
         let rad = th.radius.min(lay.addr.h / 2);
         let (bg, br) = (u.tint(th.band), u.tint(th.border));
         u.c.rrect_bordered(lay.addr, rad, th.line, bg, br);
@@ -401,8 +482,10 @@ impl App {
         // Веха 166.2 — ПРАВКА ПУТИ. Отдельного окна «перейти к» нет и не нужно: строка адреса
         // и так отвечает на «где я», логично, что она же принимает «куда идти». Пока правим,
         // крошек нет — иначе в одном месте было бы два разных ответа на один вопрос.
-        if let Some(text) = self.edit.clone() {
-            u.field(lay.addr, &text, "путь", true);
+        if let Some((What::Path, e)) = &self.edit {
+            if let Some(at) = u.edit_field(lay.addr, e, "путь") {
+                caret_to = Some(at);
+            }
         } else if !self.query.is_empty() {
             u.label(a, &alloc::format!("поиск: {}", self.query), th.text, Align::Left);
         } else {
@@ -433,7 +516,12 @@ impl App {
         // отвечает на «перейти туда», и отдавать ей ещё и «править» значило бы два смысла на
         // одном месте.
         if self.edit.is_none() && jump.is_none() && u.clicked(lay.addr) {
-            self.edit = Some(self.cwd.clone());
+            self.begin_edit(What::Path);
+            dirty = true;
+        }
+        // Щелчок ВНУТРИ правимого поля ставит курсор туда, куда ткнули.
+        if let (Some(at), Some((_, e))) = (caret_to, self.edit.as_mut()) {
+            e.put_caret(at);
             dirty = true;
         }
 
@@ -470,14 +558,12 @@ impl App {
         head.cut_left(th.px(4));
         u.label(head, "закладки", th.muted, Align::Left);
         d.cut_top(th.px(4));
-        let row_h = font_h + th.px(3);
         let mut act: Option<String> = None;
         for k in 0..self.marks.len() {
-            if d.h < row_h {
+            let r = self.mark_rect(lay, k);
+            if r.bottom() > lay.side.bottom() {
                 break;
             }
-            let r = d.cut_top(row_h);
-            d.cut_top(th.px(3));
             let (path, label) = (self.marks[k].0.clone(), self.marks[k].1.clone());
             let here = self.cwd == path;
             let bg = if here {
@@ -512,6 +598,22 @@ impl App {
         u.card(lay.body);
         let font_h = u.font.line_h();
         let mut dirty = false;
+        // Веха 167 — ПОЛОСА ПРАВКИ ИМЕНИ поверх содержимого: переименование и создание набирают
+        // в ней. Не в самой ячейке: ячейка сетки шириной в девять знаков, и поле в ней было бы
+        // уже, чем то, что в него набирают.
+        if let Some((what @ (What::Rename(_) | What::Create { .. }), e)) = &self.edit {
+            let hint = match what {
+                What::Create { dir: true } => "имя каталога",
+                What::Create { dir: false } => "имя файла",
+                _ => "новое имя",
+            };
+            let r = Rect::new(lay.body.x + th.pad, lay.body.y + th.px(6), lay.body.w - 2 * th.pad, font_h + th.px(10));
+            let at = u.edit_field(r, e, hint);
+            if let (Some(at), Some((_, e))) = (at, self.edit.as_mut()) {
+                e.put_caret(at);
+            }
+            return true;
+        }
         if let Some(e) = &self.err {
             let mut d = lay.body.inset(th.pad);
             let msg = e.clone();
@@ -540,14 +642,21 @@ impl App {
         // Это тот же уговор, по которому [`ui::Client::after`] отделён от `draw`, и та же
         // причина: кадр рисует ПО СНИМКУ состояния, и менять снимок в середине кадра — значит
         // рисовать вторую половину по данным, которых первая не видела.
-        let mut act: Option<usize> = None;
+        let mut act: Option<(usize, u8)> = None;
         for k in self.top..end {
             let i = self.hits[k];
             let r = self.cell_rect(lay, k - self.top);
-            let sel = k == self.sel;
-            if sel || u.hot(r) {
-                let c = u.tint(if sel { th.band_on } else { th.text.with_a(0x10) });
+            // Выделенных может быть много, а КУРСОР один: выделенное залито, курсор ещё и
+            // обведён. Без разницы между ними после `Shift`-полосы непонятно, откуда она
+            // потянется дальше.
+            let mark = self.marked.contains(&k);
+            if mark || u.hot(r) {
+                let c = u.tint(if mark { th.band_on } else { th.text.with_a(0x10) });
                 u.c.rrect(r, th.radius.min(r.h / 2), c);
+            }
+            if k == self.sel && mark {
+                let c = u.tint(th.accent.with_a(0x88));
+                u.c.rrect_bordered(r, th.radius.min(r.h / 2), th.line.max(1), Rgba::CLEAR, c);
             }
             let (name, dir, size) = {
                 let e = &self.entries[i];
@@ -583,7 +692,7 @@ impl App {
                 u.label(val, &s, th.muted, Align::Right);
             }
             if u.clicked(r) {
-                act = Some(k);
+                act = Some((k, u.mods()));
             }
         }
         // Подвал содержимого: ответ на последнее действие, а без него — не обрезан ли список.
@@ -603,19 +712,253 @@ impl App {
         // по уже выбранному — открывает. Двойного щелчка по ВРЕМЕНИ у нас нет и самодельного не
         // будет: часов у событий композитора нет, а мерить их самим значит завести своё понятие
         // «двойного» вразрез с системным.
-        if let Some(k) = act.filter(|_| self.menu.is_none()) {
-            if self.picked && k == self.sel {
-                self.open_sel();
-            } else {
-                self.sel = k;
-                self.picked = true;
-                if let Some(&i) = self.hits.get(k) {
-                    self.measure_sel(i);
-                }
-            }
+        if let Some((k, mods)) = act.filter(|_| self.menu.is_none()) {
+            self.click_entry(k, mods);
             dirty = true;
         }
         dirty
+    }
+
+    /// Веха 167 — щелчок по записи с учётом модификаторов.
+    ///
+    /// Три жеста, и они не выдуманы: `Ctrl` добавляет по одному, `Shift` берёт полосу от якоря,
+    /// простой щелчок начинает выделение заново. Второй щелчок по УЖЕ выделенной одиночке
+    /// открывает — двойного щелчка по времени у нас нет ([[void-fm]]).
+    fn click_entry(&mut self, k: usize, mods: u8) {
+        let ctrl = mods & win::modk::CTRL != 0;
+        let shift = mods & win::modk::SHIFT != 0;
+        if ctrl {
+            match self.marked.iter().position(|&x| x == k) {
+                Some(i) => {
+                    self.marked.remove(i);
+                }
+                None => self.marked.push(k),
+            }
+            self.sel = k;
+            self.anchor = k;
+            return;
+        }
+        if shift {
+            let (a, b) = (self.anchor.min(k), self.anchor.max(k));
+            self.marked = (a..=b).collect();
+            self.sel = k;
+            return;
+        }
+        if self.marked.len() == 1 && self.marked[0] == k && self.sel == k {
+            self.open_sel();
+            return;
+        }
+        self.pick_one(k);
+        if let Some(&i) = self.hits.get(k) {
+            self.measure_sel(i);
+        }
+    }
+
+    /// Выделить ровно одну запись и сделать её якорем.
+    fn pick_one(&mut self, k: usize) {
+        self.sel = k;
+        self.anchor = k;
+        self.marked.clear();
+        self.marked.push(k);
+    }
+
+    /// Пути всего выделенного (или, если не выделено ничего, — пусто).
+    fn marked_paths(&self) -> Vec<String> {
+        let mut v: Vec<usize> = self.marked.clone();
+        v.sort_unstable();
+        v.dedup();
+        v.iter().filter_map(|&k| self.path_of(k)).collect()
+    }
+
+    /// Веха 167 — ПЕРЕНЕСТИ сюда всё, что уронили. Возвращает, сколько перенеслось.
+    ///
+    /// Перенос, а не переход по пути: уронить объект в окно менеджера значит «положи его сюда»,
+    /// и другого смысла у этого жеста нет. Переход остался у ВСТАВКИ (`Ctrl+V`) — там человек
+    /// назвал путь, а не объект.
+    ///
+    /// Делает его `rename` файлового сервера: у него уже есть правило POSIX «цель — существующий
+    /// каталог, значит внутрь него» (Веха 97.1), и второго такого правила заводить не надо.
+    fn move_here(&mut self, paths: &[String]) {
+        let (mut ok, mut fail) = (0usize, 0usize);
+        for p in paths {
+            // Своё же место — не работа, а недоразумение: молча ничего не делаем.
+            if Self::parent(p) == self.cwd {
+                continue;
+            }
+            if px::rename(self.ep, p.as_bytes(), self.cwd.as_bytes()) == 0 {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        self.flash = Some(match (ok, fail) {
+            (0, 0) => String::from("это уже здесь"),
+            (n, 0) => alloc::format!("перенесено: {n}"),
+            (0, f) => alloc::format!("не перенести: {f} (каталоги пока не переносятся)"),
+            (n, f) => alloc::format!("перенесено: {n}, не вышло: {f}"),
+        });
+        if ok > 0 {
+            self.read();
+        }
+    }
+
+    /// Веха 167 — закладки ЖИВУТ ФАЙЛОМ (`/etc/fm.marks`, по пути на строку).
+    ///
+    /// Не в конфиге поколения, хотя соблазн был: закладка — не свойство системы, а привычка
+    /// человека, и требовать ради неё `rebuild` со сменой поколения значило бы приравнять
+    /// «добавил папку в боковую колонку» к «переставил службу». Файлом же её видно и правит
+    /// любой редактор.
+    const MARKS_FILE: &'static str = "/etc/fm.marks";
+
+    /// Прочитать закладки; строки, которых на диске уже нет, отбрасываются молча.
+    fn load_marks(&mut self) {
+        let mut out: Vec<(String, String)> = Vec::new();
+        if let Some(text) = ui::font::read_path(Self::MARKS_FILE) {
+            for line in String::from_utf8_lossy(&text).lines() {
+                let p = line.trim();
+                if p.starts_with('/') && px::stat(self.ep, p.as_bytes()).is_some_and(|(d, _)| d) {
+                    out.push((String::from(p), Self::leaf_name(p)));
+                }
+            }
+        }
+        if out.is_empty() {
+            // Пусто (или файла нет) — умолчание из мест, которые в системе есть всегда.
+            out = MARKS
+                .iter()
+                .filter(|(p, _)| px::stat(self.ep, p.as_bytes()).is_some_and(|(d, _)| d))
+                .map(|(p, l)| (String::from(*p), String::from(*l)))
+                .collect();
+        }
+        self.marks = out;
+    }
+
+    /// Записать закладки обратно в файл.
+    fn save_marks(&mut self) {
+        let mut text = String::new();
+        for (p, _) in &self.marks {
+            text.push_str(p);
+            text.push('\n');
+        }
+        let fd = px::open(self.ep, Self::MARKS_FILE.as_bytes(), px::O_TRUNC);
+        if fd == usize::MAX {
+            self.flash = Some(String::from("закладки не записать"));
+            return;
+        }
+        px::write(self.ep, fd, text.as_bytes());
+        px::close(self.ep, fd);
+    }
+
+    /// Имя последнего звена пути (для подписи закладки). У корня имени нет — так и назовём.
+    fn leaf_name(p: &str) -> String {
+        match p.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()) {
+            Some(n) => String::from(n),
+            None => String::from("корень"),
+        }
+    }
+
+    fn add_mark(&mut self, path: String) {
+        if !px::stat(self.ep, path.as_bytes()).is_some_and(|(d, _)| d) {
+            self.flash = Some(String::from("в закладки кладём каталоги"));
+            return;
+        }
+        if self.marks.iter().any(|(p, _)| *p == path) {
+            self.flash = Some(String::from("уже в закладках"));
+            return;
+        }
+        let name = Self::leaf_name(&path);
+        self.marks.push((path, name));
+        self.save_marks();
+        self.flash = Some(String::from("добавлено в закладки"));
+    }
+
+    fn drop_mark(&mut self, k: usize) {
+        if k >= self.marks.len() {
+            return;
+        }
+        self.marks.remove(k);
+        self.save_marks();
+        self.flash = Some(String::from("закладка убрана"));
+    }
+
+    /// Начать правку: адреса, имени записи или имени нового объекта.
+    fn begin_edit(&mut self, what: What) {
+        let text = match what {
+            What::Path => self.cwd.clone(),
+            What::Rename(k) => self
+                .hits
+                .get(k)
+                .map(|&i| self.entries[i].name.clone())
+                .unwrap_or_default(),
+            What::Create { .. } => String::new(),
+        };
+        self.edit = Some((what, ui::Edit::all(text)));
+        self.edit_fresh = true;
+    }
+
+    /// Довести правку до конца: применить набранное.
+    fn finish_edit(&mut self, what: What, text: String) {
+        let text = text.trim().to_string();
+        match what {
+            What::Path => {
+                self.goto_path(&text);
+                // Путь никуда не увёл — правку не закрываем: человеку править её же.
+                if self.flash.is_some() {
+                    self.edit = Some((What::Path, ui::Edit::tail(text)));
+                }
+            }
+            What::Rename(k) => {
+                if text.is_empty() || text.contains('/') {
+                    self.flash = Some(String::from("имя без косых черт и не пустое"));
+                    return;
+                }
+                // Каталог переименовать НЕЧЕМ, и сказать это надо до попытки. У файлового
+                // сервера корни объектов названы ПУТЯМИ (`f/etc/x`, `d/etc/x`), поэтому
+                // переименование каталога — это переименование корня каждого потомка вглубь;
+                // операции для этого в протоколе нет. Молчаливое «не вышло» тут хуже отказа:
+                // человек начинает искать причину в имени.
+                if self.hits.get(k).is_some_and(|&i| self.entries[i].dir) {
+                    self.flash = Some(String::from("каталоги пока не переименовываются"));
+                    return;
+                }
+                let Some(old) = self.path_of(k) else { return };
+                let new = Self::join(&self.cwd, &text);
+                if px::rename(self.ep, old.as_bytes(), new.as_bytes()) == 0 {
+                    self.flash = Some(alloc::format!("переименовано: {text}"));
+                    self.read();
+                } else {
+                    self.flash = Some(String::from("переименовать не вышло"));
+                }
+            }
+            What::Create { dir } => {
+                if text.is_empty() || text.contains('/') {
+                    self.flash = Some(String::from("имя без косых черт и не пустое"));
+                    return;
+                }
+                let p = Self::join(&self.cwd, &text);
+                let ok = if dir {
+                    px::mkdir(self.ep, p.as_bytes()) == 0
+                } else {
+                    // Файл заводится ОТКРЫТИЕМ: у персоналии `open` создаёт пустой, и отдельной
+                    // операции «создать файл» в протоколе нет. Закрыть обязательно — иначе он
+                    // останется висеть в слоте сервера незаписанным.
+                    let fd = px::open(self.ep, p.as_bytes(), 0);
+                    if fd != usize::MAX {
+                        px::close(self.ep, fd);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                self.flash = Some(if ok {
+                    alloc::format!("создано: {text}")
+                } else {
+                    String::from("создать не вышло")
+                });
+                if ok {
+                    self.read();
+                }
+            }
+        }
     }
 
     /// Полный путь записи `k` в отобранном списке.
@@ -629,12 +972,15 @@ impl App {
     /// Все действия — над ОДНОЙ записью либо над текущим каталогом; ни одно не спрашивает имени,
     /// потому что спрашивать его пока негде: поля ввода в менеджере ровно одно, и оно адресное.
     /// Переименование и «создать каталог» приедут вместе со вторым — не раньше.
-    fn do_act(&mut self, a: Act, target: Option<usize>) {
+    fn do_act(&mut self, a: Act, target: Tgt) {
+        let entry = match target {
+            Tgt::Entry(k) => Some(k),
+            _ => None,
+        };
         match a {
             Act::Open => {
-                if let Some(k) = target {
-                    self.sel = k;
-                    self.picked = true;
+                if let Some(k) = entry {
+                    self.pick_one(k);
                     self.open_sel();
                 }
             }
@@ -642,7 +988,7 @@ impl App {
             // в терминал, в редактор, в адресную строку. Возить содержимое файла было бы
             // догадкой о том, чего человек хотел.
             Act::Copy => {
-                let p = match target {
+                let p = match entry {
                     Some(k) => self.path_of(k).unwrap_or_else(|| self.cwd.clone()),
                     None => self.cwd.clone(),
                 };
@@ -650,17 +996,54 @@ impl App {
             }
             Act::Paste => self.paste(),
             Act::Refresh => self.read(),
+            Act::Rename => {
+                if let Some(k) = entry {
+                    self.begin_edit(What::Rename(k));
+                }
+            }
+            Act::NewDir => self.begin_edit(What::Create { dir: true }),
+            Act::NewFile => self.begin_edit(What::Create { dir: false }),
+            // Закладка — это путь в списке слева. Хранится файлом (`/etc/fm.marks`), а не в
+            // конфиге поколения: закладка не свойство СИСТЕМЫ, и требовать ради неё `rebuild`
+            // было бы издевательством.
+            Act::Mark => {
+                let p = match entry.and_then(|k| self.path_of(k)) {
+                    Some(p) => p,
+                    None => self.cwd.clone(),
+                };
+                self.add_mark(p);
+            }
+            Act::Unmark => {
+                if let Tgt::Mark(k) = target {
+                    self.drop_mark(k);
+                }
+            }
             Act::Delete => {
-                let Some(k) = target else { return };
-                let Some(p) = self.path_of(k) else { return };
-                // `unlink` у посикс-персоны сносит файл или ПУСТОЙ каталог. Непустой она не
-                // трогает, и это правильно: рекурсивное удаление — отдельное решение, а не
-                // побочный смысл того же пункта меню.
-                if px::unlink(self.ep, p.as_bytes()) == 0 {
-                    self.flash = Some(alloc::format!("удалено: {p}"));
+                if entry.is_none() {
+                    return;
+                }
+                // Сносится ВСЁ ВЫДЕЛЕННОЕ: меню открывалось по одному из них, но выделение
+                // человек делал руками, и «удалить» при пяти выделенных значит пять.
+                let paths = self.marked_paths();
+                let (mut ok, mut fail) = (0usize, 0usize);
+                for p in &paths {
+                    // `unlink` у посикс-персоны сносит файл или ПУСТОЙ каталог. Непустой она не
+                    // трогает, и это правильно: рекурсивное удаление — отдельное решение, а не
+                    // побочный смысл того же пункта меню.
+                    if px::unlink(self.ep, p.as_bytes()) == 0 {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                }
+                self.flash = Some(match (ok, fail) {
+                    (n, 0) => alloc::format!("удалено: {n}"),
+                    (0, f) => alloc::format!("не удалить: {f} (каталог не пуст?)"),
+                    (n, f) => alloc::format!("удалено: {n}, не вышло: {f}"),
+                });
+                if ok > 0 {
+                    self.marked.clear();
                     self.read();
-                } else {
-                    self.flash = Some(alloc::format!("не удалить: {p} (каталог не пуст?)"));
                 }
             }
         }
@@ -680,21 +1063,22 @@ impl App {
         });
     }
 
+    /// Текст из буфера обмена. `None` — пусто, не текст либо нет права на store.
+    fn clip_text(&self) -> Option<String> {
+        let store = self.store?;
+        let mut buf = alloc::vec![0u8; 4096];
+        let (kind, got, _) = win::clip_read(store, &mut buf)?;
+        (kind == win::CLIP_TEXT)
+            .then(|| String::from_utf8_lossy(&buf[..got.min(buf.len())]).trim().to_string())
+    }
+
     /// Вставить из буфера: если там путь — перейти по нему. Каталог открывается, файл
     /// выделяется в своём каталоге.
     fn paste(&mut self) {
-        let Some(store) = self.store else { return };
-        let mut buf = alloc::vec![0u8; 4096];
-        let Some((kind, got, _)) = win::clip_read(store, &mut buf) else {
-            self.flash = Some(String::from("буфер обмена пуст"));
-            return;
-        };
-        if kind != win::CLIP_TEXT {
-            self.flash = Some(String::from("в буфере не текст"));
-            return;
+        match self.clip_text() {
+            Some(t) => self.goto_path(&t),
+            None => self.flash = Some(String::from("буфер обмена пуст")),
         }
-        let text = String::from_utf8_lossy(&buf[..got.min(buf.len())]).trim().to_string();
-        self.goto_path(&text);
     }
 
     /// Перейти по пути, откуда бы он ни пришёл: из буфера, из уроненного, из адресной строки.
@@ -716,8 +1100,7 @@ impl App {
                 self.flash = None;
                 self.go(dir);
                 if let Some(k) = self.hits.iter().position(|&i| self.entries[i].name == name) {
-                    self.sel = k;
-                    self.picked = true;
+                    self.pick_one(k);
                 }
             }
             None => self.flash = Some(alloc::format!("нет такого пути: {text}")),
@@ -750,15 +1133,44 @@ impl App {
         (self.top..end).find(|&k| self.cell_rect(&self.lay, k - self.top).contains(x, y))
     }
 
-    /// Веха 166.2 — начать ТАЩИТЬ запись: композитору уезжает путь текстом и подпись под курсор.
+    /// Какая ЗАКЛАДКА под точкой. Считается тем же кодом, которым колонка рисуется.
+    fn mark_at(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.lay.side.contains(x, y) {
+            return None;
+        }
+        (0..self.marks.len()).find(|&k| self.mark_rect(&self.lay, k).contains(x, y))
+    }
+
+    /// Место строки закладки `k`. ОДИН расчёт на рисование и на попадание.
     ///
-    /// Возится ровно то же, что кладётся в буфер обмена, — путь. Значит уронить значок можно и
-    /// в терминал (там он вставится строкой), и в это же окно (перейдём по нему): получателю не
-    /// нужно знать про файловый менеджер ничего.
-    fn start_drag(&mut self, k: usize) {
-        let (Some(store), Some(path)) = (self.store, self.path_of(k)) else { return };
-        let name = path.rsplit('/').next().unwrap_or("").to_string();
-        win::drag(store, win::CLIP_TEXT, path.as_bytes(), &name);
+    /// Раскладка приезжает ПАРАМЕТРОМ, а не берётся из `self.lay`: на время кадра она оттуда
+    /// вынута (`core::mem::take` в `draw`), и поле там — нули. На этом строки закладок один раз
+    /// уже нарисовались в точке (0,0) размером ноль, то есть исчезли совсем.
+    fn mark_rect(&self, lay: &Lay, k: usize) -> Rect {
+        let (pad, gap) = (lay.mark_pad, lay.mark_gap);
+        let h = lay.mark_h;
+        Rect::new(lay.side.x + pad, lay.mark_y + k as i32 * (h + gap), lay.side.w - 2 * pad, h)
+    }
+
+    /// Веха 166.2 — начать ТАЩИТЬ: композитору уезжают пути текстом и подпись под курсор.
+    ///
+    /// Возится ровно то же, что кладётся в буфер обмена, — пути, по одному на строку. Значит
+    /// уронить значок можно и в терминал (там он вставится строкой), и в другое окно менеджера
+    /// (там он ПЕРЕЕДЕТ): получателю не нужно знать про файловый менеджер ничего.
+    ///
+    /// Веха 167 — тащится ВСЁ ВЫДЕЛЕННОЕ, а подпись под курсором считает их: тащить пять
+    /// объектов и видеть имя одного — врать про то, что сейчас произойдёт.
+    fn start_drag(&mut self) {
+        let Some(store) = self.store else { return };
+        let paths = self.marked_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let label = match paths.len() {
+            1 => Self::leaf_name(&paths[0]),
+            n => alloc::format!("{n} объектов"),
+        };
+        win::drag(store, win::CLIP_TEXT, paths.join("\n").as_bytes(), &label);
     }
 
     /// Веха 166.2 — КОНТЕКСТНОЕ МЕНЮ по правой кнопке.
@@ -771,21 +1183,36 @@ impl App {
         let font_h = u.font.line_h();
         let row = font_h + th.px(6);
         let mut items: Vec<(Act, String)> = Vec::new();
+        let many = self.marked.len() > 1;
         match target {
-            Some(k) => {
+            Tgt::Entry(k) => {
                 let dir = self.hits.get(k).is_some_and(|&i| self.entries[i].dir);
-                if dir {
+                if dir && !many {
                     items.push((Act::Open, String::from("открыть")));
                 }
+                if !many {
+                    items.push((Act::Rename, String::from("переименовать")));
+                }
                 items.push((Act::Copy, String::from("копировать путь")));
+                if dir && !many {
+                    items.push((Act::Mark, String::from("в закладки")));
+                }
                 items.push((
                     Act::Delete,
-                    String::from(if self.armed { "удалить? ещё раз" } else { "удалить" }),
+                    String::from(match (self.armed, many) {
+                        (true, _) => "удалить? ещё раз",
+                        (false, true) => "удалить выделенное",
+                        (false, false) => "удалить",
+                    }),
                 ));
             }
-            None => {
-                items.push((Act::Copy, String::from("копировать путь каталога")));
+            Tgt::Mark(_) => items.push((Act::Unmark, String::from("убрать закладку"))),
+            Tgt::Empty => {
+                items.push((Act::NewDir, String::from("создать каталог")));
+                items.push((Act::NewFile, String::from("создать файл")));
                 items.push((Act::Paste, String::from("вставить путь")));
+                items.push((Act::Copy, String::from("копировать путь каталога")));
+                items.push((Act::Mark, String::from("этот каталог в закладки")));
                 items.push((Act::Refresh, String::from("обновить")));
             }
         }
@@ -929,7 +1356,7 @@ impl ui::Client for App {
                         b'c' => {
                             let p = self
                                 .path_of(self.sel)
-                                .filter(|_| self.picked)
+                                .filter(|_| !self.marked.is_empty())
                                 .unwrap_or_else(|| self.cwd.clone());
                             self.flash_clip(&p);
                             return ui::Scope::All;
@@ -943,30 +1370,46 @@ impl ui::Client for App {
                 }
                 // Правка пути забирает клавиатуру целиком: набирать в двух местах сразу нельзя,
                 // а «половина букв в путь, половина в поиск» — ровно это и было бы.
-                if let Some(mut text) = self.edit.take() {
-                    match code {
-                        sym::RETURN => {
-                            let t = text.trim().to_string();
-                            self.goto_path(&t);
-                            // Путь не увёл никуда — правку не бросаем: человеку править её же,
-                            // а не набирать заново.
-                            if self.flash.is_some() {
-                                self.edit = Some(t);
+                if let Some((what, mut e)) = self.edit.take() {
+                    // Внутри правки `Ctrl+C/V` — про ТЕКСТ, а не про файлы: рука на тех же
+                    // клавишах, а смысл диктует место, где стоит курсор.
+                    if mods & win::modk::CTRL != 0 {
+                        let letter = match (code, ch) {
+                            (c, _) if (0x41..=0x5a).contains(&c) => (c as u8) | 0x20,
+                            (c, _) if (0x61..=0x7a).contains(&c) => c as u8,
+                            (_, c) if (0x01..=0x1a).contains(&c) => (c as u8) + 0x60,
+                            _ => 0,
+                        };
+                        match letter {
+                            b'c' if !e.selected().is_empty() => {
+                                let t = String::from(e.selected());
+                                self.flash_clip(&t);
+                            }
+                            b'v' => {
+                                if let Some(t) = self.clip_text() {
+                                    e.insert_str(&t);
+                                }
+                            }
+                            _ => {
+                                // `Ctrl+A` и прочее разбирает сама правка.
+                                e.key(code, ch, mods);
                             }
                         }
-                        sym::ESCAPE => {}
-                        sym::BACKSPACE => {
-                            text.pop();
-                            self.edit = Some(text);
-                        }
-                        _ => {
-                            match char::from_u32(ch as u32).filter(|c| !c.is_control()) {
-                                Some(c) => text.push(c),
-                                None => {}
-                            }
-                            self.edit = Some(text);
-                        }
+                        self.edit = Some((what, e));
+                        return ui::Scope::All;
                     }
+                    match e.key(code, ch, mods) {
+                        ui::edit::Hit::Done => self.finish_edit(what, e.text.clone()),
+                        ui::edit::Hit::Cancel => {}
+                        _ => self.edit = Some((what, e)),
+                    }
+                    return ui::Scope::All;
+                }
+                // F2 — переименовать выбранное. Тот же смысл, что и пункт меню; аккорд нужен
+                // потому, что до меню надо дотянуться рукой.
+                // F2 — код клавиши из раскладки ядра (`F1..F10` = 0x120..0x129).
+                if code == 0x121 && !self.marked.is_empty() {
+                    self.begin_edit(What::Rename(self.sel));
                     return ui::Scope::All;
                 }
                 let cols = if self.grid { self.lay.cols as usize } else { 1 };
@@ -1008,7 +1451,14 @@ impl ui::Client for App {
                         return ui::Scope::All;
                     }
                 }
-                self.picked = true;
+                // Стрелка ведёт КУРСОР; с `Shift` за ним тянется полоса от якоря, без него
+                // выделение начинается заново — то же правило, что у щелчка.
+                if mods & win::modk::SHIFT != 0 {
+                    let (a, b) = (self.anchor.min(self.sel), self.anchor.max(self.sel));
+                    self.marked = (a..=b).collect();
+                } else {
+                    self.pick_one(self.sel);
+                }
                 let page = self.lay.page;
                 self.scroll_to_sel(page, cols);
                 if let Some(&i) = self.hits.get(self.sel) {
@@ -1029,15 +1479,15 @@ impl ui::Client for App {
                 // Веха 166.2 — ПЕРЕТАСКИВАНИЕ начинается не с нажатия, а с движения при зажатой
                 // кнопке: иначе каждый щелчок был бы началом перетаскивания, и выбрать значок
                 // мышью стало бы нельзя. Порог в несколько точек — про дрожание руки.
-                if let (Some((px_, py_, k)), Some((x, y))) = (self.press, input.held) {
+                if let (Some((px_, py_, _)), Some((x, y))) = (self.press, input.held) {
                     if !self.dragging && (x - px_).abs() + (y - py_).abs() > 6 {
                         self.dragging = true;
-                        self.start_drag(k);
+                        self.start_drag();
                     }
                 }
                 ui::Scope::All
             }
-            Event::Button { x, y, buttons, down } => {
+            Event::Button { x, y, buttons, down, mods } => {
                 let (x, y) = (x as i32, y as i32);
                 if !down {
                     self.press = None;
@@ -1046,7 +1496,23 @@ impl ui::Client for App {
                 }
                 // Правая — КОНТЕКСТНОЕ МЕНЮ. Бит 1, как его кодирует ядро (`SYS_MOUSE_READ`).
                 if buttons & 2 != 0 {
-                    self.menu = Some((x, y, self.entry_at(x, y)));
+                    // Правая по НЕ выделенному сперва выделяет: меню обязано относиться к тому,
+                    // на что человек показывает, а не к тому, что осталось выделенным до этого.
+                    let _ = mods;
+                    let t = match (self.entry_at(x, y), self.mark_at(x, y)) {
+                        (Some(k), _) => {
+                            // Правая по НЕ выделенному сперва выделяет: меню обязано относиться
+                            // к тому, на что человек показывает, а не к тому, что осталось
+                            // выделенным до этого.
+                            if !self.marked.contains(&k) {
+                                self.pick_one(k);
+                            }
+                            Tgt::Entry(k)
+                        }
+                        (None, Some(m)) => Tgt::Mark(m),
+                        _ => Tgt::Empty,
+                    };
+                    self.menu = Some((x, y, t));
                     self.menu_fresh = true;
                     self.armed = false;
                     return ui::Scope::All;
@@ -1059,11 +1525,20 @@ impl ui::Client for App {
             // самое, что делает «вставить», и по той же причине.
             Event::Drop { .. } => {
                 let Some(store) = self.store else { return ui::Scope::No };
-                let mut buf = alloc::vec![0u8; 4096];
+                let mut buf = alloc::vec![0u8; 16 * 1024];
                 if let Some((win::CLIP_TEXT, got, _)) = win::drop_read(store, &mut buf) {
-                    let text =
-                        String::from_utf8_lossy(&buf[..got.min(buf.len())]).trim().to_string();
-                    self.goto_path(&text);
+                    let text = String::from_utf8_lossy(&buf[..got.min(buf.len())]).into_owned();
+                    let paths: Vec<String> = text
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| l.starts_with('/'))
+                        .map(String::from)
+                        .collect();
+                    if paths.is_empty() {
+                        self.flash = Some(String::from("уронили не путь"));
+                    } else {
+                        self.move_here(&paths);
+                    }
                 }
                 ui::Scope::All
             }
@@ -1074,6 +1549,31 @@ impl ui::Client for App {
             }
             _ => ui::Scope::No,
         }
+    }
+
+    /// Веха 167 — **АВТООБНОВЛЕНИЕ**. И сразу честно: это ОПРОС, а не подписка.
+    ///
+    /// Подписки у файлового сервера нет — ни события «каталог изменился», ни счётчика поколения
+    /// каталога наружу он не отдаёт. Завести их можно (и когда-нибудь стоит: подписка дешевле
+    /// опроса и точнее), но это протокол `posixfs`, а не менеджера, и делать вид, что у нас она
+    /// есть, нельзя.
+    ///
+    /// Поэтому раз в две секунды каталог перечитывается, и КАДР рисуется только если подпись
+    /// содержимого изменилась. Цена честная: один `readdir` в две секунды на открытое окно;
+    /// выбор и прокрутка при этом сохраняются по имени (см. [`App::read`]).
+    fn wake(&mut self) -> Option<u32> {
+        Some(2000)
+    }
+
+    fn tick(&mut self) -> ui::Scope {
+        // Пока набирают имя или открыто меню — не трогаем ничего: перечитывание сдвинет номера
+        // строк под рукой, а именно на этом менеджер уже падал (Веха 166.1).
+        if self.edit.is_some() || self.menu.is_some() {
+            return ui::Scope::No;
+        }
+        let was = self.sig;
+        self.read();
+        if self.sig != was { ui::Scope::All } else { ui::Scope::No }
     }
 
     /// Веха 151 — вернуться после перезагрузки в ТОТ ЖЕ каталог.
@@ -1109,12 +1609,6 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let av = sys::argv::Argv::take();
     let start = av.str(0).filter(|s| s.starts_with('/')).unwrap_or("/").to_string();
 
-    // Закладки проверяются ОДИН раз, на старте: каталог, которого нет, в колонку не попадает.
-    let marks = MARKS
-        .iter()
-        .filter(|(p, _)| px::stat(ep, p.as_bytes()).map(|(d, _)| d).unwrap_or(false))
-        .map(|(p, l)| (String::from(*p), String::from(*l)))
-        .collect();
 
     let mut app = App {
         w: w as i32,
@@ -1124,25 +1618,30 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         entries: Vec::new(),
         hits: Vec::new(),
         sel: 0,
-        picked: false,
+        marked: Vec::new(),
+        anchor: 0,
         top: 0,
         back: Vec::new(),
         fwd: Vec::new(),
         query: String::new(),
         grid: true,
+        sig: 0,
         err: None,
         flash: None,
         cut: false,
-        marks,
+        marks: Vec::new(),
         lay: Lay::default(),
         edit: None,
         menu: None,
+        edit_fresh: false,
         menu_fresh: false,
         armed: false,
         store: ui::conf::store_cap(),
         press: None,
         dragging: false,
     };
+    // Закладки читаются ОДИН раз, на старте: каталог, которого нет, в колонку не попадает.
+    app.load_marks();
     app.read();
 
     ui::app::run(&mut surf, &th, &mut font, &mut app);

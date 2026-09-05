@@ -78,6 +78,10 @@ pub struct Input {
     pub click: Option<(i32, i32)>,
     /// Где держат левую кнопку. Протяжка полосы прокрутки — это оно.
     pub held: Option<(i32, i32)>,
+    /// Веха 167 — модификаторы на момент ПОСЛЕДНЕГО щелчка (`Ctrl`, `Shift`, …). Без них
+    /// выделение мышью не построить: щелчок с `Ctrl` и без него — разные действия, а событию
+    /// мыши модификаторы не принадлежат ни в железе, ни в ядре — их несёт композитор.
+    pub mods: u8,
 }
 
 /// Программа с окном. Обязательны два метода; остальные нужны не всем.
@@ -187,7 +191,7 @@ pub fn run(surf: &mut Window, th: &Theme, font: &mut Font, c: &mut impl Client) 
                     if let Scope::Part(r) = scope {
                         u.clip(r);
                     }
-                    u.input(input.ptr, input.click, input.held);
+                    u.input(input.ptr, input.click, input.held, input.mods);
                     let more = c.draw(&mut u);
                     let d = u.dirty();
                     if !d.is_empty() {
@@ -241,8 +245,9 @@ pub fn run(surf: &mut Window, th: &Theme, font: &mut Font, c: &mut impl Client) 
                         input.held = input.ptr;
                     }
                 }
-                Event::Button { x, y, down, buttons } => {
+                Event::Button { x, y, down, buttons, mods } => {
                     let p = (x as i32, y as i32);
+                    input.mods = mods;
                     if down {
                         input.click = Some(p);
                         if buttons & 1 != 0 {
