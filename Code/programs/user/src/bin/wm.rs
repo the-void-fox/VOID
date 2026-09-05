@@ -292,6 +292,26 @@ struct Payload {
     from: u32,
 }
 
+/// Веха 168 — одно уведомление. Имя отправителя здесь уже проверенное: его назвало ядро.
+struct Note {
+    id: u32,
+    level: u8,
+    from: String,
+    title: String,
+    text: String,
+}
+
+/// Сколько уведомлений храним. Список копится сам собой, а читает человек последние.
+const NOTES_MAX: usize = 32;
+/// Сколько живёт всплывашка. Три секунды — столько, чтобы прочесть две строки и не больше:
+/// уведомление, висящее дольше, начинает мешать тому, ради чего человек сидит за экраном.
+const TOAST_NS: u64 = 3_000_000_000;
+/// Поля всплывашки.
+const TOAST_PAD: i32 = 8;
+/// Сколько байт списка отдаём за раз. Потолок нужен не «на всякий случай»: ответ едет через
+/// приёмный буфер спрашивающего, и то, что в него не влезло, он не увидит вовсе.
+const NOTES_REPLY_MAX: usize = 8 * 1024;
+
 /// Веха 142.1 — переезд между СТОЛАМИ: старая лента уходит, новая приходит по вертикали.
 ///
 /// Хранятся окна УХОДЯЩЕГО стола и его сдвиг ленты: после обмена лент `self.scroll_x` уже чужой,
@@ -784,6 +804,9 @@ fn main_loop() -> ! {
         grants: grant_policy(&generation),
         liveness_at: 0,
         kmods: 0,
+        notes: Vec::new(),
+        next_note: 1,
+        toast: None,
         wins: Vec::new(),
         next_id: 1,
         cursor: Pt::new(info.width as i32 / 2, info.height as i32 / 2),
@@ -819,7 +842,7 @@ fn main_loop() -> ! {
         ov_at: 0,
         ov_dur: 0,
         ov_band_y: 0,
-        status: (0, 1, None, 0, false),
+        status: (0, 1, None, 0, false, 0),
         anim: ANIM_MS,
         drag: None,
         slide: None,
@@ -959,6 +982,14 @@ fn main_loop() -> ! {
         // упасть, и тогда её рамка осталась бы на экране навсегда — с картинкой, за которой
         // никого нет. Спрашиваем ядро, а не верим на слово.
         wm.reap();
+
+        // ── всплывашка догорела ────────────────────────────────────────────────────────────
+        // Гаснет по времени, а не по действию человека: уведомление — это сообщение, а не
+        // вопрос, и требовать на него ответа значило бы превратить экран в очередь диалогов.
+        if wm.toast.is_some_and(|(_, until)| sys::monotonic_ns() >= until) {
+            wm.damage_toast();
+            wm.toast = None;
+        }
 
         // ── запросы клиентов ───────────────────────────────────────────────────────────
         // Спим только когда делать нечего — и просыпаемся по клавише ИЛИ движению мыши
@@ -1531,6 +1562,11 @@ struct Wm {
     grants: Vec<(u8, String)>,
     /// Веха 166.1 — когда последний раз сверяли живость ЧУЖИХ хозяев окон по списку процессов.
     liveness_at: u64,
+    /// Веха 168 — накопленные УВЕДОМЛЕНИЯ, свежие первыми, и номер для следующего.
+    notes: Vec<Note>,
+    next_note: u32,
+    /// Какое из них сейчас висит всплывашкой и до какого времени.
+    toast: Option<(u32, u64)>,
     /// Веха 167 — модификаторы клавиатуры, как их видел последний раз. Уезжают клиенту вместе
     /// со щелчком мыши: у события мыши своих модификаторов нет ни в железе, ни в ядре.
     kmods: u8,
@@ -1544,7 +1580,7 @@ struct Wm {
     /// меняют ещё закрытие окна, обзор и раскладка, и каждый новый путь пришлось бы вспоминать.
     /// Забытая рассылка — это бар, молча показывающий прошлое.
     /// Веха 145 — пятым идёт ОБЗОР: он тоже меняет то, что бару надо знать (см. `win::ST_OVERVIEW`).
-    status: (usize, usize, Option<u32>, usize, bool),
+    status: (usize, usize, Option<u32>, usize, bool, usize),
 }
 
 /// Окно в обзоре: куда его уменьшили и с какого стола оно родом.
@@ -2481,6 +2517,9 @@ impl Wm {
 
     /// Курсор поверх всего: он не принадлежит ни одному окну.
     fn draw_cursor_row(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
+        // Веха 168 — всплывашка ПОД курсором и ярлыком: она сообщение, а они — рука человека,
+        // и закрывать руку сообщением нельзя.
+        self.draw_toast_row(out, yy, x0, x1);
         // Ярлык — ПОД курсором: он говорит, что несут, а курсор говорит, куда целятся, и
         // закрывать второе первым нельзя.
         self.draw_badge_row(out, yy, x0, x1);
@@ -4149,6 +4188,96 @@ impl Wm {
         }
     }
 
+    /// Веха 168 — ИМЯ ПРОЦЕССА по его номеру, спрошенное у ядра.
+    ///
+    /// Тот же приём, которым проверяется проситель права ([`Wm::grant_for`]): имя процесса ядро
+    /// берёт из имени программы в store, и подделать его нельзя, не подменив саму программу.
+    /// Спросить самого отправителя было бы не проверкой, а анкетой.
+    ///
+    /// Права обзора нет — уведомление всё равно покажем, просто без имени: сказать человеку то,
+    /// что ему говорят, важнее, чем знать, кто это сказал.
+    fn proc_name(&self, pid: usize) -> String {
+        if self.sysview == sys::NO_CAP {
+            return String::new();
+        }
+        let rec = sys::PROC_REC;
+        let mut buf = vec![0u8; rec * 64];
+        let Some(total) = sys::proc_list(self.sysview, &mut buf) else { return String::new() };
+        for k in 0..total.min(buf.len() / rec) {
+            let r = &buf[k * rec..k * rec + rec];
+            if u16::from_le_bytes([r[0], r[1]]) as usize == pid {
+                let nlen = (r[7] as usize).min(24);
+                return String::from_utf8_lossy(&r[40..40 + nlen]).into_owned();
+            }
+        }
+        String::new()
+    }
+
+    /// Веха 168 — где сейчас ВСПЛЫВАШКА. Правый верх, под полосой панели: там же, где её ждут
+    /// системы, к которым владелец привык, и там же, где стоит колокольчик в панели — глаз
+    /// переходит от одного к другому, не ища.
+    fn toast_at(&self) -> Option<At<Screen>> {
+        let (id, _) = self.toast?;
+        let n = self.notes.iter().find(|n| n.id == id)?;
+        let gw = sys::glyph::W as i32;
+        let gh = sys::glyph::H as i32;
+        let chars = n.title.chars().count().max(n.text.chars().count()).max(8) as i32;
+        let w = chars * gw + 2 * TOAST_PAD;
+        let h = 2 * gh + 2 * TOAST_PAD;
+        let sc = self.screen().rect();
+        // Под РАБОЧЕЙ ЗОНОЙ, а не под краем экрана: панель уже сказала, сколько места заняла,
+        // и всплывашка, залезающая под неё, была бы наполовину невидимой.
+        Some(At::new((sc.w - w - TOAST_PAD).max(0), self.work.rect().y + TOAST_PAD, w, h))
+    }
+
+    fn damage_toast(&mut self) {
+        if let Some(r) = self.toast_at() {
+            self.damage(r);
+        }
+    }
+
+    /// Веха 168 — ВСПЛЫВАШКА строкой, как курсор и ярлык: пиксель экрана пишется ровно один раз
+    /// за кадр.
+    fn draw_toast_row(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
+        let (Some(t), Some(b)) = (self.toast, self.toast_at()) else {
+            return;
+        };
+        let Some(n) = self.notes.iter().find(|n| n.id == t.0) else {
+            return;
+        };
+        let r = b.rect();
+        let ry = yy - r.y;
+        if ry < 0 || ry >= r.h {
+            return;
+        }
+        // Важное отличается ЦВЕТОМ РАМКИ, а не формой: форма говорит «это уведомление», цвет —
+        // «прочти сейчас».
+        let ink = self.pack(tri(if n.level == win::NOTE_WARN { self.th.danger } else { self.th.accent }));
+        let bg = self.pack(tri(self.th.bg));
+        for xx in r.x.max(x0)..r.right().min(x1) {
+            let edge = ry == 0 || ry == r.h - 1 || xx == r.x || xx == r.right() - 1;
+            out[(xx - x0) as usize] = if edge { ink } else { bg };
+        }
+        let gh = sys::glyph::H as i32;
+        let (line, gy) = ((ry - TOAST_PAD) / gh, (ry - TOAST_PAD) % gh);
+        if ry < TOAST_PAD || line > 1 {
+            return;
+        }
+        let text = if line == 0 { &n.title } else { &n.text };
+        let col = if line == 0 { ink } else { self.pack(tri(self.th.text)) };
+        let mut cx = r.x + TOAST_PAD;
+        for ch in text.chars() {
+            let bits = sys::glyph::rows(ch)[gy as usize];
+            for bit in 0..8 {
+                let xx = cx + bit;
+                if bits & (0x80 >> bit) != 0 && xx >= x0 && xx < x1 {
+                    out[(xx - x0) as usize] = col;
+                }
+            }
+            cx += sys::glyph::W as i32;
+        }
+    }
+
     /// Веха 166.1 — окна ЧУЖИХ процессов: тех, кого запустили не мы.
     ///
     /// `SYS_WAIT` отвечает только про СВОИХ детей, а приложение из строки запуска — ребёнок
@@ -4208,7 +4337,16 @@ impl Wm {
     fn notify_status(&mut self) {
         // Веха 143 — раскладка входит в снимок: её меняет не только наше действие (в ядре
         // остался зашитый Alt+Shift для текстового режима), поэтому спрашиваем, а не помним.
-        let now = (self.space, self.space_count(), self.focus, sys::keymap(), self.overview);
+        // Веха 168 — счётчик уведомлений входит в снимок: панель рисует его у колокольчика, и
+        // не разбудить её на новое уведомление значило бы показать вчерашнее число.
+        let now = (
+            self.space,
+            self.space_count(),
+            self.focus,
+            sys::keymap(),
+            self.overview,
+            self.notes.len(),
+        );
         if now == self.status {
             return;
         }
@@ -4230,6 +4368,9 @@ impl Wm {
             .iter()
             .filter(|w| w.waiting.is_some())
             .filter_map(|w| w.wait_until)
+            // Веха 168 — срок ВСПЛЫВАШКИ здесь же: она гаснет сама, и «раз в 200 мс» ей не
+            // годится — человек увидел бы, как она держится лишнюю пятую секунды.
+            .chain(self.toast.map(|(_, until)| until))
             .map(|d| d.max(now))
             .min()
     }
@@ -5003,9 +5144,12 @@ impl Wm {
                     // слоям не отдают вовсе, и открытое меню осталось бы на экране навсегда —
                     // закрывать его кликом было бы нечем.
                     overview: self.overview,
+                    // Веха 168 — сколько уведомлений накопилось: по этому числу панель рисует
+                    // счётчик у колокольчика.
+                    notes: self.notes.len().min(255) as u8,
                     title,
                 };
-                let mut rep = [0u8; 4 + win::TITLE_MAX];
+                let mut rep = [0u8; 8 + win::TITLE_MAX];
                 let n = s.encode(&mut rep);
                 sys::reply(m.reply_cap, &rep[..n]);
             }
@@ -5120,6 +5264,70 @@ impl Wm {
             // бы раздать право дальше, и объявление владельца перестало бы что-то значить со
             // второй передачи. Для обзора процессов остаётся `rw`, для выключения — `w`
             // (у самого права `power` чтения нет вовсе).
+            // Веха 168 — СКАЗАТЬ ЧЕЛОВЕКУ. Имя отправителя берём У ЯДРА по номеру процесса, а
+            // не из сообщения: написать себе чужое имя не должно быть возможно (тот же довод,
+            // что у раздачи прав).
+            win::OP_NOTIFY => {
+                let body = &req[..m.len.min(req.len())];
+                if body.len() < 2 {
+                    sys::reply(m.reply_cap, &[]);
+                    return;
+                }
+                let (level, tl) = (body[0], (body[1] as usize).min(body.len() - 2));
+                let title = String::from_utf8_lossy(&body[2..2 + tl]).into_owned();
+                let text = String::from_utf8_lossy(&body[2 + tl..]).into_owned();
+                let from = self.proc_name(m.sender);
+                let id = self.next_note;
+                self.next_note = self.next_note.wrapping_add(1).max(1);
+                // Свежие ПЕРВЫМИ и потолок на список: уведомления копятся сами собой, а
+                // «сто двадцать штук» человек всё равно не читает — он читает последние.
+                self.notes.insert(0, Note { id, level, from, title, text });
+                self.notes.truncate(NOTES_MAX);
+                // Всплывашка — на несколько секунд. Рисует её композитор сам: поверхности у
+                // уведомления нет и не должно быть, иначе оно ловило бы клики по чужим окнам.
+                self.toast = Some((id, sys::monotonic_ns() + TOAST_NS));
+                self.damage_toast();
+                sys::reply(m.reply_cap, &[1]);
+            }
+            // Что накопилось — списком. Читает панель, когда открывает своё меню.
+            win::OP_NOTES => {
+                let mut rep: Vec<u8> = Vec::new();
+                for n in &self.notes {
+                    let (f, t, x) = (n.from.as_bytes(), n.title.as_bytes(), n.text.as_bytes());
+                    if rep.len() + 8 + f.len() + t.len() + x.len() > NOTES_REPLY_MAX {
+                        break;
+                    }
+                    rep.extend_from_slice(&n.id.to_le_bytes());
+                    rep.push(n.level);
+                    rep.push(f.len() as u8);
+                    rep.push(t.len() as u8);
+                    rep.push(x.len() as u8);
+                    rep.extend_from_slice(f);
+                    rep.extend_from_slice(t);
+                    rep.extend_from_slice(x);
+                }
+                sys::reply(m.reply_cap, &rep);
+            }
+            // Убрать одно или всё.
+            win::OP_NOTE_DROP => {
+                let body = &req[..m.len.min(req.len())];
+                let id = match body.get(..4) {
+                    Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                    None => 0,
+                };
+                let was = self.notes.len();
+                if id == 0 {
+                    self.notes.clear();
+                } else {
+                    self.notes.retain(|n| n.id != id);
+                }
+                // Ушедшее уведомление не должно остаться всплывашкой на экране.
+                if self.toast.is_some_and(|(t, _)| id == 0 || t == id) {
+                    self.damage_toast();
+                    self.toast = None;
+                }
+                sys::reply(m.reply_cap, &[(was - self.notes.len()).min(255) as u8]);
+            }
             win::OP_GRANT => {
                 let kind = body!(m, win::wire::Rd::new(req).u8());
                 let cap = self.grant_for(m.sender, kind);

@@ -279,6 +279,8 @@ const A_MENU: u32 = 4;
 const A_LANG: u32 = 5;
 const A_SYS: u32 = 6;
 const A_POWER: u32 = 9;
+/// Веха 168 — подсветка колокольчика.
+const A_NOTES: u32 = 10;
 /// Подсветка пилюль столов: `A_PILL + номер стола`.
 const A_PILL: u32 = 16;
 
@@ -332,9 +334,17 @@ struct Bar {
     ram: u32,
     /// Кадра ещё не было: холст надо очистить ЦЕЛИКОМ.
     fresh: bool,
-    /// Меню: открыто ли (цель) и растянута ли поверхность на весь экран (факт).
-    open: bool,
+    /// Меню: какое открыто (цель) и растянута ли поверхность на весь экран (факт).
+    open: Menu,
     grown: bool,
+    /// Веха 168 — сколько уведомлений (из снимка состояния) и сам список, прочитанный при
+    /// открытии меню. Список не держим постоянно: он нужен ровно тогда, когда на него смотрят.
+    notes: u8,
+    notes_buf: Vec<u8>,
+    /// Какое полотно СЕЙЧАС нарисовано. Отличается от `open` ровно на время ухода: пока оно
+    /// уезжает, `open` уже `None`, а рисовать надо то же самое — иначе меню на прощание
+    /// подменяет содержимое.
+    showing: Menu,
     /// Подпись СОДЕРЖИМОГО меню прошлого кадра — без доли выезда. Ею кадр отличает «меню едет»
     /// от «в меню изменилось написанное»: первое стоит одной полоски, второе — всего полотна.
     card_body: u64,
@@ -360,13 +370,27 @@ struct Bar {
     /// Что решил последний кадр.
     go: Option<u8>,
     flip: bool,
-    toggle: bool,
+    /// Какое меню просят открыть-закрыть.
+    toggle: Option<Menu>,
     power: bool,
     /// Кадр изменил то, ЧТО РИСУЕТСЯ, уже после того как посчитал подпись (сегодня это только
     /// подтверждение выключения). Такому изменению нужен ещё один кадр, и попросить его больше
     /// некому: события от композитора не будет — оно ничего в системе не меняло.
     again: bool,
     mo: Motion,
+}
+
+/// Веха 168 — какое полотно свисает с полосы. Их два, и они взаимоисключающи: два открытых
+/// меню — это два ответа на вопрос «что сейчас делает панель», и человеку пришлось бы гадать,
+/// какое из них слушает его щелчок.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Menu {
+    None,
+    /// Меню оболочки: кнопка поколения.
+    Shell,
+    /// Уведомления: колокольчик.
+    Notes,
 }
 
 /// Веха 160 — ОСТРОВ ПАНЕЛИ как выбор человека: что стоит и в каком порядке, решает `bar.vv`
@@ -384,11 +408,13 @@ enum Slot {
     Spaces = 3,
     Title = 4,
     Gen = 5,
+    /// Веха 168 — колокольчик уведомлений.
+    Notes = 6,
 }
 
 /// Сколько всего островов знает панель. Карточка меню идёт следом отдельным индексом: она не
 /// остров ряда — её нельзя ни переставить, ни убрать, она принадлежит кнопке поколения.
-const SLOTS: usize = 6;
+const SLOTS: usize = 7;
 
 impl Slot {
     fn parse(s: &str) -> Option<Slot> {
@@ -399,6 +425,7 @@ impl Slot {
             "spaces" => Slot::Spaces,
             "title" => Slot::Title,
             "gen" => Slot::Gen,
+            "notes" => Slot::Notes,
             _ => return None,
         })
     }
@@ -438,7 +465,7 @@ fn layout_from(text: &str) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>, bool) {
         (
             alloc::vec![Slot::Clock, Slot::Lang, Slot::Metrics, Slot::Spaces],
             alloc::vec![Slot::Title],
-            alloc::vec![Slot::Gen],
+            alloc::vec![Slot::Notes, Slot::Gen],
             false,
         )
     }
@@ -461,6 +488,7 @@ fn slot_names(v: &[Slot]) -> String {
             Slot::Spaces => "spaces",
             Slot::Title => "title",
             Slot::Gen => "gen",
+            Slot::Notes => "notes",
         });
     }
     s
@@ -507,8 +535,11 @@ impl Bar {
             cpu: 0,
             ram: 0,
             fresh: true,
-            open: false,
+            open: Menu::None,
             grown: false,
+            notes: 0,
+            notes_buf: Vec::new(),
+            showing: Menu::None,
             card_body: 0,
             confirm: false,
             gen: ui::conf::generation_name().unwrap_or_else(|| "VOID".to_string()),
@@ -522,7 +553,7 @@ impl Bar {
             roots: (0, true),
             go: None,
             flip: false,
-            toggle: false,
+            toggle: None,
             power: false,
             again: false,
             mo: Motion::new(anim_ms),
@@ -554,7 +585,7 @@ impl Bar {
 
     /// Нужна ли сейчас полноэкранная поверхность: меню открыто ИЛИ ещё доигрывает закрытие.
     fn want_grown(&self) -> bool {
-        self.open || self.mo.peek(A_MENU) > 0
+        self.open != Menu::None || self.mo.peek(A_MENU) > 0
     }
 
     /// Спросить композитор: стол, сколько столов, раскладка, обзор, заголовок окна в фокусе.
@@ -565,10 +596,11 @@ impl Bar {
         self.spaces = st.spaces.max(1);
         self.layout = st.layout;
         self.overview = st.overview;
+        self.notes = st.notes;
         self.title = String::from(core::str::from_utf8(&buf[..st.title_len]).unwrap_or(""));
         // В обзоре мышь слоям не отдают вовсе — закрыть меню было бы нечем.
         if self.overview {
-            self.open = false;
+            self.open = Menu::None;
         }
     }
 
@@ -584,7 +616,7 @@ impl Bar {
         let h = if want { self.sh } else { self.h };
         if !surf.resize_buf(self.sw as u16, h as u16) {
             say("bar: композитор не дал буфер под меню — меню не открыть\n");
-            self.open = false;
+            self.open = Menu::None;
             return;
         }
         self.grown = want;
@@ -626,14 +658,29 @@ impl Bar {
                 say("bar: выключить не вышло — право есть, но машина продолжает работу\n");
             }
         }
-        if core::mem::take(&mut self.toggle) {
-            self.open = !self.open;
-            if self.open {
-                // Сведения собираются в момент ОТКРЫТИЯ: держать их свежими постоянно значило бы
-                // ходить в store каждую минуту ради того, на что никто не смотрит.
-                self.roots = store_roots();
-                self.confirm = false;
-                self.load_avatar();
+        if let Some(want) = core::mem::take(&mut self.toggle) {
+            // Нажали на то же — закрыли; на другое — переехали. Два открытых полотна сразу
+            // человеку пришлось бы различать по содержимому, а не по тому, куда он нажал.
+            self.open = if self.open == want { Menu::None } else { want };
+            if self.open != Menu::None {
+                self.showing = self.open;
+            }
+            match self.open {
+                Menu::Shell => {
+                    // Сведения собираются в момент ОТКРЫТИЯ: держать их свежими постоянно
+                    // значило бы ходить в store каждую минуту ради того, на что никто не смотрит.
+                    self.roots = store_roots();
+                    self.confirm = false;
+                    self.load_avatar();
+                }
+                // Список тоже читается при открытии — по той же причине.
+                Menu::Notes => {
+                    let mut buf = alloc::vec![0u8; 8 * 1024];
+                    let n = sys::win::notes_read(&mut buf);
+                    buf.truncate(n);
+                    self.notes_buf = buf;
+                }
+                Menu::None => {}
             }
             return true;
         }
@@ -681,6 +728,8 @@ impl Bar {
         let ico = isle_h - 2 * th.px(5);
         let num_w = u.font.width("100%");
         let title_w = u.font.width(&self.shown) + 2 * th.pad;
+        let note_text = alloc::format!("{}", self.notes.min(99));
+        let note_w = u.font.width(&note_text) + th.px(4);
         let gen_w = u.font.width(&self.gen) + 2 * th.pad;
         // Все ширины сняты со шрифта ЗАРАНЕЕ: измерение строки просит шрифт изменяемо (глиф
         // может лечь в кэш), а замыкание, которое так делает, нельзя звать из `map`.
@@ -696,6 +745,8 @@ impl Bar {
                 Slot::Title if self.shown.is_empty() => 0,
                 Slot::Title => title_w,
                 Slot::Gen => gen_w,
+                // Веха 168 — колокольчик: знак, а при накопившемся — ещё и число рядом.
+                Slot::Notes => ico + 2 * th.pad + if self.notes > 0 { note_w } else { 0 },
             }
         };
 
@@ -750,6 +801,7 @@ impl Bar {
             at[Slot::Gen.at()],
         );
         let lang_isle = at[Slot::Lang.at()];
+        let n_isle = at[Slot::Notes.at()];
         let t_isle = at[Slot::Title.at()];
 
         // Заголовок меняется в ДВА ТАКТА: старый гаснет, подменяется и загорается новый. Смена
@@ -790,9 +842,11 @@ impl Bar {
             .collect();
         let lang_hot = self.mo.val(A_LANG, if hot(lang_isle) { 256 } else { 0 }) as u32;
         let sys_hot = self.mo.val(A_SYS, if hot(s_isle) { 256 } else { 0 }) as u32;
+        let notes_hot = self.mo.val(A_NOTES, if hot(n_isle) { 256 } else { 0 }) as u32;
 
         // ── карточка меню ──────────────────────────────────────────────────────────────────
-        let menu_t = self.mo.val(A_MENU, if self.open { 256 } else { 0 }).clamp(0, 256) as u32;
+        let menu_t =
+            self.mo.val(A_MENU, if self.open == Menu::None { 0 } else { 256 }).clamp(0, 256) as u32;
         // Место — окончательное, а на экране столько, сколько вытянулось. Содержимое считается
         // по ПЕРВОМУ: строки, съезжающие вверх по мере выезда, читались бы как второе движение
         // внутри первого, и это ровно то, чем «выехало» отличается от «уехало и приехало».
@@ -809,6 +863,9 @@ impl Bar {
         // просто едет» от «в меню изменилось написанное»: в первом случае перерисовать надо
         // одну полоску у нижнего края, во втором — всё полотно.
         let card_body = sig(&[
+            self.showing as u64,
+            self.notes_buf.len() as u64,
+            sig(&self.notes_buf.iter().map(|&b| b as u64).collect::<Vec<_>>()),
             self.confirm as u64,
             self.space as u64,
             self.spaces as u64,
@@ -839,6 +896,10 @@ impl Bar {
             },
             Isle { rect: t_isle, sig: sig(&[sig_str(&self.shown), title_a as u64]) },
             Isle { rect: s_isle, sig: sig(&[sig_str(&self.gen), sys_hot as u64]) },
+            Isle {
+                rect: n_isle,
+                sig: sig(&[self.notes as u64, notes_hot as u64, (self.open == Menu::Notes) as u64]),
+            },
             Isle {
                 rect: if menu_t == 0 { Rect::ZERO } else { sheet },
                 sig: sig(&[menu_t as u64, card_body]),
@@ -932,7 +993,24 @@ impl Bar {
             // есть очевидная карточка, — это заставлять человека мериться с пикселями.
             let pressed = u.button(inner, &self.gen, sys_hot) | u.clicked(s_isle);
             if pressed {
-                self.toggle = true;
+                self.toggle = Some(Menu::Shell);
+            }
+        }
+
+        if redraw[Slot::Notes.at()] && !n_isle.is_empty() {
+            // Веха 168 — КОЛОКОЛЬЧИК. Число рядом, а не поверх знака: цифра на знаке в шрифте
+            // 8×16 превращается в кляксу, а рядом она читается.
+            let inner = u.island(n_isle);
+            let mut d = inner;
+            let ir = d.cut_left(ico);
+            let lit = self.notes > 0;
+            let col = if self.open == Menu::Notes || lit { th.text } else { th.muted };
+            u.icon(Rect::new(ir.x, n_isle.y + (isle_h - ico) / 2, ico, ico), ui::icon::BELL, col);
+            if lit {
+                u.label(d, &note_text, th.text, Align::Right);
+            }
+            if u.clicked(n_isle) {
+                self.toggle = Some(Menu::Notes);
             }
         }
 
@@ -975,17 +1053,18 @@ impl Bar {
         // Щелчок мимо всего — закрыть меню. Работает потому, что открытая поверхность накрывает
         // экран: клик по чужому окну приходит НАМ, а не ему. Пока меню закрыто, поверхность —
         // полоска панели, и мимо неё щёлкнуть нельзя вовсе.
-        if self.open && !self.toggle {
+        if self.open != Menu::None && self.toggle.is_none() {
             if let Some((cx, cy)) = click {
                 // По ВЫТЯНУТОМУ, а не по окончательному: пока полотно едет, «внутри меню» — это
                 // то, что человек видит, а не то, где меню будет через треть секунды.
                 let inside = sheet.contains(cx, cy)
+                    || n_isle.contains(cx, cy)
                     || l_isle.contains(cx, cy)
                     || t_isle.contains(cx, cy)
                     || r_isle.contains(cx, cy)
                     || s_isle.contains(cx, cy);
                 if !inside {
-                    self.toggle = true;
+                    self.toggle = Some(self.open);
                 }
             }
         }
@@ -1106,6 +1185,83 @@ impl Bar {
         (row, head, pad)
     }
 
+    /// Веха 168 — ПОЛОТНО УВЕДОМЛЕНИЙ: что накопилось, свежее сверху.
+    ///
+    /// Каждое — своя карточка: заголовок, под ним «от кого» и текст, справа крестик. «От кого» —
+    /// имя, которое назвало ЯДРО, а не то, которым программа представилась: подписаться чужим
+    /// именем в уведомлении должно быть так же невозможно, как выпросить чужое право.
+    fn draw_notes(&mut self, u: &mut Ui, th: &Theme, card: Rect) {
+        let font_h = u.font.line_h();
+        let (_, _, pad) = Self::metrics(th, &*u.font);
+        let m = th.px(5);
+        let mut d = card.inset(m);
+        let note_h = 2 * font_h + 2 * pad;
+        // Список читается из буфера, снятого при открытии: он не меняется, пока смотрят, и
+        // перечитывать его каждый кадр значило бы дёргать композитор шестьдесят раз в секунду.
+        let buf = core::mem::take(&mut self.notes_buf);
+        let mut drop_id: Option<u32> = None;
+        let mut shown = 0usize;
+        for n in win::notes(&buf) {
+            if shown >= Self::NOTES_SHOWN || d.h < note_h {
+                break;
+            }
+            shown += 1;
+            let r = d.cut_top(note_h);
+            d.cut_top(m);
+            u.card(r);
+            let mut c = r.inset(pad);
+            let x = c.cut_right(font_h);
+            let title = String::from_utf8_lossy(n.title);
+            let from = String::from_utf8_lossy(n.from);
+            let text = String::from_utf8_lossy(n.text);
+            let col = if n.level == win::NOTE_WARN { th.danger } else { th.text };
+            u.label(Rect::new(c.x, c.y, c.w, font_h), &title, col, Align::Left);
+            // Вторая строка — «от кого» и текст вместе: у уведомления обычно одна короткая
+            // фраза, и отдавать ей отдельную строку значило бы растить полотно вдвое ради
+            // пустоты.
+            let sub = if from.is_empty() {
+                text.to_string()
+            } else {
+                alloc::format!("{from}: {text}")
+            };
+            u.label(Rect::new(c.x, c.y + font_h, c.w, font_h), &sub, th.muted, Align::Left);
+            let hot = if u.hot(x) { 256 } else { 0 };
+            if u.icon_button(x, ui::icon::CLOSE, hot, false) {
+                drop_id = Some(n.id);
+            }
+        }
+        let total = win::notes(&buf).count();
+        self.notes_buf = buf;
+        // Подвал: «убрать все» — и сколько не поместилось. Молча спрятанный хвост списка это
+        // ровно та ложь, которой в системе быть не должно.
+        let foot = d.cut_top(font_h + th.px(4));
+        if shown == 0 {
+            u.label(foot, "уведомлений нет", th.muted, Align::Left);
+        } else {
+            if total > shown {
+                let more = alloc::format!("ещё {}", total - shown);
+                u.label(foot, &more, th.muted, Align::Left);
+            }
+            let btn = Rect::new(foot.right() - th.px(90), foot.y, th.px(90), foot.h);
+            let hot = if u.hot(btn) { 256 } else { 0 };
+            if u.button(btn, "убрать все", hot) {
+                drop_id = Some(0);
+            }
+        }
+        if let Some(id) = drop_id {
+            win::note_drop(id);
+            let mut nb = alloc::vec![0u8; 8 * 1024];
+            let n = win::notes_read(&mut nb);
+            nb.truncate(n);
+            self.notes_buf = nb;
+            self.again = true;
+        }
+    }
+
+    /// Сколько уведомлений показываем разом. Больше — полотно перестаёт помещаться на экран
+    /// ноутбука, а история всё равно не читается «вся»: человек смотрит последние.
+    const NOTES_SHOWN: usize = 6;
+
     /// Сколько строк в коробке сведений. Число живёт одним местом: по нему считается и высота
     /// карточки, и то, что в неё влезает.
     const INFO_ROWS: i32 = 6;
@@ -1138,6 +1294,15 @@ impl Bar {
     fn card_rect(&self, th: &Theme, font: &mut Font) -> Rect {
         let (row, head, pad) = Self::metrics(th, &*font);
         let m = th.px(5); // поле полотна вокруг коробок — из макета
+        // Веха 168 — у полотна уведомлений свои меры: оно шире (в нём текст, а не пары
+        // «подпись — значение») и ровно такой высоты, сколько накопилось.
+        if self.showing == Menu::Notes {
+            let w = th.px(320).min(self.sw - th.px(20));
+            let n = win::notes(&self.notes_buf).count().min(Self::NOTES_SHOWN).max(1) as i32;
+            let note_h = 2 * font.line_h() + 2 * pad;
+            let h = 2 * m + n * (note_h + m) + row + m;
+            return Rect::new(self.sw - w, self.strip, w, h);
+        }
         let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));
         let h = 2 * m + head + m + (2 * pad + Self::INFO_ROWS * row);
         // От низа ПОЛОСЫ, а не поверхности: под полосой у нас теперь ещё вогнутые уголки, и
@@ -1226,6 +1391,10 @@ impl Bar {
         clock: &str,
         pow_hot: u32,
     ) {
+        if self.showing == Menu::Notes {
+            self.draw_notes(u, th, card);
+            return;
+        }
         let (row, head_h, pad) = Self::metrics(th, &*u.font);
         let (top, info) = self.boxes(th, &*u.font, card);
 

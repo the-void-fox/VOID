@@ -113,6 +113,10 @@ pub struct Status {
     pub layout: u8,
     /// Веха 145 — композитор показывает ОБЗОР ([`ST_OVERVIEW`]).
     pub overview: bool,
+    /// Веха 168 — сколько уведомлений накопилось. В снимке состояния, а не отдельным событием:
+    /// панель и так просыпается на каждое его изменение, а второй канал про то же самое —
+    /// это второй повод им разойтись.
+    pub notes: u8,
     /// Сколько байт заголовка легло в переданный буфер.
     pub title_len: usize,
 }
@@ -240,6 +244,110 @@ pub const OP_PERSIST: usize = 21;
 
 /// Сколько байт командной строки принимаем в [`OP_PERSIST`].
 pub const RUN_MAX: usize = 128;
+
+/// Веха 168 — **СКАЗАТЬ ЧЕЛОВЕКУ**: `[уровень u8, длина заголовка u8, заголовок, текст]` → `[1]`.
+///
+/// ## Почему уведомления живут у КОМПОЗИТОРА
+///
+/// Их можно было завести отдельной службой, и в других системах так и делают. Здесь довод против
+/// решающий: уведомление обязано появиться НА ЭКРАНЕ, а экран принадлежит композитору. Служба
+/// показала бы его своей поверхностью — то есть завела бы окно поверх окон, которое ловит клики
+/// там, где человек целился в чужую программу. Композитору же поверхность не нужна: он и так
+/// рисует поверх всего (курсор, ярлык перетаскивания) и знает, где что лежит.
+///
+/// Второе следствие того же: **уведомление не может соврать, от кого оно**. Имя отправителя
+/// композитор берёт у ЯДРА по номеру процесса (`m.sender`), а не из сообщения. Написать себе
+/// чужое имя нельзя — как и в раздаче прав ([`OP_GRANT`]).
+///
+/// Уровень: 0 — обычное, 1 — важное. Больше видов пока нет и выдумывать их незачем: разница
+/// должна что-то менять на экране, а «предупреждение» и «ошибка» выглядели бы одинаково.
+pub const OP_NOTIFY: usize = 23;
+
+/// Веха 168 — **что накопилось**: `[]` → записи подряд, свежие ПЕРВЫМИ.
+///
+/// Запись: `[id u32, уровень u8, длина «от кого» u8, длина заголовка u8, длина текста u8, байты]`.
+/// Разбирает её [`notes`] — итератором по чужому буферу, без выделения памяти.
+pub const OP_NOTES: usize = 24;
+
+/// Веха 168 — **убрать**: `[id u32]`; нулевой id — убрать ВСЕ. Ответ `[сколько убрано u8]`.
+pub const OP_NOTE_DROP: usize = 25;
+
+/// Уровень уведомления: обычное.
+pub const NOTE_INFO: u8 = 0;
+/// Уровень уведомления: важное (композитор показывает его иначе).
+pub const NOTE_WARN: u8 = 1;
+
+/// Одно уведомление, как оно лежит в ответе [`OP_NOTES`]. Срезы чужого буфера — разбор не
+/// выделяет памяти, поэтому годится и там, где кучи нет.
+#[derive(Clone, Copy)]
+pub struct Note<'a> {
+    pub id: u32,
+    pub level: u8,
+    /// Имя программы-отправителя, как его назвало ЯДРО.
+    pub from: &'a [u8],
+    pub title: &'a [u8],
+    pub text: &'a [u8],
+}
+
+/// Разобрать ответ [`OP_NOTES`]: записи подряд, пока хватает байт.
+pub fn notes(buf: &[u8]) -> impl Iterator<Item = Note<'_>> {
+    let mut at = 0usize;
+    core::iter::from_fn(move || {
+        let h = buf.get(at..at + 8)?;
+        let id = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+        let (level, fl, tl, xl) = (h[4], h[5] as usize, h[6] as usize, h[7] as usize);
+        let body = buf.get(at + 8..at + 8 + fl + tl + xl)?;
+        at += 8 + fl + tl + xl;
+        Some(Note {
+            id,
+            level,
+            from: &body[..fl],
+            title: &body[fl..fl + tl],
+            text: &body[fl + tl..],
+        })
+    })
+}
+
+/// Веха 168 — сказать человеку. `false` — композитора нет или он отказал.
+pub fn notify(level: u8, title: &str, text: &str) -> bool {
+    let Some(ep) = endpoint() else { return false };
+    let mut req = [0u8; 2 + NOTE_MAX * 2];
+    let (t, x) = (cut_note(title), cut_note(text));
+    req[0] = level;
+    req[1] = t.len() as u8;
+    req[2..2 + t.len()].copy_from_slice(t.as_bytes());
+    let n = 2 + t.len();
+    req[n..n + x.len()].copy_from_slice(x.as_bytes());
+    let mut rep = [0u8; 1];
+    crate::call(ep, OP_NOTIFY, &req[..n + x.len()], &mut rep) == 1
+}
+
+/// Сколько байт заголовка и текста принимает композитор. Режется по границе символа: половина
+/// буквы приедет к нему мусором, который он честно нарисует.
+pub const NOTE_MAX: usize = 96;
+
+fn cut_note(s: &str) -> &str {
+    let mut cut = NOTE_MAX.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// Веха 168 — забрать уведомление (0 — все). Возвращает, сколько убрано.
+pub fn note_drop(id: u32) -> usize {
+    let Some(ep) = endpoint() else { return 0 };
+    let mut rep = [0u8; 1];
+    let n = crate::call(ep, OP_NOTE_DROP, &id.to_le_bytes(), &mut rep);
+    if n == 1 { rep[0] as usize } else { 0 }
+}
+
+/// Веха 168 — прочитать список уведомлений в свой буфер. Возвращает, сколько байт легло.
+pub fn notes_read(out: &mut [u8]) -> usize {
+    let Some(ep) = endpoint() else { return 0 };
+    let n = crate::call(ep, OP_NOTES, &[], out);
+    if n == crate::NO_CAP { 0 } else { n }
+}
 
 /// Веха 155 — ПОПРОСИТЬ ПРАВО, объявленное конфигом: `[вид u8]` → право в ответе (пусто — отказ).
 ///
@@ -959,6 +1067,7 @@ pub mod wire {
         pub spaces: u8,
         pub layout: u8,
         pub overview: bool,
+        pub notes: u8,
         pub title: &'a [u8],
     }
 
@@ -969,6 +1078,7 @@ pub mod wire {
                 .u8(self.spaces)
                 .u8(self.layout)
                 .u8(if self.overview { ST_OVERVIEW } else { 0 })
+                .u8(self.notes)
                 .bytes(cut(self.title));
             w.len()
         }
@@ -976,11 +1086,13 @@ pub mod wire {
         pub fn decode(b: &'a [u8]) -> Option<Status<'a>> {
             let mut r = Rd::new(b);
             let (space, spaces, layout, flags) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
+            let notes = r.u8()?;
             Some(Status {
                 space,
                 spaces,
                 layout,
                 overview: flags & ST_OVERVIEW != 0,
+                notes,
                 title: r.tail(),
             })
         }
@@ -1422,6 +1534,7 @@ impl Window {
             spaces: s.spaces,
             layout: s.layout,
             overview: s.overview,
+            notes: s.notes,
             title_len: t,
         })
     }
