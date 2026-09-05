@@ -94,6 +94,12 @@ impl Edit {
         self.anchor = at;
     }
 
+    /// Веха 167.2 — ПРОТЯЩИТЬ курсор: сдвинуть его, оставив якорь на месте. Ровно то же, что
+    /// делает `Shift`+стрелка, только точку называет мышь.
+    pub fn drag_caret(&mut self, at: usize) {
+        self.caret = at.min(self.text.len());
+    }
+
     /// Убрать выделенное. `true` — что-то стёрли.
     fn drop_selection(&mut self) -> bool {
         let Some((a, b)) = self.selection() else { return false };

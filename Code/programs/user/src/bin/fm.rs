@@ -155,6 +155,13 @@ struct App {
     /// с зажатой кнопкой — иначе каждый щелчок был бы началом перетаскивания.
     press: Option<(i32, i32, usize)>,
     dragging: bool,
+    /// Веха 167.2 — РАМКА ВЫДЕЛЕНИЯ: откуда протянули и куда. `None` — не тянут.
+    band: Option<((i32, i32), (i32, i32))>,
+    /// Что было выделено ДО протяжки: с `Ctrl` рамка добавляет, без него — заменяет.
+    band_base: Vec<usize>,
+    /// Правку тянут мышью: протяжка действует, только если начали ВНУТРИ поля. Иначе выделять
+    /// текст начинал бы всякий, кто провёл курсором над полем с зажатой кнопкой.
+    edit_drag: bool,
 }
 
 /// Что выбрали в контекстном меню.
@@ -478,6 +485,7 @@ impl App {
         // крошек — поиск и адрес отвечают на один и тот же вопрос «что я сейчас вижу».
         let mut jump: Option<String> = None;
         let mut caret_to: Option<usize> = None;
+        let mut drag_to: Option<usize> = None;
         let rad = th.radius.min(lay.addr.h / 2);
         let (bg, br) = (u.tint(th.band), u.tint(th.border));
         u.c.rrect_bordered(lay.addr, rad, th.line, bg, br);
@@ -486,9 +494,9 @@ impl App {
         // и так отвечает на «где я», логично, что она же принимает «куда идти». Пока правим,
         // крошек нет — иначе в одном месте было бы два разных ответа на один вопрос.
         if let Some((What::Path, e)) = &self.edit {
-            if let Some(at) = u.edit_field(lay.addr, e, "путь") {
-                caret_to = Some(at);
-            }
+            let (click, drag) = u.edit_field(lay.addr, e, "путь");
+            caret_to = click;
+            drag_to = drag;
         } else if !self.query.is_empty() {
             u.label(a, &alloc::format!("поиск: {}", self.query), th.text, Align::Left);
         } else {
@@ -522,10 +530,18 @@ impl App {
             self.begin_edit(What::Path);
             dirty = true;
         }
-        // Щелчок ВНУТРИ правимого поля ставит курсор туда, куда ткнули.
+        // Щелчок ВНУТРИ правимого поля ставит курсор туда, куда ткнули; протяжка от него —
+        // выделяет. Порядок важен: щелчок сбрасывает выделение, протяжка его строит, и в одном
+        // кадре может прийти и то и другое (нажали и сразу повели).
         if let (Some(at), Some((_, e))) = (caret_to, self.edit.as_mut()) {
             e.put_caret(at);
             dirty = true;
+        }
+        if self.edit_drag {
+            if let (Some(at), Some((_, e))) = (drag_to, self.edit.as_mut()) {
+                e.drag_caret(at);
+                dirty = true;
+            }
         }
 
         // Поиск — ПЕРЕКЛЮЧАТЕЛЬ набранного: нажали при пустом — просто подсказка «набирай»,
@@ -611,9 +627,18 @@ impl App {
                 _ => "новое имя",
             };
             let r = Rect::new(lay.body.x + th.pad, lay.body.y + th.px(6), lay.body.w - 2 * th.pad, font_h + th.px(10));
-            let at = u.edit_field(r, e, hint);
-            if let (Some(at), Some((_, e))) = (at, self.edit.as_mut()) {
+            let (click, drag) = u.edit_field(r, e, hint);
+            let inside = click.is_some();
+            if let (Some(at), Some((_, e))) = (click, self.edit.as_mut()) {
                 e.put_caret(at);
+            }
+            if inside {
+                self.edit_drag = true;
+            }
+            if self.edit_drag {
+                if let (Some(at), Some((_, e))) = (drag, self.edit.as_mut()) {
+                    e.drag_caret(at);
+                }
             }
             return true;
         }
@@ -698,6 +723,13 @@ impl App {
                 act = Some((k, u.mods()));
             }
         }
+        // Рамка — ПОВЕРХ значков: она про них, и прятать её под ними бессмысленно.
+        if let Some((a, b)) = self.band {
+            let r = Rect::new(a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs());
+            let fill = u.tint(th.accent.with_a(0x28));
+            let line = u.tint(th.accent.with_a(0x99));
+            u.c.rrect_bordered(r, th.px(2), th.line.max(1), fill, line);
+        }
         // Подвал содержимого: ответ на последнее действие, а без него — не обрезан ли список.
         let foot = Rect::new(lay.body.x, lay.body.bottom() - font_h - th.px(4), lay.body.w, font_h);
         match (&self.flash, self.cut) {
@@ -754,6 +786,27 @@ impl App {
         self.pick_one(k);
         if let Some(&i) = self.hits.get(k) {
             self.measure_sel(i);
+        }
+    }
+
+    /// Веха 167.2 — пересобрать выделение по РАМКЕ: всё, чью ячейку она задела.
+    ///
+    /// Задела, а не «накрыла целиком»: рамкой ведут наспех, и требовать полного накрытия значит
+    /// требовать аккуратности там, где человек её не проявляет.
+    fn mark_in_band(&mut self, a: (i32, i32), b: (i32, i32)) {
+        let r = Rect::new(a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs());
+        self.marked = self.band_base.clone();
+        let end = (self.top + self.lay.page).min(self.hits.len());
+        for k in self.top..end {
+            let cell = self.cell_rect(&self.lay, k - self.top);
+            if !cell.intersect(r).is_empty() && !self.marked.contains(&k) {
+                self.marked.push(k);
+            }
+        }
+        // Курсор ставим на последнюю задетую: с неё пойдёт следующая `Shift`-полоса.
+        if let Some(&k) = self.marked.last() {
+            self.sel = k;
+            self.anchor = k;
         }
     }
 
@@ -1527,7 +1580,14 @@ impl ui::Client for App {
                 }
                 ui::Scope::All
             }
-            Event::Motion { .. } => {
+            Event::Motion { x, y } => {
+                // Веха 167.2 — тянут РАМКУ: пересобрать выделение по тому, что она накрыла.
+                if let (Some((a, _)), Some(_)) = (self.band, input.held) {
+                    let b = (x as i32, y as i32);
+                    self.band = Some((a, b));
+                    self.mark_in_band(a, b);
+                    return ui::Scope::All;
+                }
                 // Веха 166.2 — ПЕРЕТАСКИВАНИЕ начинается не с нажатия, а с движения при зажатой
                 // кнопке: иначе каждый щелчок был бы началом перетаскивания, и выбрать значок
                 // мышью стало бы нельзя. Порог в несколько точек — про дрожание руки.
@@ -1544,6 +1604,8 @@ impl ui::Client for App {
                 if !down {
                     self.press = None;
                     self.dragging = false;
+                    self.band = None;
+                    self.edit_drag = false;
                     return ui::Scope::All;
                 }
                 // Правая — КОНТЕКСТНОЕ МЕНЮ. Бит 1, как его кодирует ядро (`SYS_MOUSE_READ`).
@@ -1570,7 +1632,16 @@ impl ui::Client for App {
                     return ui::Scope::All;
                 }
                 // Левая по записи — запомнить точку: с неё может начаться перетаскивание.
+                // Левая по пустому месту содержимого — начало РАМКИ выделения.
                 self.press = self.entry_at(x, y).map(|k| (x, y, k));
+                if self.press.is_none() && self.lay.body.contains(x, y) && self.edit.is_none() {
+                    self.band = Some(((x, y), (x, y)));
+                    // С `Ctrl` рамка ДОБАВЛЯЕТ к выделенному, без него — начинает заново.
+                    self.band_base =
+                        if mods & win::modk::CTRL != 0 { self.marked.clone() } else { Vec::new() };
+                    self.marked = self.band_base.clone();
+                }
+                self.edit_drag = self.edit.is_some() && self.lay.addr.contains(x, y);
                 ui::Scope::All
             }
             // Веха 166.2 — в нас УРОНИЛИ. Возят текст, и если это путь — идём по нему: то же
@@ -1692,6 +1763,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         store: ui::conf::store_cap(),
         press: None,
         dragging: false,
+        band: None,
+        band_base: Vec::new(),
+        edit_drag: false,
     };
     // Закладки читаются ОДИН раз, на старте: каталог, которого нет, в колонку не попадает.
     app.load_marks();

@@ -657,9 +657,12 @@ impl<'a> Ui<'a> {
     /// не мигает и не должен: он показывает МЕСТО, а не то, что поле живо, и мигание ради мигания
     /// стоило бы кадра каждые полсекунды на каждом открытом поле.
     ///
-    /// Возвращает байтовый индекс, на который пришёлся щелчок (`None` — не щёлкали): попадание
-    /// считает тот же код, который рисует, и потому курсор встаёт ровно туда, куда ткнули.
-    pub fn edit_field(&mut self, r: Rect, e: &edit::Edit, hint: &str) -> Option<usize> {
+    /// Возвращает два байтовых индекса: куда пришёлся ЩЕЛЧОК и куда — ТОЧКА ПРОТЯЖКИ (палец
+    /// держат). Попадание считает тот же код, который рисует, и потому курсор встаёт ровно
+    /// туда, куда ткнули; протяжкой же выделяют — а это второй вопрос, и ответ у него свой.
+    pub fn edit_field(
+        &mut self, r: Rect, e: &edit::Edit, hint: &str,
+    ) -> (Option<usize>, Option<usize>) {
         let rad = self.th.radius.min(r.h / 2);
         let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.th.border));
         self.c.rrect_bordered(r, rad, self.th.line, bg, br);
@@ -697,20 +700,28 @@ impl<'a> Ui<'a> {
         self.c.fill(bar, c);
         self.c.set_clip(keep);
         self.mark(r);
-        // Куда ткнули: ближайшая граница символа к точке щелчка.
-        let hit = self.click.filter(|&(cx, cy)| r.contains(cx, cy))?;
-        let want = hit.0 - inner.x + over;
-        let mut at = 0;
-        for (i, _) in s.char_indices().skip(1) {
-            if self.font.width(&s[..i]) > want {
-                break;
+        // Куда ткнули (и куда тянут): ближайшая граница символа к точке.
+        let x0 = inner.x - over;
+        let at_of = |font: &mut Font, px: i32| -> usize {
+            let want = px - x0;
+            if want >= font.width(s) {
+                return s.len();
             }
-            at = i;
-        }
-        if want > self.font.width(s) {
-            at = s.len();
-        }
-        Some(at)
+            let mut at = 0;
+            for (i, _) in s.char_indices().skip(1) {
+                if font.width(&s[..i]) > want {
+                    break;
+                }
+                at = i;
+            }
+            at
+        };
+        let click = self.click.filter(|&(cx, cy)| r.contains(cx, cy)).map(|(cx, _)| cx);
+        // Протяжку по ГОРИЗОНТАЛИ не ограничиваем прямоугольником: уводя палец вниз или вбок,
+        // человек продолжает выделять — так ведёт себя всякое текстовое поле.
+        let drag = self.held.map(|(cx, _)| cx);
+        let (click, drag) = (click.map(|x| at_of(self.font, x)), drag.map(|x| at_of(self.font, x)));
+        (click, drag)
     }
 
     /// Веха 146 — **строка списка**: значок, название и подпись под ним.

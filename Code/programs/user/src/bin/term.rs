@@ -856,6 +856,17 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut exec_cap = sys::NO_CAP;
     let mut panes: Vec<Pane> = vec![new_pane(PaneId(0), &rects, &mut exec_cap, me, &conf)];
     let mut focus = 0usize;
+    // Веха 167.2 — ВЫДЕЛЕНИЕ МЫШЬЮ: якорь и текущая ячейка в координатах ВСЕГО кадра.
+    //
+    // Кадра, а не панели: кадр терминала и так собирается мозаикой из панелей в одну сетку
+    // (`compose`), и выделение по ней и подсвечивается, и вычитывается. Панель тут ни при чём —
+    // человек ведёт мышью по экрану, а не по дереву разбиений.
+    let mut sel: Option<(usize, usize, usize, usize)> = None;
+    let mut sel_drag = false;
+    // Кадр, по которому выделение вычитывается: тот же, что нарисован.
+    let mut sel_cells: Vec<Cell> = Vec::new();
+    // Строки, подсвеченные в ПРОШЛОМ кадре: их надо перерисовать, когда подсветка ушла.
+    let mut sel_rows_prev: (usize, usize) = (0, 0);
 
     // Веха 151 — КАК ЗОВУТ НАШЕ СОСТОЯНИЕ в store. Пришло аргументом — значит нас вернул сеанс, и
     // имя надо оставить прежним (иначе объекты копились бы от загрузки к загрузке). Не пришло —
@@ -929,6 +940,40 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     sys::win::Event::Key { sym, mods, ch, down } => {
                         if down {
                             keys_from_win.push(win_key(sym, mods, ch));
+                        }
+                    }
+                    // Веха 167.2 — ВЫДЕЛЕНИЕ МЫШЬЮ. Терминал — это сетка знакомест, поэтому
+                    // точка превращается в ячейку делением, а не поиском: тем же расчётом
+                    // кадр и рисуется.
+                    sys::win::Event::Button { x, y, buttons, down, .. } => {
+                        if buttons & 1 != 0 && down {
+                            let c = cell_at(&view, x as usize, y as usize);
+                            sel = Some((c.0, c.1, c.0, c.1));
+                            sel_drag = true;
+                            redraw = true;
+                        } else if !down {
+                            // Отпустили — КОПИРУЕМ выделенное. Отдельного «копировать» у
+                            // терминала нет и не нужно: выделение мышью для того и делают.
+                            if sel_drag {
+                                sel_drag = false;
+                                // Щелчок БЕЗ протяжки — не выделение, а «сними выделение»:
+                                // копировать один знак по случайному клику никто не просил.
+                                if matches!(sel, Some((ac, ar, cc, cr)) if (ac, ar) == (cc, cr)) {
+                                    sel = None;
+                                } else if let Some(text) = sel_text(&sel_cells, view.cols, sel) {
+                                    if let Some(c) = store_cap() {
+                                        sys::win::clip_put(c, sys::win::CLIP_TEXT, text.as_bytes());
+                                    }
+                                }
+                                redraw = true;
+                            }
+                        }
+                    }
+                    sys::win::Event::Motion { x, y } if sel_drag => {
+                        if let Some((ac, ar, _, _)) = sel {
+                            let c = cell_at(&view, x as usize, y as usize);
+                            sel = Some((ac, ar, c.0, c.1));
+                            redraw = true;
                         }
                     }
                     sys::win::Event::Close => {
@@ -1306,7 +1351,36 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     );
                 }
             }
-            let dirty = dirty_rows(&prev_cells, &cells, view.cols, view.rows);
+            let mut dirty = dirty_rows(&prev_cells, &cells, view.cols, view.rows);
+            // Веха 167.2 — строки ПОДСВЕТКИ считаются изменившимися, даже если знаки в них те
+            // же: подсветку рисуем поверх готовых пикселей, а перерисовываются только грязные
+            // строки. Берём и прошлые тоже — иначе снятая подсветка осталась бы на экране.
+            {
+                let rows_of = |sel: Option<(usize, usize, usize, usize)>| match sel {
+                    Some((_, ar, _, cr)) => (ar.min(cr), ar.max(cr)),
+                    None => (usize::MAX, 0),
+                };
+                let (a0, a1) = rows_of(sel);
+                let (b0, b1) = sel_rows_prev;
+                for (lo, hi) in [(a0, a1), (b0, b1)] {
+                    if lo == usize::MAX {
+                        continue;
+                    }
+                    for y in lo..=hi.min(view.rows.saturating_sub(1)) {
+                        if !dirty.contains(&y) {
+                            dirty.push(y);
+                        }
+                    }
+                }
+                sel_rows_prev = if sel.is_some() { (a0, a1) } else { (usize::MAX, 0) };
+                dirty.sort_unstable();
+            }
+            // Кадр, по которому выделение вычитывается при отпускании кнопки, — ЭТОТ. Копия
+            // только ПОКА ВЫДЕЛЯЮТ: без выделения это шестьдесят килобайт на каждый кадр
+            // вывода, то есть плата за то, чем никто не пользуется.
+            if sel.is_some() {
+                sel_cells = cells.clone();
+            }
             if !dirty.is_empty() {
                 // Рисуем И переносим ТОЛЬКО изменившиеся строки. Раньше отрисовка шла по всему
                 // кадру «потому что RAM дешёвая» — оценка оказалась неверной: 116×36 знакомест
@@ -1316,6 +1390,27 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     &cells, view.cols, view.rows, &mut view.cache, &mut view.surface, &dirty,
                 );
                 let ch = view.cell_h();
+                // Подсветка — ИНВЕРСИЕЙ поверх готовых пикселей: у ячейки свои цвета (фон,
+                // жирность, курсор), и красить её «цветом выделения» значило бы стирать их.
+                // Инверсия читается на любом фоне и ничего не теряет.
+                if sel.is_some() {
+                    let m = view.renderer.metrics();
+                    let cw = m.width.max(1) as usize;
+                    for &y in &dirty {
+                        if let Some((from, to)) = sel_span(sel, y, view.cols) {
+                            view.surface.fill_rect(
+                                ereb_render::Rect {
+                                    x: (from * cw) as i32,
+                                    y: (y * ch) as i32,
+                                    w: ((to - from) * cw) as u32,
+                                    h: ch as u32,
+                                },
+                                ereb_render::Rgb::new(255, 255, 255),
+                                ereb_render::BlendMode::Invert,
+                            );
+                        }
+                    }
+                }
                 for &y in &dirty {
                     blit_rows(&view.surface, &info, out.base(), y * ch,
                               ((y + 1) * ch).min(info.height));
@@ -1698,6 +1793,57 @@ fn rect_size(rects: &[PaneRect], id: PaneId) -> (usize, usize) {
         .find(|r| r.id == id)
         .map(|r| (r.area.cols.max(1) as usize, r.area.rows.max(1) as usize))
         .unwrap_or((1, 1))
+}
+
+/// Веха 167.2 — какая ЯЧЕЙКА под точкой окна. Тем же делением, каким кадр и раскладывается.
+fn cell_at(view: &View, x: usize, y: usize) -> (usize, usize) {
+    let m = view.renderer.metrics();
+    let (cw, ch) = (m.width.max(1) as usize, m.height.max(1) as usize);
+    ((x / cw).min(view.cols.saturating_sub(1)), (y / ch).min(view.rows.saturating_sub(1)))
+}
+
+/// Отрезок строки `y`, попавший в выделение: `[от, до)` в столбцах. `None` — строка вне его.
+///
+/// Выделение ЛИНЕЙНОЕ, а не прямоугольное: человек выделяет ТЕКСТ, и на переносе строки он
+/// ожидает продолжения, а не колонки. Прямоугольное пригодилось бы для таблиц — это отдельный
+/// режим, и заводить его молча, вместо ожидаемого, нельзя.
+fn sel_span(sel: Option<(usize, usize, usize, usize)>, y: usize, cols: usize) -> Option<(usize, usize)> {
+    let (ac, ar, cc, cr) = sel?;
+    let ((sc, sr), (ec, er)) =
+        if (ar, ac) <= (cr, cc) { ((ac, ar), (cc, cr)) } else { ((cc, cr), (ac, ar)) };
+    if y < sr || y > er {
+        return None;
+    }
+    let from = if y == sr { sc } else { 0 };
+    let to = if y == er { (ec + 1).min(cols) } else { cols };
+    (to > from).then_some((from, to))
+}
+
+/// Текст выделенного — по тому же кадру, который нарисован.
+fn sel_text(
+    cells: &[Cell], cols: usize, sel: Option<(usize, usize, usize, usize)>,
+) -> Option<String> {
+    let (_, ar, _, cr) = sel?;
+    let (sr, er) = (ar.min(cr), ar.max(cr));
+    let mut out = String::new();
+    for y in sr..=er {
+        let (from, to) = match sel_span(sel, y, cols) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut line = String::new();
+        for x in from..to {
+            if let Some(c) = cells.get(y * cols + x) {
+                line.push(if c.ch == '\0' { ' ' } else { c.ch });
+            }
+        }
+        // Хвостовые пробелы — не текст, а пустое место сетки: в буфере они мусор.
+        out.push_str(line.trim_end());
+        if y < er {
+            out.push('\n');
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
 }
 
 /// Собрать кадр: панели по своим прямоугольникам + подсветка фокуса + статус-бар.
