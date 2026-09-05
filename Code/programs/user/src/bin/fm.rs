@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 
 use void_user as sys;
 use void_user::posix as px;
-use void_user::win::{sym, Event, Window};
+use void_user::win::{self as win, sym, Event, Window};
 
 #[allow(dead_code)]
 #[path = "../ui/mod.rs"]
@@ -117,11 +117,43 @@ struct App {
     query: String,
     /// Сетка значков (как в макете) или список с размерами.
     grid: bool,
-    /// Что сказал сервер, если каталог не открылся, и не обрезан ли список.
+    /// Что сказал сервер, если каталог НЕ ОТКРЫЛСЯ, и не обрезан ли список.
     err: Option<String>,
+    /// Ответ на последнее действие («скопировано», «нет такого пути»). Отдельно от `err`: тот
+    /// значит «показывать нечего», а этот — «показать есть что, и вот ещё словечко».
+    flash: Option<String>,
     cut: bool,
     marks: Vec<(String, String)>,
     lay: Lay,
+    /// Веха 166.2 — ПРАВКА ПУТИ прямо в адресной строке: `Some(текст)` — правим. Отдельного окна
+    /// «перейти к» нет и не надо: строка адреса уже показывает, где мы, и логично, что она же
+    /// принимает, куда идти.
+    edit: Option<String>,
+    /// Контекстное меню: где открыто и по какой записи (`None` — по пустому месту).
+    menu: Option<(i32, i32, Option<usize>)>,
+    /// Меню открыто ЭТИМ ЖЕ щелчком: пока так, его пункты кликов не принимают. Иначе нажатие
+    /// правой кнопкой открывало бы меню и тут же выбирало в нём пункт под курсором.
+    menu_fresh: bool,
+    /// «Удалить» в меню взведено вторым нажатием. Диалогов в тулките нет, а один щелчок на
+    /// необратимое — слишком дёшево.
+    armed: bool,
+    /// Право на store: под буфер обмена и перетаскивание возится не содержимое, а ИМЯ объекта,
+    /// и класть объект копирующий обязан сам ([[void-ui]], Веха 150).
+    store: Option<usize>,
+    /// Откуда нажали и потащили ли уже: перетаскивание начинается не с нажатия, а с ДВИЖЕНИЯ
+    /// с зажатой кнопкой — иначе каждый щелчок был бы началом перетаскивания.
+    press: Option<(i32, i32, usize)>,
+    dragging: bool,
+}
+
+/// Что выбрали в контекстном меню.
+#[derive(Clone, Copy, PartialEq)]
+enum Act {
+    Open,
+    Copy,
+    Paste,
+    Refresh,
+    Delete,
 }
 
 impl App {
@@ -198,6 +230,7 @@ impl App {
         self.back.push(core::mem::replace(&mut self.cwd, path));
         self.fwd.clear();
         self.query.clear();
+        self.flash = None;
         self.sel = 0;
         self.picked = false;
         self.read();
@@ -213,6 +246,7 @@ impl App {
         let Some(p) = from.pop() else { return };
         to.push(core::mem::replace(&mut self.cwd, p));
         self.query.clear();
+        self.flash = None;
         self.sel = 0;
         self.picked = false;
         self.read();
@@ -282,7 +316,8 @@ impl App {
 
         // Сетка: ячейка вмещает значок и подпись под ним.
         let cw = th.px(88);
-        let ch = th.px(34) + font_h + th.px(10);
+        // Две строки подписи: имена в store длинные, и одной строкой они режутся почти всегда.
+        let ch = th.px(34) + 2 * font_h + th.px(10);
         let inner = lay.body.inset(th.px(8));
         lay.inner = inner;
         lay.cols = (inner.w / cw).max(1);
@@ -315,6 +350,17 @@ impl App {
         dirty |= self.paint_bar(u, th, lay);
         dirty |= self.paint_side(u, th, lay);
         dirty |= self.paint_body(u, th, lay);
+        // Меню — ПОСЛЕДНИМ: оно лежит поверх всего, и рисовать его раньше значит рисовать под.
+        dirty |= self.paint_menu(u, th);
+        // Щелчок мимо адресной строки бросает правку: человек передумал, а не ошибся.
+        if self.edit.is_some() {
+            if let Some((cx, cy)) = u.click() {
+                if !lay.addr.contains(cx, cy) {
+                    self.edit = None;
+                    dirty = true;
+                }
+            }
+        }
         dirty
     }
 
@@ -352,7 +398,12 @@ impl App {
         let (bg, br) = (u.tint(th.band), u.tint(th.border));
         u.c.rrect_bordered(lay.addr, rad, th.line, bg, br);
         let mut a = lay.addr.inset_xy(th.px(4), 0);
-        if !self.query.is_empty() {
+        // Веха 166.2 — ПРАВКА ПУТИ. Отдельного окна «перейти к» нет и не нужно: строка адреса
+        // и так отвечает на «где я», логично, что она же принимает «куда идти». Пока правим,
+        // крошек нет — иначе в одном месте было бы два разных ответа на один вопрос.
+        if let Some(text) = self.edit.clone() {
+            u.field(lay.addr, &text, "путь", true);
+        } else if !self.query.is_empty() {
             u.label(a, &alloc::format!("поиск: {}", self.query), th.text, Align::Left);
         } else {
             let crumbs = self.crumbs();
@@ -376,6 +427,14 @@ impl App {
                     u.label(sep, ">", th.muted, Align::Center);
                 }
             }
+        }
+
+        // Щелчок по адресной строке МИМО крошек — начать правку пути. Мимо, а не по: крошка
+        // отвечает на «перейти туда», и отдавать ей ещё и «править» значило бы два смысла на
+        // одном месте.
+        if self.edit.is_none() && jump.is_none() && u.clicked(lay.addr) {
+            self.edit = Some(self.cwd.clone());
+            dirty = true;
         }
 
         // Поиск — ПЕРЕКЛЮЧАТЕЛЬ набранного: нажали при пустом — просто подсказка «набирай»,
@@ -500,8 +559,15 @@ impl App {
                 let side = th.px(34);
                 let ir = Rect::new(r.x + (r.w - side) / 2, r.y + th.px(5), side, side);
                 u.icon(ir, art, col);
-                let lr = Rect::new(r.x, ir.bottom() + th.px(2), r.w, font_h);
-                u.label(lr, &name, th.text, Align::Center);
+                // Подпись УЖЕ ячейки: иначе имя, влезшее впритык, касается соседнего и оба
+                // читаются как одно слово.
+                let lw = r.w - 2 * th.px(8);
+                let (l1, l2) = wrap2(u.font, &name, lw);
+                let lr = Rect::new(r.x + (r.w - lw) / 2, ir.bottom() + th.px(2), lw, font_h);
+                u.label(lr, &l1, th.text, Align::Center);
+                if !l2.is_empty() {
+                    u.label(Rect::new(lr.x, lr.bottom(), lw, font_h), &l2, th.text, Align::Center);
+                }
             } else {
                 let mut t = r.inset_xy(th.px(6), 0);
                 let ir = t.cut_left(font_h);
@@ -520,21 +586,24 @@ impl App {
                 act = Some(k);
             }
         }
-        // Подвал списка живёт в самой карточке содержимого: сколько всего и не обрезано ли.
-        if self.cut {
-            let foot = Rect::new(lay.body.x, lay.body.bottom() - font_h - th.px(4), lay.body.w, font_h);
-            u.label(
-                foot.inset_xy(th.px(8), 0),
-                &alloc::format!("показаны не все: сервер отдал {} имён", total),
-                th.muted,
-                Align::Right,
-            );
-        }
+        // Подвал содержимого: ответ на последнее действие, а без него — не обрезан ли список.
+        let foot = Rect::new(lay.body.x, lay.body.bottom() - font_h - th.px(4), lay.body.w, font_h);
+        match (&self.flash, self.cut) {
+            (Some(m), _) => {
+                let m = m.clone();
+                u.label(foot.inset_xy(th.px(8), 0), &m, th.accent, Align::Right);
+            }
+            (None, true) => {
+                let m = alloc::format!("показаны не все: сервер отдал {} имён", total);
+                u.label(foot.inset_xy(th.px(8), 0), &m, th.muted, Align::Right);
+            }
+            _ => {}
+        };
         // Кадр дорисован по СНИМКУ — теперь можно менять снимок. Первый щелчок ВЫБИРАЕТ, щелчок
         // по уже выбранному — открывает. Двойного щелчка по ВРЕМЕНИ у нас нет и самодельного не
         // будет: часов у событий композитора нет, а мерить их самим значит завести своё понятие
         // «двойного» вразрез с системным.
-        if let Some(k) = act {
+        if let Some(k) = act.filter(|_| self.menu.is_none()) {
             if self.picked && k == self.sel {
                 self.open_sel();
             } else {
@@ -549,6 +618,224 @@ impl App {
         dirty
     }
 
+    /// Полный путь записи `k` в отобранном списке.
+    fn path_of(&self, k: usize) -> Option<String> {
+        let i = *self.hits.get(k)?;
+        Some(Self::join(&self.cwd, &self.entries.get(i)?.name))
+    }
+
+    /// Веха 166.2 — исполнить пункт контекстного меню.
+    ///
+    /// Все действия — над ОДНОЙ записью либо над текущим каталогом; ни одно не спрашивает имени,
+    /// потому что спрашивать его пока негде: поля ввода в менеджере ровно одно, и оно адресное.
+    /// Переименование и «создать каталог» приедут вместе со вторым — не раньше.
+    fn do_act(&mut self, a: Act, target: Option<usize>) {
+        match a {
+            Act::Open => {
+                if let Some(k) = target {
+                    self.sel = k;
+                    self.picked = true;
+                    self.open_sel();
+                }
+            }
+            // В буфер уезжает ПУТЬ текстом: это то, что можно вставить куда угодно ещё —
+            // в терминал, в редактор, в адресную строку. Возить содержимое файла было бы
+            // догадкой о том, чего человек хотел.
+            Act::Copy => {
+                let p = match target {
+                    Some(k) => self.path_of(k).unwrap_or_else(|| self.cwd.clone()),
+                    None => self.cwd.clone(),
+                };
+                self.flash_clip(&p);
+            }
+            Act::Paste => self.paste(),
+            Act::Refresh => self.read(),
+            Act::Delete => {
+                let Some(k) = target else { return };
+                let Some(p) = self.path_of(k) else { return };
+                // `unlink` у посикс-персоны сносит файл или ПУСТОЙ каталог. Непустой она не
+                // трогает, и это правильно: рекурсивное удаление — отдельное решение, а не
+                // побочный смысл того же пункта меню.
+                if px::unlink(self.ep, p.as_bytes()) == 0 {
+                    self.flash = Some(alloc::format!("удалено: {p}"));
+                    self.read();
+                } else {
+                    self.flash = Some(alloc::format!("не удалить: {p} (каталог не пуст?)"));
+                }
+            }
+        }
+    }
+
+    /// Положить текст в буфер обмена и сказать об этом. Молчащее «скопировано» неотличимо от
+    /// «ничего не произошло», а буфер снаружи не видно.
+    fn flash_clip(&mut self, text: &str) {
+        let ok = match self.store {
+            Some(c) => win::clip_put(c, win::CLIP_TEXT, text.as_bytes()),
+            None => false,
+        };
+        self.flash = Some(if ok {
+            alloc::format!("скопировано: {text}")
+        } else {
+            String::from("буфер обмена недоступен (нет права на store?)")
+        });
+    }
+
+    /// Вставить из буфера: если там путь — перейти по нему. Каталог открывается, файл
+    /// выделяется в своём каталоге.
+    fn paste(&mut self) {
+        let Some(store) = self.store else { return };
+        let mut buf = alloc::vec![0u8; 4096];
+        let Some((kind, got, _)) = win::clip_read(store, &mut buf) else {
+            self.flash = Some(String::from("буфер обмена пуст"));
+            return;
+        };
+        if kind != win::CLIP_TEXT {
+            self.flash = Some(String::from("в буфере не текст"));
+            return;
+        }
+        let text = String::from_utf8_lossy(&buf[..got.min(buf.len())]).trim().to_string();
+        self.goto_path(&text);
+    }
+
+    /// Перейти по пути, откуда бы он ни пришёл: из буфера, из уроненного, из адресной строки.
+    fn goto_path(&mut self, text: &str) {
+        if !text.starts_with('/') {
+            self.flash = Some(alloc::format!("это не путь: {text}"));
+            return;
+        }
+        match px::stat(self.ep, text.as_bytes()) {
+            Some((true, _)) => {
+                self.flash = None;
+                self.go(String::from(text));
+            }
+            // Файл — открыть его КАТАЛОГ и выделить сам файл: показать человеку то, что он
+            // назвал, ближе, чем отказать.
+            Some((false, _)) => {
+                let dir = Self::parent(text);
+                let name = text.rsplit('/').next().unwrap_or("").to_string();
+                self.flash = None;
+                self.go(dir);
+                if let Some(k) = self.hits.iter().position(|&i| self.entries[i].name == name) {
+                    self.sel = k;
+                    self.picked = true;
+                }
+            }
+            None => self.flash = Some(alloc::format!("нет такого пути: {text}")),
+        }
+    }
+
+    /// Докуда можно прокрутить: чтобы ПОСЛЕДНЯЯ СТРАНИЦА была полной, а не «последний значок и
+    /// пустота под ним».
+    ///
+    /// Потолком стояло `len - 1`, и колесо в любом каталоге уматывало список так, что на экране
+    /// оставалась ровно одна запись — та самая «прокрутка всё прячет» (Веха 166.2). Число
+    /// округляется вверх до границы РЯДА: иначе в сетке последний ряд оказывался бы срезанным
+    /// по половине.
+    fn max_top(&self) -> usize {
+        let page = self.lay.page.max(1);
+        let row = if self.grid { (self.lay.cols as usize).max(1) } else { 1 };
+        let over = self.hits.len().saturating_sub(page);
+        over.div_ceil(row) * row
+    }
+
+    /// Какая запись под точкой экрана. `None` — пустое место содержимого либо вообще не оно.
+    ///
+    /// Считается ТЕМ ЖЕ кодом, которым ячейки рисуются ([`App::cell_rect`]): два расчёта «где
+    /// что» — это два случая разойтись, и система на них уже стояла.
+    fn entry_at(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.lay.body.contains(x, y) {
+            return None;
+        }
+        let end = (self.top + self.lay.page).min(self.hits.len());
+        (self.top..end).find(|&k| self.cell_rect(&self.lay, k - self.top).contains(x, y))
+    }
+
+    /// Веха 166.2 — начать ТАЩИТЬ запись: композитору уезжает путь текстом и подпись под курсор.
+    ///
+    /// Возится ровно то же, что кладётся в буфер обмена, — путь. Значит уронить значок можно и
+    /// в терминал (там он вставится строкой), и в это же окно (перейдём по нему): получателю не
+    /// нужно знать про файловый менеджер ничего.
+    fn start_drag(&mut self, k: usize) {
+        let (Some(store), Some(path)) = (self.store, self.path_of(k)) else { return };
+        let name = path.rsplit('/').next().unwrap_or("").to_string();
+        win::drag(store, win::CLIP_TEXT, path.as_bytes(), &name);
+    }
+
+    /// Веха 166.2 — КОНТЕКСТНОЕ МЕНЮ по правой кнопке.
+    ///
+    /// Пункты собираются по МЕСТУ нажатия: по записи — про неё, по пустому месту — про текущий
+    /// каталог. Меню, в котором половина пунктов серая, ничем не лучше меню, которого нет: серый
+    /// пункт всё равно надо прочесть, чтобы узнать, что он недоступен.
+    fn paint_menu(&mut self, u: &mut Ui, th: &Theme) -> bool {
+        let Some((mx, my, target)) = self.menu else { return false };
+        let font_h = u.font.line_h();
+        let row = font_h + th.px(6);
+        let mut items: Vec<(Act, String)> = Vec::new();
+        match target {
+            Some(k) => {
+                let dir = self.hits.get(k).is_some_and(|&i| self.entries[i].dir);
+                if dir {
+                    items.push((Act::Open, String::from("открыть")));
+                }
+                items.push((Act::Copy, String::from("копировать путь")));
+                items.push((
+                    Act::Delete,
+                    String::from(if self.armed { "удалить? ещё раз" } else { "удалить" }),
+                ));
+            }
+            None => {
+                items.push((Act::Copy, String::from("копировать путь каталога")));
+                items.push((Act::Paste, String::from("вставить путь")));
+                items.push((Act::Refresh, String::from("обновить")));
+            }
+        }
+        let tw = items.iter().map(|(_, t)| u.text_w(t)).max().unwrap_or(0);
+        let w = tw + 4 * th.pad;
+        let h = row * items.len() as i32 + 2 * th.px(4);
+        // У края экрана меню разворачивается ВНУТРЬ: половина меню за краем — это половина меню.
+        let r = Rect::new(
+            mx.min(self.w - w - th.px(4)).max(0),
+            my.min(self.h - h - th.px(4)).max(0),
+            w,
+            h,
+        );
+        u.popup(r);
+        let mut d = r.inset(th.px(4));
+        let mut chosen: Option<Act> = None;
+        for (a, text) in &items {
+            let rr = d.cut_top(row);
+            if u.hot(rr) {
+                let c = u.tint(th.text.with_a(0x14));
+                u.c.rrect(rr, th.radius.min(rr.h / 2), c);
+            }
+            let col = if *a == Act::Delete { th.danger } else { th.text };
+            u.label(rr.inset_xy(th.pad, 0), text, col, Align::Left);
+            if u.clicked(rr) && !self.menu_fresh {
+                chosen = Some(*a);
+            }
+        }
+        // Щелчок мимо меню закрывает его — тот же жест, что закрывает меню оболочки.
+        let outside = u.click().is_some_and(|(cx, cy)| !r.contains(cx, cy));
+        self.menu_fresh = false;
+        if let Some(a) = chosen {
+            // «Удалить» взводится, а не срабатывает: второй щелчок по тому же пункту — согласие.
+            if a == Act::Delete && !self.armed {
+                self.armed = true;
+                return true;
+            }
+            self.armed = false;
+            self.menu = None;
+            self.do_act(a, target);
+            return true;
+        }
+        if outside {
+            self.menu = None;
+            self.armed = false;
+            return true;
+        }
+        false
+    }
+
     /// Держать выбранное в видимом окне.
     fn scroll_to_sel(&mut self, page: usize, cols: usize) {
         if self.sel < self.top {
@@ -558,6 +845,53 @@ impl App {
             self.top = over + (cols.max(1) - over % cols.max(1)) % cols.max(1);
         }
     }
+}
+
+/// Веха 166.2 — **имя в ДВЕ строки**: сколько влезло, остальное на вторую, и только если и там
+/// не помещается — многоточием.
+///
+/// Резать сразу многоточием было проще, но неверно: имена в store длинные и различаются как раз
+/// хвостом (`networking.vv` и `network.vv`), а обрезанные по одной ширине они сливаются в одно.
+/// Перенос показывает на строку больше и режет заметно реже.
+///
+/// Многоточие — ТРИ ТОЧКИ, а не знак `…`: во встроенном шрифте 8×16 его глифа нет, и на экране
+/// он выходит посторонней буквой (уже проверено на кавычках-ёлочках).
+fn wrap2(font: &mut Font, s: &str, w: i32) -> (String, String) {
+    if font.width(s) <= w {
+        return (String::from(s), String::new());
+    }
+    let cut = fit(font, s, w);
+    let (a, b) = s.split_at(cut);
+    if font.width(b) <= w {
+        (String::from(a), String::from(b))
+    } else {
+        (String::from(a), ellipsis(font, b, w))
+    }
+}
+
+/// Байтовый индекс, до которого строка ещё влезает в `w`. Не меньше одного символа: ноль дал бы
+/// пустую строку и вечный перенос одного и того же хвоста.
+fn fit(font: &mut Font, s: &str, w: i32) -> usize {
+    let mut last = 0;
+    for (i, _) in s.char_indices().skip(1) {
+        if font.width(&s[..i]) > w {
+            break;
+        }
+        last = i;
+    }
+    if last == 0 {
+        return s.char_indices().nth(1).map_or(s.len(), |(i, _)| i);
+    }
+    last
+}
+
+/// Хвост, не влезающий даже во вторую строку, — с тремя точками.
+fn ellipsis(font: &mut Font, s: &str, w: i32) -> String {
+    let dots = font.width("...");
+    let cut = fit(font, s, (w - dots).max(0));
+    let mut out = String::from(&s[..cut]);
+    out.push_str("...");
+    out
 }
 
 /// Размер файла человеку: байты, КиБ, МиБ. Точность одна десятая — больше не читается, меньше
@@ -575,7 +909,66 @@ fn size_text(n: usize) -> String {
 impl ui::Client for App {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
         match e {
-            Event::Key { sym: code, ch, down, .. } if down => {
+            Event::Key { sym: code, ch, mods, down } if down => {
+                // Веха 166.2 — буфер обмена С КЛАВИАТУРЫ, теми же аккордами, что везде. Меню
+                // мышью и аккорд клавишами — два входа в одно действие, и второй нужен ровно
+                // потому, что до первого надо дотянуться рукой.
+                if mods & win::modk::CTRL != 0 {
+                    // Какая БУКВА нажата. Спрашивать одно поле нельзя: у печатающей клавиши код
+                    // (`sym`) и есть её знак, а `ch` при зажатом Ctrl приходит то нулём, то
+                    // управляющим кодом (`Ctrl+C` = 0x03) — смотря чем набрано. Терминал живёт
+                    // по тому же правилу: текст берётся только без Ctrl.
+                    let letter = match (code, ch) {
+                        (c, _) if (0x41..=0x5a).contains(&c) => (c as u8) | 0x20,
+                        (c, _) if (0x61..=0x7a).contains(&c) => c as u8,
+                        (_, c) if (0x01..=0x1a).contains(&c) => (c as u8) + 0x60,
+                        (_, c) if (0x41..=0x7a).contains(&c) => (c as u8) | 0x20,
+                        _ => 0,
+                    };
+                    match letter {
+                        b'c' => {
+                            let p = self
+                                .path_of(self.sel)
+                                .filter(|_| self.picked)
+                                .unwrap_or_else(|| self.cwd.clone());
+                            self.flash_clip(&p);
+                            return ui::Scope::All;
+                        }
+                        b'v' => {
+                            self.paste();
+                            return ui::Scope::All;
+                        }
+                        _ => return ui::Scope::No,
+                    }
+                }
+                // Правка пути забирает клавиатуру целиком: набирать в двух местах сразу нельзя,
+                // а «половина букв в путь, половина в поиск» — ровно это и было бы.
+                if let Some(mut text) = self.edit.take() {
+                    match code {
+                        sym::RETURN => {
+                            let t = text.trim().to_string();
+                            self.goto_path(&t);
+                            // Путь не увёл никуда — правку не бросаем: человеку править её же,
+                            // а не набирать заново.
+                            if self.flash.is_some() {
+                                self.edit = Some(t);
+                            }
+                        }
+                        sym::ESCAPE => {}
+                        sym::BACKSPACE => {
+                            text.pop();
+                            self.edit = Some(text);
+                        }
+                        _ => {
+                            match char::from_u32(ch as u32).filter(|c| !c.is_control()) {
+                                Some(c) => text.push(c),
+                                None => {}
+                            }
+                            self.edit = Some(text);
+                        }
+                    }
+                    return ui::Scope::All;
+                }
                 let cols = if self.grid { self.lay.cols as usize } else { 1 };
                 match code {
                     sym::RETURN => {
@@ -624,20 +1017,56 @@ impl ui::Client for App {
                 ui::Scope::All
             }
             Event::Wheel { delta, .. } => {
-                let cols = if self.grid { self.lay.cols as usize } else { 1 };
-                let step = cols.max(1);
+                let step = if self.grid { (self.lay.cols as usize).max(1) } else { 1 };
                 if delta < 0 {
-                    self.top = (self.top + step).min(self.hits.len().saturating_sub(1));
+                    self.top = (self.top + step).min(self.max_top());
                 } else {
                     self.top = self.top.saturating_sub(step);
                 }
                 ui::Scope::All
             }
             Event::Motion { .. } => {
-                let _ = input;
+                // Веха 166.2 — ПЕРЕТАСКИВАНИЕ начинается не с нажатия, а с движения при зажатой
+                // кнопке: иначе каждый щелчок был бы началом перетаскивания, и выбрать значок
+                // мышью стало бы нельзя. Порог в несколько точек — про дрожание руки.
+                if let (Some((px_, py_, k)), Some((x, y))) = (self.press, input.held) {
+                    if !self.dragging && (x - px_).abs() + (y - py_).abs() > 6 {
+                        self.dragging = true;
+                        self.start_drag(k);
+                    }
+                }
                 ui::Scope::All
             }
-            Event::Button { .. } => ui::Scope::All,
+            Event::Button { x, y, buttons, down } => {
+                let (x, y) = (x as i32, y as i32);
+                if !down {
+                    self.press = None;
+                    self.dragging = false;
+                    return ui::Scope::All;
+                }
+                // Правая — КОНТЕКСТНОЕ МЕНЮ. Бит 1, как его кодирует ядро (`SYS_MOUSE_READ`).
+                if buttons & 2 != 0 {
+                    self.menu = Some((x, y, self.entry_at(x, y)));
+                    self.menu_fresh = true;
+                    self.armed = false;
+                    return ui::Scope::All;
+                }
+                // Левая по записи — запомнить точку: с неё может начаться перетаскивание.
+                self.press = self.entry_at(x, y).map(|k| (x, y, k));
+                ui::Scope::All
+            }
+            // Веха 166.2 — в нас УРОНИЛИ. Возят текст, и если это путь — идём по нему: то же
+            // самое, что делает «вставить», и по той же причине.
+            Event::Drop { .. } => {
+                let Some(store) = self.store else { return ui::Scope::No };
+                let mut buf = alloc::vec![0u8; 4096];
+                if let Some((win::CLIP_TEXT, got, _)) = win::drop_read(store, &mut buf) {
+                    let text =
+                        String::from_utf8_lossy(&buf[..got.min(buf.len())]).trim().to_string();
+                    self.goto_path(&text);
+                }
+                ui::Scope::All
+            }
             Event::Resize { w, h } => {
                 self.w = w as i32;
                 self.h = h as i32;
@@ -702,9 +1131,17 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         query: String::new(),
         grid: true,
         err: None,
+        flash: None,
         cut: false,
         marks,
         lay: Lay::default(),
+        edit: None,
+        menu: None,
+        menu_fresh: false,
+        armed: false,
+        store: ui::conf::store_cap(),
+        press: None,
+        dragging: false,
     };
     app.read();
 
