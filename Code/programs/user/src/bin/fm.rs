@@ -132,6 +132,8 @@ struct App {
     flash: Option<String>,
     cut: bool,
     marks: Vec<(String, String)>,
+    /// Текст конфига поколения: из него берутся программы по умолчанию (`default …`).
+    generation: String,
     lay: Lay,
     /// Веха 167 — что правим прямо сейчас и чем. Правка одна на весь менеджер: набирать в двух
     /// местах разом нельзя, а «половина букв в путь, половина в имя» — ровно это и было бы.
@@ -168,6 +170,7 @@ enum Act {
     NewFile,
     Mark,
     Unmark,
+    Term,
 }
 
 /// По чему нажали правой кнопкой.
@@ -802,6 +805,40 @@ impl App {
         }
     }
 
+    /// Программа по умолчанию для роли: строка `default <роль> <имя>` конфига поколения.
+    fn default_app(&self, role: &str) -> Option<String> {
+        void_conf::of(&self.generation, "default")
+            .find(|e| e.key() == role)
+            .map(|e| String::from(e.tail().trim()))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Веха 167 — запустить программу роли `role` над путём `arg`.
+    ///
+    /// Через СТОРОЖА (`run`), как это делает строка запуска: досмотреть запуск может только
+    /// родитель, а менеджер на эту роль не годится — он живёт своей жизнью и ждать чужого кода
+    /// выхода ему нечем ([[launcher]], Веха 147).
+    fn open_with(&mut self, role: &str, arg: &str) {
+        let Some(prog) = self.default_app(role) else {
+            self.flash = Some(alloc::format!("в конфиге нет строки `default {role} …`"));
+            return;
+        };
+        let Some(store) = self.store else {
+            self.flash = Some(String::from("нет права на store — запускать нечем"));
+            return;
+        };
+        let mut a: Vec<u8> = Vec::new();
+        a.extend_from_slice(prog.as_bytes());
+        a.push(0);
+        a.extend_from_slice(arg.as_bytes());
+        a.push(0);
+        if sys::spawn(store, b"run", &a).is_none() {
+            self.flash = Some(alloc::format!("не запустить: {prog}"));
+        } else {
+            self.flash = Some(alloc::format!("{prog}: {arg}"));
+        }
+    }
+
     /// Веха 167 — закладки ЖИВУТ ФАЙЛОМ (`/etc/fm.marks`, по пути на строку).
     ///
     /// Не в конфиге поколения, хотя соблазн был: закладка — не свойство системы, а привычка
@@ -1018,6 +1055,19 @@ impl App {
                     self.drop_mark(k);
                 }
             }
+            // Веха 167 — ОТКРЫТЬ В ТЕРМИНАЛЕ. Какая программа терминал, решает не менеджер, а
+            // конфиг (`default terminal …` в `apps.vv`): «чем открывать» — выбор человека, и
+            // зашивать его в приложение значило бы отобрать этот выбор у него.
+            Act::Term => {
+                let dir = match entry.and_then(|k| self.path_of(k)) {
+                    // По каталогу — в него; по файлу — в его каталог (открыть файл терминалом
+                    // нечем, а показать, где он лежит, — можно).
+                    Some(p) if px::stat(self.ep, p.as_bytes()).is_some_and(|(d, _)| d) => p,
+                    Some(p) => Self::parent(&p),
+                    None => self.cwd.clone(),
+                };
+                self.open_with("terminal", &dir);
+            }
             Act::Delete => {
                 if entry.is_none() {
                     return;
@@ -1195,6 +1245,7 @@ impl App {
                 }
                 items.push((Act::Copy, String::from("копировать путь")));
                 if dir && !many {
+                    items.push((Act::Term, String::from("открыть в терминале")));
                     items.push((Act::Mark, String::from("в закладки")));
                 }
                 items.push((
@@ -1208,6 +1259,7 @@ impl App {
             }
             Tgt::Mark(_) => items.push((Act::Unmark, String::from("убрать закладку"))),
             Tgt::Empty => {
+                items.push((Act::Term, String::from("открыть в терминале")));
                 items.push((Act::NewDir, String::from("создать каталог")));
                 items.push((Act::NewFile, String::from("создать файл")));
                 items.push((Act::Paste, String::from("вставить путь")));
@@ -1593,7 +1645,7 @@ impl ui::Client for App {
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
-    let (_generation, th, mut font) = ui::app::boot();
+    let (generation, th, mut font) = ui::app::boot();
     // Файловый сервер: по имени из окружения, а нет имени — стартовым правом 0, как у шелла.
     let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
     if ep == sys::NO_CAP {
@@ -1630,6 +1682,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         flash: None,
         cut: false,
         marks: Vec::new(),
+        generation,
         lay: Lay::default(),
         edit: None,
         menu: None,

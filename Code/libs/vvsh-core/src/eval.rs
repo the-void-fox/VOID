@@ -448,6 +448,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("desktop", b_desktop),
     ("ui", b_ui),
     ("bar", b_bar),
+    ("default", b_default),
     ("device", b_device),
     ("packages", b_packages),
     ("channel", b_channel),
@@ -686,6 +687,16 @@ fn b_bar(args: &[Value]) -> Result<Value, EvalError> {
 /// Почему вид системы вообще в конфиге: тогда он получает поколения и откат бесплатно
 /// (ADR 0017). Отдельный «файл темы» пришлось бы версионировать руками, и «система откатилась,
 /// а панель осталась чужого цвета» стало бы нормой.
+/// Веха 167 — `(default роль имя)` — ПРОГРАММА ПО УМОЛЧАНИЮ: чем открывать вот такое.
+///
+/// Отдельный вид, а не ключ внутри `desktop`, по тому же правилу, по которому отделены `ui` и
+/// `bar`: `desktop` читает КОМПОЗИТОР (кому раздать права, какие обои), а «чем открывать» —
+/// вопрос любой программы, у которой возникла нужда в чужой. Файловому менеджеру нужен терминал,
+/// редактору — просмотрщик картинок, и никто из них композитору не подчинён.
+fn b_default(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("default", args)
+}
+
 fn b_ui(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("ui", args)
 }
@@ -765,5 +776,5 @@ fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
             "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
-                | "packages" | "channel" | "bar"))
+                | "packages" | "channel" | "bar" | "default"))
 }

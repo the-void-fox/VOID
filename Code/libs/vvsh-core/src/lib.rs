@@ -86,6 +86,20 @@ system(
         assert_eq!(build_config(src).expect("конфиг"), "");
     }
 
+    /// Веха 167 — ПРОГРАММЫ ПО УМОЛЧАНИЮ доезжают до конфига целой строкой, а число полей у
+    /// них проверяет тот же словарь: `(default "terminal")` — опечатка, и падать она обязана на
+    /// `rebuild`, а не молчать в загруженной системе.
+    #[test]
+    fn default_apps_reach_config() {
+        let src = "system([default(\"terminal\", \"term\"), default(\"files\", \"fm\")])";
+        assert_eq!(
+            build_config(src).expect("конфиг"),
+            "default terminal term\ndefault files fm\n"
+        );
+        assert!(build_config("system([default(\"terminal\")])").is_err());
+        assert!(build_config("system([default(\"a\", \"b\", \"c\")])").is_err());
+    }
+
     /// Число полей у `bar` проверяет СЛОВАРЬ видов: опечатка обязана падать на `rebuild`,
     /// а не пропадать молча в загруженной системе.
     #[test]
