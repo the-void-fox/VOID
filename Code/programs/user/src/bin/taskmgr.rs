@@ -60,6 +60,11 @@ const CAP_REC: usize = sys::PROC_CAP_REC; // 12 — запись права
 /// Сколько замеров загрузки помнит график. При обновлении дважды в секунду это минута.
 const HIST: usize = 120;
 
+/// Веха 168.2 — имя движущейся величины у тумблера сети (см. [`ui::Ui::anim`]). Величина одна,
+/// и константа тоже одна: числа, названные прямо в вызове, — это первый шаг к тому, чтобы два
+/// виджета поехали под одним именем.
+const A_NET: u32 = 1;
+
 fn say(s: &str) {
     sys::write_console(s.as_bytes());
 }
@@ -525,7 +530,7 @@ impl App {
             match self.net {
                 Some(on) => {
                     let label = if on { "сеть работает" } else { "сеть выключена" };
-                    if u.toggle(lay.foot_btn, label, if on { 256 } else { 0 }, hot) {
+                    if u.toggle(lay.foot_btn, label, on, hot, A_NET) {
                         self.switch_net(!on);
                         self.net = self.net_on();
                         dirty = true;

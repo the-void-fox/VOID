@@ -310,6 +310,18 @@ const TOAST_NS: u64 = 3_000_000_000;
 /// окна, и радиус окна на ней выглядел бы каплей.
 const TOAST_PAD: i32 = 10;
 const TOAST_RAD: i32 = RADIUS / 2;
+
+/// Веха 168.2 — ВСПЛЫВАШКА: что висит, когда появилась и когда погаснет.
+///
+/// Время появления пришлось запомнить ради движения: до этой вехи всплывашка возникала целиком и
+/// целиком же исчезала. Уведомление — единственное, что система говорит человеку без спроса, и
+/// возникнуть рывком посреди работы для него слишком много.
+#[derive(Clone, Copy)]
+struct Toast {
+    id: u32,
+    at: u64,
+    until: u64,
+}
 /// Сколько байт списка отдаём за раз. Потолок нужен не «на всякий случай»: ответ едет через
 /// приёмный буфер спрашивающего, и то, что в него не влезло, он не увидит вовсе.
 const NOTES_REPLY_MAX: usize = 8 * 1024;
@@ -809,6 +821,7 @@ fn main_loop() -> ! {
         notes: Vec::new(),
         next_note: 1,
         toast: None,
+        toast_box: None,
         dnd: false,
         wins: Vec::new(),
         next_id: 1,
@@ -989,7 +1002,7 @@ fn main_loop() -> ! {
         // ── всплывашка догорела ────────────────────────────────────────────────────────────
         // Гаснет по времени, а не по действию человека: уведомление — это сообщение, а не
         // вопрос, и требовать на него ответа значило бы превратить экран в очередь диалогов.
-        if wm.toast.is_some_and(|(_, until)| sys::monotonic_ns() >= until) {
+        if wm.toast.is_some_and(|t| sys::monotonic_ns() >= t.until) {
             wm.damage_toast();
             wm.toast = None;
         }
@@ -1568,8 +1581,12 @@ struct Wm {
     /// Веха 168 — накопленные УВЕДОМЛЕНИЯ, свежие первыми, и номер для следующего.
     notes: Vec<Note>,
     next_note: u32,
-    /// Какое из них сейчас висит всплывашкой и до какого времени.
-    toast: Option<(u32, u64)>,
+    /// Какое из них сейчас висит всплывашкой.
+    toast: Option<Toast>,
+    /// Веха 168.2 — сколько её ВИДНО на этом кадре. Считается раз за оборот ([`Wm::animate`]), а
+    /// не в строке отрисовки: строке пришлось бы спрашивать время у ядра, то есть делать по
+    /// системному вызову на каждую строку экрана.
+    toast_box: Option<At<Screen>>,
     /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт.
     dnd: bool,
     /// Веха 167 — модификаторы клавиатуры, как их видел последний раз. Уезжают клиенту вместе
@@ -1835,6 +1852,15 @@ impl Wm {
     fn animate(&mut self, now: u64) -> bool {
         let mut moving = false;
         let mut done: Vec<u32> = Vec::new();
+        // Веха 168.2 — всплывашка вытягивается и втягивается сама, без чужого участия. Пока она
+        // в движении, помечаем ВЕСЬ её прямоугольник, а не выросшую полоску: за краем карточки
+        // остаётся то, что было под ней, и стереть его должен тот же кадр.
+        let box_now = self.toast_sheet(now);
+        if box_now != self.toast_box {
+            self.toast_box = box_now;
+            self.damage_toast();
+            moving = true;
+        }
         for i in 0..self.wins.len() {
             let sc = self.scroll_x;
             let was = self.wins[i].place(sc);
@@ -4222,8 +4248,8 @@ impl Wm {
     /// системы, к которым владелец привык, и там же, где стоит колокольчик в панели — глаз
     /// переходит от одного к другому, не ища.
     fn toast_at(&self) -> Option<At<Screen>> {
-        let (id, _) = self.toast?;
-        let n = self.notes.iter().find(|n| n.id == id)?;
+        let t = self.toast?;
+        let n = self.notes.iter().find(|n| n.id == t.id)?;
         let gw = sys::glyph::W as i32;
         let gh = sys::glyph::H as i32;
         let chars = n.title.chars().count().max(n.text.chars().count()).max(8) as i32;
@@ -4241,6 +4267,33 @@ impl Wm {
         }
     }
 
+    /// Веха 168.2 — насколько всплывашка ВЫТЯНУЛАСЬ (0..256).
+    ///
+    /// Одна формула на приход и уход: берётся меньшее из «сколько прошло от появления» и
+    /// «сколько осталось до конца». Заведи мы два счёта — они разошлись бы сроками, и
+    /// уведомление уходило бы не так, как пришло.
+    ///
+    /// Движение то же самое, что у полотен панели: карточка ВЫТЯГИВАЕТСЯ из своего верхнего
+    /// края, а не проявляется. Проявление здесь было бы вдвойне неуместно — оно говорит «поверх
+    /// экрана легло второе окно», а всплывашка окном как раз не является.
+    fn toast_t(&self, now: u64) -> u32 {
+        let Some(t) = self.toast else { return 0 };
+        let d = self.anim * D_OPEN / 100 * 1_000_000;
+        if d == 0 {
+            return 256;
+        }
+        let came = (now.saturating_sub(t.at) * 1024 / d).min(1024) as i32;
+        let left = (t.until.saturating_sub(now) * 1024 / d).min(1024) as i32;
+        (ease_out(came.min(left)) / 4).clamp(0, 256) as u32
+    }
+
+    /// Сколько всплывашки видно СЕЙЧАС: полный прямоугольник, поджатый по высоте.
+    fn toast_sheet(&self, now: u64) -> Option<At<Screen>> {
+        let b = self.toast_at()?.rect();
+        let h = b.h * self.toast_t(now) as i32 / 256;
+        (h > 0).then(|| At::new(b.x, b.y, b.w, h))
+    }
+
     /// Веха 168 — ВСПЛЫВАШКА строкой, как курсор и ярлык: пиксель экрана пишется ровно один раз
     /// за кадр.
     ///
@@ -4249,10 +4302,10 @@ impl Wm {
     /// ЗАГОЛОВКА, а не рамка вокруг: рамка кричит всей формой, а форма у всех уведомлений
     /// одна, и менять её значило бы делать важное другой сущностью.
     fn draw_toast_row(&self, out: &mut [u32], yy: i32, x0: i32, x1: i32) {
-        let (Some(t), Some(b)) = (self.toast, self.toast_at()) else {
+        let (Some(t), Some(b)) = (self.toast, self.toast_box) else {
             return;
         };
-        let Some(n) = self.notes.iter().find(|n| n.id == t.0) else {
+        let Some(n) = self.notes.iter().find(|n| n.id == t.id) else {
             return;
         };
         let r = b.rect();
@@ -4261,7 +4314,9 @@ impl Wm {
             return;
         }
         let bg = tri(self.th.bg);
-        let rad = TOAST_RAD;
+        // Скругление не крупнее половины того, что видно: на первых кадрах карточка ниже своего
+        // угла, и радиус «как задумано» вывернул бы форму наизнанку.
+        let rad = TOAST_RAD.min(r.h / 2);
         let corner = ry < rad || r.h - 1 - ry < rad;
         for xx in r.x.max(x0)..r.right().min(x1) {
             // Скругление — тем же знаковым расстоянием, что у окон: две формулы «где угол»
@@ -4394,7 +4449,7 @@ impl Wm {
             .filter_map(|w| w.wait_until)
             // Веха 168 — срок ВСПЛЫВАШКИ здесь же: она гаснет сама, и «раз в 200 мс» ей не
             // годится — человек увидел бы, как она держится лишнюю пятую секунды.
-            .chain(self.toast.map(|(_, until)| until))
+            .chain(self.toast.map(|t| t.until))
             .map(|d| d.max(now))
             .min()
     }
@@ -5313,7 +5368,8 @@ impl Wm {
                 // «Не беспокоить» гасит ВСПЛЫВАШКУ, а не уведомление: счёт идёт, колокольчик
                 // считает, человек прочтёт когда захочет.
                 if !self.dnd {
-                    self.toast = Some((id, sys::monotonic_ns() + TOAST_NS));
+                    let now = sys::monotonic_ns();
+                    self.toast = Some(Toast { id, at: now, until: now + TOAST_NS });
                     self.damage_toast();
                 }
                 sys::reply(m.reply_cap, &[1]);
@@ -5351,7 +5407,7 @@ impl Wm {
                     self.notes.retain(|n| n.id != id);
                 }
                 // Ушедшее уведомление не должно остаться всплывашкой на экране.
-                if self.toast.is_some_and(|(t, _)| id == 0 || t == id) {
+                if self.toast.is_some_and(|t| id == 0 || t.id == id) {
                     self.damage_toast();
                     self.toast = None;
                 }

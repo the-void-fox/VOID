@@ -178,6 +178,8 @@ pub fn run(surf: &mut Window, th: &Theme, font: &mut Font, c: &mut impl Client) 
     let mut input = Input::default();
     // Первый кадр — всегда целиком: до него в буфере нет ничего.
     let mut scope = Scope::All;
+    // Веха 168.2 — часы движения ВИДЖЕТОВ: заводит их цикл, а не программа (см. [`Ui::anim`]).
+    let mut mo = super::Motion::new(super::anim::default_ms());
 
     loop {
         if !scope.is_none() {
@@ -186,8 +188,9 @@ pub fn run(surf: &mut Window, th: &Theme, font: &mut Font, c: &mut impl Client) 
                 // быть тем самым, а не прошлым.
                 scope = scope.union(c.before(surf));
                 let (w, h) = (surf.width as i32, surf.height as i32);
+                mo.begin(sys::monotonic_ns());
                 let more = {
-                    let mut u = Ui::new(surf.pixels(), w, h, th, font);
+                    let mut u = Ui::new(surf.pixels(), w, h, th, font, &mut mo);
                     if let Scope::Part(r) = scope {
                         u.clip(r);
                     }
@@ -217,12 +220,36 @@ pub fn run(surf: &mut Window, th: &Theme, font: &mut Font, c: &mut impl Client) 
 
         // Спим до события, а если программа назвала срок — до срока. Событие композитора будит
         // раньше, и это ровно то, чего мы ждём.
-        let first = match c.wake() {
+        //
+        // Веха 168.2 — а если едет ВИДЖЕТ, срок называем мы сами, и программу об этом не
+        // спрашиваем: она о движении внутри тумблера не знает и знать не должна. Кадр движения
+        // просим целиком (`Scope::All`) — виджет обязан стереть за собой прошлое положение, а
+        // чем оно закрашивается, знает только программа: у окна это её фон, у слоя прозрачность.
+        let moving = mo.moving();
+        let want = c.wake();
+        let frame = super::anim::FRAME_MS;
+        // Чей срок вышел — программы или движения? Это не педантизм: [`Client::tick`] у иной
+        // программы стоит дорого (диспетчер задач перечитывает список процессов, а загрузка у
+        // него считается РАЗНИЦЕЙ двух замеров). Спроси мы его шестьдесят раз в секунду ради
+        // ползущего тумблера — и числа поехали бы вместе с ним.
+        let anim_frame = moving && want.is_none_or(|ms| frame < ms);
+        let due = match (want, moving) {
+            (Some(ms), true) => Some(ms.min(frame)),
+            (Some(ms), false) => Some(ms),
+            (None, true) => Some(frame),
+            (None, false) => None,
+        };
+        let first = match due {
             Some(ms) => match surf.next_event_timeout(ms) {
                 Some(e) => Some(e),
                 // Срок вышел: спрашиваем программу и идём рисовать, не заходя в разбор событий.
                 None => {
-                    scope = scope.union(c.tick());
+                    if !anim_frame {
+                        scope = scope.union(c.tick());
+                    }
+                    if moving {
+                        scope = scope.union(Scope::All);
+                    }
                     continue;
                 }
             },
@@ -300,6 +327,10 @@ pub fn boot() -> (String, Theme, Font) {
     let generation = super::conf::generation().unwrap_or_default();
     let th = Theme::from_config(&generation);
     let font = Font::load(th.font.as_deref(), th.font_px);
+    // Веха 168.2 — срок движения запоминается ЗДЕСЬ, один раз на программу: тащить его через
+    // подписи до самого тумблера значило бы просить каждого клиента помнить про анимацию — то
+    // самое, от чего эта веха и уходит.
+    super::anim::set_default_ms(super::anim::duration_from_config(&generation));
     (generation, th, font)
 }
 

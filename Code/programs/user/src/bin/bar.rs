@@ -281,6 +281,10 @@ const A_SYS: u32 = 6;
 const A_POWER: u32 = 9;
 /// Веха 168 — подсветка колокольчика.
 const A_NOTES: u32 = 10;
+/// Веха 168.2 — сколько ОСТАЛОСЬ от уходящего уведомления (256 — целое, 0 — ушло совсем).
+/// Величина одна на всё полотно: убирают их по одному, а «очистить» убирает сразу все — и в
+/// обоих случаях это одно движение, а не шесть независимых.
+const A_NOTE_GO: u32 = 11;
 /// Подсветка пилюль столов: `A_PILL + номер стола`.
 const A_PILL: u32 = 16;
 
@@ -347,6 +351,16 @@ struct Bar {
     /// уезжает, `open` уже `None`, а рисовать надо то же самое — иначе меню на прощание
     /// подменяет содержимое.
     showing: Menu,
+    /// Веха 168.2 — какое полотно откроется, КОГДА ВТЯНЕТСЯ нынешнее.
+    ///
+    /// Переезд между полотнами обязан идти через полосу: они разной высоты и с разным
+    /// содержимым, и подмена на месте читается как «полотно моргнуло», а не «панель показала
+    /// другое». `Menu::None` — никто не ждёт.
+    pending: Menu,
+    /// Веха 168.2 — какое уведомление УХОДИТ: `Some(id)` — одно, `Some(0)` — все (то же число,
+    /// каким «убрать всё» называет себя в протоколе). Пока оно уходит, список ещё прежний:
+    /// убрать запись у композитора и увидеть, как она складывается, — разные моменты.
+    dying: Option<u32>,
     /// Подпись СОДЕРЖИМОГО меню прошлого кадра — без доли выезда. Ею кадр отличает «меню едет»
     /// от «в меню изменилось написанное»: первое стоит одной полоски, второе — всего полотна.
     card_body: u64,
@@ -543,6 +557,8 @@ impl Bar {
             notes_buf: Vec::new(),
             dnd: false,
             showing: Menu::None,
+            pending: Menu::None,
+            dying: None,
             card_body: 0,
             confirm: false,
             gen: ui::conf::generation_name().unwrap_or_else(|| "VOID".to_string()),
@@ -587,8 +603,12 @@ impl Bar {
     }
 
     /// Нужна ли сейчас полноэкранная поверхность: меню открыто ИЛИ ещё доигрывает закрытие.
+    ///
+    /// Веха 168.2 — и ЖДЁТ СВОЕЙ ОЧЕРЕДИ. Без `pending` переезд между полотнами отдавал бы
+    /// буфер посреди движения и тут же просил обратно: два `OP_REBUF` подряд, между которыми
+    /// панель на кадр пустая.
     fn want_grown(&self) -> bool {
-        self.open != Menu::None || self.mo.peek(A_MENU) > 0
+        self.open != Menu::None || self.pending != Menu::None || self.mo.peek(A_MENU) > 0
     }
 
     /// Спросить композитор: стол, сколько столов, раскладка, обзор, заголовок окна в фокусе.
@@ -665,34 +685,72 @@ impl Bar {
         if let Some(want) = core::mem::take(&mut self.toggle) {
             // Нажали на то же — закрыли; на другое — переехали. Два открытых полотна сразу
             // человеку пришлось бы различать по содержимому, а не по тому, куда он нажал.
-            self.open = if self.open == want { Menu::None } else { want };
-            if self.open != Menu::None {
-                self.showing = self.open;
+            self.pending = Menu::None;
+            if self.open == want {
+                self.open = Menu::None;
+            } else if self.open == Menu::None {
+                self.open = want;
+                self.showing = want;
+                self.fill_menu(want);
+            } else {
+                // Веха 168.2 — ПЕРЕЕЗД идёт через полосу: нынешнее втягивается, и только потом
+                // вытягивается новое. Раньше содержимое подменялось на месте, и переход между
+                // меню оболочки и уведомлениями был единственным движением панели, которого
+                // не было вовсе, — полотно просто становилось другим.
+                self.open = Menu::None;
+                self.pending = want;
             }
-            match self.open {
-                Menu::Shell => {
-                    // Сведения собираются в момент ОТКРЫТИЯ: держать их свежими постоянно
-                    // значило бы ходить в store каждую минуту ради того, на что никто не смотрит.
-                    self.roots = store_roots();
-                    self.confirm = false;
-                    self.load_avatar();
-                }
-                // Список тоже читается при открытии — по той же причине.
-                Menu::Notes => {
-                    let mut buf = alloc::vec![0u8; 8 * 1024];
-                    let n = sys::win::notes_read(&mut buf);
-                    buf.truncate(n);
-                    self.notes_buf = buf;
-                }
-                Menu::None => {}
-            }
+            return true;
+        }
+        // Полотно втянулось — можно вытягивать то, которое этого ждало.
+        if self.pending != Menu::None && self.mo.peek(A_MENU) == 0 {
+            let want = core::mem::replace(&mut self.pending, Menu::None);
+            self.open = want;
+            self.showing = want;
+            self.fill_menu(want);
+            return true;
+        }
+        // Веха 168.2 — уведомление сложилось: вот теперь его можно убрать у композитора.
+        // Раньше, до движения, оно исчезало в момент щелчка — и соседи прыгали на его место.
+        if self.dying.is_some() && self.mo.peek(A_NOTE_GO) == 0 {
+            let id = self.dying.take().unwrap_or(0);
+            win::note_drop(id);
+            let mut buf = alloc::vec![0u8; 8 * 1024];
+            let n = win::notes_read(&mut buf);
+            buf.truncate(n);
+            self.notes_buf = buf;
+            self.mo.set(A_NOTE_GO, 256);
             return true;
         }
         core::mem::take(&mut self.again)
     }
 
+    /// Веха 168.2 — набрать то, что покажет полотно. Собирается в момент ОТКРЫТИЯ: держать
+    /// свежим постоянно значило бы ходить в store каждую минуту ради того, на что никто не
+    /// смотрит.
+    fn fill_menu(&mut self, m: Menu) {
+        match m {
+            Menu::Shell => {
+                self.roots = store_roots();
+                self.confirm = false;
+                self.load_avatar();
+            }
+            Menu::Notes => {
+                let mut buf = alloc::vec![0u8; 8 * 1024];
+                let n = win::notes_read(&mut buf);
+                buf.truncate(n);
+                self.notes_buf = buf;
+            }
+            Menu::None => {}
+        }
+    }
+
     fn paint(&mut self, u: &mut Ui) {
         self.mo.begin(sys::monotonic_ns());
+        // Веха 168.2 — уходящее уведомление двигаем ПЕРВЫМ делом: от него зависит высота всего
+        // полотна ([`Bar::card_rect`]), а высота нужна до первого касания холста. Спроси её
+        // позже — полотно ехало бы на кадр позади собственного содержимого.
+        self.mo.val(A_NOTE_GO, if self.dying.is_some() { 0 } else { 256 });
         let confirm_was = self.confirm;
         let (th, click) = (u.th.clone(), u.click());
         let th = &th;
@@ -871,6 +929,10 @@ impl Bar {
             self.dnd as u64,
             self.notes_buf.len() as u64,
             sig(&self.notes_buf.iter().map(|&b| b as u64).collect::<Vec<_>>()),
+            // Веха 168.2 — уходящее уведомление меняет НАПИСАННОЕ, а не только край полотна:
+            // соседи под ним съезжают вверх. Без этой строки кадр считал бы движение за выезд и
+            // трогал одну полоску у низа, оставляя список нарисованным по-старому.
+            self.mo.peek(A_NOTE_GO) as u64,
             self.confirm as u64,
             self.space as u64,
             self.spaces as u64,
@@ -1212,7 +1274,7 @@ impl Bar {
         let mut dnd_click = false;
 
         // ── шапка: знак, «Уведомления», не беспокоить и очистить ───────────────────────────
-        let head = d.cut_top(font_h + 2 * pad);
+        let head = d.cut_top(Self::notes_head(&*u.font, pad, th));
         d.cut_top(m);
         u.card(head);
         let mut h = head.inset(pad);
@@ -1221,7 +1283,7 @@ impl Bar {
         h.cut_left(th.px(4));
         // Две кнопки справа: «не беспокоить» и «убрать все». Знаками, а не словами — так в
         // макете, и слова здесь заняли бы всю шапку целиком.
-        let btn = font_h + th.px(4);
+        let btn = Self::notes_btn(&*u.font, th);
         let clear = h.cut_right(btn);
         h.cut_right(th.px(2));
         let quiet = h.cut_right(btn);
@@ -1238,7 +1300,7 @@ impl Bar {
             dnd_click = true;
         }
         let ch = hot(u, clear);
-        if u.icon_button(clear, ui::icon::TRASH, ch, true) {
+        if u.icon_button(clear, ui::icon::TRASH, ch, true) && self.dying.is_none() {
             drop_id = Some(0);
         }
 
@@ -1259,17 +1321,33 @@ impl Bar {
                 Align::Center,
             );
         }
-        let note_h = 2 * font_h + 2 * pad;
+        let note_h = Self::note_h(&*u.font, pad);
+        // Веха 168.2 — сколько осталось от уходящего. Складывается сама карточка, а соседи
+        // съезжают следом сами собой: они режутся от того же `d`, что и она.
+        let go = self.mo.peek(A_NOTE_GO).clamp(0, 256);
         let mut shown = 0usize;
         for n in win::notes(&buf) {
-            if shown >= Self::NOTES_SHOWN || d.h < note_h {
+            if shown >= Self::NOTES_SHOWN {
                 break;
             }
+            let leaving = matches!(self.dying, Some(id) if id == 0 || id == n.id);
+            let rh = if leaving { note_h * go / 256 } else { note_h };
+            if d.h < rh || rh <= 0 {
+                // Сложилось до нуля — карточки больше нет; место под ней уже отдано соседям.
+                if leaving {
+                    shown += 1;
+                }
+                continue;
+            }
             shown += 1;
-            let r = d.cut_top(note_h);
-            d.cut_top(m);
+            let r = d.cut_top(rh);
+            d.cut_top(m * rh / note_h);
             u.card(r);
-            let mut c = r.inset(pad);
+            // Содержимое режется КАРТОЧКОЙ: текст, уезжающий вместе с её краем, читался бы как
+            // второе движение внутри первого — то же правило, что у выезда полотна.
+            let keep = u.c.clip();
+            u.clip(keep.intersect(r));
+            let mut c = Rect::new(r.x, r.y, r.w, note_h).inset(pad);
             let x = c.cut_right(font_h);
             let title = String::from_utf8_lossy(n.title);
             let from = String::from_utf8_lossy(n.from);
@@ -1286,9 +1364,10 @@ impl Bar {
             };
             u.label(Rect::new(c.x, c.y + font_h, c.w, font_h), &sub, th.muted, Align::Left);
             let hot = if u.hot(x) { 256 } else { 0 };
-            if u.icon_button(x, ui::icon::CLOSE, hot, false) {
+            if u.icon_button(x, ui::icon::CLOSE, hot, false) && self.dying.is_none() {
                 drop_id = Some(n.id);
             }
+            u.clip(keep);
         }
         self.notes_buf = buf;
         // Сколько не поместилось — вслух: молча спрятанный хвост списка это ровно та ложь,
@@ -1303,12 +1382,11 @@ impl Bar {
             self.dnd = now;
             self.again = true;
         }
+        // Веха 168.2 — щелчок НЕ убирает уведомление, а отправляет его складываться: убирает его
+        // [`Bar::act`], когда от карточки ничего не осталось. Иначе соседи прыгали на её место в
+        // тот же кадр, и «убрал одно» выглядело как «список дёрнулся».
         if let Some(id) = drop_id {
-            win::note_drop(id);
-            let mut nb = alloc::vec![0u8; 8 * 1024];
-            let n = win::notes_read(&mut nb);
-            nb.truncate(n);
-            self.notes_buf = nb;
+            self.dying = Some(id);
             self.again = true;
         }
     }
@@ -1316,6 +1394,23 @@ impl Bar {
     /// Сколько уведомлений показываем разом. Больше — полотно перестаёт помещаться на экран
     /// ноутбука, а история всё равно не читается «вся»: человек смотрит последние.
     const NOTES_SHOWN: usize = 6;
+
+    /// Веха 168.2 — высота карточки уведомления и высота шапки полотна. ОДИН расчёт на всех:
+    /// высоту полотна считает [`Bar::card_rect`], а карточки режет [`Bar::draw_notes`], и два
+    /// ответа на «сколько это в точках» разъехались бы на первой же правке размера.
+    fn note_h(font: &Font, pad: i32) -> i32 {
+        2 * font.line_h() + 2 * pad + 6
+    }
+
+    fn notes_head(font: &Font, pad: i32, th: &Theme) -> i32 {
+        font.line_h() + 2 * pad + th.px(6)
+    }
+
+    /// Сторона кнопки-знака в шапке полотна. Крупнее строки: по просьбе владельца знаки должны
+    /// быть кнопками, в которые целятся мышью, а не значками рядом с надписью.
+    fn notes_btn(font: &Font, th: &Theme) -> i32 {
+        font.line_h() + th.px(10)
+    }
 
     /// Сколько строк в коробке сведений. Число живёт одним местом: по нему считается и высота
     /// карточки, и то, что в неё влезает.
@@ -1354,12 +1449,27 @@ impl Bar {
         if self.showing == Menu::Notes {
             // Меры сняты с макета (`ScreanNotificationMenuOpen`): полотно 206 при экране 1280,
             // шапка 35, тело 156 — то есть шапка в строку с полями, а тело под то, что есть.
-            let w = th.px(280).min(self.sw - th.px(20));
+            //
+            // Веха 168.2 — по просьбе владельца полотно и кнопки в нём КРУПНЕЕ: в уведомлении
+            // живой текст, а не пара «подпись — значение», и на 280 точках он обрывался на
+            // половине фразы. Пропорции макета при этом целы — вырос масштаб, а не раскладка.
+            let w = th.px(340).min(self.sw - th.px(20));
             let n = win::notes(&self.notes_buf).count().min(Self::NOTES_SHOWN);
-            let note_h = 2 * font.line_h() + 2 * pad;
-            let head = font.line_h() + 2 * pad;
+            let note_h = Self::note_h(font, pad);
+            let head = Self::notes_head(font, pad, th);
+            let empty = 3 * font.line_h() + 2 * pad;
             // Пусто — тело в одну карточку со знаком и подписью, как в макете.
-            let body = if n == 0 { 3 * font.line_h() + 2 * pad } else { n as i32 * (note_h + m) - m };
+            let full = |k: usize| if k == 0 { empty } else { k as i32 * (note_h + m) - m };
+            // Уходящее уведомление тянет высоту за собой: полотно складывается ВМЕСТЕ с ним, а
+            // не прыгает в новый размер, когда оно уже исчезло.
+            let body = match self.dying {
+                None => full(n),
+                Some(id) => {
+                    let after = full(if id == 0 { 0 } else { n.saturating_sub(1) });
+                    let go = self.mo.peek(A_NOTE_GO).clamp(0, 256);
+                    after + (full(n) - after) * go / 256
+                }
+            };
             let h = 2 * m + head + m + body;
             return Rect::new(self.sw - w, self.strip, w, h);
         }
