@@ -75,7 +75,13 @@ pub fn on_tick() {
 ///
 /// Толкаем только СПЯЩЕЕ ядро ([`crate::cpu::wake_if_idle`]): занятому оно и так по пути.
 fn poke_boot_core_on_input() {
-    if crate::cpu::id() != 0 && (arch::console_has_input() || arch::key_pending() || arch::mouse_pending()) {
+    // Порядок проверок — от самой дешёвой: свой номер (арифметика над `sp`), потом одна
+    // атомарная загрузка маски спящих, и только потом три кольца. Тик приходит десятки раз в
+    // секунду на каждом ядре, и лишняя работа здесь платится всё время.
+    if crate::cpu::id() == 0 || !crate::cpu::any_idle() {
+        return;
+    }
+    if arch::console_has_input() || arch::key_pending() || arch::mouse_pending() {
         crate::cpu::wake_if_idle(0);
     }
 }

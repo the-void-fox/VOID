@@ -92,6 +92,11 @@ impl<T> SpinLock<T> {
     }
 
     /// Крутиться, пока не удастся взять замок.
+    ///
+    /// Веха 170.6 — ждём ЧТЕНИЕМ, а обменом только пробуем. Атомарный обмен требует строку кэша в
+    /// исключительное владение, то есть отнимает её у того, кто замок держит и в этот момент
+    /// работает: ожидающий замедляет ровно того, кого ждёт. Пока ядро было одно, разницы не было
+    /// вовсе — за замок никто не соперничал.
     #[inline]
     fn spin(&self) {
         while self
@@ -99,7 +104,9 @@ impl<T> SpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
         }
     }
 }
