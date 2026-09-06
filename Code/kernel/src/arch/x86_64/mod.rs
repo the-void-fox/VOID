@@ -47,7 +47,7 @@ pub use pci::intx_irq_setup;
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Веха 170 — многоядерность: сколько ядер у машины, сколько поднято и как их поднять.
-pub use smp::{cpu_count, cpus_up, start_aps};
+pub use smp::{cpu_count, cpus_up, start_aps, wake_cpu, MAX_CPUS};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
 pub const ARCH_NAME: &str = "x86_64";
@@ -649,6 +649,17 @@ pub fn console_getc() -> Option<u8> {
 
 // ─── прерывания ─────────────────────────────────────────────────────────────
 
+/// Веха 170 — указатель стека. По нему ядро узнаёт, какое оно ([`crate::cpu`]): стеки лежат
+/// одним массивом с блоком на ядро, и номер блока — это номер ядра.
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mov {0}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    sp
+}
+
 /// Выключить прерывания, вернув прежнее состояние rflags.IF.
 pub fn irq_save_disable() -> bool {
     let rflags: usize;
@@ -865,6 +876,13 @@ pub fn flush_tlb() {
             options(nostack),
         );
     }
+}
+
+/// Веха 170 — корень таблиц ЯДРА как токен пространства: на него переезжает ядро, которому
+/// нечего исполнять. Держать в CR3/satp пространство чужой группы, ничего в нём не исполняя,
+/// значит запрещать её освобождение — а именно этим ядро и занято, пока спит.
+pub fn kernel_space_root() -> usize {
+    paging::kernel_root()
 }
 
 /// Токен адресного пространства — на x86 это значение CR3 (низ = флаги, нулевые).

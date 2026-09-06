@@ -69,6 +69,7 @@ TRAP_STUB 33, 0                     # консоль: IOAPIC GSI4 (Веха 27)
 TRAP_STUB 34, 0                     # диск: MSI-X virtio-blk (Веха 27)
 TRAP_STUB 35, 0                     # userspace-драйвер: IOAPIC IRQ устройства (Веха 52)
 TRAP_STUB 36, 0                     # Веха 91: MSI-X приёма virtio-net
+TRAP_STUB 37, 0                     # Веха 170: побудка ядра (IPI) — обработчик пустой
 TRAP_STUB 255, 0                    # spurious
 TRAP_STUB 128, 0                    # int 0x80 — syscall (шлюз DPL=3, Веха 26)
 
@@ -109,7 +110,7 @@ trap_common:
     add rsp, 16                     # vector + err
     iretq
 
-# Таблица адресов стабов для заполнения IDT из Rust ([0..=36] + spurious + syscall).
+# Таблица адресов стабов для заполнения IDT из Rust ([0..=37] + spurious + syscall).
 .section .rodata
 .align 8
 .global TRAP_STUBS
@@ -151,5 +152,6 @@ TRAP_STUBS:
     .quad trap_stub_34
     .quad trap_stub_35
     .quad trap_stub_36
+    .quad trap_stub_37
     .quad trap_stub_255
     .quad trap_stub_128

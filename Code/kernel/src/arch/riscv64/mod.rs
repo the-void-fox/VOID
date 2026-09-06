@@ -391,6 +391,13 @@ pub const MAP_WC: usize = 0;
 pub const MAP_SHARED: usize = paging::PTE_SHARED;
 
 /// Построить таблицы ядра (direct map RAM + MMIO, W^X) и вернуть корень.
+/// Веха 170 — корень таблиц ЯДРА как токен пространства: на него переезжает ядро, которому
+/// нечего исполнять. Держать в CR3/satp пространство чужой группы, ничего в нём не исполняя,
+/// значит запрещать её освобождение — а именно этим ядро и занято, пока спит.
+pub fn kernel_space_root() -> usize {
+    paging::kernel_root()
+}
+
 pub fn mm_init() -> usize {
     paging::init()
 }
@@ -524,6 +531,22 @@ pub fn platform_init(_hartid: usize, dtb: usize) {
 
 /// Сколько хартов перечислил device tree (0 — DTB не разобрался).
 static HARTS: AtomicUsize = AtomicUsize::new(1);
+
+/// Веха 170 — на скольких хартах ЯДРО умеет работать. На riscv пока один, и это число здесь не
+/// заглушка: по нему [`crate::cpu`] отводит стеки и решает, спрашивать ли вообще «какое я ядро».
+pub const MAX_CPUS: usize = 1;
+
+/// Веха 170 — разбудить ядро `i`. Прикладных хартов на riscv пока нет, будить некого.
+pub fn wake_cpu(_i: usize) {}
+
+/// Веха 170 — указатель стека (см. [`crate::cpu`]). На однопроцессорной сборке им никто не
+/// пользуется, но контракт арха один на обе архитектуры.
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    let sp: usize;
+    unsafe { core::arch::asm!("mv {0}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    sp
+}
 
 /// Веха 170 — ядер (хартов) у машины.
 pub fn cpu_count() -> usize {

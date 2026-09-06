@@ -22,9 +22,9 @@ use crate::println;
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
 extern "C" {
-    /// Таблица адресов стабов: [0..=35] — вектора 0–35 (исключения + таймер +
-    /// консоль + диск + userspace-драйвер), [36] — spurious (0xFF), [37] — syscall (0x80).
-    static TRAP_STUBS: [usize; 39];
+    /// Таблица адресов стабов: [0..=37] — вектора 0–37 (исключения + таймер + консоль + диск +
+    /// userspace-драйвер + сеть + побудка), [38] — spurious (0xFF), [39] — syscall (0x80).
+    static TRAP_STUBS: [usize; 40];
 }
 
 /// Вектор LAPIC-таймера (первый свободный после 32 исключений).
@@ -44,6 +44,14 @@ pub const VEC_USERDRV: u8 = 35;
 /// Веха 91 — вектор прерывания ПРИЁМА сетевой карты (MSI-X virtio-net): сетевой сервер спит,
 /// пока карта молчит, и просыпается ровно от кадра.
 pub const VEC_NET: u8 = 36;
+
+/// Веха 170 — **побудка ядра**: межпроцессорное прерывание, у которого нет работы.
+///
+/// Спящее ядро стоит в `hlt`, и разбудить его можно только прерыванием. Всё, что этому вектору
+/// нужно сделать, — случиться: `hlt` вернёт управление, и ядро само посмотрит, не появилось ли
+/// кого исполнять. Обработчик поэтому пустой (одно подтверждение LAPIC), и это не заглушка —
+/// содержательная работа здесь была бы дублированием того, что ядро сделает следующей строкой.
+pub const VEC_WAKE: u8 = 37;
 
 /// Снимок состояния процессора на момент trap'а. Раскладка = порядок push'ей в
 /// trap_entry.s (адреса растут к концу структуры; регистры — в порядке r15..rax).
@@ -268,11 +276,11 @@ pub fn init() {
     unsafe {
         // Веха 91: вектор 36 — MSI-X приёма сети. Шлюз ему обязателен: прерывание на вектор
         // без шлюза не «игнорируется», а убивает машину (в первом заходе — паника и зависание).
-        for v in 0..=36 {
+        for v in 0..=37 {
             IDT[v] = IdtEntry::gate(TRAP_STUBS[v]);
         }
-        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[37]);
-        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[38]);
+        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[38]);
+        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[39]);
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
@@ -333,25 +341,40 @@ fn classify_user(frame: &TrapFrame) -> UserTrap {
 /// trap, rip уже за инструкцией), остальное — фатальный дамп.
 #[no_mangle]
 extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
+    // Веха 170 — два вектора обслуживаются ДО большого замка, потому что им нечего защищать.
+    match frame.vector as u8 {
+        VEC_SPURIOUS => return, // spurious: без EOI по спецификации
+        // Побудка: вся её работа — случиться. Ядро проснулось из `hlt`, дальше оно само
+        // посмотрит, кого исполнять. Брать здесь замок значило бы ждать на нём в обработчике
+        // прерывания — то есть с запрещёнными прерываниями и на чужом стеке.
+        VEC_WAKE => {
+            lapic::eoi();
+            return;
+        }
+        _ => {}
+    }
+    // Дальше — общее состояние ядра, и в него входит одно ядро за раз (см. `crate::cpu`).
+    // `mine` ложно только при ВЛОЖЕННОМ входе, то есть при исключении в самом ядре: замок уже
+    // наш, отпускать его здесь нельзя, а дойти до аварийного дампа надо.
+    let mine = crate::cpu::lock();
     // Прерывания устройств (Веха 27) обрабатываются НЕЗАВИСИМО от кольца: стаб
     // полностью сохранил кадр и вернёт его iretq'ом — короткая работа + EOI, и
     // прерванное (хоть ядро, хоть ring3-процесс) продолжится, как ни в чём не бывало.
-    match frame.vector as u8 {
-        VEC_SPURIOUS => return, // spurious: без EOI по спецификации
+    let done = match frame.vector as u8 {
         VEC_CONSOLE => {
             super::console_drain();
             lapic::eoi();
-            return;
+            true
         }
         VEC_BLK => {
             crate::virtio_blk::on_irq();
             lapic::eoi();
-            return;
+            true
         }
         VEC_NET => {
             crate::virtio_net::on_irq(); // Веха 91: приехал кадр — разбудить сетевой сервер
             lapic::eoi();
-            return;
+            true
         }
         VEC_USERDRV => {
             // Веха 52 — IRQ устройства userspace-драйвера. Сперва ЗАМАСКИРОВАТЬ линию (oneshot):
@@ -362,11 +385,19 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
             super::ioapic::set_userdrv_masked(true);
             crate::proc::on_userdrv_irq();
             lapic::eoi();
-            return;
+            true
         }
-        _ => {}
+        _ => false,
+    };
+    if done {
+        if mine {
+            crate::cpu::unlock();
+        }
+        return;
     }
     if frame.cs & 3 == 3 {
+        // Отсюда не возвращаются: управление уйдёт в процесс через `iretq`, а замок отпустит
+        // `proc::resume` — ровно перед входом в кольцо 3. Иначе его отпускать было бы негде.
         let trap = classify_user(frame);
         crate::proc::handle_user_trap(frame, trap);
     }
@@ -377,6 +408,9 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
         }
         3 => println!("  [trap] breakpoint @ {:#x} → продолжаем", frame.rip),
         _ => fatal(frame),
+    }
+    if mine {
+        crate::cpu::unlock();
     }
 }
 

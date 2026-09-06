@@ -848,7 +848,12 @@ impl Store {
             .map(|id| {
                 let o = &self.objects[id];
                 match (&o.data, o.disk) {
-                    (Some(d), _) => encode(&d.payload, &d.children).len().div_ceil(SECTOR) as u64,
+                    // Длину кадра СЧИТАЕМ, а не собираем: раньше здесь стоял `encode(...).len()`,
+                    // то есть копия всей полезной нагрузки в кучу ядра ради одного числа. На
+                    // объекте в 1,8 МиБ и почти полной куче это была паника аллокатора — на
+                    // шаге, где ничего ещё даже не записывается. Ловится только на тяжёлом
+                    // сеансе: снимок сессии растёт с числом окон.
+                    (Some(d), _) => frame_len(d.payload.len(), d.children.len()).div_ceil(SECTOR) as u64,
                     (None, Some((_, len))) => (len as usize).div_ceil(SECTOR) as u64,
                     (None, None) => 0,
                 }
@@ -870,7 +875,14 @@ impl Store {
                 return false;
             }
             let d = self.objects[&id].data.as_ref().expect("объект без данных и без диска");
-            let frame = encode(&d.payload, &d.children);
+            // Не хватило кучи на кадр — коммит НЕ состоялся, как и при отказе носителя ниже: на
+            // диске остаётся прежнее консистентное поколение, объект уедет следующим коммитом.
+            // Паниковать здесь нельзя по той же причине, по какой нельзя в `try_put_node`:
+            // размер задаёт программа, а не ядро.
+            let Some(frame) = try_encode(&d.payload, &d.children) else {
+                self.failed_writes += 1;
+                return false;
+            };
             if borrowed {
                 if let Some(o) = self.objects.get_mut(&id) {
                     o.data = None; // кадр уже собран — вторая копия в куче не нужна
@@ -1007,9 +1019,16 @@ impl Default for Store {
 /// Веха 104 — тот же кадр, но **без паники при нехватке памяти**: `None` вместо аварии.
 /// Нужен пути из userspace: кадр — самая крупная из выделяемых здесь вещей (полезная нагрузка
 /// целиком), и падать на нём всей системой из-за чужого размера недопустимо.
+/// Длина кадра, не собирая его. Нужна там, где спрашивают «сколько это займёт секторов»:
+/// собирать ради ответа копию всей нагрузки — это и лишняя работа, и повод для паники на
+/// нехватке кучи (см. `Store::commit`).
+fn frame_len(payload: usize, children: usize) -> usize {
+    4 + children * 32 + payload
+}
+
 fn try_encode(payload: &[u8], children: &[ContentId]) -> Option<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
-    buf.try_reserve_exact(4 + children.len() * 32 + payload.len()).ok()?;
+    buf.try_reserve_exact(frame_len(payload.len(), children.len())).ok()?;
     buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
     for c in children {
         buf.extend_from_slice(&c.0);
@@ -1019,7 +1038,7 @@ fn try_encode(payload: &[u8], children: &[ContentId]) -> Option<Vec<u8>> {
 }
 
 fn encode(payload: &[u8], children: &[ContentId]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + children.len() * 32 + payload.len());
+    let mut buf = Vec::with_capacity(frame_len(payload.len(), children.len()));
     buf.extend_from_slice(&(children.len() as u32).to_le_bytes());
     for c in children {
         buf.extend_from_slice(&c.0);
