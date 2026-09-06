@@ -60,11 +60,18 @@ copied=$(mdir -i "$out@@${off}" ::/boot 2>/dev/null | awk '/void-kernel/ {gsub(/
 [ "$copied" = "$(stat -c%s "$kernel")" ] || {
     echo "ядро легло в p1 не целиком ($copied из $(stat -c%s "$kernel") Б) — увеличь P1_MB"; exit 1; }
 cfg="$(mktemp)"
-cat > "$cfg" <<'CFG'
-set timeout=0
+# Веха 170.7 — СТРОКА ЗАГРУЗКИ. Пустая по умолчанию; `VOID_CMDLINE="cores=1"` кладёт ключи в
+# запись меню. Ядро сегодня читает из неё одно — сколько ядер отдать планировщику. На живой
+# машине то же самое правится в GRUB клавишей `e`, без пересборки: сравнить систему на одном
+# ядре и на всех иначе нечем, потому что пересборка меняет слишком многое сразу.
+#
+# Таймаут при непустой строке — не ноль: иначе меню не увидеть и `e` нажать негде.
+cmdline="${VOID_CMDLINE:-}"
+cat > "$cfg" <<CFG
+set timeout=$([ -n "$cmdline" ] && echo 1 || echo 0)
 set default=0
 menuentry "VOID" {
-    multiboot2 /boot/void-kernel
+    multiboot2 /boot/void-kernel $cmdline
     boot
 }
 CFG

@@ -215,6 +215,17 @@ struct Proc {
     /// Веха 89 — сколько ФРЕЙМОВ куча этой группы реально заняла (лениво, по фолтам).
     /// Живёт у лидера группы, как и `heap_brk`; сверяется с [`page_quota`].
     pages: usize,
+    /// Веха 170.7 — на КАКОМ ядре процесс работал в прошлый раз (`u8::MAX` — ни на каком).
+    ///
+    /// Планировщик старается вернуть его туда же. Дело не в справедливости, а в кэше: у
+    /// композитора рабочий набор в мегабайты (теневой кадр, буферы окон, кэш глифов), и каждое
+    /// переселение на соседнее ядро начинается с холодных L1 и L2. Пока ядро было одно,
+    /// переселяться было некуда; с двумя процесс скакал между ними на каждом пробуждении, и на
+    /// ноутбуке это видно как рывки, приходящие вместе с числом открытых программ.
+    ///
+    /// Не привязка намертво: ядро, которому нечего делать, возьмёт чужого — простаивать хуже,
+    /// чем переселить.
+    last_cpu: u8,
     /// Веха 163 — СКОЛЬКО ВРЕМЕНИ ядро исполняло этот процесс, в тиках. Копится в [`resume`]:
     /// каждый trap из U закрывает отрезок, начатый последним входом в U. Считается тем же
     /// счётчиком, что уптайм и простой, и простой из отрезка вычитается — иначе процесс,
@@ -354,16 +365,41 @@ impl Table {
     /// Следующий готовый процесс по кругу от `from` (включая сам `from`, если он готов).
     ///
     /// Веха 170 — «готовый» значит ещё и «которого не взял сосед» (см. [`Table::bound`]).
+    ///
+    /// Веха 170.7 — сперва СВОИ: те, кто в прошлый раз работал на этом же ядре ([`Proc::last_cpu`]).
+    /// Чужого берём, только если своих готовых нет: простаивающее ядро полезнее тёплого кэша.
     fn next_runnable(&self, from: usize) -> Option<usize> {
         let me = cpu::id();
+        self.scan(from, me, true).or_else(|| self.scan(from, me, false))
+    }
+
+    /// Круговой поиск готового от `from`. `home` — только тех, кто в прошлый раз шёл на этом ядре.
+    fn scan(&self, from: usize, me: usize, home: bool) -> Option<usize> {
         let n = self.procs.len();
+        if n == 0 {
+            return None;
+        }
         for i in 1..=n {
             let idx = (from + i) % n;
-            if self.procs[idx].state == State::Runnable && self.proc_free(idx, me) {
+            let p = &self.procs[idx];
+            if p.state != State::Runnable || (home && p.last_cpu != me as u8) {
+                continue;
+            }
+            if self.proc_free(idx, me) {
                 return Some(idx);
             }
         }
         None
+    }
+
+    /// Кого взять ядру, у которого сейчас нет никого (вход в сессию, пробуждение после простоя).
+    /// Тот же порядок, что и у [`Table::next_runnable`]: сперва свои, потом чужие.
+    fn first_for_me(&self) -> Option<usize> {
+        let n = self.procs.len();
+        if n == 0 {
+            return None;
+        }
+        self.next_runnable(n - 1)
     }
 
     /// Есть ли ГОТОВЫЙ процесс, которого не взяло ни одно ядро, — повод разбудить спящее.
@@ -528,6 +564,7 @@ fn create_process_locked(
         wake_on_key: false,
         reads_console: false,
         pages: 0,
+        last_cpu: u8::MAX,
         run_ticks: 0,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
         args: {
@@ -589,6 +626,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         wake_on_key: false,
         reads_console: false,
         pages: 0, // не используется у нити: учёт ведёт лидер
+        last_cpu: u8::MAX,
         run_ticks: 0, // у нити СВОЙ: она исполняется отдельно от лидера
         heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
         args: Vec::new(),
@@ -802,9 +840,7 @@ pub fn run() {
         // остаётся Finished/заблокированными).
         let first = {
             let t = TABLE.lock();
-            let me = cpu::id();
-            (0..t.procs.len())
-                .find(|&i| t.procs[i].state == State::Runnable && t.proc_free(i, me))
+            t.first_for_me()
         };
         if let Some(first) = first {
             // Вытеснение процессов (Веха 16): разрешить ТАЙМЕР (STIE) — он прервёт процесс в
@@ -907,8 +943,7 @@ pub fn run_ap() -> ! {
         cpu::lock();
         let first = {
             let t = TABLE.lock();
-            (0..t.procs.len())
-                .find(|&i| t.procs[i].state == State::Runnable && t.proc_free(i, me))
+            t.first_for_me()
         };
         if let Some(first) = first {
             arch::irq_mask_preempt(0); // свой LVT-таймер: вытеснение считает каждое ядро само
@@ -1504,6 +1539,16 @@ const RECLAIMED: usize = usize::MAX;
 fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
     let mut roots = Vec::new();
     let n = t.procs.len();
+    // Веха 170.7 — сперва спросить, есть ли вообще что возвращать.
+    //
+    // Ниже — двойной обход: на каждого лидера проверяется вся таблица. Зовётся это на КАЖДОМ
+    // трапе из процесса, а умирает кто-нибудь раз в сотни тысяч трапов, — то есть почти всегда
+    // квадрат отрабатывал впустую. Пока программ было пять, это терялось в шуме; с двумя
+    // десятками открытых окон таблица разрастается, и цена растёт как квадрат числа слотов.
+    // Одна линейная проверка отсекает почти все заходы.
+    if !t.procs.iter().any(|p| p.state == State::Finished && p.space != RECLAIMED) {
+        return roots;
+    }
     for leader in 0..n {
         if t.procs[leader].group != leader || t.procs[leader].space == RECLAIMED {
             continue; // только лидеры групп и только ещё не освобождённые
@@ -1610,6 +1655,7 @@ fn resume() -> ! {
         Some(n) => {
             t.set_cur(n);
             t.bound[me] = n;
+            t.procs[n].last_cpu = me as u8; // Веха 170.7 — сюда его и вернём в следующий раз
             open_slice(n);
             let frame = t.procs[n].frame;
             let space = t.procs[n].space;

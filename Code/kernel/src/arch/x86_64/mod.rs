@@ -103,6 +103,26 @@ pub fn platform_init(magic: usize, info: usize) {
     }
 }
 
+/// Веха 170.7 — вытащить `cores=N` из строки загрузки. `None` — не назвали (берём все ядра).
+///
+/// Разбор нарочно тупой: ищем подстроку и читаем десятичное число за ней. Строка приходит от
+/// человека через меню GRUB, и никакого разбора сложнее ей не нужно.
+fn cores_from_cmdline(at: usize, len: usize) -> Option<usize> {
+    let bytes = unsafe { core::slice::from_raw_parts(at as *const u8, len) };
+    let key = b"cores=";
+    let start = bytes.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut v = 0usize;
+    let mut any = false;
+    for &b in &bytes[start..] {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        v = v * 10 + (b - b'0') as usize;
+        any = true;
+    }
+    if any && v > 0 { Some(v) } else { None }
+}
+
 /// Magic PVH `hvm_start_info` (по смещению 0): так отличаем QEMU-PVH от multiboot2/мусора.
 const PVH_MAGIC: u32 = 0x336e_c578;
 
@@ -196,6 +216,11 @@ fn discover_multiboot(info: usize) -> usize {
             break; // завершающий тег или мусор
         }
         match ty {
+            // Веха 170.7 — СТРОКА ЗАГРУЗКИ (тег 1). Пока из неё нужно одно: `cores=N` — сколько
+            // ядер отдать планировщику. Знать это стоит владельцу, а не только сборке: сравнить
+            // «на одном ядре» и «на всех» на живой машине иначе нечем — пересборка меняет не
+            // только число ядер, но и всё остальное. В GRUB строка правится клавишей `e`.
+            1 => smp::set_core_limit(cores_from_cmdline(info + p + 8, size - 8)),
             4 => basic = 0x10_0000 + rd(p + 12) as usize * 1024, // basic meminfo: mem_upper (КиБ)
             // Веха 88 — КАРТА ПАМЯТИ (E820 в переводе GRUB). Заголовок тега: type, size,
             // entry_size@+8, entry_version@+12; дальше записи по entry_size:
