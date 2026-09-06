@@ -47,7 +47,7 @@ pub use pci::intx_irq_setup;
 pub use trap::{init as trap_init, TrapFrame};
 
 /// Веха 170 — многоядерность: сколько ядер у машины, сколько поднято и как их поднять.
-pub use smp::{cpu_count, cpus_up, start_aps, wake_cpu, MAX_CPUS};
+pub use smp::{cpu_count, cpus_up, flush_cpu, start_aps, wake_cpu, MAX_CPUS};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
 pub const ARCH_NAME: &str = "x86_64";

@@ -60,19 +60,27 @@ static UP: AtomicUsize = AtomicUsize::new(1);
 const NO_APIC: u8 = 0xff;
 static APIC_OF: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(NO_APIC) }; MAX_CPUS];
 
-/// Веха 170, этап 2 — разбудить ядро `i`: послать ему [`trap::VEC_WAKE`].
-///
-/// Молча ничего не делает, если такого ядра нет: будить некого — это нормальное состояние
-/// системы, а не ошибка.
-pub fn wake_cpu(i: usize) {
+/// Послать ядру `i` межпроцессорное прерывание `vector`. Молча ничего не делает, если такого
+/// ядра нет: адресовать некому — нормальное состояние системы, а не ошибка.
+fn ipi(i: usize, vector: u8) {
     if i >= MAX_CPUS {
         return;
     }
     let apic = APIC_OF[i].load(Ordering::Relaxed);
     if apic != NO_APIC {
         // SAFETY: LAPIC поднят (иначе номеров ядер бы не было), вектор имеет шлюз в IDT.
-        unsafe { lapic::send_ipi(apic, super::trap::VEC_WAKE) };
+        unsafe { lapic::send_ipi(apic, vector) };
     }
+}
+
+/// Веха 170, этап 2 — разбудить ядро `i`: послать ему [`trap::VEC_WAKE`].
+pub fn wake_cpu(i: usize) {
+    ipi(i, super::trap::VEC_WAKE);
+}
+
+/// Веха 170, этап 3 — попросить ядро `i` сбросить буфер трансляций ([`trap::VEC_TLB`]).
+pub fn flush_cpu(i: usize) {
+    ipi(i, super::trap::VEC_TLB);
 }
 
 unsafe extern "C" {

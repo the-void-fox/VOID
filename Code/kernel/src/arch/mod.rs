@@ -94,7 +94,7 @@ pub use imp::{
     userdrv_irq_arm,
     // Веха 170 — многоядерность: сколько ядер у машины, сколько поднято, как их поднять,
     // сколько их система готова обслуживать и чем ядро узнаёт само себя (см. `crate::cpu`)
-    cpu_count, cpus_up, kernel_space_root, stack_pointer, start_aps, wake_cpu, MAX_CPUS,
+    cpu_count, cpus_up, flush_cpu, kernel_space_root, stack_pointer, start_aps, wake_cpu, MAX_CPUS,
     // разное
     ARCH_NAME, ELF_MACHINE, USERSPACE_READY,
     // платформа (Веха 41/42): границы RAM из карты памяти + ранняя инициализация + детект металла

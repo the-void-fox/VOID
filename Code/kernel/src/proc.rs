@@ -312,14 +312,12 @@ struct Table {
     /// Веха 170 — кого исполняет КАЖДОЕ ядро. Было одно число на систему, и это было верно
     /// ровно до второго ядра: «текущий процесс» — свойство процессора, а не машины.
     current: [usize; cpu::MAX],
-    /// Веха 170 — какую ГРУППУ нитей ядро `i` сейчас обслуживает (индекс лидера; [`NO_CPU`] —
-    /// никакую).
+    /// Веха 170 — какой ПРОЦЕСС (нить) ядро `i` сейчас обслуживает; [`NO_CPU`] — никакой.
     ///
-    /// Это не учёт ради учёта, а правило: **одна группа исполняется не более чем на одном
-    /// ядре**. Нити группы делят адресное пространство, и пока нет рассылки сброса TLB (этап 3),
-    /// ленивая страница, отображённая одним ядром, для другого осталась бы отсутствующей — а
-    /// снятая — по-прежнему доступной. Разные процессы такого следа друг у друга не оставляют:
-    /// вход в процесс перезагружает CR3, а это полный сброс TLB.
+    /// Ровно одно правило: одну нить не берут два ядра. Этапу 2 приходилось запрещать больше —
+    /// целую группу на ядро, потому что нити делят адресное пространство, а сказать соседу «эта
+    /// страница больше не твоя» было нечем. С рассылкой сброса TLB (этап 3) запрет снят: нити
+    /// одного процесса считают одновременно, как им и положено.
     bound: [usize; cpu::MAX],
     /// Веха 170 — токен пространства, который у ядра `i` СЕЙЧАС в CR3 (0 — ядерный корень).
     /// По нему решается, можно ли освободить таблицы умершей группы: нельзя, пока хоть одно
@@ -348,22 +346,20 @@ impl Table {
         self.current[cpu::id()] = n;
     }
 
-    /// Свободна ли группа процесса `idx` для ядра `me` — то есть не занята ли она ДРУГИМ ядром.
-    fn group_free(&self, idx: usize, me: usize) -> bool {
-        let g = self.procs[idx].group;
-        !self.bound.iter().enumerate().any(|(j, &b)| j != me && b == g)
+    /// Свободен ли процесс `idx` для ядра `me` — то есть не взят ли он ДРУГИМ ядром.
+    fn proc_free(&self, idx: usize, me: usize) -> bool {
+        !self.bound.iter().enumerate().any(|(j, &b)| j != me && b == idx)
     }
 
     /// Следующий готовый процесс по кругу от `from` (включая сам `from`, если он готов).
     ///
-    /// Веха 170 — «готовый» теперь значит ещё и «которого можно взять ЭТОМУ ядру»: чужую
-    /// группу мы пропускаем (см. [`Table::bound`]).
+    /// Веха 170 — «готовый» значит ещё и «которого не взял сосед» (см. [`Table::bound`]).
     fn next_runnable(&self, from: usize) -> Option<usize> {
         let me = cpu::id();
         let n = self.procs.len();
         for i in 1..=n {
             let idx = (from + i) % n;
-            if self.procs[idx].state == State::Runnable && self.group_free(idx, me) {
+            if self.procs[idx].state == State::Runnable && self.proc_free(idx, me) {
                 return Some(idx);
             }
         }
@@ -374,7 +370,8 @@ impl Table {
     fn has_spare_work(&self) -> bool {
         self.procs
             .iter()
-            .any(|p| p.state == State::Runnable && !self.bound.contains(&p.group))
+            .enumerate()
+            .any(|(i, p)| p.state == State::Runnable && !self.bound.contains(&i))
     }
 }
 
@@ -807,7 +804,7 @@ pub fn run() {
             let t = TABLE.lock();
             let me = cpu::id();
             (0..t.procs.len())
-                .find(|&i| t.procs[i].state == State::Runnable && t.group_free(i, me))
+                .find(|&i| t.procs[i].state == State::Runnable && t.proc_free(i, me))
         };
         if let Some(first) = first {
             // Вытеснение процессов (Веха 16): разрешить ТАЙМЕР (STIE) — он прервёт процесс в
@@ -864,6 +861,11 @@ fn open_scheduler() {
 /// последнее мгновение и вот-вот её отдаст.
 fn close_scheduler() {
     SCHED_OPEN.store(false, Ordering::Release);
+    // Веха 170, этап 3 — съехать с пространства процесса ДО ожидания. Ниже мы крутимся без
+    // большого замка и с запрещёнными прерываниями: рассылка сброса TLB нас в таком состоянии
+    // не достала бы, а значит сосед ждал бы нашего отчёта, пока мы ждём его выхода. Съехав на
+    // ядерный корень, мы перестаём быть адресатом рассылки вовсе.
+    release_space(cpu::id());
     // Ждать, отпустив замок: без него прикладным ядрам не выйти из ядра, и ожидание стало бы
     // взаимной блокировкой.
     cpu::unlock();
@@ -906,7 +908,7 @@ pub fn run_ap() -> ! {
         let first = {
             let t = TABLE.lock();
             (0..t.procs.len())
-                .find(|&i| t.procs[i].state == State::Runnable && t.group_free(i, me))
+                .find(|&i| t.procs[i].state == State::Runnable && t.proc_free(i, me))
         };
         if let Some(first) = first {
             arch::irq_mask_preempt(0); // свой LVT-таймер: вытеснение считает каждое ядро само
@@ -941,6 +943,28 @@ pub fn run_ap() -> ! {
     }
 }
 
+/// Веха 170, этап 3 — сбросить буфер трансляций после того, как в `space` ИЗМЕНИЛИСЬ уже
+/// существовавшие отображения: у себя сразу, у соседей — рассылкой с ожиданием отчёта.
+///
+/// Нужно там, где отображение СНИМАЕТСЯ, ПЕРЕЗАПИСЫВАЕТСЯ или УРЕЗАЕТСЯ в правах. Для чистого
+/// добавления (ленивая страница кучи) хватает своего сброса: процессор не заводит записей в
+/// буфере для отсутствующих страниц, поэтому соседу нечего забывать, — а платить за каждый
+/// фолт кучи межпроцессорным прерыванием пришлось бы на самом горячем пути ядра.
+fn flush_space(t: &Table, space: usize) {
+    arch::flush_tlb();
+    if cpu::MAX == 1 {
+        return;
+    }
+    let me = cpu::id();
+    let mut mask = 0usize;
+    for (j, &tok) in t.space.iter().enumerate() {
+        if j != me && tok == space {
+            mask |= 1 << j;
+        }
+    }
+    cpu::flush_others(mask);
+}
+
 /// Веха 170 — обслуживает ли процесс какое-нибудь ДРУГОЕ ядро.
 fn others_busy() -> bool {
     let t = TABLE.lock();
@@ -952,7 +976,7 @@ fn others_busy() -> bool {
 fn any_runnable_for_me() -> bool {
     let t = TABLE.lock();
     let me = cpu::id();
-    (0..t.procs.len()).any(|i| t.procs[i].state == State::Runnable && t.group_free(i, me))
+    (0..t.procs.len()).any(|i| t.procs[i].state == State::Runnable && t.proc_free(i, me))
 }
 
 /// Веха 170 — переехать на ядерный корень и объявить, что пространства процесса мы больше не
@@ -1312,8 +1336,16 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
             page_quota(),
         );
     } else if lazy {
+        let page_va = va & !(PAGE - 1);
+        // Веха 170 — страница УЖЕ отображена: её поставила соседняя нить той же группы, пока
+        // мы стояли в очереди на большой замок с этим самым фолтом. Просто вернуться —
+        // инструкция повторится и найдёт страницу на месте. Без этой проверки `map` положил бы
+        // поверх второй фрейм: первый утёк бы, а всё, что нить успела в него записать, исчезло
+        // бы без единого признака ошибки.
+        if arch::translate(arch::space_root(space), page_va).is_some() {
+            return;
+        }
         if let Some(pa) = frame::alloc() {
-            let page_va = va & !(PAGE - 1);
             // SAFETY: пространство процесса сейчас активно — после map сбрасываем TLB,
             // иначе повтор инструкции мог бы увидеть старую (пустую) трансляцию.
             let ok = unsafe {
@@ -1321,6 +1353,7 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
             };
             if ok {
                 t.procs[leader].pages += 1;
+                // Своего сброса довольно: страница ДОБАВЛЕНА (см. `flush_space`).
                 arch::flush_tlb();
                 vprintln!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
                 return; // sepc не тронут — инструкция повторится по замапленной странице
@@ -1364,6 +1397,7 @@ fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
                 frame::free(pa);
                 return false; // Веха 89: нет памяти под таблицу — шлюз честно откажет
             }
+            // Своего сброса довольно: страница ДОБАВЛЕНА (см. `flush_space`).
             arch::flush_tlb();
             vprintln!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
         }
@@ -1567,7 +1601,7 @@ fn resume() -> ! {
     let me = cpu::id();
     let c = t.cur();
     // Свой процесс продолжаем без вопросов: его группа занята НАМИ, и это законно.
-    let chosen = if t.procs[c].state == State::Runnable && t.group_free(c, me) {
+    let chosen = if t.procs[c].state == State::Runnable && t.proc_free(c, me) {
         Some(c)
     } else {
         t.next_runnable(c)
@@ -1575,7 +1609,7 @@ fn resume() -> ! {
     match chosen {
         Some(n) => {
             t.set_cur(n);
-            t.bound[me] = t.procs[n].group;
+            t.bound[me] = n;
             open_slice(n);
             let frame = t.procs[n].frame;
             let space = t.procs[n].space;
@@ -1681,14 +1715,17 @@ fn shm_attach(t: &mut Table, cur: usize, id: usize, va: usize, writable: bool) -
     if writable {
         flags |= arch::MAP_W;
     }
+    let space = t.procs[cur].space;
     for (i, &pa) in frames.iter().enumerate() {
         let ok = unsafe { arch::map(root, va + i * PAGE, pa, flags) };
         if !ok {
-            arch::flush_tlb();
+            flush_space(t, space);
             return usize::MAX; // Веха 89: нет памяти под таблицу — честный отказ
         }
     }
-    arch::flush_tlb();
+    // Веха 170 — адрес выбирает процесс, значит `map` мог ПЕРЕЗАПИСАТЬ то, что там лежало:
+    // сброс нужен всем, кто стоит на этом пространстве.
+    flush_space(t, space);
     t.procs[cur].shm.push(id);
     0
 }
@@ -1726,7 +1763,9 @@ fn shm_unmap(t: &mut Table, cur: usize, id: usize, va: usize) -> usize {
         assert!(ok, "shm_unmap: фрейм области отображён как приватный (va {:#x}, P{})",
             va + i * PAGE, cur);
     }
-    arch::flush_tlb();
+    // Веха 170 — страницы СНЯТЫ, и сразу за этим область может быть отпущена вместе с кадрами.
+    // Сосед со старой трансляцией писал бы в чужую память: рассылаем и ждём отчёта.
+    flush_space(t, t.procs[cur].space);
     t.procs[cur].shm.remove(slot);
     crate::shm::release(id);
     0
@@ -3068,7 +3107,9 @@ fn syscall(t: &mut Table, cur: usize) {
                                 break; // Веха 89: нет памяти под таблицы — отказ драйверу
                             }
                         }
-                        arch::flush_tlb();
+                        // Веха 170 — адрес назвал драйвер, отображение могло лечь поверх
+                        // прежнего: сброс нужен всем, кто стоит на этом пространстве.
+                        flush_space(t, t.procs[cur].space);
                         if !ok {
                             usize::MAX
                         } else {
@@ -3129,7 +3170,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                         break;
                                     }
                                 }
-                                arch::flush_tlb();
+                                flush_space(t, t.procs[cur].space);
                                 if ok {
                                     pa // физ-адрес начала (драйверу нужен именно физический)
                                 } else {
@@ -4260,7 +4301,9 @@ fn lx_map_range(t: &mut Table, cur: usize, start: usize, size: usize, _prot: usi
         }
         va += PAGE;
     }
-    arch::flush_tlb();
+    // Веха 170 — первая ветка цикла ПЕРЕЗАПИСЫВАЕТ права уже отображённой страницы, значит
+    // своего сброса мало (см. `flush_space`).
+    flush_space(t, t.procs[cur].space);
     true
 }
 
@@ -4275,7 +4318,9 @@ fn lx_protect_range(t: &mut Table, cur: usize, start: usize, size: usize, prot: 
         }
         va += PAGE;
     }
-    arch::flush_tlb();
+    // Веха 170 — права УРЕЗАНЫ (mprotect снимает запись с уже отданных страниц): сосед со
+    // старой трансляцией продолжал бы туда писать.
+    flush_space(t, t.procs[cur].space);
 }
 
 /// Веха 38 — трансля́тор Linux-syscall'ов для процессов личности `linux` ([`crate::linux`]).
