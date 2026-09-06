@@ -1,0 +1,318 @@
+# soak-smp.txt — ДЛИННЫЙ отстой многоядерности (Веха 170, этап 5).
+#
+# Короткие прогоны ловят падения. Этот ищет другое — ДРЕЙФ: то, что за минуту не видно, а за
+# десять минут выходит наружу. Восемь одинаковых кругов, и после каждого снимок: ряд из восьми
+# кадров отвечает на вопрос, растёт ли что-нибудь. Последним кадром — диспетчер задач с точными
+# числами памяти и процессов.
+#
+# Круг: четыре окна открыть → нити (общее адресное пространство на разных ядрах) → счётная
+# нагрузка в соседнем окне → мышь и обзор столов, пока идёт счёт → ввод ПОД нагрузкой (проверка
+# того, что нажатие, подобранное прикладным ядром, доходит) → четыре окна закрыть.
+#
+# Как гонять (образ — КОПИЯ рабочего, не он сам):
+#   cp Code/target/void.img Code/target/void-soak.img
+#   VOID_QEMU_SMP=4 VOID_QEMU_ACCEL=kvm VOID_QEMU_CPU=host \
+#     Code/tools/run.sh --img Code/target/void-soak.img --script Code/tools/soak-smp.txt вых/
+#
+# Что считать нормой (замер Вехи 170.5, четыре ядра, KVM): память 68 МиБ и на восьми кругах, и
+# на шестнадцати — то есть полка, а не течь; процессов ровно столько же, сколько после загрузки
+# (11); в консоли ни `[PANIC]`, ни `FATAL TRAP`, ни «ядра молчат о сбросе TLB».
+
+sleep 18
+shot 00-start
+# ── круг 1 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 01-krug
+# ── круг 2 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 02-krug
+# ── круг 3 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 03-krug
+# ── круг 4 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 04-krug
+# ── круг 5 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 05-krug
+# ── круг 6 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 06-krug
+# ── круг 7 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 07-krug
+# ── круг 8 ──
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+hotkey Super+Return
+sleep 2
+type threads
+hotkey Return
+sleep 1
+hotkey Super+H
+type busy 5
+hotkey Return
+sleep 2
+mouse 300 120
+mouse -180 -60
+hotkey Super+Tab
+sleep 2
+hotkey Super+Tab
+mouse 150 -90
+sleep 4
+type echo pod-nagruzkoi
+hotkey Return
+sleep 3
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+hotkey Super+Q
+sleep 1
+sleep 4
+shot 08-krug
+
+# Точные числа: память и живые процессы после всех кругов.
+hotkey Super+Return
+sleep 3
+type taskmgr perf
+hotkey Return
+sleep 7
+shot 99-dispetcher
