@@ -106,11 +106,18 @@ impl Default for FxArea {
 }
 
 /// `fxsave64`/`fxrstor64` требуют 16-выровненный адрес; кадры в таблице процессов не
-/// выровнены — скретч + копия. Один на систему: ядро однопроцессорное, а внутри
-/// trap-обработчиков IF=0 (interrupt gate) — реентерабельность исключена.
+/// выровнены — скретч + копия.
+///
+/// Веха 170, этап 4 — скретч СВОЙ У КАЖДОГО ЯДРА, и это исправление настоящей порчи, а не
+/// осторожность. Один на систему он был, пока «в ядре одно ядро» значило «в машине одно ядро».
+/// С этапа 2 `restore_fp` зовётся из `enter_user` — то есть УЖЕ ПОСЛЕ того, как большой замок
+/// отпущен (иначе ядро держало бы его, уходя в кольцо 3). Два ядра, входящие в свои процессы
+/// одновременно, писали бы в один буфер: один процесс получал бы регистры SSE другого. Ничего
+/// не падает — просто откуда-то берутся не те числа и не те пиксели.
 #[repr(C, align(16))]
 struct FxScratch([u64; 64]);
-static mut FX_SCRATCH: FxScratch = FxScratch([0; 64]);
+static mut FX_SCRATCH: [FxScratch; super::MAX_CPUS] =
+    [const { FxScratch([0; 64]) }; super::MAX_CPUS];
 
 // Индексы регистров в `regs` (порядок push'ей: rax первым → верх структуры).
 pub const RAX: usize = 14;
@@ -202,7 +209,7 @@ impl TrapFrame {
     /// ровно состояние затрапившего процесса (ядро с soft-float их не меняет).
     pub fn save_fp(&mut self) {
         unsafe {
-            let p = core::ptr::addr_of_mut!(FX_SCRATCH);
+            let p = &raw mut FX_SCRATCH[crate::cpu::id()];
             core::arch::asm!("fxsave64 [{0}]", in(reg) p, options(nostack));
             self.fx.0 = (*p).0;
         }
@@ -211,7 +218,7 @@ impl TrapFrame {
     /// Веха 36 — вернуть FPU/SSE-состояние кадра в CPU (вход в U, [`super::enter_user`]).
     pub fn restore_fp(&self) {
         unsafe {
-            let p = core::ptr::addr_of_mut!(FX_SCRATCH);
+            let p = &raw mut FX_SCRATCH[crate::cpu::id()];
             (*p).0 = self.fx.0;
             core::arch::asm!("fxrstor64 [{0}]", in(reg) p, options(nostack));
         }
@@ -430,6 +437,11 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
 
 /// Необработанный (фатальный) trap: полный контекст и стоп — паритет riscv64/fatal.
 fn fatal(frame: &TrapFrame) -> ! {
+    // Веха 170 — сперва остановить остальные ядра, потом печатать. Иначе дамп аварии выходит
+    // вперемешку с обычным выводом соседей, а система продолжает исполнять процессы поверх
+    // ядра, которое только что призналось, что не понимает своего состояния.
+    crate::cpu::stop_others();
+    crate::break_output_lock();
     let cr2: usize;
     unsafe { core::arch::asm!("mov {0}, cr2", out(reg) cr2, options(nomem, nostack)) };
     println!();
@@ -463,9 +475,7 @@ fn fatal(frame: &TrapFrame) -> ! {
     }
     backtrace(frame.rsp);
     println!("  ╚════════════════════════════════════════════════");
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
+    crate::cpu::halt_here()
 }
 
 /// Веха 126.4 — обратный след по стеку ядра.

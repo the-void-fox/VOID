@@ -412,7 +412,12 @@ static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // читатель (getc)
 
 /// Положить принятый байт в кольцевой буфер (переполнение — байт теряется, как в riscv-кольце).
 /// Единая точка для обоих источников ввода: COM1 (QEMU/serial) и PS/2-клавиатура (реальное
-/// железо, Веха 42). Зовётся с выключенными прерываниями (из обработчика тика/IRQ) — гонок нет.
+/// железо, Веха 42).
+///
+/// Веха 170 — писатель по-прежнему один в каждый момент, но уже не потому, что ядро одно: сюда
+/// приходят только из-под большого замка ([`crate::cpu`]) — с тика вытеснения и с обработчика
+/// прерывания консоли. Свободно, БЕЗ замка, кольцо читает лишь [`console_has_input`], и читает
+/// он только счётчики.
 pub(super) fn rx_push(b: u8) {
     let head = RX_HEAD.load(Ordering::Relaxed);
     if head.wrapping_sub(RX_TAIL.load(Ordering::Relaxed)) < RX_CAP {
@@ -492,6 +497,10 @@ pub fn mouse_pop() -> Option<MouseEvent> {
 }
 
 /// Есть ли непрочитанные события (для пробуждения спящего владельца экрана).
+///
+/// Веха 170 — единственный читатель кольца ВНЕ большого замка (`proc::wait_stdin` спрашивает об
+/// этом, решая, ложиться ли спать). Читает только счётчики и никогда буфер, поэтому устаревший
+/// ответ здесь значит «поспим ещё немного», а не порчу: разбудит побудка соседа или прерывание.
 pub fn mouse_pending() -> bool {
     MOUSE_TAIL.load(Ordering::Relaxed) != MOUSE_HEAD.load(Ordering::Relaxed)
 }
@@ -543,6 +552,8 @@ pub fn key_pop() -> Option<KeyEvent> {
     Some(e)
 }
 
+/// Есть ли непрочитанные события клавиатуры. Как и [`mouse_pending`], спрашивается ВНЕ большого
+/// замка и читает только счётчики.
 pub fn key_pending() -> bool {
     KEY_TAIL.load(Ordering::Relaxed) != KEY_HEAD.load(Ordering::Relaxed)
 }
@@ -633,6 +644,8 @@ pub fn usb_key(b: u8) {
     rx_push(b);
 }
 
+/// Есть ли непрочитанные байты консоли. Как и [`mouse_pending`], спрашивается ВНЕ большого
+/// замка и читает только счётчики.
 pub fn console_has_input() -> bool {
     RX_HEAD.load(Ordering::Relaxed) != RX_TAIL.load(Ordering::Relaxed)
 }
@@ -679,6 +692,14 @@ pub fn irq_restore(enabled: bool) {
 /// Глобально включить прерывания.
 pub fn enable_interrupts() {
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) }
+}
+
+/// Веха 170 — остановиться навсегда, с запрещёнными прерываниями. Для аварийного пути: ядро,
+/// объявившее аварию, и его соседи не должны исполнять больше ничего.
+pub fn halt_forever() -> ! {
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Спать до прерывания. ОТЛИЧИЕ от `wfi`: hlt при IF=0 не просыпается от pending-

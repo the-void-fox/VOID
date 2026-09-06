@@ -15,7 +15,7 @@ use core::ptr::read_volatile;
 
 use crate::arch::{BlkDevice, BlkTransport, NetDevice};
 
-use super::{paging, trap};
+use super::{lapic, paging, trap};
 
 const CFG_ADDR: u16 = 0xcf8;
 const CFG_DATA: u16 = 0xcfc;
@@ -537,7 +537,9 @@ fn setup_msix(d: Bdf, vec: u8) -> bool {
     unsafe {
         paging::map_mmio(msix_table, 16);
         let e = msix_table as *mut u32;
-        e.add(0).write_volatile(0xfee0_0000); // message address (LAPIC, dest id 0)
+        // Веха 170 — адресат в битах 19..12 адреса сообщения: ЗАГРУЗОЧНОЕ ядро (см. `ioapic`).
+        // Прежний ноль был верен лишь потому, что у него такой номер в QEMU.
+        e.add(0).write_volatile(0xfee0_0000 | ((lapic::id() as u32) << 12));
         e.add(1).write_volatile(0);
         e.add(2).write_volatile(vec as u32); // data: fixed, edge, вектор
         e.add(3).write_volatile(0); // vector control: размаскирован

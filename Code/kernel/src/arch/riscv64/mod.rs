@@ -167,6 +167,14 @@ pub fn mark_in_kernel() {
     csr::write_sscratch(0);
 }
 
+/// Веха 170 — остановиться навсегда, с запрещёнными прерываниями (аварийный путь).
+pub fn halt_forever() -> ! {
+    csr::irq_save_disable();
+    loop {
+        unsafe { core::arch::asm!("wfi") }
+    }
+}
+
 /// Спать до прерывания (`wfi`). Просыпается и от PENDING-прерывания при SIE=0 —
 /// на этом стоит протокол «сон без потерянного пробуждения» в `proc::wait_stdin`.
 pub fn wait_for_interrupt() {
