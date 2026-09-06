@@ -67,8 +67,13 @@ cfg="$(mktemp)"
 #
 # Таймаут при непустой строке — не ноль: иначе меню не увидеть и `e` нажать негде.
 cmdline="${VOID_CMDLINE:-}"
+# Меню ДОСТУПНО всегда. Скрытый стиль означает «жди столько-то молча, но покажи меню, если нажали
+# клавишу»: загрузка выглядит как прежде, а дописать `cores=1` клавишей `e` можно без пересборки.
+# Ноль здесь стоил владельцу правки этого файла руками — меню было недостижимо в принципе.
+# Хочется видеть меню всегда — `VOID_MENU=menu`; дольше ждать — `VOID_MENU_WAIT=5`.
 cat > "$cfg" <<CFG
-set timeout=$([ -n "$cmdline" ] && echo 1 || echo 0)
+set timeout=${VOID_MENU_WAIT:-1}
+set timeout_style=${VOID_MENU:-hidden}
 set default=0
 menuentry "VOID" {
     multiboot2 /boot/void-kernel $cmdline
