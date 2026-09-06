@@ -513,6 +513,118 @@ pub fn platform_init(_hartid: usize, dtb: usize) {
             TIMEBASE_HZ.store(hz as u64, Ordering::Relaxed);
         }
     }
+    // Веха 170 — СКОЛЬКО ХАРТОВ у платы. Пока мы работаем на одном, но сказать, сколько их
+    // есть, честнее, чем показывать единицу: «ядер 1» на четырёхъядерной плате — это неверное
+    // число, а не скромность.
+    let harts = dtb_count_harts(dtb);
+    if harts > 0 {
+        HARTS.store(harts, Ordering::Relaxed);
+    }
+}
+
+/// Сколько хартов перечислил device tree (0 — DTB не разобрался).
+static HARTS: AtomicUsize = AtomicUsize::new(1);
+
+/// Веха 170 — ядер (хартов) у машины.
+pub fn cpu_count() -> usize {
+    HARTS.load(Ordering::Relaxed).max(1)
+}
+
+/// Веха 170 — ядер, на которых работает ЯДРО. На riscv пока одно: прикладные харты поднимаются
+/// вызовом SBI HSM (`hart_start`), и это следующий шаг — за x86, где путь длиннее и потому
+/// пройден первым.
+pub fn cpus_up() -> usize {
+    1
+}
+
+/// Веха 170 — поднять прикладные харты. На riscv ещё не делаем; возвращаем то, что есть.
+///
+/// # Safety
+/// Ничего не делает — сигнатура общая с x86 ради единого контракта арха.
+pub unsafe fn start_aps() -> (usize, usize) {
+    (cpu_count(), 1)
+}
+
+/// Веха 170 — посчитать узлы `cpu@…` под `/cpus`, пропуская выключенные (`status = "disabled"`).
+///
+/// Считаем ИМЕНА узлов, а не что-то умнее: `/cpus/cpu@N` — это и есть харт по спецификации
+/// device tree, а разбирать `riscv,isa` нам здесь незачем.
+fn dtb_count_harts(dtb: usize) -> usize {
+    if dtb == 0 {
+        return 0;
+    }
+    let mut n = 0usize;
+    unsafe {
+        if fdt_be32(dtb) != FDT_MAGIC {
+            return 0;
+        }
+        let totalsize = fdt_be32(dtb + 4) as usize;
+        let off_struct = fdt_be32(dtb + 8) as usize;
+        let off_strings = fdt_be32(dtb + 12) as usize;
+        let end = dtb + totalsize;
+        let strings_base = dtb + off_strings;
+        let mut p = dtb + off_struct;
+        // Глубина нужна затем, чтобы не считать `cpu@…` из `cpu-map` (там те же имена в
+        // ссылках) и не спутать узел с одноимённым где-нибудь ещё.
+        let (mut depth, mut cpus_at, mut in_cpu, mut disabled) = (0i32, -1i32, false, false);
+        while p + 4 <= end {
+            let tok = fdt_be32(p);
+            p += 4;
+            match tok {
+                FDT_BEGIN_NODE => {
+                    let name_ptr = p;
+                    let mut q = name_ptr;
+                    while q < end && *(q as *const u8) != 0 {
+                        q += 1;
+                    }
+                    let name = core::slice::from_raw_parts(name_ptr as *const u8, q - name_ptr);
+                    depth += 1;
+                    if name == b"cpus" {
+                        cpus_at = depth;
+                    }
+                    if cpus_at >= 0 && depth == cpus_at + 1 && name.starts_with(b"cpu@") {
+                        in_cpu = true;
+                        disabled = false;
+                    }
+                    p += ((q - name_ptr) + 1 + 3) & !3;
+                }
+                FDT_END_NODE => {
+                    if in_cpu && depth == cpus_at + 1 {
+                        if !disabled {
+                            n += 1;
+                        }
+                        in_cpu = false;
+                    }
+                    if depth == cpus_at {
+                        cpus_at = -1;
+                    }
+                    depth -= 1;
+                }
+                FDT_PROP => {
+                    let len = fdt_be32(p) as usize;
+                    let nameoff = fdt_be32(p + 4) as usize;
+                    let val = p + 8;
+                    p += 8 + ((len + 3) & !3);
+                    if in_cpu && len >= 8 {
+                        let nptr = strings_base + nameoff;
+                        let mut q = nptr;
+                        while q < end && *(q as *const u8) != 0 {
+                            q += 1;
+                        }
+                        let pname = core::slice::from_raw_parts(nptr as *const u8, q - nptr);
+                        if pname == b"status" {
+                            let v = core::slice::from_raw_parts(val as *const u8, len);
+                            disabled = v.starts_with(b"disabled");
+                        }
+                    }
+                }
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => break,
+            }
+        }
+    }
+    n
 }
 
 // ─── разбор device tree (FDT) — только узел /memory (Веха 85) ────────────────

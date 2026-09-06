@@ -21,6 +21,7 @@ mod paging;
 mod pci;
 mod ps2;
 mod rtc;
+mod smp;
 mod trap;
 mod vga;
 
@@ -30,6 +31,8 @@ core::arch::global_asm!(include_str!("entry.s"));
 core::arch::global_asm!(include_str!("switch.s"));
 // Вход в процесс: iretq по подготовленному trap-кадру.
 core::arch::global_asm!(include_str!("enter_user.s"));
+// Веха 170 — трамплин прикладного ядра: 16 → 32 → 64 бита.
+core::arch::global_asm!(include_str!("ap.s"));
 
 pub use pci::{
     e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_virtio_rng,
@@ -42,6 +45,9 @@ pub use pci::probe_bar0;
 /// Веха 133.2 — включить INTx устройства и замаршрутизировать линии PCI на вектор драйверов.
 pub use pci::intx_irq_setup;
 pub use trap::{init as trap_init, TrapFrame};
+
+/// Веха 170 — многоядерность: сколько ядер у машины, сколько поднято и как их поднять.
+pub use smp::{cpu_count, cpus_up, start_aps};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
 pub const ARCH_NAME: &str = "x86_64";

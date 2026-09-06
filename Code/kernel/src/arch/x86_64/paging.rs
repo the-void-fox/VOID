@@ -87,6 +87,12 @@ fn tbl_ptr(pa: usize) -> *mut u64 {
 /// Корень таблиц ЯДРА (PML4) — основа адресных пространств процессов.
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 
+/// Веха 170 — корень таблиц ЯДРА. Нужен прикладному ядру: оно приходит в длинный режим по
+/// загрузочным таблицам и первым делом обязано переехать на настоящие.
+pub fn kernel_root() -> usize {
+    KERNEL_ROOT.load(Ordering::Relaxed)
+}
+
 extern "C" {
     static _kernel_start: u8;
     static _text_start: u8;
