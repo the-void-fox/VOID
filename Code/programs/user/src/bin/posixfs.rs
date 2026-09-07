@@ -290,6 +290,92 @@ fn idx_empty(dir: &[u8], len: usize) -> bool {
     len < 2 || u16::from_le_bytes([dir[0], dir[1]]) == 0
 }
 
+/// Сколько записей поддерева помещается в один обход. Потолок, а не вежливость: обход держит
+/// список путей, и без границы каталог с миллионом имён съел бы всю кучу персоналии молча.
+const WALK_MAX: usize = 512;
+
+/// Веха 175 — **обойти ПОДДЕРЕВО каталога** и вернуть все его записи списком.
+///
+/// Зачем это вообще нужно. В store нет каталогов как объектов: файл — корень `f<путь>`, каталог —
+/// корень-индекс `d<путь>`, и путь входит в ИМЯ каждого корня. Поэтому переименовать каталог
+/// значит перевесить корень КАЖДОГО потомка вглубь, а удалить непустой — снять их все. Обе
+/// операции — один и тот же обход, и он поэтому здесь один.
+///
+/// Список работает и очередью: вынутый каталог дописывает в него своих детей, поэтому обход
+/// идёт вширь и без рекурсии. Рекурсия здесь была бы не стилем, а риском: глубину дерева задаёт
+/// человек, а стек персоналии кончается молча.
+///
+/// Нулевой записью идёт сам `root`. `None` — дерево не влезло в `WALK_MAX`; тогда вызывающий
+/// обязан отказать, а не сделать половину.
+fn subtree(
+    store: usize,
+    root: &[u8],
+    paths: &mut [[u8; PATH_MAX]],
+    lens: &mut [usize],
+    dirs: &mut [bool],
+) -> Option<usize> {
+    let mut dir = [0u8; DIR_MAX];
+    let mut idb = [0u8; 32];
+    let mut n = 0usize;
+    let put = |paths: &mut [[u8; PATH_MAX]], lens: &mut [usize], dirs: &mut [bool],
+               n: &mut usize, p: &[u8], d: bool| -> bool {
+        if *n == WALK_MAX || p.len() > PATH_MAX {
+            return false;
+        }
+        paths[*n][..p.len()].copy_from_slice(p);
+        lens[*n] = p.len();
+        dirs[*n] = d;
+        *n += 1;
+        true
+    };
+    if !put(paths, lens, dirs, &mut n, root, true) {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < n {
+        if !dirs[i] {
+            i += 1;
+            continue;
+        }
+        let (plen, mut base) = (lens[i], [0u8; PATH_MAX]);
+        base[..plen].copy_from_slice(&paths[i][..plen]);
+        let mut rn = [0u8; ROOT_MAX];
+        let rl = root_name(b'd', &base[..plen], &mut rn);
+        if sys::obj_get_root(store, &rn[..rl], &mut idb) == 32 {
+            let dlen = sys::obj_get(store, &idb, &mut dir);
+            let cnt = if dlen >= 2 { u16::from_le_bytes([dir[0], dir[1]]) as usize } else { 0 };
+            let mut off = 2usize;
+            for _ in 0..cnt {
+                if off + 2 > dlen {
+                    break;
+                }
+                let (ty, nl) = (dir[off], dir[off + 1] as usize);
+                if off + 2 + nl > dlen {
+                    break;
+                }
+                // Полный путь ребёнка: у корня разделитель уже есть, у прочих его надо дописать.
+                let mut child = [0u8; PATH_MAX];
+                let mut w = plen;
+                child[..w].copy_from_slice(&base[..w]);
+                if w > 0 && child[w - 1] != b'/' {
+                    child[w] = b'/';
+                    w += 1;
+                }
+                if w + nl > PATH_MAX {
+                    return None;
+                }
+                child[w..w + nl].copy_from_slice(&dir[off + 2..off + 2 + nl]);
+                if !put(paths, lens, dirs, &mut n, &child[..w + nl], ty == 1) {
+                    return None;
+                }
+                off += 2 + nl;
+            }
+        }
+        i += 1;
+    }
+    Some(n)
+}
+
 #[no_mangle]
 pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     // Данные открытых файлов — в ленивой куче: NFILES страничных диапазонов, физпамять по факту.
@@ -298,7 +384,11 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     // бывает в сотни имён (у glibc `lib/gconv` — 255), и на 4 КиБ список снова начал бы упираться.
     const AREAS: usize = NFILES + 3;
     let kids_bytes = KIDS_MAX * 32;
-    let total = AREAS * DATA_MAX + kids_bytes;
+    // Веха 175 — плюс область под ОБХОД ПОДДЕРЕВА: список путей, он же очередь. Куча ленивая
+    // (`SYS_MAP` резервирует диапазон, страницы приходят по обращению), поэтому четверть
+    // мегабайта здесь ничего не стоит, пока каталоги не переименовывают.
+    let walk_bytes = WALK_MAX * PATH_MAX;
+    let total = AREAS * DATA_MAX + kids_bytes + walk_bytes;
     let heap = sys::heap_map(total);
     if heap == usize::MAX {
         sys::exit(1);
@@ -307,10 +397,18 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     let (files, rest) = all.split_at_mut(NFILES * DATA_MAX);
     let (scratch, rest) = rest.split_at_mut(DATA_MAX);
     let (ibuf, rest) = rest.split_at_mut(DATA_MAX);
-    let (repbuf, kidsb) = rest.split_at_mut(DATA_MAX);
+    let (repbuf, rest) = rest.split_at_mut(DATA_MAX);
+    let (kidsb, walkb) = rest.split_at_mut(kids_bytes);
     let kids = unsafe {
         core::slice::from_raw_parts_mut(kidsb.as_mut_ptr() as *mut [u8; 32], KIDS_MAX)
     };
+    let walk = unsafe {
+        core::slice::from_raw_parts_mut(walkb.as_mut_ptr() as *mut [u8; PATH_MAX], WALK_MAX)
+    };
+    // Длины и признак «каталог» — рядом со списком, но на стеке: пять килобайт, зато без ещё
+    // одного куска ленивой кучи и без арифметики смещений в двух местах.
+    let mut walk_len = [0usize; WALK_MAX];
+    let mut walk_dir = [false; WALK_MAX];
 
     // Метаданные слотов файлов (кэш открытых) и таблица дескрипторов.
     let mut paths = [[0u8; PATH_MAX]; NFILES]; // абсолютный путь файла в слоте
@@ -623,10 +721,61 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             OP_UNLINK => {
                 // req — путь. Файл: снять корень `f<path>` + убрать из родителя. Каталог: только
                 // пустой — снять `d<path>` + убрать из родителя. rep[0]: 0 ок / 1 ошибка.
+                //
+                // Веха 175 — режим 1 значит РЕКУРСИВНО: снять и всё, что внутри. Отдельным
+                // режимом, а не отдельной операцией: спрашивают то же самое («убери вот это»),
+                // разница только в согласии человека на потерю содержимого. И спрашивать его
+                // обязан тот, кто разговаривает с человеком, — файловый менеджер или шелл.
                 let pl = normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
                 if under_mount(path).is_some() {
+                    sys::reply(m.reply_cap, &rep[..1]);
+                    continue;
+                }
+                if pl > 1 && mode == 1 && read_index(store_cap, path, &mut dir, &mut idb).is_some()
+                {
+                    // Рекурсивное удаление: обойти поддерево и снять корень каждой записи.
+                    // Порядок не важен — пути собраны заранее, и родитель, снятый раньше
+                    // ребёнка, ничего о нём не забывает: связь тут через ИМЯ корня, а не ссылку.
+                    match subtree(store_cap, path, walk, &mut walk_len, &mut walk_dir) {
+                        None => {
+                            // Дерево не влезло в обход. Отказываем ЦЕЛИКОМ: половина удалённого
+                            // каталога хуже, чем неудалённый.
+                            sys::reply(m.reply_cap, &rep[..1]);
+                            continue;
+                        }
+                        Some(n) => {
+                            for i in 0..n {
+                                let p = &walk[i][..walk_len[i]];
+                                // Открытые слоты этого файла закрываем: иначе `close` вернул бы
+                                // содержимое на корень, который мы только что сняли.
+                                for k in 0..NFILES {
+                                    if fused[k] && &paths[k][..path_len[k]] == p {
+                                        fused[k] = false;
+                                        for d in 0..NFILES {
+                                            if fd_used[d] && fd_file[d] == k {
+                                                fd_used[d] = false;
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut rn = [0u8; ROOT_MAX];
+                                let rl = root_name(
+                                    if walk_dir[i] { b'd' } else { b'f' },
+                                    p,
+                                    &mut rn,
+                                );
+                                sys::obj_del_root(store_cap, &rn[..rl]);
+                            }
+                            let par = parent(path);
+                            let plen =
+                                read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
+                            let nlen = idx_remove(&mut dir, plen, leaf(path));
+                            write_index(store_cap, par, &dir[..nlen], &mut idb);
+                            rep[0] = 0;
+                        }
+                    }
                     sys::reply(m.reply_cap, &rep[..1]);
                     continue;
                 }
@@ -722,6 +871,78 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     // Переименование в самого себя — успех и НИКАКОЙ работы: иначе ниже мы бы
                     // сняли корень сразу после того, как его же поставили, и потеряли файл.
                     let same = old == new;
+
+                    // Веха 175 — КАТАЛОГ переименовывается и переезжает. В store каталогов как
+                    // объектов нет: путь входит в ИМЯ корня каждого потомка (`f<путь>`,
+                    // `d<путь>`), поэтому «переименовать каталог» — это перевесить корень
+                    // каждого потомка вглубь. Раньше файловый менеджер честно говорил, что не
+                    // умеет; теперь умеет — тем же обходом, что и рекурсивное удаление.
+                    if !same && onl > 1 && read_index(store_cap, old, &mut dir, &mut idb).is_some()
+                    {
+                        // Внутрь самого себя каталог не переезжает. Проверка обязательна: без неё
+                        // обход получил бы дерево, растущее по мере обхода, и не кончился бы.
+                        let inside = nnl > onl && newp[..onl] == oldp[..onl] && newp[onl] == b'/';
+                        let mut rd = [0u8; ROOT_MAX];
+                        let rf = root_name(b'd', new, &mut rd);
+                        let taken_d = sys::obj_get_root(store_cap, &rd[..rf], &mut idb) == 32;
+                        let rf = root_name(b'f', new, &mut rd);
+                        let taken_f = sys::obj_get_root(store_cap, &rd[..rf], &mut idb) == 32;
+                        if inside || taken_d || taken_f {
+                            sys::reply(m.reply_cap, &rep[..1]); // rep[0] уже 0xff — отказ
+                            continue;
+                        }
+                        let Some(n) = subtree(store_cap, old, walk, &mut walk_len, &mut walk_dir)
+                        else {
+                            // Дерево не влезло в обход. Отказываем ЦЕЛИКОМ: каталог, переехавший
+                            // наполовину, — это потерянные данные под правдоподобным именем.
+                            sys::reply(m.reply_cap, &rep[..1]);
+                            continue;
+                        };
+                        for i in 0..n {
+                            let plen = walk_len[i];
+                            let mut src = [0u8; PATH_MAX];
+                            src[..plen].copy_from_slice(&walk[i][..plen]);
+                            // Новый путь: НОВЫЙ корень плюс хвост старого пути после старого.
+                            let tail = &src[onl..plen];
+                            let mut dst = [0u8; PATH_MAX];
+                            if nnl + tail.len() > PATH_MAX {
+                                continue; // не поместилось — оставляем как было, скажем отказом
+                            }
+                            dst[..nnl].copy_from_slice(new);
+                            dst[nnl..nnl + tail.len()].copy_from_slice(tail);
+                            let (dl, sp) = (nnl + tail.len(), &src[..plen]);
+                            let dp = &dst[..dl];
+                            let kind = if walk_dir[i] { b'd' } else { b'f' };
+                            let mut ro = [0u8; ROOT_MAX];
+                            let mut rn = [0u8; ROOT_MAX];
+                            let rlo = root_name(kind, sp, &mut ro);
+                            let rln = root_name(kind, dp, &mut rn);
+                            if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
+                                sys::obj_set_root(store_cap, &rn[..rln], &idb);
+                                sys::obj_del_root(store_cap, &ro[..rlo]);
+                            }
+                            // Открытый файл под старым путём должен уехать вместе с ним: иначе
+                            // `close` вернул бы его содержимое на корень, которого больше нет.
+                            for k in 0..NFILES {
+                                if fused[k] && &paths[k][..path_len[k]] == sp {
+                                    paths[k][..dl].copy_from_slice(dp);
+                                    path_len[k] = dl;
+                                }
+                            }
+                        }
+                        // Индексы родителей: из старого имя убрать, в новый добавить каталогом.
+                        let pold = parent(old);
+                        let plen = read_index(store_cap, pold, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_remove(&mut dir, plen, leaf(old));
+                        write_index(store_cap, pold, &dir[..nlen], &mut idb);
+                        let pnew = parent(new);
+                        let plen = read_index(store_cap, pnew, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_add(&mut dir, plen, leaf(new), true);
+                        write_index(store_cap, pnew, &dir[..nlen], &mut idb);
+                        rep[0] = 0;
+                        sys::reply(m.reply_cap, &rep[..1]);
+                        continue;
+                    }
                     let mut ok = same;
                     // перевесить файл-корень f<old> → f<new>
                     let mut ro = [0u8; ROOT_MAX];

@@ -1170,10 +1170,23 @@ fn sh_mkdir(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// `(rm путь)` — удалить файл или пустой каталог (относительно cwd).
+/// `(rm путь)` — снять файл или ПУСТОЙ каталог. `(rm "-r" путь)` — вместе с содержимым.
+///
+/// Веха 175 — ключ отдельным аргументом, а не флагом у пути: вызов, который может потерять чужую
+/// работу, обязан выглядеть иначе, чем обычный. Порядок как в мире Unix (`rm -r путь`), потому
+/// что человек его уже знает.
 fn sh_rm(args: &[Value]) -> Result<Value, EvalError> {
-    let path = arg_path(args, "rm: (rm \"путь\")")?;
-    if px::unlink(cap_fs(), &path) != 0 {
-        return Err(EvalError::new("rm не удался (нет файла? каталог не пуст?)"));
+    let deep = matches!(args.first(), Some(Value::Str(s)) if &**s == "-r" || &**s == "-rf");
+    let rest = if deep { &args[1..] } else { args };
+    let path = arg_path(rest, "rm: (rm [\"-r\"] \"путь\")")?;
+    let ep = cap_fs();
+    let gone = if deep { px::unlink_all(ep, &path) } else { px::unlink(ep, &path) };
+    if gone != 0 {
+        return Err(EvalError::new(if deep {
+            "rm -r не удался (нет такого пути? слишком большое дерево?)"
+        } else {
+            "rm не удался (нет файла? каталог не пуст? — тогда `rm \"-r\"`)"
+        }));
     }
     Ok(Value::nil())
 }
@@ -1202,14 +1215,22 @@ fn sh_tail(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::nil())
 }
 
-/// `(mv старый новый)` — переименовать файл (оба пути — относительно cwd).
+/// `(mv старый новый)` — переименовать или переместить файл ИЛИ КАТАЛОГ (пути — от cwd).
+///
+/// Веха 175 — каталоги переехали наравне с файлами. Если цель — существующий каталог, содержимое
+/// кладётся ВНУТРЬ него (`mv /a /b` при живом `/b` даёт `/b/a`), как и положено `mv`.
 fn sh_mv(args: &[Value]) -> Result<Value, EvalError> {
     match (args.first(), args.get(1)) {
         (Some(Value::Str(o)), Some(Value::Str(n))) => {
             let old = resolve(o.as_bytes());
             let new = resolve(n.as_bytes());
             if px::rename(cap_fs(), &old, &new) != 0 {
-                return Err(EvalError::new("mv не удался (нет файла?)"));
+                // Причин ровно три, и человеку стоит знать все: чего-то нет, что-то уже
+                // занято, либо каталог просят переехать внутрь самого себя.
+                return Err(EvalError::new(
+                    "mv не удался: нет такого пути, либо цель занята, либо каталог переезжает \
+                     внутрь себя",
+                ));
             }
             Ok(Value::nil())
         }
