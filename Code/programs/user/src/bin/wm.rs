@@ -812,28 +812,46 @@ fn parse_rec(e: &void_conf::Entry) -> Option<Rec> {
     (!r.run.is_empty()).then_some(r)
 }
 
+/// Конфиг активного поколения: `system/current` → имя → `system/<имя>` → текст.
+///
+/// Веха 171 — **на каждом отказе говорит, на каком шаге он случился.** Раньше функция молча
+/// возвращала `None`, а вызывающий так же молча брал умолчания: композитор поднимался без обоев,
+/// без панели и с зашитой раскладкой — то есть выглядел работающим. Отличить «в конфиге так и
+/// написано» от «конфиг не прочитан» было нельзя ничем, и на живом ISO это стоило полудня.
 fn read_generation(scap: usize) -> Option<String> {
     let mut id = [0u8; 32];
     if sys::obj_get_root(scap, b"system/current", &mut id) != 32 {
+        sys::write_console("[wm] конфиг: нет корня system/current\n".as_bytes());
         return None;
     }
     let mut name = [0u8; 64];
     let n = sys::obj_get(scap, &id, &mut name);
     if n == 0 || n > name.len() {
+        sys::write_console("[wm] конфиг: имя поколения не прочиталось\n".as_bytes());
         return None;
     }
     let mut root = alloc::vec::Vec::from(&b"system/"[..]);
     root.extend_from_slice(&name[..n]);
     if sys::obj_get_root(scap, &root, &mut id) != 32 {
+        sys::write_console("[wm] конфиг: нет корня ".as_bytes());
+        sys::write_console(&root);
+        sys::write_console(b"\n");
         return None;
     }
     let mut buf = vec![0u8; 64 * 1024];
     let n = sys::obj_get(scap, &id, &mut buf);
     if n == 0 || n > buf.len() {
+        sys::write_console("[wm] конфиг: текст поколения не прочитался\n".as_bytes());
         return None;
     }
     buf.truncate(n);
-    String::from_utf8(buf).ok()
+    match String::from_utf8(buf) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            sys::write_console("[wm] конфиг: текст поколения не UTF-8\n".as_bytes());
+            None
+        }
+    }
 }
 
 fn main_loop() -> ! {

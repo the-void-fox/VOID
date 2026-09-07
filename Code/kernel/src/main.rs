@@ -79,6 +79,7 @@ mod linux;
 mod lxfs;
 mod object;
 mod proc;
+mod ramdisk;
 mod jitter;
 mod random;
 mod shm;
@@ -285,10 +286,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // текстового буфера уже нет, и без этого шага экран молчал бы до самого `platform_init`.
     arch::console_init(hartid, dtb);
     println!();
+    // Версия берётся из `Cargo.toml` (`version.workspace`), а не пишется здесь буквами. Так
+    // баннер не может отстать от системы: за первые сто семьдесят вех он назывался «Вехой 41»,
+    // хотя к тому времени успел появиться композитор, свой шелл и многоядерность. Число, которое
+    // надо править руками, рано или поздно врёт — значит править его руками нельзя.
     println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║  VOID — Веха 41                           ║");
-    println!("  ║  платформа: загрузка на реальном железе   ║");
-    println!("  ║  (multiboot/GRUB, VGA, карта памяти)      ║");
+    println!("  ║  VOID {:<35}║", env!("CARGO_PKG_VERSION"));
+    println!("  ║  объектная ОС · riscv64 · x86_64         ║");
     println!("  ╚══════════════════════════════════════════╝");
     println!();
     println!("  hart id : {}", hartid);
@@ -367,11 +371,22 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // Веха 7.1/47: подключить диск (нужен для персистентности). Сперва AHCI — так стоит диск
     // на реальном x86-железе (SATA); в QEMU virt/q35 его нет → откат на virtio-blk (mmio/pci).
+    // Веха 171 — третьим идёт ОБРАЗ В ПАМЯТИ, привезённый загрузчиком: так грузится живой ISO,
+    // у которого записываемого носителя нет вовсе. Порядок именно такой: настоящий диск всегда
+    // лучше памяти, потому что переживает выключение.
     if ahci::init() {
         object::use_ahci();
         println!("  [blk]  AHCI SATA: {} секторов", ahci::capacity_sectors());
     } else if virtio_blk::init() {
         println!("  [blk]  virtio-blk: {} секторов", virtio_blk::capacity_sectors());
+    } else if ramdisk::init() {
+        object::use_ramdisk();
+        println!(
+            "  [blk]  store живёт В ПАМЯТИ ({} секторов из загрузочного образа)",
+            ramdisk::capacity_sectors(),
+        );
+        println!("  [blk]  ЖИВОЙ НОСИТЕЛЬ: всё, что вы измените, исчезнет при перезагрузке.");
+        println!("  [blk]  Оставить систему насовсем — команда `install` (пишет на SATA-диск).");
     } else {
         println!("  [blk]  диск не найден — персистентность недоступна!");
     }

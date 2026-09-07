@@ -134,13 +134,23 @@ pub fn init() -> bool {
     dev.capacity = dev.total; // по умолчанию весь диск
 
     // 5) Веха 48 — прочитать MBR (СЫРОЙ сектор 0, base ещё 0) и найти раздел store VOID.
-    //    Есть — store живёт на его смещении (диск разбит: p1 загрузчик, p2 store). Нет MBR/
-    //    раздела — store с сектора 0 на весь диск (обратная совместимость с QEMU-образом).
+    //    Есть — store живёт на его смещении (диск разбит: p1 загрузчик, p2 store). Нет MBR
+    //    вовсе — store с сектора 0 на весь диск (обратная совместимость с QEMU-образом).
+    //
+    // Веха 171 — **чужой диск НЕ БЕРЁМ**. Раньше правило было «нет нашего раздела — значит весь
+    // диск наш», и пока VOID запускал только владелец на своей машине, это было безобидно. С
+    // живого ISO система загружается у постороннего человека, и первый же коммит store лёг бы
+    // поверх его таблицы разделов. Поэтому: размеченный диск без раздела [`VOID_STORE_TYPE`]
+    // считается ЧУЖИМ, носителем store не становится (система уедет на образ в памяти —
+    // [`crate::ramdisk`]), а `install` при этом остаётся доступен: устройство зарегистрировано,
+    // и разметить диск по явной просьбе человека он по-прежнему может.
+    let mut foreign = false;
     if dev.command(ATA_READ_DMA_EXT, 0, false) {
         unsafe {
             let m = crate::frame::ptr(buf) as *const u8;
             let sig = m.add(510).read_volatile() == 0x55 && m.add(511).read_volatile() == 0xaa;
             if sig {
+                let mut found = false;
                 for i in 0..4 {
                     let e = m.add(446 + i * 16);
                     if e.add(4).read_volatile() == VOID_STORE_TYPE {
@@ -152,15 +162,25 @@ pub fn init() -> bool {
                         };
                         dev.base = rd_le(8); // LBA начала раздела
                         dev.capacity = rd_le(12); // число секторов раздела
+                        found = true;
                         break;
                     }
                 }
+                foreign = !found;
             }
         }
     }
 
+    if foreign {
+        dev.capacity = 0; // не носитель: ни одного сектора store на этом диске нет
+    }
     *AHCI.lock() = Some(dev);
-    true
+    if foreign {
+        crate::println!(
+            "  [blk]  SATA-диск размечен НЕ ПОД VOID — не трогаем его (поставить систему: `install`)"
+        );
+    }
+    !foreign
 }
 
 impl Ahci {

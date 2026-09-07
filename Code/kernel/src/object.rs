@@ -12,7 +12,7 @@
 //! Порядок замков прежний: `with`/`gc` держат STORE, чтение диска берёт замок BLK
 //! внутри virtio_blk (STORE→BLK).
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use alloc::vec::Vec;
 
@@ -22,14 +22,37 @@ use void_store::{BlockIo, Store, SECTOR};
 use crate::sync::SpinLock;
 use crate::{ahci, println, timer, virtio_blk};
 
-/// Веха 47 — какой носитель активен: AHCI (реальный SATA) или virtio-blk (QEMU). Выбор
-/// делает загрузка ([`use_ahci`]): на железе поднялся AHCI — сектора идут через него,
-/// иначе — через virtio-blk. Формат сектора одинаков (512 Б), поэтому store не различает.
-static AHCI_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Веха 47/171 — КАКОЙ НОСИТЕЛЬ активен. Выбор делает загрузка (`kmain`), перебирая их в
+/// порядке «настоящий диск, потом память»: на железе поднялся AHCI (SATA), в виртуальной
+/// машине — virtio-blk, а если диска нет вовсе (загрузка с ISO), носителем становится образ,
+/// привезённый загрузчиком в RAM ([`crate::ramdisk`]). Формат сектора у всех трёх одинаков
+/// (512 Б), поэтому сам store их не различает — и это главное: путь записи ОДИН.
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum Medium {
+    Virtio = 0,
+    Ahci = 1,
+    Ram = 2,
+}
+
+static MEDIUM: AtomicU8 = AtomicU8::new(Medium::Virtio as u8);
+
+fn medium() -> Medium {
+    match MEDIUM.load(Ordering::Relaxed) {
+        1 => Medium::Ahci,
+        2 => Medium::Ram,
+        _ => Medium::Virtio,
+    }
+}
 
 /// Переключить носитель store на AHCI (зовёт `kmain`, когда `ahci::init()` удался).
 pub fn use_ahci() {
-    AHCI_ACTIVE.store(true, Ordering::Relaxed);
+    MEDIUM.store(Medium::Ahci as u8, Ordering::Relaxed);
+}
+
+/// Веха 171 — носителем становится образ в оперативной памяти (загрузка с ISO, диска нет).
+pub fn use_ramdisk() {
+    MEDIUM.store(Medium::Ram as u8, Ordering::Relaxed);
 }
 
 /// Веха 48 — «заморозка»: после установки на диск ([`crate::install`]) раскладка диска сменилась,
@@ -48,29 +71,29 @@ struct Disk;
 
 impl BlockIo for Disk {
     fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR]) -> bool {
-        if AHCI_ACTIVE.load(Ordering::Relaxed) {
-            ahci::read(sector, buf)
-        } else {
-            virtio_blk::read(sector, buf)
+        match medium() {
+            Medium::Ahci => ahci::read(sector, buf),
+            Medium::Ram => crate::ramdisk::read(sector, buf),
+            Medium::Virtio => virtio_blk::read(sector, buf),
         }
     }
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool {
         if FROZEN.load(Ordering::Relaxed) {
             return true; // Веха 48: после установки диск заморожен — коммиты «успешны», но без записи
         }
-        if AHCI_ACTIVE.load(Ordering::Relaxed) {
-            ahci::write(sector, buf)
-        } else {
-            virtio_blk::write(sector, buf)
+        match medium() {
+            Medium::Ahci => ahci::write(sector, buf),
+            Medium::Ram => crate::ramdisk::write(sector, buf),
+            Medium::Virtio => virtio_blk::write(sector, buf),
         }
     }
     /// Веха 89 — ёмкость носителя store в секторах: раздел p2 на реальном диске (AHCI сам держит
     /// смещение раздела) либо весь virtio-диск. 0 — устройства нет, проверок не будет.
     fn capacity(&mut self) -> u64 {
-        if AHCI_ACTIVE.load(Ordering::Relaxed) {
-            ahci::capacity_sectors()
-        } else {
-            virtio_blk::capacity_sectors()
+        match medium() {
+            Medium::Ahci => ahci::capacity_sectors(),
+            Medium::Ram => crate::ramdisk::capacity_sectors(),
+            Medium::Virtio => virtio_blk::capacity_sectors(),
         }
     }
 }
@@ -268,19 +291,27 @@ fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
 
 /// Веха 89 — сказать вслух, если носитель соврал. Целостность, о которой молчат, бесполезна:
 /// расхождение хэша или отказ записи означают, что диск портит данные, и узнать об этом надо
-/// в момент события, а не когда система не поднимется. Печатаем ОДИН раз на каждое новое
-/// расхождение (счётчики монотонные), чтобы не залить консоль на сыплющемся диске.
+/// в момент события, а не когда система не поднимется.
+///
+/// Веха 171 — говорить РЕЖЕ, чем растёт счётчик. «Один раз на каждое новое расхождение» звучало
+/// осторожно, но у этого рассуждения был неявный посыл: что отказы редки. Стоило загрузиться без
+/// диска вовсе (ISO), и отказом кончался КАЖДЫЙ коммит — консоль залило тысячами одинаковых
+/// строк, и за ними не стало видно ни рабочего стола, ни настоящих сообщений. Порог теперь
+/// растёт вдесятеро: 1, 10, 100… — первое событие видно сразу, а сыплющийся носитель не может
+/// сделать журнал бесполезным.
 fn report_integrity(corrupt_reads: u64, failed_writes: u64) {
-    static SEEN_R: AtomicU64 = AtomicU64::new(0);
-    static SEEN_W: AtomicU64 = AtomicU64::new(0);
-    if corrupt_reads > SEEN_R.swap(corrupt_reads, Ordering::Relaxed) {
+    static NEXT_R: AtomicU64 = AtomicU64::new(1);
+    static NEXT_W: AtomicU64 = AtomicU64::new(1);
+    if corrupt_reads >= NEXT_R.load(Ordering::Relaxed) {
+        NEXT_R.store(corrupt_reads.saturating_mul(10).max(10), Ordering::Relaxed);
         println!(
             "  [store] ЦЕЛОСТНОСТЬ: кадр с диска не сошёлся со своим content-id ({} раз) — \
              объект считается недоступным, мусор в store не попал",
             corrupt_reads,
         );
     }
-    if failed_writes > SEEN_W.swap(failed_writes, Ordering::Relaxed) {
+    if failed_writes >= NEXT_W.load(Ordering::Relaxed) {
+        NEXT_W.store(failed_writes.saturating_mul(10).max(10), Ordering::Relaxed);
         println!(
             "  [store] ЗАПИСЬ ОТКАЗАНА ({} раз) — коммит не состоялся, на диске прежнее \
              консистентное поколение",
