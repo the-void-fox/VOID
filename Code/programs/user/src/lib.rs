@@ -1023,9 +1023,63 @@ pub fn start_cap(i: usize) -> usize {
 /// `SYS_INSTALL(store_cap)` (Веха 48): установить VOID на AHCI-диск из загрузочного модуля
 /// (образ с USB). Нужен store-cap с правом WRITE. **ДИСК СТИРАЕТСЯ.** `Some(p2_start)` — успех
 /// (store заморожен, нужен ребут без USB); `None` — отказ (нет диска/образа/прав), система цела.
-pub fn install(store_cap: usize) -> Option<u64> {
-    let r = abi::syscall(SYS_INSTALL, store_cap, 0, 0, 0, 0, 0, 0).0;
+pub fn install(store_cap: usize, slot: usize) -> Option<u64> {
+    let r = abi::syscall(SYS_INSTALL, store_cap, 1, slot, 0, 0, 0, 0).0;
     (r != NO_CAP).then_some(r as u64)
+}
+
+/// Веха 174 — размер записи о диске в [`disks`]. Тот же в ядре (`proc::INSTALL_REC`).
+pub const INSTALL_REC: usize = 56;
+
+/// Что установщик знает про один диск. Разбирается из записи [`INSTALL_REC`] байт.
+pub struct DiskInfo {
+    /// Номер диска — им же он и называется ядру при установке.
+    pub slot: usize,
+    /// Полная ёмкость в секторах по 512 Б.
+    pub sectors: u64,
+    /// Модель из IDENTIFY, уже без хвостовых пробелов.
+    pub model: [u8; 40],
+    pub model_len: usize,
+    /// На диске уже есть раздел VOID.
+    pub void: bool,
+    /// С этого диска работает система прямо сейчас — ставить на него нельзя.
+    pub live: bool,
+}
+
+/// `SYS_INSTALL(store_cap, 0, …)` — СПРОСИТЬ, какие в машине диски (Веха 174).
+///
+/// Возвращает сколько дисков описано. Буфер даёт вызывающий: ядро не выделяет память за
+/// программу, как и во всех прочих вызовах, отдающих список.
+pub fn disks(store_cap: usize, out: &mut [DiskInfo]) -> usize {
+    let mut buf = [0u8; INSTALL_REC * 8];
+    let want = out.len().min(buf.len() / INSTALL_REC);
+    let n = abi::syscall(
+        SYS_INSTALL, store_cap, 0, 0, buf.as_mut_ptr() as usize, want * INSTALL_REC, 0, 0,
+    ).0;
+    if n == NO_CAP {
+        return 0;
+    }
+    let n = n.min(want);
+    for i in 0..n {
+        let r = &buf[i * INSTALL_REC..(i + 1) * INSTALL_REC];
+        let mut model = [0u8; 40];
+        model.copy_from_slice(&r[16..56]);
+        // Хвостовые пробелы в IDENTIFY — часть формата, а не имени: ATA дополняет ими строку до
+        // сорока знаков. Показывать их человеку значит показывать формат.
+        let mut len = model.len();
+        while len > 0 && (model[len - 1] == b' ' || model[len - 1] == 0) {
+            len -= 1;
+        }
+        out[i] = DiskInfo {
+            slot: u32::from_le_bytes([r[8], r[9], r[10], r[11]]) as usize,
+            sectors: u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]),
+            model,
+            model_len: len,
+            void: r[12] & 1 != 0,
+            live: r[12] & 2 != 0,
+        };
+    }
+    n
 }
 
 /// `SYS_MMIO_MAP(mmio_cap, va)` (Веха 51): замапить окно MMIO устройства (регистры железа) в свой

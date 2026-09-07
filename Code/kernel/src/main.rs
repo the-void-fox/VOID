@@ -127,7 +127,6 @@ static PROGRAMS: &[(&str, &[u8])] = &[
     ("freeze", include_bytes!(env!("PROG_FREEZE"))),
     ("e1000d", include_bytes!(env!("PROG_E1000D"))),
     ("lx_e1000", include_bytes!(env!("PROG_LX_E1000"))),
-    ("install", include_bytes!(env!("PROG_INSTALL"))),
     ("vvsh", include_bytes!(env!("PROG_VVSH"))),
     ("httpsc", include_bytes!(env!("PROG_HTTPSC"))),
     ("spawn-demo", include_bytes!(env!("PROG_SPAWN_DEMO"))),
@@ -208,6 +207,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // случаю, а обычная строка автозапуска в конфиге (`autostart welcome`): в этом и весь его
     // рассказ — он объясняет конфигурацию, будучи её же примером.
     ("welcome", include_bytes!(env!("PROG_WELCOME"))),
+    // Веха 174 — установщик: окно со списком дисков. Сеется только на живом носителе (см. ниже),
+    // но x86-only теперь и по второй причине — у него есть экран.
+    ("install", include_bytes!(env!("PROG_INSTALL"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

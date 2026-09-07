@@ -10,7 +10,7 @@ use std::process::Command;
 const PROGRAMS: &[&str] = &[
     "hello", "vsh", "posixfs", "mini-sh", "blk-srv", "blk-cli", "obj-srv", "obj-cli", "cap-srv",
     "cap-cli", "busy", "heap", "crash", "bench", "net-srv", "threads", "freeze", "e1000d",
-    "lx_e1000", "install", "vvsh", "httpsc", "spawn-demo", "stdio-demo", "pkg", "klog", "ved",
+    "lx_e1000", "vvsh", "httpsc", "spawn-demo", "stdio-demo", "pkg", "klog", "ved",
     "hostile", "run", "probe", "ps",
 ];
 
@@ -25,6 +25,9 @@ const PROGRAMS: &[&str] = &[
 const PROGRAMS_X86: &[&str] = &[
     "term", "wm", "winbox", "img", "wall", "bar", "launcher", "roots", "taskmgr", "fm", "fps",
     "welcome",
+    // Веха 174 — установщик стал ОКНОМ (список дисков, выбор, подтверждение), а окна бывают
+    // только там, где есть экран. Текстовый путь у него остался, но живёт он в том же бинаре.
+    "install",
 ];
 
 /// Веха 132 — C-драйверы (портированный код Linux, сборка nix'ом). Едут семенами В ЯДРЕ, как и

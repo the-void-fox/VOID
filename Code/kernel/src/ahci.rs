@@ -68,6 +68,32 @@ struct Ahci {
     capacity: u64, // ёмкость store в секторах (раздел p2 или весь диск)
     base: u64, // Веха 48 — LBA начала store: 0 (весь диск) или начало раздела VOID
     total: u64, // Веха 48 — полная ёмкость диска в секторах (для установщика)
+    /// Веха 174 — номер порта AHCI. Он же ИМЯ диска для установщика: список дисков нумеруется
+    /// по порядку портов, и по этому номеру человек выбирает, куда ставить.
+    slot: usize,
+    /// Веха 174 — модель диска из IDENTIFY (слова 27..46, по два знака на слово, старший первым).
+    /// Показывается человеку: «поставить на диск 0» — не выбор, а угадывание.
+    model: [u8; MODEL_LEN],
+    /// Веха 174 — есть ли на диске раздел VOID. Установщику это единственный способ сказать
+    /// «здесь уже стоит система», не читая её содержимого.
+    void: bool,
+}
+
+/// Длина строки модели в IDENTIFY: слова 27..46 — это 40 знаков.
+pub const MODEL_LEN: usize = 40;
+
+/// Веха 174 — что установщик показывает человеку про один диск.
+#[derive(Clone, Copy)]
+pub struct Disk {
+    /// Номер порта — им же диск и выбирают.
+    pub slot: usize,
+    /// Полная ёмкость в секторах по 512 Б.
+    pub sectors: u64,
+    pub model: [u8; MODEL_LEN],
+    /// На диске уже есть раздел VOID.
+    pub void: bool,
+    /// С этого диска работает СЕЙЧАШНИЙ store — ставить на него нельзя.
+    pub live: bool,
 }
 
 unsafe impl Send for Ahci {}
@@ -83,14 +109,15 @@ unsafe fn wr(addr: usize, v: u32) {
     core::ptr::write_volatile(addr as *mut u32, v);
 }
 
-/// Инициализировать AHCI-диск, если он есть. `true` — готов к чтению/записи.
-pub fn init() -> bool {
-    let Some((abar, port_num)) = crate::arch::probe_ahci() else {
-        return false;
-    };
+/// Подключить диск на порту `port_num` и опросить его. `None` — порт не отвечает.
+///
+/// Веха 174 — отдельно от [`init`], потому что портов бывает несколько: store живёт на одном, а
+/// установщик спрашивает про все и пишет на выбранный. Раньше эта работа была телом `init`, и
+/// «диск» в драйвере существовал ровно один — тот, что нашёлся первым.
+fn open(abar: usize, port_num: u32) -> Option<Ahci> {
     let port = abar + 0x100 + port_num as usize * 0x80;
-    let Some(frame_a) = frame::alloc() else { return false };
-    let Some(buf) = frame::alloc() else { return false };
+    let frame_a = frame::alloc()?;
+    let buf = frame::alloc()?;
 
     unsafe {
         // 1) Остановить порт: снять ST, дождаться CR=0; снять FRE, дождаться FR=0.
@@ -115,11 +142,24 @@ pub fn init() -> bool {
         wr(port + PX_CMD, rd(port + PX_CMD) | CMD_ST);
     }
 
-    let mut dev = Ahci { port, frame_a, buf, capacity: 0, base: 0, total: 0 };
+    let mut dev = Ahci {
+        port,
+        frame_a,
+        buf,
+        capacity: 0,
+        base: 0,
+        total: 0,
+        slot: port_num as usize,
+        model: [0; MODEL_LEN],
+        void: false,
+    };
 
-    // 4) IDENTIFY DEVICE → полная ёмкость диска (LBA48 в словах 100..103, иначе LBA28 в 60..61).
+    // 4) IDENTIFY DEVICE → полная ёмкость диска (LBA48 в словах 100..103, иначе LBA28 в 60..61)
+    //    и МОДЕЛЬ (слова 27..46: по два знака на слово, старший байт первым).
     if !dev.command(ATA_IDENTIFY, 0, false) {
-        return false;
+        frame::free(frame_a);
+        frame::free(buf);
+        return None;
     }
     unsafe {
         let id = crate::frame::ptr(buf) as *const u16;
@@ -130,6 +170,11 @@ pub fn init() -> bool {
         let lba28 =
             id.add(60).read_volatile() as u64 | (id.add(61).read_volatile() as u64) << 16;
         dev.total = if lba48 != 0 { lba48 } else { lba28 };
+        for i in 0..MODEL_LEN / 2 {
+            let w = id.add(27 + i).read_volatile();
+            dev.model[i * 2] = (w >> 8) as u8;
+            dev.model[i * 2 + 1] = w as u8;
+        }
     }
     dev.capacity = dev.total; // по умолчанию весь диск
 
@@ -170,22 +215,140 @@ pub fn init() -> bool {
         }
     }
 
+    dev.void = ours;
     if !ours {
         dev.capacity = 0; // не носитель: ни одного сектора store на этом диске нет
     }
-    *AHCI.lock() = Some(dev);
-    if !ours {
-        crate::println!(
-            "  [blk]  SATA-диск ({} секторов) — БЕЗ раздела VOID, не трогаем его; поставить систему: `install`",
-            dev_total(),
-        );
-    }
-    ours
+    Some(dev)
 }
 
-/// Полная ёмкость подключённого диска — для сообщения выше (устройство уже под замком).
-fn dev_total() -> u64 {
-    AHCI.lock().as_ref().map_or(0, |d| d.total)
+/// Отпустить фреймы диска, которым больше не пользуемся (перечисление, смена цели установки).
+fn close(dev: Ahci) {
+    unsafe {
+        // Порт остановить: DMA по нашим фреймам после их освобождения — порча памяти, которую
+        // не свяжет с причиной никто.
+        wr(dev.port + PX_CMD, rd(dev.port + PX_CMD) & !(CMD_ST | CMD_FRE));
+        for _ in 0..1_000_000 {
+            if rd(dev.port + PX_CMD) & (CMD_CR | CMD_FR) == 0 {
+                break;
+            }
+        }
+    }
+    frame::free(dev.frame_a);
+    frame::free(dev.buf);
+}
+
+/// Инициализировать диск ПОД STORE, если он есть. `true` — готов к чтению/записи.
+///
+/// Веха 174 — перебираем все порты и берём тот, на котором лежит раздел VOID. Раньше брался
+/// первый попавшийся, и на машине с двумя дисками система молча зависела от порядка портов.
+pub fn init() -> bool {
+    let Some((abar, ports, n)) = crate::arch::probe_ahci_ports() else {
+        return false;
+    };
+    ABAR.store(abar, Ordering::Relaxed);
+    let mut seen = 0usize;
+    for &p in ports.iter().take(n) {
+        let Some(dev) = open(abar, p) else { continue };
+        seen += 1;
+        if dev.void {
+            *AHCI.lock() = Some(dev);
+            return true;
+        }
+        close(dev);
+    }
+    if seen > 0 {
+        crate::println!(
+            "  [blk]  SATA-дисков {} — ни на одном нет раздела VOID, не трогаем их (поставить систему: `install`)",
+            seen,
+        );
+    }
+    false
+}
+
+/// ABAR найденного контроллера — по нему установщик открывает выбранный порт.
+static ABAR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Веха 174 — ПЕРЕЧИСЛИТЬ диски для установщика. Возвращает, сколько записано в `out`.
+///
+/// Каждый порт открывается и тут же закрывается: держать восемь устройств живыми ради списка,
+/// который смотрят раз в жизни, значило бы занять по два фрейма на каждое навсегда.
+pub fn disks(out: &mut [Disk]) -> usize {
+    let abar = ABAR.load(Ordering::Relaxed);
+    let Some((_, ports, n)) = crate::arch::probe_ahci_ports() else {
+        return 0;
+    };
+    let live = AHCI.lock().as_ref().map(|d| d.slot);
+    let mut k = 0usize;
+    for &p in ports.iter().take(n) {
+        if k == out.len() {
+            break;
+        }
+        // Порт, на котором работает store, НЕ ТРОГАЕМ: он уже открыт, и второй `open` сбросил бы
+        // ему базы команд посреди чужой работы. Всё нужное про него мы и так знаем.
+        if live == Some(p as usize) {
+            if let Some(d) = AHCI.lock().as_ref() {
+                out[k] = Disk { slot: d.slot, sectors: d.total, model: d.model, void: d.void, live: true };
+                k += 1;
+            }
+            continue;
+        }
+        let Some(dev) = open(if abar != 0 { abar } else { 0 }, p) else { continue };
+        out[k] = Disk { slot: dev.slot, sectors: dev.total, model: dev.model, void: dev.void, live: false };
+        k += 1;
+        close(dev);
+    }
+    k
+}
+
+/// Веха 174 — ЦЕЛЬ УСТАНОВКИ: диск, выбранный человеком. Отдельно от [`AHCI`], потому что это
+/// разные вещи: с одного система работает, на другой её ставят, и путать их нельзя ни на шаг.
+static TARGET: SpinLock<Option<Ahci>> = SpinLock::new(None);
+
+/// Открыть диск на порту `slot` как цель установки. `false` — порта нет либо это наш store.
+pub fn target_open(slot: usize) -> bool {
+    if AHCI.lock().as_ref().map(|d| d.slot) == Some(slot) {
+        return false; // ставить на диск, с которого работаем, нельзя — см. [`TARGET`]
+    }
+    let abar = ABAR.load(Ordering::Relaxed);
+    let Some((_, ports, n)) = crate::arch::probe_ahci_ports() else {
+        return false;
+    };
+    if !ports.iter().take(n).any(|&p| p as usize == slot) {
+        return false;
+    }
+    let Some(dev) = open(abar, slot as u32) else { return false };
+    if let Some(old) = TARGET.lock().take() {
+        close(old);
+    }
+    *TARGET.lock() = Some(dev);
+    true
+}
+
+/// Полная ёмкость ЦЕЛИ установки в секторах (0 — цель не выбрана).
+pub fn target_sectors() -> u64 {
+    TARGET.lock().as_ref().map_or(0, |d| d.total)
+}
+
+/// Абсолютная запись сектора на ЦЕЛЬ установки (без смещения раздела).
+pub fn target_write(sector: u64, buf: &[u8; SECTOR]) -> bool {
+    let g = TARGET.lock();
+    let Some(d) = g.as_ref() else { return false };
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::frame::ptr(d.buf), SECTOR) };
+    d.command(ATA_WRITE_DMA_EXT, sector, true)
+}
+
+/// Абсолютное чтение сектора с ЦЕЛИ установки.
+pub fn target_read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
+    let g = TARGET.lock();
+    let Some(d) = g.as_ref() else { return false };
+    if !d.command(ATA_READ_DMA_EXT, sector, false) {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(crate::frame::ptr(d.buf) as *const u8, buf.as_mut_ptr(), SECTOR)
+    };
+    true
 }
 
 impl Ahci {
@@ -286,22 +449,3 @@ pub fn write(sector: u64, buf: &[u8; SECTOR]) -> bool {
     d.command(ATA_WRITE_DMA_EXT, d.base + sector, true)
 }
 
-/// Веха 48 — АБСОЛЮТНАЯ запись сектора диска (БЕЗ смещения раздела) — для установщика:
-/// он кладёт загрузочный образ (MBR, ядро, GRUB) в начало ДИСКА, а не в раздел store.
-pub fn write_abs(sector: u64, buf: &[u8; SECTOR]) -> bool {
-    let g = AHCI.lock();
-    let Some(d) = g.as_ref() else { return false };
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), crate::frame::ptr(d.buf), SECTOR) };
-    d.command(ATA_WRITE_DMA_EXT, sector, true)
-}
-
-/// Веха 48 — АБСОЛЮТНОЕ чтение сектора диска (для установщика: правка таблицы разделов в MBR).
-pub fn read_abs(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
-    let g = AHCI.lock();
-    let Some(d) = g.as_ref() else { return false };
-    if !d.command(ATA_READ_DMA_EXT, sector, false) {
-        return false;
-    }
-    unsafe { core::ptr::copy_nonoverlapping(crate::frame::ptr(d.buf) as *const u8, buf.as_mut_ptr(), SECTOR) };
-    true
-}

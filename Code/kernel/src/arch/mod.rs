@@ -88,7 +88,10 @@ pub use imp::{
     // trap'ы и контексты
     context_switch, enter_user, trap_init, Context, TrapFrame,
     // устройства (Веха 27, virtio-net — Веха 34, AHCI — Веха 47, e1000 — Веха 49, IRQ — Веха 52)
-    e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net,
+    e1000_irq_setup, probe_e1000, probe_virtio_blk, probe_virtio_net,
+    // Веха 174 — ВСЕ порты AHCI с дисками и потолок их числа: установщик спрашивает человека,
+    // куда ставить, и список из одного диска на машине с двумя — не выбор, а лотерея.
+    probe_ahci_ports, MAX_DISKS,
     // virtio-rng (долг Вехи 86, закрыт перед 95): аппаратная энтропия от гипервизора
     probe_virtio_rng,
     userdrv_irq_arm,

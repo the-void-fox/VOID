@@ -8,7 +8,7 @@
 //!
 //! Шаги [`run`]:
 //! 1. записать загрузочный префикс образа (сектора 0..начало p2: MBR + зазор с core.img + p1 FAT)
-//!    на диск АБСОЛЮТНО ([`crate::ahci::write_abs`]);
+//!    на диск АБСОЛЮТНО ([`crate::ahci::target_write`]);
 //! 2. поправить в MBR диска раздел p2 (store) — растянуть на весь реальный диск;
 //! 3. обнулить начало p2 → на ребуте store увидит «пусто» и засеет программы заново;
 //! 4. ЗАМОРОЗИТЬ текущий store ([`crate::object::freeze`]) — его кэш больше не должен писать на
@@ -18,12 +18,18 @@
 
 /// Выполнить установку на AHCI-диск. `Ok(p2_start)` — префикс записан, диск размечен, store
 /// заморожен (нужен ребут). `Err(причина)` — не сложилось (диск/образ не годны), система цела.
-pub fn run() -> Result<u64, &'static str> {
+pub fn run(slot: usize) -> Result<u64, &'static str> {
     let (mbase, mlen) =
         crate::arch::boot_module().ok_or("нет образа установки (модуль multiboot2 с USB)")?;
-    let total = crate::ahci::total_sectors();
+    // Веха 174 — ставим на ВЫБРАННЫЙ диск, а не на «тот, что нашёлся первым». Открытие цели
+    // само отказывает, если названный порт — это диск, с которого работает store: система,
+    // стирающая диск из-под себя, не установка, а потеря.
+    if !crate::ahci::target_open(slot) {
+        return Err("такого диска нет либо это диск, с которого работает система");
+    }
+    let total = crate::ahci::target_sectors();
     if total == 0 {
-        return Err("нет AHCI-диска (установка только на SATA)");
+        return Err("диск не отвечает на IDENTIFY");
     }
     // Веха 87: GRUB кладёт модуль в RAM и сообщает ФИЗИЧЕСКИЙ адрес — читаем через direct-map.
     let img = unsafe { core::slice::from_raw_parts(crate::frame::ptr(mbase), mlen) };
@@ -49,18 +55,18 @@ pub fn run() -> Result<u64, &'static str> {
     for s in 0..p2_start {
         let o = (s as usize) * 512;
         sec.copy_from_slice(&img[o..o + 512]);
-        if !crate::ahci::write_abs(s, &sec) {
+        if !crate::ahci::target_write(s, &sec) {
             return Err("сбой записи загрузочного префикса на диск");
         }
     }
 
     // 2) MBR диска: растянуть p2 (store) на весь диск — num_sectors@+12 = total − p2_start.
-    if !crate::ahci::read_abs(0, &mut sec) {
+    if !crate::ahci::target_read(0, &mut sec) {
         return Err("сбой чтения MBR после записи");
     }
     let cnt = ((total - p2_start) as u32).to_le_bytes();
     sec[p2 + 12..p2 + 16].copy_from_slice(&cnt);
-    if !crate::ahci::write_abs(0, &sec) {
+    if !crate::ahci::target_write(0, &sec) {
         return Err("сбой записи MBR");
     }
 
@@ -68,12 +74,15 @@ pub fn run() -> Result<u64, &'static str> {
     //    и засеет программы (как первый запуск), не подхватив мусор старого содержимого диска.
     let zero = [0u8; 512];
     for s in 0..64u64 {
-        if !crate::ahci::write_abs(p2_start + s, &zero) {
+        if !crate::ahci::target_write(p2_start + s, &zero) {
             return Err("сбой очистки области store");
         }
     }
 
-    // 4) Заморозить текущий store: раскладку диска мы уже сменили, его кэш писать туда нельзя.
-    crate::object::freeze();
+    // Веха 174 — заморозки store БОЛЬШЕ НЕТ, и это следствие выбора диска. Она стояла здесь
+    // потому, что установка меняла раскладку диска, С КОТОРОГО СИСТЕМА И РАБОТАЛА: писать туда
+    // дальше значило затереть свежий образ. Теперь установщик на такой диск не ставит вовсе
+    // (`target_open` отказывает), а живой носитель держит store в памяти — замораживать нечего.
+    // Заодно сеанс переживает установку: человек может смотреть систему дальше.
     Ok(p2_start)
 }

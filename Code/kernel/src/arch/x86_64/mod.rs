@@ -35,8 +35,8 @@ core::arch::global_asm!(include_str!("enter_user.s"));
 core::arch::global_asm!(include_str!("ap.s"));
 
 pub use pci::{
-    e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_virtio_rng,
-    probe_xhci,
+    e1000_irq_setup, probe_ahci_ports, probe_e1000, probe_virtio_blk, probe_virtio_net,
+    probe_virtio_rng, probe_xhci, MAX_DISKS,
 };
 /// Веха 130 — опись шины PCI в журнал ядра: что вообще стоит в этой машине.
 pub use pci::dump as pci_dump;

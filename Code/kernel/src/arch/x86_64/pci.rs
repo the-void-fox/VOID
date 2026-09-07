@@ -438,13 +438,22 @@ fn setup_transport(d: Bdf) -> Option<BlkTransport> {
 /// (PxSSTS.DET==3). Возвращает `(ABAR, номер порта)`; None — AHCI с диском не нашли (тогда
 /// драйвер откатится на virtio-blk). Много-контроллерный случай QEMU (встроенный ich9 без
 /// диска на 1f.2 + добавленный с диском) разрулён проверкой наличия диска в самом порту:
-/// обход идёт дальше, пока `setup_ahci` не ответит.
-pub fn probe_ahci() -> Option<(usize, u32)> {
-    find(BUS0, |d| (d.class() == (0x01, 0x06, 0x01)).then(|| setup_ahci(d))?)
+
+/// Веха 174 — ВСЕ порты контроллера, на которых есть диск: `(ABAR, порты, сколько)`.
+///
+/// Установщику мало «первого попавшегося»: он спрашивает человека, КУДА ставить, и список из
+/// одного диска на машине с двумя — это не выбор, а лотерея. Контроллер берём один (первый
+/// найденный): на ноутбуке он и есть один, а «второй AHCI» — задача того дня, когда он появится.
+pub fn probe_ahci_ports() -> Option<(usize, [u32; MAX_DISKS], usize)> {
+    find(BUS0, |d| (d.class() == (0x01, 0x06, 0x01)).then(|| setup_ahci_all(d))?)
 }
 
-/// Включить контроллер AHCI, отобразить ABAR, найти порт с диском.
-fn setup_ahci(d: Bdf) -> Option<(usize, u32)> {
+/// Сколько дисков перечисляем. Портов у AHCI до 32, но столько их не бывает ни на одной машине,
+/// куда ставят VOID, а список — это ещё и экран, на котором его читают.
+pub const MAX_DISKS: usize = 8;
+
+/// Включить контроллер AHCI, отобразить ABAR, собрать ВСЕ порты с дисками.
+fn setup_ahci_all(d: Bdf) -> Option<(usize, [u32; MAX_DISKS], usize)> {
     d.enable(); // память + bus master (DMA)
     let abar = d.bar(5); // ABAR обязан быть memory-BAR; 0 — не он либо окна нет
     if abar == 0 {
@@ -456,17 +465,20 @@ fn setup_ahci(d: Bdf) -> Option<(usize, u32)> {
         ghc.write_volatile(ghc.read_volatile() | 1 << 31); // GHC.AE — включить AHCI
     }
     let pi = unsafe { read_volatile((abar + 0x0c) as *const u32) }; // Ports Implemented
+    let mut ports = [0u32; MAX_DISKS];
+    let mut n = 0usize;
     for port in 0..32u32 {
-        if pi & (1 << port) == 0 {
+        if pi & (1 << port) == 0 || n == MAX_DISKS {
             continue;
         }
         let pbase = abar + 0x100 + port as usize * 0x80;
         let ssts = unsafe { read_volatile((pbase + 0x28) as *const u32) }; // PxSSTS
         if ssts & 0xf == 3 {
-            return Some((abar, port)); // DET==3: устройство есть и связь установлена
+            ports[n] = port; // DET==3: устройство есть и связь установлена
+            n += 1;
         }
     }
-    None
+    (n > 0).then_some((abar, ports, n))
 }
 
 /// Веха 52 — настроить прерывание e1000 для userspace-драйвера: включить INTx, замаршрутизировать

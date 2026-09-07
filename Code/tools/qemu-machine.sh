@@ -73,11 +73,22 @@ void_qemu_machine() {
         # проверки, зато главной для образа, который отдают людям, — `install`: до сих пор её
         # нельзя было прогнать сценарием вовсе (стенд знал один образ), и «загрузился с флешки,
         # поставил на диск» проверялось руками или никак.
+        # Дисков можно назвать НЕСКОЛЬКО через запятую: установщик выбирает, куда ставить, и
+        # проверять этот выбор на одном диске — значит не проверять его вовсе.
         if [ -n "${VOID_QEMU_DISK2:-}" ]; then
-            printf '%s\n' \
-                -device ich9-ahci,id=a \
-                -drive "if=none,id=d2,file=$VOID_QEMU_DISK2,format=raw" \
-                -device ide-hd,drive=d2,bus=a.0
+            printf '%s\n' -device ich9-ahci,id=a
+            local i=0
+            local d
+            local rest="$VOID_QEMU_DISK2"
+            while [ -n "$rest" ]; do
+                d="${rest%%,*}"
+                [ "$d" = "$rest" ] && rest="" || rest="${rest#*,}"
+                [ -n "$d" ] || continue
+                printf '%s\n' \
+                    -drive "if=none,id=d$i,file=$d,format=raw" \
+                    -device "ide-hd,drive=d$i,bus=a.$i"
+                i=$((i + 1))
+            done
         fi
         return 0
     fi

@@ -486,6 +486,11 @@ static mut RETURN_CTX: [Context; cpu::MAX] = [Context::EMPTY; cpu::MAX];
 /// Веха 159 — размер записи `SYS_SYSINFO` в байтах. Тот же в `void_user::SYSINFO_REC`.
 const SYSINFO_REC: usize = 48;
 
+/// Веха 174 — размер записи о диске в `SYS_INSTALL(op=0)`. Тот же в `void_user::INSTALL_REC`.
+/// Раскладка: `u64` секторов · `u32` номер диска · `u8` признаки (бит 0 — есть VOID, бит 1 —
+/// с него работает система) · до 16 выравнивание · 40 байт модели из IDENTIFY.
+const INSTALL_REC: usize = 56;
+
 /// Веха 170 — на скольких ядрах работает ПЛАНИРОВЩИК.
 ///
 /// Этап 2 — планировщик работает на ВСЕХ поднятых ядрах, поэтому число берётся у арха, а не
@@ -3230,17 +3235,64 @@ fn syscall(t: &mut Table, cur: usize) {
                 f.advance();
             }
         }
-        // SYS_INSTALL(store_cap) -> p2_start | MAX (Веха 48): установить VOID на AHCI-диск из
-        // загрузочного модуля multiboot2 (образ с USB). Нужен store-cap с правом WRITE — тот же,
-        // что у shell'а (gen1: store:xw): установка меняет содержимое store целиком, право по силе
-        // равно записи. ДИСК СТИРАЕТСЯ. После успеха store заморожен — дальше только ребут.
+        // SYS_INSTALL(store_cap, op, slot, buf, len) (Вехи 48, 174): установить VOID на SATA-диск
+        // из загрузочного модуля multiboot2 (образ с носителя) — либо СПРОСИТЬ, какие диски есть.
+        //
+        //   op = 0 — перечислить диски: в `buf` пишутся записи по [`INSTALL_REC`] байт, возврат —
+        //            сколько записано. Столько же, сколько влезло в `len`.
+        //   op = 1 — установить на диск с номером `slot`; возврат — сектор начала store | MAX.
+        //
+        // Оба под одним правом — store-cap с WRITE (у shell'а `store:xw`): установка меняет
+        // содержимое store целиком, право по силе равно записи. Список дисков сам по себе
+        // безобиден, но отдельного права под него мы не заводим: спрашивает его ровно тот, кто
+        // собирается ставить, а лишний вид права — лишняя вещь, которую надо объяснять.
+        //
+        // ДИСК СТИРАЕТСЯ ЦЕЛИКОМ. Ставить на диск, с которого работает система, ядро отказывает.
         30 => {
-            let scap = t.procs[cur].frame.arg(0);
+            let (scap, op, slot, ptr, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
+            };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
-                Ok(()) => match crate::install::run() {
+                Err(e) => {
+                    vprintln!("  [install] P{} отклонён: {:?}  ← нет capability (WRITE) на store", cur, e);
+                    usize::MAX
+                }
+                Ok(()) if op == 0 => {
+                    let want = (len / INSTALL_REC).min(crate::arch::MAX_DISKS);
+                    let mut disks = [crate::ahci::Disk {
+                        slot: 0,
+                        sectors: 0,
+                        model: [0; crate::ahci::MODEL_LEN],
+                        void: false,
+                        live: false,
+                    }; crate::arch::MAX_DISKS];
+                    let n = crate::ahci::disks(&mut disks[..want]);
+                    if !ensure_heap_range(t, cur, ptr, n * INSTALL_REC) {
+                        usize::MAX
+                    } else {
+                        for (i, d) in disks.iter().take(n).enumerate() {
+                            // SAFETY: диапазон проверен `ensure_heap_range` — он же дотянул
+                            // ленивые страницы кучи, в которые пишем.
+                            let rec = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (ptr + i * INSTALL_REC) as *mut u8,
+                                    INSTALL_REC,
+                                )
+                            };
+                            rec.fill(0);
+                            rec[0..8].copy_from_slice(&d.sectors.to_le_bytes());
+                            rec[8..12].copy_from_slice(&(d.slot as u32).to_le_bytes());
+                            rec[12] = (d.void as u8) | (d.live as u8) << 1;
+                            rec[16..16 + crate::ahci::MODEL_LEN].copy_from_slice(&d.model);
+                        }
+                        n
+                    }
+                }
+                Ok(()) => match crate::install::run(slot) {
                     Ok(p2) => {
-                        crate::println!("  [install] VOID установлен на диск (store с сектора {}); заморожен — перезагрузись без USB", p2);
+                        crate::println!("  [install] VOID установлен на диск {} (store с сектора {}) — перезагрузись без носителя", slot, p2);
                         p2 as usize
                     }
                     Err(e) => {
@@ -3248,10 +3300,6 @@ fn syscall(t: &mut Table, cur: usize) {
                         usize::MAX
                     }
                 },
-                Err(e) => {
-                    vprintln!("  [install] P{} отклонён: {:?}  ← нет capability (WRITE) на store", cur, e);
-                    usize::MAX
-                }
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);

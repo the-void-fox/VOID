@@ -227,7 +227,12 @@ pub fn probe_virtio_blk() -> Option<crate::arch::BlkDevice> {
 /// Веха 47 — AHCI (SATA) на этой платформе нет: QEMU `virt` даёт только virtio-mmio, а
 /// таргет-железо riscv (VisionFive 2 и т.п.) использует eMMC/NVMe, не SATA. Заглушка: диск
 /// приходит через virtio-blk, драйвер AHCI откатится на него.
-pub fn probe_ahci() -> Option<(usize, u32)> {
+/// Сколько дисков перечисляет установщик. На riscv их не перечисляет никто (см. выше), но
+/// константа общая: размер буфера у неё спрашивает арх-независимый код.
+pub const MAX_DISKS: usize = 8;
+
+/// Веха 174 — перечисление портов AHCI. Заглушка по той же причине, что и [`probe_ahci`].
+pub fn probe_ahci_ports() -> Option<(usize, [u32; MAX_DISKS], usize)> {
     None
 }
 
