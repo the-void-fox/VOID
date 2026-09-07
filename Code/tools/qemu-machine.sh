@@ -69,6 +69,16 @@ void_qemu_machine() {
             -cdrom "$img" \
             -boot d \
             -device virtio-rng-pci,disable-legacy=on
+        # Веха 171 — ВТОРОЙ носитель: пустой SATA-диск рядом с живым ISO. Нужен ровно для одной
+        # проверки, зато главной для образа, который отдают людям, — `install`: до сих пор её
+        # нельзя было прогнать сценарием вовсе (стенд знал один образ), и «загрузился с флешки,
+        # поставил на диск» проверялось руками или никак.
+        if [ -n "${VOID_QEMU_DISK2:-}" ]; then
+            printf '%s\n' \
+                -device ich9-ahci,id=a \
+                -drive "if=none,id=d2,file=$VOID_QEMU_DISK2,format=raw" \
+                -device ide-hd,drive=d2,bus=a.0
+        fi
         return 0
     fi
     printf '%s\n' \
