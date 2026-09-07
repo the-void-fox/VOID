@@ -277,7 +277,7 @@ fn run_init_config() {
     // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` (1.5 КиБ) однажды доехал
     // наполовину и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не
     // бывало; виноватым тогда выглядел конфиг, а не запись.
-    let files: [(&[u8], &str); 8] = [
+    let files: [(&[u8], &str); 9] = [
         (b"/etc/system/net.vv", NET_VV),
         (b"/etc/system/services.vv", SERVICES_VV),
         (b"/etc/system/networking.vv", NETWORKING_VV),
@@ -285,6 +285,7 @@ fn run_init_config() {
         (b"/etc/system/bar.vv", BAR_VV),
         (b"/etc/system/packages.vv", PACKAGES_VV),
         (b"/etc/system/apps.vv", APPS_VV),
+        (b"/etc/system/autostart.vv", AUTOSTART_VV),
         (DEFAULT_PATH, DEFAULT_VV),
     ];
     let mut bad = false;
@@ -2222,9 +2223,7 @@ const TERMINAL_VV: &str = "# terminal.vv — чем встречает сист�
 # система не превращается в кирпич из-за одной строки конфига.\n\
 mode = \"wm\"\n\
 net = import(\"net.vv\")\n\
-\n\
-# Программы, которые оконный режим открывает на старте (для mode = \"wm\").\n\
-apps = [\"term\"]\n\
+
 \n\
 # ДИСПЕТЧЕР ЗАДАЧ (Вехи 153-155): кому композитор отдаёт право ВИДЕТЬ процессы и отзывать\n\
 # их права на ходу. Список процессов в VOID сам под правом — программа без него не знает даже,\n\
@@ -2358,7 +2357,7 @@ sysviewcap = \"sysview:rwg!\"\n\
 if mode == \"wm\" {\n\
 \x20 append(\n\
 \x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb!\", \"power:wg!\", sysviewcap,\n\
-\x20          \"env\", map(|a| \"arg:\" + a, apps))],\n\
+\x20          \"env\")],\n\
 \x20   map(|p| desktop(\"sysview\", p), sysview),\n\
 \x20   map(|p| desktop(\"power\", p), poweroff),\n\
 \x20   if wallpaper == \"\" { [] } else { [desktop(\"wallpaper\", wallpaper)] },\n\
@@ -2455,6 +2454,28 @@ const APPS_VV: &str = "# apps.vv — ЧЕМ ОТКРЫВАТЬ: программ
 \x20 default(\"files\", \"fm\"),\n\
 ]\n";
 
+/// Веха 172 — ЧТО ОТКРЫВАЕТСЯ ПРИ ВХОДЕ. Отдельным модулем, а не строчкой в `terminal.vv`, по
+/// той же причине, по какой отдельны `bar.vv`, `packages.vv` и `apps.vv`: это отдельный вопрос,
+/// и человек правит его отдельно от всего прочего.
+///
+/// До этой вехи список жил здесь же под именем `apps` и превращался в `arg:имя` — аргументы
+/// процесса композитора. Снаружи это выглядело так: чтобы убрать окно со стола, надо знать, что
+/// такое argv, и найти его в конце списка ПРАВ. Теперь это обычная запись конфига, и на неё же
+/// указывает окно «добро пожаловать»: оно объясняет конфигурацию, будучи её примером.
+const AUTOSTART_VV: &str = "# autostart.vv — ЧТО ОТКРЫВАЕТСЯ ПРИ ВХОДЕ (Веха 172).\n\
+#\n\
+# Имена программ из store, как их видит `run`. Открывает их композитор (для mode = \"wm\"),\n\
+# каждую своим окном, в порядке списка. Пустой список — пустой стол, и это законно.\n\
+#\n\
+# Убери имя, скажи `rebuild` — программа больше не запускается при входе. Верни — запускается\n\
+# снова. Так в VOID устроено всё остальное: `gens` покажет поколения, `switch` вернёт прежнее.\n\
+#\n\
+# Терминал здесь НЕ стоит: он открывается по Super+Return, когда нужен. Захочешь его при\n\
+# входе — допиши \"term\".\n\
+open = [\"welcome\"]\n\
+\n\
+if null?(open) { [] } else { [autostart(open)] }\n";
+
 const DEFAULT_VV: &str = "# default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
 # Собери систему из модулей: сеть — net.vv (true/false), терминал и его клавиши — terminal.vv,\n\
 # раскладка панели — bar.vv, пакеты — packages.vv.\n\
@@ -2467,4 +2488,5 @@ system(\n\
 \x20 import(\"bar.vv\"),\n\
 \x20 import(\"packages.vv\"),\n\
 \x20 import(\"apps.vv\"),\n\
+\x20 import(\"autostart.vv\"),\n\
 )\n";

@@ -76,7 +76,7 @@ shell term endpoint:posixfs store:rwx mmio:fb power env
 ";
 
 /// Четвёртое поколение (`gen4`, Веха 129) — **оконный режим**: композитор владеет экраном, а
-/// терминал живёт в нём окном. `arg:term` — клиент, которого `wm` открывает на старте.
+/// терминал живёт в нём окном. Что открыть на старте, сказано строкой `autostart` (Веха 172).
 ///
 /// Системное и переписывается на каждой загрузке, как `gen3`, и по той же причине: это витрина
 /// возможностей образа, а не выбор владельца. До него оконный режим существовал, но добраться до
@@ -109,7 +109,7 @@ const DEFAULT_GEN4: &str = "\
 # под выключатель сети). `!` — чтобы канал не достался каждому окну наследством.
 service posixfs store:rw
 service net-srv dev:net:rw
-shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! env arg:term
+shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! env
 desktop sysview taskmgr
 desktop sysview bar
 desktop power bar
@@ -127,6 +127,13 @@ default files fm
 # нужно, любой экран получает свой точный размер.
 desktop bar on
 desktop wallpaper builtin:void
+# Веха 172 — ЧТО ОТКРЫВАЕТСЯ ПРИ ВХОДЕ. Раньше здесь стояло `arg:term` в строке композитора, и
+# терминал открывался на каждой загрузке — включая ту, где человек его не просил. Теперь это
+# обычная строка конфига: убрал имя — программа не запускается, вернул — запускается.
+#
+# По умолчанию названо одно окно, и оно же про это и рассказывает: `welcome` показывает ЭТУ
+# строку и говорит, что с ней делать. Терминал открывается по Super+Return, когда он нужен.
+autostart welcome
 ";
 
 /// Прочитать текстовый объект по корню-имени. `None` — корня нет или это не UTF-8.

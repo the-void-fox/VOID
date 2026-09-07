@@ -451,6 +451,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("default", b_default),
     ("device", b_device),
     ("packages", b_packages),
+    ("autostart", b_autostart),
     ("channel", b_channel),
     ("system", b_system),
 ];
@@ -537,9 +538,13 @@ fn as_int(v: &Value) -> Result<i64, EvalError> {
 
 /// `+` — сложение чисел ИЛИ склейка строк (Веха 119.1).
 ///
-/// Склейка понадобилась конфигу: список программ окна пишется по-человечески
-/// (`apps = ["term"]`), а ядру нужны токены `arg:term`. Заставлять человека писать `"arg:term"`
-/// значило бы протащить внутреннее устройство наружу.
+/// Склейка понадобилась конфигу: человеческую запись приходилось превращать во внутреннюю —
+/// список программ окна (`apps = ["term"]`) в токены `arg:term` строки запуска композитора.
+/// Заставлять человека писать `"arg:term"` значило бы протащить устройство ядра наружу.
+///
+/// Веха 172 — тот самый случай ушёл: «что открыть при входе» стало собственным видом записи
+/// (`autostart`), и склеивать больше нечего. Склейка осталась, потому что она общая: имена
+/// пакетов, пути и адреса каналов человек собирает из кусков ровно так же.
 ///
 /// Смешивать типы нельзя: `1 + "a"` — ошибка, а не выдумка. Тип определяется ПЕРВЫМ аргументом.
 fn b_add(args: &[Value]) -> Result<Value, EvalError> {
@@ -714,7 +719,26 @@ fn b_device(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
-    let mut out = vec![Value::sym("packages")];
+    name_list("packages", "имя пакета", args)
+}
+
+/// Веха 172 — `(autostart имя…)` — ЧТО ОТКРЫВАЕТСЯ ПРИ ВХОДЕ. Читает композитор.
+///
+/// Список, как `packages`, и по той же причине: перечень однородных имён. Раньше это жило
+/// аргументом в строке запуска композитора (`shell wm … arg:term`) — то есть механизмом ядра,
+/// про который человеку пришлось бы знать, что такое argv. Здесь же обычная строка конфига: её
+/// видно в `sysdef`, она переживает `rebuild` и откатывается вместе с поколением.
+fn b_autostart(args: &[Value]) -> Result<Value, EvalError> {
+    name_list("autostart", "имя программы", args)
+}
+
+/// Сборка однородного СПИСКА имён: `(вид "a" "b")` и `(вид [список])` — одно и то же.
+///
+/// Своя сборка вместо [`build_entry`] нужна ради одного: у списка нет «имени и прав», все
+/// аргументы равны. Поэтому список строк вливается на любом месте — `packages(base, "jq")`
+/// пишется естественно, а через `build_entry` первым аргументом обязана была бы стоять строка.
+fn name_list(kind: &str, what: &str, args: &[Value]) -> Result<Value, EvalError> {
+    let mut out = vec![Value::sym(kind)];
     for a in args {
         match a {
             Value::Str(_) => out.push(a.clone()),
@@ -722,17 +746,23 @@ fn b_packages(args: &[Value]) -> Result<Value, EvalError> {
                 for it in items.iter() {
                     match it {
                         Value::Str(_) => out.push(it.clone()),
-                        _ => return Err(EvalError::new("packages: имя пакета — строка")),
+                        _ => return Err(EvalError::new(alloc::format!("{kind}: {what} — строка"))),
                     }
                 }
             }
-            _ => return Err(EvalError::new("packages: имя пакета — строка или список строк")),
+            _ => {
+                return Err(EvalError::new(alloc::format!(
+                    "{kind}: {what} — строка или список строк"
+                )))
+            }
         }
     }
     // Пустой `packages()` — не «ни одного пакета», а почти наверняка опечатка: «ни одного»
     // записывается отсутствием записи или `[]`, как и у всех прочих модулей конфига.
     if out.len() == 1 {
-        return Err(EvalError::new("packages: нужно хотя бы одно имя (пусто — просто не пиши запись)"));
+        return Err(EvalError::new(alloc::format!(
+            "{kind}: нужно хотя бы одно имя (пусто — просто не пиши запись)"
+        )));
     }
     Ok(Value::list(out))
 }
@@ -776,5 +806,5 @@ fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
             "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
-                | "packages" | "channel" | "bar" | "default"))
+                | "packages" | "autostart" | "channel" | "bar" | "default"))
 }

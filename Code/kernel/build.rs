@@ -24,6 +24,7 @@ const PROGRAMS: &[&str] = &[
 // на этой архитектуре может только сказать «композитор не ответил», ей не нужна.
 const PROGRAMS_X86: &[&str] = &[
     "term", "wm", "winbox", "img", "wall", "bar", "launcher", "roots", "taskmgr", "fm", "fps",
+    "welcome",
 ];
 
 /// Веха 132 — C-драйверы (портированный код Linux, сборка nix'ом). Едут семенами В ЯДРЕ, как и

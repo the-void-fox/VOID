@@ -36,6 +36,9 @@ pub const FILE: &[u8] = include_bytes!("../../../../assets/icons/file.vg");
 pub const BACK: &[u8] = include_bytes!("../../../../assets/icons/back.vg");
 pub const FORWARD: &[u8] = include_bytes!("../../../../assets/icons/forward.vg");
 pub const UP: &[u8] = include_bytes!("../../../../assets/icons/up.vg");
+/// Веха 172 — ШЕВРОН ВНИЗ: «здесь ещё есть, крути дальше». Первый потребитель — окно
+/// «добро пожаловать», где он единственный элемент управления на экране.
+pub const DOWN: &[u8] = include_bytes!("../../../../assets/icons/down.vg");
 pub const STAR: &[u8] = include_bytes!("../../../../assets/icons/star.vg");
 pub const SEARCH: &[u8] = include_bytes!("../../../../assets/icons/search.vg");
 pub const MENU: &[u8] = include_bytes!("../../../../assets/icons/menu.vg");

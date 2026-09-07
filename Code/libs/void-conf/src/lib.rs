@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! service posixfs store:rw
-//! shell wm endpoint:posixfs store:rwx mmio:fb power env arg:term
+//! shell wm endpoint:posixfs store:rwx mmio:fb power env
+//! autostart welcome
 //! desktop anim 360
 //! ui accent #4c7dfd
 //! bind wm Super+Return spawn-term
@@ -241,6 +242,22 @@ pub const KINDS: &[Kind] = &[
         name: "channel",
         form: "(channel url)",
         values: Some(1),
+        kernel: false,
+    },
+    // Веха 172 — ЧТО ОТКРЫВАЕТСЯ ПРИ ВХОДЕ: `(autostart имя…)`, читает композитор.
+    //
+    // Список, а не ключ `desktop`, по той же причине, что и `packages`: это однородный перечень
+    // имён, и он растёт. И не `arg:` в строке `shell wm …`, как было: аргументы процесса — это
+    // механизм ядра (оно передаёт argv кому угодно), а «что человек хочет видеть на столе» —
+    // решение владельца, которому место в конфиге на общих правах, с поколениями и откатом.
+    //
+    // Заодно это самый короткий рассказ о том, как VOID вообще настраивается: убрал имя из
+    // списка — программа не запускается; вернул — запускается. Ровно это и объясняет окно
+    // «добро пожаловать», которое здесь по умолчанию и стоит.
+    Kind {
+        name: "autostart",
+        form: "(autostart имя…)",
+        values: None,
         kernel: false,
     },
 ];

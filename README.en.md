@@ -217,7 +217,7 @@ note per milestone, and `notes/known-gaps.md`. Most of it is written in Russian.
 
 **GNU GPL version 3 or later** — full text in [LICENSE](LICENSE).
 
-    Copyright (C) 2025-2026 voidfox <sergeevaleks2711@gmail.com>
+    Copyright (C) 2025-2026 voidfox
 
 Copyleft is a deliberate choice: do anything you like with the code, but derivative works must
 stay open and credit the author. A permissive license (MIT, BSD) does not require that — it
