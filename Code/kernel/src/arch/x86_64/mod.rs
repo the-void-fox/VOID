@@ -21,6 +21,7 @@ mod paging;
 mod pci;
 mod ps2;
 mod rtc;
+mod smp;
 mod trap;
 mod vga;
 
@@ -30,6 +31,8 @@ core::arch::global_asm!(include_str!("entry.s"));
 core::arch::global_asm!(include_str!("switch.s"));
 // Вход в процесс: iretq по подготовленному trap-кадру.
 core::arch::global_asm!(include_str!("enter_user.s"));
+// Веха 170 — трамплин прикладного ядра: 16 → 32 → 64 бита.
+core::arch::global_asm!(include_str!("ap.s"));
 
 pub use pci::{
     e1000_irq_setup, probe_ahci, probe_e1000, probe_virtio_blk, probe_virtio_net, probe_virtio_rng,
@@ -42,6 +45,9 @@ pub use pci::probe_bar0;
 /// Веха 133.2 — включить INTx устройства и замаршрутизировать линии PCI на вектор драйверов.
 pub use pci::intx_irq_setup;
 pub use trap::{init as trap_init, TrapFrame};
+
+/// Веха 170 — многоядерность: сколько ядер у машины, сколько поднято и как их поднять.
+pub use smp::{cpu_count, cpus_up, flush_cpu, start_aps, wake_cpu, MAX_CPUS};
 
 /// Имя архитектуры — арх-измерение корней программ `bin/<arch>/<имя>` (Веха 26).
 pub const ARCH_NAME: &str = "x86_64";
@@ -95,6 +101,26 @@ pub fn platform_init(magic: usize, info: usize) {
     } else {
         RAM_TOTAL_CELL.store(total, Ordering::Relaxed);
     }
+}
+
+/// Веха 170.7 — вытащить `cores=N` из строки загрузки. `None` — не назвали (берём все ядра).
+///
+/// Разбор нарочно тупой: ищем подстроку и читаем десятичное число за ней. Строка приходит от
+/// человека через меню GRUB, и никакого разбора сложнее ей не нужно.
+fn cores_from_cmdline(at: usize, len: usize) -> Option<usize> {
+    let bytes = unsafe { core::slice::from_raw_parts(at as *const u8, len) };
+    let key = b"cores=";
+    let start = bytes.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut v = 0usize;
+    let mut any = false;
+    for &b in &bytes[start..] {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        v = v * 10 + (b - b'0') as usize;
+        any = true;
+    }
+    if any && v > 0 { Some(v) } else { None }
 }
 
 /// Magic PVH `hvm_start_info` (по смещению 0): так отличаем QEMU-PVH от multiboot2/мусора.
@@ -190,6 +216,11 @@ fn discover_multiboot(info: usize) -> usize {
             break; // завершающий тег или мусор
         }
         match ty {
+            // Веха 170.7 — СТРОКА ЗАГРУЗКИ (тег 1). Пока из неё нужно одно: `cores=N` — сколько
+            // ядер отдать планировщику. Знать это стоит владельцу, а не только сборке: сравнить
+            // «на одном ядре» и «на всех» на живой машине иначе нечем — пересборка меняет не
+            // только число ядер, но и всё остальное. В GRUB строка правится клавишей `e`.
+            1 => smp::set_core_limit(cores_from_cmdline(info + p + 8, size - 8)),
             4 => basic = 0x10_0000 + rd(p + 12) as usize * 1024, // basic meminfo: mem_upper (КиБ)
             // Веха 88 — КАРТА ПАМЯТИ (E820 в переводе GRUB). Заголовок тега: type, size,
             // entry_size@+8, entry_version@+12; дальше записи по entry_size:
@@ -406,7 +437,12 @@ static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // читатель (getc)
 
 /// Положить принятый байт в кольцевой буфер (переполнение — байт теряется, как в riscv-кольце).
 /// Единая точка для обоих источников ввода: COM1 (QEMU/serial) и PS/2-клавиатура (реальное
-/// железо, Веха 42). Зовётся с выключенными прерываниями (из обработчика тика/IRQ) — гонок нет.
+/// железо, Веха 42).
+///
+/// Веха 170 — писатель по-прежнему один в каждый момент, но уже не потому, что ядро одно: сюда
+/// приходят только из-под большого замка ([`crate::cpu`]) — с тика вытеснения и с обработчика
+/// прерывания консоли. Свободно, БЕЗ замка, кольцо читает лишь [`console_has_input`], и читает
+/// он только счётчики.
 pub(super) fn rx_push(b: u8) {
     let head = RX_HEAD.load(Ordering::Relaxed);
     if head.wrapping_sub(RX_TAIL.load(Ordering::Relaxed)) < RX_CAP {
@@ -486,6 +522,10 @@ pub fn mouse_pop() -> Option<MouseEvent> {
 }
 
 /// Есть ли непрочитанные события (для пробуждения спящего владельца экрана).
+///
+/// Веха 170 — единственный читатель кольца ВНЕ большого замка (`proc::wait_stdin` спрашивает об
+/// этом, решая, ложиться ли спать). Читает только счётчики и никогда буфер, поэтому устаревший
+/// ответ здесь значит «поспим ещё немного», а не порчу: разбудит побудка соседа или прерывание.
 pub fn mouse_pending() -> bool {
     MOUSE_TAIL.load(Ordering::Relaxed) != MOUSE_HEAD.load(Ordering::Relaxed)
 }
@@ -537,6 +577,8 @@ pub fn key_pop() -> Option<KeyEvent> {
     Some(e)
 }
 
+/// Есть ли непрочитанные события клавиатуры. Как и [`mouse_pending`], спрашивается ВНЕ большого
+/// замка и читает только счётчики.
 pub fn key_pending() -> bool {
     KEY_TAIL.load(Ordering::Relaxed) != KEY_HEAD.load(Ordering::Relaxed)
 }
@@ -627,6 +669,8 @@ pub fn usb_key(b: u8) {
     rx_push(b);
 }
 
+/// Есть ли непрочитанные байты консоли. Как и [`mouse_pending`], спрашивается ВНЕ большого
+/// замка и читает только счётчики.
 pub fn console_has_input() -> bool {
     RX_HEAD.load(Ordering::Relaxed) != RX_TAIL.load(Ordering::Relaxed)
 }
@@ -642,6 +686,17 @@ pub fn console_getc() -> Option<u8> {
 }
 
 // ─── прерывания ─────────────────────────────────────────────────────────────
+
+/// Веха 170 — указатель стека. По нему ядро узнаёт, какое оно ([`crate::cpu`]): стеки лежат
+/// одним массивом с блоком на ядро, и номер блока — это номер ядра.
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mov {0}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    sp
+}
 
 /// Выключить прерывания, вернув прежнее состояние rflags.IF.
 pub fn irq_save_disable() -> bool {
@@ -662,6 +717,14 @@ pub fn irq_restore(enabled: bool) {
 /// Глобально включить прерывания.
 pub fn enable_interrupts() {
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) }
+}
+
+/// Веха 170 — остановиться навсегда, с запрещёнными прерываниями. Для аварийного пути: ядро,
+/// объявившее аварию, и его соседи не должны исполнять больше ничего.
+pub fn halt_forever() -> ! {
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Спать до прерывания. ОТЛИЧИЕ от `wfi`: hlt при IF=0 не просыпается от pending-
@@ -859,6 +922,13 @@ pub fn flush_tlb() {
             options(nostack),
         );
     }
+}
+
+/// Веха 170 — корень таблиц ЯДРА как токен пространства: на него переезжает ядро, которому
+/// нечего исполнять. Держать в CR3/satp пространство чужой группы, ничего в нём не исполняя,
+/// значит запрещать её освобождение — а именно этим ядро и занято, пока спит.
+pub fn kernel_space_root() -> usize {
+    paging::kernel_root()
 }
 
 /// Токен адресного пространства — на x86 это значение CR3 (низ = флаги, нулевые).

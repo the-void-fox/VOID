@@ -710,6 +710,14 @@ pub struct SysInfo {
     pub idle_ns: u64,
     /// Живых процессов (нити отдельно не считаются).
     pub procs: u16,
+    /// Веха 170 — ядер у машины и ядер, на которых работает ядро системы.
+    ///
+    /// Два числа, а не одно: пока прикладные ядра только подняты и запаркованы, «ядер 4»
+    /// означало бы, что система ими пользуется, — а она пока нет. Разницу видно, и это честно.
+    pub cores: u16,
+    pub cores_up: u16,
+    /// Сколько ядер занято ПЛАНИРОВЩИКОМ. Меньше `cores_up` — остальные подняты, но стоят.
+    pub cores_sched: u16,
 }
 
 impl SysInfo {
@@ -753,6 +761,9 @@ pub fn sysinfo(sysview_cap: usize) -> Option<SysInfo> {
         uptime_ns: u64at(16),
         idle_ns: u64at(24),
         procs: u16::from_le_bytes([buf[32], buf[33]]),
+        cores: u16::from_le_bytes([buf[34], buf[35]]),
+        cores_up: u16::from_le_bytes([buf[36], buf[37]]),
+        cores_sched: u16::from_le_bytes([buf[38], buf[39]]),
     })
 }
 

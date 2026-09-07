@@ -53,8 +53,13 @@ void_qemu_machine() {
     if [ -z "$mem" ]; then
         mem="${VOID_QEMU_MEM:-$VOID_QEMU_MEM_DEFAULT}"
     fi
+    # Веха 170 — СКОЛЬКО ЯДЕР у стенда. Умолчание — одно: пока система работает на одном ядре,
+    # менять стенд значило бы обесценить все прежние замеры (они делались на одноядерной
+    # машине). Многоядерные прогоны просят это явно: `VOID_QEMU_SMP=4`.
+    local smp="${VOID_QEMU_SMP:-1}"
     printf '%s\n' \
         -machine q35 \
+        -smp "$smp" \
         -m "$mem" \
         -device ich9-ahci,id=a \
         -drive "if=none,id=d,file=$img,format=raw" \

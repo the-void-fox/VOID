@@ -22,9 +22,9 @@ use crate::println;
 core::arch::global_asm!(include_str!("trap_entry.s"));
 
 extern "C" {
-    /// Таблица адресов стабов: [0..=35] — вектора 0–35 (исключения + таймер +
-    /// консоль + диск + userspace-драйвер), [36] — spurious (0xFF), [37] — syscall (0x80).
-    static TRAP_STUBS: [usize; 39];
+    /// Таблица адресов стабов: [0..=38] — вектора 0–38 (исключения + таймер + консоль + диск +
+    /// userspace-драйвер + сеть + побудка + сброс TLB), [39] — spurious (0xFF), [40] — syscall.
+    static TRAP_STUBS: [usize; 41];
 }
 
 /// Вектор LAPIC-таймера (первый свободный после 32 исключений).
@@ -44,6 +44,21 @@ pub const VEC_USERDRV: u8 = 35;
 /// Веха 91 — вектор прерывания ПРИЁМА сетевой карты (MSI-X virtio-net): сетевой сервер спит,
 /// пока карта молчит, и просыпается ровно от кадра.
 pub const VEC_NET: u8 = 36;
+
+/// Веха 170 — **побудка ядра**: межпроцессорное прерывание, у которого нет работы.
+///
+/// Спящее ядро стоит в `hlt`, и разбудить его можно только прерыванием. Всё, что этому вектору
+/// нужно сделать, — случиться: `hlt` вернёт управление, и ядро само посмотрит, не появилось ли
+/// кого исполнять. Обработчик поэтому пустой (одно подтверждение LAPIC), и это не заглушка —
+/// содержательная работа здесь была бы дублированием того, что ядро сделает следующей строкой.
+pub const VEC_WAKE: u8 = 37;
+
+/// Веха 170, этап 3 — **сброс буфера трансляций по просьбе соседа**.
+///
+/// Соседнее ядро сняло страницу с адреса в пространстве, которое сейчас у нас в CR3; пока мы не
+/// сбросим TLB, для нас она всё ещё на месте — и запись пойдёт в кадр, который уже вернулся в
+/// аллокатор. Обработчик сбрасывает буфер и отмечается в маске ([`crate::cpu::serve_flush`]).
+pub const VEC_TLB: u8 = 38;
 
 /// Снимок состояния процессора на момент trap'а. Раскладка = порядок push'ей в
 /// trap_entry.s (адреса растут к концу структуры; регистры — в порядке r15..rax).
@@ -91,11 +106,18 @@ impl Default for FxArea {
 }
 
 /// `fxsave64`/`fxrstor64` требуют 16-выровненный адрес; кадры в таблице процессов не
-/// выровнены — скретч + копия. Один на систему: ядро однопроцессорное, а внутри
-/// trap-обработчиков IF=0 (interrupt gate) — реентерабельность исключена.
+/// выровнены — скретч + копия.
+///
+/// Веха 170, этап 4 — скретч СВОЙ У КАЖДОГО ЯДРА, и это исправление настоящей порчи, а не
+/// осторожность. Один на систему он был, пока «в ядре одно ядро» значило «в машине одно ядро».
+/// С этапа 2 `restore_fp` зовётся из `enter_user` — то есть УЖЕ ПОСЛЕ того, как большой замок
+/// отпущен (иначе ядро держало бы его, уходя в кольцо 3). Два ядра, входящие в свои процессы
+/// одновременно, писали бы в один буфер: один процесс получал бы регистры SSE другого. Ничего
+/// не падает — просто откуда-то берутся не те числа и не те пиксели.
 #[repr(C, align(16))]
 struct FxScratch([u64; 64]);
-static mut FX_SCRATCH: FxScratch = FxScratch([0; 64]);
+static mut FX_SCRATCH: [FxScratch; super::MAX_CPUS] =
+    [const { FxScratch([0; 64]) }; super::MAX_CPUS];
 
 // Индексы регистров в `regs` (порядок push'ей: rax первым → верх структуры).
 pub const RAX: usize = 14;
@@ -187,7 +209,7 @@ impl TrapFrame {
     /// ровно состояние затрапившего процесса (ядро с soft-float их не меняет).
     pub fn save_fp(&mut self) {
         unsafe {
-            let p = core::ptr::addr_of_mut!(FX_SCRATCH);
+            let p = &raw mut FX_SCRATCH[crate::cpu::id()];
             core::arch::asm!("fxsave64 [{0}]", in(reg) p, options(nostack));
             self.fx.0 = (*p).0;
         }
@@ -196,7 +218,7 @@ impl TrapFrame {
     /// Веха 36 — вернуть FPU/SSE-состояние кадра в CPU (вход в U, [`super::enter_user`]).
     pub fn restore_fp(&self) {
         unsafe {
-            let p = core::ptr::addr_of_mut!(FX_SCRATCH);
+            let p = &raw mut FX_SCRATCH[crate::cpu::id()];
             (*p).0 = self.fx.0;
             core::arch::asm!("fxrstor64 [{0}]", in(reg) p, options(nostack));
         }
@@ -268,11 +290,11 @@ pub fn init() {
     unsafe {
         // Веха 91: вектор 36 — MSI-X приёма сети. Шлюз ему обязателен: прерывание на вектор
         // без шлюза не «игнорируется», а убивает машину (в первом заходе — паника и зависание).
-        for v in 0..=36 {
+        for v in 0..=38 {
             IDT[v] = IdtEntry::gate(TRAP_STUBS[v]);
         }
-        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[37]);
-        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[38]);
+        IDT[VEC_SPURIOUS as usize] = IdtEntry::gate(TRAP_STUBS[39]);
+        IDT[VEC_SYSCALL as usize] = IdtEntry::gate_user(TRAP_STUBS[40]);
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
@@ -282,6 +304,21 @@ pub fn init() {
     // Замаскировать оба 8259 (иначе legacy-таймер/клавиатура шумят по своим векторам).
     super::outb(0x21, 0xff);
     super::outb(0xa1, 0xff);
+}
+
+/// Веха 170 — вектор трапов ПРИКЛАДНОГО ядра: только `lidt`.
+///
+/// Таблица общая и только читается, а регистр `IDTR` у каждого ядра свой — заполнять её второй
+/// раз незачем, да и нельзя: она уже используется загрузочным ядром. Контроллеры 8259 тоже
+/// маскирует загрузочное, они на машине одни.
+pub fn init_ap() {
+    unsafe {
+        let ptr = IdtPtr {
+            limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
+            base: addr_of!(IDT) as u64,
+        };
+        core::arch::asm!("lidt [{0}]", in(reg) &ptr, options(nostack));
+    }
 }
 
 /// Классифицировать trap из ring3 в арх-нейтральный [`UserTrap`] для `proc` —
@@ -318,25 +355,47 @@ fn classify_user(frame: &TrapFrame) -> UserTrap {
 /// trap, rip уже за инструкцией), остальное — фатальный дамп.
 #[no_mangle]
 extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
+    // Веха 170 — два вектора обслуживаются ДО большого замка, потому что им нечего защищать.
+    match frame.vector as u8 {
+        VEC_SPURIOUS => return, // spurious: без EOI по спецификации
+        // Побудка: вся её работа — случиться. Ядро проснулось из `hlt`, дальше оно само
+        // посмотрит, кого исполнять. Брать здесь замок значило бы ждать на нём в обработчике
+        // прерывания — то есть с запрещёнными прерываниями и на чужом стеке.
+        VEC_WAKE => {
+            lapic::eoi();
+            return;
+        }
+        // Сброс TLB: работа короткая и своя (буфер трансляций у каждого ядра свой), а брать под
+        // неё большой замок нельзя в принципе — его в этот момент держит тот, кто нас и просит.
+        VEC_TLB => {
+            crate::cpu::serve_flush();
+            lapic::eoi();
+            return;
+        }
+        _ => {}
+    }
+    // Дальше — общее состояние ядра, и в него входит одно ядро за раз (см. `crate::cpu`).
+    // `mine` ложно только при ВЛОЖЕННОМ входе, то есть при исключении в самом ядре: замок уже
+    // наш, отпускать его здесь нельзя, а дойти до аварийного дампа надо.
+    let mine = crate::cpu::lock();
     // Прерывания устройств (Веха 27) обрабатываются НЕЗАВИСИМО от кольца: стаб
     // полностью сохранил кадр и вернёт его iretq'ом — короткая работа + EOI, и
     // прерванное (хоть ядро, хоть ring3-процесс) продолжится, как ни в чём не бывало.
-    match frame.vector as u8 {
-        VEC_SPURIOUS => return, // spurious: без EOI по спецификации
+    let done = match frame.vector as u8 {
         VEC_CONSOLE => {
             super::console_drain();
             lapic::eoi();
-            return;
+            true
         }
         VEC_BLK => {
             crate::virtio_blk::on_irq();
             lapic::eoi();
-            return;
+            true
         }
         VEC_NET => {
             crate::virtio_net::on_irq(); // Веха 91: приехал кадр — разбудить сетевой сервер
             lapic::eoi();
-            return;
+            true
         }
         VEC_USERDRV => {
             // Веха 52 — IRQ устройства userspace-драйвера. Сперва ЗАМАСКИРОВАТЬ линию (oneshot):
@@ -347,11 +406,19 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
             super::ioapic::set_userdrv_masked(true);
             crate::proc::on_userdrv_irq();
             lapic::eoi();
-            return;
+            true
         }
-        _ => {}
+        _ => false,
+    };
+    if done {
+        if mine {
+            crate::cpu::unlock();
+        }
+        return;
     }
     if frame.cs & 3 == 3 {
+        // Отсюда не возвращаются: управление уйдёт в процесс через `iretq`, а замок отпустит
+        // `proc::resume` — ровно перед входом в кольцо 3. Иначе его отпускать было бы негде.
         let trap = classify_user(frame);
         crate::proc::handle_user_trap(frame, trap);
     }
@@ -363,10 +430,18 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
         3 => println!("  [trap] breakpoint @ {:#x} → продолжаем", frame.rip),
         _ => fatal(frame),
     }
+    if mine {
+        crate::cpu::unlock();
+    }
 }
 
 /// Необработанный (фатальный) trap: полный контекст и стоп — паритет riscv64/fatal.
 fn fatal(frame: &TrapFrame) -> ! {
+    // Веха 170 — сперва остановить остальные ядра, потом печатать. Иначе дамп аварии выходит
+    // вперемешку с обычным выводом соседей, а система продолжает исполнять процессы поверх
+    // ядра, которое только что призналось, что не понимает своего состояния.
+    crate::cpu::stop_others();
+    crate::break_output_lock();
     let cr2: usize;
     unsafe { core::arch::asm!("mov {0}, cr2", out(reg) cr2, options(nomem, nostack)) };
     println!();
@@ -400,9 +475,7 @@ fn fatal(frame: &TrapFrame) -> ! {
     }
     backtrace(frame.rsp);
     println!("  ╚════════════════════════════════════════════════");
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
+    crate::cpu::halt_here()
 }
 
 /// Веха 126.4 — обратный след по стеку ядра.

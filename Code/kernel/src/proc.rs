@@ -39,7 +39,7 @@ use void_abi::{Cap, ContentId, Rights};
 
 use crate::arch::{self, Context, FaultKind, TrapFrame, UserTrap};
 use crate::sync::SpinLock;
-use crate::{cap, elf, frame, klog, println, timer};
+use crate::{cap, cpu, elf, frame, klog, println, timer};
 
 /// Болтливость шлюзов syscall'ов ([ipc]/[obj]/[blk]/[mm]/[exec]-строки на каждый вызов).
 /// Демо живут этой трассировкой, но бенчи (Веха 28) она бы утопила — и в шуме, и в
@@ -99,17 +99,13 @@ pub const WOULD_BLOCK: usize = usize::MAX - 1;
 const ARGS_MAX: usize = 512;
 
 // ─── ядерный trap-стек для trap'ов из U-mode ──────────────────────────────────
-// 64 КиБ — как загрузочный стек ядра (linker.ld): syscall'ы делают настоящую работу
-// (`object::put` → BLAKE3 + куча + `println!`), а в -O0-сборках кадры были крупные: с 16 КиБ
-// стек однажды переполнялся ВНИЗ в соседнюю read-only секцию (store page fault на записи).
-const TRAP_STACK_SIZE: usize = 64 * 1024;
+// Веха 170 — стек СВОЙ У КАЖДОГО ЯДРА и живёт в [`crate::cpu`]: замком стек не защитить, на нём
+// в этот момент стоят кадры вызовов. Два ядра, вошедшие в ядро на одном стеке, затирают друг
+// другу кадры — и это не гонка за данные, а мгновенная смерть обоих.
 
-#[repr(align(16))]
-struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
-static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
-
+/// Вершина трап-стека ТОГО ядра, которое спрашивает.
 fn trap_top() -> usize {
-    addr_of!(TRAP_STACK) as usize + TRAP_STACK_SIZE
+    cpu::trap_top(cpu::id())
 }
 
 /// Веха 128 — **сторож стека trap'ов**: магия в самом низу, проверяемая на каждом возврате в
@@ -124,14 +120,14 @@ fn trap_top() -> usize {
 /// вспоминать, какая где.
 const TRAP_CANARY: usize = 0x5641_4C49_4E41_4359; // "VALINACY"
 
-/// Положить сторожа (один раз, на входе в первую сессию процессов).
+/// Положить сторожа на стек ЭТОГО ядра (один раз, на входе в его первую сессию процессов).
 fn arm_trap_canary() {
-    unsafe { core::ptr::write_volatile(addr_of_mut!(TRAP_STACK) as *mut usize, TRAP_CANARY) };
+    unsafe { core::ptr::write_volatile(cpu::trap_base(cpu::id()) as *mut usize, TRAP_CANARY) };
 }
 
 /// Цел ли сторож. Одно сравнение на trap — дешевле любой отладки «кто затёр соседа».
 fn trap_canary_ok() -> bool {
-    unsafe { core::ptr::read_volatile(addr_of!(TRAP_STACK) as *const usize) == TRAP_CANARY }
+    unsafe { core::ptr::read_volatile(cpu::trap_base(cpu::id()) as *const usize) == TRAP_CANARY }
 }
 
 /// Веха 126.4 — последний syscall и его процесс (см. [`syscall`]): единственная улика о том,
@@ -152,8 +148,8 @@ pub fn last_syscall() -> (usize, usize) {
 /// содержимое, выданное за цепочку вызовов, увело бы поиск в ложную сторону.
 #[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 pub fn trap_stack_range() -> (usize, usize) {
-    let base = addr_of!(TRAP_STACK) as usize;
-    (base, base + TRAP_STACK_SIZE)
+    let i = cpu::id();
+    (cpu::trap_base(i), cpu::trap_top(i))
 }
 
 // ─── таблица процессов ────────────────────────────────────────────────────────
@@ -219,6 +215,21 @@ struct Proc {
     /// Веха 89 — сколько ФРЕЙМОВ куча этой группы реально заняла (лениво, по фолтам).
     /// Живёт у лидера группы, как и `heap_brk`; сверяется с [`page_quota`].
     pages: usize,
+    /// Веха 170.7 — на КАКОМ ядре процесс работал в прошлый раз (`u8::MAX` — ни на каком).
+    ///
+    /// Планировщик старается вернуть его туда же. Дело не в справедливости, а в кэше: у
+    /// композитора рабочий набор в мегабайты (теневой кадр, буферы окон, кэш глифов), и каждое
+    /// переселение на соседнее ядро начинается с холодных L1 и L2. Пока ядро было одно,
+    /// переселяться было некуда; с двумя процесс скакал между ними на каждом пробуждении, и на
+    /// ноутбуке это видно как рывки, приходящие вместе с числом открытых программ.
+    ///
+    /// Не привязка намертво: ядро, которому нечего делать, возьмёт чужого — простаивать хуже,
+    /// чем переселить.
+    last_cpu: u8,
+    /// Веха 170.9 — КОГДА процесс стал готовым (тики). По этому числу решается, стоит ли отдавать
+    /// его СОСЕДНЕМУ ядру: см. [`may_steal`]. Ноль у новорождённого — «беру кто угодно»: тёплого
+    /// кэша у него ещё нет нигде.
+    ready_at: u64,
     /// Веха 163 — СКОЛЬКО ВРЕМЕНИ ядро исполняло этот процесс, в тиках. Копится в [`resume`]:
     /// каждый trap из U закрывает отрезок, начатый последним входом в U. Считается тем же
     /// счётчиком, что уптайм и простой, и простой из отрезка вычитается — иначе процесс,
@@ -308,9 +319,28 @@ struct LxFd {
     dpos: usize,
 }
 
+/// «Ни на каком ядре» / «никакой группы». Индексом быть не может.
+const NO_CPU: usize = usize::MAX;
+
 struct Table {
     procs: Vec<Proc>,
-    current: usize,
+    /// Веха 170 — кого исполняет КАЖДОЕ ядро. Было одно число на систему, и это было верно
+    /// ровно до второго ядра: «текущий процесс» — свойство процессора, а не машины.
+    current: [usize; cpu::MAX],
+    /// Веха 170 — какой ПРОЦЕСС (нить) ядро `i` сейчас обслуживает; [`NO_CPU`] — никакой.
+    ///
+    /// Ровно одно правило: одну нить не берут два ядра. Этапу 2 приходилось запрещать больше —
+    /// целую группу на ядро, потому что нити делят адресное пространство, а сказать соседу «эта
+    /// страница больше не твоя» было нечем. С рассылкой сброса TLB (этап 3) запрет снят: нити
+    /// одного процесса считают одновременно, как им и положено.
+    bound: [usize; cpu::MAX],
+    /// Веха 170 — токен пространства, который у ядра `i` СЕЙЧАС в CR3 (0 — ядерный корень).
+    /// По нему решается, можно ли освободить таблицы умершей группы: нельзя, пока хоть одно
+    /// ядро на них стоит, даже если оно в это время исполняет код ядра.
+    space: [usize; cpu::MAX],
+    /// Веха 170 — корни умерших пространств, которых пока держит какое-то ядро. Освободятся,
+    /// как только оно переедет.
+    dead_roots: Vec<usize>,
     /// Недоставленные запросы IPC: (отправитель, получатель, сообщение).
     mailbox: Vec<(usize, usize, usize)>,
     /// Веха 89 — номера слотов полностью утилизированных групп, готовые к переиспользованию.
@@ -321,27 +351,150 @@ struct Table {
 }
 
 impl Table {
+    /// Кого исполняет ЭТО ядро.
+    fn cur(&self) -> usize {
+        self.current[cpu::id()]
+    }
+
+    /// Назначить, кого ЭТО ядро исполняет дальше.
+    fn set_cur(&mut self, n: usize) {
+        self.current[cpu::id()] = n;
+    }
+
+    /// Свободен ли процесс `idx` для ядра `me` — то есть не взят ли он ДРУГИМ ядром.
+    fn proc_free(&self, idx: usize, me: usize) -> bool {
+        !self.bound.iter().enumerate().any(|(j, &b)| j != me && b == idx)
+    }
+
     /// Следующий готовый процесс по кругу от `from` (включая сам `from`, если он готов).
+    ///
+    /// Веха 170 — «готовый» значит ещё и «которого не взял сосед» (см. [`Table::bound`]).
+    ///
+    /// Веха 170.7 — сперва СВОИ: те, кто в прошлый раз работал на этом же ядре ([`Proc::last_cpu`]).
+    /// Веха 170.9 — чужого прикладное ядро берёт, только если тот ЖДАЛ (см. [`may_steal`]).
     fn next_runnable(&self, from: usize) -> Option<usize> {
+        let me = cpu::id();
+        self.scan(from, me, true).or_else(|| self.scan(from, me, false))
+    }
+
+    /// Круговой поиск готового от `from`. `home` — только тех, кто в прошлый раз шёл на этом ядре.
+    fn scan(&self, from: usize, me: usize, home: bool) -> Option<usize> {
         let n = self.procs.len();
+        if n == 0 {
+            return None;
+        }
+        let now = arch::now_ticks();
         for i in 1..=n {
             let idx = (from + i) % n;
-            if self.procs[idx].state == State::Runnable {
+            let p = &self.procs[idx];
+            if p.state != State::Runnable || (home && p.last_cpu != me as u8) {
+                continue;
+            }
+            if !home && !may_steal(p, me, now) {
+                continue;
+            }
+            if self.proc_free(idx, me) {
                 return Some(idx);
             }
         }
         None
     }
+
+    /// Кого взять ядру, у которого сейчас нет никого (вход в сессию, пробуждение после простоя).
+    /// Тот же порядок, что и у [`Table::next_runnable`]: сперва свои, потом чужие.
+    fn first_for_me(&self) -> Option<usize> {
+        let n = self.procs.len();
+        if n == 0 {
+            return None;
+        }
+        self.next_runnable(n - 1)
+    }
+
+    /// Есть ли работа, ради которой стоит будить спящее ядро.
+    ///
+    /// Веха 170.9 — «стоит» значит ЖДУЩАЯ ([`STEAL_WAIT_NS`]), а не просто готовая. Разбор в
+    /// [`may_steal`]: передача хода не ждёт, она едет, и будить под неё соседа — чистый убыток.
+    fn has_spare_work(&self) -> bool {
+        let now = arch::now_ticks();
+        self.procs.iter().enumerate().any(|(i, p)| {
+            p.state == State::Runnable && !self.bound.contains(&i) && waited_long(p, now)
+        })
+    }
 }
 
-static TABLE: SpinLock<Table> =
-    SpinLock::new(Table { procs: Vec::new(), current: 0, mailbox: Vec::new(), free_slots: Vec::new() });
+/// Веха 170.9 — сколько ГОТОВЫЙ процесс должен прождать, прежде чем его стоит отдавать соседнему
+/// ядру. Миллисекунда: на порядки больше передачи хода (единицы микросекунд) и на порядок меньше
+/// кадра (16 мс).
+const STEAL_WAIT_NS: u64 = 1_000_000;
 
-/// Контекст ядра, в который возвращаемся, когда все процессы завершились.
-static mut RETURN_CTX: Context = Context::EMPTY;
+/// То же в ТИКАХ — считается один раз: сравнение идёт на каждом обходе таблицы, а перевод
+/// наносекунд в тики стоит 128-битного умножения. Ноль значит «ещё не считали» (таймбаза
+/// известна только после [`crate::clock::init`], а до неё планировщика ещё нет).
+static STEAL_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Ждал ли процесс дольше [`STEAL_WAIT_NS`] — то есть работы в системе БОЛЬШЕ, чем ядро успевает.
+fn waited_long(p: &Proc, now: u64) -> bool {
+    let mut t = STEAL_TICKS.load(Ordering::Relaxed);
+    if t == 0 {
+        t = crate::clock::ns_to_ticks(STEAL_WAIT_NS);
+        STEAL_TICKS.store(t, Ordering::Relaxed);
+    }
+    now.saturating_sub(p.ready_at) >= t
+}
+
+/// Веха 170.9 — **можно ли ядру `me` взять ЧУЖОЙ готовый процесс.**
+///
+/// Главная находка Вехи 170.9. Замер: обмен «вызов-ответ» между двумя процессами стоил 2.4 мкс на
+/// одном ядре и 11 мкс на двух — при том, что обычный системный вызов не подорожал вовсе. Значит
+/// платили не за работу, а за ПЕРЕХОДЫ: за десять секунд возни с мышью два ядра сделали полторы
+/// тысячи переселений процессов, четыре тысячи межпроцессорных прерываний и вчетверо с лишним
+/// больше засыпаний, чем одно ядро на той же работе (4973 против 1141).
+///
+/// Причина в природе задачи. Интерфейс VOID — это ЦЕПЬ передач хода: клавиша будит композитор,
+/// композитор шлёт событие клиенту, клиент рисует и коммитит, композитор собирает кадр. В цепи в
+/// каждый момент готов ровно один, и разложить её по ядрам нельзя — можно только гонять её между
+/// ними, платя за каждый шаг прерыванием, побудкой из `hlt` и холодным кэшем. Ровно это владелец
+/// и видел как «любое изменение экрана даётся с трудом».
+///
+/// Многоядерность выигрывает там, где работа НЕ ВЛЕЗАЕТ в одно ядро, — и это состояние
+/// наблюдаемо: готовый процесс ЖДЁТ. Поэтому правило простое: сосед берёт чужого, только если тот
+/// уже прождал ([`STEAL_WAIT_NS`]). Передача хода не ждёт — она едет дальше на том же ядре, как
+/// на одноядерной машине; счётный поток ждёт сразу и уезжает к соседу через миллисекунду.
+///
+/// **Загрузочное ядро исключение — оно берёт всегда.** Ему приходят прерывания устройств, оно
+/// ведёт сессию и оно же спит в [`wait_stdin`]; если бы и оно умело отказываться, готовый процесс
+/// мог бы остаться без ядра вовсе (все спят, будить некому). Так оно остаётся страховкой: что бы
+/// ни отказалось делать прикладное ядро, загрузочное сделает.
+fn may_steal(p: &Proc, me: usize, now: u64) -> bool {
+    me == 0 || waited_long(p, now)
+}
+
+static TABLE: SpinLock<Table> = SpinLock::new(Table {
+    procs: Vec::new(),
+    current: [0; cpu::MAX],
+    bound: [NO_CPU; cpu::MAX],
+    space: [0; cpu::MAX],
+    dead_roots: Vec::new(),
+    mailbox: Vec::new(),
+    free_slots: Vec::new(),
+});
+
+/// Контекст ядра, в который возвращаемся, когда все процессы завершились. Свой у каждого ядра:
+/// возвращаться надо в СВОЙ цикл планирования, стоящий на своём стеке.
+static mut RETURN_CTX: [Context; cpu::MAX] = [Context::EMPTY; cpu::MAX];
 
 /// Веха 159 — размер записи `SYS_SYSINFO` в байтах. Тот же в `void_user::SYSINFO_REC`.
 const SYSINFO_REC: usize = 48;
+
+/// Веха 170 — на скольких ядрах работает ПЛАНИРОВЩИК.
+///
+/// Этап 2 — планировщик работает на ВСЕХ поднятых ядрах, поэтому число берётся у арха, а не
+/// пишется константой. Три числа в `SYS_SYSINFO` («есть / поднято / под планировщиком») при
+/// этом остались: они и дальше могут разойтись — потолок `MAX_CPUS` наш, а ядер у машины
+/// столько, сколько их есть.
+fn sched_cores() -> u16 {
+    arch::cpus_up().min(0xffff) as u16
+}
 
 /// Веха 159 — сколько тиков машина ПРОСТОЯЛА с загрузки (см. [`wait_stdin`]).
 ///
@@ -349,16 +502,61 @@ const SYSINFO_REC: usize = 48;
 /// готовы» и не усреднением, как `loadavg`: простой — это ровно одно место в ядре, где
 /// исполнять некого, и время в нём измеряется тем же счётчиком, что и всё остальное. Число
 /// поэтому честное по построению, а не правдоподобное.
-static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+///
+/// Веха 170 — по счётчику на ядро. Общий счётчик был бы не просто неточен, а неверен в обе
+/// стороны сразу: наружу простой четырёх ядер рос бы вчетверо быстрее времени (загрузка ушла бы
+/// в минус), а внутри [`close_slice`] вычитал бы из отрезка процесса чужой простой — время,
+/// которого тот и не тратил. Наружу (`SYS_SYSINFO`) уходит СРЕДНЕЕ по работающим ядрам.
+static IDLE_TICKS: [AtomicU64; cpu::MAX] = [const { AtomicU64::new(0) }; cpu::MAX];
+
+/// Веха 170.9 — с какого мгновения ядро спит ПРЯМО СЕЙЧАС (0 — не спит).
+///
+/// [`IDLE_TICKS`] пополняется, только когда ядро проснётся, — а с ленивым воровством
+/// ([`may_steal`]) прикладное ядро спит подолгу, иногда десятками секунд. Без этого числа его
+/// сон в эти секунды не засчитывается никому, и наружу уходит «загружено наполовину» на
+/// совершенно холостой машине. Считать сон надо по тем же часам, что и всё остальное, — включая
+/// тот, который ещё идёт.
+static IDLE_SINCE: [AtomicU64; cpu::MAX] = [const { AtomicU64::new(0) }; cpu::MAX];
+
+/// Простой в среднем на ядро — то, что имеет смысл сравнивать со временем работы системы.
+fn idle_ticks_avg() -> u64 {
+    let now = arch::now_ticks();
+    let sum: u64 = (0..cpu::MAX)
+        .map(|i| {
+            let base = IDLE_TICKS[i].load(Ordering::Relaxed);
+            match IDLE_SINCE[i].load(Ordering::Relaxed) {
+                0 => base,
+                since => base + now.saturating_sub(since),
+            }
+        })
+        .sum();
+    sum / (sched_cores() as u64).max(1)
+}
+
+/// Отметить начало/конец сна ЭТОГО ядра для учёта простоя. Возвращает мгновение начала.
+fn idle_begin() -> u64 {
+    let now = arch::now_ticks();
+    IDLE_SINCE[cpu::id()].store(now, Ordering::Relaxed);
+    now
+}
+
+fn idle_end(from: u64) {
+    let me = cpu::id();
+    IDLE_SINCE[me].store(0, Ordering::Relaxed);
+    IDLE_TICKS[me].fetch_add(arch::now_ticks().saturating_sub(from), Ordering::Relaxed);
+}
 
 /// Веха 163 — незакрытый отрезок исполнения: кого мы отпустили в U, когда это было и сколько к
 /// тому мгновению накопилось простоя. Три числа рядом, потому что закрывается отрезок ОДНИМ
 /// вычитанием ([`resume`]): «прошло всего» минус «из этого простаивали».
 ///
 /// `usize::MAX` в pid значит «в U никого не отпускали» — первый заход и путь без процессов.
-static LAST_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
-static LAST_ENTER: AtomicU64 = AtomicU64::new(0);
-static LAST_IDLE: AtomicU64 = AtomicU64::new(0);
+///
+/// Веха 170 — по тройке на ядро: отрезки открываются и закрываются на разных ядрах
+/// одновременно, и общая тройка означала бы, что время одного процесса засчитывается другому.
+static LAST_PID: [AtomicUsize; cpu::MAX] = [const { AtomicUsize::new(usize::MAX) }; cpu::MAX];
+static LAST_ENTER: [AtomicU64; cpu::MAX] = [const { AtomicU64::new(0) }; cpu::MAX];
+static LAST_IDLE: [AtomicU64; cpu::MAX] = [const { AtomicU64::new(0) }; cpu::MAX];
 
 /// Веха 52 — «пришло прерывание userspace-драйвера» (вектор `VEC_USERDRV`). Обработчик IRQ
 /// выставляет флаг БЕЗ замка таблицы процессов (иначе дедлок с прерванным контекстом), а
@@ -380,6 +578,7 @@ fn drain_userdrv_irq(t: &mut Table) {
         for p in &mut t.procs {
             if p.state == State::IrqWait {
                 p.state = State::Runnable;
+                p.ready_at = arch::now_ticks();
             }
         }
     }
@@ -455,6 +654,8 @@ fn create_process_locked(
         wake_on_key: false,
         reads_console: false,
         pages: 0,
+        last_cpu: u8::MAX,
+        ready_at: 0,
         run_ticks: 0,
         heap_brk: USER_HEAP_BASE_VA, // куча пуста, пока процесс не попросит SYS_MAP
         args: {
@@ -516,6 +717,8 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         wake_on_key: false,
         reads_console: false,
         pages: 0, // не используется у нити: учёт ведёт лидер
+        last_cpu: u8::MAX,
+        ready_at: 0,
         run_ticks: 0, // у нити СВОЙ: она исполняется отдельно от лидера
         heap_brk: USER_HEAP_BASE_VA, // не используется у нити: куча резолвится у лидера
         args: Vec::new(),
@@ -719,12 +922,17 @@ pub fn run() {
     arm_trap_canary();
     let sstatus_sie = arch::irq_save_disable(); // S-mode SIE (ядро НЕ вытесняется: SIE=0 в S-mode)
     let saved_sie = arch::irq_mask_read();
+    // Веха 170 — с этого мгновения ядро входит только под большим замком ([`cpu::lock`]). До
+    // сюда загрузка шла БЕЗ него — и правильно: её делает одно ядро, остальные ещё не
+    // допущены к планировщику ([`sched_open`]).
+    cpu::lock();
+    open_scheduler();
     loop {
         // Первый готовый процесс (может быть не индекс 0: после прошлой сессии часть процессов
         // остаётся Finished/заблокированными).
         let first = {
             let t = TABLE.lock();
-            (0..t.procs.len()).find(|&i| t.procs[i].state == State::Runnable)
+            t.first_for_me()
         };
         if let Some(first) = first {
             // Вытеснение процессов (Веха 16): разрешить ТАЙМЕР (STIE) — он прервёт процесс в
@@ -733,10 +941,10 @@ pub fn run() {
             // работают опросом, а ввод UART скапливается в PLIC как pending до [`wait_stdin`].
             arch::irq_mask_preempt(saved_sie); // таймер вкл, устройства выкл
             timer::arm(); // вооружить первое вытеснение этой сессии
-            TABLE.lock().current = first;
+            TABLE.lock().set_cur(first);
             unsafe {
                 let launch = Context::new_kernel(proc_enter, trap_top());
-                arch::context_switch(addr_of_mut!(RETURN_CTX), addr_of!(launch));
+                arch::context_switch(addr_of_mut!(RETURN_CTX[0]), addr_of!(launch));
             }
             // ── сюда возвращаемся, когда готовых не осталось ──
             arch::mark_in_kernel();
@@ -746,8 +954,200 @@ pub fn run() {
             break;
         }
     }
+    close_scheduler();
+    cpu::unlock();
     arch::irq_mask_write(saved_sie); // вернуть прежние разрешения прерываний
     arch::irq_restore(sstatus_sie);
+}
+
+/// Веха 170 — открыт ли планировщик для ПРИКЛАДНЫХ ядер.
+///
+/// До сессии процессов загрузочное ядро собирает store, поднимает службы и гоняет демонстрации
+/// — всё это БЕЗ большого замка, потому что делать это одновременно некому. Прикладное ядро,
+/// вошедшее в планировщик в этот момент, взяло бы замок и полезло в структуры, которые сосед в
+/// это время строит без всякой синхронизации. Поэтому вход открывается ровно один раз — на
+/// входе в [`run`], — и закрывается на выходе из неё.
+static SCHED_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Пустить прикладные ядра в планировщик и позвать тех, кто ждёт этого во сне.
+fn open_scheduler() {
+    SCHED_OPEN.store(true, Ordering::Release);
+    for i in 1..cpu::MAX {
+        arch::wake_cpu(i);
+    }
+}
+
+/// Закрыть вход и ДОЖДАТЬСЯ, пока прикладные ядра выйдут из процессов.
+///
+/// Ждать обязательно. За `run` начинается работа ядра, которую [`crate::init`] и `kmain` делают
+/// БЕЗ большого замка — они писались в мире, где ядро одно. Прикладное ядро, всё ещё
+/// обслуживающее процесс, в этот момент вошло бы в те же структуры под замком, которого сосед не
+/// берёт. Первым это видно на консоли: два потока букв, посимвольно перемешанных.
+///
+/// Ожидание короткое по построению: сюда приходят только после того, как [`wait_stdin`] уже
+/// увидел, что соседи свободны ([`others_busy`]), — ловим лишь того, кто успел взять работу в
+/// последнее мгновение и вот-вот её отдаст.
+fn close_scheduler() {
+    SCHED_OPEN.store(false, Ordering::Release);
+    // Веха 170, этап 3 — съехать с пространства процесса ДО ожидания. Ниже мы крутимся без
+    // большого замка и с запрещёнными прерываниями: рассылка сброса TLB нас в таком состоянии
+    // не достала бы, а значит сосед ждал бы нашего отчёта, пока мы ждём его выхода. Съехав на
+    // ядерный корень, мы перестаём быть адресатом рассылки вовсе.
+    release_space(cpu::id());
+    // Ждать, отпустив замок: без него прикладным ядрам не выйти из ядра, и ожидание стало бы
+    // взаимной блокировкой.
+    cpu::unlock();
+    loop {
+        let busy = {
+            let t = TABLE.lock();
+            t.bound.iter().skip(1).any(|&b| b != NO_CPU)
+        };
+        if !busy {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    cpu::lock();
+}
+
+/// Веха 170, этап 2 — **цикл планирования ПРИКЛАДНОГО ядра**.
+///
+/// Отличается от [`run`] ровно тем, чем прикладное ядро отличается от загрузочного: у него нет
+/// сессии. Оно не решает, когда система кончилась, не будит читателей консоли, не ждёт сроков —
+/// всем этим занимается загрузочное. Прикладное умеет одно: взять готовый процесс, если он
+/// есть, и заснуть, если его нет.
+///
+/// Не возвращается: возвращаться прикладному ядру некуда.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+pub fn run_ap() -> ! {
+    arm_trap_canary();
+    arch::irq_save_disable();
+    let me = cpu::id();
+    loop {
+        if !SCHED_OPEN.load(Ordering::Acquire) {
+            // Загрузка ещё идёт. Спать до побудки: крутиться здесь значило бы отнимать такты
+            // ровно у того ядра, которое эту загрузку и делает.
+            cpu::set_idle(true);
+            arch::wait_for_interrupt();
+            cpu::set_idle(false);
+            continue;
+        }
+        cpu::lock();
+        let first = {
+            let mut t = TABLE.lock();
+            // Веха 170.9 — истёкшие сроки разбирать ЗДЕСЬ, а не только в [`resume`].
+            //
+            // Ниже мы взводим свой таймер на срок своего спящего (Веха 170.8), а готовым его
+            // делает `wake_futex_timeouts`. Она живёт в `resume`, куда приходят из ПРОЦЕССА, — а
+            // у нас процесса нет. Без этой строки ядро просыпалось по сроку, не находило готовых,
+            // взводило таймер на тот же — уже прошедший — срок и просыпалось снова: холостой
+            // цикл с большим замком в руках, пока сосед не разберёт срок за нас.
+            wake_futex_timeouts(&mut t);
+            t.first_for_me()
+        };
+        if let Some(first) = first {
+            arch::irq_mask_preempt(0); // свой LVT-таймер: вытеснение считает каждое ядро само
+            timer::arm();
+            TABLE.lock().set_cur(first);
+            unsafe {
+                let launch = Context::new_kernel(proc_enter, trap_top());
+                arch::context_switch(addr_of_mut!(RETURN_CTX[me]), addr_of!(launch));
+            }
+            // ── сюда `resume` возвращает, когда брать стало нечего ──
+            arch::mark_in_kernel();
+            cpu::unlock();
+            continue;
+        }
+        // Работы нет. Отпустить и пространство тоже: пока мы держим в CR3 чужие таблицы, их
+        // нельзя освободить, — а мы на них всё равно ничего не исполняем.
+        release_space(me);
+        // Веха 170.8 — **взвести свой таймер на срок СВОИХ спящих**, а не глушить его.
+        //
+        // Раньше прикладное ядро глушило таймер и ложилось до побудки соседа. Выглядело
+        // бережливо, а на деле каждое пробуждение по сроку шло через загрузочное ядро: оно
+        // просыпалось, делало процесс готовым и либо забирало его себе (переселение с холодным
+        // кэшем), либо будило нас межпроцессорным прерыванием. Композитор просит срок на каждый
+        // кадр — то есть этот крюк оплачивался ШЕСТЬДЕСЯТ РАЗ В СЕКУНДУ, и оплачивался неровно.
+        // Ровно это владелец и видел: на одном ядре крюка нет, и рывков нет тоже.
+        //
+        // Берём сроки только СВОИХ (`last_cpu`): чужих разбудит их ядро, а загрузочное сторожит
+        // все сроки в `wait_stdin` и потому остаётся страховкой для ничейных.
+        let mine = {
+            let t = TABLE.lock();
+            t.procs
+                .iter()
+                .filter(|p| sleeps_by_deadline(p) && p.last_cpu == me as u8)
+                .filter_map(|p| p.futex_deadline)
+                .min()
+        };
+        match mine {
+            Some(d) => {
+                arch::irq_mask_idle(0); // таймер нужен: срок замечаем сами
+                arch::timer_arm_at(d);
+            }
+            // Своих спящих нет — будить нас некому и незачем: разбудит побудка соседа.
+            None => arch::irq_mask_write(0),
+        }
+        let idle_from = idle_begin();
+        cpu::set_idle(true);
+        // Сказать загрузочному ядру, что мы освободились. Только оно умеет закончить сессию и
+        // подобрать ввод с консоли; пока мы работали, оно могло уснуть с картиной мира, в
+        // которой всё занято, — а она изменилась.
+        cpu::wake_if_idle(0);
+        cpu::unlock();
+        arch::wait_for_interrupt();
+        cpu::set_idle(false);
+        idle_end(idle_from);
+    }
+}
+
+/// Веха 170, этап 3 — сбросить буфер трансляций после того, как в `space` ИЗМЕНИЛИСЬ уже
+/// существовавшие отображения: у себя сразу, у соседей — рассылкой с ожиданием отчёта.
+///
+/// Нужно там, где отображение СНИМАЕТСЯ, ПЕРЕЗАПИСЫВАЕТСЯ или УРЕЗАЕТСЯ в правах. Для чистого
+/// добавления (ленивая страница кучи) хватает своего сброса: процессор не заводит записей в
+/// буфере для отсутствующих страниц, поэтому соседу нечего забывать, — а платить за каждый
+/// фолт кучи межпроцессорным прерыванием пришлось бы на самом горячем пути ядра.
+fn flush_space(t: &Table, space: usize) {
+    arch::flush_tlb();
+    if cpu::MAX == 1 {
+        return;
+    }
+    let me = cpu::id();
+    let mut mask = 0usize;
+    for (j, &tok) in t.space.iter().enumerate() {
+        if j != me && tok == space {
+            mask |= 1 << j;
+        }
+    }
+    cpu::flush_others(mask);
+}
+
+/// Веха 170 — обслуживает ли процесс какое-нибудь ДРУГОЕ ядро.
+fn others_busy() -> bool {
+    let t = TABLE.lock();
+    let me = cpu::id();
+    t.bound.iter().enumerate().any(|(j, &b)| j != me && b != NO_CPU)
+}
+
+/// Веха 170 — есть ли готовый процесс, которого ЭТО ядро может взять.
+fn any_runnable_for_me() -> bool {
+    let t = TABLE.lock();
+    let me = cpu::id();
+    (0..t.procs.len()).any(|i| t.procs[i].state == State::Runnable && t.proc_free(i, me))
+}
+
+/// Веха 170 — переехать на ядерный корень и объявить, что пространства процесса мы больше не
+/// держим. Зовётся с большим замком: `Table::space` читают те, кто решает, что можно освободить.
+fn release_space(me: usize) {
+    let mut t = TABLE.lock();
+    if t.space[me] != 0 {
+        // SAFETY: ядерный корень отображает и образ, и стеки, и прямую карту — всё, чем ядро
+        // пользуется, пока не войдёт в процесс.
+        unsafe { arch::mm_enable(arch::kernel_space_root()) };
+        t.space[me] = 0;
+    }
+    t.bound[me] = NO_CPU;
 }
 
 /// Idle-ожидание ввода (Веха 20.2). Если есть процессы в StdinWait — спать (`wfi`), пока
@@ -789,7 +1189,12 @@ fn wait_stdin(saved_sie: usize) -> bool {
         let reader = t.procs.iter().any(|p| p.state != State::Finished && p.reads_console);
         (w, wake, d, want, reader)
     };
-    if waiting.is_empty() && !irq_waiting && deadline.is_none() {
+    // Веха 170 — «ждать нечего» перестало значить «сессия окончена». Пока сосед обслуживает
+    // процесс, работа в системе идёт, и выйти из сессии значило бы снести её из-под него.
+    // Ровно на этом первый многоядерный запуск закончился на второй секунде: загрузочное ядро
+    // взяло `posixfs`, отдало `net-srv` и `wm` соседям, тут же осталось без работы — и объявило
+    // сессию завершённой, хотя оболочка только что напечатала своё приветствие.
+    if waiting.is_empty() && !irq_waiting && deadline.is_none() && !others_busy() {
         return false;
     }
     // Веха 139.1 — ВЫБРОСИТЬ события ввода, которые прочитать НЕКОМУ.
@@ -845,7 +1250,17 @@ fn wait_stdin(saved_sie: usize) -> bool {
     // исполнять: всё остальное время процессор занят кем-то из процессов или самим ядром.
     // Значит «загрузка» — не оценка и не выборка, а `1 - простой/время`, посчитанное по
     // тем же тикам, которыми живёт таймер.
-    let idle_from = arch::now_ticks();
+    let idle_from = idle_begin();
+    // Веха 170 — уходя спать, отпустить ВСЁ: и пространство процесса в CR3 (пока мы его держим,
+    // таблицы умершей группы нельзя вернуть), и большой замок (пока мы его держим, прикладные
+    // ядра стоят на входе в ядро). Спящий, держащий замок, — это не простой, а остановка.
+    //
+    // Порядок важен: отметиться спящим ДО отпускания замка. Наоборот — окно, в котором сосед
+    // сделал процесс готовым, посмотрел на маску спящих, никого там не увидел и не позвал нас, а
+    // мы в это время как раз легли.
+    release_space(cpu::id());
+    cpu::set_idle(true);
+    cpu::unlock();
     while !arch::console_has_input()
         // Веха 115: движение мыши — тоже повод проснуться, Веха 119: и событие клавиатуры.
         // Но только если их ЖДУТ (`wants_input`): непрочитанное событие иначе становится
@@ -854,6 +1269,9 @@ fn wait_stdin(saved_sie: usize) -> bool {
         && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
         && !NET_IRQ_PENDING.load(Ordering::Relaxed) // Веха 91: кадр разбудит сетевой сервер
         && !deadline.is_some_and(|d| arch::now_ticks() >= d)
+        // Веха 170 — пока мы спали, сосед мог сделать кого-то готовым. Спать дальше при живой
+        // работе значило бы держать целое ядро без дела ровно тогда, когда оно нужно.
+        && !any_runnable_for_me()
     {
         // Веха 145.4 — взвести таймер РОВНО на ближайший срок, а не ждать конца кванта.
         //
@@ -875,7 +1293,9 @@ fn wait_stdin(saved_sie: usize) -> bool {
         arch::enable_interrupts();
         arch::irq_save_disable();
     }
-    IDLE_TICKS.fetch_add(arch::now_ticks().saturating_sub(idle_from), Ordering::Relaxed);
+    cpu::set_idle(false);
+    cpu::lock();
+    idle_end(idle_from);
     let mut t = TABLE.lock();
     // Веха 115 — движение мыши будит тех же, кого будит клавиша: для реактора терминала это
     // такое же событие ввода, и спать сквозь него значило бы двигать курсор рывками по таймеру.
@@ -887,6 +1307,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
                 f.set_ret_at(2, 0);
                 f.advance();
                 t.procs[i].state = State::Runnable;
+                t.procs[i].ready_at = arch::now_ticks();
                 t.procs[i].futex_deadline = None;
                 t.procs[i].wake_on_key = false;
             }
@@ -898,6 +1319,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
         crate::random::stir(1);
         for pid in waiting {
             t.procs[pid].state = State::Runnable; // ввод пришёл — будим ждущих READ
+            t.procs[pid].ready_at = arch::now_ticks();
         }
         // Веха 103 — и тех, кто спит в `SYS_RECV` с пробуждением по клавише: сообщения не было,
         // но событие есть. Ответ тот же, что при истёкшем сроке, — «запроса нет», и реактор идёт
@@ -909,6 +1331,7 @@ fn wait_stdin(saved_sie: usize) -> bool {
                 f.set_ret_at(2, 0);
                 f.advance();
                 t.procs[i].state = State::Runnable;
+                t.procs[i].ready_at = arch::now_ticks();
                 t.procs[i].futex_deadline = None;
                 t.procs[i].wake_on_key = false;
             }
@@ -934,6 +1357,7 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
             f.set_ret(code);
             f.advance();
             t.procs[i].state = State::Runnable;
+            t.procs[i].ready_at = arch::now_ticks();
         }
     }
 }
@@ -947,6 +1371,7 @@ fn wake_join_waiters(t: &mut Table, thread: usize, retval: usize) {
             f.set_ret(retval);
             f.advance();
             t.procs[i].state = State::Runnable;
+            t.procs[i].ready_at = arch::now_ticks();
         }
     }
 }
@@ -968,6 +1393,7 @@ fn wake_futex(t: &mut Table, space: usize, uaddr: usize, count: usize) -> usize 
             f.set_ret(0); // 0 — разбужены (не таймаут)
             f.advance();
             t.procs[i].state = State::Runnable;
+            t.procs[i].ready_at = arch::now_ticks();
             t.procs[i].futex_deadline = None;
             woken += 1;
         }
@@ -1000,6 +1426,7 @@ fn drain_net_irq(t: &mut Table) -> bool {
             f.set_ret_at(2, 0);
             f.advance();
             t.procs[i].state = State::Runnable;
+            t.procs[i].ready_at = arch::now_ticks();
             t.procs[i].futex_deadline = None;
             t.procs[i].wake_on_net = false;
         }
@@ -1052,6 +1479,7 @@ fn wake_futex_timeouts(t: &mut Table) {
             _ => continue,
         }
         t.procs[i].state = State::Runnable;
+        t.procs[i].ready_at = arch::now_ticks();
         t.procs[i].futex_deadline = None;
     }
 }
@@ -1074,8 +1502,16 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
             page_quota(),
         );
     } else if lazy {
+        let page_va = va & !(PAGE - 1);
+        // Веха 170 — страница УЖЕ отображена: её поставила соседняя нить той же группы, пока
+        // мы стояли в очереди на большой замок с этим самым фолтом. Просто вернуться —
+        // инструкция повторится и найдёт страницу на месте. Без этой проверки `map` положил бы
+        // поверх второй фрейм: первый утёк бы, а всё, что нить успела в него записать, исчезло
+        // бы без единого признака ошибки.
+        if arch::translate(arch::space_root(space), page_va).is_some() {
+            return;
+        }
         if let Some(pa) = frame::alloc() {
-            let page_va = va & !(PAGE - 1);
             // SAFETY: пространство процесса сейчас активно — после map сбрасываем TLB,
             // иначе повтор инструкции мог бы увидеть старую (пустую) трансляцию.
             let ok = unsafe {
@@ -1083,6 +1519,7 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
             };
             if ok {
                 t.procs[leader].pages += 1;
+                // Своего сброса довольно: страница ДОБАВЛЕНА (см. `flush_space`).
                 arch::flush_tlb();
                 vprintln!("  [mm] P{} +страница {:#x} (ленивый фолт кучи)", cur, page_va);
                 return; // sepc не тронут — инструкция повторится по замапленной странице
@@ -1101,7 +1538,7 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
     t.procs[cur].state = State::Finished;
     wake_exec_waiters(t, cur, usize::MAX);
     if let Some(n) = t.next_runnable(cur) {
-        t.current = n;
+        t.set_cur(n);
     }
 }
 
@@ -1126,6 +1563,7 @@ fn ensure_heap_range(t: &Table, pid: usize, va: usize, len: usize) -> bool {
                 frame::free(pa);
                 return false; // Веха 89: нет памяти под таблицу — шлюз честно откажет
             }
+            // Своего сброса довольно: страница ДОБАВЛЕНА (см. `flush_space`).
             arch::flush_tlb();
             vprintln!("  [mm] P{} +страница {:#x} (доотображение под шлюз)", pid, page);
         }
@@ -1147,13 +1585,13 @@ fn page_quota() -> usize {
 }
 
 /// Лончер: возобновить текущий (первый) процесс.
+///
+/// Веха 170 — тем же путём, что и все остальные входы в кольцо 3. Раньше здесь была своя,
+/// короткая копия: взять кадр и войти. С многоядерностью у входа появилась работа, которую
+/// нельзя пропускать (занять группу, объявить пространство, открыть отрезок времени, отпустить
+/// большой замок), и вторая копия этого списка разошлась бы с первой при первой же правке.
 extern "C" fn proc_enter() -> ! {
-    let (frame, space) = {
-        let t = TABLE.lock();
-        let c = t.current;
-        (t.procs[c].frame, t.procs[c].space)
-    };
-    unsafe { arch::enter_user(&frame, space, trap_top()) }
+    resume()
 }
 
 // ─── обработка trap'ов из U-mode ──────────────────────────────────────────────
@@ -1163,7 +1601,7 @@ extern "C" fn proc_enter() -> ! {
 pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
     {
         let mut t = TABLE.lock();
-        let cur = t.current;
+        let cur = t.cur();
         // Веха 35: TLS-указатель нити (x86 fsbase) НЕ спасается стабом trap'а — во «свежем»
         // кадре он мусор. Переносим его из прошлого кадра ДО перезаписи (riscv — no-op: tp
         // в GPR). SYS_SET_TLS, если это он, перепишет уже верным новым значением.
@@ -1191,7 +1629,7 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                 // остаётся Runnable, его кадр сохранён; PC НЕ двигаем — продолжит с прерванного.
                 timer::preempt_tick();
                 if let Some(n) = t.next_runnable(cur) {
-                    t.current = n;
+                    t.set_cur(n);
                 }
             }
             UserTrap::Unknown(code) => {
@@ -1210,7 +1648,7 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                     t.procs[cur].state = State::Finished;
                     wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
                     if let Some(n) = t.next_runnable(cur) {
-                        t.current = n;
+                        t.set_cur(n);
                     }
                 }
             }
@@ -1232,6 +1670,16 @@ const RECLAIMED: usize = usize::MAX;
 fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
     let mut roots = Vec::new();
     let n = t.procs.len();
+    // Веха 170.7 — сперва спросить, есть ли вообще что возвращать.
+    //
+    // Ниже — двойной обход: на каждого лидера проверяется вся таблица. Зовётся это на КАЖДОМ
+    // трапе из процесса, а умирает кто-нибудь раз в сотни тысяч трапов, — то есть почти всегда
+    // квадрат отрабатывал впустую. Пока программ было пять, это терялось в шуме; с двумя
+    // десятками открытых окон таблица разрастается, и цена растёт как квадрат числа слотов.
+    // Одна линейная проверка отсекает почти все заходы.
+    if !t.procs.iter().any(|p| p.state == State::Finished && p.space != RECLAIMED) {
+        return roots;
+    }
     for leader in 0..n {
         if t.procs[leader].group != leader || t.procs[leader].space == RECLAIMED {
             continue; // только лидеры групп и только ещё не освобождённые
@@ -1268,7 +1716,7 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
                 // Веха 98 — слот ЗОМБИ придержан: родитель ещё не забрал код выхода
                 // (`SYS_WAIT`). Отдать его сейчас значит подсунуть ожидающему чужой процесс.
                 // Текущий слот не отдаём по другой причине: `resume` ещё читает из него кадр.
-                if i != t.current && !t.procs[i].zombie {
+                if i != t.cur() && !t.procs[i].zombie {
                     t.free_slots.push(i);
                 }
             }
@@ -1286,21 +1734,23 @@ fn reclaim_dead_spaces(t: &mut Table) -> Vec<usize> {
 /// отрезка того, кто уснул. Без него единственный спящий процесс показывал бы 100 % — ровно
 /// наоборот тому, что происходит.
 fn close_slice(t: &mut Table) {
-    let pid = LAST_PID.swap(usize::MAX, Ordering::Relaxed);
+    let me = cpu::id();
+    let pid = LAST_PID[me].swap(usize::MAX, Ordering::Relaxed);
     if pid == usize::MAX || pid >= t.procs.len() {
         return;
     }
-    let idle = IDLE_TICKS.load(Ordering::Relaxed);
-    let spent = arch::now_ticks().saturating_sub(LAST_ENTER.load(Ordering::Relaxed));
-    let idled = idle.saturating_sub(LAST_IDLE.load(Ordering::Relaxed));
+    let idle = IDLE_TICKS[me].load(Ordering::Relaxed);
+    let spent = arch::now_ticks().saturating_sub(LAST_ENTER[me].load(Ordering::Relaxed));
+    let idled = idle.saturating_sub(LAST_IDLE[me].load(Ordering::Relaxed));
     t.procs[pid].run_ticks += spent.saturating_sub(idled);
 }
 
 /// Веха 163 — открыть отрезок: с этого мгновения процессорное время идёт процессу `pid`.
 fn open_slice(pid: usize) {
-    LAST_IDLE.store(IDLE_TICKS.load(Ordering::Relaxed), Ordering::Relaxed);
-    LAST_ENTER.store(arch::now_ticks(), Ordering::Relaxed);
-    LAST_PID.store(pid, Ordering::Relaxed);
+    let me = cpu::id();
+    LAST_IDLE[me].store(IDLE_TICKS[me].load(Ordering::Relaxed), Ordering::Relaxed);
+    LAST_ENTER[me].store(arch::now_ticks(), Ordering::Relaxed);
+    LAST_PID[me].store(pid, Ordering::Relaxed);
 }
 
 fn resume() -> ! {
@@ -1324,38 +1774,71 @@ fn resume() -> ! {
     // включая вытеснение таймером. Работа ядра по системному вызову засчитывается процессу,
     // который её заказал, — это его процессорное время, а не ничьё.
     close_slice(&mut t);
-    let c = t.current;
-    let chosen = if t.procs[c].state == State::Runnable {
+    let me = cpu::id();
+    let c = t.cur();
+    // Свой процесс продолжаем без вопросов: его группа занята НАМИ, и это законно.
+    let chosen = if t.procs[c].state == State::Runnable && t.proc_free(c, me) {
         Some(c)
     } else {
         t.next_runnable(c)
     };
     match chosen {
         Some(n) => {
-            t.current = n;
+            t.set_cur(n);
+            t.bound[me] = n;
+            t.procs[n].last_cpu = me as u8; // Веха 170.7 — сюда его и вернём в следующий раз
             open_slice(n);
             let frame = t.procs[n].frame;
             let space = t.procs[n].space;
+            // Веха 170 — переехать на пространство выбранного ПОД ЗАМКОМ, а не в `enter_user`.
+            // Между отпусканием замка и записью CR3 соседнее ядро успело бы освободить таблицы,
+            // на которых мы в этот момент стоим, — и следующий же промах TLB читал бы их из
+            // списка свободных. `enter_user` ниже позовёт то же самое ещё раз и не сделает
+            // ничего: `mm_enable` не трогает регистр, если корень уже тот (Веха 170.6).
+            unsafe { arch::mm_enable(arch::space_root(space)) };
+            t.space[me] = space;
             // Веха 46: вернуть фреймы групп, что полностью завершились (страницы, таблицы, корень).
             let dead = reclaim_dead_spaces(&mut t);
-            drop(t);
-            unsafe {
-                if !dead.is_empty() {
-                    // Переключиться на ЖИВОЕ пространство ПЕРЕД сносом мёртвых: их таблицы нельзя
-                    // рушить под активным satp/CR3 (MMU потом читала бы их из списка свободных).
-                    arch::mm_enable(arch::space_root(space));
-                    for root in dead {
-                        arch::free_address_space(root);
-                    }
+            t.dead_roots.extend(dead);
+            // Веха 170 — освобождаем только то, на чём НИКТО не стоит. Корень, оставшийся у
+            // другого ядра, ждёт своей очереди: оно переедет при следующем же переключении.
+            let held = t.space; // копия: `retain` ниже уже держит `t` занятым
+            let mut free_now = Vec::new();
+            t.dead_roots.retain(|&root| {
+                if held.iter().any(|&tok| arch::space_root(tok) == root) {
+                    true
+                } else {
+                    free_now.push(root);
+                    false
                 }
+            });
+            // Есть кого исполнять сверх нашего — позвать спящее ядро. Под замком: разбудить
+            // того, кому работы не досталось, дешевле, чем не разбудить того, кому досталась.
+            //
+            // Веха 170.6 — сперва дешёвый вопрос «а спит ли кто-нибудь»: обход всей таблицы
+            // процессов на КАЖДОМ системном вызове ради ответа «будить некого» — это заметная
+            // доля работы ядра, а ответ этот верен почти всегда.
+            let spare = cpu::any_idle() && t.has_spare_work();
+            drop(t);
+            if spare {
+                cpu::wake_one();
+            }
+            unsafe {
+                for root in free_now {
+                    arch::free_address_space(root);
+                }
+                cpu::unlock(); // дальше — кольцо 3, ядро свободно
                 arch::enter_user(&frame, space, trap_top())
             }
         }
         None => {
+            // Исполнять некого: отпустить группу и вернуться в свой цикл планирования — он
+            // разберётся, спать нам или заканчивать сессию.
+            t.bound[me] = NO_CPU;
             drop(t);
             unsafe {
                 let mut discard = Context::default();
-                arch::context_switch(addr_of_mut!(discard), addr_of!(RETURN_CTX));
+                arch::context_switch(addr_of_mut!(discard), addr_of!(RETURN_CTX[me]));
             }
             loop {} // не достигается
         }
@@ -1413,14 +1896,17 @@ fn shm_attach(t: &mut Table, cur: usize, id: usize, va: usize, writable: bool) -
     if writable {
         flags |= arch::MAP_W;
     }
+    let space = t.procs[cur].space;
     for (i, &pa) in frames.iter().enumerate() {
         let ok = unsafe { arch::map(root, va + i * PAGE, pa, flags) };
         if !ok {
-            arch::flush_tlb();
+            flush_space(t, space);
             return usize::MAX; // Веха 89: нет памяти под таблицу — честный отказ
         }
     }
-    arch::flush_tlb();
+    // Веха 170 — адрес выбирает процесс, значит `map` мог ПЕРЕЗАПИСАТЬ то, что там лежало:
+    // сброс нужен всем, кто стоит на этом пространстве.
+    flush_space(t, space);
     t.procs[cur].shm.push(id);
     0
 }
@@ -1458,7 +1944,9 @@ fn shm_unmap(t: &mut Table, cur: usize, id: usize, va: usize) -> usize {
         assert!(ok, "shm_unmap: фрейм области отображён как приватный (va {:#x}, P{})",
             va + i * PAGE, cur);
     }
-    arch::flush_tlb();
+    // Веха 170 — страницы СНЯТЫ, и сразу за этим область может быть отпущена вместе с кадрами.
+    // Сосед со старой трансляцией писал бы в чужую память: рассылаем и ждём отчёта.
+    flush_space(t, t.procs[cur].space);
     t.procs[cur].shm.remove(slot);
     crate::shm::release(id);
     0
@@ -1508,14 +1996,14 @@ fn syscall(t: &mut Table, cur: usize) {
             }
             wake_exec_waiters(t, leader, code);
             if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+                t.set_cur(n);
             }
         }
         // SYS_YIELD: уступить следующему готовому.
         3 => {
             t.procs[cur].frame.advance();
             if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+                t.set_cur(n);
             }
         }
         // SYS_RECV(recv_buf, recv_cap, nonblock) -> (a0=op, a1=reply-право, a2=длина запроса,
@@ -1579,7 +2067,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.procs[cur].wake_on_key = mode == 4;
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
                 if let Some(n) = t.next_runnable(cur) {
-                    t.current = n;
+                    t.set_cur(n);
                 }
             }
         }
@@ -1640,12 +2128,13 @@ fn syscall(t: &mut Table, cur: usize) {
                         df.set_ret_at(4, cur);
                         df.advance();
                         t.procs[dest].state = State::Runnable;
+                        t.procs[dest].ready_at = arch::now_ticks();
                     } else {
                         t.mailbox.push((cur, dest, op)); // нагрузку скопируют при его RECV
                     }
                     t.procs[cur].state = State::ReplyWait; // sepc двинет доставка ответа
                     if let Some(n) = t.next_runnable(cur) {
-                        t.current = n;
+                        t.set_cur(n);
                     }
                 }
                 Err(e) => {
@@ -1741,6 +2230,7 @@ fn syscall(t: &mut Table, cur: usize) {
                         df.set_ret_at(3, len);
                         df.advance();
                         t.procs[dest].state = State::Runnable;
+                        t.procs[dest].ready_at = arch::now_ticks();
                     }
                     let _ = cap::revoke(dom, Cap::from_bits(rcap as u64)); // одноразовость
                     0
@@ -2122,7 +2612,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.procs[cur].frame.restart();
                 t.procs[cur].state = State::StdinWait;
                 if let Some(nx) = t.next_runnable(cur) {
-                    t.current = nx;
+                    t.set_cur(nx);
                 }
             }
         }
@@ -2339,7 +2829,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                     if wait_child {
                                         // Родитель ждёт ребёнка; sepc/a0 выставит wake_exec_waiters.
                                         t.procs[cur].state = State::ExecWait(child);
-                                        t.current = child;
+                                        t.set_cur(child);
                                     } else {
                                         // Веха 98 — SPAWN: родителю сразу отдаём номер ребёнка и
                                         // ПРОДОЛЖАЕМ его. Ребёнок помечается зомби — его слот не
@@ -2525,7 +3015,7 @@ fn syscall(t: &mut Table, cur: usize) {
             t.procs[cur].retval = retval;
             wake_join_waiters(t, cur, retval);
             if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+                t.set_cur(n);
             }
         }
         // SYS_THREAD_JOIN(tid) -> retval | MAX (Веха 35): дождаться завершения нити `tid`
@@ -2548,7 +3038,7 @@ fn syscall(t: &mut Table, cur: usize) {
             } else {
                 t.procs[cur].state = State::JoinWait(tid);
                 if let Some(n) = t.next_runnable(cur) {
-                    t.current = n;
+                    t.set_cur(n);
                 }
             }
         }
@@ -2582,7 +3072,7 @@ fn syscall(t: &mut Table, cur: usize) {
                             t.procs[cur].futex_addr = uaddr;
                             t.procs[cur].futex_deadline = deadline;
                             if let Some(n) = t.next_runnable(cur) {
-                                t.current = n;
+                                t.set_cur(n);
                             }
                         }
                         _ => {
@@ -2718,7 +3208,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                     cur, root_name, child, img.pages,
                                 );
                                 t.procs[cur].state = State::ExecWait(child);
-                                t.current = child;
+                                t.set_cur(child);
                                 spawned = true;
                             }
                             None => vprintln!(
@@ -2800,7 +3290,9 @@ fn syscall(t: &mut Table, cur: usize) {
                                 break; // Веха 89: нет памяти под таблицы — отказ драйверу
                             }
                         }
-                        arch::flush_tlb();
+                        // Веха 170 — адрес назвал драйвер, отображение могло лечь поверх
+                        // прежнего: сброс нужен всем, кто стоит на этом пространстве.
+                        flush_space(t, t.procs[cur].space);
                         if !ok {
                             usize::MAX
                         } else {
@@ -2861,7 +3353,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                         break;
                                     }
                                 }
-                                arch::flush_tlb();
+                                flush_space(t, t.procs[cur].space);
                                 if ok {
                                     pa // физ-адрес начала (драйверу нужен именно физический)
                                 } else {
@@ -2905,7 +3397,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     // висит на карте, прерывание доставится сразу; обработчик снова замаскирует.
                     arch::userdrv_irq_arm();
                     if let Some(n) = t.next_runnable(cur) {
-                        t.current = n;
+                        t.set_cur(n);
                     }
                 }
                 Err(e) => {
@@ -3007,7 +3499,7 @@ fn syscall(t: &mut Table, cur: usize) {
                 t.procs[cur].futex_deadline = Some(deadline);
             }
             if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+                t.set_cur(n);
             }
         }
         // SYS_PARENT(pid) -> ppid | MAX (Веха 114): чей это ребёнок.
@@ -3460,7 +3952,9 @@ fn syscall(t: &mut Table, cur: usize) {
         // а не про процесс, под правом Sysview READ. 48 Б в буфер:
         //   0..8   всего памяти, байт          8..16  занято памяти, байт
         //   16..24 время с загрузки, нс        24..32 из него ПРОСТОЙ, нс
-        //   32..34 живых процессов, u16        34..48 резерв (нули)
+        //   32..34 живых процессов, u16        34..36 ядер у машины, u16
+        //   36..38 ядер поднято, u16            38..40 ядер под планировщиком, u16
+        //   40..48 резерв (нули)
         //
         // Загрузка процессора отсюда считается ВЫЧИТАНИЕМ двух замеров: `1 - Δпростой/Δвремя`.
         // Мгновенного числа ядро не отдаёт намеренно — «сейчас» у загрузки не бывает, бывает
@@ -3486,9 +3980,17 @@ fn syscall(t: &mut Table, cur: usize) {
                     rec[0..8].copy_from_slice(&(crate::frame::usable_bytes() as u64).to_le_bytes());
                     rec[8..16].copy_from_slice(&(crate::frame::used_bytes() as u64).to_le_bytes());
                     rec[16..24].copy_from_slice(&crate::clock::uptime_ns().to_le_bytes());
-                    let idle = crate::clock::ticks_to_ns(IDLE_TICKS.load(Ordering::Relaxed));
+                    let idle = crate::clock::ticks_to_ns(idle_ticks_avg());
                     rec[24..32].copy_from_slice(&idle.to_le_bytes());
                     rec[32..34].copy_from_slice(&(live as u16).to_le_bytes());
+                    // Веха 170 — ЯДРА: сколько машина объявила и сколько из них поднято нами.
+                    // Два числа, а не одно: «ядер 4» на системе, работающей на одном, — это
+                    // неправда ровно в ту сторону, в которую соврать соблазнительнее всего.
+                    rec[34..36]
+                        .copy_from_slice(&(crate::arch::cpu_count().min(0xffff) as u16).to_le_bytes());
+                    rec[36..38]
+                        .copy_from_slice(&(crate::arch::cpus_up().min(0xffff) as u16).to_le_bytes());
+                    rec[38..40].copy_from_slice(&sched_cores().to_le_bytes());
                     let dst = unsafe { core::slice::from_raw_parts_mut(bptr as *mut u8, SYSINFO_REC) };
                     dst.copy_from_slice(&rec);
                     0
@@ -3833,7 +4335,7 @@ fn syscall(t: &mut Table, cur: usize) {
             } else if let Some(code) = t.procs[pid].exit_code {
                 // Ребёнок уже закончил: отдать код и ОТПУСТИТЬ слот — зомби больше не нужен.
                 t.procs[pid].zombie = false;
-                if t.procs[pid].state == State::Finished && pid != t.current {
+                if t.procs[pid].state == State::Finished && pid != t.cur() {
                     t.free_slots.push(pid);
                 }
                 code
@@ -3982,7 +4484,9 @@ fn lx_map_range(t: &mut Table, cur: usize, start: usize, size: usize, _prot: usi
         }
         va += PAGE;
     }
-    arch::flush_tlb();
+    // Веха 170 — первая ветка цикла ПЕРЕЗАПИСЫВАЕТ права уже отображённой страницы, значит
+    // своего сброса мало (см. `flush_space`).
+    flush_space(t, t.procs[cur].space);
     true
 }
 
@@ -3997,7 +4501,9 @@ fn lx_protect_range(t: &mut Table, cur: usize, start: usize, size: usize, prot: 
         }
         va += PAGE;
     }
-    arch::flush_tlb();
+    // Веха 170 — права УРЕЗАНЫ (mprotect снимает запись с уже отданных страниц): сосед со
+    // старой трансляцией продолжал бы туда писать.
+    flush_space(t, t.procs[cur].space);
 }
 
 /// Веха 38 — трансля́тор Linux-syscall'ов для процессов личности `linux` ([`crate::linux`]).
@@ -4103,7 +4609,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     // Ввода нет — заблокироваться с рестартом (PC на инструкции syscall'а).
                     t.procs[cur].state = State::StdinWait;
                     if let Some(nx) = t.next_runnable(cur) {
-                        t.current = nx;
+                        t.set_cur(nx);
                     }
                     done = false;
                 }
@@ -4313,7 +4819,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                             t.procs[cur].futex_addr = uaddr;
                             t.procs[cur].futex_deadline = None;
                             if let Some(n) = t.next_runnable(cur) {
-                                t.current = n;
+                                t.set_cur(n);
                             }
                             done = false; // спим: кадр и PC не трогаем (проснёмся — повторим)
                         }
@@ -4423,7 +4929,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                         t.procs[cur].state = State::Sleeping;
                         t.procs[cur].futex_deadline = Some(deadline);
                         if let Some(n) = t.next_runnable(cur) {
-                            t.current = n;
+                            t.set_cur(n);
                         }
                         done = false; // спим: кадр и PC не трогаем, возврат оформит пробуждение
                     }
@@ -4670,7 +5176,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             }
             wake_exec_waiters(t, leader, code);
             if let Some(n) = t.next_runnable(cur) {
-                t.current = n;
+                t.set_cur(n);
             }
             done = false; // процесс завершён — PC/кадр не трогаем
         }
