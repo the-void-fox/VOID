@@ -335,7 +335,13 @@ impl Xhci {
         // Slot Context (1): Context Entries=1, Speed; Root Hub Port Number.
         let sc = input + cs;
         write_volatile(dm(sc) as *mut u32, 1 << 27 | speed << 20);
-        write_volatile((sc + 4) as *mut u32, port << 16);
+        // Веха 173 — `dm()` здесь ОБЯЗАТЕЛЕН, и его тут не было. `sc` — физический адрес кадра, а
+        // с Вехи 87 ядро живёт в верхней половине: прямая карта смещена, и физический адрес,
+        // взятый как указатель, не отображён никуда. Строка писала по адресу вида `0x1753024` и
+        // валила ядро page fault'ом — то есть машина с xHCI и любым USB-устройством не
+        // загружалась вовсе. Драйвер писался до переезда ядра (Веха 50), а поймать это было
+        // некому: в QEMU xHCI-устройств у нас на стенде не было, а у владельца ноутбук на EHCI.
+        write_volatile(dm(sc + 4) as *mut u32, port << 16);
         // EP0 Context (2): MPS по скорости, EPType=Control(4), CErr=3; TR dequeue|DCS; avg TRB=8.
         let ep = input + 2 * cs;
         let mps: u32 = match speed { 3 => 64, 4 => 512, _ => 8 };
