@@ -246,7 +246,6 @@ pub fn init() -> bool {
     let Some((abar, ports, n)) = crate::arch::probe_ahci_ports() else {
         return false;
     };
-    ABAR.store(abar, Ordering::Relaxed);
     let mut seen = 0usize;
     for &p in ports.iter().take(n) {
         let Some(dev) = open(abar, p) else { continue };
@@ -266,16 +265,14 @@ pub fn init() -> bool {
     false
 }
 
-/// ABAR найденного контроллера — по нему установщик открывает выбранный порт.
-static ABAR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
 /// Веха 174 — ПЕРЕЧИСЛИТЬ диски для установщика. Возвращает, сколько записано в `out`.
 ///
 /// Каждый порт открывается и тут же закрывается: держать восемь устройств живыми ради списка,
 /// который смотрят раз в жизни, значило бы занять по два фрейма на каждое навсегда.
 pub fn disks(out: &mut [Disk]) -> usize {
-    let abar = ABAR.load(Ordering::Relaxed);
-    let Some((_, ports, n)) = crate::arch::probe_ahci_ports() else {
+    // ABAR спрашиваем У ПРОБЫ, а не помним с загрузки: на живом носителе `init` не звали вовсе
+    // (store в памяти — Веха 174.1), и запомненный адрес остался бы нулём. Проба идемпотентна.
+    let Some((abar, ports, n)) = crate::arch::probe_ahci_ports() else {
         return 0;
     };
     let live = AHCI.lock().as_ref().map(|d| d.slot);
@@ -293,7 +290,7 @@ pub fn disks(out: &mut [Disk]) -> usize {
             }
             continue;
         }
-        let Some(dev) = open(if abar != 0 { abar } else { 0 }, p) else { continue };
+        let Some(dev) = open(abar, p) else { continue };
         out[k] = Disk { slot: dev.slot, sectors: dev.total, model: dev.model, void: dev.void, live: false };
         k += 1;
         close(dev);
@@ -310,8 +307,7 @@ pub fn target_open(slot: usize) -> bool {
     if AHCI.lock().as_ref().map(|d| d.slot) == Some(slot) {
         return false; // ставить на диск, с которого работаем, нельзя — см. [`TARGET`]
     }
-    let abar = ABAR.load(Ordering::Relaxed);
-    let Some((_, ports, n)) = crate::arch::probe_ahci_ports() else {
+    let Some((abar, ports, n)) = crate::arch::probe_ahci_ports() else {
         return false;
     };
     if !ports.iter().take(n).any(|&p| p as usize == slot) {
