@@ -12,7 +12,7 @@
 //! Порядок замков прежний: `with`/`gc` держат STORE, чтение диска берёт замок BLK
 //! внутри virtio_blk (STORE→BLK).
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use alloc::vec::Vec;
 
@@ -55,17 +55,6 @@ pub fn use_ramdisk() {
     MEDIUM.store(Medium::Ram as u8, Ordering::Relaxed);
 }
 
-/// Веха 48 — «заморозка»: после установки на диск ([`crate::install`]) раскладка диска сменилась,
-/// и кэш работающего store'а НЕ должен больше туда писать (иначе group-commit затрёт свежий
-/// образ). Ставит установщик; [`Disk::write`] и коммиты становятся no-op — состояние живёт в RAM
-/// до перезагрузки с диска.
-static FROZEN: AtomicBool = AtomicBool::new(false);
-
-/// Заморозить запись на диск (см. [`FROZEN`]). Необратимо в пределах сессии — дальше ребут.
-pub fn freeze() {
-    FROZEN.store(true, Ordering::Relaxed);
-}
-
 /// Носитель ядра: сектор store = сектор блочного устройства (размеры совпадают по построению).
 struct Disk;
 
@@ -78,9 +67,6 @@ impl BlockIo for Disk {
         }
     }
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool {
-        if FROZEN.load(Ordering::Relaxed) {
-            return true; // Веха 48: после установки диск заморожен — коммиты «успешны», но без записи
-        }
         match medium() {
             Medium::Ahci => ahci::write(sector, buf),
             Medium::Ram => crate::ramdisk::write(sector, buf),

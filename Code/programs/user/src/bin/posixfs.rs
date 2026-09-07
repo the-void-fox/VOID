@@ -16,7 +16,8 @@
 
 use void_user as sys;
 use void_user::posix::{
-    OP_CLOSE, OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_READLINK, OP_RENAME, OP_SEEK, OP_STAT,
+    OP_CLOSE, OP_COPY, OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_READLINK, OP_RENAME, OP_SEEK,
+    OP_STAT,
     OP_UNLINK, OP_WRITE,
 };
 use void_user::posix::{O_APPEND, O_TRUNC};
@@ -25,12 +26,12 @@ use void_user::posix::{O_APPEND, O_TRUNC};
 // `alloc`: здесь кучи нет вовсе, поэтому индекс читается итератором по чужому буферу.
 use void_tree as tree;
 
-const NFILES: usize = 16;
+const NFILES: usize = 32;
 /// Путь (Веха 108.2: было 128 — не хватало даже на `/nix/store/<хэш>-<имя>/lib/...`).
 const PATH_MAX: usize = 512;
 /// Веха 39: файл ≤ 128 КиБ (wasm-модули проходят через персоналию). Буферы — в ленивой куче.
 /// Для файлов ПАКЕТА этот потолок не действует: они читаются прямо из дерева store, кусками.
-const DATA_MAX: usize = 128 * 1024;
+const DATA_MAX: usize = 8 * 1024 * 1024;
 /// Индекс каталога — на СТЕКЕ, свой скромный потолок (не DATA_MAX): count(u16) + записи.
 const DIR_MAX: usize = 4096;
 /// Имя корня = префикс `f`/`d` + абсолютный путь.
@@ -288,6 +289,37 @@ fn idx_remove(dir: &mut [u8], mut len: usize, name: &[u8]) -> usize {
 /// Пуст ли каталог (count == 0).
 fn idx_empty(dir: &[u8], len: usize) -> bool {
     len < 2 || u16::from_le_bytes([dir[0], dir[1]]) == 0
+}
+
+/// Веха 176 — сказать вслух, что файл не открыть: он больше слота. Молчаливая половина файла
+/// хуже отказа — половина шрифта не шрифт, половина архива не архив.
+fn say_too_big(path: &[u8]) {
+    sys::write_console("[posixfs] файл больше слота — открыть нельзя: ".as_bytes());
+    sys::write_console(path);
+    sys::write_console(b"\n");
+}
+
+/// Веха 176 — положить содержимое файла в store: маленькое одним объектом, большое КУСКАМИ.
+///
+/// Формат кусков — общий с загрузкой из сети (`void_tree::blob`): узел несёт манифест, куски
+/// висят детьми. Свой формат здесь был бы вторым, и первым же следствием стало бы, что
+/// скачанная картинка открывается, а та же картинка, положенная файлом, — нет.
+///
+/// Дедуп достаётся даром: одинаковый кусок в двух файлах — один объект в store.
+fn put_body(store: usize, body: &[u8], kids: &mut [[u8; 32]], id_out: &mut [u8; 32]) {
+    let chunk = sys::http::CHUNK;
+    if body.len() <= chunk {
+        sys::obj_put(store, body, id_out);
+        return;
+    }
+    let n = body.len().div_ceil(chunk).min(kids.len());
+    for k in 0..n {
+        let from = k * chunk;
+        let to = (from + chunk).min(body.len());
+        sys::obj_put(store, &body[from..to], &mut kids[k]);
+    }
+    let manifest = tree::blob::manifest(body.len(), n, chunk);
+    sys::obj_put_node(store, &manifest, &kids[..n], id_out);
 }
 
 /// Сколько записей поддерева помещается в один обход. Потолок, а не вежливость: обход держит
@@ -584,14 +616,56 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                                 // хвост `.vv`-модулей. Отдавать половину файла нельзя: половина
                                 // шрифта не шрифт, половина архива не архив.
                                 let (got, whole) = sys::obj_get_ex(store_cap, &idb, dbuf);
-                                if whole > dbuf.len() {
-                                    sys::write_console("[posixfs] файл больше 128 КиБ — открыть нельзя: ".as_bytes());
-                                    sys::write_console(path);
-                                    sys::write_console(b"\n");
-                                    fused[j] = false;
-                                    fidx = usize::MAX;
-                                } else {
-                                    size[j] = got;
+                                // Веха 176 — большой файл лежит в store КУСКАМИ: узел с
+                                // манифестом, куски детьми. Тем же форматом приезжает всё, что
+                                // скачано из сети (`void_tree::blob`), и это не совпадение —
+                                // формат один на систему, иначе `img` открывал бы скачанную
+                                // картинку и не открывал ту же картинку, положенную файлом.
+                                let blob = sys::http::blob_info(&dbuf[..got.min(whole)]);
+                                match blob {
+                                    Some((total, nchunks, csize)) if total <= dbuf.len() => {
+                                        let mut ok = sys::obj_children(store_cap, &idb, kids)
+                                            == nchunks;
+                                        let mut off = 0usize;
+                                        for k in 0..nchunks.min(kids.len()) {
+                                            if !ok {
+                                                break;
+                                            }
+                                            let end = (off + csize).min(total);
+                                            let n = sys::obj_get(
+                                                store_cap,
+                                                &kids[k],
+                                                &mut dbuf[off..end],
+                                            );
+                                            if n == 0 || n == usize::MAX {
+                                                ok = false;
+                                            }
+                                            off = end;
+                                        }
+                                        if ok && off == total {
+                                            size[j] = total;
+                                        } else {
+                                            sys::write_console("[posixfs] куски файла не сложились: ".as_bytes());
+                                            sys::write_console(path);
+                                            sys::write_console(b"\n");
+                                            fused[j] = false;
+                                            fidx = usize::MAX;
+                                        }
+                                    }
+                                    // Файл больше слота открыть НЕЧЕМ, и сказать это надо вслух:
+                                    // молча отдать половину — то же семейство тихих усечений,
+                                    // что съедало хвост `.vv`-модулей (Веха 114).
+                                    Some(_) => {
+                                        say_too_big(path);
+                                        fused[j] = false;
+                                        fidx = usize::MAX;
+                                    }
+                                    None if whole > dbuf.len() => {
+                                        say_too_big(path);
+                                        fused[j] = false;
+                                        fidx = usize::MAX;
+                                    }
+                                    None => size[j] = got,
                                 }
                             } else {
                                 size[j] = 0; // новый файл (создастся при close)
@@ -980,6 +1054,96 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 }
                 reply_len = 1;
             }
+            OP_COPY => {
+                // req: old_len(1) | old | new — как у `rename`. Веха 176.
+                //
+                // Копия НЕ ДВИГАЕТ БАЙТЫ: содержимое адресуется хэшем, поэтому достаточно завести
+                // второе имя для тех же объектов. Каталог копируется тем же обходом, что и
+                // переезд, и стоит ровно столько же — то есть ничего, сколько бы в нём ни лежало.
+                rep[0] = 0xff;
+                let ol = if len >= 2 { req[0] as usize } else { usize::MAX };
+                if ol != usize::MAX && 1 + ol < len {
+                    let mut oldp = [0u8; PATH_MAX];
+                    let mut newp = [0u8; PATH_MAX];
+                    let onl = normalize(&req[1..1 + ol], &mut oldp);
+                    let mut nnl = normalize(&req[1 + ol..len], &mut newp);
+                    // Из дерева пакета копировать нечего: там узлы чужого формата, а не корни
+                    // `f<путь>`. Такой файл копируется содержимым, и это дело вызывающего.
+                    if under_mount(&oldp[..onl]).is_some() || under_mount(&newp[..nnl]).is_some() {
+                        sys::reply(m.reply_cap, &rep[..1]);
+                        continue;
+                    }
+                    // Цель — существующий каталог: кладём ВНУТРЬ, как это делает `cp` и как уже
+                    // делает `rename`. Правило одно на обе операции, потому что вопрос один.
+                    {
+                        let mut rd = [0u8; ROOT_MAX];
+                        let rdl = root_name(b'd', &newp[..nnl], &mut rd);
+                        if sys::obj_get_root(store_cap, &rd[..rdl], &mut idb) == 32 {
+                            let name = leaf(&oldp[..onl]);
+                            let mut w = nnl;
+                            if newp[w - 1] != b'/' && w < PATH_MAX {
+                                newp[w] = b'/';
+                                w += 1;
+                            }
+                            let n = name.len().min(PATH_MAX - w);
+                            newp[w..w + n].copy_from_slice(&name[..n]);
+                            nnl = w + n;
+                        }
+                    }
+                    let (old, new) = (&oldp[..onl], &newp[..nnl]);
+                    let inside = nnl > onl && newp[..onl] == oldp[..onl] && newp[onl] == b'/';
+                    if old == new || inside {
+                        sys::reply(m.reply_cap, &rep[..1]);
+                        continue;
+                    }
+                    let is_dir = read_index(store_cap, old, &mut dir, &mut idb).is_some();
+                    let mut done = false;
+                    if is_dir {
+                        if let Some(n) = subtree(store_cap, old, walk, &mut walk_len, &mut walk_dir)
+                        {
+                            done = true;
+                            for i in 0..n {
+                                let plen = walk_len[i];
+                                let mut src = [0u8; PATH_MAX];
+                                src[..plen].copy_from_slice(&walk[i][..plen]);
+                                let tail = &src[onl..plen];
+                                if nnl + tail.len() > PATH_MAX {
+                                    done = false;
+                                    break;
+                                }
+                                let mut dst = [0u8; PATH_MAX];
+                                dst[..nnl].copy_from_slice(new);
+                                dst[nnl..nnl + tail.len()].copy_from_slice(tail);
+                                let kind = if walk_dir[i] { b'd' } else { b'f' };
+                                let mut ro = [0u8; ROOT_MAX];
+                                let mut rn = [0u8; ROOT_MAX];
+                                let rlo = root_name(kind, &src[..plen], &mut ro);
+                                let rln = root_name(kind, &dst[..nnl + tail.len()], &mut rn);
+                                if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
+                                    sys::obj_set_root(store_cap, &rn[..rln], &idb);
+                                }
+                            }
+                        }
+                    } else {
+                        let mut ro = [0u8; ROOT_MAX];
+                        let mut rn = [0u8; ROOT_MAX];
+                        let rlo = root_name(b'f', old, &mut ro);
+                        let rln = root_name(b'f', new, &mut rn);
+                        if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
+                            sys::obj_set_root(store_cap, &rn[..rln], &idb);
+                            done = true;
+                        }
+                    }
+                    if done {
+                        let pnew = parent(new);
+                        let plen = read_index(store_cap, pnew, &mut dir, &mut idb).unwrap_or(2);
+                        let nlen = idx_add(&mut dir, plen, leaf(new), is_dir);
+                        write_index(store_cap, pnew, &dir[..nlen], &mut idb);
+                        rep[0] = 0;
+                    }
+                }
+                reply_len = 1;
+            }
             OP_READLINK => {
                 // req — путь. Ответ: цель ссылки (пусто — не ссылка либо нет такой).
                 // Симлинки есть только в дереве пакета: своих в персоналии по-прежнему нет.
@@ -1149,7 +1313,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         let path = &paths[fi][..path_len[fi]];
                         let mut rn = [0u8; ROOT_MAX];
                         let rl = root_name(b'f', path, &mut rn);
-                        sys::obj_put(store_cap, &files[fi * DATA_MAX..fi * DATA_MAX + size[fi]], &mut idb);
+                        let body = &files[fi * DATA_MAX..fi * DATA_MAX + size[fi]];
+                        put_body(store_cap, body, kids, &mut idb);
                         sys::obj_set_root(store_cap, &rn[..rl], &idb);
                         // добавить имя в индекс родителя (скопировать путь — dir/idb переиспользуются)
                         let mut pcopy = [0u8; PATH_MAX];

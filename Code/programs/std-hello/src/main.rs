@@ -71,5 +71,20 @@ fn fs_demo(arch: &str) -> std::io::Result<()> {
         .filter_map(|e| Some(e.ok()?.file_name().into_string().ok()?))
         .collect();
     println!("[hello-std] fs: в каталоге {} файлов: {names:?}", names.len());
+
+    // Веха 176 — КАТАЛОГИ из std. До неё `create_dir` был `unsupported`, хотя каталоги у
+    // персоналии есть с Вехи 44: просто никто не связал одно с другим. Здесь это и проверяется —
+    // создать, положить внутрь, снести вместе с содержимым.
+    let _ = std::fs::remove_dir_all("std-dir"); // от прошлого запуска
+    std::fs::create_dir("std-dir")?;
+    std::fs::create_dir("std-dir/sub")?;
+    std::fs::write("std-dir/sub/deep.txt", "глубже\n")?;
+    let deep = std::fs::read_to_string("std-dir/sub/deep.txt")?;
+    println!("[hello-std] fs: каталоги: std-dir/sub/deep.txt = {:?}", deep.trim_end());
+    std::fs::remove_dir_all("std-dir")?;
+    println!(
+        "[hello-std] fs: remove_dir_all снёс дерево: {}",
+        if std::fs::metadata("std-dir").is_err() { "да" } else { "НЕТ" }
+    );
     Ok(())
 }

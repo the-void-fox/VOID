@@ -253,13 +253,58 @@ fn cmd_ls(store: &mut Store, io: &mut FileIo) {
 
 fn cmd_cat(store: &mut Store, io: &mut FileIo, name: &str) -> Result<(), String> {
     let id = store.root(name).ok_or_else(|| format!("нет корня «{name}»"))?;
-    store.with(io, &id, |p| match p {
-        Some(p) => match std::io::stdout().write_all(p) {
+    // Веха 176 — БОЛЬШОЙ файл лежит кусками: узел несёт манифест, куски висят детьми. Мост об
+    // этом не знал и отдавал сам манифест — двадцать пять байт вместо мегабайта, молча и с
+    // нулевым кодом возврата. Худший вид ошибки: `void-store-import cat … > файл` создавал
+    // правдоподобный файл не с тем содержимым.
+    let head = store.with(io, &id, |p| p.map(|b| b.to_vec()));
+    let Some(head) = head else {
+        return Err(format!("корень «{name}» указывает на отсутствующий объект"));
+    };
+    let mut out = std::io::stdout();
+    let write = |out: &mut dyn Write, bytes: &[u8]| -> Result<(), String> {
+        match out.write_all(bytes) {
             Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(format!("stdout: {e}")),
             _ => Ok(()), // закрытая труба (`| head`) — не ошибка
-        },
-        None => Err(format!("корень «{name}» указывает на отсутствующий объект")),
-    })
+        }
+    };
+    let Some((total, nchunks, _csize)) = blob_info(&head) else {
+        return write(&mut out, &head);
+    };
+    let kids = store.children(io, &id);
+    if kids.len() != nchunks {
+        return Err(format!("куски файла не сошлись: обещано {nchunks}, есть {}", kids.len()));
+    }
+    let mut got = 0usize;
+    for kid in &kids {
+        let part = store.with(io, kid, |p| p.map(|b| b.to_vec()));
+        let Some(part) = part else {
+            return Err(String::from("кусок файла не читается"));
+        };
+        got += part.len();
+        write(&mut out, &part)?;
+    }
+    if got != total {
+        return Err(format!("куски сложились в {got} Б вместо обещанных {total}"));
+    }
+    Ok(())
+}
+
+/// Разобрать манифест блоба (`void_tree::blob`): `(всего, кусков, размер куска)`.
+///
+/// Формат читается здесь, а не берётся из `void-tree`: мост собирается ХОСТОВЫМ cargo и намеренно
+/// зависит только от `void-store` — того единственного, где формат диска. Двадцать строк разбора
+/// дешевле, чем ещё одна общая зависимость у инструмента, живущего вне дерева VOID.
+fn blob_info(manifest: &[u8]) -> Option<(usize, usize, usize)> {
+    const MAGIC: &[u8; 9] = b"VOIDBLOB1";
+    if manifest.len() < MAGIC.len() + 16 || &manifest[..MAGIC.len()] != MAGIC {
+        return None;
+    }
+    let n = MAGIC.len();
+    let total = u64::from_le_bytes(manifest[n..n + 8].try_into().ok()?) as usize;
+    let chunks = u32::from_le_bytes(manifest[n + 8..n + 12].try_into().ok()?) as usize;
+    let csize = u32::from_le_bytes(manifest[n + 12..n + 16].try_into().ok()?) as usize;
+    (chunks > 0 && csize > 0).then_some((total, chunks, csize))
 }
 
 fn cmd_put(store: &mut Store, io: &mut FileIo, file: &str, root: &str) -> Result<(), String> {

@@ -1489,6 +1489,8 @@ pub mod posix {
     /// readlink(path) -> цель ссылки (пусто — не ссылка). Веха 108.2: симлинки есть только в
     /// дереве пакета под `/nix/store` — своих персоналия по-прежнему не заводит.
     pub const OP_READLINK: usize = 10;
+    /// copy(old, new) — Веха 176: скопировать файл ИЛИ КАТАЛОГ. Запрос как у `rename`.
+    pub const OP_COPY: usize = 11;
 
     /// Тип записи в ответе `stat` (7-й байт, Веха 108.2) — тот же, что в индексе дерева пакета.
     pub const T_FILE: u8 = 0;
@@ -1651,6 +1653,27 @@ pub mod posix {
     pub fn unlink(ep: usize, path: &[u8]) -> usize {
         let mut r = [0u8; 1];
         crate::call(ep, OP_UNLINK, path, &mut r);
+        if r[0] == 0 { 0 } else { usize::MAX }
+    }
+
+    /// Веха 176 — `copy(old, new) -> 0 | MAX`: скопировать файл или каталог со всем содержимым.
+    ///
+    /// Копия МГНОВЕННА и не занимает места, сколько бы ни весил оригинал. Содержимое в VOID
+    /// адресуется хэшем, поэтому «скопировать» — это завести второе ИМЯ для тех же объектов;
+    /// байты не двигаются вовсе. Это не оптимизация, а прямое следствие того, чем store является.
+    ///
+    /// Оговорка: так копируется только своё дерево. Файл из дерева пакета (`/nix/store/…`) —
+    /// узел чужого формата, у него нет корня `f<путь>`, и его копируют содержимым (`cat … > …`).
+    pub fn copy(ep: usize, old: &[u8], new: &[u8]) -> usize {
+        let mut req = [0u8; 512];
+        if 1 + old.len() + new.len() > req.len() {
+            return usize::MAX;
+        }
+        req[0] = old.len() as u8;
+        req[1..1 + old.len()].copy_from_slice(old);
+        req[1 + old.len()..1 + old.len() + new.len()].copy_from_slice(new);
+        let mut r = [0u8; 1];
+        crate::call(ep, OP_COPY, &req[..1 + old.len() + new.len()], &mut r);
         if r[0] == 0 { 0 } else { usize::MAX }
     }
 

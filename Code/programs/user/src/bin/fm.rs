@@ -130,6 +130,14 @@ struct App {
     /// Ответ на последнее действие («скопировано», «нет такого пути»). Отдельно от `err`: тот
     /// значит «показывать нечего», а этот — «показать есть что, и вот ещё словечко».
     flash: Option<String>,
+    /// Веха 176 — что взято «в руки» под копирование или перенос, и что именно из двух.
+    ///
+    /// Своё поле, а не буфер обмена: в буфере лежит ТЕКСТ (путь), и он общий на всю систему —
+    /// человек кладёт туда путь, чтобы вставить его в терминал. Смешать это с «я собираюсь
+    /// перенести вот эти три файла» значило бы, что копирование пути в терминал молча заряжает
+    /// перенос.
+    held: Vec<String>,
+    held_move: bool,
     cut: bool,
     marks: Vec<(String, String)>,
     /// Текст конфига поколения: из него берутся программы по умолчанию (`default …`).
@@ -174,6 +182,12 @@ enum Act {
     Open,
     Copy,
     Paste,
+    /// Веха 176 — взять выделенные файлы «в руки», чтобы положить их в другом каталоге.
+    Hold,
+    /// То же, но с переносом: оригинал уедет.
+    HoldCut,
+    /// Положить взятое в текущий каталог.
+    Put,
     Refresh,
     Delete,
     Rename,
@@ -1108,6 +1122,20 @@ impl App {
                 self.flash_clip(&p);
             }
             Act::Paste => self.paste(),
+            Act::Hold | Act::HoldCut => {
+                self.held = self.marked_paths();
+                self.held_move = a == Act::HoldCut;
+                let n = self.held.len();
+                self.flash = Some(if n == 0 {
+                    String::from("нечего брать")
+                } else {
+                    alloc::format!(
+                        "взято: {n} — откройте каталог и «{} сюда»",
+                        if self.held_move { "перенести" } else { "скопировать" }
+                    )
+                });
+            }
+            Act::Put => self.put_held(),
             Act::Refresh => self.read(),
             Act::Rename => {
                 if let Some(k) = entry {
@@ -1200,6 +1228,66 @@ impl App {
 
     /// Вставить из буфера: если там путь — перейти по нему. Каталог открывается, файл
     /// выделяется в своём каталоге.
+    /// Веха 176 — положить взятое в текущий каталог: копией или переносом.
+    ///
+    /// Копия у персоналии МГНОВЕННА и не занимает места (содержимое адресуется хэшем — копия это
+    /// второе имя тех же объектов), поэтому индикатора прогресса здесь нет и быть не может: он
+    /// показывал бы ноль.
+    fn put_held(&mut self) {
+        let (mut ok, mut fail) = (0usize, 0usize);
+        let held = core::mem::take(&mut self.held);
+        for src in &held {
+            let name = src.rsplit('/').next().unwrap_or("").to_string();
+            if name.is_empty() {
+                fail += 1;
+                continue;
+            }
+            let dst = self.free_name(&name);
+            let done = if self.held_move {
+                px::rename(self.ep, src.as_bytes(), dst.as_bytes()) == 0
+            } else {
+                px::copy(self.ep, src.as_bytes(), dst.as_bytes()) == 0
+            };
+            if done {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        self.flash = Some(match (ok, fail) {
+            (n, 0) if self.held_move => alloc::format!("перенесено: {n}"),
+            (n, 0) => alloc::format!("скопировано: {n}"),
+            (0, f) => alloc::format!("не вышло: {f}"),
+            (n, f) => alloc::format!("готово: {n}, не вышло: {f}"),
+        });
+        if ok > 0 {
+            self.read();
+        }
+    }
+
+    /// Свободное имя в текущем каталоге: `имя`, потом `имя-копия`, `имя-копия-2`, …
+    ///
+    /// Без этого копирование в тот же каталог упиралось бы в «цель занята» — а это самый частый
+    /// способ сделать копию файла вообще.
+    fn free_name(&self, name: &str) -> String {
+        let first = Self::join(&self.cwd, name);
+        if px::stat(self.ep, first.as_bytes()).is_none() {
+            return first;
+        }
+        for k in 1..100 {
+            let try_name = if k == 1 {
+                alloc::format!("{name}-копия")
+            } else {
+                alloc::format!("{name}-копия-{k}")
+            };
+            let p = Self::join(&self.cwd, &try_name);
+            if px::stat(self.ep, p.as_bytes()).is_none() {
+                return p;
+            }
+        }
+        first
+    }
+
     fn paste(&mut self) {
         match self.clip_text() {
             Some(t) => self.goto_path(&t),
@@ -1320,6 +1408,11 @@ impl App {
                     items.push((Act::Rename, String::from("переименовать")));
                 }
                 items.push((Act::Copy, String::from("копировать путь")));
+                // Веха 176 — «взять» и «перенести» отделены от «копировать путь» намеренно: то
+                // кладёт в общий буфер ТЕКСТ, а это берёт сами файлы. Одно слово на два разных
+                // действия было бы удобно ровно до первой потери данных.
+                items.push((Act::Hold, String::from(if many { "скопировать это" } else { "скопировать" })));
+                items.push((Act::HoldCut, String::from(if many { "перенести это" } else { "перенести" })));
                 if dir && !many {
                     items.push((Act::Term, String::from("открыть в терминале")));
                     items.push((Act::Mark, String::from("в закладки")));
@@ -1343,6 +1436,16 @@ impl App {
                 items.push((Act::Term, String::from("открыть в терминале")));
                 items.push((Act::NewDir, String::from("создать каталог")));
                 items.push((Act::NewFile, String::from("создать файл")));
+                if !self.held.is_empty() {
+                    let n = self.held.len();
+                    items.push((
+                        Act::Put,
+                        alloc::format!(
+                            "{} сюда ({n})",
+                            if self.held_move { "перенести" } else { "скопировать" }
+                        ),
+                    ));
+                }
                 items.push((Act::Paste, String::from("вставить путь")));
                 items.push((Act::Copy, String::from("копировать путь каталога")));
                 items.push((Act::Mark, String::from("этот каталог в закладки")));
@@ -1805,6 +1908,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sig: 0,
         err: None,
         flash: None,
+                held: Vec::new(),
+                held_move: false,
                 cut: false,
         marks: Vec::new(),
         generation,

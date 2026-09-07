@@ -421,10 +421,6 @@ pub fn capacity_sectors() -> u64 {
     AHCI.lock().as_ref().map_or(0, |d| d.capacity)
 }
 
-/// Веха 48 — полная ёмкость физического диска в секторах (нужна установщику для разметки).
-pub fn total_sectors() -> u64 {
-    AHCI.lock().as_ref().map_or(0, |d| d.total)
-}
 
 /// Прочитать сектор `sector` store'а в `buf` (со смещением раздела `base`).
 pub fn read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {

@@ -716,6 +716,7 @@ fn shell_env() -> Env {
         ("log", sh_log),
         ("clear", sh_clear),
         ("help", sh_help),
+        ("cp", sh_cp), // Веха 176 — копия мгновенна: то же содержимое под вторым именем
         ("date", sh_date), // Веха 86 — часы системы
         ("notify", sh_notify), // Веха 168 — сказать человеку
         ("random", sh_random), // Веха 86 — случайные байты от ядра
@@ -974,13 +975,14 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     sys::write(C_RESET);
     sys::write(" — шелл VOID. Строка с ведущим `\\` — выражение, иначе команда.\n".as_bytes());
     help_row(b"ls [DIR]", "список файлов (каталог или текущий)");
-    help_row(b"cat FILE", "показать содержимое файла");
+    help_row(b"cat FILE", "показать содержимое (cat A > B — записать содержимым)");
     help_row(b"tail FILE", "последние ~32 байта файла");
     help_row(b"cd [DIR]", "сменить каталог (.. вверх, без арг — в корень)");
     help_row(b"pwd", "текущий каталог");
     help_row(b"mkdir DIR", "создать каталог");
-    help_row(b"rm PATH", "удалить файл (или пустой каталог)");
-    help_row(b"mv OLD NEW", "переименовать файл");
+    help_row(b"rm PATH", "удалить файл или пустой каталог (rm \"-r\" — с содержимым)");
+    help_row(b"mv OLD NEW", "переименовать/переместить файл или каталог");
+    help_row(b"cp SRC DST", "копировать файл или каталог (мгновенно: то же содержимое)");
     help_row(b"echo TEXT", "напечатать ($x — переменная; TEXT > FILE — запись)");
     help_row(b"ved FILE", "экранный редактор: ^S сохранить, ^Q выход (программа)");
     help_row(b"grep SUB L", "фильтр строк списка (для конвейеров)");
@@ -1036,8 +1038,25 @@ fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => resolve(s.as_bytes()),
         _ => return Err(EvalError::new("cat: нужен путь-строка")),
     };
+    // Веха 176 — `cat откуда > куда` пишет СОДЕРЖИМОЕ в файл. Тот же знак и тот же смысл, что у
+    // `echo … > файл`, и нужен он там, где мгновенная копия невозможна: файл дерева пакета
+    // (`/nix/store/…`) — узел чужого формата, корня `f<путь>` у него нет, и `cp` его не возьмёт.
+    // Так содержимое пакета попадает в своё дерево — единственным способом, который у нас есть.
+    let out = match args.iter().position(|a| matches!(a, Value::Str(s) if &**s == ">")) {
+        Some(i) => match args.get(i + 1) {
+            Some(Value::Str(pth)) => Some(resolve(pth.as_bytes())),
+            _ => return Err(EvalError::new("cat: после > нужен путь")),
+        },
+        None => None,
+    };
     match read_file(ep, &path) {
         Some(bytes) => {
+            if let Some(dst) = out {
+                if !px::echo_to(ep, &dst, &bytes) {
+                    return Err(EvalError::new("cat: файл записан не полностью"));
+                }
+                return Ok(Value::nil());
+            }
             if !bytes.is_empty() {
                 sys::write(&bytes);
                 if *bytes.last().unwrap() != b'\n' {
@@ -1213,6 +1232,30 @@ fn sh_tail(args: &[Value]) -> Result<Value, EvalError> {
         sys::write(b"\n");
     }
     Ok(Value::nil())
+}
+
+/// `(cp откуда куда)` — СКОПИРОВАТЬ файл или каталог (Веха 176).
+///
+/// Копия мгновенна и не занимает места: содержимое в VOID адресуется хэшем, поэтому копия — это
+/// второе имя для тех же объектов. Каталог копируется со всем содержимым по той же причине.
+///
+/// Из дерева пакета (`/nix/store/…`) так копировать нельзя — там узлы чужого формата; для них
+/// есть `cat откуда > куда`, копирующий содержимым.
+fn sh_cp(args: &[Value]) -> Result<Value, EvalError> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Str(o)), Some(Value::Str(n))) => {
+            let old = resolve(o.as_bytes());
+            let new = resolve(n.as_bytes());
+            if px::copy(cap_fs(), &old, &new) != 0 {
+                return Err(EvalError::new(
+                    "cp не удался: нет такого пути, цель занята, либо это файл из дерева пакета \
+                     (для него `cat откуда > куда`)",
+                ));
+            }
+            Ok(Value::nil())
+        }
+        _ => Err(EvalError::new("cp: (cp \"откуда\" \"куда\")")),
+    }
 }
 
 /// `(mv старый новый)` — переименовать или переместить файл ИЛИ КАТАЛОГ (пути — от cwd).
