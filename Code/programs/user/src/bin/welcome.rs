@@ -167,7 +167,7 @@ impl App {
         // столов» и «Терминал» разъехались бы при другом кегле или шрифте.
         let key_w = SCREENS[screen]
             .iter()
-            .filter_map(|i| if let Pair(k, _) = i { Some(*k) } else { None })
+            .filter_map(|i| if let Pair(k, _) = i { Some(ui::t(k)) } else { None })
             .map(|k| u.text_w(k))
             .max()
             .unwrap_or(0);
@@ -176,21 +176,22 @@ impl App {
             match item {
                 Title(s) => {
                     let col = u.th.muted;
+                    let s = ui::t(s);
                     let w = self.big.width(s);
                     let base = y + self.big.ascent();
                     self.big.draw(&mut u.c, (self.w - w) / 2, base, s, col);
                     y += self.big.line_h();
                 }
-                Text(s) => y = wrap(u, left, y, width, s, u.th.muted),
+                Text(s) => y = wrap(u, left, y, width, ui::t(s), u.th.muted),
                 Item(k, s) => {
                     let tag = alloc::format!("{k}.");
                     let col = u.th.muted;
                     u.label(Rect::new(left, y, line * 2, line), &tag, col, Align::Left);
-                    y = wrap(u, left + line * 2, y, width - line * 2, s, col);
+                    y = wrap(u, left + line * 2, y, width - line * 2, ui::t(s), col);
                 }
                 Pair(k, v) => {
                     let (mu, tx) = (u.th.muted, u.th.text);
-                    u.label(Rect::new(left, y, key_w, line), k, mu, Align::Left);
+                    u.label(Rect::new(left, y, key_w, line), ui::t(k), mu, Align::Left);
                     let vx = left + key_w + line;
                     u.label(Rect::new(vx, y, width - key_w - line, line), v, tx, Align::Left);
                     y += line;
@@ -320,7 +321,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Размер окна — пожелание: композитор всё равно уложит его в колонку ленты и пришлёт
     // `Resize` с настоящим. Крупные кегли поэтому и считаются в первом кадре, а не здесь.
     let (w, h) = (640u16, 760u16);
-    let Some(mut surf) = Window::create(w, h, "Добро пожаловать") else {
+    let Some(mut surf) = Window::create(w, h, ui::t("Добро пожаловать")) else {
         ui::app::say("welcome: композитора нет (WM в окружении)");
         sys::exit(1);
     };

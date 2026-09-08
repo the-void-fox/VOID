@@ -60,6 +60,7 @@ pub mod app;
 pub mod conf;
 pub mod edit;
 pub mod font;
+pub mod i18n;
 pub mod icon;
 pub mod list;
 pub mod paint;
@@ -73,6 +74,10 @@ pub use anim::Motion;
 pub use app::{Client, Input, Scope};
 #[allow(unused_imports)]
 pub use edit::Edit;
+// Веха 178 — перевод строк интерфейса. Реэкспорт, а не `ui::i18n::t` на каждом вызове: `t()`
+// стоит в коде десятками раз подряд, и длинный путь превратил бы читаемую строку в шум.
+#[allow(unused_imports)]
+pub use i18n::{f1, f2, f3, t};
 #[allow(unused_imports)]
 pub use list::{Hit, List};
 pub use paint::{Align, Canvas, Rect, Rgba};

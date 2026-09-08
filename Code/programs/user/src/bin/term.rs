@@ -478,6 +478,8 @@ impl Conf {
             shell_args: b"repl".to_vec(),
         };
         if let Some(text) = read_generation() {
+            // Веха 178 — язык интерфейса из того же текста поколения, что и всё остальное.
+            sys::i18n::set_from_config(&text);
             c.apply(&text);
         }
         // Пустая схема — не «терминал без клавиш», а «конфиг про клавиши не говорил».
@@ -797,7 +799,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     // Веха 118 — есть композитор? Тогда мы ОКНО, а не владелец экрана. Решение принимается
     // здесь и больше нигде: дальше по коду разница видна только в том, куда лёг кадр.
-    let (mut out, mut info) = match sys::win::Window::create(WIN_W, WIN_H, "терминал") {
+    let (mut out, mut info) = match sys::win::Window::create(WIN_W, WIN_H, sys::i18n::t("терминал")) {
         Some(win) => {
             log_line("term: работаю окном композитора");
             // Кадр окна — RGBA по строкам без выравнивания; описываем его теми же полями, что
@@ -1377,9 +1379,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 if let Wait::Exited(_) = sys::wait(pid, true) {
                     let pane = &mut panes[i];
                     pane.child = None;
-                    let note =
-                        "\r\n\x1b[1;31m[процесс завершился — Ctrl-A x закрыть панель]\x1b[0m\r\n";
+                    let note = sys::i18n::t("[процесс завершился — Ctrl-A x закрыть панель]");
+                    pane.parser.advance(&mut pane.grid, b"\r\n\x1b[1;31m");
                     pane.parser.advance(&mut pane.grid, note.as_bytes());
+                    pane.parser.advance(&mut pane.grid, b"\x1b[0m\r\n");
                     redraw = true;
                     worked = true;
                 }
@@ -1663,8 +1666,10 @@ fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize, con
         scroll: 0,
     };
     if child.is_none() {
-        let msg = "\x1b[1;31m[не удалось запустить шелл]\x1b[0m\r\n";
+        let msg = sys::i18n::t("[не удалось запустить шелл]");
+        pane.parser.advance(&mut pane.grid, b"\x1b[1;31m");
         pane.parser.advance(&mut pane.grid, msg.as_bytes());
+        pane.parser.advance(&mut pane.grid, b"\x1b[0m\r\n");
     }
     pane
 }
@@ -1812,13 +1817,13 @@ fn read_root_text(cap: usize, name: &[u8]) -> Option<String> {
 
 /// Веха 150 — ВСТАВИТЬ из буфера обмена в очередь ввода фокусной панели.
 fn paste_clipboard(panes: &mut [Pane], focus: usize) -> usize {
-    paste_named(panes, focus, sys::win::clip_read, "буфер обмена пуст")
+    paste_named(panes, focus, sys::win::clip_read, sys::i18n::t("буфер обмена пуст"))
 }
 
 /// Веха 150.1 — вставить то, что в нас УРОНИЛИ. Читается ровно так же, как буфер обмена, и
 /// разница только в том, кто назвал имя: буфер мы спросили сами, уроненное нам дали.
 fn paste_dropped(panes: &mut [Pane], focus: usize) -> usize {
-    paste_named(panes, focus, sys::win::drop_read, "уроненное уже забрали")
+    paste_named(panes, focus, sys::win::drop_read, sys::i18n::t("уроненное уже забрали"))
 }
 
 /// Общая вставка: прочитать названный композитором объект и положить его как будто набранный.
@@ -2145,14 +2150,18 @@ fn status_bar(
     let bg = if mode == Mode::Pane { NamedColor::BrightYellow } else { NamedColor::BrightCyan };
     let mut text = String::new();
     use core::fmt::Write;
-    let _ = write!(text, " VOID · панель {}/{} ", focus + 1, panes.len());
+    let _ = write!(text, " VOID · {} {}/{} ", sys::i18n::t("панель"), focus + 1, panes.len());
     if let Some(p) = panes.get(focus) {
-        let _ = write!(text, "· {} ", if p.child.is_some() { "живая" } else { "мертва" });
+        let _ = write!(
+            text,
+            "· {} ",
+            if p.child.is_some() { sys::i18n::t("живая") } else { sys::i18n::t("мертва") }
+        );
         // Прокрутка показывается ТОЛЬКО когда она есть: строка состояния, в которой всегда
         // написано «0 строк», перестаёт читаться. Зато когда вьюпорт поднят — это видно сразу,
         // и «почему не появляется новый вывод» перестаёт быть загадкой.
         if p.scroll > 0 {
-            let _ = write!(text, "· ↑{} из {} ", p.scroll, p.grid.scrollback_len());
+            let _ = write!(text, "· ↑{} / {} ", p.scroll, p.grid.scrollback_len());
         }
     }
     // Режим показывается всегда: модальное управление без индикатора — способ потеряться.
@@ -2185,7 +2194,7 @@ fn hint(conf: &Conf, mode: Mode) -> String {
     if mode != Mode::Pane {
         return match conf.key_for(Mode::Normal, "mode-pane") {
             Some(k) => {
-                let _ = write!(s, "{} — команды панелей", k);
+                let _ = write!(s, "{} — {}", k, sys::i18n::t("команды панелей"));
                 s
             }
             None => s,
@@ -2193,9 +2202,14 @@ fn hint(conf: &Conf, mode: Mode) -> String {
     }
     // Без значка-«квадратика»: U+2B1B в шрифте нет, и вместо метки режима выходил тофу —
     // в статус-баре это читается как поломка. Режим и так виден цветом полосы и словом.
-    let _ = write!(s, "ПАНЕЛИ:");
+    let _ = write!(s, "{}", sys::i18n::t("ПАНЕЛИ:"));
     for (action, label) in
-        [("split-v", "разбить"), ("split-h", "поперёк"), ("close", "закрыть"), ("quit", "выход")]
+        [
+            ("split-v", sys::i18n::t("разбить")),
+            ("split-h", sys::i18n::t("поперёк")),
+            ("close", sys::i18n::t("закрыть")),
+            ("quit", sys::i18n::t("выход")),
+        ]
     {
         if let Some(k) = conf.key_for(Mode::Pane, action) {
             let _ = write!(s, " {} {} ·", k, label);
@@ -2211,7 +2225,13 @@ fn hint(conf: &Conf, mode: Mode) -> String {
         .collect();
     if !nav.is_empty() {
         let shown = nav.len().min(4);
-        let _ = write!(s, " {}{} переход", nav[..shown].join(" "), if nav.len() > shown { " …" } else { "" });
+        let _ = write!(
+            s,
+            " {}{} {}",
+            nav[..shown].join(" "),
+            if nav.len() > shown { " …" } else { "" },
+            sys::i18n::t("переход")
+        );
     }
     s
 }

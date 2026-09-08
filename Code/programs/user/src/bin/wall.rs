@@ -99,7 +99,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         }
     };
 
-    let Some(mut surf) = Window::layer(win::Layer::WALLPAPER, sw, sh, "обои") else {
+    let Some(mut surf) = Window::layer(win::Layer::WALLPAPER, sw, sh, sys::i18n::t("обои")) else {
         say("wall: композитор не дал поверхность слоя\n");
         sys::exit(1);
     };

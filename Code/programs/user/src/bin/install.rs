@@ -163,18 +163,18 @@ impl ui::Client for App {
 
         let title = r.cut_top(line * 2);
         let (tx, mu) = (u.th.text, u.th.muted);
-        u.label(title, "Куда поставить систему", tx, Align::Center);
+        u.label(title, ui::t("Куда поставить систему"), tx, Align::Center);
 
         match &self.stage {
             Stage::Working => {
-                u.label(r, "ставлю…", mu, Align::Center);
+                u.label(r, ui::t("ставлю…"), mu, Align::Center);
                 return ui::Scope::No;
             }
             Stage::Done(text, ok) => {
                 let col = if *ok { u.th.text } else { u.th.danger };
                 let mut body = r;
                 let head = body.cut_top(line * 2);
-                u.label(head, if *ok { "Готово" } else { "Не вышло" }, col, Align::Center);
+                u.label(head, if *ok { ui::t("Готово") } else { ui::t("Не вышло") }, col, Align::Center);
                 wrap(u, body.x, body.y, body.w, text, mu);
                 return ui::Scope::No;
             }
@@ -182,7 +182,7 @@ impl ui::Client for App {
         }
 
         if self.disks.is_empty() {
-            wrap(u, r.x, r.y, r.w, "SATA-дисков не найдено. Ставить некуда.", mu);
+            wrap(u, r.x, r.y, r.w, ui::t("SATA-дисков не найдено. Ставить некуда."), mu);
             return ui::Scope::No;
         }
 
@@ -197,15 +197,15 @@ impl ui::Client for App {
             let (name, sub, sel) = {
                 let d = &self.disks[i];
                 let mark = if d.live {
-                    " · с него работает система"
+                    ui::t(" · с него работает система")
                 } else if d.void {
-                    " · здесь уже есть VOID"
+                    ui::t(" · здесь уже есть VOID")
                 } else {
                     ""
                 };
                 (
                     alloc::format!("{}  ·  {}", d.model, d.size),
-                    alloc::format!("диск {}{}", d.slot, mark),
+                    alloc::format!("{}{}", ui::f1(ui::t("диск {}"), &alloc::format!("{}", d.slot)), mark),
                     if i == self.sel { 256 } else { 0 },
                 )
             };
@@ -228,12 +228,14 @@ impl ui::Client for App {
                 warn.x,
                 warn.y,
                 warn.w,
-                "Диск будет стёрт целиком: таблица разделов, все разделы, все файлы. \
-                 Отменить это нельзя.",
+                ui::t(
+                    "Диск будет стёрт целиком: таблица разделов, все разделы, все файлы. \
+                     Отменить это нельзя.",
+                ),
                 u.th.danger,
             );
             let hot = if u.hot(btn) { 256 } else { 0 };
-            if u.danger(btn, "Стереть и поставить", hot) {
+            if u.danger(btn, ui::t("Стереть и поставить"), hot) {
                 self.stage = Stage::Working;
                 return ui::Scope::All; // кадр «ставлю…» — ДО самой установки
             }
@@ -243,7 +245,7 @@ impl ui::Client for App {
                 warn.x,
                 warn.y,
                 warn.w,
-                "На этот диск поставить нельзя: с него работает система прямо сейчас.",
+                ui::t("На этот диск поставить нельзя: с него работает система прямо сейчас."),
                 mu,
             );
         }
@@ -259,17 +261,17 @@ impl ui::Client for App {
         let slot = self.disks.get(self.sel).map(|d| d.slot).unwrap_or(usize::MAX);
         self.stage = match sys::install(self.store, slot) {
             Some(_) => Stage::Done(
-                String::from(
+                String::from(ui::t(
                     "VOID установлен. Выключи машину, вынь носитель и включи снова — \
                      система поднимется с диска. Первая загрузка сама посеет конфиг.",
-                ),
+                )),
                 true,
             ),
             None => Stage::Done(
-                String::from(
+                String::from(ui::t(
                     "Установка не состоялась. Причину ядро сказало в журнал: `klog`. \
                      Чаще всего это отсутствие образа установки — то есть загрузка не с носителя.",
-                ),
+                )),
                 false,
             ),
         };
@@ -356,7 +358,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let arg = argv.str(0).and_then(|s| s.parse::<usize>().ok());
 
     let (w, h) = (720u16, 520u16);
-    let Some(mut surf) = Window::create(w, h, "Установка VOID") else {
+    let Some(mut surf) = Window::create(w, h, ui::t("Установка VOID")) else {
         text_mode(store, &disks, arg);
     };
     // Номер, названный словами, слушаемся и в окне: человек уже сказал, куда ставить.

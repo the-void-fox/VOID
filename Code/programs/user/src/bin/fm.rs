@@ -67,13 +67,27 @@ struct Entry {
 /// Места, куда ходят чаще всего. Список ФИКСИРОВАННЫЙ и проверенный: каждая закладка перед
 /// показом опрашивается `stat`, и та, которой нет, не рисуется. Закладка на несуществующее —
 /// это кнопка, ведущая в ошибку, а «здесь ничего нет» человек должен узнавать не так.
-const MARKS: [(&str, &str); 5] = [
+const MARKS: [(&str, &str); 6] = [
     ("/", "корень"),
     ("/etc", "конфиг"),
     ("/etc/system", "поколения"),
     ("/nix/store", "store"),
     ("/bin", "программы"),
+    // Веха 178 — корзины может не быть вовсе: закладка появится, когда в неё что-нибудь
+    // положат, и исчезнет, когда её очистят. Ровно то поведение, которое здесь и заявлено.
+    (TRASH, "корзина"),
 ];
+
+/// Веха 178 — КОРЗИНА: обычный каталог, а не скрытая машинерия.
+///
+/// Внутри неё путь ЗЕРКАЛИТСЯ: `/etc/foo.txt` уезжает в `/trash/etc/foo.txt`. Поэтому «вернуть»
+/// — это снять приставку, и никакого индекса «что откуда» держать не нужно. Индекс пришлось бы
+/// хранить файлом рядом, чинить при рассинхроне и объяснять человеку, почему корзину нельзя
+/// разгрести руками; зеркало не нужно объяснять вовсе — оно видно глазами.
+///
+/// Лежит в корне и НЕ прячется: скрытых файлов в VOID нет как понятия, а корзина, которую не
+/// видно, — это тихо растущее место на диске.
+const TRASH: &str = "/trash";
 
 #[derive(Default)]
 struct Lay {
@@ -192,6 +206,13 @@ enum Act {
     /// Положить взятое в текущий каталог.
     Put,
     Refresh,
+    /// Веха 178 — в корзину: обратимо, поэтому без переспроса.
+    Trash,
+    /// Оттуда же обратно, на прежнее место.
+    Restore,
+    /// Опорожнить корзину целиком (взводится, как и `Delete`).
+    EmptyTrash,
+    /// Снести НАВСЕГДА, минуя корзину. Взводится вторым нажатием.
     Delete,
     Rename,
     NewDir,
@@ -260,14 +281,14 @@ impl App {
         self.err = None;
         self.cut = false;
         if self.ep == sys::NO_CAP {
-            self.err = Some(String::from("нет права на файловый сервер"));
+            self.err = Some(String::from(ui::t("нет права на файловый сервер")));
             self.refilter();
             return;
         }
         let mut buf = alloc::vec![0u8; DIR_BUF];
         let (n, want) = px::readdir_ex(self.ep, self.cwd.as_bytes(), &mut buf);
         if n == usize::MAX {
-            self.err = Some(alloc::format!("каталог не открылся: {}", self.cwd));
+            self.err = Some(ui::f1(ui::t("каталог не открылся: {}"), &self.cwd));
             self.refilter();
             return;
         }
@@ -525,11 +546,11 @@ impl App {
         // и так отвечает на «где я», логично, что она же принимает «куда идти». Пока правим,
         // крошек нет — иначе в одном месте было бы два разных ответа на один вопрос.
         if let Some((What::Path, e)) = &self.edit {
-            let (click, drag) = u.edit_field(lay.addr, e, "путь");
+            let (click, drag) = u.edit_field(lay.addr, e, ui::t("путь"));
             caret_to = click;
             drag_to = drag;
         } else if !self.query.is_empty() {
-            u.label(a, &alloc::format!("поиск: {}", self.query), th.text, Align::Left);
+            u.label(a, &ui::f1(ui::t("поиск: {}"), &self.query), th.text, Align::Left);
         } else {
             let crumbs = self.crumbs();
             let ch = lay.addr.h - th.px(6);
@@ -606,7 +627,7 @@ impl App {
         let ico = head.cut_left(font_h);
         u.icon(ico, ui::icon::STAR, th.muted);
         head.cut_left(th.px(4));
-        u.label(head, "закладки", th.muted, Align::Left);
+        u.label(head, ui::t("закладки"), th.muted, Align::Left);
         d.cut_top(th.px(4));
         let mut act: Option<String> = None;
         for k in 0..self.marks.len() {
@@ -653,9 +674,9 @@ impl App {
         // уже, чем то, что в него набирают.
         if let Some((what @ (What::Rename(_) | What::Create { .. }), e)) = &self.edit {
             let hint = match what {
-                What::Create { dir: true } => "имя каталога",
-                What::Create { dir: false } => "имя файла",
-                _ => "новое имя",
+                What::Create { dir: true } => ui::t("имя каталога"),
+                What::Create { dir: false } => ui::t("имя файла"),
+                _ => ui::t("новое имя"),
             };
             let r = Rect::new(lay.body.x + th.pad, lay.body.y + th.px(6), lay.body.w - 2 * th.pad, font_h + th.px(10));
             let (click, drag) = u.edit_field(r, e, hint);
@@ -677,15 +698,15 @@ impl App {
             let mut d = lay.body.inset(th.pad);
             let msg = e.clone();
             u.label(d.cut_top(font_h + th.px(4)), &msg, th.text, Align::Left);
-            u.label(d.cut_top(font_h), "проверь путь и права", th.muted, Align::Left);
+            u.label(d.cut_top(font_h), ui::t("проверь путь и права"), th.muted, Align::Left);
             return false;
         }
         if self.hits.is_empty() {
             let mut d = lay.body.inset(th.pad);
             let msg = if self.entries.is_empty() {
-                "каталог пуст"
+                ui::t("каталог пуст")
             } else {
-                "ничего не нашлось"
+                ui::t("ничего не нашлось")
             };
             u.label(d.cut_top(font_h + th.px(4)), msg, th.muted, Align::Left);
             return false;
@@ -748,7 +769,7 @@ impl App {
                 let when_r = (t.w > dw * 2).then(|| t.cut_right(dw));
                 u.label(t, &name, th.text, Align::Left);
                 let s = match (dir, size) {
-                    (true, _) => String::from("каталог"),
+                    (true, _) => String::from(ui::t("каталог")),
                     (false, Some(n)) => size_text(n),
                     (false, None) => String::new(),
                 };
@@ -776,7 +797,7 @@ impl App {
                 u.label(foot.inset_xy(th.px(8), 0), &m, th.accent, Align::Right);
             }
             (None, true) => {
-                let m = alloc::format!("показаны не все: сервер отдал {} имён", total);
+                let m = ui::f1(ui::t("показаны не все: сервер отдал имён — {}"), &num(total));
                 u.label(foot.inset_xy(th.px(8), 0), &m, th.muted, Align::Right);
             }
             _ => {}
@@ -899,10 +920,10 @@ impl App {
             }
         }
         self.flash = Some(match (ok, fail) {
-            (0, 0) => String::from("это уже здесь"),
-            (n, 0) => alloc::format!("перенесено: {n}"),
-            (0, f) => alloc::format!("не перенести: {f} (каталоги пока не переносятся)"),
-            (n, f) => alloc::format!("перенесено: {n}, не вышло: {f}"),
+            (0, 0) => String::from(ui::t("это уже здесь")),
+            (n, 0) => ui::f1(ui::t("перенесено: {}"), &num(n)),
+            (0, f) => ui::f1(ui::t("не перенести: {}"), &num(f)),
+            (n, f) => ui::f2(ui::t("перенесено: {}, не вышло: {}"), &num(n), &num(f)),
         });
         if ok > 0 {
             self.read();
@@ -924,11 +945,11 @@ impl App {
     /// выхода ему нечем ([[launcher]], Веха 147).
     fn open_with(&mut self, role: &str, arg: &str) {
         let Some(prog) = self.default_app(role) else {
-            self.flash = Some(alloc::format!("в конфиге нет строки `default {role} …`"));
+            self.flash = Some(ui::f1(ui::t("в конфиге нет строки `default {} …`"), role));
             return;
         };
         let Some(store) = self.store else {
-            self.flash = Some(String::from("нет права на store — запускать нечем"));
+            self.flash = Some(String::from(ui::t("нет права на store — запускать нечем")));
             return;
         };
         let mut a: Vec<u8> = Vec::new();
@@ -937,7 +958,7 @@ impl App {
         a.extend_from_slice(arg.as_bytes());
         a.push(0);
         if sys::spawn(store, b"run", &a).is_none() {
-            self.flash = Some(alloc::format!("не запустить: {prog}"));
+            self.flash = Some(ui::f1(ui::t("не запустить: {}"), &prog));
         } else {
             self.flash = Some(alloc::format!("{prog}: {arg}"));
         }
@@ -964,10 +985,12 @@ impl App {
         }
         if out.is_empty() {
             // Пусто (или файла нет) — умолчание из мест, которые в системе есть всегда.
+            // Веха 178 — подписи УМОЛЧАНИЙ переводятся здесь, при загрузке: дальше закладка
+            // живёт обычной строкой, и отличить свою (её назвал человек) от нашей уже нельзя.
             out = MARKS
                 .iter()
                 .filter(|(p, _)| px::stat(self.ep, p.as_bytes()).is_some_and(|(d, _)| d))
-                .map(|(p, l)| (String::from(*p), String::from(*l)))
+                .map(|(p, l)| (String::from(*p), String::from(ui::t(l))))
                 .collect();
         }
         self.marks = out;
@@ -982,7 +1005,7 @@ impl App {
         }
         let fd = px::open(self.ep, Self::MARKS_FILE.as_bytes(), px::O_TRUNC);
         if fd == usize::MAX {
-            self.flash = Some(String::from("закладки не записать"));
+            self.flash = Some(String::from(ui::t("закладки не записать")));
             return;
         }
         px::write(self.ep, fd, text.as_bytes());
@@ -993,23 +1016,23 @@ impl App {
     fn leaf_name(p: &str) -> String {
         match p.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()) {
             Some(n) => String::from(n),
-            None => String::from("корень"),
+            None => String::from(ui::t("корень")),
         }
     }
 
     fn add_mark(&mut self, path: String) {
         if !px::stat(self.ep, path.as_bytes()).is_some_and(|(d, _)| d) {
-            self.flash = Some(String::from("в закладки кладём каталоги"));
+            self.flash = Some(String::from(ui::t("в закладки кладём каталоги")));
             return;
         }
         if self.marks.iter().any(|(p, _)| *p == path) {
-            self.flash = Some(String::from("уже в закладках"));
+            self.flash = Some(String::from(ui::t("уже в закладках")));
             return;
         }
         let name = Self::leaf_name(&path);
         self.marks.push((path, name));
         self.save_marks();
-        self.flash = Some(String::from("добавлено в закладки"));
+        self.flash = Some(String::from(ui::t("добавлено в закладки")));
     }
 
     fn drop_mark(&mut self, k: usize) {
@@ -1018,7 +1041,7 @@ impl App {
         }
         self.marks.remove(k);
         self.save_marks();
-        self.flash = Some(String::from("закладка убрана"));
+        self.flash = Some(String::from(ui::t("закладка убрана")));
     }
 
     /// Начать правку: адреса, имени записи или имени нового объекта.
@@ -1049,7 +1072,7 @@ impl App {
             }
             What::Rename(k) => {
                 if text.is_empty() || text.contains('/') {
-                    self.flash = Some(String::from("имя без косых черт и не пустое"));
+                    self.flash = Some(String::from(ui::t("имя без косых черт и не пустое")));
                     return;
                 }
                 // Веха 175 — каталоги переименовываются наравне с файлами. Раньше здесь стоял
@@ -1060,15 +1083,15 @@ impl App {
                 let Some(old) = self.path_of(k) else { return };
                 let new = Self::join(&self.cwd, &text);
                 if px::rename(self.ep, old.as_bytes(), new.as_bytes()) == 0 {
-                    self.flash = Some(alloc::format!("переименовано: {text}"));
+                    self.flash = Some(ui::f1(ui::t("переименовано: {}"), &text));
                     self.read();
                 } else {
-                    self.flash = Some(String::from("переименовать не вышло"));
+                    self.flash = Some(String::from(ui::t("переименовать не вышло")));
                 }
             }
             What::Create { dir } => {
                 if text.is_empty() || text.contains('/') {
-                    self.flash = Some(String::from("имя без косых черт и не пустое"));
+                    self.flash = Some(String::from(ui::t("имя без косых черт и не пустое")));
                     return;
                 }
                 let p = Self::join(&self.cwd, &text);
@@ -1087,9 +1110,9 @@ impl App {
                     }
                 };
                 self.flash = Some(if ok {
-                    alloc::format!("создано: {text}")
+                    ui::f1(ui::t("создано: {}"), &text)
                 } else {
-                    String::from("создать не вышло")
+                    String::from(ui::t("создать не вышло"))
                 });
                 if ok {
                     self.read();
@@ -1112,6 +1135,107 @@ impl App {
     fn path_of(&self, k: usize) -> Option<String> {
         let i = *self.hits.get(k)?;
         Some(Self::join(&self.cwd, &self.entries.get(i)?.name))
+    }
+
+    // ── корзина (Веха 178) ─────────────────────────────────────────────────────────────
+
+    /// Смотрим ли мы сейчас внутрь корзины (в неё саму или глубже).
+    fn in_trash(&self) -> bool {
+        self.cwd == TRASH || self.cwd.starts_with(&alloc::format!("{TRASH}/"))
+    }
+
+    /// Создать каталог и всех его недостающих родителей. `mkdir` персоналии требует, чтобы
+    /// родитель уже был, — а зеркало путей в корзине как раз и состоит из недостающих родителей.
+    fn mkdir_p(&self, dir: &str) -> bool {
+        let mut acc = String::from("/");
+        for part in dir.split('/').filter(|s| !s.is_empty()) {
+            if !acc.ends_with('/') {
+                acc.push('/');
+            }
+            acc.push_str(part);
+            // Уже есть — идём дальше; есть, но ФАЙЛОМ — дальше идти некуда.
+            match px::stat(self.ep, acc.as_bytes()) {
+                Some((true, _)) => continue,
+                Some((false, _)) => return false,
+                None => {
+                    if px::mkdir(self.ep, acc.as_bytes()) != 0 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Перенести пути в корзину (или из неё обратно). `back` — направление.
+    ///
+    /// Одна функция на оба направления намеренно: это одно и то же действие — перенос по
+    /// зеркальному пути, — и разойтись в мелочах (создание родителей, отчёт, обновление списка)
+    /// им было бы не на чем, кроме забывчивости.
+    fn move_trash(&mut self, paths: &[String], back: bool) {
+        let (mut ok, mut fail) = (0usize, 0usize);
+        for p in paths {
+            let dst = if back {
+                // Обратно — снять приставку. Всё, что не под корзиной, сюда не попадает.
+                match p.strip_prefix(TRASH) {
+                    Some(rest) if rest.starts_with('/') => String::from(rest),
+                    _ => {
+                        fail += 1;
+                        continue;
+                    }
+                }
+            } else {
+                alloc::format!("{TRASH}{p}")
+            };
+            // Занято — отказ. Перезаписать значило бы потерять то, что уже лежит; переименовать
+            // «(2)» — потерять исходное имя, то есть сломать возврат.
+            if px::stat(self.ep, dst.as_bytes()).is_some() {
+                fail += 1;
+                continue;
+            }
+            if !self.mkdir_p(&Self::parent(&dst)) {
+                fail += 1;
+                continue;
+            }
+            if px::rename(self.ep, p.as_bytes(), dst.as_bytes()) == 0 {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        let all = paths.len();
+        self.flash = Some(if back {
+            ui::f2(ui::t("возвращено {} из {}"), &num(ok), &num(all))
+        } else {
+            ui::f2(ui::t("в корзину: {} из {}"), &num(ok), &num(all))
+        });
+        let _ = fail;
+        if ok > 0 {
+            self.marked.clear();
+            self.read();
+        }
+    }
+
+    /// Опорожнить корзину: снять её целиком и завести пустую заново.
+    ///
+    /// Целиком, а не по записи: «очистить» — это одно решение человека, и половина очищенной
+    /// корзины не была бы ни очисткой, ни отказом.
+    fn empty_trash(&mut self) {
+        let gone = px::unlink_all(self.ep, TRASH.as_bytes()) == 0;
+        self.flash = Some(String::from(if gone {
+            ui::t("корзина очищена")
+        } else {
+            ui::t("корзину не очистить")
+        }));
+        if gone {
+            // Стояли внутри — выходим: каталога, в котором мы стоим, больше нет.
+            if self.in_trash() {
+                self.go(String::from("/"));
+                return;
+            }
+            self.marked.clear();
+            self.read();
+        }
     }
 
     /// Веха 166.2 — исполнить пункт контекстного меню.
@@ -1147,11 +1271,15 @@ impl App {
                 self.held_move = a == Act::HoldCut;
                 let n = self.held.len();
                 self.flash = Some(if n == 0 {
-                    String::from("нечего брать")
+                    String::from(ui::t("нечего брать"))
                 } else {
-                    alloc::format!(
-                        "взято: {n} — откройте каталог и «{} сюда»",
-                        if self.held_move { "перенести" } else { "скопировать" }
+                    ui::f1(
+                        if self.held_move {
+                            ui::t("взято: {} — откройте каталог и «перенести сюда»")
+                        } else {
+                            ui::t("взято: {} — откройте каталог и «скопировать сюда»")
+                        },
+                        &num(n),
                     )
                 });
             }
@@ -1192,6 +1320,24 @@ impl App {
                 };
                 self.open_with("terminal", &dir);
             }
+            // Веха 178 — корзина. Переспроса нет и не должно быть: обратимое действие, у
+            // которого спрашивают согласия, приучает жать «да» не читая — и тогда согласие
+            // перестаёт работать там, где оно и правда нужно (`Delete` навсегда).
+            Act::Trash => {
+                if entry.is_none() {
+                    return;
+                }
+                let paths = self.marked_paths();
+                self.move_trash(&paths, false);
+            }
+            Act::Restore => {
+                if entry.is_none() {
+                    return;
+                }
+                let paths = self.marked_paths();
+                self.move_trash(&paths, true);
+            }
+            Act::EmptyTrash => self.empty_trash(),
             Act::Delete => {
                 if entry.is_none() {
                     return;
@@ -1211,9 +1357,9 @@ impl App {
                     }
                 }
                 self.flash = Some(match (ok, fail) {
-                    (n, 0) => alloc::format!("удалено: {n}"),
-                    (0, f) => alloc::format!("не удалить: {f}"),
-                    (n, f) => alloc::format!("удалено: {n}, не вышло: {f}"),
+                    (n, 0) => ui::f1(ui::t("удалено: {}"), &num(n)),
+                    (0, f) => ui::f1(ui::t("не удалить: {}"), &num(f)),
+                    (n, f) => ui::f2(ui::t("удалено: {}, не вышло: {}"), &num(n), &num(f)),
                 });
                 if ok > 0 {
                     self.marked.clear();
@@ -1231,9 +1377,9 @@ impl App {
             None => false,
         };
         self.flash = Some(if ok {
-            alloc::format!("скопировано: {text}")
+            ui::f1(ui::t("скопировано: {}"), text)
         } else {
-            String::from("буфер обмена недоступен (нет права на store?)")
+            String::from(ui::t("буфер обмена недоступен (нет права на store?)"))
         });
     }
 
@@ -1275,10 +1421,10 @@ impl App {
             }
         }
         self.flash = Some(match (ok, fail) {
-            (n, 0) if self.held_move => alloc::format!("перенесено: {n}"),
-            (n, 0) => alloc::format!("скопировано: {n}"),
-            (0, f) => alloc::format!("не вышло: {f}"),
-            (n, f) => alloc::format!("готово: {n}, не вышло: {f}"),
+            (n, 0) if self.held_move => ui::f1(ui::t("перенесено: {}"), &num(n)),
+            (n, 0) => ui::f1(ui::t("скопировано: {}"), &num(n)),
+            (0, f) => ui::f1(ui::t("не вышло: {}"), &num(f)),
+            (n, f) => ui::f2(ui::t("готово: {}, не вышло: {}"), &num(n), &num(f)),
         });
         if ok > 0 {
             self.read();
@@ -1311,14 +1457,14 @@ impl App {
     fn paste(&mut self) {
         match self.clip_text() {
             Some(t) => self.goto_path(&t),
-            None => self.flash = Some(String::from("буфер обмена пуст")),
+            None => self.flash = Some(String::from(ui::t("буфер обмена пуст"))),
         }
     }
 
     /// Перейти по пути, откуда бы он ни пришёл: из буфера, из уроненного, из адресной строки.
     fn goto_path(&mut self, text: &str) {
         if !text.starts_with('/') {
-            self.flash = Some(alloc::format!("это не путь: {text}"));
+            self.flash = Some(ui::f1(ui::t("это не путь: {}"), text));
             return;
         }
         match px::stat(self.ep, text.as_bytes()) {
@@ -1337,7 +1483,7 @@ impl App {
                     self.pick_one(k);
                 }
             }
-            None => self.flash = Some(alloc::format!("нет такого пути: {text}")),
+            None => self.flash = Some(ui::f1(ui::t("нет такого пути: {}"), text)),
         }
     }
 
@@ -1402,7 +1548,7 @@ impl App {
         }
         let label = match paths.len() {
             1 => Self::leaf_name(&paths[0]),
-            n => alloc::format!("{n} объектов"),
+            n => ui::f1(ui::t("объектов: {}"), &num(n)),
         };
         win::drag(store, win::CLIP_TEXT, paths.join("\n").as_bytes(), &label);
     }
@@ -1422,20 +1568,34 @@ impl App {
             Tgt::Entry(k) => {
                 let dir = self.hits.get(k).is_some_and(|&i| self.entries[i].dir);
                 if dir && !many {
-                    items.push((Act::Open, String::from("открыть")));
+                    items.push((Act::Open, String::from(ui::t("открыть"))));
                 }
                 if !many {
-                    items.push((Act::Rename, String::from("переименовать")));
+                    items.push((Act::Rename, String::from(ui::t("переименовать"))));
                 }
-                items.push((Act::Copy, String::from("копировать путь")));
+                items.push((Act::Copy, String::from(ui::t("копировать путь"))));
                 // Веха 176 — «взять» и «перенести» отделены от «копировать путь» намеренно: то
                 // кладёт в общий буфер ТЕКСТ, а это берёт сами файлы. Одно слово на два разных
                 // действия было бы удобно ровно до первой потери данных.
-                items.push((Act::Hold, String::from(if many { "скопировать это" } else { "скопировать" })));
-                items.push((Act::HoldCut, String::from(if many { "перенести это" } else { "перенести" })));
+                items.push((
+                    Act::Hold,
+                    String::from(if many { ui::t("скопировать это") } else { ui::t("скопировать") }),
+                ));
+                items.push((
+                    Act::HoldCut,
+                    String::from(if many { ui::t("перенести это") } else { ui::t("перенести") }),
+                ));
                 if dir && !many {
-                    items.push((Act::Term, String::from("открыть в терминале")));
-                    items.push((Act::Mark, String::from("в закладки")));
+                    items.push((Act::Term, String::from(ui::t("открыть в терминале"))));
+                    items.push((Act::Mark, String::from(ui::t("в закладки"))));
+                }
+                // Веха 178 — из корзины возвращают, в корзину кладут. Оба пункта не спрашивают
+                // согласия: они обратимы, и переспрашивать о них значило бы обесценить переспрос
+                // там, где он единственная защита, — у «удалить навсегда».
+                if self.in_trash() {
+                    items.push((Act::Restore, String::from(ui::t("вернуть на место"))));
+                } else {
+                    items.push((Act::Trash, String::from(ui::t("в корзину"))));
                 }
                 // Веха 175 — взведённый пункт говорит, ЧТО именно произойдёт. Каталог с
                 // содержимым теперь сносится целиком, и узнать об этом человек обязан ДО
@@ -1443,33 +1603,47 @@ impl App {
                 let deep = self.marked_nonempty_dir();
                 items.push((
                     Act::Delete,
-                    String::from(match (self.armed, deep, many) {
-                        (true, true, _) => "удалить ВМЕСТЕ С СОДЕРЖИМЫМ? ещё раз",
-                        (true, false, _) => "удалить? ещё раз",
-                        (false, _, true) => "удалить выделенное",
-                        (false, _, false) => "удалить",
+                    String::from(match (self.armed, deep) {
+                        (true, true) => ui::t("удалить ВМЕСТЕ С СОДЕРЖИМЫМ? ещё раз"),
+                        (true, false) => ui::t("удалить навсегда? ещё раз"),
+                        (false, _) => ui::t("удалить навсегда"),
                     }),
                 ));
             }
-            Tgt::Mark(_) => items.push((Act::Unmark, String::from("убрать закладку"))),
+            Tgt::Mark(_) => items.push((Act::Unmark, String::from(ui::t("убрать закладку")))),
+            Tgt::Empty if self.in_trash() => {
+                items.push((
+                    Act::EmptyTrash,
+                    String::from(if self.armed {
+                        ui::t("очистить корзину? ещё раз")
+                    } else {
+                        ui::t("очистить корзину")
+                    }),
+                ));
+                items.push((Act::Refresh, String::from(ui::t("обновить"))));
+            }
             Tgt::Empty => {
-                items.push((Act::Term, String::from("открыть в терминале")));
-                items.push((Act::NewDir, String::from("создать каталог")));
-                items.push((Act::NewFile, String::from("создать файл")));
+                items.push((Act::Term, String::from(ui::t("открыть в терминале"))));
+                items.push((Act::NewDir, String::from(ui::t("создать каталог"))));
+                items.push((Act::NewFile, String::from(ui::t("создать файл"))));
                 if !self.held.is_empty() {
                     let n = self.held.len();
                     items.push((
                         Act::Put,
-                        alloc::format!(
-                            "{} сюда ({n})",
-                            if self.held_move { "перенести" } else { "скопировать" }
+                        ui::f1(
+                            if self.held_move {
+                                ui::t("перенести сюда ({})")
+                            } else {
+                                ui::t("скопировать сюда ({})")
+                            },
+                            &num(n),
                         ),
                     ));
                 }
-                items.push((Act::Paste, String::from("вставить путь")));
-                items.push((Act::Copy, String::from("копировать путь каталога")));
-                items.push((Act::Mark, String::from("этот каталог в закладки")));
-                items.push((Act::Refresh, String::from("обновить")));
+                items.push((Act::Paste, String::from(ui::t("вставить путь"))));
+                items.push((Act::Copy, String::from(ui::t("копировать путь каталога"))));
+                items.push((Act::Mark, String::from(ui::t("этот каталог в закладки"))));
+                items.push((Act::Refresh, String::from(ui::t("обновить"))));
             }
         }
         let tw = items.iter().map(|(_, t)| u.text_w(t)).max().unwrap_or(0);
@@ -1491,7 +1665,8 @@ impl App {
                 let c = u.tint(th.text.with_a(0x14));
                 u.c.rrect(rr, th.radius.min(rr.h / 2), c);
             }
-            let col = if *a == Act::Delete { th.danger } else { th.text };
+            let col =
+                if matches!(a, Act::Delete | Act::EmptyTrash) { th.danger } else { th.text };
             u.label(rr.inset_xy(th.pad, 0), text, col, Align::Left);
             if u.clicked(rr) && !self.menu_fresh {
                 chosen = Some(*a);
@@ -1501,8 +1676,10 @@ impl App {
         let outside = u.click().is_some_and(|(cx, cy)| !r.contains(cx, cy));
         self.menu_fresh = false;
         if let Some(a) = chosen {
-            // «Удалить» взводится, а не срабатывает: второй щелчок по тому же пункту — согласие.
-            if a == Act::Delete && !self.armed {
+            // Необратимое взводится, а не срабатывает: второй щелчок по тому же пункту —
+            // согласие. Обратимое (корзина) взводить не надо и НЕЛЬЗЯ: переспрос, который можно
+            // жать не читая, обесценивает и тот, что стоит здесь по делу.
+            if matches!(a, Act::Delete | Act::EmptyTrash) && !self.armed {
                 self.armed = true;
                 return true;
             }
@@ -1588,6 +1765,11 @@ fn date_text(ns: u64) -> String {
     }
     let (y, mo, d, h, mi, _) = sys::civil_from_unix(ns / 1_000_000_000);
     alloc::format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// Число строкой — для мест подстановки в переведённых фразах (Веха 178).
+fn num(n: usize) -> String {
+    alloc::format!("{n}")
 }
 
 fn size_text(n: usize) -> String {
@@ -1684,6 +1866,38 @@ impl ui::Client for App {
                     self.begin_edit(What::Rename(self.sel));
                     return ui::Scope::All;
                 }
+                // Веха 178 — `Delete` кладёт в КОРЗИНУ, `Shift+Delete` сносит навсегда.
+                //
+                // Так это работает везде, и потому так и сделано: клавиша, к которой рука уже
+                // привыкла, обязана делать привычное. Разница между ними не в переспросе, а в
+                // обратимости: первое можно вернуть, второе нельзя — и потому второе взводится
+                // (первое нажатие говорит, что будет, второе делает), а первое нет.
+                //
+                // Работает по ВЫДЕЛЕННОМУ, как и пункт меню: выделение человек делал руками.
+                if code == sym::DELETE && !self.marked.is_empty() {
+                    let paths = self.marked_paths();
+                    let permanent = mods & win::modk::SHIFT != 0 || self.in_trash();
+                    if !permanent {
+                        self.armed = false;
+                        self.move_trash(&paths, false);
+                        return ui::Scope::All;
+                    }
+                    if !self.armed {
+                        self.armed = true;
+                        self.flash = Some(String::from(if self.marked_nonempty_dir() {
+                            ui::t("удалить НАВСЕГДА вместе с содержимым? ещё раз Delete")
+                        } else {
+                            ui::t("удалить НАВСЕГДА? ещё раз Delete")
+                        }));
+                        return ui::Scope::All;
+                    }
+                    self.armed = false;
+                    self.do_act(Act::Delete, Tgt::Entry(self.sel));
+                    return ui::Scope::All;
+                }
+                // Любая другая клавиша снимает взвод: согласие действует на один следующий шаг,
+                // а не висит до конца сеанса.
+                self.armed = false;
                 let cols = if self.grid { self.lay.cols as usize } else { 1 };
                 match code {
                     sym::RETURN => {
@@ -1911,7 +2125,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         say("fm: нет эндпоинта файлового сервера — показывать нечего\n");
     }
     let (w, h) = (760u16, 620u16);
-    let Some(mut surf) = Window::create(w, h, "Файлы") else {
+    let Some(mut surf) = Window::create(w, h, ui::t("Файлы")) else {
         say("fm: композитора нет (WM в окружении)\n");
         sys::exit(1);
     };

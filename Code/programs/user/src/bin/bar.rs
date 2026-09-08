@@ -109,6 +109,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Тема и шрифт — ДО поверхности: от них зависит высота панели, а высоту надо назвать в
     // запросе. Размер, посчитанный после, пришлось бы менять вторым вызовом на глазах у человека.
     let generation = ui::conf::generation().unwrap_or_default();
+    // Веха 178 — язык из того же поколения, что и тема: он такая же часть вида системы.
+    ui::i18n::set_from_config(&generation);
     let th = Theme::from_config(&generation);
     let mut font = Font::load(th.font.as_deref(), th.font_px);
 
@@ -153,6 +155,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         // её — и текст перестанет доходить до окна в фокусе (Веха 146).
         kbd: false,
     };
+    // Имя ПОВЕРХНОСТИ, а не надпись на экране: слои в списке окон не показываются. Переводить
+    // его нельзя ещё и потому, что «панель» у терминала значит другое (pane), а ключ перевода
+    // здесь — сама строка: один ключ не может дать два разных слова.
     let Some(mut surf) = Window::layer(spec, sw, bar.h as u16, "панель") else {
         say("bar: композитор не дал поверхность слоя\n");
         sys::exit(1);
@@ -1321,7 +1326,7 @@ impl Bar {
         let clear = h.cut_right(btn);
         h.cut_right(th.px(2));
         let quiet = h.cut_right(btn);
-        u.label(h, "Уведомления", th.text, Align::Left);
+        u.label(h, ui::t("Уведомления"), th.text, Align::Left);
         let hot = |u: &Ui, r: Rect| if u.hot(r) { 256 } else { 0 };
         let qh = hot(u, quiet);
         // Включённое «не беспокоить» подсвечено само по себе: кнопка-состояние обязана
@@ -1350,7 +1355,7 @@ impl Bar {
             u.icon(ir, ui::icon::BELL_OFF, th.muted);
             u.label(
                 Rect::new(d.x, ir.bottom() + th.px(2), d.w, font_h),
-                "нет уведомлений",
+                ui::t("нет уведомлений"),
                 th.muted,
                 Align::Center,
             );
@@ -1407,7 +1412,7 @@ impl Bar {
         // Сколько не поместилось — вслух: молча спрятанный хвост списка это ровно та ложь,
         // которой в системе быть не должно.
         if total > shown && d.h >= font_h {
-            let more = alloc::format!("ещё {}", total - shown);
+            let more = ui::f1(ui::t("ещё {}"), &alloc::format!("{}", total - shown));
             u.label(d.cut_top(font_h), &more, th.muted, Align::Right);
         }
 
@@ -1456,12 +1461,12 @@ impl Bar {
     /// посередине.
     fn widest_row(font: &mut Font, gap: i32) -> i32 {
         [
-            ("сборка", build_short()),
-            ("поколение", "gen00"),
-            ("время", "00:00"),
-            ("дата", "00.00.0000"),
-            ("столов", "00, сейчас 00"),
-            ("корней в store", "00000+"),
+            (ui::t("сборка"), build_short()),
+            (ui::t("поколение"), "gen00"),
+            (ui::t("время"), "00:00"),
+            (ui::t("дата"), "00.00.0000"),
+            (ui::t("столов"), "00, сейчас 00"),
+            (ui::t("корней в store"), "00000+"),
         ]
         .iter()
         .map(|(k, v)| font.width(k) + gap + font.width(v))
@@ -1622,7 +1627,7 @@ impl Bar {
         // Вторая строка шапки — время работы, а на втором шаге выключения ПРЕДУПРЕЖДЕНИЕ: место
         // одно, и подпись у кнопки, которая сейчас погасит машину, важнее уптайма.
         let (sub, col) = if self.confirm {
-            ("нажми ещё раз", th.danger)
+            (ui::t("нажми ещё раз"), th.danger)
         } else {
             (uptime, th.muted)
         };
@@ -1643,20 +1648,24 @@ impl Bar {
         u.card(info);
         let mut c = info.inset(pad);
         let (year, mo, d, _, _, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
-        u.row(c.cut_top(row), "сборка", build_short());
-        u.row(c.cut_top(row), "поколение", &self.gen);
+        u.row(c.cut_top(row), ui::t("сборка"), build_short());
+        u.row(c.cut_top(row), ui::t("поколение"), &self.gen);
         // Время и дата — РАЗНЫМИ строками: вместе они были самой длинной строкой карточки и
         // растягивали её вдвое против макета ради одного значения.
-        u.row(c.cut_top(row), "время", clock);
-        u.row(c.cut_top(row), "дата", &alloc::format!("{d:02}.{mo:02}.{year}"));
+        u.row(c.cut_top(row), ui::t("время"), clock);
+        u.row(c.cut_top(row), ui::t("дата"), &full_date_text(year, mo, d));
         u.row(
             c.cut_top(row),
-            "столов",
-            &alloc::format!("{}, сейчас {}", self.spaces, self.space as u32 + 1),
+            ui::t("столов"),
+            &ui::f2(
+                ui::t("{}, сейчас {}"),
+                &alloc::format!("{}", self.spaces),
+                &alloc::format!("{}", self.space as u32 + 1),
+            ),
         );
         u.row(
             c.cut_top(row),
-            "корней в store",
+            ui::t("корней в store"),
             &if self.roots.1 {
                 alloc::format!("{}", self.roots.0)
             } else {
@@ -1705,9 +1714,26 @@ fn clock_text() -> String {
 
 /// Дата «ДД.ММ» — рядом с часами и приглушённо: она нужна реже времени, но искать её в другом
 /// месте человеку не должно приходиться.
+///
+/// Веха 178 — у даты нет слов, зато есть ПОРЯДОК: `08.09` по-английски читается как 8 сентября
+/// в одном мире и как 9 августа в другом. Поэтому здесь язык меняет не текст, а форму числа —
+/// единственное такое место в панели.
 fn date_text() -> String {
     let (_, mo, d, _, _, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
-    alloc::format!("{d:02}.{mo:02}")
+    if ui::i18n::is_en() {
+        alloc::format!("{mo:02}-{d:02}")
+    } else {
+        alloc::format!("{d:02}.{mo:02}")
+    }
+}
+
+/// Полная дата — в карточке меню, той же записью.
+fn full_date_text(year: i64, mo: u32, d: u32) -> String {
+    if ui::i18n::is_en() {
+        alloc::format!("{year:04}-{mo:02}-{d:02}")
+    } else {
+        alloc::format!("{d:02}.{mo:02}.{year}")
+    }
 }
 
 /// Сколько система работает. Монотонными часами, а не разницей календарного времени: RTC у машины
@@ -1716,11 +1742,11 @@ fn uptime_text() -> String {
     let s = sys::monotonic_ns() / 1_000_000_000;
     let (h, m) = (s / 3600, s / 60 % 60);
     if h > 0 {
-        alloc::format!("{h} ч {m} мин")
+        ui::f2(ui::t("{} ч {} мин"), &alloc::format!("{h}"), &alloc::format!("{m}"))
     } else if s >= 60 {
-        alloc::format!("{m} мин")
+        ui::f1(ui::t("{} мин"), &alloc::format!("{m}"))
     } else {
-        alloc::format!("{s} с")
+        ui::f1(ui::t("{} с"), &alloc::format!("{s}"))
     }
 }
 

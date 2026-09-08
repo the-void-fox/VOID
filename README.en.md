@@ -117,9 +117,12 @@ niri model), windows living in shared memory, animations, pointer grab, notifica
 persistent sessions (a reboot puts the windows back). Its own vector format `.vg` and
 rasteriser, its own toolkit, theming from the configuration.
 
-**Programs.** Terminal, file manager, task manager (per-process CPU and memory, rights, a
-network switch), bar, launcher, editor, image viewer, store-root browser, `pkg`, `klog`,
-microbenchmarks, frame-timing tools.
+**Programs.** Terminal, file manager (trash, `Delete`), task manager (per-process CPU and
+memory, rights, a network switch), bar, launcher, editor, image viewer, store-root browser,
+`pkg`, `klog`, microbenchmarks, frame-timing tools.
+
+**The shell speaks English too** — one line in the config: `ui("language", "en")`. The kernel log
+stays in Russian: it is read by whoever repairs the system, not by whoever uses it.
 
 **Hardware.** Boots through GRUB (multiboot2) on a real machine: framebuffer, PS/2, AHCI,
 installation onto a SATA disk, e1000 and virtio-net, virtio-blk/rng, an xHCI keyboard, CMOS

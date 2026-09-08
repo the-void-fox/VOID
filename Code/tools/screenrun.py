@@ -167,6 +167,9 @@ QCODE = {
     "Return": "ret", "Enter": "ret", "Tab": "tab", "Escape": "esc", "Space": "spc",
     "Left": "left", "Right": "right", "Up": "up", "Down": "down",
     "PageUp": "pgup", "PageDown": "pgdn", "Home": "home", "End": "end",
+    # Веха 178 — `Delete` стала настоящей клавишей системы (в корзину), и называть её надо явно:
+    # без записи здесь она уехала бы в `last.lower()` и совпала бы случайно, а не по уговору.
+    "Delete": "delete", "Backspace": "backspace", "Insert": "insert",
     # Знаки препинания у QEMU называются словами, а не символами: `[` это `bracket_left`.
     "BracketLeft": "bracket_left", "BracketRight": "bracket_right",
     "Equal": "equal", "Minus": "minus",

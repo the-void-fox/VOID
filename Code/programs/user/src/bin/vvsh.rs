@@ -188,6 +188,15 @@ fn cap_net() -> usize {
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     resolve_caps();
+    // Веха 178 — ЯЗЫК ВЫВОДА из конфига поколения: та же строка `ui("language", …)`, по которой
+    // говорят панель и окна. Шелл берёт её отсюда, а не из своего файла, потому что язык — это
+    // свойство системы, а не одной программы, и откатываться он обязан вместе с ней.
+    //
+    // Переведён только тот вывод, который читает ПОЛЬЗОВАТЕЛЬ: справка и ответы команд. Журнал
+    // ядра остаётся русским — его читает тот, кто чинит систему.
+    if let Some(text) = read_generation_text() {
+        sys::i18n::set_from_config(&text);
+    }
     // Каталог объявляем СРАЗУ, а не только при `cd`: программа, запущенная первой командой,
     // должна понимать относительный путь так же, как двадцатой.
     publish_cwd(b"/");
@@ -447,14 +456,19 @@ fn cmd_repl() -> ! {
     sys::write(C_PROMPT);
     sys::write(b"vvsh");
     sys::write(C_RESET);
-    sys::write(" — шелл VOID (ADR 0006/0013). `\\выражение` — вычислить, иначе команда. `help` — команды, `exit` — назад в vsh.\n".as_bytes());
+    sys::write(
+        sys::i18n::t(
+            " — шелл VOID (ADR 0006/0013). `\\выражение` — вычислить, иначе команда. `help` — команды, `exit` — назад в vsh.\n",
+        )
+        .as_bytes(),
+    );
     // Веха 99.3 — размер СВОЕГО окна, если мы живём в панели мультиплексора. Аналог TIOCSWINSZ,
     // только опрашиваемый: сигналов у нас нет, а сходить к хосту программа и так умеет.
     // Печатаем его в баннере не ради красоты — так сразу видно, что программа знает, куда рисует.
     if let Some((cols, rows)) = sys::stdio::win_size() {
         let mut line = alloc::string::String::new();
         use core::fmt::Write;
-        let _ = write!(line, "окно: {cols}×{rows} знакомест\n");
+        let _ = write!(line, "{}: {cols}×{rows}\n", sys::i18n::t("окно"));
         sys::write(line.as_bytes());
     }
     let loader = vvsh_core::NoLoader;
@@ -957,7 +971,10 @@ fn sh_clear(_args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Строка справки: жёлтая команда, выравнивание, описание.
-fn help_row(cmd: &[u8], desc: &str) {
+/// Строка справки. Описание переводится ЗДЕСЬ (Веха 178) — одним местом на четыре десятка
+/// строк: обернуть каждую значило бы сорок возможностей забыть одну.
+fn help_row(cmd: &[u8], desc: &'static str) {
+    let desc = sys::i18n::t(desc);
     sys::write(b"  ");
     sys::write(C_CMD);
     sys::write(cmd);
@@ -974,7 +991,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     sys::write(C_CMD);
     sys::write(b"VOID vvsh");
     sys::write(C_RESET);
-    sys::write(" — шелл VOID. Строка с ведущим `\\` — выражение, иначе команда.\n".as_bytes());
+    sys::write(sys::i18n::t(" — шелл VOID. Строка с ведущим `\\` — выражение, иначе команда.\n").as_bytes());
     help_row(b"ls [DIR]", "список файлов (каталог или текущий)");
     help_row(b"cat FILE", "показать содержимое (cat A > B — записать содержимым)");
     help_row(b"tail FILE", "последние ~32 байта файла");
@@ -1015,9 +1032,9 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"nar-unpack", "разложить NAR из корня store в файлы");
     // Справка обязана показывать ТОТ синтаксис, что понимает reader. Здесь висели S-выражения,
     // хотя с Вехи 102 (ADR 0013) язык инфиксный: `(define x 5)` шелл теперь не примет вовсе.
-    sys::write("  Выражение — с ведущим \\: \\x = 5 · \\ping(\"10.0.2.2\")\n".as_bytes());
-    sys::write("  Язык: x = 5 · |a| a + 1 · if c { a } else { b } · [1, 2] · map(f, L)\n".as_bytes());
-    sys::write("  Конвейер: \\ls() |> grep(\"vv\") |> count()\n".as_bytes());
+    sys::write(sys::i18n::t("  Выражение — с ведущим \\: \\x = 5 · \\ping(\"10.0.2.2\")\n").as_bytes());
+    sys::write(sys::i18n::t("  Язык: x = 5 · |a| a + 1 · if c { a } else { b } · [1, 2] · map(f, L)\n").as_bytes());
+    sys::write(sys::i18n::t("  Конвейер: \\ls() |> grep(\"vv\") |> count()\n").as_bytes());
     Ok(Value::nil())
 }
 
@@ -2116,6 +2133,21 @@ fn build_prompt(out: &mut [u8]) -> usize {
 
 // ── помощники store ──────────────────────────────────────────────────────────
 
+/// Текст активного поколения целиком: `system/current` → имя → `system/<имя>`. Нужен языку
+/// вывода (Веха 178); ровно тот же текст читают панель, композитор и терминал.
+fn read_generation_text() -> Option<alloc::string::String> {
+    let scap = cap_store();
+    let name = read_current_name(scap)?;
+    let id = gen_content_id(scap, &name)?;
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let n = sys::obj_get(scap, &id, &mut buf);
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    alloc::string::String::from_utf8(buf).ok()
+}
+
 /// Имя активного поколения (значение корня `system/current`). `None` — нет/нет READ.
 fn read_current_name(scap: usize) -> Option<Vec<u8>> {
     let mut id = [0u8; 32];
@@ -2366,6 +2398,8 @@ anim = 360\n\
 #           radius gap pad — скругление и отступы · font-size — кегль\n\
 #           scale — масштаб ВСЕГО в процентах (50…400) · opacity — плотность панели, %\n\
 #           font — имя файла шрифта из установленных пакетов\n\
+#           language — язык интерфейса: ru (по умолчанию) или en. Журнал ядра остаётся\n\
+#                      русским: его читает тот, кто чинит систему, а не тот, кто ею пользуется\n\
 #\n\
 # Про шрифт: в бинарях его нет, он приходит пакетом. Без строки `font` панель рисует встроенным\n\
 # 8×16 — читаемо, но ступенчато рядом со скруглениями. Настоящий берётся так:\n\
@@ -2376,6 +2410,7 @@ look = [\n\
 \x20 # ui(\"accent\", \"#9a9999\"),\n\
 \x20 # ui(\"opacity\", 90),\n\
 \x20 # ui(\"scale\", 100),\n\
+\x20 # ui(\"language\", \"en\"),\n\
 ]\n\
 \n\
 # КТО ЭТА МАШИНА (Веха 145.1). Пользователей в VOID нет вовсе — ни root, ни юзеров, всё на\n\

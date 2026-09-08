@@ -287,7 +287,7 @@ impl App {
 
         let field = u.font.line_h() + th.px(14);
         let fr = inner.cut_top(field);
-        u.field(fr, &self.ls.query, "имя программы", true);
+        u.field(fr, &self.ls.query, ui::t("имя программы"), true);
         inner.cut_top(th.gap);
 
         let row = 2 * u.font.line_h() + th.px(14);
@@ -317,16 +317,16 @@ impl App {
         let foot = inner.cut_top(u.font.line_h() + th.px(4));
         let n = self.ls.hits.len();
         let s = if n == 0 && !self.ls.query.trim().is_empty() {
-            alloc::format!("Enter запустит «{}»", self.ls.query.trim())
+            ui::f1(ui::t("Enter запустит «{}»"), self.ls.query.trim())
         } else if self.raw {
             // Знаменатель — ВСЕ программы store, а не «те, у кого нет ярлыка»: человек ищет в
             // системе, а не в остатке от отбора, и второе число должно отвечать на «сколько их
             // всего».
-            alloc::format!("{} из {} программ store", n, self.items.len())
+            ui::f2(ui::t("{} из {} программ store"), &alloc::format!("{n}"), &alloc::format!("{}", self.items.len()))
         } else if self.ls.query.trim().is_empty() {
-            alloc::format!("ярлыков: {}", n)
+            ui::f1(ui::t("ярлыков: {}"), &alloc::format!("{n}"))
         } else {
-            alloc::format!("{} из {} ярлыков", n, self.shortcuts())
+            ui::f2(ui::t("{} из {} ярлыков"), &alloc::format!("{n}"), &alloc::format!("{}", self.shortcuts()))
         };
         u.label(foot, &s, th.muted, Align::Right);
         u.clip(keep);
@@ -485,7 +485,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 items.push(Item {
                     root: root.to_string(),
                     title: field(&text, "name").unwrap_or(root).to_string(),
-                    info: field(&text, "info").unwrap_or("приложение").to_string(),
+                    info: field(&text, "info").unwrap_or(ui::t("приложение")).to_string(),
                     shortcut: true,
                 });
             }
@@ -500,7 +500,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 items.push(Item {
                     root: root.to_string(),
                     title: root.to_string(),
-                    info: String::from("программа store, без ярлыка"),
+                    info: String::from(ui::t("программа store, без ярлыка")),
                     shortcut: false,
                 });
             }
@@ -535,7 +535,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Панели этот случай не встречался: её меню рождается ЗАКРЫТЫМ, и слот заводится на нуле сам.
     app.mo.set(A_OPEN, 0);
 
-    let Some(mut surf) = Window::layer(win::Layer::POPUP, sw, sh, "строка запуска") else {
+    let Some(mut surf) = Window::layer(win::Layer::POPUP, sw, sh, ui::t("строка запуска")) else {
         say("launcher: композитор не дал поверхность слоя\n");
         sys::exit(1);
     };

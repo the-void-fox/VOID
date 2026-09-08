@@ -906,6 +906,8 @@ fn main_loop() -> ! {
     // Конфиг поколения читаем ОДИН раз: из него и раскладка клавиш, и обои, и — с Вехи 148.3 —
     // ПАЛИТРА. Читать его надо до первой заливки: фон стола красится уже из темы.
     let generation = read_generation(store).unwrap_or_default();
+    // Веха 178 — язык из того же поколения, что и тема.
+    ui::i18n::set_from_config(&generation);
     let theme = Theme::from_config(&generation);
 
     let mut wm = Wm {
@@ -4922,9 +4924,9 @@ impl Wm {
             sys::write_console("[wm] окно без буфера: кончилось окно ВА под чужие кадры\n".as_bytes());
             self.post_note(
                 2,
-                "композитор",
-                "окну не хватило места",
-                "кончилось адресное пространство под кадры окон — закройте часть окон",
+                ui::t("композитор"),
+                ui::t("окну не хватило места"),
+                ui::t("кончилось адресное пространство под кадры окон — закройте часть окон"),
             );
             return None;
         };
@@ -5988,7 +5990,7 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
         None => {
             let long = now.saturating_sub(l.since) >= LAUNCH_ANIM_NS;
             let y = bh / 2 - 34;
-            tile_center(c, y, "ЗАПУСКАЕТСЯ", th.muted, 1);
+            tile_center(c, y, ui::t("ЗАПУСКАЕТСЯ"), th.muted, 1);
             tile_center(c, y + 24, &l.name, th.text, 2);
             // Дорожка и бегунок. Проценты не рисуем и не выдумываем: мы не знаем ни сколько
             // осталось, ни сколько всего, — знаем только, что ещё ждём.
@@ -5998,7 +6000,7 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
             if long {
                 // Срок вышел: полоса замирает целиком, а словами говорим правду.
                 tile_fill(c, Rect::new(tx, ty, track, 4), th.muted);
-                tile_center(c, ty + 14, "дольше обычного — окна всё нет", th.muted, 1);
+                tile_center(c, ty + 14, ui::t("дольше обычного — окна всё нет"), th.muted, 1);
             } else {
                 let run = (track / 4).max(8);
                 // Челнок туда-обратно: бесконечная лента вправо выглядит как «загрузка идёт»,
@@ -6012,11 +6014,11 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
         // ── всё кончилось, а окна не было ──────────────────────────────────────────────
         Some((code, tail)) => {
             let bad = *code != 0;
-            let head = if bad { "НЕ ЗАПУСТИЛОСЬ" } else { "ЗАВЕРШИЛОСЬ БЕЗ ОКНА" };
+            let head = if bad { ui::t("НЕ ЗАПУСТИЛОСЬ") } else { ui::t("ЗАВЕРШИЛОСЬ БЕЗ ОКНА") };
             let pad = 14;
             tile_text(c, pad, pad, head, if bad { th.danger } else { th.muted }, 1);
             tile_text(c, pad, pad + 22, &l.name, th.text, 2);
-            let code_line = alloc::format!("код выхода {}", code);
+            let code_line = ui::f1(ui::t("код выхода {}"), &alloc::format!("{code}"));
             tile_text(c, pad, pad + 56, &code_line, th.muted, 1);
             tile_fill(c, Rect::new(pad, pad + 78, bw - 2 * pad, 1), th.border);
             // Вывод — ПОСЛЕДНИЕ строки: смерть объясняют они, а не первые. Пустой вывод не
@@ -6040,13 +6042,13 @@ fn draw_tile(px: &mut [u8], bw: i32, bh: i32, l: &Launch, phase: u32, now: u64, 
             }
             let fit = ((bh - y - pad) / 18).max(0) as usize;
             if lines.is_empty() {
-                tile_text(c, pad, y, "вывода не было", th.muted, 1);
+                tile_text(c, pad, y, ui::t("вывода не было"), th.muted, 1);
             }
             for line in lines.iter().skip(lines.len().saturating_sub(fit)) {
                 tile_text(c, pad, y, line, th.text, 1);
                 y += 18;
             }
-            tile_text(c, pad, bh - pad - 16, "Super+Q — убрать", th.muted, 1);
+            tile_text(c, pad, bh - pad - 16, ui::t("Super+Q — убрать"), th.muted, 1);
         }
     }
 }

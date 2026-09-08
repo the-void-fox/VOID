@@ -363,6 +363,10 @@ pub fn run(surf: &mut Window, th: &Theme, font: &mut Font, c: &mut impl Client) 
 /// собирает список, создаёт поверхность нужного вида.
 pub fn boot() -> (String, Theme, Font) {
     let generation = super::conf::generation().unwrap_or_default();
+    // Веха 178 — ЯЗЫК первым делом: он влияет на ширину надписей, а по ним считается раскладка.
+    // Поколение здесь то же самое, что и у темы: язык интерфейса — такая же его часть, как цвет,
+    // и откатывается вместе с системой.
+    super::i18n::set_from_config(&generation);
     let th = Theme::from_config(&generation);
     let font = Font::load(th.font.as_deref(), th.font_px);
     // Веха 168.2 — срок движения запоминается ЗДЕСЬ, один раз на программу: тащить его через

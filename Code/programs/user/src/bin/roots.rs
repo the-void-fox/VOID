@@ -213,7 +213,7 @@ impl App {
         // Окно, а не слой: фон рисуем сами (см. `Ui::background`).
         u.background(th.bg);
 
-        u.field(lay.head, &self.ls.query, "поиск по имени корня", true);
+        u.field(lay.head, &self.ls.query, ui::t("поиск по имени корня"), true);
 
         if let Some(t) = u.scrollbar(
             lay.bar.inset_xy(th.px(1), th.px(2)),
@@ -258,15 +258,15 @@ impl App {
                 u.label(d.cut_top(font_h), "content-id", th.muted, Align::Left);
                 u.label(d.cut_top(font_h), &hex[..32], th.text, Align::Left);
                 u.label(d.cut_top(font_h + th.px(4)), &hex[32..], th.text, Align::Left);
-                u.row(d.cut_top(font_h + th.px(2)), "размер", &human(det.size));
+                u.row(d.cut_top(font_h + th.px(2)), ui::t("размер"), &human(det.size));
                 if det.parts > 0 {
-                    let s = alloc::format!("{} частей", det.parts);
-                    u.row(d.cut_top(font_h + th.px(2)), "дерево", &s);
+                    let s = ui::f1(ui::t("частей: {}"), &alloc::format!("{}", det.parts));
+                    u.row(d.cut_top(font_h + th.px(2)), ui::t("дерево"), &s);
                 }
                 d.cut_top(th.px(6));
                 u.hsep(d.cut_top(th.px(6)));
                 d.cut_top(th.px(4));
-                let title = if det.binary { "первые байты" } else { "начало содержимого" };
+                let title = if det.binary { ui::t("первые байты") } else { ui::t("начало содержимого") };
                 u.label(d.cut_top(font_h), title, th.muted, Align::Left);
                 for line in det.lines.iter() {
                     if d.h < font_h {
@@ -277,22 +277,22 @@ impl App {
             }
             (Some(i), None) => {
                 u.label(d.cut_top(font_h), &self.items[i].name, th.text, Align::Left);
-                u.label(d.cut_top(font_h * 2), "объект не читается", th.muted, Align::Left);
+                u.label(d.cut_top(font_h * 2), ui::t("объект не читается"), th.muted, Align::Left);
             }
             _ => {
-                u.label(d.cut_top(font_h), "ничего не найдено", th.muted, Align::Left);
+                u.label(d.cut_top(font_h), ui::t("ничего не найдено"), th.muted, Align::Left);
             }
         }
 
         let s = match &self.copied {
-            Some(name) => alloc::format!("скопировано: {}", name),
+            Some(name) => ui::f1(ui::t("скопировано: {}"), name),
             None if self.ls.query.trim().is_empty() => {
-                alloc::format!(
-                    "корней в store: {}  ·  Ctrl+C — скопировать имя, мышью — перетащить",
-                    self.items.len()
+                ui::f1(
+                    ui::t("корней в store: {}  ·  Ctrl+C — скопировать имя, мышью — перетащить"),
+                    &alloc::format!("{}", self.items.len()),
                 )
             }
-            None => alloc::format!("{} из {} корней", self.ls.hits.len(), self.items.len()),
+            None => ui::f2(ui::t("{} из {} корней"), &alloc::format!("{}", self.ls.hits.len()), &alloc::format!("{}", self.items.len())),
         };
         let col = if self.copied.is_some() { th.accent } else { th.muted };
         u.label(foot, &s, col, Align::Right);
@@ -410,7 +410,7 @@ impl ui::Client for App {
                     Some(cap) if win::clip_put(cap, win::CLIP_TEXT, name.as_bytes()) => Some(name),
                     // Права на store нет либо композитор отказал — молчать нельзя: человек
                     // нажал и вправе знать, что не вышло.
-                    _ => Some(String::from("не вышло скопировать")),
+                    _ => Some(String::from(ui::t("не вышло скопировать"))),
                 };
                 ui::Scope::All
             }
@@ -540,7 +540,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     items.sort_by(|a, b| a.name.cmp(&b.name));
 
     let (w, h) = (900u16, 620u16);
-    let Some(mut surf) = Window::create(w, h, "корни store") else {
+    let Some(mut surf) = Window::create(w, h, ui::t("корни store")) else {
         say("roots: композитора нет (WM в окружении)\n");
         sys::exit(1);
     };

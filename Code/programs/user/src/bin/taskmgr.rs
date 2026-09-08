@@ -80,9 +80,9 @@ enum Tab {
 impl Tab {
     fn name(self) -> &'static str {
         match self {
-            Tab::Perf => "производительность",
-            Tab::Apps => "приложения",
-            Tab::Services => "службы",
+            Tab::Perf => ui::t("производительность"),
+            Tab::Apps => ui::t("приложения"),
+            Tab::Services => ui::t("службы"),
         }
     }
 }
@@ -407,9 +407,9 @@ impl App {
     /// Отозвать право у процесса `pid` в слоте `slot` и обновить подробности.
     fn revoke(&mut self, pid: u16, slot: u16) {
         if sys::proc_revoke(self.sysview, pid as usize, slot as usize) {
-            self.flash = Some(alloc::format!("отнято: P{} слот {}", pid, slot));
+            self.flash = Some(ui::f2(ui::t("отнято: P{} слот {}"), &alloc::format!("{pid}"), &alloc::format!("{slot}")));
         } else {
-            self.flash = Some(String::from("отзыв не удался"));
+            self.flash = Some(String::from(ui::t("отзыв не удался")));
         }
         self.detail_pid = None; // перечитать граф на следующем проходе
     }
@@ -472,17 +472,17 @@ impl App {
     /// «отобрать сеть вот у этого одного» — знаком у каждого права выбранного процесса.
     fn switch_net(&mut self, on: bool) {
         let Some(ep) = (self.net_ep != sys::NO_CAP).then_some(self.net_ep) else {
-            self.flash = Some(String::from("сети нет: у диспетчера нет канала к серверу"));
+            self.flash = Some(String::from(ui::t("сети нет: у диспетчера нет канала к серверу")));
             return;
         };
         let mut rep = [0u8; 1];
         let n = sys::call(ep, sys::net_cli::OP_NET_SWITCH, &[on as u8], &mut rep);
         self.flash = Some(if n == 0 || n == usize::MAX {
-            String::from("сервер сети не ответил")
+            String::from(ui::t("сервер сети не ответил"))
         } else if on {
-            String::from("сеть включена: сервер снова обслуживает")
+            String::from(ui::t("сеть включена: сервер снова обслуживает"))
         } else {
-            String::from("сеть выключена: сервер не обслуживает никого")
+            String::from(ui::t("сеть выключена: сервер не обслуживает никого"))
         });
     }
 
@@ -516,9 +516,9 @@ impl App {
             // подвала — не место для оговорок, она обрежется первой.
             None => alloc::format!(
                 "{}: {} · sysview: {}",
-                if self.want_system() { "служб" } else { "приложений" },
+                if self.want_system() { ui::t("служб") } else { ui::t("приложений") },
                 self.ls.hits.len(),
-                if self.can_write { "чтение+управление" } else { "только чтение" }
+                if self.can_write { ui::t("чтение+управление") } else { ui::t("только чтение") }
             ),
         };
         let mcol = if self.flash.is_some() { th.accent } else { th.muted };
@@ -529,7 +529,7 @@ impl App {
             let hot = if u.hot(lay.foot_btn) { 256 } else { 0 };
             match self.net {
                 Some(on) => {
-                    let label = if on { "сеть работает" } else { "сеть выключена" };
+                    let label = if on { ui::t("сеть работает") } else { ui::t("сеть выключена") };
                     if u.toggle(lay.foot_btn, label, on, hot, A_NET) {
                         self.switch_net(!on);
                         self.net = self.net_on();
@@ -539,7 +539,7 @@ impl App {
                 // Сервера сети нет вовсе (или канала к нему): тумблер не рисуем. Выключатель,
                 // за которым ничего, — та же ложь, что пустой ползунок громкости в меню.
                 None => {
-                    u.label(lay.foot_btn, "сети нет", th.muted, Align::Right);
+                    u.label(lay.foot_btn, ui::t("сети нет"), th.muted, Align::Right);
                 }
             }
         }
@@ -575,7 +575,7 @@ impl App {
         let cols = Cols::new(th, lay.head);
         // ── шапка колонок ──────────────────────────────────────────────────────────────────
         let h = lay.head;
-        cols.label(u, h, "имя", "PID", "ЦП", "куча", "состояние", th.muted, th.muted);
+        cols.label(u, h, ui::t("имя"), "PID", ui::t("ЦП"), ui::t("куча"), ui::t("состояние"), th.muted, th.muted);
         u.hsep(Rect::new(h.x, h.bottom(), h.w, th.px(2)));
 
         if let Some(t) = u.scrollbar(
@@ -615,7 +615,7 @@ impl App {
                 &name,
                 &alloc::format!("{pid}"),
                 &alloc::format!("{cpu} %"),
-                &alloc::format!("{heap} КиБ"),
+                &ui::f1(ui::t("{} КиБ"), &alloc::format!("{heap}")),
                 state,
                 fg,
                 dim,
@@ -633,7 +633,7 @@ impl App {
         let inner = u.card(lay.caps);
         let mut d = inner.inset(th.pad);
         let Some(i) = self.ls.current() else {
-            u.label(d.cut_top(font_h), "процесс не выбран", th.muted, Align::Left);
+            u.label(d.cut_top(font_h), ui::t("процесс не выбран"), th.muted, Align::Left);
             u.card(lay.capinfo);
             return false;
         };
@@ -643,7 +643,7 @@ impl App {
         };
         u.label(
             d.cut_top(font_h + th.px(2)),
-            &alloc::format!("права процесса {name} (P{pid})"),
+            &ui::f2(ui::t("права процесса {} (P{})"), &name, &alloc::format!("{pid}")),
             th.text,
             Align::Left,
         );
@@ -711,24 +711,24 @@ impl App {
                     if d.h < font_h {
                         break;
                     }
-                    u.label(d.cut_top(font_h + th.px(1)), line, th.muted, Align::Left);
+                    u.label(d.cut_top(font_h + th.px(1)), ui::t(line), th.muted, Align::Left);
                 }
                 d.cut_top(th.px(4));
-                u.row(d.cut_top(font_h + th.px(2)), "слот", &alloc::format!("{slot}"));
-                u.row(d.cut_top(font_h + th.px(2)), "права", &rights_full(rights));
+                u.row(d.cut_top(font_h + th.px(2)), ui::t("слот"), &alloc::format!("{slot}"));
+                u.row(d.cut_top(font_h + th.px(2)), ui::t("права"), &rights_full(rights));
                 if aux != 0xFFFF {
                     let who = match self.procs.iter().find(|p| p.pid == aux) {
                         Some(p) => alloc::format!("P{} ({})", aux, p.name),
                         None => alloc::format!("P{}", aux),
                     };
-                    u.row(d.cut_top(font_h + th.px(2)), "цель", &who);
+                    u.row(d.cut_top(font_h + th.px(2)), ui::t("цель"), &who);
                 }
             }
             None => {
-                u.label(d.cut_top(font_h), "прав нет", th.muted, Align::Left);
+                u.label(d.cut_top(font_h), ui::t("прав нет"), th.muted, Align::Left);
                 u.label(
                     d.cut_top(font_h + th.px(2)),
-                    "процесс не может ничего вне себя",
+                    ui::t("процесс не может ничего вне себя"),
                     th.muted,
                     Align::Left,
                 );
@@ -739,14 +739,14 @@ impl App {
         d.cut_top(th.px(2));
         u.row(
             d.cut_top(font_h + th.px(2)),
-            "происхождение",
-            if system { "служба (init)" } else { "приложение" },
+            ui::t("происхождение"),
+            if system { ui::t("служба (init)") } else { ui::t("приложение") },
         );
         if has_hash {
             // По шестнадцать знаков в строке: колонка узкая, а хэш — то самое, ради чего
             // диспетчер и не верит именам; обрезать его многоточием нельзя.
             let hex = hex64(&hash);
-            u.label(d.cut_top(font_h), "content-id образа", th.muted, Align::Left);
+            u.label(d.cut_top(font_h), ui::t("content-id образа"), th.muted, Align::Left);
             for k in 0..4 {
                 if d.h < font_h {
                     break;
@@ -756,7 +756,7 @@ impl App {
         } else {
             u.label(
                 d.cut_top(font_h),
-                if linux { "образ из пакета Linux" } else { "образ без хэша" },
+                if linux { ui::t("образ из пакета Linux") } else { ui::t("образ без хэша") },
                 th.muted,
                 Align::Left,
             );
@@ -816,7 +816,7 @@ impl App {
         // ── подробности выбранного: заголовок и сетка пар в две колонки ────────────────────
         let mut d = lay.detail;
         let head = d.cut_top(font_h + th.px(6));
-        u.label(head, DEVS[self.dev].name, th.text, Align::Left);
+        u.label(head, ui::t(DEVS[self.dev].name), th.text, Align::Left);
         let (val, sub, col) = self.dev_value(self.dev);
         u.label(head, &alloc::format!("{sub} · {val}"), col, Align::Right);
         let rh = font_h + th.px(3);
@@ -851,11 +851,12 @@ impl App {
         let inner = u.card(lay.graph);
         let mut g = Rect::new(inner.x, lay.graph.y + th.pad, inner.w, lay.graph.h - 2 * th.pad);
         let title = g.cut_top(font_h);
-        u.label(title, &alloc::format!("{}, последняя минута", DEVS[self.dev].name), th.muted, Align::Left);
+        u.label(title, &ui::f1(ui::t("{}, последняя минута"), ui::t(DEVS[self.dev].name)), th.muted, Align::Left);
         g.cut_top(th.px(4));
         let hist = self.hist.get(self.dev).map(|h| h.as_slice()).unwrap_or(&[]);
         if hist.len() < 2 {
-            let why = if DEVS[self.dev].why.is_empty() { "замеров ещё нет" } else { DEVS[self.dev].why };
+            let why =
+                if DEVS[self.dev].why.is_empty() { ui::t("замеров ещё нет") } else { ui::t(DEVS[self.dev].why) };
             u.label(g, why, th.muted, Align::Left);
             return dirty;
         }
@@ -874,11 +875,11 @@ impl App {
                     (Some(n), Some(p)) => alloc::format!("{} %", n.cpu_percent(p)),
                     _ => String::from("—"),
                 };
-                let mut v = alloc::vec![s("загрузка", load), s("архитектура", String::from(ARCH))];
+                let mut v = alloc::vec![s(ui::t("загрузка"), load), s(ui::t("архитектура"), String::from(ARCH))];
                 if let Some(n) = info {
-                    v.push(s("время работы", dur_text(n.uptime_ns)));
-                    v.push(s("из них простой", dur_text(n.idle_ns)));
-                    v.push(s("процессов", alloc::format!("{}", n.procs)));
+                    v.push(s(ui::t("время работы"), dur_text(n.uptime_ns)));
+                    v.push(s(ui::t("из них простой"), dur_text(n.idle_ns)));
+                    v.push(s(ui::t("процессов"), alloc::format!("{}", n.procs)));
                     // Веха 170 — ЯДРА двумя числами: сколько машина объявила и на скольких
                     // работает система. Здесь стояло зашитое «1 (SMP нет)» — оно было верным
                     // ровно до этой вехи и, что важнее, ничего не измеряло.
@@ -891,24 +892,24 @@ impl App {
                     if up < c {
                         // Ядро есть, а поднять его не вышло — это неисправность, и молчать о
                         // ней нельзя.
-                        text.push_str(&alloc::format!(", поднято {up}"));
+                        text.push_str(&ui::f1(ui::t(", поднято {}"), &alloc::format!("{up}")));
                     }
                     if run < up {
-                        text.push_str(&alloc::format!(" (работает {run})"));
+                        text.push_str(&ui::f1(ui::t(" (работает {})"), &alloc::format!("{run}")));
                     }
-                    v.push(s("ядер", text));
+                    v.push(s(ui::t("ядер"), text));
                 }
                 v
             }
             (1, Some(n)) => {
-                let mib = |b: u64| alloc::format!("{} МиБ", b / (1024 * 1024));
+                let mib = |b: u64| ui::f1(ui::t("{} МиБ"), &alloc::format!("{}", b / (1024 * 1024)));
                 alloc::vec![
-                    s("всего", mib(n.ram_total)),
-                    s("занято", mib(n.ram_used)),
-                    s("свободно", mib(n.ram_total.saturating_sub(n.ram_used))),
-                    s("занято, доля", alloc::format!("{} %", n.ram_percent())),
-                    s("страница", String::from("4 КиБ")),
-                    s("подкачки", String::from("нет (и не будет)")),
+                    s(ui::t("всего"), mib(n.ram_total)),
+                    s(ui::t("занято"), mib(n.ram_used)),
+                    s(ui::t("свободно"), mib(n.ram_total.saturating_sub(n.ram_used))),
+                    s(ui::t("занято, доля"), alloc::format!("{} %", n.ram_percent())),
+                    s(ui::t("страница"), String::from(ui::t("4 КиБ"))),
+                    s(ui::t("подкачки"), String::from(ui::t("нет (и не будет)"))),
                 ]
             }
             _ => Vec::new(),
@@ -930,12 +931,12 @@ impl App {
             1 => match &self.info {
                 Some(n) => (
                     alloc::format!("{} %", n.ram_percent()),
-                    alloc::format!("{} из {} МиБ", n.ram_used / 1048576, n.ram_total / 1048576),
+                    ui::f2(ui::t("{} из {} МиБ"), &alloc::format!("{}", n.ram_used / 1048576), &alloc::format!("{}", n.ram_total / 1048576)),
                     Rgba::hex(0xdcdcdd),
                 ),
-                None => (String::from("—"), String::from("нет права"), th_muted),
+                None => (String::from("—"), String::from(ui::t("нет права")), th_muted),
             },
-            _ => (String::from("—"), String::from(DEVS[k].why), th_muted),
+            _ => (String::from("—"), String::from(ui::t(DEVS[k].why)), th_muted),
         }
     }
 
@@ -946,7 +947,7 @@ impl App {
         all.cut_top(lay.tabs.h + th.gap);
         let inner = u.card(all);
         let mut d = inner.inset(th.pad);
-        u.label(d.cut_top(font_h + th.px(6)), "нет права обзора процессов", th.text, Align::Left);
+        u.label(d.cut_top(font_h + th.px(6)), ui::t("нет права обзора процессов"), th.text, Align::Left);
         u.hsep(d.cut_top(th.px(6)));
         d.cut_top(th.px(4));
         // Строки КОРОТКИЕ намеренно: ширину окна назначает композитор (колонка ленты), и текст,
@@ -976,7 +977,7 @@ impl App {
                 break;
             }
             let col = if line.starts_with("  ") { th.accent } else { th.muted };
-            u.label(d.cut_top(font_h + th.px(2)), line, col, Align::Left);
+            u.label(d.cut_top(font_h + th.px(2)), ui::t(line), col, Align::Left);
         }
     }
 }
@@ -1091,8 +1092,8 @@ fn kind_name(k: u8) -> &'static str {
         3 => "value",
         4 => "endpoint",
         5 => "reply",
-        6 => "диск",
-        7 => "сеть",
+        6 => ui::t("диск"),
+        7 => ui::t("сеть"),
         8 => "mmio",
         9 => "dma",
         10 => "power",
@@ -1130,7 +1131,7 @@ fn kind_help(k: u8) -> &'static [&'static str] {
 /// Права словами (для панели пояснения).
 fn rights_full(r: u32) -> String {
     if r == 0 {
-        return String::from("никаких");
+        return String::from(ui::t("никаких"));
     }
     let mut s = String::new();
     for (bit, word) in [
@@ -1144,7 +1145,7 @@ fn rights_full(r: u32) -> String {
             if !s.is_empty() {
                 s.push_str(", ");
             }
-            s.push_str(word);
+            s.push_str(ui::t(word));
         }
     }
     s
@@ -1198,7 +1199,7 @@ fn dev_help(k: usize) -> &'static [&'static str] {
 
 /// Короткое имя состояния (для колонки таблицы).
 fn state_name(s: u8) -> &'static str {
-    match s {
+    ui::t(match s {
         0 => "готов",
         1 => "ждёт IPC",
         2 => "ждёт ответа",
@@ -1209,7 +1210,7 @@ fn state_name(s: u8) -> &'static str {
         7 => "ждёт IRQ",
         8 => "спит",
         _ => "неизвестно",
-    }
+    })
 }
 
 /// Веха 163 — длительность человеку: миллисекунды, пока их немного, дальше секунды с десятой,
@@ -1350,7 +1351,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     }
 
     let (w, h) = (820u16, 620u16);
-    let Some(mut surf) = Window::create(w, h, "Диспетчер задач") else {
+    let Some(mut surf) = Window::create(w, h, ui::t("Диспетчер задач")) else {
         say("taskmgr: композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
