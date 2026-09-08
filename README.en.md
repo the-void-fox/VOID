@@ -164,8 +164,9 @@ limits will be found anyway — better that the system names them first.
   says "no drivers" honestly instead of pretending.
 - **BIOS/MBR only.** UEFI, GPT and NVMe are not supported; `install` erases the whole disk.
 - **No time zones** (everything is UTC) and no clock discipline — there is no NTP.
-- **`posixfs` is thin**: no file permissions or timestamps, no recursive delete, directories
-  cannot be renamed.
+- **No file permissions** (uid/gid/mode) — and there never will be: VOID has no users and no
+  root, and access is handed out as capability objects. There are no symlinks of our own either
+  (only inside package trees). A file is held whole in the personality's memory: 8 MiB today.
 - **Security has not been audited.** The capability model is exercised by our own red team
   (`Code/tools/redteam.py` plus the `probe` probe), but that is not an audit.
 - **This is not a production OS** and does not claim to be one.

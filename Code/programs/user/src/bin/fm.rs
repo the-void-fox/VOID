@@ -59,6 +59,9 @@ struct Entry {
     dir: bool,
     /// Размер файла в байтах; `None` — не спрашивали (каталог либо ещё не смотрели).
     size: Option<usize>,
+    /// Веха 177 — когда изменяли, наносекунды Unix; 0 — время неизвестно. В отличие от размера
+    /// спрашивается СРАЗУ у всех: времена всего каталога приезжают одним вызовом.
+    when: u64,
 }
 
 /// Места, куда ходят чаще всего. Список ФИКСИРОВАННЫЙ и проверенный: каждая закладка перед
@@ -282,15 +285,25 @@ impl App {
                 name: String::from_utf8_lossy(raw).into_owned(),
                 dir,
                 size: None,
+                when: 0,
             });
         }
+        // Веха 177 — времена ОДНИМ вызовом на каталог. Размер так спросить нельзя (он у каждого
+        // файла свой объект), а время лежит рядом с именем — там же, где имя, то есть в самом
+        // каталоге. Поэтому дата в списке бесплатна, а размер по-прежнему у одного файла.
+        let (tn, _) = px::times_ex(self.ep, self.cwd.as_bytes(), &mut buf);
+        if tn > 0 {
+            for e in self.entries.iter_mut() {
+                e.when = px::time_in(&buf[..tn.min(buf.len())], e.name.as_bytes()).unwrap_or(0);
+            }
+        }
         self.entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
-        // Подпись — по именам и виду: перечитали и получили то же самое значит «ничего не
-        // изменилось», и кадра не надо. Размеры в подпись не входят: их мы спрашиваем у одного
+        // Подпись — по именам, виду и времени: перечитали и получили то же самое значит «ничего
+        // не изменилось», и кадра не надо. Размеры в подпись не входят: их мы спрашиваем у одного
         // файла, а не у всех, и знать о них нечего.
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for e in &self.entries {
-            for b in e.name.as_bytes().iter().chain(&[e.dir as u8]) {
+            for b in e.name.as_bytes().iter().chain(&[e.dir as u8]).chain(&e.when.to_le_bytes()) {
                 h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
             }
         }
@@ -704,9 +717,9 @@ impl App {
                 let c = u.tint(th.accent.with_a(0x88));
                 u.c.rrect_bordered(r, th.radius.min(r.h / 2), th.line.max(1), Rgba::CLEAR, c);
             }
-            let (name, dir, size) = {
+            let (name, dir, size, when) = {
                 let e = &self.entries[i];
-                (e.name.clone(), e.dir, e.size)
+                (e.name.clone(), e.dir, e.size, e.when)
             };
             let art = if dir { ui::icon::FOLDER } else { ui::icon::FILE };
             let col = if dir { th.text } else { th.muted };
@@ -729,6 +742,10 @@ impl App {
                 u.icon(Rect::new(ir.x, ir.y + (r.h - font_h) / 2, font_h, font_h), art, col);
                 t.cut_left(th.px(6));
                 let val = t.cut_right(u.text_w("0000,0 МиБ"));
+                // Веха 177 — столбец даты. Отдаётся только тогда, когда имени остаётся не меньше,
+                // чем дате: в узком окне имя важнее, а обрезанное имя — это уже не имя.
+                let dw = u.text_w("0000-00-00 00:00") + th.px(10);
+                let when_r = (t.w > dw * 2).then(|| t.cut_right(dw));
                 u.label(t, &name, th.text, Align::Left);
                 let s = match (dir, size) {
                     (true, _) => String::from("каталог"),
@@ -736,6 +753,9 @@ impl App {
                     (false, None) => String::new(),
                 };
                 u.label(val, &s, th.muted, Align::Right);
+                if let Some(wr) = when_r {
+                    u.label(wr, &date_text(when), th.muted, Align::Right);
+                }
             }
             if u.clicked(r) {
                 act = Some((k, u.mods()));
@@ -1559,6 +1579,17 @@ fn ellipsis(font: &mut Font, s: &str, w: i32) -> String {
 
 /// Размер файла человеку: байты, КиБ, МиБ. Точность одна десятая — больше не читается, меньше
 /// врёт («0 КиБ» у файла в 900 байт).
+/// Веха 177 — время записи человеку. **Ноль значит «неизвестно», а не 1970 год**: у всего, что
+/// лежало в системе до этой вехи, времени просто нет, и подписать его началом эпохи значило бы
+/// сочинить факт. Прочерк — честный ответ.
+fn date_text(ns: u64) -> String {
+    if ns == 0 {
+        return String::from("—");
+    }
+    let (y, mo, d, h, mi, _) = sys::civil_from_unix(ns / 1_000_000_000);
+    alloc::format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
 fn size_text(n: usize) -> String {
     if n < 1024 {
         alloc::format!("{n} Б")

@@ -1491,6 +1491,10 @@ pub mod posix {
     pub const OP_READLINK: usize = 10;
     /// copy(old, new) — Веха 176: скопировать файл ИЛИ КАТАЛОГ. Запрос как у `rename`.
     pub const OP_COPY: usize = 11;
+    /// times(путь каталога) -> `count(u16 LE) | [nlen(1) | имя | время(u64 LE)]*` — Веха 177.
+    /// Времена всех записей ОДНИМ вызовом: список рисуют целиком, и `stat` на каждое имя стоил бы
+    /// кругового рейса на запись.
+    pub const OP_TIMES: usize = 12;
 
     /// Тип записи в ответе `stat` (7-й байт, Веха 108.2) — тот же, что в индексе дерева пакета.
     pub const T_FILE: u8 = 0;
@@ -1696,14 +1700,62 @@ pub mod posix {
     /// То же плюс ТИП записи (Веха 108.2): по нему видно симлинк и исполняемый бит — в дереве
     /// пакета это единственный способ их различить, а `ls` без этого показывал бы ссылку файлом.
     pub fn stat_ex(ep: usize, path: &[u8]) -> Option<(bool, usize, u8)> {
-        let mut r = [0u8; 7];
+        stat_all(ep, path).map(|(d, sz, ty, _)| (d, sz, ty))
+    }
+
+    /// То же плюс ВРЕМЯ последнего изменения — наносекунды Unix (Веха 177). **0 значит
+    /// «неизвестно»**, а не «начало эпохи»: время появляется у записи, когда её создали или
+    /// изменили, и у всего, что лежало в системе прежних версий, его просто нет. Показывать
+    /// такое датой 1970 года было бы враньём — показывайте прочерк.
+    pub fn stat_all(ep: usize, path: &[u8]) -> Option<(bool, usize, u8, u64)> {
+        let mut r = [0u8; 15];
         let n = crate::call(ep, OP_STAT, path, &mut r);
         if n < 6 || r[0] == 0 {
             return None;
         }
         let size = u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as usize;
         let ty = if n >= 7 { r[6] } else { r[5] }; // старый сервер: только «каталог?»
-        Some((r[5] != 0, size, ty))
+        let when =
+            if n >= 15 { u64::from_le_bytes(r[7..15].try_into().unwrap_or([0; 8])) } else { 0 };
+        Some((r[5] != 0, size, ty, when))
+    }
+
+    /// `times(dir, buf) -> (доехало, хотел отдать)` — времена ВСЕХ записей каталога одним
+    /// вызовом (Веха 177). Разбирает ответ [`time_in`].
+    ///
+    /// Одним вызовом на каталог, а не `stat` на каждое имя: список рисуется целиком, и сотня
+    /// круговых рейсов вместо одного видна глазом.
+    pub fn times_ex(ep: usize, dir: &[u8], buf: &mut [u8]) -> (usize, usize) {
+        let c = crate::call_ex(ep, OP_TIMES, dir, buf, crate::NO_CAP);
+        if c.reply_len == usize::MAX {
+            (0, 0)
+        } else {
+            (c.reply_len, c.reply_want)
+        }
+    }
+
+    /// Время записи `name` в ответе [`times_ex`]. `None` — времени у неё нет.
+    pub fn time_in(blob: &[u8], name: &[u8]) -> Option<u64> {
+        if blob.len() < 2 {
+            return None;
+        }
+        let cnt = u16::from_le_bytes([blob[0], blob[1]]) as usize;
+        let mut off = 2usize;
+        for _ in 0..cnt {
+            if off >= blob.len() {
+                break;
+            }
+            let nl = blob[off] as usize;
+            if off + 9 + nl > blob.len() {
+                break;
+            }
+            if &blob[off + 1..off + 1 + nl] == name {
+                let at = off + 1 + nl;
+                return Some(u64::from_le_bytes(blob[at..at + 8].try_into().ok()?));
+            }
+            off += 9 + nl;
+        }
+        None
     }
 
     /// `readlink(path, buf) -> длина цели` (0 — не ссылка либо нет такой). Веха 108.2.

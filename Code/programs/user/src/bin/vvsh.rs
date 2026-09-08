@@ -723,6 +723,7 @@ fn shell_env() -> Env {
         // Веха 84 — перенос команд vsh в vvsh: файлы/каталоги, store, сеть, поколения.
         ("roots", sh_roots),
         ("mkdir", sh_mkdir),
+        ("stat", sh_stat), // Веха 177 — вид, размер и время
         ("readlink", sh_readlink), // Веха 108.2 — симлинки есть только в дереве пакета
         ("rm", sh_rm),
         ("tail", sh_tail),
@@ -980,6 +981,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"cd [DIR]", "сменить каталог (.. вверх, без арг — в корень)");
     help_row(b"pwd", "текущий каталог");
     help_row(b"mkdir DIR", "создать каталог");
+    help_row(b"stat PATH", "вид, размер и время последнего изменения");
     help_row(b"rm PATH", "удалить файл или пустой каталог (rm \"-r\" — с содержимым)");
     help_row(b"mv OLD NEW", "переименовать/переместить файл или каталог");
     help_row(b"cp SRC DST", "копировать файл или каталог (мгновенно: то же содержимое)");
@@ -1180,6 +1182,30 @@ fn sh_readlink(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// `(mkdir путь)` — создать каталог (относительно cwd).
+/// `(stat "путь")` — что известно о записи: вид, размер и время последнего изменения.
+///
+/// Веха 177. Отдельной командой, а не столбцами в `ls`: `ls` возвращает СПИСОК ИМЁН и тем живёт
+/// в конвейерах (`(| (ls) (grep "vv"))`). Приделать к именам ещё и колонки значило бы сломать
+/// каждый такой конвейер ради одной подробности.
+fn sh_stat(args: &[Value]) -> Result<Value, EvalError> {
+    let path = arg_path(args, "stat: (stat \"путь\")")?;
+    let shown = || String::from(core::str::from_utf8(&path).unwrap_or("?"));
+    let Some((dir, size, _, when)) = px::stat_all(cap_fs(), &path) else {
+        return Err(EvalError::new(alloc::format!("stat: нет такого пути: {}", shown())));
+    };
+    let kind = if dir { "каталог" } else { "файл" };
+    let sz = if dir { String::new() } else { alloc::format!("  {} Б", size) };
+    // Ноль — «времени нет», а не 1970 год: у всего, что легло в систему до Вехи 177, его просто
+    // не записывали, и подписывать это датой было бы выдумкой.
+    let at = if when == 0 {
+        String::from("  время неизвестно")
+    } else {
+        let (y, mo, d, h, mi, s) = sys::civil_from_unix(when / 1_000_000_000);
+        alloc::format!("  {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+    };
+    Ok(Value::str(&alloc::format!("{kind}{sz}{at}")))
+}
+
 fn sh_mkdir(args: &[Value]) -> Result<Value, EvalError> {
     let path = arg_path(args, "mkdir: (mkdir \"путь\")")?;
     if px::mkdir(cap_fs(), &path) != 0 {

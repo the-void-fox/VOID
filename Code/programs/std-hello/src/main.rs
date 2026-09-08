@@ -66,7 +66,24 @@ fn fs_demo(arch: &str) -> std::io::Result<()> {
     std::fs::write("std.txt", format!("привет из std::fs (писал {arch})\n"))?;
     let back = std::fs::read_to_string("std.txt")?;
     println!("[hello-std] fs: записал и перечитал std.txt: {:?}", back.trim_end());
-    println!("[hello-std] fs: metadata: {} байт", std::fs::metadata("std.txt")?.len());
+    let meta = std::fs::metadata("std.txt")?;
+    println!("[hello-std] fs: metadata: {} байт", meta.len());
+    // Веха 177 — ВРЕМЯ файла из std. Оно только что записано, значит и разница с `now` должна
+    // быть секундами, а не десятилетиями: печатаем именно её, потому что абсолютная дата на
+    // машине без RTC ничего не доказывает, а «сколько прошло» доказывает.
+    match meta.modified() {
+        Ok(t) => println!(
+            "[hello-std] fs: modified: {} с назад",
+            std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0)
+        ),
+        Err(e) => println!("[hello-std] fs: modified: НЕТ ({e})"),
+    }
+    // Веха 177 попутно починила и это: шестой байт ответа `stat` здесь не читали вовсе, и для
+    // std каталогов не существовало — `metadata("/etc").is_dir()` отвечал «нет».
+    println!(
+        "[hello-std] fs: metadata(\"/etc\").is_dir() = {:?}",
+        std::fs::metadata("/etc").map(|m| m.is_dir())
+    );
     let names: Vec<String> = std::fs::read_dir(".")?
         .filter_map(|e| Some(e.ok()?.file_name().into_string().ok()?))
         .collect();
