@@ -317,6 +317,10 @@ struct LxFd {
     path: Vec<u8>,
     /// Сколько записей каталога уже отдано `getdents64`.
     dpos: usize,
+    /// Веха 181 — файл открыт НА ЗАПИСЬ: содержимое собирается здесь и уезжает в store на
+    /// `close`. Так же поступает `posixfs` со своими слотами, и по той же причине: объект в
+    /// store неизменяем, дописать в него нельзя — можно только положить новый целиком.
+    wbuf: Option<Vec<u8>>,
 }
 
 /// «Ни на каком ядре» / «никакой группы». Индексом быть не может.
@@ -4469,7 +4473,7 @@ fn lx_cstr(t: &mut Table, cur: usize, va: usize, max: usize) -> Option<Vec<u8>> 
 
 /// Открыть найденный узел: занять слот в таблице дескрипторов процесса, вернуть номер fd.
 fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>) -> usize {
-    let fd = LxFd { meta, off: 0, path, dpos: 0 };
+    let fd = LxFd { meta, off: 0, path, dpos: 0, wbuf: None };
     let tbl = &mut t.procs[cur].lx_fds;
     let i = match tbl.iter().position(|s| s.is_none()) {
         Some(i) => {
@@ -4583,7 +4587,32 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     None => linux::err(linux::EFAULT),
                 };
             } else {
-                ret = linux::err(linux::EBADF);
+                // Веха 181 — запись в ФАЙЛ. Копим в буфере дескриптора; в store уедет на
+                // `close` одним объектом (или кусками, если вырос).
+                ret = match lx_get(t, cur, buf, len).map(|b| b.to_vec()) {
+                    None => linux::err(linux::EFAULT),
+                    Some(bytes) => match fd.checked_sub(LX_FD_BASE).and_then(|i| {
+                        t.procs[cur].lx_fds.get_mut(i).and_then(|s| s.as_mut())
+                    }) {
+                        Some(sl) => match &mut sl.wbuf {
+                            Some(w) => {
+                                let at = sl.off as usize;
+                                if w.len() < at {
+                                    w.resize(at, 0); // дыра от `lseek` за конец — нулями, как POSIX
+                                }
+                                let end = at + bytes.len();
+                                if w.len() < end {
+                                    w.resize(end, 0);
+                                }
+                                w[at..end].copy_from_slice(&bytes);
+                                sl.off = end as u64;
+                                bytes.len()
+                            }
+                            None => linux::err(linux::EBADF),
+                        },
+                        None => linux::err(linux::EBADF),
+                    },
+                };
             }
         }
         Some(Lx::Writev) => {
@@ -4995,12 +5024,77 @@ fn linux_syscall(t: &mut Table, cur: usize) {
         Some(Lx::Fcntl) => ret = 0,
         Some(Lx::Close) => {
             // fd 0/1/2 — «закрыты», реальных ресурсов нет; файловые — освободить слот.
+            //
+            // Веха 181 — и ЗДЕСЬ файл уезжает в store. Именно здесь, а не на каждом `write`:
+            // объект неизменяем, значит всякая запись стоила бы нового объекта и нового корня, а
+            // сборка пишет вывод компилятора байтами. `posixfs` поступает так же и по той же
+            // причине.
+            ret = 0;
             if a0 >= LX_FD_BASE {
-                if let Some(sl) = t.procs[cur].lx_fds.get_mut(a0 - LX_FD_BASE) {
-                    *sl = None;
+                let taken = t.procs[cur].lx_fds.get_mut(a0 - LX_FD_BASE).and_then(|s| s.take());
+                if let Some(sl) = taken {
+                    if let Some(body) = sl.wbuf {
+                        if !crate::lxfs::write_file(&sl.path, &body) {
+                            vprintln!(
+                                "  [linux] P{} close: файл НЕ записан ({} Б) — нет каталога или места",
+                                cur,
+                                body.len()
+                            );
+                            ret = linux::err(linux::ENOSPC);
+                        }
+                    }
                 }
             }
-            ret = 0;
+        }
+        // ── создание и снятие имён (Веха 181, ADR 0019) ──────────────────────────
+        //
+        // Путь берётся ВСЕГДА абсолютным: `cwd` Linux-процесса у нас `/`, и относительных путей
+        // нет — это записано отдельным пунктом в известных пробелах, а не забыто. `dirfd`
+        // поэтому игнорируется; когда появится `chdir`, разбор придёт сюда же.
+        Some(Lx::Mkdirat) => {
+            // legacy `mkdir(path, mode)` кладёт путь первым аргументом, `mkdirat` — вторым.
+            let legacy = nr == 83;
+            let path_va = if legacy { a0 } else { a1 };
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                None => linux::err(linux::EFAULT),
+                Some(path) if crate::lxfs::lookup_nofollow(&path).is_some() => {
+                    linux::err(linux::EEXIST)
+                }
+                Some(path) if crate::lxfs::mkdir(&path) => 0,
+                Some(_) => linux::err(linux::ENOENT),
+            };
+        }
+        Some(Lx::Unlinkat) => {
+            // legacy `unlink(path)`/`rmdir(path)` — путь первым; `unlinkat(dirfd, path, flags)`
+            // — вторым. Флаг `AT_REMOVEDIR` нам не нужен: что это каталог, мы и так видим.
+            let legacy = nr == 87 || nr == 84;
+            let path_va = if legacy { a0 } else { a1 };
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                None => linux::err(linux::EFAULT),
+                Some(path) if crate::lxfs::lookup_nofollow(&path).is_none() => {
+                    linux::err(linux::ENOENT)
+                }
+                Some(path) if crate::lxfs::unlink(&path) => 0,
+                // Не вышло, а путь есть — значит каталог с содержимым. Рекурсии здесь нет
+                // намеренно: снести дерево одним вызовом ядро не станет.
+                Some(_) => linux::err(linux::ENOTEMPTY),
+            };
+        }
+        Some(Lx::Renameat) => {
+            // legacy `rename(old, new)` — оба пути первыми; `renameat(olddirfd, old, newdirfd,
+            // new)` — вторым и четвёртым; `renameat2` добавляет флаги, которых мы не умеем.
+            let legacy = nr == 82;
+            let (o_va, n_va) = if legacy { (a0, a1) } else { (a1, a(t, 3)) };
+            ret = match (lx_cstr(t, cur, o_va, 4096), lx_cstr(t, cur, n_va, 4096)) {
+                (Some(o), Some(n)) if crate::lxfs::rename(&o, &n) => 0,
+                (Some(o), Some(_)) if crate::lxfs::lookup_nofollow(&o).is_none() => {
+                    linux::err(linux::ENOENT)
+                }
+                // Каталоги ядро не переименовывает: путь входит в имя корня каждого потомка, то
+                // есть это обход поддерева, и он уже написан в `posixfs`.
+                (Some(_), Some(_)) => linux::err(linux::EINVAL),
+                _ => linux::err(linux::EFAULT),
+            };
         }
         // ── файлы (Веха 108.3): читаются ПРЯМО ИЗ STORE, см. [`crate::lxfs`] ──────
         Some(Lx::Openat) | Some(Lx::Open) => {
@@ -5012,13 +5106,42 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             const O_CREAT: usize = 0o100;
             let legacy = decoded == Some(Lx::Open);
             let (path_va, flags) = if legacy { (a0, a1) } else { (a1, a2) };
+            const O_TRUNC: usize = 0o1000;
+            const O_APPEND: usize = 0o2000;
+            let writing = flags & (O_WRONLY | O_RDWR | O_CREAT) != 0;
             ret = match lx_cstr(t, cur, path_va, 4096) {
                 None => linux::err(linux::EFAULT),
-                Some(path) if flags & (O_WRONLY | O_RDWR | O_CREAT) != 0 => {
-                    // Только чтение — и сказать об этом надо честно, а не «нет файла».
-                    vprintln!("  [linux] P{} openat на запись — EROFS", cur);
-                    let _ = path;
+                // Веха 181 — ЗАПИСЬ. Дерево пакета остаётся неизменяемым: это не недоделка, а
+                // его смысл, и отказ здесь честнее молчаливого успеха.
+                Some(path) if writing && crate::lxfs::in_package(&path) => {
+                    vprintln!("  [linux] P{} openat на запись в пакет — EROFS", cur);
                     linux::err(linux::EROFS)
+                }
+                Some(path) if writing => {
+                    let existing = crate::lxfs::lookup(&path);
+                    // Содержимое, с которого начинаем: пусто при O_TRUNC и у нового файла,
+                    // прежнее при O_APPEND. Дописывать в объект store нельзя — он неизменяем,
+                    // поэтому файл собирается в буфере целиком и кладётся на `close`.
+                    let start = match &existing {
+                        Some(m) if flags & O_TRUNC == 0 && flags & O_APPEND != 0 => {
+                            crate::lxfs::read_all(m).unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let meta = existing.unwrap_or(crate::lxfs::Meta {
+                        id: void_abi::ContentId([0u8; 32]),
+                        size: 0,
+                        ty: void_tree::K_FILE,
+                        src: crate::lxfs::Src::Hier,
+                    });
+                    let off = start.len() as u64;
+                    let fd = lx_fd_alloc(t, cur, meta, path);
+                    if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                        sl.wbuf = Some(start);
+                        sl.off = off;
+                    }
+                    vprintln!("  [linux] P{} openat на запись → fd {}", cur, fd);
+                    fd
                 }
                 Some(path) => match crate::lxfs::lookup(&path) {
                     Some(meta) => {

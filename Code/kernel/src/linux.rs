@@ -28,6 +28,14 @@ pub const ESPIPE: isize = 29;
 /// Веха 108.3 — файловая система только для чтения: пакет неизменяем, и врать «нет файла» на
 /// попытку записи было бы хуже, чем сказать правду.
 pub const EROFS: isize = 30;
+/// Веха 181 — места на носителе не хватило (или каталога, куда класть, нет). Отдельный код, а
+/// не «успех»: сборка, чей `close` молча потерял вывод компилятора, — это испорченный пакет,
+/// который выяснится через полчаса и в другом месте.
+pub const ENOSPC: isize = 28;
+/// Каталог не пуст — `rmdir` на непустом.
+pub const ENOTEMPTY: isize = 39;
+/// Уже существует.
+pub const EEXIST: isize = 17;
 
 /// Обёрнутый в usize код ошибки (`-errno` в дополнительном коде — как возвращает ядро Linux).
 pub fn err(e: isize) -> usize {
@@ -48,6 +56,11 @@ pub enum Lx {
     Close,
     Lseek,
     Openat,
+    /// Веха 181 (ADR 0019) — создание и снятие имён. Без них сборка не начнётся: `configure`
+    /// первым делом заводит рабочий каталог и складывает в него пробные файлы.
+    Mkdirat,
+    Unlinkat,
+    Renameat,
     Fstat,
     Newfstatat,
     Getdents64,
@@ -155,6 +168,14 @@ pub fn decode(nr: usize) -> Option<Lx> {
         230 => Lx::ClockNanosleep,
         231 => Lx::ExitGroup,
         257 => Lx::Openat,
+        83 => Lx::Mkdirat,   // legacy mkdir(path, mode)
+        258 => Lx::Mkdirat,
+        87 => Lx::Unlinkat,  // legacy unlink(path)
+        84 => Lx::Unlinkat,  // legacy rmdir(path) — каталог отличаем по тому, что он каталог
+        263 => Lx::Unlinkat,
+        82 => Lx::Renameat,  // legacy rename(old, new)
+        264 => Lx::Renameat,
+        316 => Lx::Renameat, // renameat2 — флаги мы не поддерживаем, разбор ниже
         262 => Lx::Newfstatat,
         269 => Lx::Faccessat,
         271 => Lx::Ppoll,
@@ -179,6 +200,9 @@ pub fn decode(nr: usize) -> Option<Lx> {
         29 => Lx::Ioctl,
         48 => Lx::Faccessat,
         56 => Lx::Openat,
+        34 => Lx::Mkdirat,
+        35 => Lx::Unlinkat,
+        276 => Lx::Renameat, // renameat2 — legacy на riscv нет
         57 => Lx::Close,
         61 => Lx::Getdents64,
         62 => Lx::Lseek,

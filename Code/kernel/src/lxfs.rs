@@ -31,6 +31,16 @@ const TREE_ROOT: &str = "pkg/tree/";
 /// Длина хэша пути nix.
 const HASH_LEN: usize = 32;
 
+/// Откуда узел. Веха 181 — различать обязательно: у дерева пакета и у иерархии `posixfs`
+/// РАЗНЫЕ форматы индекса каталога, и прочитать один другим значит увидеть мусор вместо имён.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Src {
+    /// Дерево распакованного пакета под `/nix/store` — формат [`void_tree`]. Только чтение.
+    Tree,
+    /// Иерархия `posixfs` — формат [`void_fs`]. С этой вехи ещё и записывается.
+    Hier,
+}
+
 /// Найденный узел: что читать и чем оно является.
 #[derive(Clone, Copy)]
 pub struct Meta {
@@ -38,6 +48,7 @@ pub struct Meta {
     pub size: u64,
     /// Тип записи дерева пакета ([`void_tree`]); у файлов иерархии posixfs — обычный файл.
     pub ty: u8,
+    pub src: Src,
 }
 
 /// Путь относительно точки монтирования (пустой ломоть — сам `/nix/store`).
@@ -64,7 +75,8 @@ fn tree_lookup(rel: &[u8]) -> Option<Meta> {
     let mut root_name = String::with_capacity(TREE_ROOT.len() + HASH_LEN);
     root_name.push_str(TREE_ROOT);
     root_name.push_str(hash);
-    let mut cur = Meta { id: object::root(&root_name)?, size: 0, ty: void_tree::K_DIR };
+    let mut cur =
+        Meta { id: object::root(&root_name)?, size: 0, ty: void_tree::K_DIR, src: Src::Tree };
     let mut name: &[u8] = base;
 
     loop {
@@ -77,7 +89,7 @@ fn tree_lookup(rel: &[u8]) -> Option<Meta> {
         })?;
         let (i, ty, size) = found;
         let kids = object::children(&cur.id);
-        cur = Meta { id: *kids.get(i)?, size, ty };
+        cur = Meta { id: *kids.get(i)?, size, ty, src: Src::Tree };
         match parts.next() {
             Some(next) => {
                 if !void_tree::is_dir(cur.ty) {
@@ -161,25 +173,47 @@ pub fn lookup_nofollow(path: &[u8]) -> Option<Meta> {
     // Родители точки монтирования синтетические: своего `/nix` в персоналии нет, но разбор пути
     // обязан пройти сквозь него — иначе спотыкается сам поиск `ld.so`, чей путь начинается
     // именно с него. (Ровно так же их показывает posixfs.)
-    if path == b"/" || path == b"/nix" {
-        return Some(Meta { id: ContentId([0u8; 32]), size: 0, ty: void_tree::K_DIR });
+    if path == b"/nix" {
+        return Some(Meta { id: ContentId([0u8; 32]), size: 0, ty: void_tree::K_DIR, src: Src::Tree });
     }
     if let Some(rel) = under_mount(path) {
         if rel.is_empty() {
             // Сам /nix/store — каталог, но у него нет узла: перечисление живёт в `store_roots`.
-            return Some(Meta { id: ContentId([0u8; 32]), size: 0, ty: void_tree::K_DIR });
+            return Some(Meta { id: ContentId([0u8; 32]), size: 0, ty: void_tree::K_DIR, src: Src::Tree });
         }
         return tree_lookup(rel);
     }
-    // Иерархия posixfs: файл = объект под корнем `f<путь>` (каталоги её здесь не читаем — их
-    // индекс другого формата, а Linux-программе они пока и не нужны).
+    // Иерархия posixfs. Веха 181 — теперь и КАТАЛОГИ: без них Linux-процесс не может ни
+    // `stat` каталога, ни `getdents`, а сборке нужно и то и другое (`configure` начинает с
+    // обхода дерева). Формат индекса — `void_fs`, и различает их `Meta::src`.
+    if let Some(m) = hier_dir(path) {
+        return Some(m);
+    }
+    let id = object::root(&hier_root(void_fs::K_FILE, path)?)?;
+    let size = object::with(&id, |payload| payload.map(|b| b.len() as u64))?;
+    // Большой файл лежит блобом — размер берётся из манифеста, а не из длины узла.
+    let (size, ty) = match object::with(&id, |p| {
+        p.and_then(|b| void_tree::blob::info(b, 16 * 1024)).map(|(total, _, _)| total)
+    }) {
+        Some(total) => (total as u64, void_tree::K_FILE | void_tree::F_BLOB),
+        None => (size, void_tree::K_FILE),
+    };
+    Some(Meta { id, size, ty, src: Src::Hier })
+}
+
+/// Имя корня иерархии: вид плюс путь. `None` — путь не UTF-8 (в store имена корней — строки).
+fn hier_root(kind: u8, path: &[u8]) -> Option<String> {
     let p = core::str::from_utf8(path).ok()?;
     let mut name = String::with_capacity(1 + p.len());
-    name.push('f');
+    name.push(kind as char);
     name.push_str(p);
-    let id = object::root(&name)?;
-    let size = object::with(&id, |payload| payload.map(|b| b.len() as u64))?;
-    Some(Meta { id, size, ty: void_tree::K_FILE })
+    Some(name)
+}
+
+/// Каталог иерархии, если он есть.
+fn hier_dir(path: &[u8]) -> Option<Meta> {
+    let id = object::root(&hier_root(void_fs::K_DIR, path)?)?;
+    Some(Meta { id, size: 0, ty: void_tree::K_DIR, src: Src::Hier })
 }
 
 /// Прочитать не больше `out.len()` байт файла с позиции `off`. Возвращает сколько прочитано;
@@ -261,6 +295,20 @@ pub fn dir_entries(path: &[u8], meta: &Meta) -> Vec<(u8, String)> {
     if !void_tree::is_dir(meta.ty) {
         return out;
     }
+    // Веха 181 — у иерархии СВОЙ формат индекса (`void_fs`). Прочитать его форматом дерева
+    // пакета значит показать мусор вместо имён, поэтому `Meta` и носит `src`.
+    if meta.src == Src::Hier {
+        object::with(&meta.id, |payload| {
+            let Some(b) = payload else { return };
+            for e in void_fs::entries(b, b.len()) {
+                if let Ok(name) = core::str::from_utf8(e.name) {
+                    let ty = if e.is_dir() { void_tree::K_DIR } else { void_tree::K_FILE };
+                    out.push((ty, String::from(name)));
+                }
+            }
+        });
+        return out;
+    }
     object::with(&meta.id, |payload| {
         let Some(b) = payload else { return };
         let Some(it) = void_tree::iter(b) else { return };
@@ -285,4 +333,202 @@ pub fn readlink(meta: &Meta) -> Option<Vec<u8>> {
         return None;
     }
     object::with(&meta.id, |payload| payload.map(|b| b.to_vec()))
+}
+
+// ─── запись (Веха 181, ADR 0019) ─────────────────────────────────────────────────────────────
+//
+// Писать иерархию ядру нужно ровно затем, чтобы на VOID можно было СОБРАТЬ деривацию: builder
+// пишет `$out`, а он — обычный Linux-процесс, чей `write` обязан ответить внутри системного
+// вызова. Сходить отсюда по IPC к `posixfs` нечем (см. шапку файла), поэтому пишем сами — тем же
+// форматом (`void_fs`), одной с ним реализацией.
+//
+// **Правило, которое надо помнить: один файл — один писатель.** Каталоги от двух писателей не
+// страдают (индекс перечитывается на каждой операции), а вот файл, который `posixfs` держит
+// открытым и грязным, его `close` перезапишет поверх написанного нами. В песочнице сборки этого
+// не случится — там файлы принадлежат Linux-стороне.
+
+/// Лежит ли путь в дереве пакета (там запись запрещена — пакет неизменяем).
+pub fn in_package(path: &[u8]) -> bool {
+    under_mount(path).is_some()
+}
+
+/// Положить содержимое в store: маленькое одним объектом, большое КУСКАМИ.
+///
+/// Формат кусков — общий с загрузкой из сети и с `posixfs` (`void_tree::blob`). Свой был бы
+/// вторым, и первым же следствием стало бы, что файл, записанный из сборки, не открывается
+/// файловым менеджером.
+fn put_body(body: &[u8]) -> Option<(ContentId, u8)> {
+    const CHUNK: usize = 16 * 1024;
+    if body.len() <= CHUNK {
+        return object::try_put(body).map(|id| (id, void_tree::K_FILE));
+    }
+    let n = body.len().div_ceil(CHUNK);
+    let mut kids: Vec<ContentId> = Vec::with_capacity(n);
+    for k in 0..n {
+        let to = ((k + 1) * CHUNK).min(body.len());
+        kids.push(object::try_put(&body[k * CHUNK..to])?);
+    }
+    let manifest = void_tree::blob::manifest(body.len(), n, CHUNK);
+    object::try_put_node(&manifest, &kids).map(|id| (id, void_tree::K_FILE | void_tree::F_BLOB))
+}
+
+/// Прочитать индекс каталога в буфер; 0 — каталога нет.
+fn read_index(path: &[u8], dir: &mut [u8; void_fs::DIR_MAX]) -> usize {
+    let Some(name) = hier_root(void_fs::K_DIR, path) else { return 0 };
+    let Some(id) = object::root(&name) else { return 0 };
+    object::with(&id, |payload| {
+        let Some(b) = payload else { return 0 };
+        let n = b.len().min(dir.len());
+        dir[..n].copy_from_slice(&b[..n]);
+        n
+    })
+}
+
+fn write_index(path: &[u8], dir: &[u8]) -> bool {
+    let Some(name) = hier_root(void_fs::K_DIR, path) else { return false };
+    let Some(id) = object::try_put(dir) else { return false };
+    object::set_root(&name, id);
+    true
+}
+
+/// Пометить запись `name` каталога `dirp` временем «сейчас».
+fn touch(dirp: &[u8], name: &[u8]) {
+    let Some(root) = hier_root(void_fs::K_TIME, dirp) else { return };
+    let mut t = [0u8; void_fs::MT_MAX];
+    let n = match object::root(&root) {
+        Some(id) => object::with(&id, |payload| {
+            let Some(b) = payload else { return 0 };
+            let n = b.len().min(t.len());
+            t[..n].copy_from_slice(&b[..n]);
+            n
+        }),
+        None => 0,
+    };
+    let n = void_fs::mt_set(&mut t, n, name, crate::clock::realtime_ns());
+    if let Some(id) = object::try_put(&t[..n]) {
+        object::set_root(&root, id);
+    }
+}
+
+/// Забыть время записи — её больше нет в каталоге.
+fn untouch(dirp: &[u8], name: &[u8]) {
+    let Some(root) = hier_root(void_fs::K_TIME, dirp) else { return };
+    let Some(id) = object::root(&root) else { return };
+    let mut t = [0u8; void_fs::MT_MAX];
+    let n = object::with(&id, |payload| {
+        let Some(b) = payload else { return 0 };
+        let n = b.len().min(t.len());
+        t[..n].copy_from_slice(&b[..n]);
+        n
+    });
+    if n == 0 {
+        return;
+    }
+    let n = void_fs::mt_remove(&mut t, n, name);
+    if let Some(id) = object::try_put(&t[..n]) {
+        object::set_root(&root, id);
+    }
+}
+
+/// Вписать имя в индекс родителя. `false` — родителя нет (создавать его молча мы не станем:
+/// `mkdir -p` это работа вызывающего, а не файловой системы).
+fn link_into_parent(path: &[u8], is_dir: bool) -> bool {
+    let par = void_fs::parent(path);
+    let mut dir = [0u8; void_fs::DIR_MAX];
+    let mut n = read_index(par, &mut dir);
+    if n == 0 && par != b"/" {
+        return false;
+    }
+    n = void_fs::idx_add(&mut dir, n, void_fs::leaf(path), is_dir);
+    if !write_index(par, &dir[..n]) {
+        return false;
+    }
+    touch(par, void_fs::leaf(path));
+    true
+}
+
+fn unlink_from_parent(path: &[u8]) {
+    let par = void_fs::parent(path);
+    let mut dir = [0u8; void_fs::DIR_MAX];
+    let n = read_index(par, &mut dir);
+    if n == 0 {
+        return;
+    }
+    let n = void_fs::idx_remove(&mut dir, n, void_fs::leaf(path));
+    write_index(par, &dir[..n]);
+    untouch(par, void_fs::leaf(path));
+}
+
+/// Записать файл целиком. `false` — не влезло в store либо нет родительского каталога.
+pub fn write_file(path: &[u8], body: &[u8]) -> bool {
+    if under_mount(path).is_some() {
+        return false; // пакет неизменяем — и это не недоделка, а его смысл
+    }
+    let Some(root) = hier_root(void_fs::K_FILE, path) else { return false };
+    let Some((id, _)) = put_body(body) else { return false };
+    object::set_root(&root, id);
+    link_into_parent(path, false)
+}
+
+/// Создать каталог. `false` — уже есть, нет родителя или путь не наш.
+pub fn mkdir(path: &[u8]) -> bool {
+    if under_mount(path).is_some() || path == b"/" {
+        return false;
+    }
+    if hier_dir(path).is_some() {
+        return false;
+    }
+    let empty = [0u8; 2];
+    if !write_index(path, &empty) {
+        return false;
+    }
+    link_into_parent(path, true)
+}
+
+/// Снять файл либо ПУСТОЙ каталог. Рекурсии здесь нет намеренно: `rm -r` разворачивает обход
+/// вызывающий, и согласие человека на потерю содержимого — тоже его дело.
+pub fn unlink(path: &[u8]) -> bool {
+    if under_mount(path).is_some() || path == b"/" {
+        return false;
+    }
+    if let Some(m) = hier_dir(path) {
+        let empty = object::with(&m.id, |p| p.map(|b| void_fs::idx_empty(b, b.len())).unwrap_or(true));
+        if !empty {
+            return false;
+        }
+        let Some(d) = hier_root(void_fs::K_DIR, path) else { return false };
+        object::del_root(&d);
+        if let Some(t) = hier_root(void_fs::K_TIME, path) {
+            object::del_root(&t);
+        }
+        unlink_from_parent(path);
+        return true;
+    }
+    let Some(f) = hier_root(void_fs::K_FILE, path) else { return false };
+    if !object::del_root(&f) {
+        return false;
+    }
+    unlink_from_parent(path);
+    true
+}
+
+/// Переименовать ФАЙЛ. Каталог здесь не переименовывается: путь входит в имя корня каждого
+/// потомка, значит это обход поддерева — и он уже написан в `posixfs`. Дублировать его в ядре
+/// ради сборки незачем: сборочные скрипты переименовывают файлы, а каталоги переносят по одному.
+pub fn rename(old: &[u8], new: &[u8]) -> bool {
+    if under_mount(old).is_some() || under_mount(new).is_some() {
+        return false;
+    }
+    if hier_dir(old).is_some() {
+        return false;
+    }
+    let (Some(fo), Some(fna)) = (hier_root(void_fs::K_FILE, old), hier_root(void_fs::K_FILE, new))
+    else {
+        return false;
+    };
+    let Some(id) = object::root(&fo) else { return false };
+    object::set_root(&fna, id);
+    object::del_root(&fo);
+    unlink_from_parent(old);
+    link_into_parent(new, false)
 }
