@@ -179,7 +179,9 @@ limits will be found anyway — better that the system names them first.
 ## Building from source
 
 You need `nix-shell` (QEMU, GRUB, mtools) and the rustup toolchain from
-`Code/rust-toolchain.toml`.
+`Code/rust-toolchain.toml`. Clone **without** `--recursive`: the `vendor/` submodules are only
+needed by the `std` port and uutils; the system, the ISO and everything visible in the
+screenshots build without them (see "Third-party code" below).
 
 ```sh
 Code/tools/run.sh                    # build and run x86_64 with graphics (one command)
@@ -230,3 +232,10 @@ allows the source of a derivative work to be closed.
 Third-party code: `vendor/rust` and `vendor/coreutils` are submodules tracking upstream under
 their own licenses, `Reference/` is not part of the repository, and the vendored crates are
 listed in `Code/programs/user/Cargo.toml` with a note on why each was taken.
+
+**A caveat about the submodules.** They are FORKS (branch `void`), and their changes — the `std`
+port to VOID and the uutils port — currently live only locally: the public repository holds
+pointers into upstream, where those commits do not exist. So `git submodule update --init` will
+fail, and that is expected. It does not affect the system: the kernel, the shell, every program
+in the screenshots and the ISO all build without the submodules — they are only needed to
+rebuild the std programs and uutils.
