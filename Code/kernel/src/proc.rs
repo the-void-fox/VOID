@@ -4471,6 +4471,96 @@ fn lx_cstr(t: &mut Table, cur: usize, va: usize, max: usize) -> Option<Vec<u8>> 
     None
 }
 
+/// Веха 182 — `execve`: заменить образ ТЕКУЩЕГО процесса, не заводя нового.
+///
+/// ## Почему это не `SYS_SPAWN` с последующим `exit`
+///
+/// `execve` обязан сохранить НОМЕР процесса и его дескрипторы: на этом стоит вся оболочка —
+/// родитель ждёт того же ребёнка, которого породил, а перенаправление (`> файл`) делается ДО
+/// `execve` и обязано пережить его. Спавн с самоубийством дал бы другой pid и потерянные
+/// дескрипторы, и ошибка вылезла бы не здесь, а в `wait4` через полсборки.
+///
+/// ## Порядок, в котором нельзя ошибиться
+///
+/// Новый образ строится в НОВОМ адресном пространстве и только потом подменяет старое. Если по
+/// дороге что-то не вышло — не нашёлся файл, негодный ELF, кончилась память, — старое остаётся
+/// нетронутым, и вызывающий получает честный `errno`. Так и ведёт себя Linux: неудачный
+/// `execve` возвращается, удачный — нет.
+///
+/// Старое пространство освобождается НЕ ЗДЕСЬ, а через `dead_roots`: на нём прямо сейчас стоит
+/// это самое ядро машины, и снести его под собой значило бы освободить таблицы, на которые
+/// смотрит регистр. Планировщик отдаст фреймы, когда никто на них не стоит (Веха 170).
+fn exec_linux_in_place(
+    t: &mut Table,
+    cur: usize,
+    pname: &'static str,
+    bytes: &[u8],
+    args_blob: Vec<u8>,
+    env_blob: Vec<u8>,
+) -> bool {
+    let Some(root) = new_address_space() else { return false };
+    let fail = |root: usize| {
+        unsafe { arch::free_address_space(root) };
+        false
+    };
+    let pie = match elf::load_pie(root, bytes, USER_REGION_START, USER_HEAP_BASE_VA) {
+        Ok(p) => p,
+        Err(e) => {
+            vprintln!("  [linux] execve: негодный PIE-образ: {:?}", e);
+            return fail(root);
+        }
+    };
+    // Динамический бинарь: загрузчик из `PT_INTERP` — тем же путём, что и при спавне.
+    let mut interp_base = 0usize;
+    let mut entry = pie.entry;
+    if let Some(ipath) = elf::interp_path(bytes) {
+        let Some(meta) = crate::lxfs::lookup(ipath) else { return fail(root) };
+        let Some(idata) = crate::lxfs::read_all(&meta) else { return fail(root) };
+        match elf::load_pie(root, &idata, INTERP_BASE_VA, USER_HEAP_BASE_VA) {
+            Ok(ip) => {
+                interp_base = INTERP_BASE_VA;
+                entry = ip.entry;
+            }
+            Err(_) => return fail(root),
+        }
+    }
+    let mut rnd = [0u8; 16];
+    let mut seed = arch::now_ticks();
+    for chunk in rnd.chunks_mut(8) {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let b = seed.to_le_bytes();
+        chunk.copy_from_slice(&b[..chunk.len()]);
+    }
+    let (block, sp) = crate::linux::build_init_stack(
+        USER_STACK_TOP_VA,
+        &args_blob,
+        &env_blob,
+        &pie,
+        rnd,
+        interp_base,
+    );
+    copy_to_space(root, sp, &block);
+
+    // С этой строки пути назад нет: образ подменён.
+    let old = arch::space_root(t.procs[cur].space);
+    t.procs[cur].space = arch::space_token(root);
+    t.procs[cur].frame = TrapFrame::new_user(entry, sp, 0);
+    t.procs[cur].heap_brk = USER_HEAP_BASE_VA; // куча новая — старого `brk` больше нет
+    t.procs[cur].args = args_blob;
+    t.procs[cur].env = env_blob;
+    t.procs[cur].linux = true;
+    t.procs[cur].image = None;
+    // Дескрипторы ПЕРЕЖИВАЮТ `execve` — так велит POSIX, и на этом стоит перенаправление вывода.
+    //
+    // А вот ДОМЕН ПРАВ не меняется, и это не забывчивость. В VOID домен привязан к ИМЕНИ
+    // программы (Веха 156), и подменять его здесь значило бы выдать процессу права чужой
+    // программы по одному лишь её названию — то есть отдать повышение прав любому, кто умеет
+    // звать `execve`. Права наследуются от того, кто был, ровно как при спавне ребёнка.
+    let _ = pname; // имя процесса живёт в `args[0]`, отдельного поля у него нет
+    t.dead_roots.push(old);
+    true
+}
+
 /// Открыть найденный узел: занять слот в таблице дескрипторов процесса, вернуть номер fd.
 fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>) -> usize {
     let fd = LxFd { meta, off: 0, path, dpos: 0, wbuf: None };
@@ -5045,6 +5135,64 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     }
                 }
             }
+        }
+        Some(Lx::Execve) => {
+            // execve(path, argv[], envp[]) — массивы указателей, каждый кончается NULL.
+            let (path_va, argv_va, envp_va) = (a0, a1, a2);
+            // Собрать блоб NUL-разделённых строк из массива указателей. Потолок — тот же
+            // `ARGS_MAX`, что у своих процессов: чужой массив без NULL иначе увёл бы ядро в
+            // бесконечное чтение.
+            let gather = |t: &mut Table, base: usize| -> Option<Vec<u8>> {
+                let mut out: Vec<u8> = Vec::new();
+                if base == 0 {
+                    return Some(out);
+                }
+                for i in 0..256usize {
+                    let ent = lx_get(t, cur, base + i * 8, 8)?;
+                    let ptr = usize::from_le_bytes(ent.try_into().ok()?);
+                    if ptr == 0 {
+                        return Some(out);
+                    }
+                    let sarg = lx_cstr(t, cur, ptr, 4096)?;
+                    if out.len() + sarg.len() + 1 > ARGS_MAX {
+                        return None;
+                    }
+                    out.extend_from_slice(&sarg);
+                    out.push(0);
+                }
+                None // NULL так и не встретился — считаем массив негодным
+            };
+            ret = match lx_cstr(t, cur, path_va, 4096) {
+                None => linux::err(linux::EFAULT),
+                Some(path) => match crate::lxfs::lookup(&path) {
+                    None => linux::err(linux::ENOENT),
+                    Some(meta) => match crate::lxfs::read_all(&meta) {
+                        None => linux::err(linux::ENOENT),
+                        Some(image) => {
+                            match (gather(t, argv_va), gather(t, envp_va)) {
+                                (Some(argv), Some(envp)) => {
+                                    // Имя процесса обязано жить дольше таблицы (как и при
+                                    // спавне): утечка на запуск, запусков за сессию немного.
+                                    let pname: &'static str = alloc::boxed::Box::leak(
+                                        alloc::string::String::from_utf8_lossy(&path)
+                                            .into_owned()
+                                            .into_boxed_str(),
+                                    );
+                                    if exec_linux_in_place(t, cur, pname, &image, argv, envp) {
+                                        vprintln!("  [linux] P{} execve → {}", cur, pname);
+                                        // Кадр уже НОВЫЙ — общий эпилог его трогать не должен.
+                                        done = false;
+                                        0
+                                    } else {
+                                        linux::err(linux::ENOMEM)
+                                    }
+                                }
+                                _ => linux::err(linux::EFAULT),
+                            }
+                        }
+                    },
+                },
+            };
         }
         // ── создание и снятие имён (Веха 181, ADR 0019) ──────────────────────────
         //

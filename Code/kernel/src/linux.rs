@@ -61,6 +61,8 @@ pub enum Lx {
     Mkdirat,
     Unlinkat,
     Renameat,
+    /// Веха 182 (ADR 0019, шаг 2) — заменить образ ТЕКУЩЕГО процесса.
+    Execve,
     Fstat,
     Newfstatat,
     Getdents64,
@@ -176,6 +178,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         82 => Lx::Renameat,  // legacy rename(old, new)
         264 => Lx::Renameat,
         316 => Lx::Renameat, // renameat2 — флаги мы не поддерживаем, разбор ниже
+        59 => Lx::Execve,
         262 => Lx::Newfstatat,
         269 => Lx::Faccessat,
         271 => Lx::Ppoll,
@@ -203,6 +206,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         34 => Lx::Mkdirat,
         35 => Lx::Unlinkat,
         276 => Lx::Renameat, // renameat2 — legacy на riscv нет
+        221 => Lx::Execve,
         57 => Lx::Close,
         61 => Lx::Getdents64,
         62 => Lx::Lseek,
