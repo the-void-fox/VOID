@@ -169,6 +169,17 @@ enum State {
     /// Веха 52: userspace-драйвер заблокирован в SYS_IRQ_WAIT — ждёт прерывания своего устройства;
     /// будит [`drain_userdrv_irq`] по флагу [`USERDRV_IRQ_PENDING`], выставленному обработчиком IRQ.
     IrqWait,
+    /// Веха 183: заблокирован в `wait4` — ждёт ребёнка с этим номером ([`ANY_CHILD`] — любого).
+    ///
+    /// Отдельно от [`State::ExecWait`] намеренно: тот будят, ВПИСЫВАЯ код выхода прямо в кадр
+    /// (`SYS_EXEC` возвращает именно его), а `wait4` обязан ещё и положить статус в память
+    /// вызывающего и вернуть НОМЕР ребёнка. Разделить проще, чем учить один будильник двум
+    /// разным способам разбудить.
+    ChildWait(usize),
+    /// Веха 183: заблокирован на ТРУБЕ с этим номером — читатель ждёт данных либо писатель
+    /// ждёт места. Будит его чужой `write`/`read` по той же трубе или закрытие последнего
+    /// конца с той стороны (тогда читатель получает конец файла, а писатель — `EPIPE`).
+    PipeWait(usize),
     /// Веха 114: заблокирован в SYS_SLEEP до срока в `futex_deadline`. Отдельное состояние, а не
     /// `FutexWait` с выдуманным адресом: спящий по времени НЕ должен просыпаться от чужого
     /// `FUTEX_WAKE`, случайно назвавшего тот же адрес.
@@ -317,11 +328,28 @@ struct LxFd {
     path: Vec<u8>,
     /// Сколько записей каталога уже отдано `getdents64`.
     dpos: usize,
+    /// Веха 183 — это дескриптор ТРУБЫ: её номер и с какого она конца (`true` — пишущий).
+    /// Труба живёт в таблице, а не в дескрипторе, потому что концов у неё двое, а после
+    /// `fork` станет и вчетверо больше: владелец у неё не один.
+    pipe: Option<(usize, bool)>,
     /// Веха 181 — файл открыт НА ЗАПИСЬ: содержимое собирается здесь и уезжает в store на
     /// `close`. Так же поступает `posixfs` со своими слотами, и по той же причине: объект в
     /// store неизменяем, дописать в него нельзя — можно только положить новый целиком.
     wbuf: Option<Vec<u8>>,
 }
+
+/// Веха 183 — ТРУБА: байты, ждущие читателя, и сколько концов ещё открыто.
+///
+/// Ёмкость конечная и это важно: без неё писатель, который быстрее читателя, съел бы всю память
+/// ядра. Упёрся в потолок — ждёт, ровно как на Linux.
+struct LxPipe {
+    buf: alloc::collections::VecDeque<u8>,
+    readers: usize,
+    writers: usize,
+}
+
+/// Сколько байт труба держит, пока их не забрали. Столько же по умолчанию у Linux.
+const PIPE_CAP: usize = 64 * 1024;
 
 /// «Ни на каком ядре» / «никакой группы». Индексом быть не может.
 const NO_CPU: usize = usize::MAX;
@@ -345,6 +373,9 @@ struct Table {
     /// Веха 170 — корни умерших пространств, которых пока держит какое-то ядро. Освободятся,
     /// как только оно переедет.
     dead_roots: Vec<usize>,
+    /// Веха 183 — ТРУБЫ личности Linux. В таблице, а не в процессе, потому что у трубы два
+    /// конца, а после `fork` их станет вчетверо больше: одним владельцем она не описывается.
+    lx_pipes: Vec<Option<LxPipe>>,
     /// Недоставленные запросы IPC: (отправитель, получатель, сообщение).
     mailbox: Vec<(usize, usize, usize)>,
     /// Веха 89 — номера слотов полностью утилизированных групп, готовые к переиспользованию.
@@ -479,6 +510,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
     bound: [NO_CPU; cpu::MAX],
     space: [0; cpu::MAX],
     dead_roots: Vec::new(),
+    lx_pipes: Vec::new(),
     mailbox: Vec::new(),
     free_slots: Vec::new(),
 });
@@ -1368,8 +1400,19 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
             t.procs[i].state = State::Runnable;
             t.procs[i].ready_at = arch::now_ticks();
         }
+        // Веха 183 — ждущий в `wait4` будится ПРОСТО: его кадр уже отмотан на сам вызов
+        // (`restart`), и, проснувшись, он найдёт зомби сам и сам решит, что вернуть.
+        let waits_this = t.procs[i].state == State::ChildWait(child)
+            || (t.procs[i].state == State::ChildWait(ANY_CHILD) && t.procs[child].parent == i);
+        if waits_this {
+            t.procs[i].state = State::Runnable;
+            t.procs[i].ready_at = arch::now_ticks();
+        }
     }
 }
+
+/// Веха 183 — «любой ребёнок» для [`State::ChildWait`]. Номером процесса быть не может.
+const ANY_CHILD: usize = usize::MAX;
 
 /// Веха 35 — разбудить присоединяющихся к нити `thread` (THREAD_JOIN), вернув им её
 /// `retval`. Зеркало [`wake_exec_waiters`] для нитей вместо процессов.
@@ -3849,6 +3892,8 @@ fn syscall(t: &mut Table, cur: usize) {
                             State::IrqWait => 7,
                             State::Sleeping => 8,
                             State::Finished => 9,
+                            State::PipeWait(_) => 10,
+                            State::ChildWait(_) => 11,
                         };
                         // Имя = argv[0] до NUL, обрезанное до 24 байт.
                         let name: &[u8] = p.args.split(|&b| b == 0).next().unwrap_or(&[]);
@@ -4471,6 +4516,54 @@ fn lx_cstr(t: &mut Table, cur: usize, va: usize, max: usize) -> Option<Vec<u8>> 
     None
 }
 
+// ─── трубы (Веха 183) ────────────────────────────────────────────────────────────────────────
+
+/// Разбудить всех, кто ждёт на трубе `idx`.
+///
+/// Будим ВСЕХ, а не одного: спящих у трубы может быть и читатель, и писатель, и кто из них
+/// дождался — решает не будильник, а повторённый системный вызов. Проснувшийся, которому опять
+/// нечего делать, просто уснёт снова — это дешевле, чем ошибиться в выборе.
+fn pipe_wake(t: &mut Table, idx: usize) {
+    for i in 0..t.procs.len() {
+        if t.procs[i].state == State::PipeWait(idx) {
+            t.procs[i].state = State::Runnable;
+            t.procs[i].ready_at = arch::now_ticks();
+        }
+    }
+}
+
+/// Занять слот трубы. Возвращает её номер.
+fn pipe_alloc(t: &mut Table) -> usize {
+    let p = LxPipe { buf: alloc::collections::VecDeque::new(), readers: 1, writers: 1 };
+    match t.lx_pipes.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            t.lx_pipes[i] = Some(p);
+            i
+        }
+        None => {
+            t.lx_pipes.push(Some(p));
+            t.lx_pipes.len() - 1
+        }
+    }
+}
+
+/// Закрыть один конец трубы. Последний закрытый конец освобождает слот.
+fn pipe_close_end(t: &mut Table, idx: usize, write_end: bool) {
+    let Some(Some(p)) = t.lx_pipes.get_mut(idx) else { return };
+    if write_end {
+        p.writers = p.writers.saturating_sub(1);
+    } else {
+        p.readers = p.readers.saturating_sub(1);
+    }
+    let dead = p.readers == 0 && p.writers == 0;
+    // Разбудить обязательно: читатель, у которого закрылся последний писатель, ждёт НЕ данных,
+    // а конца файла, и узнать о нём может только проснувшись.
+    pipe_wake(t, idx);
+    if dead {
+        t.lx_pipes[idx] = None;
+    }
+}
+
 /// Веха 182 — `execve`: заменить образ ТЕКУЩЕГО процесса, не заводя нового.
 ///
 /// ## Почему это не `SYS_SPAWN` с последующим `exit`
@@ -4563,7 +4656,7 @@ fn exec_linux_in_place(
 
 /// Открыть найденный узел: занять слот в таблице дескрипторов процесса, вернуть номер fd.
 fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>) -> usize {
-    let fd = LxFd { meta, off: 0, path, dpos: 0, wbuf: None };
+    let fd = LxFd { meta, off: 0, path, dpos: 0, wbuf: None, pipe: None };
     let tbl = &mut t.procs[cur].lx_fds;
     let i = match tbl.iter().position(|s| s.is_none()) {
         Some(i) => {
@@ -4676,6 +4769,46 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     }
                     None => linux::err(linux::EFAULT),
                 };
+            } else if let Some((idx, true)) =
+                fd.checked_sub(LX_FD_BASE).and_then(|i| {
+                    t.procs[cur].lx_fds.get(i).and_then(|s| s.as_ref()).and_then(|s| s.pipe)
+                })
+            {
+                // Веха 183 — запись в ТРУБУ.
+                let bytes = lx_get(t, cur, buf, len).map(|b| b.to_vec());
+                match bytes {
+                    None => ret = linux::err(linux::EFAULT),
+                    Some(bytes) => {
+                        let (readers, room) = match t.lx_pipes.get(idx).and_then(|p| p.as_ref()) {
+                            Some(p) => (p.readers, PIPE_CAP.saturating_sub(p.buf.len())),
+                            None => (0, 0),
+                        };
+                        if readers == 0 {
+                            // Читателей не осталось — писать некому. На Linux здесь ещё и
+                            // `SIGPIPE`; сигналов у нас нет, остаётся честный код.
+                            ret = linux::err(linux::EPIPE);
+                        } else if room == 0 && !bytes.is_empty() {
+                            // Труба полна: ждём читателя. С РЕСТАРТОМ — при пробуждении вызов
+                            // повторится целиком, и ничего запоминать не нужно.
+                            t.procs[cur].frame.restart();
+                            t.procs[cur].state = State::PipeWait(idx);
+                            if let Some(nx) = t.next_runnable(cur) {
+                                t.set_cur(nx);
+                            }
+                            done = false;
+                            ret = 0;
+                        } else {
+                            // Короткая запись законна: столько, сколько влезло. Так же ведёт
+                            // себя труба на Linux, и вызывающий дозапишет остаток.
+                            let n = bytes.len().min(room);
+                            if let Some(Some(p)) = t.lx_pipes.get_mut(idx) {
+                                p.buf.extend(bytes[..n].iter().copied());
+                            }
+                            pipe_wake(t, idx);
+                            ret = n;
+                        }
+                    }
+                }
             } else {
                 // Веха 181 — запись в ФАЙЛ. Копим в буфере дескриптора; в store уедет на
                 // `close` одним объектом (или кусками, если вырос).
@@ -4740,7 +4873,44 @@ fn linux_syscall(t: &mut Table, cur: usize) {
         // ── ввод (stdin с консоли, блокирующе) ──────────────────────────────────
         Some(Lx::Read) => {
             let (fd, buf, len) = (a0, a1, a2);
-            if fd >= LX_FD_BASE {
+            let pipe_end = fd.checked_sub(LX_FD_BASE).and_then(|i| {
+                t.procs[cur].lx_fds.get(i).and_then(|s| s.as_ref()).and_then(|s| s.pipe)
+            });
+            if let Some((idx, false)) = pipe_end {
+                // Веха 183 — чтение из ТРУБЫ.
+                let (have, writers) = match t.lx_pipes.get(idx).and_then(|p| p.as_ref()) {
+                    Some(p) => (p.buf.len(), p.writers),
+                    None => (0, 0),
+                };
+                if have > 0 {
+                    let n = have.min(len);
+                    let mut tmp = alloc::vec![0u8; n];
+                    if let Some(Some(p)) = t.lx_pipes.get_mut(idx) {
+                        for b in tmp.iter_mut() {
+                            *b = p.buf.pop_front().unwrap_or(0);
+                        }
+                    }
+                    if lx_put(t, cur, buf, &tmp) {
+                        // Место освободилось — писателю, который ждал, есть смысл проснуться.
+                        pipe_wake(t, idx);
+                        ret = n;
+                    } else {
+                        ret = linux::err(linux::EFAULT);
+                    }
+                } else if writers == 0 {
+                    // Писателей не осталось и данных нет — это КОНЕЦ ФАЙЛА, а не ошибка.
+                    ret = 0;
+                } else {
+                    // Пусто, но писатель жив — ждём. С рестартом: вызов повторится целиком.
+                    t.procs[cur].frame.restart();
+                    t.procs[cur].state = State::PipeWait(idx);
+                    if let Some(nx) = t.next_runnable(cur) {
+                        t.set_cur(nx);
+                    }
+                    done = false;
+                    ret = 0;
+                }
+            } else if fd >= LX_FD_BASE {
                 // Файл из store (Веха 108.3). Чтение короткое: за раз отдаём не больше остатка
                 // текущего куска блоба — так же ведёт себя `read` на трубе, и musl дочитает.
                 let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
@@ -5123,6 +5293,12 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             if a0 >= LX_FD_BASE {
                 let taken = t.procs[cur].lx_fds.get_mut(a0 - LX_FD_BASE).and_then(|s| s.take());
                 if let Some(sl) = taken {
+                    // Веха 183 — конец ТРУБЫ: убавить счётчик и разбудить того, кто ждёт. Для
+                    // читателя закрытие последнего писателя — это конец файла, и узнать о нём
+                    // он может только проснувшись.
+                    if let Some((idx, write_end)) = sl.pipe {
+                        pipe_close_end(t, idx, write_end);
+                    }
                     if let Some(body) = sl.wbuf {
                         if !crate::lxfs::write_file(&sl.path, &body) {
                             vprintln!(
@@ -5135,6 +5311,109 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     }
                 }
             }
+        }
+        Some(Lx::Wait4) => {
+            // wait4(pid, wstatus, options, rusage): pid -1 — любой ребёнок, >0 — этот.
+            // `rusage` не заполняем: счётчиков на процесс у нас нет, и врать нулями хуже, чем
+            // не трогать (вызывающий обычно передаёт NULL).
+            const WNOHANG: usize = 1;
+            let (want, status_va, options) = (a0 as isize, a1, a2);
+            let mut any_child = false;
+            let mut ready: Option<usize> = None;
+            for i in 0..t.procs.len() {
+                if t.procs[i].parent != cur || !t.procs[i].zombie {
+                    continue;
+                }
+                if want > 0 && want as usize != i {
+                    continue;
+                }
+                any_child = true;
+                if t.procs[i].exit_code.is_some() {
+                    ready = Some(i);
+                    break;
+                }
+            }
+            ret = match ready {
+                Some(pid) => {
+                    let code = t.procs[pid].exit_code.unwrap_or(0);
+                    // Слово состояния Linux: у нормально завершившегося это код в байтах 8..16.
+                    // Убитых сигналом у нас не бывает — сигналов нет вовсе.
+                    let status = ((code as u32 & 0xff) << 8).to_le_bytes();
+                    if status_va != 0 && !lx_put(t, cur, status_va, &status) {
+                        linux::err(linux::EFAULT)
+                    } else {
+                        // Похоронить: зомби своё отслужил, слот вернуть.
+                        t.procs[pid].zombie = false;
+                        if t.procs[pid].state == State::Finished && pid != t.cur() {
+                            t.free_slots.push(pid);
+                        }
+                        vprintln!("  [linux] P{} wait4 → P{} код {}", cur, pid, code);
+                        pid
+                    }
+                }
+                // Детей нет вовсе — ждать нечего, и сказать это надо отдельным кодом: иначе
+                // оболочка, ждущая в цикле, крутилась бы вечно.
+                None if !any_child => linux::err(linux::ECHILD),
+                None if options & WNOHANG != 0 => 0,
+                None => {
+                    // Дети есть, но никто не закончил. Ждём с РЕСТАРТОМ: проснувшись, вызов
+                    // повторится и сам найдёт зомби.
+                    t.procs[cur].frame.restart();
+                    let key = if want > 0 { want as usize } else { ANY_CHILD };
+                    t.procs[cur].state = State::ChildWait(key);
+                    if let Some(nx) = t.next_runnable(cur) {
+                        t.set_cur(nx);
+                    }
+                    done = false;
+                    0
+                }
+            };
+        }
+        Some(Lx::Pipe2) => {
+            // pipe2(fds[2], flags) / legacy pipe(fds[2]). Флаги (`O_CLOEXEC`, `O_NONBLOCK`) не
+            // поддержаны и молча игнорируются: `CLOEXEC` бессмыслен, пока нет `fork`, а
+            // `NONBLOCK` соврал бы — мы всегда блокируемся.
+            let idx = pipe_alloc(t);
+            let mk = |t: &mut Table, write_end: bool| -> usize {
+                let fd = LxFd {
+                    meta: crate::lxfs::Meta {
+                        id: void_abi::ContentId([0u8; 32]),
+                        size: 0,
+                        ty: void_tree::K_FILE,
+                        src: crate::lxfs::Src::Hier,
+                    },
+                    off: 0,
+                    path: Vec::new(),
+                    dpos: 0,
+                    wbuf: None,
+                    pipe: Some((idx, write_end)),
+                };
+                let tbl = &mut t.procs[cur].lx_fds;
+                match tbl.iter().position(|s| s.is_none()) {
+                    Some(i) => {
+                        tbl[i] = Some(fd);
+                        i + LX_FD_BASE
+                    }
+                    None => {
+                        tbl.push(Some(fd));
+                        tbl.len() - 1 + LX_FD_BASE
+                    }
+                }
+            };
+            let rfd = mk(t, false);
+            let wfd = mk(t, true);
+            let mut out = [0u8; 8];
+            out[0..4].copy_from_slice(&(rfd as u32).to_le_bytes());
+            out[4..8].copy_from_slice(&(wfd as u32).to_le_bytes());
+            ret = if lx_put(t, cur, a0, &out) {
+                vprintln!("  [linux] P{} pipe2 → fd {} и {}", cur, rfd, wfd);
+                0
+            } else {
+                // Не смогли отдать номера — труба никому не досталась, свернуть её целиком.
+                pipe_close_end(t, idx, false);
+                pipe_close_end(t, idx, true);
+                linux::err(linux::EFAULT)
+            };
         }
         Some(Lx::Execve) => {
             // execve(path, argv[], envp[]) — массивы указателей, каждый кончается NULL.

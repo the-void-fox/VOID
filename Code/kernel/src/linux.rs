@@ -36,6 +36,11 @@ pub const ENOSPC: isize = 28;
 pub const ENOTEMPTY: isize = 39;
 /// Уже существует.
 pub const EEXIST: isize = 17;
+/// Веха 183 — писать в трубу, у которой не осталось читателей. На Linux сюда же приходит
+/// `SIGPIPE`; сигналов у нас нет, поэтому остаётся только честный код.
+pub const EPIPE: isize = 32;
+/// Ждать нечего: у процесса нет детей.
+pub const ECHILD: isize = 10;
 
 /// Обёрнутый в usize код ошибки (`-errno` в дополнительном коде — как возвращает ядро Linux).
 pub fn err(e: isize) -> usize {
@@ -63,6 +68,10 @@ pub enum Lx {
     Renameat,
     /// Веха 182 (ADR 0019, шаг 2) — заменить образ ТЕКУЩЕГО процесса.
     Execve,
+    /// Веха 183 — труба: два дескриптора, читающий и пишущий.
+    Pipe2,
+    /// Веха 183 — дождаться ребёнка и забрать его код выхода.
+    Wait4,
     Fstat,
     Newfstatat,
     Getdents64,
@@ -179,6 +188,9 @@ pub fn decode(nr: usize) -> Option<Lx> {
         264 => Lx::Renameat,
         316 => Lx::Renameat, // renameat2 — флаги мы не поддерживаем, разбор ниже
         59 => Lx::Execve,
+        22 => Lx::Pipe2,  // legacy pipe(fds) — без флагов
+        293 => Lx::Pipe2,
+        61 => Lx::Wait4,
         262 => Lx::Newfstatat,
         269 => Lx::Faccessat,
         271 => Lx::Ppoll,
@@ -207,6 +219,8 @@ pub fn decode(nr: usize) -> Option<Lx> {
         35 => Lx::Unlinkat,
         276 => Lx::Renameat, // renameat2 — legacy на riscv нет
         221 => Lx::Execve,
+        59 => Lx::Pipe2, // на riscv legacy `pipe` отсутствует
+        260 => Lx::Wait4,
         57 => Lx::Close,
         61 => Lx::Getdents64,
         62 => Lx::Lseek,

@@ -487,6 +487,8 @@ fn en(s: &'static str) -> &'static str {
         "ждёт futex" => "waits on futex",
         "ждёт IRQ" => "waits for IRQ",
         "спит" => "sleeps",
+        "ждёт трубы" => "waits on a pipe",
+        "ждёт ребёнка" => "waits for a child",
         "неизвестно" => "unknown",
         "чтение" => "read",
         "запись" => "write",
