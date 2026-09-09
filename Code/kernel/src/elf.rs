@@ -225,9 +225,13 @@ pub fn load_pie(root: usize, bytes: &[u8], base: usize, va_limit: usize) -> Resu
     if e_machine != arch::ELF_MACHINE {
         return Err(ElfError::BadMachine);
     }
-    if e_type != ET_DYN {
-        return Err(ElfError::BadType); // load_pie — только для ET_DYN (static-pie)
+    if e_type != ET_DYN && e_type != ET_EXEC {
+        return Err(ElfError::BadType);
     }
+    // Веха 185 — статический `ET_EXEC` (а это половина того, что даёт nixpkgs) требует СВОИХ
+    // адресов: сдвинуть его нельзя, релокаций в нём нет. Значит база у него нулевая, а
+    // предложенная вызывающим относится только к `ET_DYN`, который для того и сделан подвижным.
+    let base = if e_type == ET_DYN { base } else { 0 };
     if e_phentsize == 0 || e_phoff.checked_add(e_phnum * e_phentsize).map_or(true, |end| end > bytes.len()) {
         return Err(ElfError::Truncated);
     }
@@ -276,7 +280,16 @@ pub fn load_pie(root: usize, bytes: &[u8], base: usize, va_limit: usize) -> Resu
             .checked_add(p_memsz)
             .map(|e| (e + PAGE - 1) & !(PAGE - 1))
             .ok_or(ElfError::OutOfRange)?;
-        if va_start < crate::proc::USER_REGION_START || va_end > va_limit || va_end < va_start {
+        // Веха 185 — нижняя граница здесь НЕ [`crate::proc::USER_REGION_START`], в отличие от
+        // родного загрузчика. Чужой статический `ET_EXEC` сам называет свои адреса, и Linux
+        // кладёт такие по `0x400000` — ниже нашей базы. Запрещать ему это значило бы запретить
+        // половину того, что даёт nixpkgs, ради границы, которая ничего не защищает: всё, что
+        // ниже, — такое же пользовательское пространство.
+        //
+        // Что граница защищает на самом деле — НУЛЕВУЮ СТРАНИЦУ: она обязана остаться
+        // неотображённой, иначе разыменование нулевого указателя перестанет быть ошибкой и
+        // станет тихой порчей памяти.
+        if va_start < PAGE || va_end > va_limit || va_end < va_start {
             return Err(ElfError::OutOfRange);
         }
 
@@ -356,7 +369,43 @@ pub fn elf_type(bytes: &[u8]) -> Option<u16> {
     Some(u16_at(bytes, 16))
 }
 
-/// `true`, если ELF — static-PIE (ET_DYN): признак linux-бинаря (Веха 38).
-pub fn is_pie(bytes: &[u8]) -> bool {
-    elf_type(bytes) == Some(ET_DYN)
+/// Первый адрес, по которому образ просит себя разместить (`p_vaddr` первого `PT_LOAD`).
+/// `None` — заголовок не разобрать либо загружаемых сегментов нет.
+pub fn first_load_vaddr(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < EHDR_SIZE || &bytes[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let e_phoff = u64_at(bytes, 32) as usize;
+    let e_phentsize = u16_at(bytes, 54) as usize;
+    let e_phnum = u16_at(bytes, 56) as usize;
+    if e_phentsize == 0 || e_phoff.checked_add(e_phnum * e_phentsize)? > bytes.len() {
+        return None;
+    }
+    (0..e_phnum)
+        .map(|i| e_phoff + i * e_phentsize)
+        .filter(|&ph| u32_at(bytes, ph) == PT_LOAD)
+        .map(|ph| u64_at(bytes, ph + 16) as usize)
+        .min()
+}
+
+/// Веха 185 — **чей это образ: наш или чужой**.
+///
+/// До этой вехи ответ давал ТИП ELF: `ET_DYN` — линуксовый, иначе наш. Ответ был неполон, и это
+/// стоило заметного времени: `pkgsStatic.busybox` из nixpkgs — статический `ET_EXEC`, он уезжал
+/// в родной загрузчик и не запускался, а выглядело это как «личность Linux не работает».
+///
+/// Теперь вопрос задаётся правильно: **свой образ узнаётся по БАЗЕ ЛИНКОВКИ**. Родные программы
+/// VOID собираются одним линкер-скриптом с фиксированной базой [`crate::proc::USER_REGION_START`]
+/// — это свойство нашей сборки, а не догадка о чужой. Всё, что просит разместить себя в другом
+/// месте, чужое: и `ET_DYN` (static-PIE), и статический `ET_EXEC` по адресу вроде `0x400000`.
+///
+/// Оговорка, которую надо признать: линуксовый бинарь, слинкованный РОВНО по нашей базе, был бы
+/// принят за свой. Такой не встречается — 0x4000_0000 не принадлежит ни одному соглашению
+/// Linux, — но если однажды встретится, лечится это не хитростью, а меткой в наших образах.
+pub fn is_foreign(bytes: &[u8], native_base: usize) -> bool {
+    match elf_type(bytes) {
+        Some(ET_EXEC) => first_load_vaddr(bytes) != Some(native_base),
+        Some(_) => true, // ET_DYN и всё прочее — точно не наше
+        None => false,   // заголовок не разобрать: пусть отвечает родной загрузчик
+    }
 }

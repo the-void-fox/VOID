@@ -2761,7 +2761,7 @@ fn syscall(t: &mut Table, cur: usize) {
                                 // Веха 38: тип ELF решает путь. Наш ET_EXEC — родной запуск
                                 // (argv/env/старт-права через контракт); чужой static-PIE
                                 // ET_DYN — linux-личность (стек Linux + трансля́тор syscall'ов).
-                                let child = if elf::is_pie(&bytes) {
+                                let child = if elf::is_foreign(&bytes, USER_REGION_START) {
                                     spawn_linux_locked(t, pname, &bytes, root, args)
                                 } else {
                                     match elf::load(root, &bytes, USER_HEAP_BASE_VA) {
