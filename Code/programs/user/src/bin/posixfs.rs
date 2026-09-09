@@ -30,23 +30,14 @@ use void_user::posix::{O_APPEND, O_TRUNC};
 // `alloc`: здесь кучи нет вовсе, поэтому индекс читается итератором по чужому буферу.
 use void_tree as tree;
 
+// Веха 181 — формат самой иерархии: имена корней `f`/`d`/`m`, индекс каталога, времена.
+use void_fs as fs;
+use void_fs::{DIR_MAX, MT_MAX, PATH_MAX, ROOT_MAX};
+
 const NFILES: usize = 32;
-/// Путь (Веха 108.2: было 128 — не хватало даже на `/nix/store/<хэш>-<имя>/lib/...`).
-const PATH_MAX: usize = 512;
 /// Веха 39: файл ≤ 128 КиБ (wasm-модули проходят через персоналию). Буферы — в ленивой куче.
 /// Для файлов ПАКЕТА этот потолок не действует: они читаются прямо из дерева store, кусками.
 const DATA_MAX: usize = 8 * 1024 * 1024;
-/// Индекс каталога — на СТЕКЕ, свой скромный потолок (не DATA_MAX): count(u16) + записи.
-const DIR_MAX: usize = 4096;
-/// Веха 177 — времена записей каталога (side-корень `m<путь>`), тоже на стеке.
-///
-/// Потолок не на глаз: запись индекса стоит `2 + nlen` байт, запись времён — `9 + nlen`, а
-/// индекс не длиннее `DIR_MAX`. Худший случай — имена в один байт: записей не больше
-/// `(4096 - 2) / 3 = 1364`, времён на них `2 + 1364 * 10 = 13 642` байта. То есть в 16 КиБ
-/// времена ВСЕГДА помещаются, и молчаливой потери времени быть не может по построению.
-const MT_MAX: usize = 16384;
-/// Имя корня = префикс `f`/`d` + абсолютный путь.
-const ROOT_MAX: usize = 1 + PATH_MAX;
 
 /// Точка монтирования дерева пакетов (Веха 108.2). Всё под ней — ЧТЕНИЕ: пакет неизменяем, и
 /// «записать в /nix/store» означало бы завести вторую правду о его содержимом.
@@ -181,211 +172,9 @@ fn tree_read(
     k
 }
 
-// ─── пути ──────────────────────────────────────────────────────────────────────
-/// Нормализовать запрос в абсолютный путь в `out`, вернуть длину. Пусто/`.`/`/` → корень `/`;
-/// голое имя → `/<имя>`; хвостовой `/` (кроме корня) убираем.
-fn normalize(req: &[u8], out: &mut [u8; PATH_MAX]) -> usize {
-    let mut n = 0usize;
-    if req.is_empty() || req == b"." || req == b"/" {
-        out[0] = b'/';
-        return 1;
-    }
-    if req[0] != b'/' {
-        out[0] = b'/';
-        n = 1;
-    }
-    for &b in req {
-        if n < PATH_MAX {
-            out[n] = b;
-            n += 1;
-        }
-    }
-    if n > 1 && out[n - 1] == b'/' {
-        n -= 1; // убрать хвостовой слэш
-    }
-    n
-}
-
-/// Родитель пути (`/a/b` → `/a`; `/a` → `/`; `/` → `/`).
-fn parent(path: &[u8]) -> &[u8] {
-    match path.iter().rposition(|&b| b == b'/') {
-        Some(0) | None => b"/",
-        Some(i) => &path[..i],
-    }
-}
-
-/// Листовое имя (`/a/b` → `b`; `/` → пусто).
-fn leaf(path: &[u8]) -> &[u8] {
-    match path.iter().rposition(|&b| b == b'/') {
-        Some(i) => &path[i + 1..],
-        None => path,
-    }
-}
-
-/// Собрать имя корня `<prefix><path>` в `out`, вернуть длину.
-fn root_name(prefix: u8, path: &[u8], out: &mut [u8; ROOT_MAX]) -> usize {
-    out[0] = prefix;
-    let n = path.len().min(ROOT_MAX - 1);
-    out[1..1 + n].copy_from_slice(&path[..n]);
-    1 + n
-}
-
-// ─── индекс каталога (корень `d<путь>`): count(u16 LE) | [type(1) | nlen(1) | name]* ───
-/// Есть ли `name` в индексе `dir[..len]`; возвращает тип (0=файл, 1=каталог).
-fn idx_type(dir: &[u8], len: usize, name: &[u8]) -> Option<u8> {
-    if len < 2 {
-        return None;
-    }
-    let cnt = u16::from_le_bytes([dir[0], dir[1]]) as usize;
-    let mut off = 2usize;
-    for _ in 0..cnt {
-        if off + 2 > len {
-            break;
-        }
-        let ty = dir[off];
-        let nl = dir[off + 1] as usize;
-        if off + 2 + nl > len {
-            break;
-        }
-        if &dir[off + 2..off + 2 + nl] == name {
-            return Some(ty);
-        }
-        off += 2 + nl;
-    }
-    None
-}
-
-/// Добавить запись (если её ещё нет). Возвращает новую длину.
-fn idx_add(dir: &mut [u8], mut len: usize, name: &[u8], is_dir: bool) -> usize {
-    if len < 2 {
-        dir[0] = 0;
-        dir[1] = 0;
-        len = 2;
-    }
-    if idx_type(dir, len, name).is_some() || len + 2 + name.len() > DIR_MAX {
-        return len;
-    }
-    dir[len] = is_dir as u8;
-    dir[len + 1] = name.len() as u8;
-    dir[len + 2..len + 2 + name.len()].copy_from_slice(name);
-    let cnt = u16::from_le_bytes([dir[0], dir[1]]) + 1;
-    dir[0..2].copy_from_slice(&cnt.to_le_bytes());
-    len + 2 + name.len()
-}
-
-/// Убрать запись (сдвиг хвоста). Возвращает новую длину (не меняется, если не было).
-fn idx_remove(dir: &mut [u8], mut len: usize, name: &[u8]) -> usize {
-    if len < 2 {
-        return len;
-    }
-    let cnt = u16::from_le_bytes([dir[0], dir[1]]) as usize;
-    let mut off = 2usize;
-    for _ in 0..cnt {
-        if off + 2 > len {
-            break;
-        }
-        let nl = dir[off + 1] as usize;
-        let entry = 2 + nl;
-        if &dir[off + 2..off + 2 + nl] == name {
-            dir.copy_within(off + entry..len, off);
-            len -= entry;
-            dir[0..2].copy_from_slice(&((cnt - 1) as u16).to_le_bytes());
-            return len;
-        }
-        off += entry;
-    }
-    len
-}
-
-/// Пуст ли каталог (count == 0).
-fn idx_empty(dir: &[u8], len: usize) -> bool {
-    len < 2 || u16::from_le_bytes([dir[0], dir[1]]) == 0
-}
-
-// ─── времена записей (корень `m<путь-каталога>`): count(u16 LE) | [nlen(1) | name | mtime(u64 LE)]* ───
-//
-// Веха 177. Содержимое в store адресуется ХЭШЕМ, значит время внутри объекта жить не может: два
-// одинаковых файла — один объект, а времена у них разные. Поэтому время живёт снаружи, рядом с
-// именем, — то есть там же, где уже живёт имя: в каталоге.
-//
-// Почему отдельным корнем, а не полем в индексе. Индекс читают ВСЕ поколения системы, включая
-// те, что лежат в сторе и на которые можно откатиться (`rollback`). Расширенный формат индекса
-// старая персоналия разобрала бы как мусор — то есть откат ломал бы файловую систему. Незнакомый
-// корень она просто не заметит.
-//
-// Один лишний корень на КАТАЛОГ, а не на файл: корни попадают в индекс-кадр каждого коммита, и
-// удвоение их числа стоило бы удвоения этого кадра на всех файлах системы.
-
-/// Время записи `name`, если оно известно.
-fn mt_find(t: &[u8], len: usize, name: &[u8]) -> Option<u64> {
-    if len < 2 {
-        return None;
-    }
-    let cnt = u16::from_le_bytes([t[0], t[1]]) as usize;
-    let mut off = 2usize;
-    for _ in 0..cnt {
-        if off >= len {
-            break;
-        }
-        let nl = t[off] as usize;
-        if off + 9 + nl > len {
-            break;
-        }
-        if &t[off + 1..off + 1 + nl] == name {
-            let at = off + 1 + nl;
-            return Some(u64::from_le_bytes(t[at..at + 8].try_into().unwrap()));
-        }
-        off += 9 + nl;
-    }
-    None
-}
-
-/// Убрать время записи (сдвиг хвоста). Возвращает новую длину.
-fn mt_remove(t: &mut [u8], mut len: usize, name: &[u8]) -> usize {
-    if len < 2 {
-        return len;
-    }
-    let cnt = u16::from_le_bytes([t[0], t[1]]) as usize;
-    let mut off = 2usize;
-    for _ in 0..cnt {
-        if off >= len {
-            break;
-        }
-        let nl = t[off] as usize;
-        let entry = 9 + nl;
-        if off + entry > len {
-            break;
-        }
-        if &t[off + 1..off + 1 + nl] == name {
-            t.copy_within(off + entry..len, off);
-            len -= entry;
-            t[0..2].copy_from_slice(&((cnt - 1) as u16).to_le_bytes());
-            return len;
-        }
-        off += entry;
-    }
-    len
-}
-
-/// Проставить время записи (заменив прежнее). Возвращает новую длину.
-fn mt_set(t: &mut [u8], mut len: usize, name: &[u8], when: u64) -> usize {
-    if len < 2 {
-        t[0] = 0;
-        t[1] = 0;
-        len = 2;
-    }
-    len = mt_remove(t, len, name);
-    let entry = 9 + name.len();
-    if name.len() > 255 || len + entry > t.len() {
-        return len;
-    }
-    t[len] = name.len() as u8;
-    t[len + 1..len + 1 + name.len()].copy_from_slice(name);
-    t[len + 1 + name.len()..len + entry].copy_from_slice(&when.to_le_bytes());
-    let cnt = u16::from_le_bytes([t[0], t[1]]) + 1;
-    t[0..2].copy_from_slice(&cnt.to_le_bytes());
-    len + entry
-}
+// Формат иерархии (имена корней, индекс каталога, времена) переехал в общий крейт `void_fs`
+// Вехой 181: с ADR 0019 в него пишет ещё и ЯДРО — личность Linux не может сходить по IPC изнутри
+// системного вызова, а две реализации одного формата разошлись бы и потеряли файлы.
 
 /// Веха 176 — сказать вслух, что файл не открыть: он больше слота. Молчаливая половина файла
 /// хуже отказа — половина шрифта не шрифт, половина архива не архив.
@@ -468,7 +257,7 @@ fn subtree(
         let (plen, mut base) = (lens[i], [0u8; PATH_MAX]);
         base[..plen].copy_from_slice(&paths[i][..plen]);
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'd', &base[..plen], &mut rn);
+        let rl = fs::root_name(fs::K_DIR, &base[..plen], &mut rn);
         if sys::obj_get_root(store, &rn[..rl], &mut idb) == 32 {
             let dlen = sys::obj_get(store, &idb, &mut dir);
             let cnt = if dlen >= 2 { u16::from_le_bytes([dir[0], dir[1]]) as usize } else { 0 };
@@ -566,7 +355,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     // Убедиться, что корневой каталог `/` существует (первый запуск).
     {
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'd', b"/", &mut rn);
+        let rl = fs::root_name(fs::K_DIR, b"/", &mut rn);
         if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) != 32 {
             dir[0] = 0;
             dir[1] = 0;
@@ -582,7 +371,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                       idb: &mut [u8; 32]|
      -> Option<usize> {
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'd', path, &mut rn);
+        let rl = fs::root_name(fs::K_DIR, path, &mut rn);
         if sys::obj_get_root(store, &rn[..rl], idb) != 32 {
             return None;
         }
@@ -590,7 +379,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     };
     let write_index = |store: usize, path: &[u8], dir: &[u8], idb: &mut [u8; 32]| {
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'd', path, &mut rn);
+        let rl = fs::root_name(fs::K_DIR, path, &mut rn);
         sys::obj_put(store, dir, idb);
         sys::obj_set_root(store, &rn[..rl], idb);
     };
@@ -600,7 +389,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     // трогали. Отсутствие времени — законный ответ, а не ошибка.
     let read_times = |store: usize, path: &[u8], t: &mut [u8; MT_MAX], idb: &mut [u8; 32]| -> usize {
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'm', path, &mut rn);
+        let rl = fs::root_name(fs::K_TIME, path, &mut rn);
         if sys::obj_get_root(store, &rn[..rl], idb) != 32 {
             return 0;
         }
@@ -613,14 +402,14 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
     };
     let write_times = |store: usize, path: &[u8], t: &[u8], idb: &mut [u8; 32]| {
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'm', path, &mut rn);
+        let rl = fs::root_name(fs::K_TIME, path, &mut rn);
         sys::obj_put(store, t, idb);
         sys::obj_set_root(store, &rn[..rl], idb);
     };
     // Снять корень времён каталога (вместе с самим каталогом).
     let drop_times = |store: usize, path: &[u8]| {
         let mut rn = [0u8; ROOT_MAX];
-        let rl = root_name(b'm', path, &mut rn);
+        let rl = fs::root_name(fs::K_TIME, path, &mut rn);
         sys::obj_del_root(store, &rn[..rl]);
     };
     // Пометить запись `name` каталога `dirp` временем `when`.
@@ -631,7 +420,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                  t: &mut [u8; MT_MAX],
                  idb: &mut [u8; 32]| {
         let n = read_times(store, dirp, t, idb);
-        let n = mt_set(t, n, name, when);
+        let n = fs::mt_set(t, n, name, when);
         write_times(store, dirp, &t[..n], idb);
     };
     // Забыть время записи (её больше нет в каталоге).
@@ -641,7 +430,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             if n == 0 {
                 return;
             }
-            let n = mt_remove(t, n, name);
+            let n = fs::mt_remove(t, n, name);
             write_times(store, dirp, &t[..n], idb);
         };
     // Время записи `name` каталога `dirp`, если оно известно.
@@ -652,7 +441,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                    idb: &mut [u8; 32]|
      -> u64 {
         let n = read_times(store, dirp, t, idb);
-        mt_find(t, n, name).unwrap_or(0)
+        fs::mt_find(t, n, name).unwrap_or(0)
     };
 
     loop {
@@ -666,7 +455,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
         match opcode {
             OP_MKDIR => {
                 // Создать каталог: пустой индекс `d<path>` + запись в родителе. rep[0]: 0 ок / 1 ошибка.
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
                 // Пакет неизменяем: под точкой монтирования любая запись — отказ (Веха 108.2).
@@ -676,7 +465,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 }
                 if pl > 1 {
                     // родитель должен существовать (или это корень)
-                    let par = parent(path);
+                    let par = fs::parent(path);
                     let par_exists = par == b"/"
                         || read_index(store_cap, par, &mut dir, &mut idb).is_some();
                     let exists = read_index(store_cap, path, &mut dir, &mut idb).is_some();
@@ -686,9 +475,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         write_index(store_cap, path, &dir[..2], &mut idb);
                         // добавить в родителя
                         let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_add(&mut dir, plen, leaf(path), true);
+                        let nlen = fs::idx_add(&mut dir, plen, fs::leaf(path), true);
                         write_index(store_cap, par, &dir[..nlen], &mut idb);
-                        touch(store_cap, par, leaf(path), sys::time_ns(), &mut tim, &mut idb);
+                        touch(store_cap, par, fs::leaf(path), sys::time_ns(), &mut tim, &mut idb);
                         rep[0] = 0;
                     }
                 }
@@ -696,7 +485,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             }
             OP_OPEN => {
                 // req — путь; открыть/создать файл, вернуть [fd] (0xff — ошибка).
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 // Файл ПАКЕТА (Веха 108.2): в слот кладётся узел дерева, а не содержимое —
                 // копировать libc.so.6 в буфер на 128 КиБ и незачем, и некуда.
@@ -765,7 +554,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             path_len[j] = pl;
                             paths[j][..pl].copy_from_slice(path);
                             let mut rn = [0u8; ROOT_MAX];
-                            let rl = root_name(b'f', path, &mut rn);
+                            let rl = fs::root_name(fs::K_FILE, path, &mut rn);
                             if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) == 32 {
                                 let dbuf = &mut files[j * DATA_MAX..(j + 1) * DATA_MAX];
                                 // Веха 114: ядро называет НАСТОЯЩУЮ длину объекта, и файл больше
@@ -895,7 +684,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 // исполняемый бит; хвостовые восемь (Веха 177) — наносекунды Unix последнего
                 // изменения, 0 — неизвестно. Старые клиенты читают первые шесть-семь байт и
                 // ничего не замечают: ответ растёт с конца.
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 let mut sz = usize::MAX;
                 let mut is_dir = false;
@@ -942,7 +731,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     }
                     if sz == usize::MAX {
                         let mut rn = [0u8; ROOT_MAX];
-                        let rl = root_name(b'f', path, &mut rn);
+                        let rl = fs::root_name(fs::K_FILE, path, &mut rn);
                         if sys::obj_get_root(store_cap, &rn[..rl], &mut idb) == 32 {
                             sz = sys::obj_get(store_cap, &idb, scratch);
                         }
@@ -951,7 +740,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 // Время лежит у РОДИТЕЛЯ, вместе с именем. У корня `/` родителя нет — и времени
                 // тоже: его никто не создавал.
                 let when = if pl > 1 && sz != usize::MAX {
-                    time_of(store_cap, parent(path), leaf(path), &mut tim, &mut idb)
+                    time_of(store_cap, fs::parent(path), fs::leaf(path), &mut tim, &mut idb)
                 } else {
                     0
                 };
@@ -969,7 +758,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 //
                 // Каталогом, а не файлом: список рисуют целиком, и `stat` на каждое имя — это
                 // круговой рейс на запись. У каталога в сотню имён их стало бы сто вместо одного.
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let n = read_times(store_cap, &pbuf[..pl], &mut tim, &mut idb);
                 reply_len = n.min(rep.len());
                 rep[..reply_len].copy_from_slice(&tim[..reply_len]);
@@ -982,7 +771,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 // режимом, а не отдельной операцией: спрашивают то же самое («убери вот это»),
                 // разница только в согласии человека на потерю содержимого. И спрашивать его
                 // обязан тот, кто разговаривает с человеком, — файловый менеджер или шелл.
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
                 if under_mount(path).is_some() {
@@ -1017,8 +806,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                                     }
                                 }
                                 let mut rn = [0u8; ROOT_MAX];
-                                let rl = root_name(
-                                    if walk_dir[i] { b'd' } else { b'f' },
+                                let rl = fs::root_name(
+                                    if walk_dir[i] { fs::K_DIR } else { fs::K_FILE },
                                     p,
                                     &mut rn,
                                 );
@@ -1029,12 +818,12 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                                     drop_times(store_cap, p);
                                 }
                             }
-                            let par = parent(path);
+                            let par = fs::parent(path);
                             let plen =
                                 read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
-                            let nlen = idx_remove(&mut dir, plen, leaf(path));
+                            let nlen = fs::idx_remove(&mut dir, plen, fs::leaf(path));
                             write_index(store_cap, par, &dir[..nlen], &mut idb);
-                            untouch(store_cap, par, leaf(path), &mut tim, &mut idb);
+                            untouch(store_cap, par, fs::leaf(path), &mut tim, &mut idb);
                             rep[0] = 0;
                         }
                     }
@@ -1042,18 +831,18 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     continue;
                 }
                 if pl > 1 {
-                    let par = parent(path);
+                    let par = fs::parent(path);
                     if let Some(dlen) = read_index(store_cap, path, &mut dir, &mut idb) {
                         // каталог — удаляем, только если пуст
-                        if idx_empty(&dir, dlen) {
+                        if fs::idx_empty(&dir, dlen) {
                             let mut rn = [0u8; ROOT_MAX];
-                            let rl = root_name(b'd', path, &mut rn);
+                            let rl = fs::root_name(fs::K_DIR, path, &mut rn);
                             sys::obj_del_root(store_cap, &rn[..rl]);
                             drop_times(store_cap, path);
                             let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
-                            let nlen = idx_remove(&mut dir, plen, leaf(path));
+                            let nlen = fs::idx_remove(&mut dir, plen, fs::leaf(path));
                             write_index(store_cap, par, &dir[..nlen], &mut idb);
-                            untouch(store_cap, par, leaf(path), &mut tim, &mut idb);
+                            untouch(store_cap, par, fs::leaf(path), &mut tim, &mut idb);
                             rep[0] = 0;
                         }
                     } else {
@@ -1070,12 +859,12 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             }
                         }
                         let mut rn = [0u8; ROOT_MAX];
-                        let rl = root_name(b'f', path, &mut rn);
+                        let rl = fs::root_name(fs::K_FILE, path, &mut rn);
                         sys::obj_del_root(store_cap, &rn[..rl]);
                         let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_remove(&mut dir, plen, leaf(path));
+                        let nlen = fs::idx_remove(&mut dir, plen, fs::leaf(path));
                         write_index(store_cap, par, &dir[..nlen], &mut idb);
-                        untouch(store_cap, par, leaf(path), &mut tim, &mut idb);
+                        untouch(store_cap, par, fs::leaf(path), &mut tim, &mut idb);
                         rep[0] = 0;
                     }
                 }
@@ -1105,8 +894,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 if ol != usize::MAX && 1 + ol < len {
                     let mut oldp = [0u8; PATH_MAX];
                     let mut newp = [0u8; PATH_MAX];
-                    let onl = normalize(&req[1..1 + ol], &mut oldp);
-                    let mut nnl = normalize(&req[1 + ol..len], &mut newp);
+                    let onl = fs::normalize(&req[1..1 + ol], &mut oldp);
+                    let mut nnl = fs::normalize(&req[1 + ol..len], &mut newp);
                     if under_mount(&oldp[..onl]).is_some() || under_mount(&newp[..nnl]).is_some() {
                         sys::reply(m.reply_cap, &rep[..1]);
                         continue;
@@ -1118,9 +907,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     // на X54C (Веха 97.1).
                     {
                         let mut rd = [0u8; ROOT_MAX];
-                        let rdl = root_name(b'd', &newp[..nnl], &mut rd);
+                        let rdl = fs::root_name(fs::K_DIR, &newp[..nnl], &mut rd);
                         if sys::obj_get_root(store_cap, &rd[..rdl], &mut idb) == 32 {
-                            let name = leaf(&oldp[..onl]);
+                            let name = fs::leaf(&oldp[..onl]);
                             // `/` уже оканчивается разделителем — второй не нужен.
                             let mut w = nnl;
                             if newp[w - 1] != b'/' && w < PATH_MAX {
@@ -1148,9 +937,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         // обход получил бы дерево, растущее по мере обхода, и не кончился бы.
                         let inside = nnl > onl && newp[..onl] == oldp[..onl] && newp[onl] == b'/';
                         let mut rd = [0u8; ROOT_MAX];
-                        let rf = root_name(b'd', new, &mut rd);
+                        let rf = fs::root_name(fs::K_DIR, new, &mut rd);
                         let taken_d = sys::obj_get_root(store_cap, &rd[..rf], &mut idb) == 32;
-                        let rf = root_name(b'f', new, &mut rd);
+                        let rf = fs::root_name(fs::K_FILE, new, &mut rd);
                         let taken_f = sys::obj_get_root(store_cap, &rd[..rf], &mut idb) == 32;
                         if inside || taken_d || taken_f {
                             sys::reply(m.reply_cap, &rep[..1]); // rep[0] уже 0xff — отказ
@@ -1165,7 +954,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         };
                         // Веха 177 — время каталога СОХРАНЯЕТСЯ при переезде: переименование не
                         // меняет содержимого, а время говорит именно о нём.
-                        let when = time_of(store_cap, parent(old), leaf(old), &mut tim, &mut idb);
+                        let when = time_of(store_cap, fs::parent(old), fs::leaf(old), &mut tim, &mut idb);
                         for i in 0..n {
                             let plen = walk_len[i];
                             let mut src = [0u8; PATH_MAX];
@@ -1180,11 +969,11 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             dst[nnl..nnl + tail.len()].copy_from_slice(tail);
                             let (dl, sp) = (nnl + tail.len(), &src[..plen]);
                             let dp = &dst[..dl];
-                            let kind = if walk_dir[i] { b'd' } else { b'f' };
+                            let kind = if walk_dir[i] { fs::K_DIR } else { fs::K_FILE };
                             let mut ro = [0u8; ROOT_MAX];
                             let mut rn = [0u8; ROOT_MAX];
-                            let rlo = root_name(kind, sp, &mut ro);
-                            let rln = root_name(kind, dp, &mut rn);
+                            let rlo = fs::root_name(kind, sp, &mut ro);
+                            let rln = fs::root_name(kind, dp, &mut rn);
                             if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
                                 sys::obj_set_root(store_cap, &rn[..rln], &idb);
                                 sys::obj_del_root(store_cap, &ro[..rlo]);
@@ -1193,8 +982,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             if walk_dir[i] {
                                 let mut mo = [0u8; ROOT_MAX];
                                 let mut mn = [0u8; ROOT_MAX];
-                                let mlo = root_name(b'm', sp, &mut mo);
-                                let mln = root_name(b'm', dp, &mut mn);
+                                let mlo = fs::root_name(fs::K_TIME, sp, &mut mo);
+                                let mln = fs::root_name(fs::K_TIME, dp, &mut mn);
                                 if sys::obj_get_root(store_cap, &mo[..mlo], &mut idb) == 32 {
                                     sys::obj_set_root(store_cap, &mn[..mln], &idb);
                                     sys::obj_del_root(store_cap, &mo[..mlo]);
@@ -1210,28 +999,28 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             }
                         }
                         // Индексы родителей: из старого имя убрать, в новый добавить каталогом.
-                        let pold = parent(old);
+                        let pold = fs::parent(old);
                         let plen = read_index(store_cap, pold, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_remove(&mut dir, plen, leaf(old));
+                        let nlen = fs::idx_remove(&mut dir, plen, fs::leaf(old));
                         write_index(store_cap, pold, &dir[..nlen], &mut idb);
-                        let pnew = parent(new);
+                        let pnew = fs::parent(new);
                         let plen = read_index(store_cap, pnew, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_add(&mut dir, plen, leaf(new), true);
+                        let nlen = fs::idx_add(&mut dir, plen, fs::leaf(new), true);
                         write_index(store_cap, pnew, &dir[..nlen], &mut idb);
-                        untouch(store_cap, pold, leaf(old), &mut tim, &mut idb);
-                        touch(store_cap, pnew, leaf(new), when, &mut tim, &mut idb);
+                        untouch(store_cap, pold, fs::leaf(old), &mut tim, &mut idb);
+                        touch(store_cap, pnew, fs::leaf(new), when, &mut tim, &mut idb);
                         rep[0] = 0;
                         sys::reply(m.reply_cap, &rep[..1]);
                         continue;
                     }
                     let mut ok = same;
                     // Время файла берётся ДО правки индексов: после `untouch` его уже не спросишь.
-                    let when = time_of(store_cap, parent(old), leaf(old), &mut tim, &mut idb);
+                    let when = time_of(store_cap, fs::parent(old), fs::leaf(old), &mut tim, &mut idb);
                     // перевесить файл-корень f<old> → f<new>
                     let mut ro = [0u8; ROOT_MAX];
                     let mut rnw = [0u8; ROOT_MAX];
-                    let rlo = root_name(b'f', old, &mut ro);
-                    let rln = root_name(b'f', new, &mut rnw);
+                    let rlo = fs::root_name(fs::K_FILE, old, &mut ro);
+                    let rln = fs::root_name(fs::K_FILE, new, &mut rnw);
                     if !same && sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
                         sys::obj_set_root(store_cap, &rnw[..rln], &idb);
                         sys::obj_del_root(store_cap, &ro[..rlo]);
@@ -1250,16 +1039,16 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         rep[0] = 0;
                     } else if ok {
                         // индексы родителей
-                        let pold = parent(old);
+                        let pold = fs::parent(old);
                         let plen = read_index(store_cap, pold, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_remove(&mut dir, plen, leaf(old));
+                        let nlen = fs::idx_remove(&mut dir, plen, fs::leaf(old));
                         write_index(store_cap, pold, &dir[..nlen], &mut idb);
-                        let pnew = parent(new);
+                        let pnew = fs::parent(new);
                         let plen = read_index(store_cap, pnew, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_add(&mut dir, plen, leaf(new), false);
+                        let nlen = fs::idx_add(&mut dir, plen, fs::leaf(new), false);
                         write_index(store_cap, pnew, &dir[..nlen], &mut idb);
-                        untouch(store_cap, pold, leaf(old), &mut tim, &mut idb);
-                        touch(store_cap, pnew, leaf(new), when, &mut tim, &mut idb);
+                        untouch(store_cap, pold, fs::leaf(old), &mut tim, &mut idb);
+                        touch(store_cap, pnew, fs::leaf(new), when, &mut tim, &mut idb);
                         rep[0] = 0;
                     }
                 }
@@ -1276,8 +1065,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 if ol != usize::MAX && 1 + ol < len {
                     let mut oldp = [0u8; PATH_MAX];
                     let mut newp = [0u8; PATH_MAX];
-                    let onl = normalize(&req[1..1 + ol], &mut oldp);
-                    let mut nnl = normalize(&req[1 + ol..len], &mut newp);
+                    let onl = fs::normalize(&req[1..1 + ol], &mut oldp);
+                    let mut nnl = fs::normalize(&req[1 + ol..len], &mut newp);
                     // Из дерева пакета копировать нечего: там узлы чужого формата, а не корни
                     // `f<путь>`. Такой файл копируется содержимым, и это дело вызывающего.
                     if under_mount(&oldp[..onl]).is_some() || under_mount(&newp[..nnl]).is_some() {
@@ -1288,9 +1077,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     // делает `rename`. Правило одно на обе операции, потому что вопрос один.
                     {
                         let mut rd = [0u8; ROOT_MAX];
-                        let rdl = root_name(b'd', &newp[..nnl], &mut rd);
+                        let rdl = fs::root_name(fs::K_DIR, &newp[..nnl], &mut rd);
                         if sys::obj_get_root(store_cap, &rd[..rdl], &mut idb) == 32 {
-                            let name = leaf(&oldp[..onl]);
+                            let name = fs::leaf(&oldp[..onl]);
                             let mut w = nnl;
                             if newp[w - 1] != b'/' && w < PATH_MAX {
                                 newp[w] = b'/';
@@ -1325,19 +1114,19 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                                 let mut dst = [0u8; PATH_MAX];
                                 dst[..nnl].copy_from_slice(new);
                                 dst[nnl..nnl + tail.len()].copy_from_slice(tail);
-                                let kind = if walk_dir[i] { b'd' } else { b'f' };
+                                let kind = if walk_dir[i] { fs::K_DIR } else { fs::K_FILE };
                                 let mut ro = [0u8; ROOT_MAX];
                                 let mut rn = [0u8; ROOT_MAX];
-                                let rlo = root_name(kind, &src[..plen], &mut ro);
-                                let rln = root_name(kind, &dst[..nnl + tail.len()], &mut rn);
+                                let rlo = fs::root_name(kind, &src[..plen], &mut ro);
+                                let rln = fs::root_name(kind, &dst[..nnl + tail.len()], &mut rn);
                                 if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
                                     sys::obj_set_root(store_cap, &rn[..rln], &idb);
                                 }
                                 // Времена записей копируются вместе с каталогом — тем же вторым
                                 // именем для того же объекта.
                                 if walk_dir[i] {
-                                    let mlo = root_name(b'm', &src[..plen], &mut ro);
-                                    let mln = root_name(b'm', &dst[..nnl + tail.len()], &mut rn);
+                                    let mlo = fs::root_name(fs::K_TIME, &src[..plen], &mut ro);
+                                    let mln = fs::root_name(fs::K_TIME, &dst[..nnl + tail.len()], &mut rn);
                                     if sys::obj_get_root(store_cap, &ro[..mlo], &mut idb) == 32 {
                                         sys::obj_set_root(store_cap, &rn[..mln], &idb);
                                     }
@@ -1347,8 +1136,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     } else {
                         let mut ro = [0u8; ROOT_MAX];
                         let mut rn = [0u8; ROOT_MAX];
-                        let rlo = root_name(b'f', old, &mut ro);
-                        let rln = root_name(b'f', new, &mut rn);
+                        let rlo = fs::root_name(fs::K_FILE, old, &mut ro);
+                        let rln = fs::root_name(fs::K_FILE, new, &mut rn);
                         if sys::obj_get_root(store_cap, &ro[..rlo], &mut idb) == 32 {
                             sys::obj_set_root(store_cap, &rn[..rln], &idb);
                             done = true;
@@ -1360,12 +1149,12 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         // выставить «сейчас» значило бы сказать, что оно изменилось. По духу
                         // это `cp -p`, а не голый `cp`, — и иначе быть не может, раз копия
                         // ничего не переписывает.
-                        let when = time_of(store_cap, parent(old), leaf(old), &mut tim, &mut idb);
-                        let pnew = parent(new);
+                        let when = time_of(store_cap, fs::parent(old), fs::leaf(old), &mut tim, &mut idb);
+                        let pnew = fs::parent(new);
                         let plen = read_index(store_cap, pnew, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_add(&mut dir, plen, leaf(new), is_dir);
+                        let nlen = fs::idx_add(&mut dir, plen, fs::leaf(new), is_dir);
                         write_index(store_cap, pnew, &dir[..nlen], &mut idb);
-                        touch(store_cap, pnew, leaf(new), when, &mut tim, &mut idb);
+                        touch(store_cap, pnew, fs::leaf(new), when, &mut tim, &mut idb);
                         rep[0] = 0;
                     }
                 }
@@ -1374,7 +1163,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             OP_READLINK => {
                 // req — путь. Ответ: цель ссылки (пусто — не ссылка либо нет такой).
                 // Симлинки есть только в дереве пакета: своих в персоналии по-прежнему нет.
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 if let Some(rel) = under_mount(path) {
                     if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
@@ -1387,7 +1176,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             OP_READDIR => {
                 // req — путь каталога (пусто/`.`/`/` → корень). Ответ: имена через '\n',
                 // у каталогов — с хвостовым '/'.
-                let pl = normalize(&req[..len], &mut pbuf);
+                let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 // Дерево пакетов (Веха 108.2). Сам `/nix/store` — не индекс, а СПИСОК КОРНЕЙ
                 // `pkg/tree/*`: пакет виден ровно тогда, когда он в сторе, и отдельного каталога
@@ -1539,7 +1328,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     if dirty[fi] {
                         let path = &paths[fi][..path_len[fi]];
                         let mut rn = [0u8; ROOT_MAX];
-                        let rl = root_name(b'f', path, &mut rn);
+                        let rl = fs::root_name(fs::K_FILE, path, &mut rn);
                         let body = &files[fi * DATA_MAX..fi * DATA_MAX + size[fi]];
                         put_body(store_cap, body, kids, &mut idb);
                         sys::obj_set_root(store_cap, &rn[..rl], &idb);
@@ -1547,9 +1336,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         let mut pcopy = [0u8; PATH_MAX];
                         let pl = path_len[fi];
                         pcopy[..pl].copy_from_slice(path);
-                        let par = parent(&pcopy[..pl]);
+                        let par = fs::parent(&pcopy[..pl]);
                         let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
-                        let nlen = idx_add(&mut dir, plen, leaf(&pcopy[..pl]), false);
+                        let nlen = fs::idx_add(&mut dir, plen, fs::leaf(&pcopy[..pl]), false);
                         write_index(store_cap, par, &dir[..nlen], &mut idb);
                         // Веха 177 — файл изменился ровно сейчас, и время ставится ЗДЕСЬ: `close`
                         // — единственное место, где содержимое доезжает до store. Пока файл
@@ -1557,7 +1346,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                         touch(
                             store_cap,
                             par,
-                            leaf(&pcopy[..pl]),
+                            fs::leaf(&pcopy[..pl]),
                             sys::time_ns(),
                             &mut tim,
                             &mut idb,

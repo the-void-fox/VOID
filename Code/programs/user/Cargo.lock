@@ -1074,6 +1074,10 @@ name = "void-conf"
 version = "0.1.0"
 
 [[package]]
+name = "void-fs"
+version = "0.0.1"
+
+[[package]]
 name = "void-img"
 version = "0.0.1"
 dependencies = [
@@ -1107,6 +1111,7 @@ dependencies = [
  "sha2",
  "smoltcp",
  "void-conf",
+ "void-fs",
  "void-img",
  "void-nar",
  "void-tree",
