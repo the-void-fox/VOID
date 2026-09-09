@@ -5312,6 +5312,81 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
+        Some(Lx::Fork) => {
+            // fork / vfork / clone(flags, stack, …).
+            //
+            // Нить (CLONE_VM — общее адресное пространство) мы НЕ делаем: у VOID для нитей есть
+            // свой механизм, и подменять его линуксовым значило бы завести вторую модель
+            // многопоточности в одной системе. Честный отказ лучше: `pthread_create` увидит
+            // ENOSYS и скажет об этом, а не сломается посреди работы.
+            const CLONE_VM: usize = 0x100;
+            let flags = if decoded == Some(Lx::Fork) && (nr == 56 || nr == 220) { a0 } else { 0 };
+            if flags & CLONE_VM != 0 {
+                ret = linux::err(linux::ENOSYS);
+            } else {
+                let src = arch::space_root(t.procs[cur].space);
+                match unsafe { arch::copy_user_space(src) } {
+                    None => ret = linux::err(linux::ENOMEM),
+                    Some(root) => {
+                        // Имя ребёнка — имя родителя: ветвление не меняет программу.
+                        let pname: &'static str = Box::leak(
+                            alloc::string::String::from_utf8_lossy(
+                                t.procs[cur].args.split(|&b| b == 0).next().unwrap_or(b"fork"),
+                            )
+                            .into_owned()
+                            .into_boxed_str(),
+                        );
+                        let child = create_process_locked(t, pname, root, 0, 0);
+                        // КАДР — копия родительского: ребёнок продолжает с той же строки, с тем
+                        // же стеком и теми же регистрами. Этим `fork` и отличается от спавна:
+                        // программа не начинается, а раздваивается.
+                        t.procs[child].frame = t.procs[cur].frame;
+                        t.procs[child].frame.set_ret(0); // ребёнку — ноль
+                        t.procs[child].frame.advance();
+                        t.procs[child].heap_brk = t.procs[cur].heap_brk;
+                        t.procs[child].args = t.procs[cur].args.clone();
+                        t.procs[child].env = t.procs[cur].env.clone();
+                        t.procs[child].linux = true;
+                        t.procs[child].image = t.procs[cur].image;
+                        t.procs[child].parent = cur;
+                        t.procs[child].zombie = true; // слот держим, пока родитель не заберёт код
+                        // ДЕСКРИПТОРЫ достаются копией — так велит POSIX, и на этом стоит
+                        // конвейер: `sh` открывает трубу ДО ветвления, а концы её разбирают уже
+                        // потомки. У трубы от этого прибавляется держателей, и счётчик обязан об
+                        // этом узнать — иначе закрытие одного конца объявило бы конец файла
+                        // всем остальным.
+                        t.procs[child].lx_fds = t.procs[cur].lx_fds.clone();
+                        for fd in t.procs[child].lx_fds.iter().flatten() {
+                            if let Some((idx, write_end)) = fd.pipe {
+                                if let Some(Some(p)) = t.lx_pipes.get_mut(idx) {
+                                    if write_end {
+                                        p.writers += 1;
+                                    } else {
+                                        p.readers += 1;
+                                    }
+                                }
+                            }
+                        }
+                        // Права — копиями, как при спавне (`cap::endow`), и с тем же уважением к
+                        // пометке «не наследуется»: ветвление не должно быть лазейкой, через
+                        // которую утекает то, что родитель держит при себе.
+                        let dom = t.procs[cur].domain;
+                        let cdom = t.procs[child].domain;
+                        for bits in t.procs[cur].start_caps.clone() {
+                            let pc = Cap::from_bits(bits as u64);
+                            if !cap::inheritable(dom, pc) {
+                                continue;
+                            }
+                            if let Ok(c) = cap::endow(dom, pc, cdom) {
+                                t.procs[child].start_caps.push(c.bits() as usize);
+                            }
+                        }
+                        vprintln!("  [linux] P{} fork → P{}", cur, child);
+                        ret = child; // родителю — номер ребёнка
+                    }
+                }
+            }
+        }
         Some(Lx::Wait4) => {
             // wait4(pid, wstatus, options, rusage): pid -1 — любой ребёнок, >0 — этот.
             // `rusage` не заполняем: счётчиков на процесс у нас нет, и врать нулями хуже, чем

@@ -79,7 +79,7 @@ pub use imp::{
     // таймер
     now_cycles, now_ticks, timer_arm, timer_arm_at, timer_hw_init, timer_hz,
     // память
-    clone_kernel_root, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
+    clone_kernel_root, copy_user_space, flush_tlb, free_address_space, map, mm_enable, mm_init, page_info,
     phys_to_virt, space_root, space_token, translate, unmap_shared, virt_to_phys, MAP_R,
     MAP_SHARED, MAP_U,
     MAP_W, MAP_WC,

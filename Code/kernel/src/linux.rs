@@ -72,6 +72,8 @@ pub enum Lx {
     Pipe2,
     /// Веха 183 — дождаться ребёнка и забрать его код выхода.
     Wait4,
+    /// Веха 184 — ВЕТВЛЕНИЕ: `fork`, `vfork` и `clone` без разделения памяти.
+    Fork,
     Fstat,
     Newfstatat,
     Getdents64,
@@ -191,6 +193,10 @@ pub fn decode(nr: usize) -> Option<Lx> {
         22 => Lx::Pipe2,  // legacy pipe(fds) — без флагов
         293 => Lx::Pipe2,
         61 => Lx::Wait4,
+        57 => Lx::Fork,
+        58 => Lx::Fork,  // vfork — тем же ветвлением: обещание «родитель подождёт» мы
+                         // не даём, а программы, которым нужен только exec, это устраивает
+        56 => Lx::Fork,  // clone(flags, stack, …) — разбор флагов в обработчике
         262 => Lx::Newfstatat,
         269 => Lx::Faccessat,
         271 => Lx::Ppoll,
@@ -221,6 +227,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         221 => Lx::Execve,
         59 => Lx::Pipe2, // на riscv legacy `pipe` отсутствует
         260 => Lx::Wait4,
+        220 => Lx::Fork, // на riscv есть только `clone`
         57 => Lx::Close,
         61 => Lx::Getdents64,
         62 => Lx::Lseek,

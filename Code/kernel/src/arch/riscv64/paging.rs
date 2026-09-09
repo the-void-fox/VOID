@@ -124,6 +124,72 @@ unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
     frame::free(tbl); // сама таблица — после всех детей
 }
 
+/// Веха 184 — КОПИЯ пространства процесса: то же дерево отображений, но со СВОИМИ фреймами.
+/// Зеркало одноимённой функции x86; довод и отсечки те же (см. её), Sv39 отличается лишь тем,
+/// что лист узнаётся по битам R/W/X, а не по флагу размера.
+///
+/// # Safety
+/// `src_root` — валидный корень живого пространства; вызывающий держит замок таблицы процессов.
+pub unsafe fn copy_user_space(src_root: usize) -> Option<usize> {
+    let dst = clone_kernel_root()?;
+    let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
+    if copy_private(src_root, kroot, 2, 0, dst) {
+        Some(dst)
+    } else {
+        free_address_space(dst); // полпространства хуже, чем никакого
+        None
+    }
+}
+
+unsafe fn copy_private(stbl: usize, ktbl: usize, level: usize, va: usize, dst_root: usize) -> bool {
+    let s = tbl_ptr(stbl) as *const usize;
+    let k = tbl_ptr(ktbl) as *const usize;
+    for i in 0..512 {
+        let pte = *s.add(i);
+        if pte & PTE_V == 0 {
+            continue;
+        }
+        if ktbl != 0 && pte == *k.add(i) {
+            continue; // общая с ядром — копировать нечего
+        }
+        let child = ((pte >> 10) & PPN_MASK) << 12;
+        let leaf = pte & (PTE_R | PTE_W | PTE_X) != 0;
+        let cva = va | (i << (12 + 9 * level));
+        if level == 0 || leaf {
+            // Общая память не наследуется, MMIO драйвера не копируется — доводы те же, что у
+            // x86-зеркала.
+            if pte & PTE_SHARED != 0 || !frame::is_ram(child) {
+                continue;
+            }
+            let Some(np) = frame::alloc() else { return false };
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(child) as *const u8,
+                crate::arch::phys_to_virt(np) as *mut u8,
+                frame::PAGE_SIZE,
+            );
+            // Флаги листа — родительские, без номера страницы и без бита действительности.
+            let flags = pte & 0x3ff & !PTE_V;
+            if !super::map(dst_root, cva, np, flags) {
+                frame::free(np);
+                return false;
+            }
+        } else {
+            let kchild = if ktbl != 0
+                && *k.add(i) & PTE_V != 0
+                && *k.add(i) & (PTE_R | PTE_W | PTE_X) == 0
+            {
+                ((*k.add(i) >> 10) & PPN_MASK) << 12
+            } else {
+                0
+            };
+            if !copy_private(child, kchild, level - 1, cva, dst_root) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // MMIO-регион QEMU virt: UART (0x1000_0000) + 8 слотов virtio-mmio (0x1000_1000..0x1000_9000).
 const MMIO_START: usize = 0x1000_0000;
 const MMIO_END: usize = 0x1000_9000;

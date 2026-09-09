@@ -362,6 +362,84 @@ unsafe fn free_private(tbl: usize, ktbl: usize, level: usize) {
     frame::free(tbl); // сама таблица — после детей
 }
 
+/// Веха 184 — КОПИЯ пространства процесса: то же дерево отображений, но со СВОИМИ фреймами.
+///
+/// Нужна `fork`'у личности Linux. Обходим таблицы, а не «известные диапазоны», нарочно: у
+/// процесса есть образ, загрузчик, стек, куча и всё, что он себе намапил, — список этих
+/// диапазонов пришлось бы держать в ядре и синхронизировать с каждым `mmap`. Дерево же и есть
+/// точный ответ на вопрос «что у процесса отображено».
+///
+/// # Safety
+/// `src_root` — валидный PML4 живого пространства; вызывающий держит замок таблицы процессов.
+pub unsafe fn copy_user_space(src_root: usize) -> Option<usize> {
+    let dst = clone_kernel_root()?;
+    let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
+    if copy_private(src_root, kroot, 3, 0, dst) {
+        Some(dst)
+    } else {
+        // Не хватило памяти на середине —полпространства хуже, чем никакого.
+        free_address_space(dst);
+        None
+    }
+}
+
+/// Рекурсивная половина [`copy_user_space`]. `va` — адрес, накопленный по пути сверху.
+///
+/// Отсечки те же, что у [`free_private`], и по тем же причинам: запись, УКАЗЫВАЮЩАЯ на ту же
+/// таблицу, что у ядра, — общая; huge-лист в пространстве процесса не наш; лист вне RAM — это
+/// MMIO userspace-драйвера, копировать его бессмысленно (устройство одно).
+///
+/// ОБЩАЯ ПАМЯТЬ ([`PTE_SHARED`]) не копируется и не наследуется. На Linux `MAP_SHARED` переживает
+/// `fork`, но у нас общая область принадлежит не процессу, а держателю права, и счётчик держателей
+/// ведёт она сама. Ветвление, молча добавившее держателя мимо счётчика, кончилось бы освобождением
+/// живых кадров. Linux-процессам это и не нужно: буферы окон бывают только у своих программ.
+unsafe fn copy_private(stbl: usize, ktbl: usize, level: usize, va: usize, dst_root: usize) -> bool {
+    let s = tbl_ptr(stbl) as *const u64;
+    let k = tbl_ptr(ktbl) as *const u64;
+    for i in 0..512 {
+        let pte = *s.add(i);
+        if pte & PTE_P == 0 {
+            continue;
+        }
+        let kpte = if ktbl != 0 { *k.add(i) } else { 0 };
+        if kpte & PTE_P != 0 && (kpte & ADDR_MASK) == (pte & ADDR_MASK) {
+            continue; // та же таблица, что у ядра — общая, копировать нечего
+        }
+        if level > 0 && pte & PTE_PS != 0 {
+            continue;
+        }
+        let child = (pte & ADDR_MASK) as usize;
+        let cva = va | (i << (12 + 9 * level));
+        if level == 0 {
+            if pte & PTE_SHARED != 0 || !frame::is_ram(child) {
+                continue;
+            }
+            let Some(np) = frame::alloc() else { return false };
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(child) as *const u8,
+                crate::arch::phys_to_virt(np) as *mut u8,
+                PAGE_SIZE,
+            );
+            // Флаги листа — те же, что у родителя (без адреса и без бита присутствия: их
+            // проставит `map`).
+            if !map(dst_root, cva, np, pte & !ADDR_MASK & !PTE_P) {
+                frame::free(np);
+                return false;
+            }
+        } else {
+            let kchild = if ktbl != 0 && *k.add(i) & PTE_P != 0 {
+                (*k.add(i) & ADDR_MASK) as usize
+            } else {
+                0
+            };
+            if !copy_private(child, kchild, level - 1, cva, dst_root) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Отобразить MMIO-диапазон [pa, pa+len) идентично (RW+NX) в таблицы ЯДРА уже в
 /// рантайме — BAR'ы PCI известны только после поиска устройства. Зваться обязан ДО
 /// первого клона пространств: новые записи верхних уровней в копии не попадут
