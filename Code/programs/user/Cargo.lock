@@ -1094,6 +1094,10 @@ name = "void-nar"
 version = "0.1.0"
 
 [[package]]
+name = "void-nix"
+version = "0.0.1"
+
+[[package]]
 name = "void-tree"
 version = "0.0.1"
 
@@ -1119,6 +1123,7 @@ dependencies = [
  "void-fs",
  "void-img",
  "void-nar",
+ "void-nix",
  "void-tree",
  "void-vec",
  "vte",
