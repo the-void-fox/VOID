@@ -133,8 +133,15 @@ client on rustls — that is how packages are fetched.
 
 **Compatibility.** A Rust `std` port (plain cargo, `*-unknown-void` targets), real
 uutils/coreutils, the C world through a cross-gcc and `void-libc` (GNU hello and bzip2 built
-from nixpkgs recipes), a Linux personality (unmodified static-musl binaries — busybox runs),
-and WASI through wasmi.
+from nixpkgs recipes), and WASI through wasmi. The Linux personality runs unmodified nixpkgs
+binaries, and a real `sh` lives on it: forking, `execve`, waiting for children, **pipelines and
+redirection** (`ls | wc -l`, `echo a > file`).
+
+**Nix on the device itself.** Its own lazy evaluator for the language (`nixe`) and its own build
+sandbox (`nixb`): `derivation { … }` is evaluated, the derivation is written into the store, and
+dependencies are built before whatever depends on them. **The addresses match a real
+`nix-instantiate` byte for byte** — and that is the whole test, because a store path is not chosen
+but computed from what the package will be built by. No host machine is needed in the middle.
 
 ### Speed
 
@@ -170,6 +177,10 @@ limits will be found anyway — better that the system names them first.
 - **No file permissions** (uid/gid/mode) — and there never will be: VOID has no users and no
   root, and access is handed out as capability objects. There are no symlinks of our own either
   (only inside package trees). A file is held whole in the personality's memory: 8 MiB today.
+- **A package FROM NIXPKGS cannot be built yet.** Our own derivations are evaluated and built and
+  the dependency graph is walked, but a real expression from the channel needs `import`,
+  `<nixpkgs>`, regular expressions, `fromJSON`, fixed-output derivations with hash checking, and
+  gigabytes of memory for the evaluation itself.
 - **Security has not been audited.** The capability model is exercised by our own red team
   (`Code/tools/redteam.py` plus the `probe` probe), but that is not an audit.
 - **This is not a production OS** and does not claim to be one.
