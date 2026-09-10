@@ -151,7 +151,7 @@ fn write_str(s: &str, out: &mut String) {
 /// Вычислить выражение со сборщиком деривации: `derivation` начинает работать, а текст задания
 /// уезжает туда, куда велит [`derive::StoreText`].
 pub fn eval_with_store(src: &str, store: Rc<dyn derive::StoreText>) -> Result<String, String> {
-    let sink: Rc<dyn DrvSink> = Rc::new(derive::Deriver { store });
+    let sink: Rc<dyn DrvSink> = Rc::new(derive::Deriver::new(store));
     let (mut ev, v) = eval_with(src, Some(sink))?;
     print(&mut ev, &v)
 }
@@ -289,6 +289,9 @@ mod tests {
                 self.0.borrow_mut().push((String::from(path), String::from(text)));
                 Ok(())
             }
+            fn read(&self, _path: &str) -> Option<String> {
+                None
+            }
         }
         let store = Rc::new(Записал(RefCell::new(alloc::vec::Vec::new())));
         let src = r#"derivation {
@@ -308,16 +311,55 @@ mod tests {
         assert!(wrote[0].1.contains("/nix/store/r1dlm00ran3afxw95w3v9mygvf76adk4-privet"));
     }
 
-    /// Ссылка на другую деривацию обязана быть ОТКАЗОМ, а не тихо выброшенным контекстом:
-    /// иначе `.drv` вышел бы правдоподобным и неверным.
+    /// ГРАФ: одна деривация зависит от другой. Проверяется всё сразу — что контекст строки
+    /// превратился во вход, что хэш посчитан с подменой пути на хэш входа, и что оба задания
+    /// легли по тем же адресам, что у хоста.
     #[test]
-    fn зависимость_от_деривации_отвергается() {
+    fn граф_сборок_совпадает_с_хостом() {
         use alloc::rc::Rc;
-        let store: Rc<dyn crate::derive::StoreText> = Rc::new(crate::derive::NoStore);
-        let src = r#"let a = derivation { name = "a"; system = "x86_64-linux"; builder = "/b"; };
-                     in derivation { name = "b"; system = "x86_64-linux"; builder = "${a}/bin/x"; }"#;
-        let e = crate::eval_with_store(src, store).unwrap_err();
-        assert!(e.contains("графа сборок"), "сказано другое: {}", e);
+        use core::cell::RefCell;
+
+        struct Память(RefCell<alloc::collections::BTreeMap<String, String>>);
+        impl crate::derive::StoreText for Память {
+            fn add(&self, path: &str, text: &str) -> Result<(), String> {
+                self.0.borrow_mut().insert(String::from(path), String::from(text));
+                Ok(())
+            }
+            fn read(&self, path: &str) -> Option<String> {
+                self.0.borrow().get(path).cloned()
+            }
+        }
+        let store = Rc::new(Память(RefCell::new(alloc::collections::BTreeMap::new())));
+        let src = r#"
+          let hello = derivation {
+            name = "hello"; system = "x86_64-linux"; builder = "/bin/busybox";
+            args = [ "sh" "-c" "echo Privet-iz-VOID > $out" ];
+          };
+          in derivation {
+            name = "greeting"; system = "x86_64-linux"; builder = "/bin/busybox";
+            args = [ "sh" "-c" "/bin/busybox cat ${hello} > $out" ];
+          }"#;
+        let printed = crate::eval_with_store(src, store.clone()).expect("вычислилось");
+        assert_eq!(
+            printed,
+            "<derivation /nix/store/5sgg6bwnb9fz7rjy382yin5jm79wzha5-greeting.drv>"
+        );
+        let m = store.0.borrow();
+        let hello = "/nix/store/jhinycwaxi9a2lg1ss27k031g8139s52-hello.drv";
+        let greeting = "/nix/store/5sgg6bwnb9fz7rjy382yin5jm79wzha5-greeting.drv";
+        assert!(m.contains_key(hello), "задание входа не легло");
+        let text = &m[greeting];
+        assert!(text.contains(hello), "вход не записан в задание: {}", text);
+        assert!(
+            text.contains("/nix/store/67bjfv7mkar2kxjdji89snlfr46b3i96-greeting"),
+            "не тот выход: {}",
+            text
+        );
+        assert!(
+            text.contains("/nix/store/iybhc2id80si73pn2pgqs2zryjm0p8wq-hello"),
+            "путь зависимости в аргументах не тот: {}",
+            text
+        );
     }
 
     #[test]

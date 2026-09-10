@@ -131,7 +131,7 @@ pub fn parse(text: &[u8]) -> Result<Drv, &'static str> {
 ///
 /// От этого зависит хэш пути, поэтому здесь нет ни одной вольности.
 pub fn print(d: &Drv) -> String {
-    print_with(d, false)
+    print_with(d, false, None)
 }
 
 /// То же, но с ПУСТЫМИ путями выходов — вид, по которому считается хэш деривации.
@@ -140,10 +140,19 @@ pub fn print(d: &Drv) -> String {
 /// значения тех переменных окружения, чьё имя совпадает с именем выхода. `out` в окружении и
 /// `out` в списке выходов — одна и та же величина, и обнулять её надо в обоих местах.
 pub fn print_masked(d: &Drv) -> String {
-    print_with(d, true)
+    print_with(d, true, None)
 }
 
-fn print_with(d: &Drv, mask: bool) -> String {
+/// Печать с ПОДМЕНОЙ входов-дериваций: вместо пути к чужому `.drv` — его собственный хэш.
+///
+/// Так считает `hashDerivationModulo` в nix, и иначе быть нельзя: путь входа зависит от его
+/// текста, а нам нужно, чтобы задания, одинаковые ПО СУЩЕСТВУ, давали одинаковый хэш. Подмена
+/// касается только хэширования — в файл `.drv` уезжают настоящие пути.
+pub fn print_modulo(d: &Drv, mask: bool, inputs: &[(String, Vec<String>)]) -> String {
+    print_with(d, mask, Some(inputs))
+}
+
+fn print_with(d: &Drv, mask: bool, inputs: Option<&[(String, Vec<String>)]>) -> String {
     let mut s = String::new();
     s.push_str("Derive([");
     for (i, o) in d.outputs.iter().enumerate() {
@@ -161,7 +170,9 @@ fn print_with(d: &Drv, mask: bool) -> String {
         s.push(')');
     }
     s.push_str("],[");
-    for (i, (path, outs)) in d.input_drvs.iter().enumerate() {
+    let own: Vec<(String, Vec<String>)> = d.input_drvs.clone();
+    let list: &[(String, Vec<String>)] = inputs.unwrap_or(&own);
+    for (i, (path, outs)) in list.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }

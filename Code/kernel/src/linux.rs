@@ -54,6 +54,8 @@ pub fn err(e: isize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Lx {
+    /// `umask` — прав у нас нет, но отказывать нельзя: POSIX не даёт этому вызову падать.
+    Umask,
     Read,
     Write,
     Readv,
@@ -158,6 +160,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         28 => Lx::Madvise,
         32 => Lx::Dup,
         33 => Lx::Dup3, // dup2(old,new) — тот же обработчик, флагов просто нет
+        95 => Lx::Umask,
         35 => Lx::Nanosleep,
         39 => Lx::Getpid,
         63 => Lx::Uname,
@@ -218,6 +221,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         17 => Lx::Getcwd,
         23 => Lx::Dup,
         24 => Lx::Dup3,
+        166 => Lx::Umask,
         25 => Lx::Fcntl,
         29 => Lx::Ioctl,
         48 => Lx::Faccessat,

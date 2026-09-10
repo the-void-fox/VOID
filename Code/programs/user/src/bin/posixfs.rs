@@ -1330,6 +1330,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             }
                             reply_len = off;
                         }
+                        sys::reply(m.reply_cap, &rep[..reply_len]);
+                        continue;
                     } else if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
                         if tree::is_dir(node.ty) {
                             let n = sys::obj_get(store_cap, &node.id, ibuf);
@@ -1354,9 +1356,13 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                                 reply_len = off;
                             }
                         }
+                        sys::reply(m.reply_cap, &rep[..reply_len]);
+                        continue;
                     }
-                    sys::reply(m.reply_cap, &rep[..reply_len]);
-                    continue;
+                    // Веха 190 — дерева с таким хэшем нет, но КАТАЛОГ по этому пути мог быть
+                    // собран здесь. Веха 187 научила этому `stat` и `open`, а перечисление
+                    // осталось — и собранный пакет выглядел пустым: файлы читались, а `ls`
+                    // молчал. Падаем в иерархию, как и все остальные.
                 }
                 // Родитель точки монтирования: `/nix` показывает `store/`, даже если своего
                 // каталога `/nix` в персоналии нет.

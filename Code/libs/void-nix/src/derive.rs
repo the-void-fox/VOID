@@ -14,18 +14,23 @@
 //! Значения приводятся к тексту ШИРОКО (как `toString`): `true` → `1`, `false` → пусто, число →
 //! десятичной записью, список — через пробел. Это тоже часть адреса: другой текст — другой путь.
 //!
-//! ## Почему ссылка на другую деривацию — отказ, а не догадка
+//! ## Контекст строки — это и есть граф зависимостей (Веха 190)
 //!
 //! Строка, полученная из `outPath` чужой деривации, несёт КОНТЕКСТ — след того, от чего она
-//! зависит. Если такой след дошёл сюда, честный ответ один: у задания есть вход-деривация,
-//! значит нужен обход графа (`hashDerivationModulo` в nix рекурсивна), а его у нас нет. Тихо
-//! выбросить контекст было бы хуже всего: `.drv` получился бы правдоподобным и НЕВЕРНЫМ — с
-//! другим хэшем и без записи о зависимости.
+//! зависит. `"${hello}/bin/x"` выглядит обычным текстом, но помнит, что за ним стоит задание;
+//! из этой памяти и строится список входов. Без неё зависимость исчезла бы бесследно, а сборка
+//! полезла бы по адресу, которого никто не собирал.
+//!
+//! Хэш такого задания считается с ПОДМЕНОЙ: путь входа заменяется его собственным хэшем
+//! (`hashDerivationModulo`, рекурсивно). Отсюда свойство, ради которого всё и затевалось: два
+//! задания, отличающиеся лишь тем, каким путём пришла та же зависимость, дают ОДИН адрес.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+
+use core::cell::RefCell;
 
 use void_drv::{paths, Drv, Output};
 
@@ -36,6 +41,9 @@ use crate::DrvSink;
 /// готовый текст, а кладёт их тот, у кого есть store.
 pub trait StoreText {
     fn add(&self, path: &str, text: &str) -> Result<(), String>;
+    /// Прочитать положенное раньше. Нужно графу: чтобы посчитать хэш задания, надо знать хэши
+    /// его входов, а входом может оказаться `.drv` из прошлого запуска.
+    fn read(&self, path: &str) -> Option<String>;
 }
 
 /// Приставка контекста для выхода чужой деривации: `!<имя выхода>!<путь задания>` — запись nix.
@@ -45,6 +53,24 @@ const CTX_DRV: char = '=';
 
 pub struct Deriver {
     pub store: Rc<dyn StoreText>,
+    /// Задания, построенные в ЭТОМ вычислении. Держим их при себе, чтобы не перечитывать
+    /// только что написанный файл — и чтобы граф считался, даже если store читать не умеет.
+    made: RefCell<BTreeMap<String, Drv>>,
+}
+
+impl Deriver {
+    pub fn new(store: Rc<dyn StoreText>) -> Self {
+        Deriver { store, made: RefCell::new(BTreeMap::new()) }
+    }
+
+    /// Найти задание по пути: сперва среди своих, потом в store.
+    fn resolve(&self, path: &str) -> Option<Drv> {
+        if let Some(d) = self.made.borrow().get(path) {
+            return Some(d.clone());
+        }
+        let text = self.store.read(path)?;
+        void_drv::parse(text.as_bytes()).ok()
+    }
 }
 
 impl DrvSink for Deriver {
@@ -112,18 +138,38 @@ impl DrvSink for Deriver {
         env.dedup_by(|a, b| a.0 == b.0);
 
         // ── контекст: что это за зависимости ───────────────────────────────────
+        // `!<выход>!<задание>` — нужен выход чужой деривации, `<путь>` — готовый исходник.
+        // `=<задание>` (сам `drvPath` строкой) отвергаем: в nix он значит «положи рядом ещё и
+        // сам .drv», а у нас складывать некуда — отказ честнее молчаливого пропуска.
         let mut input_srcs: Vec<String> = Vec::new();
+        let mut input_drvs: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for c in &ctx {
             match c.chars().next() {
-                Some(CTX_OUT) | Some(CTX_DRV) => {
+                Some(CTX_OUT) => {
+                    let rest = &c[CTX_OUT.len_utf8()..];
+                    let Some(i) = rest.find(CTX_OUT) else {
+                        return Err(alloc::format!("испорченный контекст строки: {}", c));
+                    };
+                    let (o, p) = (&rest[..i], &rest[i + CTX_OUT.len_utf8()..]);
+                    input_drvs.entry(p.to_string()).or_default().push(o.to_string());
+                }
+                Some(CTX_DRV) => {
                     return Err(alloc::format!(
-                        "деривация зависит от другой деривации ({}) — обхода графа сборок ещё нет",
-                        c.trim_start_matches([CTX_OUT, CTX_DRV])
+                        "деривация просит сам файл задания ({}) — складывать его некуда",
+                        &c[CTX_DRV.len_utf8()..]
                     ))
                 }
                 _ => input_srcs.push(c.clone()),
             }
         }
+        let input_drvs: Vec<(String, Vec<String>)> = input_drvs
+            .into_iter()
+            .map(|(p, mut outs)| {
+                outs.sort();
+                outs.dedup();
+                (p, outs)
+            })
+            .collect();
 
         // ── задание ────────────────────────────────────────────────────────────
         let mut sorted_outs = out_names.clone();
@@ -138,7 +184,7 @@ impl DrvSink for Deriver {
                     hash: String::new(),
                 })
                 .collect(),
-            input_drvs: Vec::new(),
+            input_drvs,
             input_srcs,
             system,
             builder,
@@ -146,7 +192,7 @@ impl DrvSink for Deriver {
             env,
         };
 
-        let h = paths::drv_hash(&d).map_err(String::from)?;
+        let h = paths::drv_hash_modulo(&d, true, &mut |p| self.resolve(p))?;
         for i in 0..d.outputs.len() {
             let o = d.outputs[i].name.clone();
             let p = paths::out_path(&h, &o, &name);
@@ -162,6 +208,7 @@ impl DrvSink for Deriver {
         let refs = paths::drv_refs(&d);
         let drv_path = paths::text_path(text.as_bytes(), &refs, &alloc::format!("{}.drv", name));
         self.store.add(&drv_path, &text)?;
+        self.made.borrow_mut().insert(drv_path.clone(), d.clone());
 
         // ── значение ───────────────────────────────────────────────────────────
         // Возвращаем исходные атрибуты плюс то, что о деривации теперь известно. `all` мы не
@@ -223,6 +270,9 @@ pub struct NoStore;
 impl StoreText for NoStore {
     fn add(&self, _path: &str, _text: &str) -> Result<(), String> {
         Ok(())
+    }
+    fn read(&self, _path: &str) -> Option<String> {
+        None
     }
 }
 

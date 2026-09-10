@@ -145,6 +145,32 @@ pub fn drv_hash(d: &Drv) -> Result<[u8; 32], &'static str> {
     Ok(sha256(crate::print_masked(d).as_bytes()))
 }
 
+/// Хэш деривации С УЧЁТОМ ГРАФА (Веха 190) — `hashDerivationModulo` целиком.
+///
+/// Каждый вход-деривация заменяется в тексте на СВОЙ хэш, посчитанный этой же функцией. Отсюда
+/// главное свойство nix: два задания, отличающиеся только тем, ЧЕРЕЗ КАКОЙ путь пришла та же
+/// самая зависимость, дают один адрес. Список входов после подмены упорядочен по хэшу — так его
+/// печатает `std::map` в nix, и порядок здесь часть отпечатка.
+///
+/// `mask` различает два случая, и путать их нельзя: у задания, которое СОЗДАЁТСЯ, путей выходов
+/// ещё нет (маскируем), а у входа они уже есть и в хэш входят (не маскируем). Ровно так в nix:
+/// `derivationStrict` зовёт с маской, `pathDerivationModulo` — без.
+pub fn drv_hash_modulo(
+    d: &Drv,
+    mask: bool,
+    resolve: &mut dyn FnMut(&str) -> Option<Drv>,
+) -> Result<[u8; 32], String> {
+    let mut inputs: Vec<(String, Vec<String>)> = Vec::new();
+    for (path, outs) in &d.input_drvs {
+        let inner = resolve(path)
+            .ok_or_else(|| alloc::format!("задания-входа нет в store: {}", path))?;
+        let h = drv_hash_modulo(&inner, false, resolve)?;
+        inputs.push((hex(&h), outs.clone()));
+    }
+    inputs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(sha256(crate::print_modulo(d, mask, &inputs).as_bytes()))
+}
+
 /// Ссылки, которые несёт текст `.drv`: исходники и задания-входы.
 pub fn drv_refs(d: &Drv) -> Vec<String> {
     let mut refs: Vec<String> = Vec::new();

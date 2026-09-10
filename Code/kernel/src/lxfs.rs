@@ -67,6 +67,37 @@ fn under_mount(path: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Путь, приведённый к канону.
+///
+/// Чужая программа вправе передать `/a/`, `//a` или `.` — и посикс обязан понять их одинаково.
+/// `posixfs` нормализует у себя (`fs::normalize`), а ядро до Вехи 190 не нормализовало ВОВСЕ, и
+/// это стоило пакета: `mkdir -p` из busybox зовёт `mkdirat("/tmp/a/")` с хвостовой косой, у
+/// такого пути пустой листок — каталог не создавался, а сообщение выходило внятное и ложное
+/// («нет такого файла»). Одна реализация правил на обе стороны — та же причина, по которой
+/// формат иерархии живёт общим крейтом.
+struct Norm([u8; void_fs::PATH_MAX], usize);
+
+impl Norm {
+    fn new(p: &[u8]) -> Self {
+        let mut b = [0u8; void_fs::PATH_MAX];
+        let n = void_fs::normalize(p, &mut b);
+        Norm(b, n)
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.0[..self.1]
+    }
+}
+
+/// Есть ли КАТАЛОГ по этому пути — вопрос, который задают перед записью файла.
+pub fn parent_dir_exists(path: &[u8]) -> bool {
+    let n = Norm::new(path);
+    let par = void_fs::parent(n.as_bytes());
+    match lookup(par) {
+        Some(m) => void_tree::is_dir(m.ty),
+        None => false,
+    }
+}
+
 /// Хэш первой компоненты пути под точкой монтирования (`<хэш>-<имя>/…`).
 fn path_hash(rel: &[u8]) -> Option<&str> {
     let base = rel.split(|&b| b == b'/').find(|c| !c.is_empty())?;
@@ -128,7 +159,7 @@ fn tree_lookup(rel: &[u8]) -> Option<Meta> {
 /// `libc.so.6.x`, `lib64 → lib`), и без разыменования загрузчик спотыкается на первой же.
 /// Потолок в 8 переходов — против петель, которые чужой пакет может завести и случайно.
 pub fn lookup(path: &[u8]) -> Option<Meta> {
-    let mut work: Vec<u8> = path.to_vec();
+    let mut work: Vec<u8> = Norm::new(path).as_bytes().to_vec();
     let mut hops = 0usize;
     'restart: loop {
         let n = work.split(|&b| b == b'/').filter(|c| !c.is_empty()).count();
@@ -190,6 +221,8 @@ pub fn read_all(meta: &Meta) -> Option<Vec<u8>> {
 /// Найти путь БЕЗ разыменования ссылок: сперва дерево пакета, затем обычный файл иерархии
 /// `posixfs` (корень `f<путь>`).
 pub fn lookup_nofollow(path: &[u8]) -> Option<Meta> {
+    let n = Norm::new(path);
+    let path = n.as_bytes();
     // Родители точки монтирования синтетические: своего `/nix` в персоналии нет, но разбор пути
     // обязан пройти сквозь него — иначе спотыкается сам поиск `ld.so`, чей путь начинается
     // именно с него. (Ровно так же их показывает posixfs.)
@@ -526,6 +559,8 @@ fn unlink_from_parent(path: &[u8]) {
 
 /// Записать файл целиком. `false` — не влезло в store либо нет родительского каталога.
 pub fn write_file(path: &[u8], body: &[u8]) -> bool {
+    let n = Norm::new(path);
+    let path = n.as_bytes();
     if in_package(path) {
         return false; // пакет неизменяем — и это не недоделка, а его смысл
     }
@@ -537,6 +572,8 @@ pub fn write_file(path: &[u8], body: &[u8]) -> bool {
 
 /// Создать каталог. `false` — уже есть, нет родителя или путь не наш.
 pub fn mkdir(path: &[u8]) -> bool {
+    let n = Norm::new(path);
+    let path = n.as_bytes();
     if in_package(path) || path == b"/" {
         return false;
     }
@@ -553,6 +590,8 @@ pub fn mkdir(path: &[u8]) -> bool {
 /// Снять файл либо ПУСТОЙ каталог. Рекурсии здесь нет намеренно: `rm -r` разворачивает обход
 /// вызывающий, и согласие человека на потерю содержимого — тоже его дело.
 pub fn unlink(path: &[u8]) -> bool {
+    let n = Norm::new(path);
+    let path = n.as_bytes();
     if in_package(path) || path == b"/" {
         return false;
     }
@@ -581,6 +620,8 @@ pub fn unlink(path: &[u8]) -> bool {
 /// потомка, значит это обход поддерева — и он уже написан в `posixfs`. Дублировать его в ядре
 /// ради сборки незачем: сборочные скрипты переименовывают файлы, а каталоги переносят по одному.
 pub fn rename(old: &[u8], new: &[u8]) -> bool {
+    let (no, nn) = (Norm::new(old), Norm::new(new));
+    let (old, new) = (no.as_bytes(), nn.as_bytes());
     if in_package(old) || in_package(new) {
         return false;
     }

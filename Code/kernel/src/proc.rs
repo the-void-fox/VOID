@@ -5889,6 +5889,14 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     vprintln!("  [linux] P{} openat на запись в пакет — EROFS", cur);
                     linux::err(linux::EROFS)
                 }
+                // Веха 190 — каталога нет, значит и файла быть не может. Раньше открытие
+                // молчаливо удавалось, а пропажа обнаруживалась на `close` — то есть никогда:
+                // умирающий процесс закрывает дескрипторы сам и на отказ не смотрит. Сборка от
+                // этого «проходила», не написав ни байта.
+                Some(path) if writing && !crate::lxfs::parent_dir_exists(&path) => {
+                    vprintln!("  [linux] P{} openat на запись: нет каталога у пути", cur);
+                    linux::err(linux::ENOENT)
+                }
                 Some(path) if writing => {
                     let existing = crate::lxfs::lookup(&path);
                     // Содержимое, с которого начинаем: пусто при O_TRUNC и у нового файла,
@@ -6061,6 +6069,11 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             let cloexec = named && nr != 33 && a2 & O_CLOEXEC != 0;
             ret = lx_dup_fd(t, cur, a0, to, 0, cloexec);
         }
+        // Веха 190 — `umask`. Прав у файлов в VOID нет по замыслу ([[no-users-root]]), поэтому
+        // маска не значит ничего. Но отвечать отказом нельзя: POSIX не позволяет этому вызову
+        // падать, и звонящий разбирает ответ как ПРЕЖНЮЮ маску. `busybox mkdir` считает по ней
+        // режим создаваемого каталога и на `-ENOSYS` уезжает в бессмыслицу.
+        Some(Lx::Umask) => ret = 0o022,
         Some(Lx::Ppoll) => ret = linux::err(linux::ENOSYS),
         // Веха 186 — `fstat` КОНСОЛИ: у неё нет узла в store, и врать про файл нельзя. Отвечаем
         // символьным устройством — тем, чем консоль и является; `isatty` из musl спрашивает
