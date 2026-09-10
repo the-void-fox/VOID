@@ -187,6 +187,46 @@ limits will be found anyway — better that the system names them first.
 
 ---
 
+## Where this is going
+
+Here a version is a **question**, not a feature list: a feature list grows on its own and never
+ends, whereas a question ends with an answer. So each version states the condition under which it
+counts as done.
+
+| version | question | done when | what is in it |
+|---|---|---|---|
+| **v0.1** ✅ | does it exist at all? | *released 2026-09-09* | live ISO, installer, shell, networking, packages, Nix on the device |
+| **v0.2** "Your own machine" | will it boot on someone else's hardware? | it reaches the shell on three machines, two of them not mine | NVMe, USB storage, touchpads, virtio-gpu, r8169/Wi-Fi, ACPI battery |
+| **v0.3** "Your own network" | can you reach what is blocked? | one program's traffic goes through a tunnel and its neighbour's does not | WireGuard, SOCKS5, Trojan/Shadowsocks, our own resolver (ad blocking comes with it) |
+| **v0.4** "Your own software" | can it build someone else's package? | a package **from nixpkgs** builds, not a hand-written derivation | `import`, `<nixpkgs>`, regular expressions, fixed-output derivations |
+| **v0.5** "A network of people" | can a handful of machines make an internet? | ten machines run their own internet with no server at all | the mesh: sites, file sharing, chats, `.void` names |
+| **v1.0** "You can live on it" | does it replace my NixOS? | a week of work on VOID with no going back | whatever turns out to be missing every day |
+
+### The idea worth looking past v1.0 for
+
+**A private internet for 10–100 machines** — your own sites, your own file sharing, your own chats
+and groups, your own `.void` names, and no server that knows everything. The groundwork exists as a
+separate project ([VoidConnect](https://github.com/the-void-fox/VoidConnect), ~13,000 lines), but on VOID it
+moves in **as a part of the system rather than as a port** — which is the interesting part:
+
+- **a chunk addressed by its hash is a store object.** A private chunk store with deduplication and
+  integrity checking disappears along with a whole layer of code: here, serving a file and storing a
+  file are the same act;
+- **a `.void` name is a named root** over content, exactly like system generations and packages;
+- **access to the network of people is a capability, not a firewall rule.** A program either holds a
+  reference to the mesh or it does not; there is nothing to work around from the inside.
+
+On privacy we promise only what is attainable: **no centre that knows everything**, content closed by
+end-to-end encryption, and an honest account of the real leak — which is not your name but your
+**address**: over the internet, every peer you connect to directly sees it. The answer to that is to
+run the whole mesh inside your own tunnel. Tor-grade anonymity across fifty machines does not exist,
+and we are not going to promise it.
+
+The full plans, with the reasoning and the rejected options, live in `Obsidian/10-projects/void/`
+(`notes/roadmap.md` and `adr/`).
+
+---
+
 ## Building from source
 
 You need `nix-shell` (QEMU, GRUB, mtools) and the rustup toolchain from
