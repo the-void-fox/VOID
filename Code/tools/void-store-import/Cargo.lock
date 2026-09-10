@@ -85,6 +85,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "void-fs"
+version = "0.0.1"
+
+[[package]]
 name = "void-nar"
 version = "0.1.0"
 
@@ -100,6 +104,7 @@ name = "void-store-import"
 version = "0.0.1"
 dependencies = [
  "void-abi",
+ "void-fs",
  "void-nar",
  "void-store",
 ]

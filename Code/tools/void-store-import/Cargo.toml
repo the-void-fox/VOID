@@ -12,3 +12,6 @@ description = "Импорт файлов и NAR-архивов в образ д�
 void-abi = { path = "../../libs/void-abi" }
 void-store = { path = "../../libs/void-store" }
 void-nar = { path = "../../libs/void-nar" }
+# Веха 187 — формат ИЕРАРХИИ: положенный файл обязан быть виден `ls`, а для этого его надо
+# внести в индекс родителя. Тот же крейт, что у ядра и posixfs, — третьей реализации не будет.
+void-fs = { path = "../../libs/void-fs" }

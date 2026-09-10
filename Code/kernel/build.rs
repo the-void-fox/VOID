@@ -12,6 +12,8 @@ const PROGRAMS: &[&str] = &[
     "cap-cli", "busy", "heap", "crash", "bench", "net-srv", "threads", "freeze", "e1000d",
     "lx_e1000", "vvsh", "httpsc", "spawn-demo", "stdio-demo", "pkg", "klog", "ved",
     "hostile", "run", "probe", "ps",
+    // Веха 187 (ADR 0019, шаг 4) — песочница сборки: выполняет деривацию на самом устройстве.
+    "nixb",
 ];
 
 /// Программы ТОЛЬКО ДЛЯ x86_64 (Веха 97). `term` рисует в пиксельный фреймбуфер, а на riscv его

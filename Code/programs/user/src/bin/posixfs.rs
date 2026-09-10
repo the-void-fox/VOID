@@ -49,6 +49,10 @@ const TREE_ROOT: &[u8] = b"pkg/tree/";
 /// Длина хэша пути nix.
 const HASH_LEN: usize = 32;
 
+/// Веха 187 — префикс корня-ПЕЧАТИ: путь, собранный здесь и доведённый до конца. Тот же, что
+/// читает ядро (`lxfs::BUILT_ROOT`) и ставит `nixb`.
+const BUILT_ROOT: &[u8] = b"pkg/built/";
+
 /// Сколько исходящих ссылок узла мы готовы выписать за раз. Потолок осмысленный: столько записей
 /// в каталоге и столько кусков у файла (при куске 16 КиБ — файл до 64 МиБ).
 const KIDS_MAX: usize = 4096;
@@ -65,6 +69,35 @@ fn under_mount(path: &[u8]) -> Option<&[u8]> {
     } else {
         None
     }
+}
+
+/// Веха 187 — лежит ли путь внутри ГОТОВОГО объекта store: распакованного пакета или
+/// запечатанной сборки. Только чтение: объект store неизменяем.
+///
+/// Зеркало `lxfs::in_package` в ядре, и разойтись им нельзя — писать под `/nix/store` теперь
+/// умеют обе стороны, и одна из них не должна разрешать то, что другая запрещает. «Готовый» это
+/// не «под точкой монтирования»: пока сборка идёт, её `$out` обязан быть открыт на запись, иначе
+/// всё, что она о себе запомнит, будет указывать в никуда.
+fn ready_object(store_cap: usize, path: &[u8], idb: &mut [u8; 32]) -> bool {
+    let Some(rel) = under_mount(path) else { return false };
+    if rel.is_empty() {
+        // Сам каталог `/nix/store` — иерархия: в него и складывают собранное.
+        return false;
+    }
+    let Some(base) = rel.split(|&b| b == b'/').find(|c| !c.is_empty()) else { return false };
+    if base.len() < HASH_LEN {
+        return true; // не путь store — и трогать под точкой монтирования нечего
+    }
+    let mut rn = [0u8; 64];
+    for prefix in [TREE_ROOT, BUILT_ROOT] {
+        let rl = prefix.len() + HASH_LEN;
+        rn[..prefix.len()].copy_from_slice(prefix);
+        rn[prefix.len()..rl].copy_from_slice(&base[..HASH_LEN]);
+        if sys::obj_get_root(store_cap, &rn[..rl], idb) == 32 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Найденный узел дерева пакета.
@@ -458,8 +491,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
-                // Пакет неизменяем: под точкой монтирования любая запись — отказ (Веха 108.2).
-                if under_mount(path).is_some() {
+                // Пакет неизменяем (Веха 108.2). Веха 187 — но лишь ГОТОВЫЙ: собираемый путь
+                // открыт на запись до печати.
+                if ready_object(store_cap, path, &mut idb) {
                     sys::reply(m.reply_cap, &rep[..1]);
                     continue;
                 }
@@ -489,9 +523,14 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let path = &pbuf[..pl];
                 // Файл ПАКЕТА (Веха 108.2): в слот кладётся узел дерева, а не содержимое —
                 // копировать libc.so.6 в буфер на 128 КиБ и незачем, и некуда.
-                if let Some(rel) = under_mount(path) {
+                // Веха 187 — если дерева с таким хэшем нет, путь мог быть СОБРАН здесь: своя
+                // деривация кладёт результат по адресу того же вида. Тогда проваливаемся в
+                // иерархию, а не отвечаем «нет такого файла».
+                if let Some(node) =
+                    under_mount(path).and_then(|rel| tree_find(store_cap, rel, ibuf, kids))
+                {
                     let mut nfd = usize::MAX;
-                    if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
+                    {
                         if !tree::is_dir(node.ty) && !tree::is_link(node.ty) {
                             let free = (0..NFILES).find(|&j| !fused[j]).or_else(|| {
                                 (0..NFILES).find(|&j| {
@@ -701,23 +740,32 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     continue;
                 }
                 if let Some(rel) = under_mount(path) {
-                    if rel.is_empty() {
-                        // Сам /nix/store — каталог, который есть всегда: он состоит из корней.
-                        is_dir = true;
-                        sz = 0;
-                        ty = tree::K_DIR;
-                    } else if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
-                        is_dir = tree::is_dir(node.ty);
-                        sz = node.size as usize;
-                        ty = node.ty;
+                    let node =
+                        (!rel.is_empty()).then(|| tree_find(store_cap, rel, ibuf, kids)).flatten();
+                    // Отвечаем ЗА ДЕРЕВО только если оно и правда отвечает. Веха 187 — иначе
+                    // путь мог быть собран здесь, и его надо искать в иерархии.
+                    if rel.is_empty() || node.is_some() {
+                        match node {
+                            Some(node) => {
+                                is_dir = tree::is_dir(node.ty);
+                                sz = node.size as usize;
+                                ty = node.ty;
+                            }
+                            // Сам /nix/store — каталог, который есть всегда: он состоит из корней.
+                            None => {
+                                is_dir = true;
+                                sz = 0;
+                                ty = tree::K_DIR;
+                            }
+                        }
+                        rep[0] = (sz != usize::MAX) as u8;
+                        let szv = if sz == usize::MAX { 0 } else { sz } as u32;
+                        rep[1..5].copy_from_slice(&szv.to_le_bytes());
+                        rep[5] = is_dir as u8;
+                        rep[6] = ty;
+                        sys::reply(m.reply_cap, &rep[..15]);
+                        continue;
                     }
-                    rep[0] = (sz != usize::MAX) as u8;
-                    let szv = if sz == usize::MAX { 0 } else { sz } as u32;
-                    rep[1..5].copy_from_slice(&szv.to_le_bytes());
-                    rep[5] = is_dir as u8;
-                    rep[6] = ty;
-                    sys::reply(m.reply_cap, &rep[..15]);
-                    continue;
                 }
                 if read_index(store_cap, path, &mut dir, &mut idb).is_some() {
                     is_dir = true;
@@ -774,7 +822,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let pl = fs::normalize(&req[..len], &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
-                if under_mount(path).is_some() {
+                if ready_object(store_cap, path, &mut idb) {
                     sys::reply(m.reply_cap, &rep[..1]);
                     continue;
                 }
@@ -896,7 +944,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     let mut newp = [0u8; PATH_MAX];
                     let onl = fs::normalize(&req[1..1 + ol], &mut oldp);
                     let mut nnl = fs::normalize(&req[1 + ol..len], &mut newp);
-                    if under_mount(&oldp[..onl]).is_some() || under_mount(&newp[..nnl]).is_some() {
+                    if ready_object(store_cap, &oldp[..onl], &mut idb)
+                        || ready_object(store_cap, &newp[..nnl], &mut idb)
+                    {
                         sys::reply(m.reply_cap, &rep[..1]);
                         continue;
                     }
@@ -1069,7 +1119,9 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                     let mut nnl = fs::normalize(&req[1 + ol..len], &mut newp);
                     // Из дерева пакета копировать нечего: там узлы чужого формата, а не корни
                     // `f<путь>`. Такой файл копируется содержимым, и это дело вызывающего.
-                    if under_mount(&oldp[..onl]).is_some() || under_mount(&newp[..nnl]).is_some() {
+                    if ready_object(store_cap, &oldp[..onl], &mut idb)
+                        || ready_object(store_cap, &newp[..nnl], &mut idb)
+                    {
                         sys::reply(m.reply_cap, &rep[..1]);
                         continue;
                     }
@@ -1193,6 +1245,53 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                             // Каждая строка списка: 12 hex короткого id + два пробела + имя.
                             for line in ibuf[..got].split(|&b| b == b'\n') {
                                 if line.len() <= 14 {
+                                    continue;
+                                }
+                                // Веха 187 — собранное ЗДЕСЬ показывается наравне со скачанным:
+                                // это один и тот же store, и делить его на две витрины значило бы
+                                // объявить свою сборку второсортной. Полное имя лежит в теле
+                                // печати — там записан сам путь.
+                                if let Some(h) = line[14..].strip_prefix(BUILT_ROOT) {
+                                    if h.len() < HASH_LEN {
+                                        continue;
+                                    }
+                                    let mut rn = [0u8; 64];
+                                    let rl = BUILT_ROOT.len() + HASH_LEN;
+                                    rn[..BUILT_ROOT.len()].copy_from_slice(BUILT_ROOT);
+                                    rn[BUILT_ROOT.len()..rl].copy_from_slice(&h[..HASH_LEN]);
+                                    let mut tid = [0u8; 32];
+                                    if sys::obj_get_root(store_cap, &rn[..rl], &mut tid) != 32 {
+                                        continue;
+                                    }
+                                    let n = sys::obj_get(store_cap, &tid, scratch);
+                                    let full = &scratch[..n.min(scratch.len())];
+                                    let base = match full.iter().rposition(|&b| b == b'/') {
+                                        Some(i) => &full[i + 1..],
+                                        None => full,
+                                    };
+                                    let mut bn = [0u8; PATH_MAX];
+                                    let bl = base.len().min(PATH_MAX);
+                                    bn[..bl].copy_from_slice(&base[..bl]);
+                                    let mut fp = [0u8; PATH_MAX];
+                                    let fl = full.len().min(PATH_MAX);
+                                    fp[..fl].copy_from_slice(&full[..fl]);
+                                    let is_dir =
+                                        read_index(store_cap, &fp[..fl], &mut dir, &mut idb)
+                                            .is_some();
+                                    for &b in &bn[..bl] {
+                                        if off + 2 < rep.len() {
+                                            rep[off] = b;
+                                            off += 1;
+                                        }
+                                    }
+                                    if is_dir && off + 1 < rep.len() {
+                                        rep[off] = b'/';
+                                        off += 1;
+                                    }
+                                    if off < rep.len() {
+                                        rep[off] = b'\n';
+                                        off += 1;
+                                    }
                                     continue;
                                 }
                                 let Some(h) = line[14..].strip_prefix(TREE_ROOT) else { continue };

@@ -28,6 +28,9 @@ use crate::object;
 const MOUNT: &[u8] = b"/nix/store";
 /// Префикс корня, под которым `pkg` держит распакованные деревья.
 const TREE_ROOT: &str = "pkg/tree/";
+/// Веха 187 — префикс корня-ПЕЧАТИ: сборка, доведённая до конца, объявляет свой путь готовым, и
+/// с этой минуты он только читается. Ставит печать `nixb`, снаружи ядра.
+const BUILT_ROOT: &str = "pkg/built/";
 /// Длина хэша пути nix.
 const HASH_LEN: usize = 32;
 
@@ -62,6 +65,23 @@ fn under_mount(path: &[u8]) -> Option<&[u8]> {
     } else {
         None
     }
+}
+
+/// Хэш первой компоненты пути под точкой монтирования (`<хэш>-<имя>/…`).
+fn path_hash(rel: &[u8]) -> Option<&str> {
+    let base = rel.split(|&b| b == b'/').find(|c| !c.is_empty())?;
+    if base.len() < HASH_LEN {
+        return None;
+    }
+    core::str::from_utf8(&base[..HASH_LEN]).ok()
+}
+
+/// Есть ли корень с таким именем-префиксом и хэшем.
+fn has_root(prefix: &str, hash: &str) -> bool {
+    let mut name = String::with_capacity(prefix.len() + hash.len());
+    name.push_str(prefix);
+    name.push_str(hash);
+    object::root(&name).is_some()
 }
 
 /// Спуститься по пути внутри дерева пакета.
@@ -181,7 +201,11 @@ pub fn lookup_nofollow(path: &[u8]) -> Option<Meta> {
             // Сам /nix/store — каталог, но у него нет узла: перечисление живёт в `store_roots`.
             return Some(Meta { id: ContentId([0u8; 32]), size: 0, ty: void_tree::K_DIR, src: Src::Tree });
         }
-        return tree_lookup(rel);
+        if let Some(m) = tree_lookup(rel) {
+            return Some(m);
+        }
+        // Веха 187 — распакованного дерева с таким хэшем нет, но путь мог быть СОБРАН здесь:
+        // своя деривация кладёт результат по адресу того же вида. Проваливаемся в иерархию.
     }
     // Иерархия posixfs. Веха 181 — теперь и КАТАЛОГИ: без них Linux-процесс не может ни
     // `stat` каталога, ни `getdents`, а сборке нужно и то и другое (`configure` начинает с
@@ -273,6 +297,34 @@ pub fn dir_entries(path: &[u8], meta: &Meta) -> Vec<(u8, String)> {
         for line in object::list_roots_text().lines() {
             // Строка списка: 12 hex короткого id + два пробела + имя корня.
             let Some(name) = line.get(14..) else { continue };
+            // Веха 187 — собранное ЗДЕСЬ стоит в списке наравне со скачанным: store один, и
+            // делить его на две витрины значило бы объявить свою сборку второсортной. Полное имя
+            // лежит в теле печати — там записан сам путь.
+            if let Some(hash) = name.strip_prefix(BUILT_ROOT) {
+                if hash.len() < HASH_LEN {
+                    continue;
+                }
+                let mut rn = String::with_capacity(BUILT_ROOT.len() + HASH_LEN);
+                rn.push_str(BUILT_ROOT);
+                rn.push_str(&hash[..HASH_LEN]);
+                let Some(id) = object::root(&rn) else { continue };
+                let Some(full) = object::with(&id, |p| {
+                    p.and_then(|b| core::str::from_utf8(b).ok()).map(String::from)
+                }) else {
+                    continue;
+                };
+                let base = match full.rfind('/') {
+                    Some(i) => &full[i + 1..],
+                    None => full.as_str(),
+                };
+                let ty = if hier_dir(full.as_bytes()).is_some() {
+                    void_tree::K_DIR
+                } else {
+                    void_tree::K_FILE
+                };
+                out.push((ty, String::from(base)));
+                continue;
+            }
             let Some(hash) = name.strip_prefix(TREE_ROOT) else { continue };
             if hash.len() < HASH_LEN {
                 continue;
@@ -347,9 +399,22 @@ pub fn readlink(meta: &Meta) -> Option<Vec<u8>> {
 // открытым и грязным, его `close` перезапишет поверх написанного нами. В песочнице сборки этого
 // не случится — там файлы принадлежат Linux-стороне.
 
-/// Лежит ли путь в дереве пакета (там запись запрещена — пакет неизменяем).
+/// Лежит ли путь в ГОТОВОМ объекте store — распакованном пакете или запечатанной сборке.
+/// Там запись запрещена: объект store неизменяем, в этом весь его смысл.
+///
+/// Веха 187 — «готовый» перестало значить «под `/nix/store`», и это не послабление, а условие
+/// сборки. Деривация обязана писать в СВОЙ настоящий адрес (`$out`): всё, что сборка о нём
+/// запомнит — а запоминает она его щедро, в shebang'ах, RPATH и текстах скриптов, — иначе будет
+/// указывать в никуда. Поэтому адрес открыт на запись ровно до тех пор, пока сборка его не
+/// запечатает; после печати он такой же неизменяемый, как скачанный.
 pub fn in_package(path: &[u8]) -> bool {
-    under_mount(path).is_some()
+    let Some(rel) = under_mount(path) else { return false };
+    if rel.is_empty() {
+        // Сам каталог `/nix/store` — иерархия: в него и складывают собранное.
+        return false;
+    }
+    let Some(hash) = path_hash(rel) else { return true };
+    has_root(TREE_ROOT, hash) || has_root(BUILT_ROOT, hash)
 }
 
 /// Положить содержимое в store: маленькое одним объектом, большое КУСКАМИ.
@@ -461,7 +526,7 @@ fn unlink_from_parent(path: &[u8]) {
 
 /// Записать файл целиком. `false` — не влезло в store либо нет родительского каталога.
 pub fn write_file(path: &[u8], body: &[u8]) -> bool {
-    if under_mount(path).is_some() {
+    if in_package(path) {
         return false; // пакет неизменяем — и это не недоделка, а его смысл
     }
     let Some(root) = hier_root(void_fs::K_FILE, path) else { return false };
@@ -472,7 +537,7 @@ pub fn write_file(path: &[u8], body: &[u8]) -> bool {
 
 /// Создать каталог. `false` — уже есть, нет родителя или путь не наш.
 pub fn mkdir(path: &[u8]) -> bool {
-    if under_mount(path).is_some() || path == b"/" {
+    if in_package(path) || path == b"/" {
         return false;
     }
     if hier_dir(path).is_some() {
@@ -488,7 +553,7 @@ pub fn mkdir(path: &[u8]) -> bool {
 /// Снять файл либо ПУСТОЙ каталог. Рекурсии здесь нет намеренно: `rm -r` разворачивает обход
 /// вызывающий, и согласие человека на потерю содержимого — тоже его дело.
 pub fn unlink(path: &[u8]) -> bool {
-    if under_mount(path).is_some() || path == b"/" {
+    if in_package(path) || path == b"/" {
         return false;
     }
     if let Some(m) = hier_dir(path) {
@@ -516,7 +581,7 @@ pub fn unlink(path: &[u8]) -> bool {
 /// потомка, значит это обход поддерева — и он уже написан в `posixfs`. Дублировать его в ядре
 /// ради сборки незачем: сборочные скрипты переименовывают файлы, а каталоги переносят по одному.
 pub fn rename(old: &[u8], new: &[u8]) -> bool {
-    if under_mount(old).is_some() || under_mount(new).is_some() {
+    if in_package(old) || in_package(new) {
         return false;
     }
     if hier_dir(old).is_some() {

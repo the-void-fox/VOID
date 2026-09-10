@@ -307,10 +307,77 @@ fn blob_info(manifest: &[u8]) -> Option<(usize, usize, usize)> {
     (chunks > 0 && csize > 0).then_some((total, chunks, csize))
 }
 
+/// Веха 187 — внести файл В ИЕРАРХИЮ: завести недостающие каталоги-предки и добавить запись в
+/// индекс родителя.
+///
+/// Без этого мост клал ПОЛОВИНУ файла: корень `f<путь>` есть, открыть и запустить можно, а `ls`
+/// каталога пуст и `lookup` спотыкается о несуществующего предка. Ошибка при этом молчит и
+/// выглядит как «файла нет» — на ней я потерял два захода подряд, прежде чем понять, что кладу
+/// файл в каталог, которого не существует.
+fn hier_link(store: &mut Store, io: &mut FileIo, root: &str) {
+    let Some(path) = root.strip_prefix(char::from(void_fs::K_FILE)) else { return };
+    if !path.starts_with('/') {
+        return; // не путь иерархии (`bin/x86_64/…` — программа, ей каталог не нужен)
+    }
+    // От корня вниз: каждый предок обязан существовать, прежде чем в него что-то класть.
+    let mut ancestors: Vec<&str> = Vec::new();
+    let mut cut = path.len();
+    while let Some(i) = path[..cut].rfind('/') {
+        if i == 0 {
+            break;
+        }
+        ancestors.push(&path[..i]);
+        cut = i;
+    }
+    ancestors.reverse();
+    for dir in ancestors {
+        if root_of(store, void_fs::K_DIR, dir.as_bytes()).is_none() {
+            idx_write(store, dir.as_bytes(), &[0u8; 2]);
+        }
+        idx_insert(store, io, dir.as_bytes(), true);
+    }
+    idx_insert(store, io, path.as_bytes(), false);
+}
+
+/// Прочитать корень нужного вида, если он есть.
+fn root_of(store: &Store, kind: u8, path: &[u8]) -> Option<ContentId> {
+    let mut rn = [0u8; void_fs::ROOT_MAX];
+    let rl = void_fs::root_name(kind, path, &mut rn);
+    store.root(std::str::from_utf8(&rn[..rl]).ok()?)
+}
+
+fn idx_write(store: &mut Store, dir: &[u8], body: &[u8]) {
+    let mut rn = [0u8; void_fs::ROOT_MAX];
+    let rl = void_fs::root_name(void_fs::K_DIR, dir, &mut rn);
+    let id = store.put(body);
+    store.set_root(std::str::from_utf8(&rn[..rl]).unwrap(), id);
+}
+
+/// Добавить `path` в индекс его родителя (если его там ещё нет).
+fn idx_insert(store: &mut Store, io: &mut FileIo, path: &[u8], is_dir: bool) {
+    let par = void_fs::parent(path);
+    let mut dir = [0u8; void_fs::DIR_MAX];
+    let mut n = 2usize;
+    if let Some(id) = root_of(store, void_fs::K_DIR, par) {
+        store.with(io, &id, |p| {
+            if let Some(p) = p {
+                n = p.len().min(dir.len());
+                dir[..n].copy_from_slice(&p[..n]);
+            }
+        });
+    }
+    if void_fs::idx_type(&dir, n, void_fs::leaf(path)).is_some() {
+        return;
+    }
+    let n = void_fs::idx_add(&mut dir, n, void_fs::leaf(path), is_dir);
+    idx_write(store, par, &dir[..n]);
+}
+
 fn cmd_put(store: &mut Store, io: &mut FileIo, file: &str, root: &str) -> Result<(), String> {
     let data = std::fs::read(file).map_err(|e| format!("не прочитать {file}: {e}"))?;
     let id = store.put(&data);
     store.set_root(root, id);
+    hier_link(store, io, root);
     let mut dir = dir_load(store, io);
     if dir_add(&mut dir, root) {
         let did = store.put(&dir);

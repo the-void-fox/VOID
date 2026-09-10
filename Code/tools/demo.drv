@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/ny91gzxawnfmghmw4nrvbaybpjh58z6n-privet","","")],[],[],"x86_64-linux","/bin/busybox",["sh","-c","echo privet-iz-pesochnicy > $out"],[("builder","/bin/busybox"),("name","privet"),("out","/nix/store/ny91gzxawnfmghmw4nrvbaybpjh58z6n-privet"),("system","x86_64-linux")])

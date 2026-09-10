@@ -843,6 +843,7 @@ fn spawn_linux_locked(
     bytes: &[u8],
     root: usize,
     args_blob: Vec<u8>,
+    parent_env: &[u8],
 ) -> Option<usize> {
     let pie = match elf::load_pie(root, bytes, USER_REGION_START, USER_HEAP_BASE_VA) {
         Ok(p) => p,
@@ -884,8 +885,28 @@ fn spawn_linux_locked(
             }
         }
     }
-    // Минимальное окружение Linux — musl это устраивает (PATH/TERM/HOME на будущее для busybox).
-    let env: &[u8] = b"PATH=/bin:/usr/bin\0TERM=linux\0HOME=/\0";
+    // Окружение НАСЛЕДУЕТСЯ от запустившего — как у родных процессов VOID (Веха 187). Раньше
+    // оно было прибито гвоздями, и это держалось ровно до первой сборки: деривация ЕСТЬ
+    // окружение (`$out`, `$name`, флаги компилятора), и передать его было нечем.
+    //
+    // Умолчания остаются, но только для того, чего родитель не назвал: у шелла VOID нет ни
+    // `PATH`, ни `HOME`, и без них чужой `sh` не найдёт даже самого себя. Названное родителем
+    // не трогаем — иначе песочница не смогла бы задать `PATH=/path-not-set`, а без него сборка
+    // тихо разъезжается от машины к машине.
+    let mut env: Vec<u8> = Vec::from(parent_env);
+    if !env.is_empty() && *env.last().unwrap() != 0 {
+        env.push(0);
+    }
+    for (key, line) in [
+        (&b"PATH="[..], &b"PATH=/bin:/usr/bin\0"[..]),
+        (&b"TERM="[..], &b"TERM=linux\0"[..]),
+        (&b"HOME="[..], &b"HOME=/\0"[..]),
+    ] {
+        if !env.split(|&b| b == 0).any(|rec| rec.starts_with(key)) {
+            env.extend_from_slice(line);
+        }
+    }
+    let env: &[u8] = &env;
     // 16 байт AT_RANDOM (канарейка/ГПСЧ musl) — из счётчика тиков через splitmix64.
     let mut rnd = [0u8; 16];
     let mut seed = arch::now_ticks();
@@ -2791,7 +2812,8 @@ fn syscall(t: &mut Table, cur: usize) {
                                 // (argv/env/старт-права через контракт); чужой static-PIE
                                 // ET_DYN — linux-личность (стек Linux + трансля́тор syscall'ов).
                                 let child = if elf::is_foreign(&bytes, USER_REGION_START) {
-                                    spawn_linux_locked(t, pname, &bytes, root, args)
+                                    let penv = t.procs[cur].env.clone();
+                                    spawn_linux_locked(t, pname, &bytes, root, args, &penv)
                                 } else {
                                     match elf::load(root, &bytes, USER_HEAP_BASE_VA) {
                                         Ok(entry) => {
