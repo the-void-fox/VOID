@@ -328,14 +328,24 @@ struct LxFd {
     path: Vec<u8>,
     /// Сколько записей каталога уже отдано `getdents64`.
     dpos: usize,
+    /// Веха 186 — это КОНСОЛЬ (`stdin`/`stdout`/`stderr`). Отдельным полем, а не особым
+    /// случаем в коде: пока 0/1/2 были не записями таблицы, а условием `if fd == 1`, подменить
+    /// их было нечем — а именно этим и живут перенаправление и конвейер. Настоящий `sh`
+    /// упирался в это как `dup2(0,1): Function not implemented`.
+    console: bool,
+    /// Веха 186 — «не переживать `execve`» (`FD_CLOEXEC`). Оболочка помечает так СВОИ рабочие
+    /// дескрипторы — сохранённый stdout, концы трубы, — и рассчитывает, что образ, пришедший на
+    /// смену, их не унаследует. Не выполнить эту пометку — значит оставить лишнего держателя у
+    /// трубы: читатель ждал бы конца файла, который никто не объявит.
+    cloexec: bool,
     /// Веха 183 — это дескриптор ТРУБЫ: её номер и с какого она конца (`true` — пишущий).
     /// Труба живёт в таблице, а не в дескрипторе, потому что концов у неё двое, а после
     /// `fork` станет и вчетверо больше: владелец у неё не один.
     pipe: Option<(usize, bool)>,
-    /// Веха 181 — файл открыт НА ЗАПИСЬ: содержимое собирается здесь и уезжает в store на
-    /// `close`. Так же поступает `posixfs` со своими слотами, и по той же причине: объект в
-    /// store неизменяем, дописать в него нельзя — можно только положить новый целиком.
-    wbuf: Option<Vec<u8>>,
+    /// Веха 181 — файл открыт НА ЗАПИСЬ: номер записи в [`Table::lx_wfiles`]. Содержимое
+    /// собирается там и уезжает в store, когда уходит последний держатель — объект в store
+    /// неизменяем, дописать в него нельзя, можно лишь положить новый целиком.
+    wfile: Option<usize>,
 }
 
 /// Веха 183 — ТРУБА: байты, ждущие читателя, и сколько концов ещё открыто.
@@ -350,6 +360,19 @@ struct LxPipe {
 
 /// Сколько байт труба держит, пока их не забрали. Столько же по умолчанию у Linux.
 const PIPE_CAP: usize = 64 * 1024;
+
+/// Веха 186 — ФАЙЛ, ОТКРЫТЫЙ НА ЗАПИСЬ. В таблице, а не в дескрипторе, по той же причине, что и
+/// труба: держателей у него бывает несколько.
+///
+/// Так выглядит перенаправление: оболочка открывает файл, делает `dup2(fd, 1)` — и теперь на
+/// него смотрят ДВА дескриптора. Пока буфер лежал в дескрипторе, копия несла бы вторую правду о
+/// содержимом, и чей `close` последним, того и файл. Поэтому буфер один, а дескрипторы лишь
+/// считаются держателями; в store содержимое уезжает, когда уходит последний.
+struct LxWrite {
+    path: Vec<u8>,
+    buf: Vec<u8>,
+    holders: usize,
+}
 
 /// «Ни на каком ядре» / «никакой группы». Индексом быть не может.
 const NO_CPU: usize = usize::MAX;
@@ -376,6 +399,8 @@ struct Table {
     /// Веха 183 — ТРУБЫ личности Linux. В таблице, а не в процессе, потому что у трубы два
     /// конца, а после `fork` их станет вчетверо больше: одним владельцем она не описывается.
     lx_pipes: Vec<Option<LxPipe>>,
+    /// Веха 186 — файлы, открытые на запись (см. [`LxWrite`]).
+    lx_wfiles: Vec<Option<LxWrite>>,
     /// Недоставленные запросы IPC: (отправитель, получатель, сообщение).
     mailbox: Vec<(usize, usize, usize)>,
     /// Веха 89 — номера слотов полностью утилизированных групп, готовые к переиспользованию.
@@ -511,6 +536,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
     space: [0; cpu::MAX],
     dead_roots: Vec::new(),
     lx_pipes: Vec::new(),
+    lx_wfiles: Vec::new(),
     mailbox: Vec::new(),
     free_slots: Vec::new(),
 });
@@ -876,6 +902,7 @@ fn spawn_linux_locked(
     // Linux читает со стека, а не из регистров — a0/rdi обнулены (musl `_start` их игнорирует).
     t.procs[child].frame = TrapFrame::new_user(entry, sp, 0);
     t.procs[child].linux = true;
+    lx_init_stdio(t, child);
     t.procs[child].args = args_blob;
     t.procs[child].env = Vec::from(env);
     copy_to_space(arch::space_root(t.procs[child].space), sp, &block);
@@ -1583,11 +1610,12 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
         vprintln!("  [mm] P{} фолт кучи {:#x}: памяти не хватило — процесс убит", cur, va);
     } else {
         vprintln!(
-            "  [mm] P{} page fault ({}) @ {:#x} вне кучи — процесс убит (ядро живо)",
-            cur, kind.name(), va,
+            "  [mm] P{} page fault ({}) @ {:#x} pc {:#x} — процесс убит (ядро живо)",
+            cur, kind.name(), va, t.procs[cur].frame.pc(),
         );
     }
     t.procs[cur].state = State::Finished;
+    lx_close_all(t, cur); // Веха 186: упавший тоже обязан отпустить трубы, иначе конвейер повиснет
     wake_exec_waiters(t, cur, usize::MAX);
     if let Some(n) = t.next_runnable(cur) {
         t.set_cur(n);
@@ -1698,6 +1726,7 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                         t.procs[cur].frame.user_pc()
                     );
                     t.procs[cur].state = State::Finished;
+                    lx_close_all(&mut t, cur);
                     wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
                     if let Some(n) = t.next_runnable(cur) {
                         t.set_cur(n);
@@ -4378,6 +4407,7 @@ fn syscall(t: &mut Table, cur: usize) {
             for i in 0..t.procs.len() {
                 if t.procs[i].group == leader {
                     t.procs[i].state = State::Finished;
+                    lx_close_all(t, i);
                 }
             }
             // Ждущие узнают код выхода тем же путём, что и при обычном завершении; права на
@@ -4564,6 +4594,57 @@ fn pipe_close_end(t: &mut Table, idx: usize, write_end: bool) {
     }
 }
 
+/// Веха 186 — отпустить ОДИН дескриптор личности Linux. Конец трубы уходит счётчику, файл на
+/// запись — в store (уносит его последний держатель).
+///
+/// Функция общая для трёх мест, где дескриптор исчезает: `close`, `dup2` поверх занятого номера
+/// и уборка за умершим. Порознь их писать нельзя: забыть здесь трубу — значит навсегда оставить
+/// читателя без конца файла, забыть файл — значит потерять всё, что в него написали.
+/// `false` — файл не удалось записать (нет каталога или места).
+fn lx_release_fd(t: &mut Table, pid: usize, sl: LxFd) -> bool {
+    if let Some((idx, write_end)) = sl.pipe {
+        pipe_close_end(t, idx, write_end);
+    }
+    let Some(wi) = sl.wfile else { return true };
+    let last = match t.lx_wfiles.get_mut(wi).and_then(|w| w.as_mut()) {
+        Some(w) => {
+            w.holders = w.holders.saturating_sub(1);
+            w.holders == 0
+        }
+        None => return true,
+    };
+    if !last {
+        return true;
+    }
+    let w = t.lx_wfiles[wi].take().expect("держатель был");
+    if crate::lxfs::write_file(&w.path, &w.buf) {
+        return true;
+    }
+    vprintln!(
+        "  [linux] P{} файл '{}' НЕ записан ({} Б) — нет каталога или места",
+        pid,
+        core::str::from_utf8(&w.path).unwrap_or("?"),
+        w.buf.len(),
+    );
+    false
+}
+
+/// Веха 186 — отпустить ВСЕ дескрипторы умирающего процесса.
+///
+/// Без этого конвейер зависает намертво, и виновата не труба: `sh` закрывает свои концы, а
+/// потомки уносят свои в могилу молча. Счётчик писателей не доходит до нуля, читатель ждёт
+/// конца файла, которого никто не объявит. `execve` сюда НЕ ходит: там процесс не умирает, а
+/// меняет образ, и дескрипторы обязаны его пережить.
+fn lx_close_all(t: &mut Table, pid: usize) {
+    if t.procs[pid].lx_fds.is_empty() {
+        return;
+    }
+    let fds: Vec<LxFd> = t.procs[pid].lx_fds.iter_mut().filter_map(|s| s.take()).collect();
+    for sl in fds {
+        let _ = lx_release_fd(t, pid, sl);
+    }
+}
+
 /// Веха 182 — `execve`: заменить образ ТЕКУЩЕГО процесса, не заводя нового.
 ///
 /// ## Почему это не `SYS_SPAWN` с последующим `exit`
@@ -4643,20 +4724,156 @@ fn exec_linux_in_place(
     t.procs[cur].env = env_blob;
     t.procs[cur].linux = true;
     t.procs[cur].image = None;
-    // Дескрипторы ПЕРЕЖИВАЮТ `execve` — так велит POSIX, и на этом стоит перенаправление вывода.
+    // Дескрипторы ПЕРЕЖИВАЮТ `execve` — так велит POSIX, и на этом стоит перенаправление вывода:
+    // заведи таблицу заново, и всё, что оболочка настроила ДО подмены образа, пропало бы, а ради
+    // этого она и ветвится. Уходят только помеченные `FD_CLOEXEC` — те, что новому образу не
+    // предназначались (сохранённый stdout оболочки, чужие концы трубы).
     //
     // А вот ДОМЕН ПРАВ не меняется, и это не забывчивость. В VOID домен привязан к ИМЕНИ
     // программы (Веха 156), и подменять его здесь значило бы выдать процессу права чужой
     // программы по одному лишь её названию — то есть отдать повышение прав любому, кто умеет
     // звать `execve`. Права наследуются от того, кто был, ровно как при спавне ребёнка.
+    let doomed: Vec<LxFd> = t.procs[cur]
+        .lx_fds
+        .iter_mut()
+        .filter(|s| s.as_ref().map(|f| f.cloexec).unwrap_or(false))
+        .filter_map(|s| s.take())
+        .collect();
+    for sl in doomed {
+        let _ = lx_release_fd(t, cur, sl);
+    }
     let _ = pname; // имя процесса живёт в `args[0]`, отдельного поля у него нет
     t.dead_roots.push(old);
     true
 }
 
+/// Веха 186 — что за дескриптор: консоль, труба или файл. Один вопрос вместо трёх разных
+/// условий, разбросанных по обработчикам.
+#[derive(Clone, Copy, PartialEq)]
+enum FdKind {
+    None,
+    Console,
+    Pipe(usize, bool),
+    File,
+}
+
+fn fd_kind(t: &Table, cur: usize, fd: usize) -> FdKind {
+    match t.procs[cur].lx_fds.get(fd).and_then(|s| s.as_ref()) {
+        None => FdKind::None,
+        Some(f) if f.console => FdKind::Console,
+        Some(f) => match f.pipe {
+            Some((i, w)) => FdKind::Pipe(i, w),
+            None => FdKind::File,
+        },
+    }
+}
+
+/// `O_CLOEXEC` — один и тот же бит у `open`, `pipe2` и `dup3`.
+const O_CLOEXEC: usize = 0o2000000;
+
+/// Веха 186 — скопировать дескриптор `old`: в НАЗВАННЫЙ номер (`to = Some`) или в младший
+/// свободный, начиная с `min`.
+///
+/// Общая половина `dup`, `dup2`/`dup3` и `fcntl(F_DUPFD)` — трёх обличий одного действия. Порознь
+/// их писать нельзя: у трубы и у файла на запись копия прибавляет ДЕРЖАТЕЛЯ, и место, где про это
+/// забыли, обнаруживается не отказом, а зависшим конвейером или потерянным файлом.
+fn lx_dup_fd(
+    t: &mut Table,
+    cur: usize,
+    old: usize,
+    to: Option<usize>,
+    min: usize,
+    cloexec: bool,
+) -> usize {
+    let Some(mut copy) = t.procs[cur].lx_fds.get(old).cloned().flatten() else {
+        return crate::linux::err(crate::linux::EBADF);
+    };
+    // dup2(x, x) — тождество, а не работа: закрывать при этом нельзя (POSIX особо оговаривает).
+    if to == Some(old) {
+        return old;
+    }
+    copy.cloexec = cloexec;
+    if let Some((idx, write_end)) = copy.pipe {
+        if let Some(Some(p)) = t.lx_pipes.get_mut(idx) {
+            if write_end {
+                p.writers += 1;
+            } else {
+                p.readers += 1;
+            }
+        }
+    }
+    if let Some(wi) = copy.wfile {
+        if let Some(Some(w)) = t.lx_wfiles.get_mut(wi) {
+            w.holders += 1;
+        }
+    }
+    match to {
+        Some(newfd) => {
+            // Занятый номер сперва ЗАКРЫВАЕТСЯ — так велит POSIX, и на этом стоит
+            // перенаправление: `dup2(труба, 1)` обязан убрать прежний stdout, иначе тот остался
+            // бы держателем.
+            if let Some(Some(prev)) = t.procs[cur].lx_fds.get_mut(newfd).map(|s| s.take()) {
+                let _ = lx_release_fd(t, cur, prev);
+            }
+            let tbl = &mut t.procs[cur].lx_fds;
+            while tbl.len() <= newfd {
+                tbl.push(None);
+            }
+            tbl[newfd] = Some(copy);
+            newfd
+        }
+        None => {
+            let tbl = &mut t.procs[cur].lx_fds;
+            while tbl.len() <= min {
+                tbl.push(None);
+            }
+            match tbl.iter().skip(min).position(|sl| sl.is_none()) {
+                Some(i) => {
+                    tbl[min + i] = Some(copy);
+                    min + i
+                }
+                None => {
+                    tbl.push(Some(copy));
+                    tbl.len() - 1
+                }
+            }
+        }
+    }
+}
+
+/// Веха 186 — завести процессу стандартные три дескриптора КОНСОЛЬЮ.
+///
+/// Раньше их не существовало вовсе: 0/1/2 разбирались условиями по номеру. Пока так, `dup2` не
+/// имел чего присваивать, а без него у чужого `sh` нет ни перенаправления, ни конвейера.
+fn lx_init_stdio(t: &mut Table, pid: usize) {
+    let mk = || {
+        Some(LxFd {
+            meta: crate::lxfs::Meta {
+                id: void_abi::ContentId([0u8; 32]),
+                size: 0,
+                ty: void_tree::K_FILE,
+                src: crate::lxfs::Src::Hier,
+            },
+            off: 0,
+            path: Vec::new(),
+            dpos: 0,
+            wfile: None,
+            pipe: None,
+            console: true,
+            cloexec: false,
+        })
+    };
+    let tbl = &mut t.procs[pid].lx_fds;
+    tbl.clear();
+    for _ in 0..3 {
+        tbl.push(mk());
+    }
+}
+
 /// Открыть найденный узел: занять слот в таблице дескрипторов процесса, вернуть номер fd.
 fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>) -> usize {
-    let fd = LxFd { meta, off: 0, path, dpos: 0, wbuf: None, pipe: None };
+    let fd =
+        LxFd { meta, off: 0, path, dpos: 0, wfile: None, pipe: None, console: false, cloexec: false };
     let tbl = &mut t.procs[cur].lx_fds;
     let i = match tbl.iter().position(|s| s.is_none()) {
         Some(i) => {
@@ -4672,7 +4889,12 @@ fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>
 }
 
 /// Первый номер файлового дескриптора Linux-процесса: 0/1/2 заняты консолью.
-const LX_FD_BASE: usize = 3;
+/// Веха 186 — дескриптор ЕСТЬ индекс в таблице: 0/1/2 занимает консоль, как и положено.
+///
+/// Раньше здесь стояла тройка, а 0/1/2 обрабатывались условиями по номеру. Ноль оставлен
+/// константой, а не убран, ровно затем, чтобы арифметика в двух десятках мест осталась той же и
+/// правка не превратилась в переписывание всей личности.
+const LX_FD_BASE: usize = 0;
 
 /// Права страницы из `prot` линуксового `mmap`/`mprotect` (PROT_READ=1, WRITE=2, EXEC=4).
 ///
@@ -4759,26 +4981,46 @@ fn linux_syscall(t: &mut Table, cur: usize) {
 
     match decoded {
         // ── вывод ──────────────────────────────────────────────────────────────
-        Some(Lx::Write) => {
-            let (fd, buf, len) = (a0, a1, a2);
-            if fd == 1 || fd == 2 {
-                ret = match lx_get(t, cur, buf, len) {
-                    Some(b) => {
-                        crate::print!("{}", core::str::from_utf8(b).unwrap_or("<?>"));
-                        len
+        Some(Lx::Write) | Some(Lx::Writev) => {
+            let fd = a0;
+            // Байты сначала СОБИРАЮТСЯ, а дальше судьба у них одна. Разводить `write` и `writev`
+            // по разным веткам было ошибкой, и дорогой: буферизованный вывод musl идёт ИМЕННО
+            // через `writev` (два куска — свой буфер и хвост), поэтому `ls > файл` не писал ни
+            // байта, пока `writev` знал одну лишь консоль. Пишущий этого не видит: вывод в
+            // терминал строчный и уходит через `write`, а стоит перенаправить — и тишина.
+            let bytes: Option<Vec<u8>> = if decoded == Some(Lx::Write) {
+                lx_get(t, cur, a1, a2).map(|b| b.to_vec())
+            } else {
+                // iov: массив из iovcnt структур { base: u64, len: u64 }.
+                let mut out: Vec<u8> = Vec::new();
+                let mut ok = true;
+                for i in 0..a2 {
+                    let Some(ent) = lx_get(t, cur, a1 + i * 16, 16) else {
+                        ok = false;
+                        break;
+                    };
+                    let base = usize::from_le_bytes(ent[0..8].try_into().unwrap());
+                    let len = usize::from_le_bytes(ent[8..16].try_into().unwrap());
+                    match lx_get(t, cur, base, len) {
+                        Some(b) => out.extend_from_slice(b),
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     }
-                    None => linux::err(linux::EFAULT),
-                };
-            } else if let Some((idx, true)) =
-                fd.checked_sub(LX_FD_BASE).and_then(|i| {
-                    t.procs[cur].lx_fds.get(i).and_then(|s| s.as_ref()).and_then(|s| s.pipe)
-                })
-            {
-                // Веха 183 — запись в ТРУБУ.
-                let bytes = lx_get(t, cur, buf, len).map(|b| b.to_vec());
-                match bytes {
-                    None => ret = linux::err(linux::EFAULT),
-                    Some(bytes) => {
+                }
+                ok.then_some(out)
+            };
+            let kind = fd_kind(t, cur, fd);
+            match bytes {
+                None => ret = linux::err(linux::EFAULT),
+                Some(bytes) if kind == FdKind::Console => {
+                    crate::print!("{}", core::str::from_utf8(&bytes).unwrap_or("<?>"));
+                    ret = bytes.len();
+                }
+                Some(bytes) => {
+                    if let FdKind::Pipe(idx, true) = kind {
+                        // Веха 183 — запись в ТРУБУ.
                         let (readers, room) = match t.lx_pipes.get(idx).and_then(|p| p.as_ref()) {
                             Some(p) => (p.readers, PIPE_CAP.saturating_sub(p.buf.len())),
                             None => (0, 0),
@@ -4788,9 +5030,11 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                             // `SIGPIPE`; сигналов у нас нет, остаётся честный код.
                             ret = linux::err(linux::EPIPE);
                         } else if room == 0 && !bytes.is_empty() {
-                            // Труба полна: ждём читателя. С РЕСТАРТОМ — при пробуждении вызов
-                            // повторится целиком, и ничего запоминать не нужно.
-                            t.procs[cur].frame.restart();
+                            // Труба полна: ждём читателя. Кадр и PC НЕ трогаем — в личности
+                            // Linux счётчик команд стоит НА самой инструкции `syscall` до
+                            // эпилога (`skip_syscall_insn`), так что проснувшийся повторит
+                            // вызов сам. `restart()` здесь был бы вторым откатом и увёл бы PC
+                            // внутрь предыдущей инструкции.
                             t.procs[cur].state = State::PipeWait(idx);
                             if let Some(nx) = t.next_runnable(cur) {
                                 t.set_cur(nx);
@@ -4807,76 +5051,43 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                             pipe_wake(t, idx);
                             ret = n;
                         }
-                    }
-                }
-            } else {
-                // Веха 181 — запись в ФАЙЛ. Копим в буфере дескриптора; в store уедет на
-                // `close` одним объектом (или кусками, если вырос).
-                ret = match lx_get(t, cur, buf, len).map(|b| b.to_vec()) {
-                    None => linux::err(linux::EFAULT),
-                    Some(bytes) => match fd.checked_sub(LX_FD_BASE).and_then(|i| {
-                        t.procs[cur].lx_fds.get_mut(i).and_then(|s| s.as_mut())
-                    }) {
-                        Some(sl) => match &mut sl.wbuf {
-                            Some(w) => {
-                                let at = sl.off as usize;
-                                if w.len() < at {
-                                    w.resize(at, 0); // дыра от `lseek` за конец — нулями, как POSIX
+                    } else {
+                        // Веха 181 — запись в ФАЙЛ. Копим в буфере; в store уедет на `close`
+                        // одним объектом (или кусками, если вырос).
+                        ret = match fd
+                            .checked_sub(LX_FD_BASE)
+                            .and_then(|i| t.procs[cur].lx_fds.get_mut(i).and_then(|s| s.as_mut()))
+                        {
+                            Some(sl) => match sl.wfile {
+                                Some(wi) => {
+                                    let at = sl.off as usize;
+                                    let end = at + bytes.len();
+                                    sl.off = end as u64;
+                                    match t.lx_wfiles.get_mut(wi).and_then(|w| w.as_mut()) {
+                                        Some(w) => {
+                                            // Дыра от `lseek` за конец — нулями, как велит POSIX.
+                                            if w.buf.len() < end {
+                                                w.buf.resize(end, 0);
+                                            }
+                                            w.buf[at..end].copy_from_slice(&bytes);
+                                            bytes.len()
+                                        }
+                                        None => linux::err(linux::EBADF),
+                                    }
                                 }
-                                let end = at + bytes.len();
-                                if w.len() < end {
-                                    w.resize(end, 0);
-                                }
-                                w[at..end].copy_from_slice(&bytes);
-                                sl.off = end as u64;
-                                bytes.len()
-                            }
+                                None => linux::err(linux::EBADF),
+                            },
                             None => linux::err(linux::EBADF),
-                        },
-                        None => linux::err(linux::EBADF),
-                    },
-                };
-            }
-        }
-        Some(Lx::Writev) => {
-            // iov: массив из iovcnt структур { base: u64, len: u64 }.
-            let (fd, iov, iovcnt) = (a0, a1, a2);
-            if fd == 1 || fd == 2 {
-                let mut total = 0usize;
-                let mut ok = true;
-                for i in 0..iovcnt {
-                    let ent = match lx_get(t, cur, iov + i * 16, 16) {
-                        Some(e) => e,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    };
-                    let base = usize::from_le_bytes(ent[0..8].try_into().unwrap());
-                    let len = usize::from_le_bytes(ent[8..16].try_into().unwrap());
-                    match lx_get(t, cur, base, len) {
-                        Some(b) => {
-                            crate::print!("{}", core::str::from_utf8(b).unwrap_or("<?>"));
-                            total += len;
-                        }
-                        None => {
-                            ok = false;
-                            break;
-                        }
+                        };
                     }
                 }
-                ret = if ok { total } else { linux::err(linux::EFAULT) };
-            } else {
-                ret = linux::err(linux::EBADF);
             }
         }
         // ── ввод (stdin с консоли, блокирующе) ──────────────────────────────────
         Some(Lx::Read) => {
             let (fd, buf, len) = (a0, a1, a2);
-            let pipe_end = fd.checked_sub(LX_FD_BASE).and_then(|i| {
-                t.procs[cur].lx_fds.get(i).and_then(|s| s.as_ref()).and_then(|s| s.pipe)
-            });
-            if let Some((idx, false)) = pipe_end {
+            let kind = fd_kind(t, cur, fd);
+            if let FdKind::Pipe(idx, false) = kind {
                 // Веха 183 — чтение из ТРУБЫ.
                 let (have, writers) = match t.lx_pipes.get(idx).and_then(|p| p.as_ref()) {
                     Some(p) => (p.buf.len(), p.writers),
@@ -4901,8 +5112,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     // Писателей не осталось и данных нет — это КОНЕЦ ФАЙЛА, а не ошибка.
                     ret = 0;
                 } else {
-                    // Пусто, но писатель жив — ждём. С рестартом: вызов повторится целиком.
-                    t.procs[cur].frame.restart();
+                    // Пусто, но писатель жив — ждём. PC не трогаем (см. запись в трубу).
                     t.procs[cur].state = State::PipeWait(idx);
                     if let Some(nx) = t.next_runnable(cur) {
                         t.set_cur(nx);
@@ -4910,7 +5120,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     done = false;
                     ret = 0;
                 }
-            } else if fd >= LX_FD_BASE {
+            } else if kind == FdKind::File {
                 // Файл из store (Веха 108.3). Чтение короткое: за раз отдаём не больше остатка
                 // текущего куска блоба — так же ведёт себя `read` на трубе, и musl дочитает.
                 let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
@@ -4929,7 +5139,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                         }
                     }
                 };
-            } else if fd != 0 {
+            } else if kind != FdKind::Console {
                 ret = linux::err(linux::EBADF);
             } else if !ensure_heap_range(t, cur, buf, len) {
                 ret = linux::err(linux::EFAULT);
@@ -5281,7 +5491,42 @@ fn linux_syscall(t: &mut Table, cur: usize) {
         }
         // ── файловые (пока без ФС: заглушки, что не роняют однопоточный CLI) ─────
         Some(Lx::Ioctl) => ret = linux::err(linux::ENOTTY), // isatty/TIOCGWINSZ → «не терминал»
-        Some(Lx::Fcntl) => ret = 0,
+        // Веха 186 — `fcntl`. Заглушка «всегда 0» была не мелочью, а ловушкой: `F_DUPFD` обязан
+        // ВЕРНУТЬ НОМЕР, а ноль — законный номер, и оболочка, сохраняя им свой stdout, получала
+        // в ответ `stdin`. Дальше она честно закрывала «сохранённое» и падала на `sh: 0: Bad file
+        // descriptor`. Молчаливый успех дороже отказа ровно там, где успех что-то значит.
+        Some(Lx::Fcntl) => {
+            const F_DUPFD: usize = 0;
+            const F_GETFD: usize = 1;
+            const F_SETFD: usize = 2;
+            const F_GETFL: usize = 3;
+            const F_DUPFD_CLOEXEC: usize = 1030;
+            const FD_CLOEXEC: usize = 1;
+            let (fd, cmd, arg) = (a0, a1, a2);
+            let known = t.procs[cur].lx_fds.get(fd).map(|s| s.is_some()).unwrap_or(false);
+            ret = match cmd {
+                F_DUPFD => lx_dup_fd(t, cur, fd, None, arg, false),
+                F_DUPFD_CLOEXEC => lx_dup_fd(t, cur, fd, None, arg, true),
+                _ if !known => linux::err(linux::EBADF),
+                F_GETFD => {
+                    let set = t.procs[cur].lx_fds[fd].as_ref().map(|f| f.cloexec).unwrap_or(false);
+                    if set { FD_CLOEXEC } else { 0 }
+                }
+                F_SETFD => {
+                    if let Some(Some(f)) = t.procs[cur].lx_fds.get_mut(fd) {
+                        f.cloexec = arg & FD_CLOEXEC != 0;
+                    }
+                    0
+                }
+                // Режим открытия мы не храним: файл на запись узнаётся по буферу, всё
+                // остальное читается. Отвечаем тем, что есть, а не выдуманным набором флагов.
+                F_GETFL => {
+                    let w = t.procs[cur].lx_fds[fd].as_ref().map(|f| f.wfile.is_some());
+                    if w == Some(true) { 0o1 } else { 0 }
+                }
+                _ => 0,
+            };
+        }
         Some(Lx::Close) => {
             // fd 0/1/2 — «закрыты», реальных ресурсов нет; файловые — освободить слот.
             //
@@ -5293,21 +5538,8 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             if a0 >= LX_FD_BASE {
                 let taken = t.procs[cur].lx_fds.get_mut(a0 - LX_FD_BASE).and_then(|s| s.take());
                 if let Some(sl) = taken {
-                    // Веха 183 — конец ТРУБЫ: убавить счётчик и разбудить того, кто ждёт. Для
-                    // читателя закрытие последнего писателя — это конец файла, и узнать о нём
-                    // он может только проснувшись.
-                    if let Some((idx, write_end)) = sl.pipe {
-                        pipe_close_end(t, idx, write_end);
-                    }
-                    if let Some(body) = sl.wbuf {
-                        if !crate::lxfs::write_file(&sl.path, &body) {
-                            vprintln!(
-                                "  [linux] P{} close: файл НЕ записан ({} Б) — нет каталога или места",
-                                cur,
-                                body.len()
-                            );
-                            ret = linux::err(linux::ENOSPC);
-                        }
+                    if !lx_release_fd(t, cur, sl) {
+                        ret = linux::err(linux::ENOSPC);
                     }
                 }
             }
@@ -5356,14 +5588,28 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                         // этом узнать — иначе закрытие одного конца объявило бы конец файла
                         // всем остальным.
                         t.procs[child].lx_fds = t.procs[cur].lx_fds.clone();
-                        for fd in t.procs[child].lx_fds.iter().flatten() {
-                            if let Some((idx, write_end)) = fd.pipe {
+                        let inherited: Vec<(Option<(usize, bool)>, Option<usize>)> = t.procs
+                            [child]
+                            .lx_fds
+                            .iter()
+                            .flatten()
+                            .map(|f| (f.pipe, f.wfile))
+                            .collect();
+                        for (pipe, wfile) in inherited {
+                            if let Some((idx, write_end)) = pipe {
                                 if let Some(Some(p)) = t.lx_pipes.get_mut(idx) {
                                     if write_end {
                                         p.writers += 1;
                                     } else {
                                         p.readers += 1;
                                     }
+                                }
+                            }
+                            // Файл на запись тоже наследуется держателем: иначе `close` у
+                            // ребёнка сбросил бы содержимое в store, пока родитель ещё пишет.
+                            if let Some(wi) = wfile {
+                                if let Some(Some(w)) = t.lx_wfiles.get_mut(wi) {
+                                    w.holders += 1;
                                 }
                             }
                         }
@@ -5431,9 +5677,8 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 None if !any_child => linux::err(linux::ECHILD),
                 None if options & WNOHANG != 0 => 0,
                 None => {
-                    // Дети есть, но никто не закончил. Ждём с РЕСТАРТОМ: проснувшись, вызов
-                    // повторится и сам найдёт зомби.
-                    t.procs[cur].frame.restart();
+                    // Дети есть, но никто не закончил. Ждём: проснувшись, вызов повторится
+                    // сам (PC стоит на `syscall`) и сам найдёт зомби.
                     let key = if want > 0 { want as usize } else { ANY_CHILD };
                     t.procs[cur].state = State::ChildWait(key);
                     if let Some(nx) = t.next_runnable(cur) {
@@ -5445,9 +5690,10 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             };
         }
         Some(Lx::Pipe2) => {
-            // pipe2(fds[2], flags) / legacy pipe(fds[2]). Флаги (`O_CLOEXEC`, `O_NONBLOCK`) не
-            // поддержаны и молча игнорируются: `CLOEXEC` бессмыслен, пока нет `fork`, а
-            // `NONBLOCK` соврал бы — мы всегда блокируемся.
+            // pipe2(fds[2], flags) / legacy pipe(fds[2]). `O_CLOEXEC` соблюдается (Веха 186:
+            // после `fork` лишний держатель конца трубы — это зависший конвейер), `O_NONBLOCK`
+            // молча игнорируется: он соврал бы — мы всегда блокируемся.
+            let flags = if decoded == Some(Lx::Pipe2) { a1 } else { 0 };
             let idx = pipe_alloc(t);
             let mk = |t: &mut Table, write_end: bool| -> usize {
                 let fd = LxFd {
@@ -5460,8 +5706,10 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     off: 0,
                     path: Vec::new(),
                     dpos: 0,
-                    wbuf: None,
+                    wfile: None,
                     pipe: Some((idx, write_end)),
+                    console: false,
+                    cloexec: flags & O_CLOEXEC != 0,
                 };
                 let tbl = &mut t.procs[cur].lx_fds;
                 match tbl.iter().position(|s| s.is_none()) {
@@ -5637,10 +5885,26 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                         src: crate::lxfs::Src::Hier,
                     });
                     let off = start.len() as u64;
-                    let fd = lx_fd_alloc(t, cur, meta, path);
+                    let fd = lx_fd_alloc(t, cur, meta, path.clone());
+                    let w = LxWrite { path, buf: start, holders: 1 };
+                    let wi = match t.lx_wfiles.iter().position(|s| s.is_none()) {
+                        Some(i) => {
+                            t.lx_wfiles[i] = Some(w);
+                            i
+                        }
+                        None => {
+                            t.lx_wfiles.push(Some(w));
+                            t.lx_wfiles.len() - 1
+                        }
+                    };
                     if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
-                        sl.wbuf = Some(start);
+                        sl.wfile = Some(wi);
                         sl.off = off;
+                    }
+                    if flags & O_CLOEXEC != 0 {
+                        if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                            sl.cloexec = true;
+                        }
                     }
                     vprintln!("  [linux] P{} openat на запись → fd {}", cur, fd);
                     fd
@@ -5648,6 +5912,11 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 Some(path) => match crate::lxfs::lookup(&path) {
                     Some(meta) => {
                         let fd = lx_fd_alloc(t, cur, meta, path);
+                        if flags & O_CLOEXEC != 0 {
+                            if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                                sl.cloexec = true;
+                            }
+                        }
                         vprintln!("  [linux] P{} openat → fd {}", cur, fd);
                         fd
                     }
@@ -5735,8 +6004,9 @@ fn linux_syscall(t: &mut Table, cur: usize) {
         }
         Some(Lx::Lseek) => {
             let (fd, off, whence) = (a0, a1 as i64, a2);
-            if fd < LX_FD_BASE {
-                ret = linux::err(linux::ESPIPE); // консоль не позиционируется
+            if !matches!(fd_kind(t, cur, fd), FdKind::File) {
+                // Ни консоль, ни труба не позиционируются — это поток, а не файл.
+                ret = linux::err(linux::ESPIPE);
             } else {
                 match t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE).and_then(|s| s.as_mut()) {
                     None => ret = linux::err(linux::EBADF),
@@ -5753,9 +6023,32 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                 }
             }
         }
-        Some(Lx::Dup) | Some(Lx::Dup3) => ret = linux::err(linux::ENOSYS),
+        // ── дублирование дескрипторов (Веха 186) ─────────────────────────────────
+        //
+        // Ради этого консоль и стала обычной записью таблицы: `dup2` — это ПРИСВАИВАНИЕ, и
+        // присваивать надо было нечему, пока 0/1/2 существовали лишь как условие `if fd == 1`.
+        // Оболочка строит перенаправление и конвейер ровно им: заводит трубу, ветвится и в
+        // ребёнке кладёт её конец на место `stdout`.
+        Some(Lx::Dup) | Some(Lx::Dup3) => {
+            // dup(old) — свободный номер; dup2(old,new)/dup3(old,new,flags) — названный.
+            let named = decoded == Some(Lx::Dup3);
+            let to = named.then_some(a1);
+            // `dup3` умеет сразу пометить копию `CLOEXEC`; у `dup`/`dup2` копия помечена быть не
+            // может — так велит POSIX, и на этом стоит перенаправление (иначе `dup2(труба, 1)`
+            // отдал бы образу stdout, который сам же и закрыл бы на входе).
+            let cloexec = named && nr != 33 && a2 & O_CLOEXEC != 0;
+            ret = lx_dup_fd(t, cur, a0, to, 0, cloexec);
+        }
         Some(Lx::Ppoll) => ret = linux::err(linux::ENOSYS),
-        Some(Lx::Fstat) if a0 >= LX_FD_BASE => {
+        // Веха 186 — `fstat` КОНСОЛИ: у неё нет узла в store, и врать про файл нельзя. Отвечаем
+        // символьным устройством — тем, чем консоль и является; `isatty` из musl спрашивает
+        // именно это.
+        Some(Lx::Fstat) if fd_kind(t, cur, a0) == FdKind::Console => {
+            let mut st = alloc::vec![0u8; linux::STAT_SIZE];
+            linux::fill_stat_chr(&mut st);
+            ret = if lx_put(t, cur, a1, &st) { 0 } else { linux::err(linux::EFAULT) };
+        }
+        Some(Lx::Fstat) if fd_kind(t, cur, a0) == FdKind::File => {
             // fstat файла из store: тип и размер знает узел дерева.
             let (fd, buf) = (a0, a1);
             let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
@@ -5845,6 +6138,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
             for i in 0..t.procs.len() {
                 if t.procs[i].group == leader {
                     t.procs[i].state = State::Finished;
+                    lx_close_all(t, i);
                 }
             }
             wake_exec_waiters(t, leader, code);

@@ -157,6 +157,7 @@ pub fn decode(nr: usize) -> Option<Lx> {
         25 => Lx::Mremap,
         28 => Lx::Madvise,
         32 => Lx::Dup,
+        33 => Lx::Dup3, // dup2(old,new) — тот же обработчик, флагов просто нет
         35 => Lx::Nanosleep,
         39 => Lx::Getpid,
         63 => Lx::Uname,
