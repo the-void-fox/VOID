@@ -31,6 +31,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 
 pub mod builtins;
+pub mod derive;
 pub mod eval;
 pub mod lex;
 pub mod parse;
@@ -145,6 +146,14 @@ fn write_str(s: &str, out: &mut String) {
         i += 1;
     }
     out.push('"');
+}
+
+/// Вычислить выражение со сборщиком деривации: `derivation` начинает работать, а текст задания
+/// уезжает туда, куда велит [`derive::StoreText`].
+pub fn eval_with_store(src: &str, store: Rc<dyn derive::StoreText>) -> Result<String, String> {
+    let sink: Rc<dyn DrvSink> = Rc::new(derive::Deriver { store });
+    let (mut ev, v) = eval_with(src, Some(sink))?;
+    print(&mut ev, &v)
 }
 
 /// Собрать вычислитель со сборщиком деривации и загрузчиком файлов.
@@ -264,6 +273,51 @@ mod tests {
         // от корня — это честнее, чем выдумать каталог.
         same("./x", "/x");
         same("1.5", "1.5");
+    }
+
+    /// Сквозная проверка: выражение → задание → ПУТИ. Эталон снят с живого `nix-instantiate`,
+    /// и это единственное, что здесь доказывает правильность: путь вычисляется, а не выбирается,
+    /// и сойтись он обязан байт в байт.
+    #[test]
+    fn деривация_даёт_те_же_пути_что_хост() {
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+
+        struct Записал(RefCell<alloc::vec::Vec<(String, String)>>);
+        impl crate::derive::StoreText for Записал {
+            fn add(&self, path: &str, text: &str) -> Result<(), String> {
+                self.0.borrow_mut().push((String::from(path), String::from(text)));
+                Ok(())
+            }
+        }
+        let store = Rc::new(Записал(RefCell::new(alloc::vec::Vec::new())));
+        let src = r#"derivation {
+            name = "privet";
+            system = "x86_64-linux";
+            builder = "/bin/busybox";
+            args = [ "sh" "-c" "echo privet-iz-pesochnicy > $out" ];
+        }"#;
+        let printed = crate::eval_with_store(src, store.clone()).expect("вычислилось");
+        assert_eq!(
+            printed,
+            "<derivation /nix/store/4y7xf0g9p4zwnspck4ym59vd5jn4l078-privet.drv>"
+        );
+        let wrote = store.0.borrow();
+        assert_eq!(wrote.len(), 1);
+        assert_eq!(wrote[0].0, "/nix/store/4y7xf0g9p4zwnspck4ym59vd5jn4l078-privet.drv");
+        assert!(wrote[0].1.contains("/nix/store/r1dlm00ran3afxw95w3v9mygvf76adk4-privet"));
+    }
+
+    /// Ссылка на другую деривацию обязана быть ОТКАЗОМ, а не тихо выброшенным контекстом:
+    /// иначе `.drv` вышел бы правдоподобным и неверным.
+    #[test]
+    fn зависимость_от_деривации_отвергается() {
+        use alloc::rc::Rc;
+        let store: Rc<dyn crate::derive::StoreText> = Rc::new(crate::derive::NoStore);
+        let src = r#"let a = derivation { name = "a"; system = "x86_64-linux"; builder = "/b"; };
+                     in derivation { name = "b"; system = "x86_64-linux"; builder = "${a}/bin/x"; }"#;
+        let e = crate::eval_with_store(src, store).unwrap_err();
+        assert!(e.contains("графа сборок"), "сказано другое: {}", e);
     }
 
     #[test]

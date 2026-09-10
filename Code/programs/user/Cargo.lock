@@ -1076,6 +1076,9 @@ version = "0.1.0"
 [[package]]
 name = "void-drv"
 version = "0.0.1"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "void-fs"
@@ -1096,6 +1099,9 @@ version = "0.1.0"
 [[package]]
 name = "void-nix"
 version = "0.0.1"
+dependencies = [
+ "void-drv",
+]
 
 [[package]]
 name = "void-tree"

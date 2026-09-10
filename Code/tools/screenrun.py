@@ -196,8 +196,12 @@ PRINTABLE = {
     "\\": "backslash", "`": "grave_accent", "\n": "ret", "\t": "tab",
 }
 SHIFTED = {"_": "minus", ":": "semicolon", '"': "apostrophe", "(": "9", ")": "0", "+": "equal",
-           "?": "slash", "*": "8", "!": "1", "~": "grave_accent", "{": "bracket_left",
-           "}": "bracket_right", "|": "backslash", "<": "comma", ">": "dot"}
+           "?": "slash", "*": "8", "~": "grave_accent", "{": "bracket_left",
+           "}": "bracket_right", "|": "backslash", "<": "comma", ">": "dot",
+           # Верхний ряд цифр целиком. Дырка в нём стоила захода: `$out` в выражении nix набирался
+           # как `out`, деривация выходила другой, и хэш пути честно не совпадал с хостовым.
+           # Предупреждение «нечем набрать знак» при этом писалось — в stderr, куда никто не смотрел.
+           "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7"}
 
 
 def typewrite(s):

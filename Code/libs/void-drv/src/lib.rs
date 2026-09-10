@@ -37,6 +37,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub mod paths;
+
 /// Выход деривации: как он зовётся, куда встанет и (для фиксированных) чем проверяется.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
@@ -129,6 +131,19 @@ pub fn parse(text: &[u8]) -> Result<Drv, &'static str> {
 ///
 /// От этого зависит хэш пути, поэтому здесь нет ни одной вольности.
 pub fn print(d: &Drv) -> String {
+    print_with(d, false)
+}
+
+/// То же, но с ПУСТЫМИ путями выходов — вид, по которому считается хэш деривации.
+///
+/// Маскируются два места сразу, и забыть второе — обычная ошибка: поля путей в списке выходов и
+/// значения тех переменных окружения, чьё имя совпадает с именем выхода. `out` в окружении и
+/// `out` в списке выходов — одна и та же величина, и обнулять её надо в обоих местах.
+pub fn print_masked(d: &Drv) -> String {
+    print_with(d, true)
+}
+
+fn print_with(d: &Drv, mask: bool) -> String {
     let mut s = String::new();
     s.push_str("Derive([");
     for (i, o) in d.outputs.iter().enumerate() {
@@ -138,7 +153,7 @@ pub fn print(d: &Drv) -> String {
         s.push('(');
         quote(&mut s, &o.name);
         s.push(',');
-        quote(&mut s, &o.path);
+        quote(&mut s, if mask { "" } else { &o.path });
         s.push(',');
         quote(&mut s, &o.hash_algo);
         s.push(',');
@@ -187,7 +202,8 @@ pub fn print(d: &Drv) -> String {
         s.push('(');
         quote(&mut s, k);
         s.push(',');
-        quote(&mut s, v);
+        let masked = mask && d.outputs.iter().any(|o| &o.name == k);
+        quote(&mut s, if masked { "" } else { v });
         s.push(')');
     }
     s.push_str("])");
