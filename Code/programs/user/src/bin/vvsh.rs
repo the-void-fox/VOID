@@ -3,7 +3,9 @@
 //! Подкоманды (запуск через vsh: `run vvsh <под> …`; права наследуются от vsh, как install.rs —
 //! start-cap 0 = posixfs-endpoint, 1 = store):
 //!   `eval FILE`   — прочитать `.vv`, вычислить НА VOID, напечатать нормализованный конфиг (M1a/b).
-//!   `init-config` — посеять модульный конфиг `/etc/system/*.vv` (правишь его → `rebuild`) (M1c).
+//!   `init-config` — посеять конфиг `/etc/system/*.vv` либо СВЕРИТЬ его с шаблоном (Веха 191):
+//!                   нетронутые файлы обновляются, правленые остаются, а про новые ключи в них
+//!                   говорится вслух. `--force` — перезаписать всё, как раньше.
 //!   `rebuild`     — вычислить `/etc/system/default.vv` → КОММИТ нового поколения `system/gen<N>`,
 //!                   двинуть `system/current` (активно после ребута) (M1c) + собрать пакеты,
 //!                   объявленные конфигом (`pkg sync`, Веха 112).
@@ -274,50 +276,209 @@ fn cmd_eval(path: &[u8]) -> ! {
 /// `init-config` (подкоманда) — посеять конфиг и выйти. Логика — в [`run_init_config`] (её же
 /// зовёт одноимённая команда REPL, чтобы не дублировать).
 fn cmd_init_config() -> ! {
-    run_init_config();
+    let argv = sys::argv::Argv::take();
+    let force = argv.rest().any(|w| w == b"--force");
+    run_init_config(force);
     sys::exit(0);
 }
 
+/// Шаблон модуля конфига: куда пишем, что пишем и под каким корнем помним ПОСЕЯННОЕ.
+///
+/// Веха 191 — третье поле и есть вся суть. Зная, что мы посеяли в прошлый раз, можно ответить на
+/// единственный вопрос, который здесь важен: **правил ли человек этот файл?** Если не правил —
+/// обновить его безопасно и незачем спрашивать. Если правил — трогать нельзя ни при каких
+/// обстоятельствах, и остаётся сказать, чего в нём не хватает.
+///
+/// Ответ даёт сам store: объект адресуется содержимым, поэтому «файл равен посеянному» — это
+/// равенство двух content-id, а не сравнение текстов.
+struct Tpl {
+    path: &'static [u8],
+    text: &'static str,
+    seed: &'static str,
+}
+
 /// Посеять модульный конфиг в `/etc/system/` (posixfs, start-cap 0). Идемпотентно. Печатает итог.
-fn run_init_config() {
+const TPLS: [Tpl; 9] = [
+    Tpl { path: b"/etc/system/net.vv", text: NET_VV, seed: "system/seed/net.vv" },
+    Tpl { path: b"/etc/system/services.vv", text: SERVICES_VV, seed: "system/seed/services.vv" },
+    Tpl {
+        path: b"/etc/system/networking.vv",
+        text: NETWORKING_VV,
+        seed: "system/seed/networking.vv",
+    },
+    Tpl { path: b"/etc/system/terminal.vv", text: TERMINAL_VV, seed: "system/seed/terminal.vv" },
+    Tpl { path: b"/etc/system/bar.vv", text: BAR_VV, seed: "system/seed/bar.vv" },
+    Tpl { path: b"/etc/system/packages.vv", text: PACKAGES_VV, seed: "system/seed/packages.vv" },
+    Tpl { path: b"/etc/system/apps.vv", text: APPS_VV, seed: "system/seed/apps.vv" },
+    Tpl { path: b"/etc/system/autostart.vv", text: AUTOSTART_VV, seed: "system/seed/autostart.vv" },
+    Tpl { path: DEFAULT_PATH, text: DEFAULT_VV, seed: "system/seed/default.vv" },
+];
+
+/// Посеять конфиг ИЛИ сверить его с шаблоном (Веха 191).
+///
+/// До этой вехи команда просто перезаписывала все девять файлов. На чистой системе это верно, а
+/// на живой — разрушительно, и потому ею никто не пользовался. Следствие вышло тихое и обидное:
+/// **каждая веха, добавлявшая ключ, была невидима для уже установленных систем.** Ровно так
+/// `ui("language", …)` от Вехи 178 не доехал до рабочего образа, и английский выглядел «выбран,
+/// но не работает» — при полностью исправном механизме перевода.
+///
+/// Теперь у каждого файла три исхода, и решает их store:
+///
+/// - **файла нет** — пишем (новый модуль достаётся даром);
+/// - **файл равен посеянному** — человек его не трогал, обновляем молча;
+/// - **файл отличается** — НЕ ТРОГАЕМ и говорим, каких ключей в нём не хватает.
+///
+/// `--force` возвращает прежнее поведение: перезаписать всё. Оно осталось, но теперь его надо
+/// попросить вслух.
+fn run_init_config(force: bool) {
     let ep = cap_fs();
+    let store = cap_store();
     px::mkdir(ep, b"/etc"); // идемпотентно: если есть — MAX, игнорируем
     px::mkdir(ep, b"/etc/system");
-    // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` (1.5 КиБ) однажды доехал
-    // наполовину и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не
-    // бывало; виноватым тогда выглядел конфиг, а не запись.
-    let files: [(&[u8], &str); 9] = [
-        (b"/etc/system/net.vv", NET_VV),
-        (b"/etc/system/services.vv", SERVICES_VV),
-        (b"/etc/system/networking.vv", NETWORKING_VV),
-        (b"/etc/system/terminal.vv", TERMINAL_VV),
-        (b"/etc/system/bar.vv", BAR_VV),
-        (b"/etc/system/packages.vv", PACKAGES_VV),
-        (b"/etc/system/apps.vv", APPS_VV),
-        (b"/etc/system/autostart.vv", AUTOSTART_VV),
-        (DEFAULT_PATH, DEFAULT_VV),
-    ];
+
+    let (mut written, mut updated, mut same, mut kept) = (0usize, 0usize, 0usize, 0usize);
     let mut bad = false;
-    for (path, text) in files {
-        if !px::echo_to(ep, path, text.as_bytes()) {
-            sys::write("vvsh: НЕ УДАЛОСЬ записать ".as_bytes());
-            sys::write(path);
-            sys::write(b"\n");
-            bad = true;
+    let mut news: Vec<(&[u8], Vec<String>)> = Vec::new();
+
+    for t in &TPLS {
+        let cur = read_file(ep, t.path);
+        // Файл УЖЕ такой же, как шаблон, — писать нечего. Отдельный случай, а не «обновлён»:
+        // сказать «обновлено 9» там, где не изменилось ничего, значит приучить не читать отчёт.
+        let tpl_id = content_id(store, t.text.as_bytes());
+        if let Some(c) = &cur {
+            if tpl_id.is_some() && content_id(store, c) == tpl_id {
+                if seed_id(store, t.seed) != tpl_id {
+                    remember_seed(store, t.seed, t.text.as_bytes());
+                }
+                same += 1;
+                continue;
+            }
+        }
+        let untouched = match (&cur, seed_id(store, t.seed)) {
+            (None, _) => true,                       // файла нет — писать можно
+            (Some(c), Some(id)) => content_id(store, c) == Some(id),
+            (Some(_), None) => false,                // посев не помним — считаем правленым
+        };
+        if force || untouched {
+            // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` однажды доехал наполовину
+            // и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не бывало.
+            if !px::echo_to(ep, t.path, t.text.as_bytes()) {
+                sys::write("vvsh: НЕ УДАЛОСЬ записать ".as_bytes());
+                sys::write(t.path);
+                sys::write(b"\n");
+                bad = true;
+                continue;
+            }
+            remember_seed(store, t.seed, t.text.as_bytes());
+            if cur.is_none() {
+                written += 1;
+            } else {
+                updated += 1;
+            }
+            continue;
+        }
+        // Правленый файл: не трогаем, но говорим, чего в нём нет.
+        kept += 1;
+        let text = cur.unwrap_or_default();
+        let missing = missing_keys(t.text, &text);
+        if !missing.is_empty() {
+            news.push((t.path, missing));
         }
     }
+
     if bad {
         sys::write("vvsh: конфиг посеян НЕПОЛНО — чинить до `rebuild`\n".as_bytes());
         return;
     }
     sys::write(
-        "vvsh: посеян модульный конфиг /etc/system/*.vv. Правь net.vv (true/false),\n\
-         terminal.vv (режим экрана, клавиши), bar.vv (что в панели), packages.vv (пакеты)\n\
-         → `rebuild`.\n\
-         Править — редактором: `ved /etc/system/terminal.vv` (^S сохранить, ^Q выход).\n"
-            .as_bytes(),
+        alloc::format!(
+            "vvsh: конфиг сверен: создано {}, обновлено {}, без изменений {}, оставлено с правками {}\n",
+            written, updated, same, kept
+        )
+        .as_bytes(),
     );
+    for (path, keys) in &news {
+        sys::write(b"  ");
+        sys::write(path);
+        sys::write(" — ваши правки сохранены; в шаблоне появилось:\n".as_bytes());
+        for k in keys {
+            sys::write(alloc::format!("      {}…)\n", k).as_bytes());
+        }
+    }
+    if !news.is_empty() {
+        sys::write(
+            "  Дописать — руками, в нужный список: `ved <файл>` (^S сохранить, ^Q выход).\n\
+             Перезаписать файл шаблоном ЦЕЛИКОМ (правки пропадут): `init-config --force`.\n"
+                .as_bytes(),
+        );
+    }
+    if written > 0 {
+        sys::write(
+            "  Правь net.vv (true/false), terminal.vv (экран, клавиши), bar.vv (панель),\n\
+             packages.vv (пакеты) → `rebuild`.\n"
+                .as_bytes(),
+        );
+    }
 }
+
+/// Content-id посеянного в прошлый раз, если помним.
+fn seed_id(store: usize, root: &str) -> Option<[u8; 32]> {
+    let mut id = [0u8; 32];
+    (sys::obj_get_root(store, root.as_bytes(), &mut id) == 32).then_some(id)
+}
+
+/// Content-id этого содержимого. Store адресуется содержимым, поэтому «положить» равное значит
+/// получить тот же id и ни одного нового объекта.
+fn content_id(store: usize, data: &[u8]) -> Option<[u8; 32]> {
+    let mut id = [0u8; 32];
+    (sys::obj_put(store, data, &mut id) == 0).then_some(id)
+}
+
+fn remember_seed(store: usize, root: &str, data: &[u8]) {
+    if let Some(id) = content_id(store, data) {
+        sys::obj_set_root(store, root.as_bytes(), &id);
+    }
+}
+
+/// Ключи, которые есть в шаблоне и не УПОМЯНУТЫ в правленом файле.
+///
+/// Сравнение текстовое и намеренно грубое: ищем вхождения вида `имя("ключ"`. Разбирать
+/// правленый файл языком нельзя — он программа, и «ключа нет» надо понимать как «о нём нигде не
+/// написано», а не как «он не вычисляется». Закомментированный ключ считается упомянутым: человек
+/// про него знает и решил не включать — напоминать об этом было бы шумом.
+fn missing_keys(tpl: &str, cur: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let b = tpl.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'(' || i + 1 >= b.len() || b[i + 1] != b'"' {
+            i += 1;
+            continue;
+        }
+        // Имя функции — слово слева от скобки.
+        let mut s = i;
+        while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_' || b[s - 1] == b'-') {
+            s -= 1;
+        }
+        // Ключ — строка справа.
+        let Some(end) = b[i + 2..].iter().position(|&c| c == b'"') else { break };
+        let key = &b[s..i + 2 + end + 1];
+        i += 2 + end + 1;
+        if s == i || key.len() > 64 {
+            continue;
+        }
+        let Ok(k) = core::str::from_utf8(key) else { continue };
+        if out.iter().any(|x| x == k) {
+            continue;
+        }
+        if !contains(cur, key) {
+            out.push(String::from(k));
+        }
+    }
+    out
+}
+
+
 
 /// `rebuild` (подкоманда) — собрать поколение и выйти. Логика — в [`run_rebuild`].
 fn cmd_rebuild() -> ! {
@@ -1839,9 +2000,14 @@ fn sh_gens(_args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::nil())
 }
 
-/// `(init-config)` — посеять `/etc/system/*.vv` (модульный конфиг для правки → `rebuild`).
-fn sh_init_config(_args: &[Value]) -> Result<Value, EvalError> {
-    run_init_config();
+/// `(init-config [--force])` — посеять либо СВЕРИТЬ `/etc/system/*.vv` с шаблоном (Веха 191).
+///
+/// `--force` принимается и отсюда: сама подсказка команды советует набрать именно это, и
+/// отправлять человека запускать `vvsh` отдельной программой ради собственного совета было бы
+/// издевательством. Произнесённое вслух намерение — это и есть набранное слово.
+fn sh_init_config(args: &[Value]) -> Result<Value, EvalError> {
+    let force = args.iter().any(|a| matches!(a, Value::Str(s) if &**s == "--force"));
+    run_init_config(force);
     Ok(Value::nil())
 }
 
