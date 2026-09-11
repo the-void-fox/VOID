@@ -22,7 +22,14 @@
 
 #define IFNAMSIZ      16
 #define MAX_ADDR_LEN  32
+#include <linux/u64_stats_sync.h> /* Веха 193 — в ядре приезжает сюда транзитивно */
+
 #define ETH_ALEN      6
+/* Веха 193 — потолки MTU и длина имени счётчика в ethtool. Драйверы объявляют ими границы,
+ * которые сеть потом проверяет; числа взяты у Linux и своими быть не могут. */
+#define ETH_MIN_MTU   68
+#define ETH_MAX_MTU   0xFFFFU
+#define ETH_GSTRING_LEN 32
 
 /* Сокет-адрес (ndo_set_mac_address получает struct sockaddr *). */
 struct sockaddr {
@@ -126,12 +133,28 @@ struct napi_struct {
 
 struct ifreq; /* eth_ioctl */
 
+/* Веха 193 — 64-битная статистика интерфейса. Мы её не читаем, но структура обязана
+ * существовать: её адрес драйвер получает в `ndo_get_stats64` и заполняет целиком. */
+struct rtnl_link_stats64 {
+	u64 rx_packets, tx_packets, rx_bytes, tx_bytes;
+	u64 rx_errors, tx_errors, rx_dropped, tx_dropped;
+	u64 multicast, collisions;
+	u64 rx_length_errors, rx_over_errors, rx_crc_errors, rx_frame_errors;
+	u64 rx_fifo_errors, rx_missed_errors;
+	u64 tx_aborted_errors, tx_carrier_errors, tx_fifo_errors;
+	u64 tx_heartbeat_errors, tx_window_errors;
+};
+
 struct net_device_ops {
 	int         (*ndo_open)(struct net_device *dev);
 	int         (*ndo_stop)(struct net_device *dev);
 	netdev_tx_t (*ndo_start_xmit)(struct sk_buff *skb, struct net_device *dev);
 	void        (*ndo_set_rx_mode)(struct net_device *dev);
 	struct net_device_stats *(*ndo_get_stats)(struct net_device *dev);
+	/* Веха 193 — 64-битная статистика. Современные драйверы (8139too в том числе) дают ИМЕННО
+	 * её; мы её не читаем, но поле обязано стоять на своём месте в структуре — иначе
+	 * назначение уезжает в соседнее поле, и вместо статистики драйвер подменяет `ndo_start_xmit`. */
+	void        (*ndo_get_stats64)(struct net_device *dev, struct rtnl_link_stats64 *stats);
 	int         (*ndo_set_mac_address)(struct net_device *dev, void *addr);
 	int         (*ndo_validate_addr)(struct net_device *dev);
 	int         (*ndo_change_mtu)(struct net_device *dev, int new_mtu);
@@ -200,6 +223,40 @@ void __napi_schedule(struct napi_struct *napi);
 bool napi_schedule_prep(struct napi_struct *napi);
 bool napi_complete_done(struct napi_struct *napi, int work_done);
 void napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
+/* Веха 193 — приём кадра МИМО GRO. Разница в Linux существенная (склейка сегментов), у нас —
+ * нет: склеивать некому, оба пути ведут к одному стеку. */
+void netif_receive_skb(struct sk_buff *skb);
+
+/* Замок самого netdev (появился в ядре 6.15, когда NAPI стали включать под ним). У нас нить
+ * одна и планировщик кооперативный — замыкать нечего; форма сохранена, чтобы чужой код,
+ * рассчитывающий на неё, компилировался неизменённым. */
+static inline void netdev_lock(struct net_device *dev)   { (void)dev; }
+static inline void netdev_unlock(struct net_device *dev) { (void)dev; }
+static inline void napi_enable_locked(struct napi_struct *napi)  { napi_enable(napi); }
+static inline void napi_disable_locked(struct napi_struct *napi) { napi_disable(napi); }
+
+/* RCU: у нас нет ни читателей в других нитях, ни отложенного освобождения. Ждать нечего. */
+static inline void synchronize_rcu(void) { }
+
+/* Сколько групповых адресов просили слушать. Список у нас есть (`netdev_hw_addr_list mc`), и
+ * драйвер по этому числу решает, включать ли приём всех групповых кадров. */
+static inline int netdev_mc_count(const struct net_device *dev) { return dev->mc.count; }
+
+/* Перелить 32-битную статистику в 64-битную. Полей много, но перекладывание механическое. */
+static inline void netdev_stats_to_stats64(struct rtnl_link_stats64 *s64,
+					   const struct net_device_stats *s)
+{
+	s64->rx_packets = s->rx_packets;
+	s64->tx_packets = s->tx_packets;
+	s64->rx_bytes   = s->rx_bytes;
+	s64->tx_bytes   = s->tx_bytes;
+	s64->rx_errors  = s->rx_errors;
+	s64->tx_errors  = s->tx_errors;
+	s64->rx_dropped = s->rx_dropped;
+	s64->tx_dropped = s->tx_dropped;
+	s64->multicast  = s->multicast;
+	s64->collisions = s->collisions;
+}
 static inline void napi_schedule(struct napi_struct *napi)
 { if (napi_schedule_prep(napi)) __napi_schedule(napi); }
 

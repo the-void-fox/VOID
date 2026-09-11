@@ -11,6 +11,8 @@
 #define VLAN_VID_MASK      0x0fff
 #define VLAN_HLEN          4
 #define VLAN_ETH_FRAME_LEN 1518
+/* Заголовок Ethernet вместе с меткой VLAN: 14 + 4. Драйвер считает по нему запас в буфере. */
+#define VLAN_ETH_HLEN      18
 
 /* skb с VLAN-тегом: у нас offload VLAN пока не задействован → тега нет. */
 static inline bool skb_vlan_tag_present(const struct sk_buff *skb) { (void)skb; return false; }

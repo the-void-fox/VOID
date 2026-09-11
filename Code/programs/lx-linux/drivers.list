@@ -21,3 +21,4 @@
 
 lx-atl1c-hw    atl1c  drv_atl1c.c       atl1c_hw.c
 lx-atl1c-full  atl1c  drv_atl1c_full.c  atl1c_main.c,atl1c_hw.c
+lx-8139too    rtl8139  drv_8139too.c     8139too.c

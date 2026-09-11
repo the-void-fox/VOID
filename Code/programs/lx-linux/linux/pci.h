@@ -44,6 +44,10 @@ struct pci_device_id {
 #define PCI_VENDOR_ID_INTEL    0x8086
 #define PCI_VENDOR_ID_VMWARE   0x15ad
 #define PCI_VENDOR_ID_ATTANSIC 0x1969
+#define PCI_VENDOR_ID_ATHEROS  0x168c
+#define PCI_VENDOR_ID_REALTEK  0x10ec
+#define PCI_DEVICE_ID_REALTEK_8129 0x8129
+#define PCI_DEVICE_ID_REALTEK_8139 0x8139
 
 /* Число стандартных BAR'ов заголовка Type 0. */
 #define PCI_STD_NUM_BARS 6
@@ -195,6 +199,11 @@ int  pcie_set_readrq(struct pci_dev *dev, int rq);
 int  pcie_capability_write_word(struct pci_dev *dev, int pos, u16 val);
 int  pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val);
 void __iomem *pci_ioremap_bar(struct pci_dev *dev, int bar);
+/* Веха 193 — `pci_iomap` отличается от `pci_ioremap_bar` тем, что умеет и порты ввода-вывода.
+ * Портов у нас нет вовсе (PIO из userspace VOID недоступен), поэтому для MMIO-окна это одно и
+ * то же, а для BAR с портами честно выйдет NULL — и драйвер увидит отказ, а не мусор. */
+void __iomem *pci_iomap(struct pci_dev *dev, int bar, unsigned long max);
+void pci_iounmap(struct pci_dev *dev, void __iomem *addr);
 
 /* Аксессоры BAR (linux/pci.h — inline поверх resource[]). */
 static inline resource_size_t pci_resource_start(const struct pci_dev *dev, int bar)

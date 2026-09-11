@@ -153,8 +153,12 @@ void_qemu_net() {
     case "$nic" in
         virtio) dev="virtio-net-pci,netdev=net0,disable-legacy=on" ;;
         e1000)  dev="e1000,netdev=net0" ;;
+        # Веха 193 — RTL8139: на ней проверяется НЕИЗМЕНЁННЫЙ `8139too.c` из Linux. Ради неё
+        # карта и добавлена: до сих пор чужой драйвер (atl1c) можно было поднять только на живом
+        # ноутбуке, а эту QEMU эмулирует — значит проверка перестала требовать железа.
+        rtl8139) dev="rtl8139,netdev=net0" ;;
         *)
-            echo "стенд: не понимаю карту '$nic' (virtio | e1000 | none)" >&2
+            echo "стенд: не понимаю карту '$nic' (virtio | e1000 | rtl8139 | none)" >&2
             return 2
             ;;
     esac

@@ -11,6 +11,11 @@
 #include <linux/container_of.h> /* container_of() — базовая идиома, вынесена отдельно */
 #include <linux/types.h>
 #include <linux/compiler.h>     /* likely/unlikely/fallthrough/READ_ONCE — нужны почти всему коду */
+/* Веха 193 — коды ошибок и «ошибка в указателе». В ядре они приезжают сюда транзитивно через
+ * десяток заголовков, и чужой код на это рассчитывает: `8139too.c` пользуется ENODEV и ERR_PTR,
+ * не включая ни `errno.h`, ни `err.h`. Держать их здесь честнее, чем дописывать включения в
+ * НЕИЗМЕНЁННЫЙ файл. */
+#include <linux/err.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 

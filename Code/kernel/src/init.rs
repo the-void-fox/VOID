@@ -231,6 +231,11 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
             // PCIe, и обход одной шины её не находил. Окно регистров у этих карт — 256 КиБ.
             #[cfg(target_arch = "x86_64")]
             "atl1c" => crate::arch::probe_bar0(0x1969, 0x1083, 0x40000).map(|b| (b, 0x40000usize)),
+            // Веха 193 — RTL8139. Окно регистров в BAR1, а не в нулевом: в BAR0 у этой карты
+            // порты ввода-вывода, до которых из userspace VOID не дотянуться. Файл регистров
+            // 256 байт, но выдаём страницу — меньше отображать нечем.
+            #[cfg(target_arch = "x86_64")]
+            "rtl8139" => crate::arch::probe_bar(0x10ec, 0x8139, 1, 0x1000).map(|b| (b, 0x1000usize)),
             // Веха 97 — ЭКРАН как обычное устройство под capability: терминал получает окно
             // фреймбуфера и рисует сам. Ядро при этом умолкает (см. fb::give_to_user).
             "fb" => crate::arch::video_window(),
@@ -557,6 +562,39 @@ pub fn boot() {
                     );
                 }
                 _ => println!("  [init] {}: не удалось выдать MMIO/DMA cap (пропуск)", driver),
+            }
+        }
+    }
+
+    // Веха 193 — RTL8139 как userspace-драйвер поверх НЕИЗМЕНЁННОГО `8139too.c` из Linux.
+    //
+    // Второй драйвер того же класса, и в этом весь смысл: им меряется конвейер Вехи 192.
+    // Карта выбрана не по распространённости, а по проверяемости — RTL8139 эмулирует QEMU, и
+    // впервые чужой драйвер можно поднять, не доставая ноутбук (`run.sh --net rtl8139`).
+    #[cfg(target_arch = "x86_64")]
+    if let Some(base) = arch::probe_bar(0x10ec, 0x8139, 1, 0x1000) {
+        println!("  [init] найдена RTL8139 (10ec:8139), регистры {:#x}", base);
+        if let Some(pid) = spawn("lx-8139too") {
+            match (mint_cap(pid, "mmio:rtl8139", &[]), mint_cap(pid, "dma", &[])) {
+                (Some(m), Some(d)) => {
+                    proc::set_arg(pid, m);
+                    proc::set_arg2(pid, d);
+                    proc::push_start_cap(pid, m);
+                    proc::push_start_cap(pid, d);
+                    let irq = arch::intx_irq_setup(0x10ec, 0x8139).map(|vec| {
+                        cap::mint(proc::domain(pid), cap::Target::Irq { vector: vec },
+                                  Rights::READ).bits() as usize
+                    });
+                    if let Some(i) = irq {
+                        proc::push_start_cap(pid, i);
+                    }
+                    println!(
+                        "  [init] userspace-драйвер lx-8139too P{} — выданы MMIO+DMA{} cap",
+                        pid,
+                        if irq.is_some() { "+IRQ" } else { "" },
+                    );
+                }
+                _ => println!("  [init] lx-8139too: не удалось выдать MMIO/DMA cap (пропуск)"),
             }
         }
     }

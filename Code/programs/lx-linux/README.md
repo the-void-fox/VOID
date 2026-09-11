@@ -88,6 +88,12 @@ Vendored (**НЕИЗМЕНЁННЫЕ**, verbatim из Linux **6.18.7**, GPL-2.0,
   OS-adaptation слой (`er32`/`ew32`→`readl`/`writel`). Собираются с ядровыми флагами
   (`-Wno-unused-parameter`/`-Wno-pointer-sign`).
 
+- **`linux-src/rtl8139/8139too.c`** — **второй настоящий драйвер** (Веха 193): RTL8139 целиком,
+  2600 строк, `drivers/net/ethernet/realtek/`. Взят вместо `r8169` осознанно: тот ходит в PHY
+  через `<linux/phy.h>`, то есть тянет ПОДСИСТЕМУ phylib, а у этого PHY свой, через `mii.h`.
+  Проверяется в QEMU (`--net user` + `VOID_QEMU_NIC=rtl8139`) — первый чужой драйвер, которому
+  не нужен живой ноутбук.
+
 Наши шим-заголовки `linux/*.h` + `asm/*.h` (lx_emul: дают ядровому коду ровно тот API, что он ждёт, под VOID):
 - `types.h`, `export.h`, `sched.h` — минимум под sort.c (Веха 55).
 - `kernel.h`, `slab.h`, `gfp.h`, `string.h`, `ctype.h`, `printk.h` — под argv_split.c (Веха 56):

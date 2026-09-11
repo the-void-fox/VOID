@@ -17,9 +17,110 @@ struct ethtool_eeprom {
 };
 
 /* Полный набор ethtool-операций поднимем с e1000_ethtool.c; пока — то, что дёргает e1000_main.c. */
+/* Веха 193 — Wake-on-LAN. Пробуждать VOID по сети некому и нечем (сна у нас ещё нет), но
+ * драйвер объявляет поддержку в своих ethtool-операциях, и структура обязана существовать. */
+#define WAKE_PHY    (1 << 0)
+#define WAKE_UCAST  (1 << 1)
+#define WAKE_MCAST  (1 << 2)
+#define WAKE_BCAST  (1 << 3)
+#define WAKE_ARP    (1 << 4)
+#define WAKE_MAGIC  (1 << 5)
+#define WAKE_MAGICSECURE (1 << 6)
+
+struct ethtool_wolinfo {
+	u32 cmd;
+	u32 supported;
+	u32 wolopts;
+	u8  sopass[6];
+};
+
+/* ─ Веха 193: поверхность ethtool ─
+ *
+ * На atl1c её удалось обойти: `atl1c_ethtool.c` просто не линковался, потому что жил отдельным
+ * файлом. У `8139too.c` операции ethtool лежат ВНУТРИ самого драйвера, и выбора нет — структуры
+ * приходится завести.
+ *
+ * Утилиты `ethtool` у нас по-прежнему нет, и заполненные драйвером поля никто не читает. Но
+ * структура обязана совпадать по ФОРМЕ: `memcpy` в `bus_info` длиной 32 байта не спросит, сколько
+ * места мы отвели на самом деле.
+ */
+struct ethtool_drvinfo {
+	u32  cmd;
+	char driver[32];
+	char version[32];
+	char fw_version[32];
+	char bus_info[32];
+	char erom_version[32];
+	char reserved2[12];
+	u32  n_priv_flags;
+	u32  n_stats;
+	u32  testinfo_len;
+	u32  eedump_len;
+	u32  regdump_len;
+};
+
+struct ethtool_regs {
+	u32 cmd;
+	u32 version;
+	u32 len;
+	u8  data[0];
+};
+
+struct ethtool_stats {
+	u32 cmd;
+	u32 n_stats;
+	u64 data[0];
+};
+
+/* Набор строк, который запрашивает ethtool. Нам важен только `ETH_SS_STATS`: по нему драйвер
+ * отвечает числом своих счётчиков. */
+#define ETH_SS_TEST       0
+#define ETH_SS_STATS      1
+#define ETH_SS_PRIV_FLAGS 2
+
+/* Современная форма описания линка (пришла на смену `ethtool_cmd`): скорость, дуплекс и битовые
+ * карты режимов. Карты у нас сведены к одному слову — драйверам RTL/MII больше и не нужно. */
+struct ethtool_link_ksettings {
+	struct {
+		u32 cmd;
+		u32 speed;
+		u8  duplex;
+		u8  port;
+		u8  phy_address;
+		u8  autoneg;
+		u8  mdio_support;
+		u8  eth_tp_mdix;
+		u8  eth_tp_mdix_ctrl;
+		s8  link_mode_masks_nwords;
+	} base;
+	struct {
+		u32 supported;
+		u32 advertising;
+		u32 lp_advertising;
+	} link_modes;
+};
+
 struct ethtool_ops {
 	int (*get_eeprom_len)(struct net_device *dev);
 	int (*get_eeprom)(struct net_device *dev, struct ethtool_eeprom *eeprom, u8 *data);
+	/* Веха 193 — то, что объявляет `8139too`. Порядок полей значения не имеет (назначение по
+	 * имени), важно лишь, чтобы имя и тип совпадали с ожиданием чужого кода. */
+	void (*get_drvinfo)(struct net_device *dev, struct ethtool_drvinfo *info);
+	int  (*get_regs_len)(struct net_device *dev);
+	void (*get_regs)(struct net_device *dev, struct ethtool_regs *regs, void *p);
+	int  (*nway_reset)(struct net_device *dev);
+	u32  (*get_link)(struct net_device *dev);
+	u32  (*get_msglevel)(struct net_device *dev);
+	void (*set_msglevel)(struct net_device *dev, u32 level);
+	void (*get_wol)(struct net_device *dev, struct ethtool_wolinfo *wol);
+	int  (*set_wol)(struct net_device *dev, struct ethtool_wolinfo *wol);
+	void (*get_strings)(struct net_device *dev, u32 stringset, u8 *data);
+	int  (*get_sset_count)(struct net_device *dev, int sset);
+	void (*get_ethtool_stats)(struct net_device *dev, struct ethtool_stats *stats, u64 *data);
+	int  (*get_link_ksettings)(struct net_device *dev,
+				   struct ethtool_link_ksettings *cmd);
+	int  (*set_link_ksettings)(struct net_device *dev,
+				   const struct ethtool_link_ksettings *cmd);
 };
 
 /* Скорость/дуплекс линка (uapi/linux/ethtool.h). */
@@ -46,5 +147,14 @@ struct ethtool_ops {
 #define ADVERTISED_1000baseT_Half (1UL << 4)
 #define ADVERTISED_1000baseT_Full (1UL << 5)
 #define ADVERTISED_Autoneg        (1UL << 6)
+
+struct mii_if_info;
+
+/* Помощники MII поверх ethtool: драйвер перекладывает на них всю работу с линком. */
+int mii_ethtool_get_link_ksettings(struct mii_if_info *mii,
+				   struct ethtool_link_ksettings *cmd);
+int mii_ethtool_set_link_ksettings(struct mii_if_info *mii,
+				   const struct ethtool_link_ksettings *cmd);
+int mii_nway_restart(struct mii_if_info *mii);
 
 #endif /* _LINUX_ETHTOOL_H_SHIM */

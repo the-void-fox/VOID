@@ -56,10 +56,21 @@ struct mii_if_info {
 	int advertising;
 	int phy_id_mask;
 	int reg_num_mask;
+	/* Веха 193 — состояние согласования, которое драйвер держит САМ. 8139too выставляет их в
+	 * `ndo_open` и читает в обработчике смены линка; у Linux эти поля в той же структуре. */
+	unsigned int full_duplex : 1;
+	unsigned int force_media : 1;
+	unsigned int supports_gmii : 1;
 	struct net_device *dev;
 	int (*mdio_read)(struct net_device *dev, int phy_id, int location);
 	void (*mdio_write)(struct net_device *dev, int phy_id, int location, int val);
 };
+
+/* Веха 193 — опрос линка через MII: читает BMSR и, если состояние изменилось, зовёт
+ * `netif_carrier_on/off`. Реализация — в Lx_kit: она короткая, но требует netdev. */
+unsigned int mii_check_media(struct mii_if_info *mii, unsigned int ok_to_print,
+			     unsigned int init_media);
+int mii_link_ok(struct mii_if_info *mii);
 
 /* MII-ioctl'ы (uapi/linux/sockios.h). */
 #define SIOCGMIIPHY 0x8947
@@ -82,6 +93,12 @@ struct ifreq {
 	} ifr_ifru;
 };
 #define ifr_data ifr_ifru.ifru_data
+
+/* Обработка MII-ioctl'ов из userspace. Пользователя, который их шлёт, у нас нет — `ifconfig`
+ * в VOID не существует, — но драйвер объявляет обработчик, и звать его должно быть чем.
+ * Объявление стоит ПОСЛЕ `struct mii_ioctl_data`: она определена здесь же, ниже по файлу. */
+int generic_mii_ioctl(struct mii_if_info *mii, struct mii_ioctl_data *mii_data, int cmd,
+		      unsigned int *duplex_changed);
 
 static inline struct mii_ioctl_data *if_mii(struct ifreq *rq)
 { return (struct mii_ioctl_data *)&rq->ifr_ifru; }

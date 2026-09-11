@@ -92,6 +92,12 @@ void skb_free_frag(void *data);
 void *skb_put(struct sk_buff *skb, unsigned int len);
 void *skb_put_data(struct sk_buff *skb, const void *data, unsigned int len);
 void  skb_reserve(struct sk_buff *skb, int len);
+/* Веха 193 — копирование в линейную часть и копирование с досчётом контрольной суммы.
+ * Досчёта у нас нет: карта считает сумму сама, а программная ветка нужна была бы только для
+ * устройств без этой возможности. Пока такого устройства нет, честнее копировать и молчать,
+ * чем считать сумму, которую никто не проверит. */
+void  skb_copy_to_linear_data(struct sk_buff *skb, const void *from, unsigned int len);
+void  skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to);
 void  skb_trim(struct sk_buff *skb, unsigned int len);
 int   skb_cow_head(struct sk_buff *skb, unsigned int headroom);
 int   skb_pad(struct sk_buff *skb, int pad);

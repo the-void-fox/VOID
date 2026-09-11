@@ -17,6 +17,8 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/netdevice.h>
+#include <linux/ethtool.h>
+#include <linux/mii.h>
 #include <linux/pci.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -403,9 +405,118 @@ void __napi_schedule(struct napi_struct *napi) { (void)napi; }
 bool napi_schedule_prep(struct napi_struct *napi) { (void)napi; return false; }
 bool napi_complete_done(struct napi_struct *napi, int work_done) { (void)napi; (void)work_done; return true; }
 void napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb) { (void)napi; dev_kfree_skb(skb); }
+/* Веха 193 — приём мимо GRO. Разница с предыдущим у нас нулевая: склеивать сегменты некому,
+ * стека над драйвером ещё нет, и оба пути кончаются одним — кадр посчитан и отпущен. */
+void netif_receive_skb(struct sk_buff *skb) { dev_kfree_skb(skb); }
 struct sk_buff *napi_get_frags(struct napi_struct *napi) { (void)napi; return NULL; }
 void napi_free_frags(struct napi_struct *napi) { (void)napi; }
 int  napi_gro_frags(struct napi_struct *napi) { (void)napi; return 0; }
+
+/* ─ MII: опрос линка (Веха 193) ─
+ *
+ * `mii_check_media` в Linux читает BMSR, сравнивает с прошлым состоянием и объявляет
+ * `netif_carrier_on/off`. Бит BMSR_LSTATUS ЗАЛИПАЮЩИЙ: он помнит, что линк пропадал, поэтому
+ * читать его надо дважды — первое чтение сбрасывает память, второе говорит правду. Урок этот
+ * уже оплачен на atl1c (Веха 133), и повторять его здесь не будем.
+ */
+int mii_link_ok(struct mii_if_info *mii)
+{
+	int bmsr;
+
+	if (!mii || !mii->mdio_read)
+		return 0;
+	mii->mdio_read(mii->dev, mii->phy_id, MII_BMSR);       /* сбросить залипание */
+	bmsr = mii->mdio_read(mii->dev, mii->phy_id, MII_BMSR);
+	return (bmsr & BMSR_LSTATUS) ? 1 : 0;
+}
+
+/* CRC32 адреса для фильтра групповых кадров. `ether_crc_le` у нас уже есть (Веха 68); это её
+ * старший-битом-вперёд близнец, которым пользуются старые карты — RTL8139 в их числе. */
+u32 ether_crc(int length, unsigned char *data)
+{
+	u32 crc = 0xffffffff;
+	int i;
+
+	while (--length >= 0) {
+		u8 c = *data++;
+
+		for (i = 0; i < 8; i++, c >>= 1)
+			crc = (crc << 1) ^ ((((crc >> 31) ^ c) & 1) ? 0x04c11db7 : 0);
+	}
+	return crc;
+}
+
+/* MII-ioctl из userspace. Слать их у нас некому — `ifconfig` в VOID не существует, — но
+ * обработчик драйвера объявлен, и звать его должно быть чем. Отвечаем честным отказом, а не
+ * правдоподобным нулём: молчаливый успех здесь означал бы «PHY настроен», когда он не тронут. */
+int generic_mii_ioctl(struct mii_if_info *mii, struct mii_ioctl_data *mii_data, int cmd,
+		      unsigned int *duplex_changed)
+{
+	(void)mii; (void)mii_data; (void)cmd;
+	if (duplex_changed)
+		*duplex_changed = 0;
+	return -EOPNOTSUPP;
+}
+
+/* Перезапуск автосогласования: взвести BMCR_ANRESTART поверх BMCR_ANENABLE. */
+int mii_nway_restart(struct mii_if_info *mii)
+{
+	int bmcr;
+
+	if (!mii || !mii->mdio_read || !mii->mdio_write)
+		return -EINVAL;
+	bmcr = mii->mdio_read(mii->dev, mii->phy_id, MII_BMCR);
+	if (!(bmcr & BMCR_ANENABLE))
+		return -EINVAL;
+	mii->mdio_write(mii->dev, mii->phy_id, MII_BMCR, bmcr | BMCR_ANRESTART);
+	return 0;
+}
+
+/* Описание линка для ethtool. Читателя у этих чисел пока нет — утилиты `ethtool` в VOID не
+ * существует, — но заполняем честно: молча оставить нули значило бы соврать первому же, кто
+ * сюда посмотрит. */
+int mii_ethtool_get_link_ksettings(struct mii_if_info *mii,
+				   struct ethtool_link_ksettings *cmd)
+{
+	int bmcr, lpa;
+
+	if (!mii || !mii->mdio_read)
+		return -EINVAL;
+	bmcr = mii->mdio_read(mii->dev, mii->phy_id, MII_BMCR);
+	lpa  = mii->mdio_read(mii->dev, mii->phy_id, MII_LPA);
+	cmd->base.phy_address = mii->phy_id;
+	cmd->base.autoneg = (bmcr & BMCR_ANENABLE) ? 1 : 0;
+	cmd->base.duplex = mii->full_duplex ? 1 : 0;
+	cmd->base.speed = (lpa & (LPA_100FULL | LPA_100HALF)) ? 100 : 10;
+	cmd->link_modes.lp_advertising = (u32)lpa;
+	cmd->link_modes.advertising = (u32)mii->advertising;
+	return 0;
+}
+
+int mii_ethtool_set_link_ksettings(struct mii_if_info *mii,
+				   const struct ethtool_link_ksettings *cmd)
+{
+	/* Задавать скорость руками мы не умеем и делать вид не будем: у драйвера и так есть
+	 * автосогласование, а неполная реализация здесь молча расходилась бы с тем, что на
+	 * проводе. Отказ увидит тот, кто попросил, — и это правда. */
+	(void)mii; (void)cmd;
+	return -EOPNOTSUPP;
+}
+
+unsigned int mii_check_media(struct mii_if_info *mii, unsigned int ok_to_print,
+			     unsigned int init_media)
+{
+	int ok = mii_link_ok(mii);
+
+	(void)init_media;
+	if (ok)
+		netif_carrier_on(mii->dev);
+	else
+		netif_carrier_off(mii->dev);
+	if (ok_to_print)
+		printk("[mii] линк %s\n", ok ? "есть" : "пропал");
+	return ok ? 1 : 0;
+}
 
 /* ─ sk_buff: аллокация/линейка (реальные — на них встанет TX/RX) ─ */
 static struct sk_buff *lx_skb_alloc(unsigned int len)
@@ -460,6 +571,14 @@ void *skb_put(struct sk_buff *skb, unsigned int len)
 void *skb_put_data(struct sk_buff *skb, const void *data, unsigned int len)
 { void *tail = skb_put(skb, len); memcpy(tail, data, len); return tail; }
 void skb_reserve(struct sk_buff *skb, int len) { skb->data += len; skb->tail += len; }
+void skb_copy_to_linear_data(struct sk_buff *skb, const void *from, unsigned int len)
+{ memcpy(skb->data, from, len); }
+/* Досчёта контрольной суммы у нас НЕТ, и это сказано вслух. В Linux эта функция копирует кадр
+ * и попутно считает сумму для карт, которые не умеют считать её сами. RTL8139 умеет; появится
+ * карта, которая не умеет, — сумму придётся считать здесь, и молчаливое копирование станет
+ * ошибкой, которую будет искать не в этом файле. */
+void skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to)
+{ memcpy(to, skb->data, skb->len); }
 void skb_trim(struct sk_buff *skb, unsigned int len)
 { if (len < skb->len) { skb->len = len; skb->tail = skb->data + len; } }
 int  skb_cow_head(struct sk_buff *skb, unsigned int headroom) { (void)skb; (void)headroom; return 0; }

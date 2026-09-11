@@ -17,6 +17,9 @@ typedef enum irqreturn {
 
 typedef irqreturn_t (*irq_handler_t)(int irq, void *dev_id);
 
+/* Веха 193 — идиома «обработал ли я прерывание»: ненулевое значит да. */
+#define IRQ_RETVAL(x) ((x) ? IRQ_HANDLED : IRQ_NONE)
+
 #define IRQF_SHARED     0x00000080
 #define IRQF_PROBE_SHARED 0x00000100
 #define IRQF_NO_THREAD  0x00010000

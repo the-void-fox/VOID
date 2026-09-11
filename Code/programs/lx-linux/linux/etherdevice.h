@@ -31,6 +31,10 @@ static inline bool is_broadcast_ether_addr(const u8 *addr)
 { return (addr[0] & addr[1] & addr[2] & addr[3] & addr[4] & addr[5]) == 0xff; }
 static inline bool is_valid_ether_addr(const u8 *addr)
 { return !is_multicast_ether_addr(addr) && !is_zero_ether_addr(addr); }
+/* Веха 193 — CRC32 адреса, старший бит вперёд. Им старые карты (RTL8139 в их числе) считают
+ * номер корзины в фильтре групповых кадров; `ether_crc_le` — её младший-битом близнец. */
+u32 ether_crc(int length, unsigned char *data);
+
 static inline void eth_broadcast_addr(u8 *addr) { memset(addr, 0xff, ETH_ALEN); }
 static inline void eth_zero_addr(u8 *addr) { memset(addr, 0x00, ETH_ALEN); }
 static inline void ether_addr_copy(u8 *dst, const u8 *src) { memcpy(dst, src, ETH_ALEN); }

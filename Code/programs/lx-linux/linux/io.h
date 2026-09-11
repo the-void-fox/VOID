@@ -55,4 +55,23 @@ static inline void iowrite32(u32 v, volatile void *a) { writel(v, a); }
 static inline void *ioremap(phys_addr_t phys, size_t size) { (void)size; return (void *)phys; }
 static inline void iounmap(volatile void *addr) { (void)addr; }
 
+/* Веха 193 — блочное чтение/запись окна MMIO. У нас окно отображено обычной памятью, поэтому
+ * это memcpy; на архитектурах со строгим доступом к устройствам здесь были бы честные readl в
+ * цикле, и различие однажды придётся вспомнить. */
+static inline void memcpy_fromio(void *to, const volatile void __iomem *from, size_t count)
+{
+	const volatile u8 __iomem *s = from;
+	u8 *d = to;
+	while (count--)
+		*d++ = *s++;
+}
+
+static inline void memcpy_toio(volatile void __iomem *to, const void *from, size_t count)
+{
+	volatile u8 __iomem *d = to;
+	const u8 *s = from;
+	while (count--)
+		*d++ = *s++;
+}
+
 #endif /* _LINUX_IO_H_SHIM */

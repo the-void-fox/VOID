@@ -893,6 +893,30 @@ void __iomem *pci_ioremap_bar(struct pci_dev *dev, int bar)
 	return ioremap(pci_resource_start(dev, bar), pci_resource_len(dev, bar));
 }
 
+/* Веха 193 — `pci_iomap` отличается от предыдущего тем, что в Linux умеет ОБА вида BAR: и
+ * память, и порты ввода-вывода. Портов у нас нет вовсе — из userspace VOID к ним не дотянуться,
+ * — поэтому окно памяти отображается как обычно, а на порты возвращается NULL.
+ *
+ * NULL здесь не отговорка, а правильный ответ: драйвер, увидев его, честно переключится на
+ * другой BAR или откажется (`8139too` делает первое). Отдать вместо этого что-нибудь
+ * правдоподобное значило бы получить чтение мусора вместо регистров и искать причину в железе. */
+void __iomem *pci_iomap(struct pci_dev *dev, int bar, unsigned long max)
+{
+	unsigned long len = pci_resource_len(dev, bar);
+
+	if (!(pci_resource_flags(dev, bar) & IORESOURCE_MEM))
+		return NULL;
+	if (max && len > max)
+		len = max;
+	return ioremap(pci_resource_start(dev, bar), len);
+}
+
+void pci_iounmap(struct pci_dev *dev, void __iomem *addr)
+{
+	(void)dev;
+	iounmap(addr);
+}
+
 /* ─ конфиг-пространство: little-endian чтение/запись над lx_config[] ─ */
 int pci_read_config_byte(struct pci_dev *dev, int where, u8 *val)
 {
