@@ -232,6 +232,13 @@ pub fn probe_virtio_blk() -> Option<crate::arch::BlkDevice> {
 pub const MAX_DISKS: usize = 8;
 
 /// Веха 174 — перечисление портов AHCI. Заглушка по той же причине, что и [`probe_ahci`].
+/// Веха 194 — NVMe на riscv/QEMU-virt нет: шина PCI там есть, но диск приходит через virtio.
+/// Стоит рядом с двойником AHCI и по той же причине — общий код спрашивает одинаково, а
+/// отвечает каждая архитектура своё.
+pub fn probe_nvme() -> Option<usize> {
+    None
+}
+
 pub fn probe_ahci_ports() -> Option<(usize, [u32; MAX_DISKS], usize)> {
     None
 }

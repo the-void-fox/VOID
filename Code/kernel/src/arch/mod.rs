@@ -91,7 +91,7 @@ pub use imp::{
     e1000_irq_setup, probe_e1000, probe_virtio_blk, probe_virtio_net,
     // Веха 174 — ВСЕ порты AHCI с дисками и потолок их числа: установщик спрашивает человека,
     // куда ставить, и список из одного диска на машине с двумя — не выбор, а лотерея.
-    probe_ahci_ports, MAX_DISKS,
+    probe_ahci_ports, probe_nvme, MAX_DISKS,
     // virtio-rng (долг Вехи 86, закрыт перед 95): аппаратная энтропия от гипервизора
     probe_virtio_rng,
     userdrv_irq_arm,

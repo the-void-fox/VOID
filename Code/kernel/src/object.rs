@@ -33,6 +33,8 @@ enum Medium {
     Virtio = 0,
     Ahci = 1,
     Ram = 2,
+    /// Веха 194 — диск NVMe. У современных ноутбуков SATA часто нет вовсе.
+    Nvme = 3,
 }
 
 static MEDIUM: AtomicU8 = AtomicU8::new(Medium::Virtio as u8);
@@ -41,6 +43,7 @@ fn medium() -> Medium {
     match MEDIUM.load(Ordering::Relaxed) {
         1 => Medium::Ahci,
         2 => Medium::Ram,
+        3 => Medium::Nvme,
         _ => Medium::Virtio,
     }
 }
@@ -48,6 +51,11 @@ fn medium() -> Medium {
 /// Переключить носитель store на AHCI (зовёт `kmain`, когда `ahci::init()` удался).
 pub fn use_ahci() {
     MEDIUM.store(Medium::Ahci as u8, Ordering::Relaxed);
+}
+
+/// Веха 194 — носителем становится диск NVMe (современные машины: SATA там часто нет вовсе).
+pub fn use_nvme() {
+    MEDIUM.store(Medium::Nvme as u8, Ordering::Relaxed);
 }
 
 /// Веха 171 — носителем становится образ в оперативной памяти (загрузка с ISO, диска нет).
@@ -62,6 +70,7 @@ impl BlockIo for Disk {
     fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR]) -> bool {
         match medium() {
             Medium::Ahci => ahci::read(sector, buf),
+            Medium::Nvme => crate::nvme::read(sector, buf),
             Medium::Ram => crate::ramdisk::read(sector, buf),
             Medium::Virtio => virtio_blk::read(sector, buf),
         }
@@ -69,6 +78,7 @@ impl BlockIo for Disk {
     fn write(&mut self, sector: u64, buf: &[u8; SECTOR]) -> bool {
         match medium() {
             Medium::Ahci => ahci::write(sector, buf),
+            Medium::Nvme => crate::nvme::write(sector, buf),
             Medium::Ram => crate::ramdisk::write(sector, buf),
             Medium::Virtio => virtio_blk::write(sector, buf),
         }
@@ -78,6 +88,7 @@ impl BlockIo for Disk {
     fn capacity(&mut self) -> u64 {
         match medium() {
             Medium::Ahci => ahci::capacity_sectors(),
+            Medium::Nvme => crate::nvme::capacity_sectors(),
             Medium::Ram => crate::ramdisk::capacity_sectors(),
             Medium::Virtio => virtio_blk::capacity_sectors(),
         }

@@ -92,13 +92,26 @@ void_qemu_machine() {
         fi
         return 0
     fi
+    # Веха 194 — КАКОЙ КОНТРОЛЛЕР у диска. Умолчание прежнее (AHCI: ближе всего к машине
+    # владельца), `VOID_QEMU_DISK=nvme` даёт NVMe — то, что стоит в ноутбуках новее ~2016, где
+    # SATA часто нет вовсе. Образ и загрузка те же: SeaBIOS умеет грузиться с NVMe.
+    local disk="${VOID_QEMU_DISK:-ahci}"
+    local ctrl=()
+    case "$disk" in
+        ahci) ctrl=(-device ich9-ahci,id=a
+                    -drive "if=none,id=d,file=$img,format=raw"
+                    -device ide-hd,drive=d,bus=a.0) ;;
+        nvme) ctrl=(-drive "if=none,id=d,file=$img,format=raw"
+                    -device nvme,drive=d,serial=void0) ;;
+        *)
+            echo "стенд: не понимаю диск '$disk' (ahci | nvme)" >&2
+            return 2 ;;
+    esac
     printf '%s\n' \
         -machine q35 \
         -smp "$smp" \
         -m "$mem" \
-        -device ich9-ahci,id=a \
-        -drive "if=none,id=d,file=$img,format=raw" \
-        -device ide-hd,drive=d,bus=a.0 \
+        "${ctrl[@]}" \
         -boot c \
         -device virtio-rng-pci,disable-legacy=on
 }

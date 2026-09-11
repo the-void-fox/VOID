@@ -50,12 +50,14 @@
 extern crate alloc;
 
 mod ahci;
+
 mod arch;
 mod cap;
 mod chan;
 mod e1000;
 mod install;
 mod net;
+mod nvme;
 // USB xHCI — только x86 (Веха 50); на riscv/QEMU-virt xHCI нет → заглушка (init всегда false).
 #[cfg(target_arch = "x86_64")]
 mod xhci;
@@ -402,6 +404,9 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         );
         println!("  [blk]  ЖИВОЙ НОСИТЕЛЬ: всё, что вы измените, исчезнет при перезагрузке.");
         println!("  [blk]  Диски машины не тронуты. Поставить систему — команда `install`.");
+    } else if nvme::init() {
+        object::use_nvme();
+        println!("  [blk]  NVMe: {} секторов", nvme::capacity_sectors());
     } else if ahci::init() {
         object::use_ahci();
         println!("  [blk]  AHCI SATA: {} секторов", ahci::capacity_sectors());
