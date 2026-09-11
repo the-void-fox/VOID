@@ -18,8 +18,11 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 
-# Драйвер → атрибут деривации в nix/default.nix.
-declare -A DRIVERS=( [lx-atl1c-hw]=lx_atl1c_drv [lx-atl1c-full]=lx_atl1c_full )
+# Веха 192 — драйверы берутся из ОДНОГО описания, а не из таблицы здесь. Атрибут деривации
+# выводится из имени (`-` → `_`), поэтому отдельного отображения больше не нужно: раньше оно
+# было четвёртым местом, которое надо не забыть.
+list="$repo/Code/programs/lx-linux/drivers.list"
+mapfile -t DRIVERS < <(grep -v '^[[:space:]]*#' "$list" | awk 'NF { print $1 }')
 
 arches=("${@:-x86_64 riscv64}")
 read -ra arches <<< "${arches[*]}"
@@ -27,8 +30,8 @@ read -ra arches <<< "${arches[*]}"
 for arch in "${arches[@]}"; do
     dest="$repo/Code/programs/lx-linux/prebuilt/$arch"
     mkdir -p "$dest"
-    for drv in "${!DRIVERS[@]}"; do
-        attr="${DRIVERS[$drv]}"
+    for drv in "${DRIVERS[@]}"; do
+        attr="${drv//-/_}"
         echo "  собираю $drv для $arch…"
         out=$(cd "$repo" && nix-build nix -A "$arch.$attr" --no-out-link)
         install -m 0644 "$out/bin/$drv" "$dest/$drv"

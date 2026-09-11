@@ -69,7 +69,54 @@ let
         doCheck = false;
         dontDisableStatic = true;
       });
-    in rec {
+      # ── Веха 192: драйверы из ОДНОГО описания ───────────────────────────────
+      # `Code/programs/lx-linux/drivers.list` — единственное место, где драйвер назван. Читают
+      # его четверо (см. шапку файла); здесь из него получаются деривации сборки.
+      #
+      # Раньше на каждый драйвер писались пятнадцать почти одинаковых строк, и отличались в них
+      # три вещи: имя, каталог исходников и список файлов. Эти три вещи и остались.
+      lib = (import nixpkgs { }).lib;
+      lxLines =
+        let text = builtins.readFile ../Code/programs/lx-linux/drivers.list;
+        in builtins.filter
+          (l: l != "" && !(lib.hasPrefix "#" l))
+          (map (l: lib.removeSuffix "\r" l) (lib.splitString "\n" text));
+      lxParse = line:
+        let f = builtins.filter (x: x != "") (lib.splitString " " line);
+        in {
+          name = builtins.elemAt f 0;
+          dir = builtins.elemAt f 1;
+          wrap = builtins.elemAt f 2;
+          files = lib.splitString "," (builtins.elemAt f 3);
+        };
+      lxDriver = d: stdenv.mkDerivation {
+        pname = d.name;
+        version = "0.192";
+        src = ../Code/programs/lx-linux;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        # Шим (`lx_kit.c`, `lx_net.c`) линкуется ВСЕГДА: это рантайм, а не часть драйвера.
+        # `-Wno-unused-parameter`/`-Wno-pointer-sign` — не наша небрежность, а код ядра как есть:
+        # править его предупреждениями значило бы перестать держать его неизменённым.
+        buildPhase = ''
+          $CC ${voidCFlags} -I. -Ilinux-src/${d.dir} -I${void-libc}/lib \
+            -DCONFIG_64BIT -DLX_HAVE_SYSCALL -Wno-unused-parameter -Wno-pointer-sign \
+            -O2 -static ${d.wrap} \
+            ${lib.concatMapStringsSep " " (f: "linux-src/${d.dir}/${f}") d.files} \
+            lx_kit.c lx_net.c -o ${d.name}
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp ${d.name} $out/bin/
+        '';
+      };
+      lxDrivers = builtins.listToAttrs (map
+        (line: let d = lxParse line; in {
+          name = builtins.replaceStrings [ "-" ] [ "_" ] d.name;
+          value = lxDriver d;
+        })
+        lxLines);
+    in (rec {
       arch = archName;
       inherit void-libc voidify;
       cc = stdenv.cc;
@@ -439,58 +486,16 @@ let
         '';
       };
 
-      # lx_atl1c_drv (Веха 132) — ПЕРВЫЙ КОНТАКТ с настоящей Atheros AR8151 через портированный
-      # код: BAR0 по MMIO-cap (start_cap 0), затем ВЕНДОРНЫЕ функции atl1c_hw.c читают EEPROM,
-      # MAC, PHY и состояние линка. DMA/IRQ ещё не нужны — кольца дескрипторов следующей вехой.
+      # Веха 192 — деривации `lx_atl1c_hw` и `lx_atl1c_full` больше НЕ ПИШУТСЯ здесь: они
+      # получаются из `drivers.list` (см. `lxDrivers` выше). Пятнадцать строк почти одинакового
+      # текста на драйвер были не просто повтором — они были четвёртым местом, которое надо не
+      # забыть, а забытое молчало.
       #
-      # Проверяется ТОЛЬКО на живом X54C: AR8151 в QEMU не эмулируется. Поэтому харнесс — один
-      # прогон, отвечающий на максимум вопросов сразу: переспросить стоит перезагрузки ноутбука.
-      lx_atl1c_drv = stdenv.mkDerivation {
-        pname = "lx-atl1c-hw";
-        version = "0.132";
-        src = ../Code/programs/lx-linux;
-        dontConfigure = true;
-        hardeningDisable = [ "all" ];
-        buildPhase = ''
-          $CC ${voidCFlags} -I. -Ilinux-src/atl1c -I${void-libc}/lib -DCONFIG_64BIT -DLX_HAVE_SYSCALL \
-            -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
-            drv_atl1c.c linux-src/atl1c/atl1c_hw.c lx_kit.c lx_net.c -o lx-atl1c-hw
-        '';
-        installPhase = ''
-          mkdir -p $out/bin
-          cp lx-atl1c-hw $out/bin/
-        '';
-      };
-
-      # lx_atl1c_full (Веха 133) — РАЗВЕДКА ЛИНКОВКИ: весь драйвер целиком (atl1c_main.c +
-      # atl1c_hw.c + atl1c_ethtool.c) против шимов. Цель та же, что у lx_atl1c_probe: не
-      # программа, а список нехваток — теперь уже на этапе линковки.
-      #
-      # Зачем целиком: кольца дескрипторов строит `atl1c_setup_ring_resources`, и она, как и
-      # вся настройка движков, объявлена static. Снаружи не позвать — значит надо запускать
-      # НАСТОЯЩИЙ `atl1c_probe`, а он тянет за собой netdev, NAPI, таймеры и DMA.
-      #
-      # `atl1c_ethtool.c` НЕ линкуется намеренно: это интерфейс для утилиты `ethtool`, которой у
-      # нас нет, а его поверхность — три десятка структур и констант, к работе карты отношения
-      # не имеющих. Вместо него Lx_kit даёт пустой `atl1c_set_ethtool_ops`. Понадобится показывать
-      # состояние линка в сетевом TUI — шим вырастет тогда, под настоящего потребителя.
-      lx_atl1c_full = stdenv.mkDerivation {
-        pname = "lx-atl1c-full";
-        version = "0.133";
-        src = ../Code/programs/lx-linux;
-        dontConfigure = true;
-        hardeningDisable = [ "all" ];
-        buildPhase = ''
-          $CC ${voidCFlags} -I. -Ilinux-src/atl1c -I${void-libc}/lib -DCONFIG_64BIT -DLX_HAVE_SYSCALL \
-            -Wno-unused-parameter -Wno-pointer-sign -O2 -static \
-            drv_atl1c_full.c linux-src/atl1c/atl1c_main.c linux-src/atl1c/atl1c_hw.c \
-            lx_kit.c lx_net.c -o lx-atl1c-full
-        '';
-        installPhase = ''
-          mkdir -p $out/bin
-          cp lx-atl1c-full $out/bin/
-        '';
-      };
+      # История этих двух: Веха 132 — первый контакт с настоящей Atheros AR8151 (BAR0 по
+      # MMIO-cap, вендорные функции `atl1c_hw.c` читают EEPROM, MAC, PHY и линк). Веха 133 —
+      # тот же драйвер ЦЕЛИКОМ: настоящий `atl1c_probe` с кольцами на DMA, потому что
+      # `atl1c_setup_ring_resources` объявлена static и снаружи её не позвать.
+      # `atl1c_ethtool.c` не линкуется намеренно: интерфейс для утилиты, которой у нас нет.
 
       # bzip2 — простой Makefile и честная утилита: сжатие файлов прямо в vsh.
       # Собираем только статический CLI (shared-библиотеке в мире ET_EXEC делать нечего).
@@ -510,7 +515,7 @@ let
           cp bzip2 $out/bin/
         '';
       }));
-    };
+    } // lxDrivers);
 in {
   riscv64 = mkWorld "riscv64-embedded" "riscv64";
   x86_64 = mkWorld "x86_64-embedded" "x86_64";

@@ -34,9 +34,25 @@ const PROGRAMS_X86: &[&str] = &[
     "install",
 ];
 
-/// Веха 132 — C-драйверы (портированный код Linux, сборка nix'ом). Едут семенами В ЯДРЕ, как и
-/// программы на Rust: до store целевой машины иначе не добраться (см. `stage_c_drivers`).
-const C_DRIVERS: &[&str] = &["lx-atl1c-hw", "lx-atl1c-full"];
+/// Веха 192 — имена C-драйверов читаются из ОДНОГО описания, а не повторяются здесь.
+///
+/// `Code/programs/lx-linux/drivers.list` — единственное место, где драйвер назван; читают его
+/// nix (деривация), `stage-drivers.sh` (выкладка), этот файл (переменные окружения) и — через
+/// сгенерированную таблицу — сам `main.rs`. До этой вехи список жил в каждом из четырёх, и
+/// забытое четвёртое молчало: ядро собиралось без драйвера и говорило «не вложен».
+fn c_drivers(kernel_dir: &PathBuf) -> Vec<String> {
+    let list = kernel_dir
+        .parent()
+        .expect("kernel/.. — Code/")
+        .join("programs/lx-linux/drivers.list");
+    println!("cargo:rerun-if-changed={}", list.display());
+    let text = std::fs::read_to_string(&list).expect("не прочитать drivers.list");
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().next().map(String::from))
+        .collect()
+}
 
 fn main() {
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel
@@ -131,7 +147,14 @@ fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
         .join(arch);
     println!("cargo:rerun-if-changed={}", staged.display());
 
-    for name in C_DRIVERS {
+    // Таблица семян для `main.rs` — ГЕНЕРИРУЕТСЯ, как и список ярлыков: руками её править
+    // значило бы завести пятое место, где драйвер назван.
+    let mut table = String::from(
+        "// Сгенерировано build.rs из programs/lx-linux/drivers.list — правится НЕ здесь.\n\
+         static C_DRIVERS: &[(&str, &[u8])] = &[\n",
+    );
+    for name in c_drivers(kernel_dir) {
+        let name = name.as_str();
         let var = name.to_uppercase().replace('-', "_");
         let src = staged.join(name);
         let path = if src.is_file() {
@@ -148,7 +171,12 @@ fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
             stub
         };
         println!("cargo:rustc-env=DRV_{}={}", var, path.display());
+        table.push_str(&format!(
+            "    (\"{name}\", include_bytes!(env!(\"DRV_{var}\"))),\n"
+        ));
     }
+    table.push_str("];\n");
+    std::fs::write(out_dir.join("c_drivers.rs"), table).expect("не записать таблицу драйверов");
 }
 
 /// Веха 19.1/23 — собрать userspace-программы (крейт `programs/user`: библиотека шимов + все
