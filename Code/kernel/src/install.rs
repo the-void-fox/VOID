@@ -8,28 +8,78 @@
 //!
 //! Шаги [`run`]:
 //! 1. записать загрузочный префикс образа (сектора 0..начало p2: MBR + зазор с core.img + p1 FAT)
-//!    на диск АБСОЛЮТНО ([`crate::ahci::target_write`]);
+//!    на диск АБСОЛЮТНО ([`Цель::write`]);
 //! 2. поправить в MBR диска раздел p2 (store) — растянуть на весь реальный диск;
 //! 3. обнулить начало p2 → на ребуте store увидит «пусто» и засеет программы заново;
 //! 4. ЗАМОРОЗИТЬ текущий store ([`crate::object::freeze`]) — его кэш больше не должен писать на
 //!    диск, иначе group-commit затрёт свежий образ до перезагрузки.
 //!
 //! После этого пользователь вынимает USB и грузится с диска. **Диск стирается целиком.**
+//!
+//! ## Куда ставим (Веха 194.1)
+//!
+//! Раскладка выше не зависит от того, по какой шине едут сектора, и это не случайность: MBR,
+//! зазор и таблица разделов — договор с ЗАГРУЗЧИКОМ, а не с контроллером. Поэтому установщик
+//! знает про диск ровно четыре действия ([`Цель`]), а какой драйвер их исполняет, решает номер
+//! диска: 0..[`crate::arch::MAX_DISKS`] — порты AHCI, от [`crate::nvme::SLOT_BASE`] — NVMe.
+//! Без этого v0.2 отвечала бы «да» только наполовину: store с NVMe читается (Веха 194), а
+//! поставить систему на машину, где SATA нет вовсе, было нечем.
 
-/// Выполнить установку на AHCI-диск. `Ok(p2_start)` — префикс записан, диск размечен, store
-/// заморожен (нужен ребут). `Err(причина)` — не сложилось (диск/образ не годны), система цела.
+/// Диск как его видит установщик: открыть, спросить ёмкость, писать и читать АБСОЛЮТНЫМИ
+/// секторами. Ровно то и не больше — установка не знает ни про разделы store, ни про кэш.
+enum Цель {
+    Ahci,
+    Nvme,
+}
+
+impl Цель {
+    /// Выбрать шину по номеру диска и открыть цель. `None` — такого диска нет либо с него
+    /// работает система (отказывает сам драйвер, и это правильное место для отказа).
+    fn open(slot: usize) -> Option<Self> {
+        if slot >= crate::nvme::SLOT_BASE {
+            crate::nvme::target_open(slot).then_some(Цель::Nvme)
+        } else {
+            crate::ahci::target_open(slot).then_some(Цель::Ahci)
+        }
+    }
+
+    fn sectors(&self) -> u64 {
+        match self {
+            Цель::Ahci => crate::ahci::target_sectors(),
+            Цель::Nvme => crate::nvme::target_sectors(),
+        }
+    }
+
+    fn write(&self, sector: u64, buf: &[u8; 512]) -> bool {
+        match self {
+            Цель::Ahci => crate::ahci::target_write(sector, buf),
+            Цель::Nvme => crate::nvme::target_write(sector, buf),
+        }
+    }
+
+    fn read(&self, sector: u64, buf: &mut [u8; 512]) -> bool {
+        match self {
+            Цель::Ahci => crate::ahci::target_read(sector, buf),
+            Цель::Nvme => crate::nvme::target_read(sector, buf),
+        }
+    }
+}
+
+/// Выполнить установку на выбранный диск (AHCI или NVMe). `Ok(p2_start)` — префикс записан, диск
+/// размечен, можно перезагружаться. `Err(причина)` — не сложилось (диск/образ не годны), система
+/// цела.
 pub fn run(slot: usize) -> Result<u64, &'static str> {
     let (mbase, mlen) =
         crate::arch::boot_module().ok_or("нет образа установки (модуль multiboot2 с USB)")?;
     // Веха 174 — ставим на ВЫБРАННЫЙ диск, а не на «тот, что нашёлся первым». Открытие цели
     // само отказывает, если названный порт — это диск, с которого работает store: система,
     // стирающая диск из-под себя, не установка, а потеря.
-    if !crate::ahci::target_open(slot) {
+    let Some(цель) = Цель::open(slot) else {
         return Err("такого диска нет либо это диск, с которого работает система");
-    }
-    let total = crate::ahci::target_sectors();
+    };
+    let total = цель.sectors();
     if total == 0 {
-        return Err("диск не отвечает на IDENTIFY");
+        return Err("диск не сказал свою ёмкость");
     }
     // Веха 87: GRUB кладёт модуль в RAM и сообщает ФИЗИЧЕСКИЙ адрес — читаем через direct-map.
     let img = unsafe { core::slice::from_raw_parts(crate::frame::ptr(mbase), mlen) };
@@ -55,18 +105,18 @@ pub fn run(slot: usize) -> Result<u64, &'static str> {
     for s in 0..p2_start {
         let o = (s as usize) * 512;
         sec.copy_from_slice(&img[o..o + 512]);
-        if !crate::ahci::target_write(s, &sec) {
+        if !цель.write(s, &sec) {
             return Err("сбой записи загрузочного префикса на диск");
         }
     }
 
     // 2) MBR диска: растянуть p2 (store) на весь диск — num_sectors@+12 = total − p2_start.
-    if !crate::ahci::target_read(0, &mut sec) {
+    if !цель.read(0, &mut sec) {
         return Err("сбой чтения MBR после записи");
     }
     let cnt = ((total - p2_start) as u32).to_le_bytes();
     sec[p2 + 12..p2 + 16].copy_from_slice(&cnt);
-    if !crate::ahci::target_write(0, &sec) {
+    if !цель.write(0, &sec) {
         return Err("сбой записи MBR");
     }
 
@@ -74,7 +124,7 @@ pub fn run(slot: usize) -> Result<u64, &'static str> {
     //    и засеет программы (как первый запуск), не подхватив мусор старого содержимого диска.
     let zero = [0u8; 512];
     for s in 0..64u64 {
-        if !crate::ahci::target_write(p2_start + s, &zero) {
+        if !цель.write(p2_start + s, &zero) {
             return Err("сбой очистки области store");
         }
     }

@@ -75,19 +75,33 @@ void_qemu_machine() {
         # поставил на диск» проверялось руками или никак.
         # Дисков можно назвать НЕСКОЛЬКО через запятую: установщик выбирает, куда ставить, и
         # проверять этот выбор на одном диске — значит не проверять его вовсе.
+        #
+        # Веха 194.1 — диск можно назвать с ШИНОЙ: `nvme:/путь` вместо `/путь`. Нужно затем, что
+        # «поставить систему» на NVMe — отдельный путь в ядре (своё окно регистров, свои кольца),
+        # и проверять его на SATA-диске значит не проверять вовсе. На машине новее ~2016 это
+        # ЕДИНСТВЕННЫЙ способ поставить VOID: SATA там часто нет вовсе.
         if [ -n "${VOID_QEMU_DISK2:-}" ]; then
             printf '%s\n' -device ich9-ahci,id=a
             local i=0
+            local n=0
             local d
             local rest="$VOID_QEMU_DISK2"
             while [ -n "$rest" ]; do
                 d="${rest%%,*}"
                 [ "$d" = "$rest" ] && rest="" || rest="${rest#*,}"
                 [ -n "$d" ] || continue
-                printf '%s\n' \
-                    -drive "if=none,id=d$i,file=$d,format=raw" \
-                    -device "ide-hd,drive=d$i,bus=a.$i"
-                i=$((i + 1))
+                case "$d" in
+                    nvme:*)
+                        printf '%s\n' \
+                            -drive "if=none,id=n$n,file=${d#nvme:},format=raw" \
+                            -device "nvme,drive=n$n,serial=target$n"
+                        n=$((n + 1)) ;;
+                    *)
+                        printf '%s\n' \
+                            -drive "if=none,id=d$i,file=$d,format=raw" \
+                            -device "ide-hd,drive=d$i,bus=a.$i"
+                        i=$((i + 1)) ;;
+                esac
             done
         fi
         return 0

@@ -3367,6 +3367,9 @@ fn syscall(t: &mut Table, cur: usize) {
                         live: false,
                     }; crate::arch::MAX_DISKS];
                     let n = crate::ahci::disks(&mut disks[..want]);
+                    // Веха 194.1: NVMe-диски идут ПОСЛЕ портов AHCI — своими номерами (сотня),
+                    // чтобы выбор человека значил одно и то же и на машине с двумя шинами.
+                    let n = n + crate::nvme::disks(&mut disks[n..want]);
                     if !ensure_heap_range(t, cur, ptr, n * INSTALL_REC) {
                         usize::MAX
                     } else {

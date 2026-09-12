@@ -76,6 +76,7 @@ struct Nvme {
     io_phase: u8,
     base: u64,     // LBA начала store: 0 (весь диск) или начало раздела VOID
     capacity: u64, // ёмкость store в 512-байтных секторах
+    nsze: u64,     // ёмкость ВСЕГО пространства имён — ею мерит диск установщик (Веха 194.1)
 }
 
 static NVME: SpinLock<Option<Nvme>> = SpinLock::new(None);
@@ -161,11 +162,26 @@ fn cmd(op: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> [u32
     c
 }
 
-/// Найти контроллер, поднять его и выбрать раздел store. `false` — NVMe на этой машине нет либо
-/// диск не отдан VOID.
-pub fn init() -> bool {
+/// Номер, под которым NVMe-диски называются установщику (Веха 194.1).
+///
+/// Слоты 0..[`crate::arch::MAX_DISKS`] заняты портами AHCI, и смешивать их нельзя: человек
+/// выбирает диск номером, а номер обязан значить одно и то же до и после перезагрузки. Отсюда
+/// отдельная сотня — она же сразу видна в журнале, если что-то пойдёт не так.
+pub const SLOT_BASE: usize = 100;
+
+/// Цель установки — второй контроллер (или тот же, но пока свободный). Держится отдельно от
+/// носителя store по той же причине, что у AHCI: ставить на диск, с которого работаешь, — не
+/// установка, а потеря.
+static TARGET: SpinLock<Option<Nvme>> = SpinLock::new(None);
+
+/// Поднять контроллер: кольца администратора, кольца ввода-вывода, размер блока. Общая половина
+/// носителя store и цели установки — две копии этого кода разошлись бы на первой же правке.
+///
+/// `Ok(устройство)` — контроллер отвечает, блок 512 Б, очереди созданы, `nsze` заполнено.
+/// Смещение раздела вызывающий выясняет сам: носителю нужен раздел VOID, установщику — весь диск.
+fn bringup() -> Result<Nvme, &'static str> {
     let Some(regs) = crate::arch::probe_nvme() else {
-        return false;
+        return Err("контроллера NVMe на этой машине нет");
     };
     // Пять фреймов: четыре кольца и буфер. Освобождать их некому и не надо — драйвер живёт,
     // пока живёт машина.
@@ -176,8 +192,7 @@ pub fn init() -> bool {
         frame::alloc(),
         frame::alloc(),
     ) else {
-        crate::println!("  [nvme] нет памяти под кольца — пропуск");
-        return false;
+        return Err("нет памяти под кольца");
     };
 
     let cap = unsafe { r64(regs, CAP) };
@@ -185,8 +200,7 @@ pub fn init() -> bool {
     // Минимальный размер страницы контроллера. Мы работаем страницами 4 КиБ, и если контроллер
     // такого не умеет — отказываемся вслух, а не пишем мимо.
     if (cap >> 48) & 0xf != 0 {
-        crate::println!("  [nvme] контроллеру мало 4 КиБ на страницу — не поддерживаем");
-        return false;
+        return Err("контроллеру мало 4 КиБ на страницу");
     }
 
     let mut d = Nvme {
@@ -205,6 +219,7 @@ pub fn init() -> bool {
         io_phase: 1,
         base: 0,
         capacity: 0,
+        nsze: 0,
     };
 
     unsafe {
@@ -221,18 +236,15 @@ pub fn init() -> bool {
         w32(regs, CC, (6 << 16) | (4 << 20) | 1);
         while r32(regs, CSTS) & 1 == 0 {
             if r32(regs, CSTS) & 2 != 0 {
-                crate::println!("  [nvme] контроллер сообщил о неисправности при включении");
-                return false;
+                return Err("контроллер сообщил о неисправности при включении");
             }
             core::hint::spin_loop();
         }
     }
 
     // Опознать пространство имён 1: размер в блоках и размер блока.
-    let st = d.submit(true, &cmd(ADMIN_IDENTIFY, 1, buf as u64, 0, 0, 0));
-    if st != 0 {
-        crate::println!("  [nvme] identify пространства имён отказал: код {:#x}", st);
-        return false;
+    if d.submit(true, &cmd(ADMIN_IDENTIFY, 1, buf as u64, 0, 0, 0)) != 0 {
+        return Err("identify пространства имён отказал");
     }
     let (nsze, lba_bytes) = unsafe {
         let p = frame::ptr(buf);
@@ -246,30 +258,42 @@ pub fn init() -> bool {
     if lba_bytes != SECTOR {
         // Трансляция 512 ↔ 4096 — это чтение-правка-запись и отдельный разговор про атомарность.
         // Пока такого диска под рукой нет, честнее отказаться, чем сделать вид.
-        crate::println!("  [nvme] блок {} Б, а store говорит 512 — такой диск пока не наш", lba_bytes);
-        return false;
+        return Err("блок не 512 Б — такой диск пока не наш");
     }
 
     // Кольца ввода-вывода. Порядок обязателен: очередь завершений создаётся ПЕРВОЙ, иначе
     // контроллеру некуда сложить ответ о создании очереди команд.
     let qsz = (QD as u32 - 1) << 16;
-    let st = d.submit(true, &cmd(ADMIN_CREATE_CQ, 0, iocq as u64, qsz | 1, 1, 0));
-    if st != 0 {
-        crate::println!("  [nvme] не создалась очередь завершений: код {:#x}", st);
-        return false;
+    if d.submit(true, &cmd(ADMIN_CREATE_CQ, 0, iocq as u64, qsz | 1, 1, 0)) != 0 {
+        return Err("не создалась очередь завершений");
     }
-    let st = d.submit(true, &cmd(ADMIN_CREATE_SQ, 0, iosq as u64, qsz | 1, (1 << 16) | 1, 0));
-    if st != 0 {
-        crate::println!("  [nvme] не создалась очередь команд: код {:#x}", st);
-        return false;
+    if d.submit(true, &cmd(ADMIN_CREATE_SQ, 0, iosq as u64, qsz | 1, (1 << 16) | 1, 0)) != 0 {
+        return Err("не создалась очередь команд");
     }
+    d.nsze = nsze;
+    Ok(d)
+}
+
+/// Найти контроллер, поднять его и выбрать раздел store. `false` — NVMe на этой машине нет либо
+/// диск не отдан VOID.
+pub fn init() -> bool {
+    let mut d = match bringup() {
+        Ok(v) => v,
+        Err(e) => {
+            // «Контроллера нет» — не событие: на большинстве машин его и не должно быть.
+            if e != "контроллера NVMe на этой машине нет" {
+                crate::println!("  [nvme] {}", e);
+            }
+            return false;
+        }
+    };
+    let buf = d.buf;
 
     // Где на этом диске store. Правило то же, что у AHCI (Веха 174): носителем становится ТОЛЬКО
     // диск с разделом VOID — он и есть след явного согласия человека, а «нет таблицы разделов,
     // значит весь диск наш» на чужой машине означало бы затереть чужие данные.
-    let st = d.submit(false, &cmd(IO_READ, 1, buf as u64, 0, 0, 0));
-    if st != 0 {
-        crate::println!("  [nvme] первый сектор не читается: код {:#x}", st);
+    if d.submit(false, &cmd(IO_READ, 1, buf as u64, 0, 0, 0)) != 0 {
+        crate::println!("  [nvme] первый сектор не читается");
         return false;
     }
     let mut found = false;
@@ -291,8 +315,12 @@ pub fn init() -> bool {
     if !found {
         crate::println!(
             "  [nvme] диск на {} секторов есть, раздела VOID на нём нет — не трогаем (поставить систему: `install`)",
-            nsze,
+            d.nsze,
         );
+        // Веха 194.1: поднятый контроллер не выбрасываем, а отдаём установщику. Второй `bringup`
+        // сбросил бы его заново и занял ещё пять фреймов — а это ровно тот случай, ради которого
+        // установщик и нужен: живой ISO плюс пустой NVMe.
+        *TARGET.lock() = Some(d);
         return false;
     }
 
@@ -327,4 +355,108 @@ pub fn write(sector: u64, buf: &[u8; SECTOR]) -> bool {
     let dbuf = d.buf;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), frame::ptr(dbuf), SECTOR) };
     d.submit(false, &cmd(IO_WRITE, 1, dbuf as u64, lba as u32, (lba >> 32) as u32, 0)) == 0
+}
+
+// ─── установщик (Веха 194.1) ─────────────────────────────────────────────────────
+
+/// Перечислить NVMe-диски для установщика. Возвращает, сколько записано в `out`.
+///
+/// Контроллер сейчас берётся один — тот, что нашла проба. Машины с двумя NVMe бывают, но список
+/// дисков и так собирается по обеим шинам, и заводить перечисление контроллеров ради второго
+/// диска, которого мы пока не видели, значило бы писать код под догадку.
+pub fn disks(out: &mut [crate::ahci::Disk]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    // Диск, на котором РАБОТАЕТ store, поднимать второй раз нельзя: `bringup` сбрасывает
+    // контроллер, а это выбило бы у store носитель из-под рук. Всё нужное про него мы знаем.
+    if let Some(d) = NVME.lock().as_ref() {
+        out[0] = crate::ahci::Disk {
+            slot: SLOT_BASE,
+            sectors: d.nsze,
+            model: model_name(),
+            void: true,
+            live: true,
+        };
+        return 1;
+    }
+    if TARGET.lock().is_none() {
+        // Контроллер ещё не поднимали (например, `init` не нашёл NVMe вовсе — тогда и здесь
+        // не найдёт, и список просто останется без этой строки).
+        match bringup() {
+            Ok(d) => *TARGET.lock() = Some(d),
+            Err(_) => return 0,
+        }
+    }
+    let g = TARGET.lock();
+    let d = g.as_ref().expect("только что положили");
+    out[0] = crate::ahci::Disk {
+        slot: SLOT_BASE,
+        sectors: d.nsze,
+        model: model_name(),
+        // Раздел VOID на этом диске искал `init`; нашёл бы — диск стал бы носителем store и
+        // сюда мы бы не дошли. Значит пометки «здесь уже есть VOID» здесь быть не может.
+        void: false,
+        live: false,
+    };
+    1
+}
+
+/// Как диск называется в списке. Настоящую модель отдаёт `Identify Controller`, и однажды её
+/// стоит прочитать; пока честнее показать род устройства, чем пустую строку.
+fn model_name() -> [u8; crate::ahci::MODEL_LEN] {
+    let mut m = [b' '; crate::ahci::MODEL_LEN];
+    let name = b"NVMe";
+    m[..name.len()].copy_from_slice(name);
+    m
+}
+
+/// Открыть NVMe как ЦЕЛЬ установки. `false` — контроллера нет либо с него работает система.
+pub fn target_open(slot: usize) -> bool {
+    if slot != SLOT_BASE {
+        return false;
+    }
+    if NVME.lock().is_some() {
+        return false; // ставить на диск, с которого работаем, нельзя
+    }
+    if TARGET.lock().is_some() {
+        return true; // уже открыт перечислением
+    }
+    match bringup() {
+        Ok(d) => {
+            *TARGET.lock() = Some(d);
+            true
+        }
+        Err(e) => {
+            crate::println!("  [nvme] цель установки не открылась: {}", e);
+            false
+        }
+    }
+}
+
+/// Полная ёмкость цели в секторах — ёмкость ПРОСТРАНСТВА ИМЁН, а не раздела: установщик
+/// размечает диск целиком.
+pub fn target_sectors() -> u64 {
+    TARGET.lock().as_ref().map_or(0, |d| d.nsze)
+}
+
+/// Абсолютная запись сектора на цель установки (без смещения раздела).
+pub fn target_write(sector: u64, buf: &[u8; SECTOR]) -> bool {
+    let mut g = TARGET.lock();
+    let Some(d) = g.as_mut() else { return false };
+    let dbuf = d.buf;
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), frame::ptr(dbuf), SECTOR) };
+    d.submit(false, &cmd(IO_WRITE, 1, dbuf as u64, sector as u32, (sector >> 32) as u32, 0)) == 0
+}
+
+/// Абсолютное чтение сектора с цели установки.
+pub fn target_read(sector: u64, buf: &mut [u8; SECTOR]) -> bool {
+    let mut g = TARGET.lock();
+    let Some(d) = g.as_mut() else { return false };
+    let dbuf = d.buf;
+    if d.submit(false, &cmd(IO_READ, 1, dbuf as u64, sector as u32, (sector >> 32) as u32, 0)) != 0 {
+        return false;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(frame::ptr(dbuf) as *const u8, buf.as_mut_ptr(), SECTOR) };
+    true
 }
