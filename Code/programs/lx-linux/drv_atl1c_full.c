@@ -43,6 +43,9 @@
 
 extern void lx_net_set_dma_cap(uintptr_t cap);
 extern void lx_net_set_irq_cap(uintptr_t cap);
+extern void lx_net_set_netdev_cap(uintptr_t cap);
+extern int  lx_netdev_open(struct net_device *dev);
+extern int  lx_netdev_attach(struct net_device *dev);
 extern int  lx_pci_register_device(struct pci_dev *pdev);
 extern int  lx_module_init(void);
 
@@ -131,8 +134,11 @@ static void atl1c_bringup(void *arg)
 			printk("[atl1c] у драйвера нет ndo_open — это не сетевое устройство?\n");
 			return;
 		}
+		/* Веха 195 — через `lx_netdev_open`, а не прямым `ndo_open`: кроме открытия он ставит
+		 * `IFF_UP`. Без флага обработчик прерывания драйвера считает интерфейс выключенным и
+		 * не принимает ни одного кадра (найдено на 8139too, причина у драйверов общая). */
 		printk("[atl1c] --- вход в ndo_open ---\n");
-		err = ndev->netdev_ops->ndo_open(ndev);
+		err = lx_netdev_open(ndev);
 		printk("[atl1c] --- выход из ndo_open ---\n");
 		printk("[atl1c] ndo_open вернул %d (%s)\n", err, err ? "ОШИБКА" : "интерфейс поднят");
 		if (err)
@@ -156,9 +162,13 @@ static void atl1c_bringup(void *arg)
 			ad->msg_enable = 0xffff;
 		}
 
-		/* Дальше карта остаётся поднятой и обслуживает приём сама (NAPI по прерыванию).
-		 * Передавать нам пока нечего и незачем: сетевой службы, которая этим драйвером
-		 * управляет, ещё нет — она следующая по плану. */
+		/* Веха 195 — объявиться КАРТОЙ СИСТЕМЫ: принятые кадры уходят в ядро, а исходящие
+		 * приходят оттуда, и над этой картой работает обычный `net-srv`. Проверено на RTL8139
+		 * в QEMU (`ping` через неизменённый `8139too`); на живом AR8151 путь тот же, но на
+		 * железе владельца ещё не гонялся — об этом сказано в заметке вехи, а не умолчано. */
+		lx_netdev_attach(ndev);
+
+		/* Дальше карта остаётся поднятой и обслуживает приём сама (NAPI по прерыванию). */
 		lx_task_create(atl1c_keepalive, NULL, "atl1c-idle");
 	}
 }
@@ -168,6 +178,7 @@ int main(void)
 	uintptr_t mmio_cap = vsys_start_cap(0);
 	uintptr_t dma_cap  = vsys_start_cap(1);
 	uintptr_t irq_cap  = vsys_start_cap(2);
+	uintptr_t ndev_cap = vsys_start_cap(3); /* Веха 195 — право БЫТЬ картой системы */
 
 	/* Небуферизованный вывод С ПЕРВОЙ СТРОКИ: если probe где-то застрянет, увидеть надо всё
 	 * сказанное ДО этого места, а не ничего (Веха 133.1). */
@@ -184,6 +195,7 @@ int main(void)
 	}
 	lx_net_set_dma_cap(dma_cap);
 	lx_net_set_irq_cap(irq_cap);
+	lx_net_set_netdev_cap(ndev_cap);
 	/* Прерывание нужно НЕ для порядка: приём кадров у atl1c идёт через NAPI, а будит его
 	 * обработчик прерывания. Без IRQ-права драйвер поднимется и будет молчать. */
 

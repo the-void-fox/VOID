@@ -638,17 +638,59 @@ pub fn on_userdrv_irq() {
     USERDRV_IRQ_PENDING.store(true, Ordering::Relaxed);
 }
 
+/// Веха 195 — растолкать драйвера-карту: стек положил в очередь исходящий кадр.
+///
+/// Будим и из `IrqWait`, и из `Sleeping`, и это не вольность. Кооперативный планировщик шима
+/// спит на прерывании ТОЛЬКО когда у него нет ни одного таймера; стоит вендорному коду завести
+/// отложенную работу (а `8139too` заводит — проверка линка), и процесс уходит в `SYS_SLEEP` на
+/// секунды. Не разбуди мы его оттуда — исходящий кадр ждал бы этих секунд, и «сеть работает»
+/// стало бы «сеть иногда работает».
+///
+/// Ранний выход из сна безвреден по построению: шим в своём цикле заново сверяет `jiffies` и,
+/// если срок не вышел, засыпает снова. Пробуждение без кадра — тоже: драйвер просто не найдёт
+/// в очереди ничего.
+fn wake_netdev_owner(t: &mut Table) -> Option<usize> {
+    let pid = crate::net::ext_owner()?;
+    let mut woken = None;
+    for i in 0..t.procs.len() {
+        // Драйвер — это группа нитей; спать на прерывании или таймере может любая из них.
+        if t.procs[i].group != pid {
+            continue;
+        }
+        match t.procs[i].state {
+            State::IrqWait => {
+                // Кадр уже продвинут при блокировке — вернётся 0, как от настоящего прерывания.
+            }
+            State::Sleeping => {
+                let f = &mut t.procs[i].frame;
+                f.set_ret(0);
+                f.advance();
+            }
+            _ => continue,
+        }
+        t.procs[i].state = State::Runnable;
+        t.procs[i].ready_at = arch::now_ticks();
+        t.procs[i].futex_deadline = None;
+        woken = Some(i);
+    }
+    woken
+}
+
 /// Веха 52 — если пришёл IRQ драйвера, разбудить всех в `IrqWait` (сделать `Runnable`). Драйвер
 /// сам сверится с состоянием устройства (ICR) при пробуждении — ложное пробуждение безвредно.
-fn drain_userdrv_irq(t: &mut Table) {
-    if USERDRV_IRQ_PENDING.swap(false, Ordering::Relaxed) {
-        for p in &mut t.procs {
-            if p.state == State::IrqWait {
-                p.state = State::Runnable;
-                p.ready_at = arch::now_ticks();
-            }
+fn drain_userdrv_irq(t: &mut Table) -> bool {
+    if !USERDRV_IRQ_PENDING.swap(false, Ordering::Relaxed) {
+        return false;
+    }
+    let mut woke = false;
+    for p in &mut t.procs {
+        if p.state == State::IrqWait {
+            p.state = State::Runnable;
+            p.ready_at = arch::now_ticks();
+            woke = true;
         }
     }
+    woke
 }
 
 /// Веха 52 — есть ли процессы, спящие в `SYS_IRQ_WAIT` (нужно `wait_stdin`: не завершать сессию,
@@ -1544,7 +1586,7 @@ fn drain_net_irq(t: &mut Table) -> bool {
 /// следующим `SYS_RECV` оно ещё старое. Пока он `Runnable`, будить его сроком незачем — он и
 /// так на очереди; а вот считать этот срок поводом не спать было прямой ошибкой.
 fn sleeps_by_deadline(p: &Proc) -> bool {
-    matches!(p.state, State::FutexWait | State::RecvWait | State::Sleeping)
+    matches!(p.state, State::FutexWait | State::RecvWait | State::Sleeping | State::IrqWait)
 }
 
 fn wake_futex_timeouts(t: &mut Table) {
@@ -1576,6 +1618,9 @@ fn wake_futex_timeouts(t: &mut Table) {
                 f.set_ret(0);
                 f.advance();
             }
+            // Веха 195: `SYS_IRQ_WAIT` со сроком — прерывания не было, но ждать больше нельзя
+            // (у драйвера свои таймеры). Кадр продвинут при блокировке, возвращать нечего.
+            State::IrqWait => {}
             _ => continue,
         }
         t.procs[i].state = State::Runnable;
@@ -1637,6 +1682,9 @@ fn handle_user_fault(t: &mut Table, cur: usize, va: usize, kind: FaultKind) {
     }
     t.procs[cur].state = State::Finished;
     lx_close_all(t, cur); // Веха 186: упавший тоже обязан отпустить трубы, иначе конвейер повиснет
+    // Веха 195: упавший драйвер-карта перестаёт быть картой — иначе стек ждал бы кадров от
+    // мертвеца, а «сети нет» выглядело бы как «сеть сломалась».
+    crate::net::ext_detach(t.procs[cur].group);
     wake_exec_waiters(t, cur, usize::MAX);
     if let Some(n) = t.next_runnable(cur) {
         t.set_cur(n);
@@ -1733,6 +1781,27 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                     t.set_cur(n);
                 }
             }
+            // Веха 195 — прерывание устройства. Вся работа уже сделана обработчиком и
+            // разливателями флагов выше (`drain_userdrv_irq`, `drain_net_irq` в `resume`);
+            // здесь ничего не нужно, кроме самого захода в планировщик. Квант прерванному не
+            // отбираем: он ни при чём, а вытеснять его значило бы наказывать за чужой кадр.
+            UserTrap::DeviceIrq => {
+                // Разбудить ждущих — и ОТДАТЬ ХОД разбуженному. Одного пробуждения мало, и это
+                // показал замер: прерванный `net-srv` крутил свой цикл опроса дальше, законно
+                // доживая квант, а драйвер стоял готовым рядом — кадр доходил до стека за 19 мс
+                // вместо двух десятков микросекунд. Двадцать тысяч холостых кругов опроса в
+                // журнале замера — это и есть цена «разбудили, но ход не дали».
+                //
+                // Прерванного при этом не наказываем: он остаётся готовым и получит ход
+                // следующим по кругу. Ровно так поступает любая система с прерываниями —
+                // обработчик, разбудивший ждущего, ведёт к перепланированию.
+                let woke = drain_userdrv_irq(&mut t) | drain_net_irq(&mut t);
+                if woke {
+                    if let Some(n) = t.next_runnable(cur) {
+                        t.set_cur(n);
+                    }
+                }
+            }
             UserTrap::Unknown(code) => {
                 // Веха 38: musl x86-64 зовёт ядро инструкцией `syscall` (0F 05); мы её НЕ
                 // включили (EFER.SCE=0), поэтому она приходит как #UD (вектор 6). Для
@@ -1748,6 +1817,7 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                     );
                     t.procs[cur].state = State::Finished;
                     lx_close_all(&mut t, cur);
+                    crate::net::ext_detach(t.procs[cur].group); // Веха 195: карта ушла с процессом
                     wake_exec_waiters(&mut t, cur, usize::MAX); // упавший ребёнок = MAX родителю
                     if let Some(n) = t.next_runnable(cur) {
                         t.set_cur(n);
@@ -2096,6 +2166,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     t.procs[i].state = State::Finished;
                 }
             }
+            crate::net::ext_detach(leader); // Веха 195: карта ушла с процессом
             wake_exec_waiters(t, leader, code);
             if let Some(n) = t.next_runnable(cur) {
                 t.set_cur(n);
@@ -3018,13 +3089,22 @@ fn syscall(t: &mut Table, cur: usize) {
                 (f.arg(0), f.arg(1), f.arg(2))
             };
             let dom = t.procs[cur].domain;
+            // Веха 195 — кого разбудил этот кадр (карта в процессе); ход ему отдаём ниже.
+            let mut netdev_woken = None;
             let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
                 Ok(cap::Device::Net) if len <= 2048 && ensure_heap_range(t, cur, buf, len) => {
                     let mut tmp = [0u8; 2048];
                     let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
                     tmp[..len].copy_from_slice(src);
                     vprintln!("  [net] P{} SYS_NET_SEND {} байт (по cap)", cur, len);
-                    if crate::net::send(&tmp[..len]) { 0 } else { usize::MAX }
+                    let ok = crate::net::send(&tmp[..len]);
+                    // Веха 195 — если карта живёт в процессе, `send` только положил кадр в
+                    // очередь. Разбудить драйвера обязан тот, у кого в руках таблица процессов:
+                    // иначе он узнает про кадр на своём следующем таймере, то есть через
+                    // десятки миллисекунд, а опрос очереди вхолостую жёг бы процессор в простое.
+                    netdev_woken = wake_netdev_owner(t);
+
+                    if ok { 0 } else { usize::MAX }
                 }
                 Ok(_) => usize::MAX,
                 Err(e) => {
@@ -3035,6 +3115,21 @@ fn syscall(t: &mut Table, cur: usize) {
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
             f.advance();
+            // Веха 195 — ОТДАТЬ ХОД ДРАЙВЕРУ, а не просто сделать его готовым.
+            //
+            // Разбудить оказалось мало, и это видно на замере: кадр лежал в очереди 16–20 мс,
+            // то есть ровно квант вытеснения. Причина не в планировщике, а в том, кто зовёт:
+            // `net-srv`, отправив кадр, не блокируется — он идёт качать стек дальше, и ядро
+            // законно продолжает его до конца кванта. Драйвер в это время готов и ждёт хода.
+            //
+            // Будь карта в ядре, отправка кончилась бы записью в кольцо и звонком в дверь, то
+            // есть НА МЕСТЕ. Уступка хода — это то же самое, только когда «кольцо» находится в
+            // другом процессе: остаток кванта дарится тому, кто доведёт кадр до провода.
+            if let Some(pid) = netdev_woken {
+                if t.procs[pid].state == State::Runnable && t.proc_free(pid, cpu::id()) {
+                    t.set_cur(pid);
+                }
+            }
         }
         // SYS_NET_RECV(dev_cap, buf, buflen) -> длина кадра (0 — пусто; MAX — отказ).
         // Неблокирующий опрос приёмного кольца (нужен cap на устройство, право READ).
@@ -3083,6 +3178,84 @@ fn syscall(t: &mut Table, cur: usize) {
                 }
                 Ok(_) => usize::MAX,
                 Err(_) => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_NETDEV(netdrv_cap, op, buf, len) — **БЫТЬ сетевой картой** (Веха 195).
+        //
+        // Это вторая сторона `SYS_NET_SEND`/`SYS_NET_RECV`: там процесс пользуется картой, здесь
+        // процесс ею ЯВЛЯЕТСЯ. Нужно затем, что настоящие драйверы у нас хостируемые (неизменённый
+        // код Linux в процессе), и до этой вехи принятые кадры до стека не доходили вовсе —
+        // `netif_receive_skb` в шиме их освобождал. Теперь тот же кадр едет в ядро, а `net-srv`
+        // достаёт его обычным `net_recv` и не знает, что карта сменила сторону.
+        //
+        // Право отдельного вида (`Device::NetDrv`, минтит только `init`): говорить от имени
+        // провода — не то же, что ходить в сеть, и смешивать это значило бы разрешить первое
+        // каждому, кому разрешили второе.
+        //
+        //   op 0 — представиться: `buf` = 6 байт MAC. С этого мгновения карта системы — этот
+        //          процесс;
+        //   op 1 — принятый кадр в ядро (`buf`, `len`); 0 — взят, MAX — очередь полна;
+        //   op 2 — забрать исходящий кадр (`buf`, `len` = размер буфера) → длина, 0 — пусто;
+        //   op 3 — отсоединиться (умирающий драйвер; смерть процесса делает это и сама).
+        64 => {
+            let (dcap, op, buf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            let dom = t.procs[cur].domain;
+            let leader = t.procs[cur].group;
+            let result = match cap::device(dom, Cap::from_bits(dcap as u64), Rights::WRITE) {
+                Ok(cap::Device::NetDrv) => match op {
+                    0 if ensure_heap_range(t, cur, buf, 6) => {
+                        let mut mac = [0u8; 6];
+                        let src = unsafe { core::slice::from_raw_parts(buf as *const u8, 6) };
+                        mac.copy_from_slice(src);
+                        crate::net::ext_attach(leader, mac);
+                        0
+                    }
+                    1 if len <= 2048 && ensure_heap_range(t, cur, buf, len) => {
+                        let mut tmp = [0u8; 2048];
+                        let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+                        tmp[..len].copy_from_slice(src);
+                        let ok = crate::net::ext_rx_push(&tmp[..len]);
+
+                        // Разбудить СТЕК тем же признаком, каким его будит прерывание настоящей
+                        // карты (Веха 91). Без этой строки кадр лежал в очереди до следующего
+                        // холостого круга `net-srv`, и цена была видна на замере: `ping` через
+                        // хостируемый драйвер отвечал за 40 000 мкс против 40 мкс через
+                        // ядерный e1000 — в тысячу раз медленнее, причём не из-за драйвера.
+                        // Разливает признак `resume`, то есть пробуждение случится сразу по
+                        // возврате из этого самого вызова.
+                        if ok {
+                            on_net_irq();
+                        }
+                        if ok { 0 } else { usize::MAX }
+                    }
+                    2 if ensure_heap_range(t, cur, buf, len.min(2048)) => {
+                        let mut tmp = [0u8; 2048];
+                        let cap_len = len.min(2048);
+                        let n = crate::net::ext_tx_pop(&mut tmp[..cap_len]);
+
+                        if n > 0 {
+                            let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
+                            dst.copy_from_slice(&tmp[..n]);
+                        }
+                        n
+                    }
+                    3 => {
+                        crate::net::ext_detach(leader);
+                        0
+                    }
+                    _ => usize::MAX,
+                },
+                Ok(_) => usize::MAX,
+                Err(e) => {
+                    vprintln!("  [net] P{} SYS_NETDEV отклонён: {:?}  ← нет права быть картой", cur, e);
+                    usize::MAX
+                }
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
@@ -3529,12 +3702,27 @@ fn syscall(t: &mut Table, cur: usize) {
             f.set_ret(result);
             f.advance();
         }
-        // SYS_IRQ_WAIT(irq_cap) -> 0 | MAX (Веха 52): усыпить userspace-драйвер до прерывания его
-        // устройства (нужен Irq-cap). Кадр продвигаем СЕЙЧАС (вернётся 0 при пробуждении); процесс
-        // уходит в IrqWait, планировщик даёт ход другим. Разбудит drain_userdrv_irq по флагу от
-        // обработчика VEC_USERDRV. Уже пришедший IRQ поймает drain в resume() сразу — потери нет.
+        // SYS_IRQ_WAIT(irq_cap, timeout_ns) -> 0 | MAX (Веха 52): усыпить userspace-драйвер до
+        // прерывания его устройства (нужен Irq-cap). Кадр продвигаем СЕЙЧАС (вернётся 0 при
+        // пробуждении); процесс уходит в IrqWait, планировщик даёт ход другим. Разбудит
+        // drain_userdrv_irq по флагу от обработчика VEC_USERDRV. Уже пришедший IRQ поймает drain
+        // в resume() сразу — потери нет.
+        //
+        // **Веха 195 — СРОК** (`timeout_ns`, 0 — ждать вечно, как было). Без него драйвер с
+        // таймерами не принимал ни одного кадра, и это стоило целого захода: кооперативный
+        // планировщик шима спит на прерывании ТОЛЬКО когда у него нет ни одного срока, а у
+        // живого драйвера срок есть всегда (сторож, проверка линка, watchdog). Он уходил спать
+        // по времени, обработчик прерывания не звался, NAPI не планировался, `poll` не вынимал
+        // кадры из кольца — снаружи это выглядело как «карта поднята, сеть не работает».
+        //
+        // Возврат по сроку — тот же 0, что по прерыванию, и это не небрежность: драйвер обязан
+        // сверяться с регистром причин, а не верить, что его будят только по делу (в Linux это
+        // то же правило разделяемой линии).
         33 => {
-            let icap = t.procs[cur].frame.arg(0);
+            let (icap, timeout_ns) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1) as u64)
+            };
             let dom = t.procs[cur].domain;
             match cap::irq(dom, Cap::from_bits(icap as u64), Rights::READ) {
                 Ok(_vector) => {
@@ -3542,6 +3730,8 @@ fn syscall(t: &mut Table, cur: usize) {
                     f.set_ret(0);
                     f.advance();
                     t.procs[cur].state = State::IrqWait;
+                    t.procs[cur].futex_deadline = (timeout_ns > 0)
+                        .then(|| arch::now_ticks() + crate::clock::ns_to_ticks(timeout_ns));
                     // Веха 52 — «взвести» линию (размаскировать в IOAPIC): если причина уже
                     // висит на карте, прерывание доставится сразу; обработчик снова замаскирует.
                     arch::userdrv_irq_arm();
@@ -4435,6 +4625,7 @@ fn syscall(t: &mut Table, cur: usize) {
                     lx_close_all(t, i);
                 }
             }
+            crate::net::ext_detach(leader); // Веха 195: карта ушла с процессом
             // Ждущие узнают код выхода тем же путём, что и при обычном завершении; права на
             // мертвеца отзовёт `reclaim_dead_spaces` (Веха 89), когда освободит его слот.
             wake_exec_waiters(t, leader, 137);
@@ -6179,6 +6370,7 @@ fn linux_syscall(t: &mut Table, cur: usize) {
                     lx_close_all(t, i);
                 }
             }
+            crate::net::ext_detach(leader); // Веха 195: карта ушла с процессом
             wake_exec_waiters(t, leader, code);
             if let Some(n) = t.next_runnable(cur) {
                 t.set_cur(n);

@@ -30,6 +30,12 @@
 
 #include "lx_sched.h" /* кооперативный планировщик (Веха 62) */
 
+/* Веха 195 — softirq-половина сетевого рантайма (`lx_net.c`): опрос NAPI и насос передачи.
+ * Объявлены здесь, а не в заголовке, по той же причине, по какой здесь живёт весь мост между
+ * планировщиком и сетью, — их зовёт ровно одно место. */
+extern int lx_napi_run(void);
+extern int lx_netdev_pump(void);
+
 #ifdef LX_HAVE_SYSCALL
 #include <syscall.h> /* vsys_irq_wait — доставка IRQ в idle-пути планировщика (Веха 72) */
 #endif
@@ -1156,6 +1162,13 @@ void lx_sched_run(void)
 		lx_jiffies_update();
 		lx_timers_fire_due(); /* выстрелившие таймеры → могут сделать задачи готовыми */
 
+		/* Веха 195 — SOFTIRQ-контекст: опрос NAPI и насос передачи. В Linux это `net_rx_action`
+		 * и очередь `qdisc`, и оба живут ровно здесь — между сменами задач, где `sched_current`
+		 * ещё NULL. Сделанная работа считается: пока она есть, спать нельзя, иначе кадры ждут
+		 * ближайшего таймера. */
+		if (lx_napi_run() || lx_netdev_pump())
+			continue;
+
 		t = sched_head;
 		while (t && t->state != LX_RUNNABLE && t->state != LX_INIT)
 			t = t->next; /* первая готовая от головы (порядок = приоритет) */
@@ -1183,8 +1196,25 @@ void lx_sched_run(void)
 
 			lx_jiffies_update();
 			left = time_before(jiffies, next_exp) ? next_exp - jiffies : 0;
-			if (left)
-				vsys_sleep_ns((unsigned long long)left * (1000000000ull / HZ));
+			if (left) {
+				unsigned long long ns = (unsigned long long)left * (1000000000ull / HZ);
+
+				/* Веха 195 — если у устройства есть прерывание, ждём ЕГО, но не дольше
+				 * ближайшего срока. Здесь стоял простой сон, и он стоил целого захода: у
+				 * живого драйвера срок есть всегда (сторож, проверка линка), поэтому до
+				 * ветки ожидания прерывания ниже дело не доходило НИКОГДА. Обработчик не
+				 * звался, NAPI не планировался, `poll` не вынимал кадры из кольца — карта
+				 * поднята, кадров нет, и по логу не видно, почему. */
+				if (lx_the_irq.active) {
+					if (!vsys_irq_wait_to(lx_the_irq.cap, ns)) {
+						lx_the_irq.active = 0;
+						break;
+					}
+					lx_the_irq.handler(lx_the_irq.irq, lx_the_irq.dev);
+				} else {
+					vsys_sleep_ns(ns);
+				}
+			}
 			lx_jiffies_update();
 #else
 			do

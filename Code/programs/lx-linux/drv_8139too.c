@@ -39,6 +39,9 @@
 
 extern void lx_net_set_dma_cap(uintptr_t cap);
 extern void lx_net_set_irq_cap(uintptr_t cap);
+extern void lx_net_set_netdev_cap(uintptr_t cap);
+extern int  lx_netdev_attach(struct net_device *dev);
+extern int  lx_netdev_open(struct net_device *dev);
 extern int  lx_pci_register_device(struct pci_dev *pdev);
 extern int  lx_module_init(void);
 
@@ -57,12 +60,17 @@ static struct pci_dev g_pdev = {
 /* Сторож: держит процесс живым. Ровно та же причина, что у atl1c, и она не про удобство —
  * карта DMA'ит в НАШУ память. Умри процесс, ядро вернёт эти страницы в общий котёл, а карта
  * продолжит писать в них принятые кадры: порча чужой памяти вдалеке от причины.
+ *
+ * Веха 195 — спит теперь СЕКУНДУ, а не минуту. Дело не в сторожении: холостой путь планировщика
+ * выбирает между «спать до срока таймера» и «спать до прерывания», и пока здесь стояла минута,
+ * он выбирал первое — карта могла принять кадр, а узнали бы мы об этом через минуту. Секунда
+ * стоит одного пробуждения в секунду и оставляет прерывание рабочим путём.
  */
 static void rtl8139_keepalive(void *arg)
 {
 	(void)arg;
 	for (;;)
-		msleep(60000);
+		msleep(1000);
 }
 
 static void rtl8139_bringup(void *arg)
@@ -81,11 +89,20 @@ static void rtl8139_bringup(void *arg)
 	}
 	/* `probe` только опознаёт карту и заводит netdev; кольца, буферы приёма и запуск движков
 	 * делает `ndo_open` — в Linux его зовёт `ip link set up`. У нас звать некому: сетевой
-	 * службы, знающей про это устройство, пока нет. */
-	if (ndev->netdev_ops && ndev->netdev_ops->ndo_open) {
-		int err = ndev->netdev_ops->ndo_open(ndev);
+	 * службы, знающей про это устройство, нет.
+	 *
+	 * Веха 195 — зовём не `ndo_open`, а `lx_netdev_open`: кроме открытия он ставит `IFF_UP`,
+	 * как это делает `dev_open` в Linux. Без флага обработчик прерывания драйвера отказывался
+	 * работать («интерфейс выключен»), и приёма не было вовсе. */
+	{
+		int err = lx_netdev_open(ndev);
 
-		printk("[8139too] ndo_open → %d\n", err);
+		printk("[8139too] интерфейс поднят → %d\n", err);
+		/* Объявиться КАРТОЙ СИСТЕМЫ, и только после открытия: до него кольца не построены,
+		 * приёмник стоит, а стек уже начал бы слать в пустоту. С этого мгновения принятые
+		 * кадры уходят в ядро, а исходящие приходят оттуда. */
+		if (!err)
+			lx_netdev_attach(ndev);
 	}
 	lx_task_create(rtl8139_keepalive, NULL, "8139-idle");
 }
@@ -95,6 +112,7 @@ int main(void)
 	uintptr_t mmio_cap = vsys_start_cap(0);
 	uintptr_t dma_cap  = vsys_start_cap(1);
 	uintptr_t irq_cap  = vsys_start_cap(2);
+	uintptr_t ndev_cap = vsys_start_cap(3); /* Веха 195 — право БЫТЬ картой системы */
 
 	/* Небуферизованный вывод С ПЕРВОЙ СТРОКИ: застрянь probe — увидеть надо всё сказанное до
 	 * этого места, а не ничего (урок Вехи 133.1). */
@@ -111,6 +129,7 @@ int main(void)
 	}
 	lx_net_set_dma_cap(dma_cap);
 	lx_net_set_irq_cap(irq_cap);
+	lx_net_set_netdev_cap(ndev_cap);
 
 	/* Драйвер берёт BAR1 (MMIO): у него `bar = !use_io`, а `use_io` по умолчанию ложь.
 	 * BAR0 — порты ввода-вывода, и трогать их нам нечем. */
@@ -119,9 +138,10 @@ int main(void)
 	g_pdev.resource[1].flags = IORESOURCE_MEM;
 
 	lx_pci_register_device(&g_pdev);
-	printf("[8139too] DMA-право %s, IRQ-право %s\n",
+	printf("[8139too] DMA-право %s, IRQ-право %s, право-карта %s\n",
 	       dma_cap == VOID_NO_CAP ? "НЕТ" : "есть",
-	       irq_cap == VOID_NO_CAP ? "НЕТ" : "есть");
+	       irq_cap == VOID_NO_CAP ? "НЕТ" : "есть",
+	       ndev_cap == VOID_NO_CAP ? "НЕТ" : "есть");
 
 	/* probe идёт ЗАДАЧЕЙ планировщика, а не прямо отсюда: вендорный код зовёт msleep и
 	 * ожидания, а им нужен тот, кто уступит процессор. */

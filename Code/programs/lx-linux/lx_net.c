@@ -384,7 +384,20 @@ bool netif_carrier_ok(const struct net_device *dev)
 void netif_device_attach(struct net_device *dev) { (void)dev; }
 void netif_device_detach(struct net_device *dev) { (void)dev; }
 
-/* ─ NAPI (оживёт при RX-поллинге на след. вехе) ─ */
+/* ─── NAPI — НАСТОЯЩИЙ (Веха 195) ────────────────────────────────────────────
+ *
+ * Здесь стояли заглушки, и именно они были причиной, по которой хостируемый драйвер не принимал
+ * ни одного кадра: `napi_schedule_prep` отвечала «нет», обработчик прерывания послушно не
+ * планировал опрос, и `poll` — та функция, что вынимает кадры из кольца, — не звалась НИКОГДА.
+ * Снаружи это выглядело как «драйвер работает, кадров нет», то есть хуже всякой ошибки.
+ *
+ * В Linux опрос идёт в softirq (`net_rx_action`). У нас есть ровно такой контекст —
+ * холостой путь планировщика Lx_kit, который уже зовёт обработчики прерываний. Оттуда и
+ * зовём [`lx_napi_run`]; больше NAPI ничего не требует.
+ */
+#define LX_NAPI_MAX 4
+static struct napi_struct *lx_napi_pending[LX_NAPI_MAX];
+
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi, int (*poll)(struct napi_struct *, int))
 {
 	napi->dev = dev;
@@ -400,14 +413,200 @@ void netif_queue_set_napi(struct net_device *dev, unsigned int q, int type, stru
 { (void)dev; (void)q; (void)type; (void)napi; }
 void napi_enable(struct napi_struct *napi)
 { napi->state = 1; printk("lx_net: napi_enable\n"); }
-void napi_disable(struct napi_struct *napi) { napi->state = 0; }
-void __napi_schedule(struct napi_struct *napi) { (void)napi; }
-bool napi_schedule_prep(struct napi_struct *napi) { (void)napi; return false; }
-bool napi_complete_done(struct napi_struct *napi, int work_done) { (void)napi; (void)work_done; return true; }
-void napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb) { (void)napi; dev_kfree_skb(skb); }
+void napi_disable(struct napi_struct *napi)
+{
+	napi->state = 0;
+	for (int i = 0; i < LX_NAPI_MAX; i++)
+		if (lx_napi_pending[i] == napi)
+			lx_napi_pending[i] = NULL;
+}
+
+/* Поставить опрос в очередь. Дубликат не добавляем: `poll` не обязан быть повторно входимым,
+ * и в Linux это гарантирует тот же самый бит «уже запланирован». */
+void __napi_schedule(struct napi_struct *napi)
+{
+	for (int i = 0; i < LX_NAPI_MAX; i++)
+		if (lx_napi_pending[i] == napi)
+			return;
+	for (int i = 0; i < LX_NAPI_MAX; i++)
+		if (!lx_napi_pending[i]) {
+			lx_napi_pending[i] = napi;
+			return;
+		}
+	printk("lx_net: очередь NAPI полна — опрос потерян\n");
+}
+
+/* Разрешено ли планировать. Выключенный NAPI (до `ndo_open`, после `ndo_stop`) отвечает «нет»,
+ * и это не формальность: до открытия кольца ещё не построены, а `poll` полез бы в них. */
+bool napi_schedule_prep(struct napi_struct *napi)
+{
+	return napi->state == 1;
+}
+
+bool napi_complete_done(struct napi_struct *napi, int work_done)
+{
+	(void)work_done;
+	for (int i = 0; i < LX_NAPI_MAX; i++)
+		if (lx_napi_pending[i] == napi)
+			lx_napi_pending[i] = NULL;
+	return true;
+}
+
+/* Прогнать запланированные опросы — зовётся из холостого пути планировщика (softirq-контекст).
+ * Возвращает, сколько работы сделано: ноль значит «можно спать». */
+int lx_napi_run(void)
+{
+	int done = 0;
+
+	for (int i = 0; i < LX_NAPI_MAX; i++) {
+		struct napi_struct *n = lx_napi_pending[i];
+
+		if (!n || !n->poll)
+			continue;
+		/* Драйвер сам снимет себя через napi_complete_done, когда кольцо опустеет. Если он
+		 * этого не сделал (кадров больше, чем вес), опрос останется в очереди — и следующий
+		 * заход продолжит с того же места, как и положено NAPI. */
+		done += n->poll(n, n->weight);
+	}
+	return done;
+}
+
+/* ─── Приём: кадр УХОДИТ В СТЕК (Веха 195) ───────────────────────────────────
+ *
+ * Здесь была честная надпись «стека над драйвером ещё нет, кадр посчитан и отпущен». Стек есть
+ * (`net-srv` на smoltcp) — не хватало дороги к нему. Теперь кадр отдаётся ядру
+ * (`SYS_NETDEV`, op 1), а ядро кладёт его в ту же очередь, из которой `net-srv` читает кадры
+ * обычной карты. Стек не меняется ни на строку и не знает, что карта сменила сторону кольца.
+ */
+#ifdef LX_HAVE_SYSCALL
+static uintptr_t lx_netdev_cap = VOID_NO_CAP;
+static struct net_device *lx_netdev_dev;
+static unsigned long lx_rx_frames, lx_rx_lost, lx_tx_frames;
+
+void lx_net_set_netdev_cap(uintptr_t cap) { lx_netdev_cap = cap; }
+
+/* Поднять интерфейс — то, что в Linux делает `dev_open`, а у нас не делал НИКТО.
+ *
+ * Обёртки звали `ndo_open` напрямую и считали, что этого довольно: кольца построены, движки
+ * запущены, карта отвечает. А приёма всё равно не было, и причина оказалась в одной строке:
+ * первое, на что смотрит обработчик прерывания `8139too`, — `netif_running(dev)`, то есть флаг
+ * `IFF_UP`. Ставит его в Linux `dev_open` ПОСЛЕ успешного `ndo_open`; без него драйвер честно
+ * решает, что интерфейс выключен, гасит маску прерываний и уходит. Снаружи это выглядело как
+ * «карта поднята, прерывания сыплются, кадров нет».
+ *
+ * Здесь же и порядок: сперва открытие, и только по успеху — флаг. Наоборот значило бы объявить
+ * поднятым то, что не поднялось.
+ */
+int lx_netdev_open(struct net_device *dev)
+{
+	const struct net_device_ops *ops = dev ? dev->netdev_ops : NULL;
+	int err;
+
+	if (!ops || !ops->ndo_open)
+		return -EOPNOTSUPP;
+	err = ops->ndo_open(dev);
+	if (err)
+		return err;
+	dev->flags |= IFF_UP;
+	/* `dev_set_rx_mode` — вторая половина `dev_open`: без неё карта не знает, какие адреса
+	 * принимать. Драйверы обычно зовут её сами из `ndo_open`, но полагаться на это нельзя. */
+	if (ops->ndo_set_rx_mode)
+		ops->ndo_set_rx_mode(dev);
+	return 0;
+}
+
+/* Объявить себя картой системы. Зовётся драйвером-обёрткой ПОСЛЕ `ndo_open`: раньше карта ещё
+ * не принимает, и стек начал бы слать в пустоту. */
+int lx_netdev_attach(struct net_device *dev)
+{
+	if (lx_netdev_cap == VOID_NO_CAP) {
+		printk("lx_net: нет права быть картой — кадры в стек не пойдут\n");
+		return 0;
+	}
+	lx_netdev_dev = dev;
+	if (!vsys_netdev_attach(lx_netdev_cap, dev->dev_addr)) {
+		printk("lx_net: ядро не приняло нас картой\n");
+		return 0;
+	}
+	printk("lx_net: мы — сетевая карта системы, кадры идут в стек\n");
+	return 1;
+}
+
+static void lx_netdev_rx(struct sk_buff *skb)
+{
+	if (lx_netdev_cap == VOID_NO_CAP || !skb->len)
+		return;
+	if (vsys_netdev_rx(lx_netdev_cap, skb->data, skb->len))
+		lx_rx_frames++;
+	else
+		lx_rx_lost++;
+	/* Каждый 1024-й кадр — строкой в журнал. Молчать нельзя (не узнать, идёт ли приём вовсе),
+	 * печатать каждый — утопить журнал на первой же закачке: тысяча кадров это меньше секунды
+	 * на сотне мегабит. */
+	if ((lx_rx_frames & 1023) == 1)
+		printk("lx_net: принято кадров %lu (потеряно %lu)\n", lx_rx_frames, lx_rx_lost);
+}
+
+/* Насос передачи: забрать у ядра кадры, которые стек просил отправить, и отдать их драйверу
+ * его же `ndo_start_xmit`. Зовётся из холостого пути планировщика — там же, где NAPI.
+ *
+ * Почему опрос, а не «ядро зовёт нас»: позвать процесс ядро не может, оно может только его
+ * РАЗБУДИТЬ — и будит (`wake_netdev_owner`). Проснувшись, планировщик заходит сюда, находит
+ * кадр и отправляет его. Вхолостую этот заход не делается: спящий процесс не крутится.
+ */
+int lx_netdev_pump(void)
+{
+	unsigned char buf[1600];
+	int sent = 0;
+
+	if (lx_netdev_cap == VOID_NO_CAP || !lx_netdev_dev)
+		return 0;
+	for (;;) {
+		size_t n = vsys_netdev_tx_pop(lx_netdev_cap, buf, sizeof(buf));
+		struct sk_buff *skb;
+		const struct net_device_ops *ops = lx_netdev_dev->netdev_ops;
+
+		if (!n)
+			break;
+		if (!ops || !ops->ndo_start_xmit)
+			break;
+		/* Буфер кадра берётся из АРЕНЫ DMA (`lx_skb_alloc`): карта будет читать его сама, и
+		 * адрес ей нужен физический. Кадр со стека сюда копируется — второй раз за путь, и
+		 * это цена того, что очереди живут в ядре (см. `kernel/src/net.rs`). */
+		skb = __netdev_alloc_skb(lx_netdev_dev, n, 0);
+		if (!skb) {
+			printk("lx_net: нет буфера под исходящий кадр — потерян\n");
+			break;
+		}
+		memcpy(skb_put(skb, n), buf, n);
+		skb->dev = lx_netdev_dev;
+		if (ops->ndo_start_xmit(skb, lx_netdev_dev) == NETDEV_TX_OK)
+			lx_tx_frames++;
+		sent++;
+		if ((lx_tx_frames & 1023) == 1)
+			printk("lx_net: отправлено кадров %lu\n", lx_tx_frames);
+	}
+	return sent;
+}
+#else
+/* Сборка-«вычислялка» (без syscall'ов): карты нет, отдавать кадры некому. */
+static void lx_netdev_rx(struct sk_buff *skb) { (void)skb; }
+int lx_netdev_pump(void) { return 0; }
+#endif
+
+void napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+{
+	(void)napi;
+	lx_netdev_rx(skb);
+	dev_kfree_skb(skb);
+}
 /* Веха 193 — приём мимо GRO. Разница с предыдущим у нас нулевая: склеивать сегменты некому,
- * стека над драйвером ещё нет, и оба пути кончаются одним — кадр посчитан и отпущен. */
-void netif_receive_skb(struct sk_buff *skb) { dev_kfree_skb(skb); }
+ * и оба пути кончаются одним — кадр уходит в стек и отпускается. */
+void netif_receive_skb(struct sk_buff *skb)
+{
+	lx_netdev_rx(skb);
+	dev_kfree_skb(skb);
+}
 struct sk_buff *napi_get_frags(struct napi_struct *napi) { (void)napi; return NULL; }
 void napi_free_frags(struct napi_struct *napi) { (void)napi; }
 int  napi_gro_frags(struct napi_struct *napi) { (void)napi; return 0; }

@@ -588,8 +588,19 @@ pub fn boot() {
                     if let Some(i) = irq {
                         proc::push_start_cap(pid, i);
                     }
+                    // Веха 195 — четвёртое право: БЫТЬ картой системы. Без него принятые кадры
+                    // некуда девать, и драйвер остаётся демонстрацией: карта поднята, стека для
+                    // неё нет. Минтит только init и только тому, кому сам же выдал MMIO этой
+                    // карты, — говорить от имени провода не то же, что ходить в сеть.
+                    let nd = cap::mint(
+                        proc::domain(pid),
+                        cap::Target::Device(cap::Device::NetDrv),
+                        Rights::READ.union(Rights::WRITE),
+                    )
+                    .bits() as usize;
+                    proc::push_start_cap(pid, nd);
                     println!(
-                        "  [init] userspace-драйвер lx-8139too P{} — выданы MMIO+DMA{} cap",
+                        "  [init] userspace-драйвер lx-8139too P{} — выданы MMIO+DMA{}+КАРТА cap",
                         pid,
                         if irq.is_some() { "+IRQ" } else { "" },
                     );
@@ -636,8 +647,18 @@ pub fn boot() {
                         if let Some(i) = irq {
                             proc::push_start_cap(pid, i);
                         }
+                        // Веха 195 — четвёртым правом БЫТЬ картой системы: принятые кадры
+                        // уходят в стек, исходящие приходят из него. Харнессу первого контакта
+                        // оно не мешает — он его просто не берёт.
+                        let nd = cap::mint(
+                            proc::domain(pid),
+                            cap::Target::Device(cap::Device::NetDrv),
+                            Rights::READ.union(Rights::WRITE),
+                        )
+                        .bits() as usize;
+                        proc::push_start_cap(pid, nd);
                         println!(
-                            "  [init] драйвер {} P{} — выданы MMIO+DMA{} права",
+                            "  [init] драйвер {} P{} — выданы MMIO+DMA{}+КАРТА права",
                             name, pid, if irq.is_some() { "+IRQ" } else { "" },
                         );
                     }

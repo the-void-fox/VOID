@@ -351,6 +351,9 @@ fn classify_user(frame: &TrapFrame) -> UserTrap {
             lapic::eoi();
             UserTrap::TimerTick
         }
+        // Веха 195 — прерывание устройства, застигшее кольцо 3. EOI и маскирование уже
+        // сделаны ниже в общей части; здесь остаётся сказать планировщику, зачем мы пришли.
+        VEC_USERDRV | VEC_NET => UserTrap::DeviceIrq,
         v => UserTrap::Unknown(v as usize),
     }
 }
@@ -401,7 +404,9 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
         VEC_NET => {
             crate::virtio_net::on_irq(); // Веха 91: приехал кадр — разбудить сетевой сервер
             lapic::eoi();
-            true
+            // Веха 195 — прервав ПОЛЬЗОВАТЕЛЬСКИЙ код, не возвращаемся в него сразу: пусть
+            // сначала пройдёт планировщик и разбудит того, кто этого кадра ждёт (см. ниже).
+            frame.cs & 3 != 3
         }
         VEC_USERDRV => {
             // Веха 52 — IRQ устройства userspace-драйвера. Сперва ЗАМАСКИРОВАТЬ линию (oneshot):
@@ -412,7 +417,11 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
             super::ioapic::set_userdrv_masked(true);
             crate::proc::on_userdrv_irq();
             lapic::eoi();
-            true
+            // Веха 195 — если прерван ПОЛЬЗОВАТЕЛЬСКИЙ код, идём через планировщик, а не
+            // обратно в процесс: иначе отметка «IRQ пришёл» лежала бы до ближайшего тика.
+            // Замок таблицы при этом берётся законно — прерванный код её не держал (ring 3).
+            // Цена была измерима: кадр от хостируемого драйвера доходил до стека за 20 мс.
+            frame.cs & 3 != 3
         }
         _ => false,
     };

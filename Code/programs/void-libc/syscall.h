@@ -26,6 +26,7 @@
 #define SYS_DMA_ALLOC 32
 #define SYS_IRQ_WAIT 33
 #define SYS_SLEEP 47
+#define SYS_NETDEV 64
 #define SYS_RANDOM 37
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
@@ -175,6 +176,17 @@ static inline uintptr_t vsys_dma_alloc_n(uintptr_t cap, uintptr_t va, size_t pag
 static inline int vsys_irq_wait(uintptr_t cap) {
     return vsys(SYS_IRQ_WAIT, cap, 0, 0, 0, 0, 0, 0) == 0;
 }
+/* То же СО СРОКОМ (Веха 195): ждать прерывания, но не дольше `ns`. Ноль — ждать вечно.
+ *
+ * Нужно затем, что у живого драйвера всегда есть свои сроки (сторож, проверка линка), а ждать
+ * можно было только одно из двух: либо прерывание, либо время. Драйвер выбирал время — и не
+ * принимал ни одного кадра, потому что обработчик прерывания не звался вовсе.
+ *
+ * Проснуться по сроку и по прерыванию одинаково (возврат 1): драйвер обязан сверяться с
+ * регистром причин своего устройства, а не верить, что его будят только по делу. */
+static inline int vsys_irq_wait_to(uintptr_t cap, unsigned long long ns) {
+    return vsys(SYS_IRQ_WAIT, cap, (uintptr_t)ns, 0, 0, 0, 0, 0) == 0;
+}
 /* SYS_RANDOM(buf, len): случайные байты от ядра (аппаратный ГСЧ + пул событий). Права не
  * требует: случайность — не ресурс, а свойство системы. Веха 131 — понадобился драйверу:
  * сетевые карты без MAC в EEPROM обязаны сгенерировать себе адрес. */
@@ -186,4 +198,30 @@ static inline void vsys_random(void *buf, size_t len) {
  * свою долю процессора вечно. */
 static inline void vsys_sleep_ns(unsigned long long ns) {
     vsys(SYS_SLEEP, (uintptr_t)ns, 0, 0, 0, 0, 0, 0);
+}
+
+/* ─── БЫТЬ сетевой картой (SYS_NETDEV, Веха 195) ──────────────────────────────────────────────
+ *
+ * Вторая сторона `net_send`/`net_recv`: там процесс пользуется картой, здесь он ею ЯВЛЯЕТСЯ.
+ * Нужно хостируемым драйверам Linux — до этой вехи принятые ими кадры до стека не доходили
+ * вовсе (`netif_receive_skb` в шиме их освобождал), и широта, ради которой конвейер затевался,
+ * упиралась в отсутствие мостика. Право отдельного вида, его выдаёт init стартовым №3.
+ */
+/* op 0 — представиться картой системы: 6 байт MAC. */
+static inline int vsys_netdev_attach(uintptr_t cap, const unsigned char mac[6]) {
+    return vsys(SYS_NETDEV, cap, 0, (uintptr_t)mac, 6, 0, 0, 0) == 0;
+}
+/* op 1 — принятый с провода кадр в ядро. 0 — приёмная очередь полна (кадр потерян, и это
+ * нормальная работа сети: лучше отбросить, чем задержать). */
+static inline int vsys_netdev_rx(uintptr_t cap, const void *frame, size_t len) {
+    return vsys(SYS_NETDEV, cap, 1, (uintptr_t)frame, len, 0, 0, 0) == 0;
+}
+/* op 2 — забрать кадр, который стек просил отправить. 0 — отправлять нечего. */
+static inline size_t vsys_netdev_tx_pop(uintptr_t cap, void *buf, size_t len) {
+    uintptr_t n = vsys(SYS_NETDEV, cap, 2, (uintptr_t)buf, len, 0, 0, 0);
+    return n == (uintptr_t)-1 ? 0 : (size_t)n;
+}
+/* op 3 — отсоединиться: картой системы мы больше не являемся. */
+static inline void vsys_netdev_detach(uintptr_t cap) {
+    vsys(SYS_NETDEV, cap, 3, 0, 0, 0, 0, 0);
 }
