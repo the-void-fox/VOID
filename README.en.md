@@ -48,6 +48,20 @@ Writing to a USB stick: `sudo dd if=Code/boot/void.iso of=/dev/sdX bs=4M status=
 (**this erases the stick** — check the letter). Set the BIOS to AHCI mode; some laptops need
 Legacy USB for a USB keyboard.
 
+### Minimum requirements — measured, not promised
+
+| | how much | how it was checked |
+|---|---|---|
+| RAM: live ISO | **112 MiB** | at 96 MiB the kernel says plainly "no RAM for the kernel heap" (the image is loaded into memory whole) |
+| RAM: installed | **48 MiB** for a session, **96 MiB** to work | at 32 MiB the compositor does not start; at 96 MiB the file manager and a second window are fine |
+| disk | **128 MiB** | installing onto such a disk and booting from it are both verified |
+| CPU | x86_64 with SSE2 (roughly 2003 and later), **one core is enough** | every measurement was taken on a single core; SMP works but is not required |
+| video | the framebuffer the firmware set up (BIOS/VBE) | there is no display driver of our own — the bootloader picks the resolution |
+
+The numbers come from QEMU (KVM, `-smp 1`) with screenshots as evidence; they are the floor, not
+a comfortable margin. From 256 MiB up the system behaves exactly as it does on the author's
+laptop.
+
 ---
 
 ## What makes it unusual
@@ -101,6 +115,12 @@ card, builds DMA rings, receives packets on interrupts and answers `ping`.
 
 The point is not e1000 but the road: the long tail of hardware does not have to be rewritten
 for the system to run on a real laptop.
+
+Since milestone 195 the guest is wired into the system completely: **the system's network card
+can be a PROCESS**. Frames from a hosted driver flow into the ordinary network server, which
+knows nothing about it, and the right to *be* a card is a separate kind, handed only to the
+process the system itself gave that card's registers to. Proven with an unmodified `8139too.c`:
+DHCP gets an address, `ping` answers, names resolve, a file downloads over HTTP.
 
 ---
 
