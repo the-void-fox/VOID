@@ -249,7 +249,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::write("  vvsh gens         показать поколения системы\n".as_bytes());
         sys::exit(0);
     } else {
-        sys::write("vvsh: неизвестная подкоманда: ".as_bytes());
+        sys::write(sys::i18n::t("vvsh: неизвестная подкоманда: ").as_bytes());
         sys::write(sub);
         sys::write(b"\n");
         sys::exit(2);
@@ -363,7 +363,7 @@ fn run_init_config(force: bool) {
             // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` однажды доехал наполовину
             // и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не бывало.
             if !px::echo_to(ep, t.path, t.text.as_bytes()) {
-                sys::write("vvsh: НЕ УДАЛОСЬ записать ".as_bytes());
+                sys::write(sys::i18n::t("vvsh: НЕ УДАЛОСЬ записать ").as_bytes());
                 sys::write(t.path);
                 sys::write(b"\n");
                 bad = true;
@@ -387,36 +387,46 @@ fn run_init_config(force: bool) {
     }
 
     if bad {
-        sys::write("vvsh: конфиг посеян НЕПОЛНО — чинить до `rebuild`\n".as_bytes());
+        sys::write(
+            sys::i18n::t("vvsh: конфиг посеян НЕПОЛНО — чинить до `rebuild`\n").as_bytes(),
+        );
         return;
     }
     sys::write(
-        alloc::format!(
-            "vvsh: конфиг сверен: создано {}, обновлено {}, без изменений {}, оставлено с правками {}\n",
-            written, updated, same, kept
-        )
+        tf("vvsh: конфиг сверен: создано {}, обновлено {}, без изменений {}, оставлено с правками {}\n", &[
+            &alloc::format!("{}", written),
+            &alloc::format!("{}", updated),
+            &alloc::format!("{}", same),
+            &alloc::format!("{}", kept),
+        ])
         .as_bytes(),
     );
     for (path, keys) in &news {
         sys::write(b"  ");
         sys::write(path);
-        sys::write(" — ваши правки сохранены; в шаблоне появилось:\n".as_bytes());
+        sys::write(
+            sys::i18n::t(" — ваши правки сохранены; в шаблоне появилось:\n").as_bytes(),
+        );
         for k in keys {
             sys::write(alloc::format!("      {}…)\n", k).as_bytes());
         }
     }
     if !news.is_empty() {
         sys::write(
-            "  Дописать — руками, в нужный список: `ved <файл>` (^S сохранить, ^Q выход).\n\
-             Перезаписать файл шаблоном ЦЕЛИКОМ (правки пропадут): `init-config --force`.\n"
-                .as_bytes(),
+            sys::i18n::t(
+                "  Дописать — руками, в нужный список: `ved <файл>` (^S сохранить, ^Q выход).\n\
+                 Перезаписать файл шаблоном ЦЕЛИКОМ (правки пропадут): `init-config --force`.\n",
+            )
+            .as_bytes(),
         );
     }
     if written > 0 {
         sys::write(
-            "  Правь net.vv (true/false), terminal.vv (экран, клавиши), bar.vv (панель),\n\
-             packages.vv (пакеты) → `rebuild`.\n"
-                .as_bytes(),
+            sys::i18n::t(
+                "  Правь net.vv (true/false), terminal.vv (экран, клавиши), bar.vv (панель),\n\
+                 packages.vv (пакеты) → `rebuild`.\n",
+            )
+            .as_bytes(),
         );
     }
 }
@@ -494,7 +504,10 @@ fn run_rebuild() {
     let text = match read_config_text(ep, DEFAULT_PATH) {
         Ok(t) => t,
         Err(_) => {
-            sys::write("vvsh: нет /etc/system/default.vv — сначала `init-config`\n".as_bytes());
+            sys::write(
+                sys::i18n::t("vvsh: нет /etc/system/default.vv — сначала `init-config`\n")
+                    .as_bytes(),
+            );
             return;
         }
     };
@@ -502,7 +515,7 @@ fn run_rebuild() {
     let norm = match vvsh_core::build_config_with(&text, &loader) {
         Ok(out) => out,
         Err(e) => {
-            sys::write("vvsh: ошибка: ".as_bytes());
+            sys::write(sys::i18n::t("vvsh: ошибка: ").as_bytes());
             sys::write(e.as_bytes());
             sys::write(b"\n");
             return;
@@ -517,9 +530,12 @@ fn run_rebuild() {
     if let Some(cn) = &cur {
         if let Some(cid) = gen_content_id(scap, cn) {
             if cid == new_id {
-                sys::write("vvsh: нет изменений — конфиг уже в поколении ".as_bytes());
-                sys::write(cn);
-                sys::write(b"\n");
+                sys::write(
+                    tf("vvsh: нет изменений — конфиг уже в поколении {}\n", &[
+                        core::str::from_utf8(cn).unwrap_or("?"),
+                    ])
+                    .as_bytes(),
+                );
                 // Пакеты синхронизируются ВСЁ РАВНО: «конфиг тот же» не значит «обещанное
                 // выполнено». Прошлый `rebuild` мог не достать пакет (не было сети или индекса),
                 // и тогда повторный `rebuild` — ровно то, чем человек это чинит.
@@ -531,7 +547,12 @@ fn run_rebuild() {
 
     // Новое поколение gen<N> (N = max существующих + 1) + активировать (current).
     let Some(num) = next_gen_number(scap) else {
-        sys::write("vvsh: список корней store не читается целиком — номер поколения не выдумываем\n".as_bytes());
+        sys::write(
+            sys::i18n::t(
+                "vvsh: список корней store не читается целиком — номер поколения не выдумываем\n",
+            )
+            .as_bytes(),
+        );
         return;
     };
     let name = alloc::format!("gen{}", num);
@@ -541,14 +562,19 @@ fn run_rebuild() {
     sys::obj_put(scap, name.as_bytes(), &mut nm_id);
     sys::obj_set_root(scap, CURRENT_ROOT, &nm_id);
 
-    sys::write("vvsh: собрано поколение ".as_bytes());
-    sys::write(name.as_bytes());
-    sys::write(" (активно после ребута)".as_bytes());
-    if let Some(cn) = &cur {
-        sys::write("; было ".as_bytes());
-        sys::write(cn);
+    // Фраза целиком, а не склейка: «было gen8» в другом языке стоит в другом месте.
+    match &cur {
+        Some(cn) => sys::write(
+            tf("vvsh: собрано поколение {} (активно после ребута); было {}\n", &[
+                &name,
+                core::str::from_utf8(cn).unwrap_or("?"),
+            ])
+            .as_bytes(),
+        ),
+        None => sys::write(
+            tf("vvsh: собрано поколение {} (активно после ребута)\n", &[&name]).as_bytes(),
+        ),
     }
-    sys::write(b"\n");
     sync_packages();
 }
 
@@ -567,9 +593,14 @@ fn run_rebuild() {
 fn sync_packages() {
     let code = px::spawn_args(cap_store(), b"pkg", b"sync\0");
     if code == usize::MAX {
-        sys::write("vvsh: pkg не запустился — пакеты конфига не собраны\n".as_bytes());
+        sys::write(
+            sys::i18n::t("vvsh: pkg не запустился — пакеты конфига не собраны\n").as_bytes(),
+        );
     } else if code != 0 {
-        sys::write(alloc::format!("vvsh: pkg sync вернул [код {}] — пакеты не собраны\n", code).as_bytes());
+        sys::write(
+            tf("vvsh: pkg sync вернул [код {}] — пакеты не собраны\n", &[&alloc::format!("{}", code)])
+                .as_bytes(),
+        );
     }
 }
 
@@ -585,14 +616,17 @@ fn run_gens() {
     let cur = read_current_name(scap);
 
     let Some(text) = roots::text(scap) else {
-        sys::write("vvsh: список корней store не прочитать (нужен store READ/WRITE)\n".as_bytes());
+        sys::write(
+            sys::i18n::t("vvsh: список корней store не прочитать (нужен store READ/WRITE)\n")
+                .as_bytes(),
+        );
         return;
     };
     let nums = roots::gen_numbers(&text, b"system/gen");
 
-    sys::write("поколения системы (активно — *):\n".as_bytes());
+    sys::write(sys::i18n::t("поколения системы (активно — *):\n").as_bytes());
     if nums.is_empty() {
-        sys::write("  (нет собранных поколений — `rebuild`)\n".as_bytes());
+        sys::write(sys::i18n::t("  (нет собранных поколений — `rebuild`)\n").as_bytes());
     }
     for k in nums {
         let name = alloc::format!("gen{}", k);
@@ -604,7 +638,9 @@ fn run_gens() {
         sys::write(b"\n");
     }
     if cur.is_none() {
-        sys::write("  (активное поколение не прочитать — нужен store READ)\n".as_bytes());
+        sys::write(
+            sys::i18n::t("  (активное поколение не прочитать — нужен store READ)\n").as_bytes(),
+        );
     }
 }
 
@@ -666,7 +702,7 @@ fn cmd_repl() -> ! {
             command_line(&interp, &env, src); // команда (голые слова)
         }
     }
-    sys::write("vvsh: выход из REPL — vsh продолжает\n".as_bytes());
+    sys::write(sys::i18n::t("vvsh: выход из REPL — vsh продолжает\n").as_bytes());
     sys::exit(0);
 }
 
@@ -675,7 +711,7 @@ fn cmd_repl() -> ! {
 fn expr_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     let text = match core::str::from_utf8(src) {
         Ok(t) => t,
-        Err(_) => return sys::write("ошибка: ввод не UTF-8\n".as_bytes()),
+        Err(_) => return sys::write(sys::i18n::t("ошибка: ввод не UTF-8\n").as_bytes()),
     };
     match vvsh_core::read_all(text) {
         Ok(forms) => {
@@ -687,7 +723,7 @@ fn expr_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
             }
         }
         Err(e) => {
-            sys::write("ошибка разбора: ".as_bytes());
+            sys::write(sys::i18n::t("ошибка разбора: ").as_bytes());
             sys::write(e.0.as_bytes());
             sys::write(b"\n");
         }
@@ -704,7 +740,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     // который был на месте.
     let text = match core::str::from_utf8(src) {
         Ok(t) => t,
-        Err(_) => return sys::write("vvsh: ввод не UTF-8\n".as_bytes()),
+        Err(_) => return sys::write(sys::i18n::t("vvsh: ввод не UTF-8\n").as_bytes()),
     };
     let owned = match vvsh_core::split_words(text) {
         Ok(w) => w,
@@ -721,7 +757,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     }
     let head = match core::str::from_utf8(words[0]) {
         Ok(s) => s,
-        Err(_) => return sys::write("vvsh: имя команды не UTF-8\n".as_bytes()),
+        Err(_) => return sys::write(sys::i18n::t("vvsh: имя команды не UTF-8\n").as_bytes()),
     };
     match env.lookup(head) {
         Some(v) if is_callable(&v) => match build_command_form(&words, env) {
@@ -741,7 +777,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
             } else {
                 sys::write("vvsh: '".as_bytes());
                 sys::write(words[0]);
-                sys::write("' — значение, а не команда (даны аргументы)\n".as_bytes());
+                sys::write(sys::i18n::t("' — значение, а не команда (даны аргументы)\n").as_bytes());
             }
         }
         None => spawn_program(words[0], &words[1..]), // PATH: несвязанное имя → программа
@@ -800,11 +836,11 @@ fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
         }
     }
     if code == usize::MAX {
-        sys::write("vvsh: команда не найдена: ".as_bytes());
+        sys::write(sys::i18n::t("vvsh: команда не найдена: ").as_bytes());
         sys::write(name);
         sys::write(b"\n");
     } else if code != 0 {
-        sys::write(alloc::format!("[код {}]\n", code).as_bytes());
+        sys::write(tf("[код {}]\n", &[&alloc::format!("{}", code)]).as_bytes());
     }
 }
 
@@ -842,7 +878,7 @@ fn str_owned(s: &str) -> alloc::string::String {
 }
 
 fn print_err(e: &EvalError) {
-    sys::write("ошибка: ".as_bytes());
+    sys::write(sys::i18n::t("ошибка: ").as_bytes());
     sys::write(e.0.as_bytes());
     sys::write(b"\n");
 }
@@ -1134,6 +1170,28 @@ fn sh_clear(_args: &[Value]) -> Result<Value, EvalError> {
 /// Строка справки: жёлтая команда, выравнивание, описание.
 /// Строка справки. Описание переводится ЗДЕСЬ (Веха 178) — одним местом на четыре десятка
 /// строк: обернуть каждую значило бы сорок возможностей забыть одну.
+/// Перевести и подставить значения (`{}` по порядку) — Веха 195.1.
+///
+/// Тот же приём, что у `ui::i18n::f1`, но без тулкита: шеллу не нужна остальная его половина, а
+/// собирать фразу из переведённых обрывков нельзя — в другом языке другой порядок слов (см.
+/// шапку `void_user::i18n`). Поэтому переводится ФРАЗА ЦЕЛИКОМ, а числа и имена встают в места.
+fn tf(tmpl: &'static str, args: &[&str]) -> String {
+    let mut out = String::new();
+    let mut rest: &str = sys::i18n::t(tmpl);
+    for a in args {
+        match rest.find("{}") {
+            Some(i) => {
+                out.push_str(&rest[..i]);
+                out.push_str(a);
+                rest = &rest[i + 2..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn help_row(cmd: &[u8], desc: &'static str) {
     let desc = sys::i18n::t(desc);
     sys::write(b"  ");
@@ -1339,7 +1397,7 @@ fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
     // замыкания, — и фиксированный буфер молча резал вывод посреди строки.
     match roots::text(cap_store()) {
         Some(text) => sys::write(&text),
-        None => sys::write("нет корней (или нет прав на store)\n".as_bytes()),
+        None => sys::write(sys::i18n::t("нет корней (или нет прав на store)\n").as_bytes()),
     }
     Ok(Value::nil())
 }
@@ -1503,7 +1561,7 @@ fn sh_ping(args: &[Value]) -> Result<Value, EvalError> {
     let n = sys::call(netep, 0 /* OP_PING */, &ip, &mut rep);
     if n >= 5 && rep[0] == 0 {
         let rtt = u32::from_le_bytes([rep[1], rep[2], rep[3], rep[4]]);
-        sys::write(alloc::format!("ответ от {}: {} мкс\n", ipstr, rtt).as_bytes());
+        sys::write(tf("ответ от {}: {} мкс\n", &[&ipstr, &alloc::format!("{}", rtt)]).as_bytes());
         return Ok(Value::nil());
     }
     // Отказы РАЗНЫЕ, и валить их в «нет ответа» — врать (Веха 135). «Не отзывается на ARP»
@@ -1930,7 +1988,7 @@ fn sh_store_probe(args: &[Value]) -> Result<Value, EvalError> {
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
 /// одностороннее действие над всей системой, и оно названо правом, а не считается общедоступным.
 fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
-    sys::write("выключаю машину…\n".as_bytes());
+    sys::write(sys::i18n::t("выключаю машину…\n").as_bytes());
     // Веха 157 — в тексте право приходит из конфига стартовым, а в ОКНЕ его приходится просить у
     // композитора: с Вехи 154 выключение помечено «не наследуется», и шелл, запущенный терминалом,
     // получал бы его только вместе со всеми окнами разом.
@@ -1953,7 +2011,7 @@ fn sh_switch(args: &[Value]) -> Result<Value, EvalError> {
     if sys::obj_put(scap, name.as_bytes(), &mut id) == 0
         && sys::obj_set_root(scap, CURRENT_ROOT, &id) == 0
     {
-        sys::write(alloc::format!("поколение выбрано, перезагрузи QEMU: {}\n", name).as_bytes());
+        sys::write(tf("поколение выбрано, перезагрузи QEMU: {}\n", &[&name]).as_bytes());
         Ok(Value::nil())
     } else {
         Err(EvalError::new("switch не удался (нет права WRITE на store?)"))
@@ -2375,7 +2433,7 @@ fn read_config_text(ep: usize, path: &[u8]) -> Result<String, usize> {
     let src = match read_file(ep, path) {
         Some(s) => s,
         None => {
-            sys::write("vvsh: не удалось прочитать файл: ".as_bytes());
+            sys::write(sys::i18n::t("vvsh: не удалось прочитать файл: ").as_bytes());
             sys::write(path);
             sys::write(b"\n");
             return Err(1);
@@ -2384,14 +2442,14 @@ fn read_config_text(ep: usize, path: &[u8]) -> Result<String, usize> {
     match String::from_utf8(src) {
         Ok(t) => Ok(t),
         Err(_) => {
-            sys::write("vvsh: файл не UTF-8\n".as_bytes());
+            sys::write(sys::i18n::t("vvsh: файл не UTF-8\n").as_bytes());
             Err(1)
         }
     }
 }
 
 fn fail(msg: &str) -> ! {
-    sys::write("vvsh: ошибка: ".as_bytes());
+    sys::write(sys::i18n::t("vvsh: ошибка: ").as_bytes());
     sys::write(msg.as_bytes());
     sys::write(b"\n");
     sys::exit(1);

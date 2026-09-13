@@ -391,6 +391,42 @@ fn en(s: &'static str) -> &'static str {
             => "Remove the name from the list, say rebuild — and the window is gone. Everything \
                 else changes the same way: gens lists the generations, switch goes back.",
 
+        "  Дописать — руками, в нужный список: `ved <файл>` (^S сохранить, ^Q выход).\n\
+                 Перезаписать файл шаблоном ЦЕЛИКОМ (правки пропадут): `init-config --force`.\n"
+            => "  Add them by hand, to the right list: `ved <file>` (^S saves, ^Q quits).\n\
+                 Overwrite the file with the template WHOLE (your edits are lost): `init-config --force`.\n",
+        "  Правь net.vv (true/false), terminal.vv (экран, клавиши), bar.vv (панель),\n\
+                 packages.vv (пакеты) → `rebuild`.\n"
+            => "  Edit net.vv (true/false), terminal.vv (screen, keys), bar.vv (the panel),\n\
+                 packages.vv (packages) → `rebuild`.\n",
+
+        "vvsh: неизвестная подкоманда: " => "vvsh: unknown subcommand: ",
+        "vvsh: ошибка: " => "vvsh: error: ",
+        "ошибка: " => "error: ",
+        "  (активное поколение не прочитать — нужен store READ)\n"
+            => "  (cannot read the active generation — needs store READ)\n",
+        "[код {}]\n" => "[code {}]\n",
+        "ответ от {}: {} мкс\n" => "reply from {}: {} us\n",
+        "поколение выбрано, перезагрузи QEMU: {}\n"
+            => "generation selected, reboot the machine: {}\n",
+
+        // ── пакеты ─────────────────────────────────────────────────────────────────────────
+        "пакеты {}: конфиг не объявляет ни одного\n"
+            => "packages of {}: the config declares none\n",
+        "пакеты {}: объявлено {}\n" => "packages of {}: {} declared\n",
+        "пакеты {}: без изменений\n" => "packages of {}: unchanged\n",
+        "профиль {} пуст — `pkg install <путь>`\n"
+            => "profile {} is empty — `pkg install <path>`\n",
+        "профиль {} ({}) — конфиг не объявляет пакетов\n"
+            => "profile {} ({}) — the config declares no packages\n",
+        "  зависимости ({}):\n" => "  dependencies ({}):\n",
+        "поколения профиля {} (активно — *):\n"
+            => "generations of profile {} (* marks the active one):\n",
+        "  (пусто — `pkg install <путь>`)\n" => "  (empty — `pkg install <path>`)\n",
+        "  сеть отказала — попытка {} из {}\n" => "  the network failed — attempt {} of {}\n",
+        "в индексе канала ничего похожего на {}\n"
+            => "nothing in the channel index looks like {}\n",
+
         // ── терминал ───────────────────────────────────────────────────────────────────────
         "терминал" => "terminal",
         "панель" => "pane",
@@ -471,6 +507,52 @@ fn en(s: &'static str) -> &'static str {
         "замер: сколько store принимает за сессию (МиБ)"
             => "measurement: how much the store takes in one session (MiB)",
         "разложить NAR из корня store в файлы" => "unpack a NAR from a store root into files",
+
+        // ── шелл: то, что человек видит каждый день (Веха 195.1) ───────────────────────────
+        //
+        // Граница та же, что в шапке: сюда попадает сказанное ЧЕЛОВЕКУ в окне, а не диагностика
+        // для того, кто чинит систему. Проверялось не чтением кода, а работой на английском:
+        // сеанс пройден целиком, и каждая оставшаяся русская фраза попала сюда.
+        "vvsh: команда не найдена: " => "vvsh: command not found: ",
+        "vvsh: нет /etc/system/default.vv — сначала `init-config`\n"
+            => "vvsh: no /etc/system/default.vv — run `init-config` first\n",
+        "vvsh: нет изменений — конфиг уже в поколении {}\n"
+            => "vvsh: no changes — the config is already generation {}\n",
+        "vvsh: список корней store не читается целиком — номер поколения не выдумываем\n"
+            => "vvsh: the store root list does not read in full — refusing to invent a generation number\n",
+        "vvsh: собрано поколение {} (активно после ребута); было {}\n"
+            => "vvsh: built generation {} (active after a reboot); it was {}\n",
+        "vvsh: собрано поколение {} (активно после ребута)\n"
+            => "vvsh: built generation {} (active after a reboot)\n",
+        "vvsh: pkg не запустился — пакеты конфига не собраны\n"
+            => "vvsh: pkg did not start — the config's packages were not built\n",
+        "vvsh: pkg sync вернул [код {}] — пакеты не собраны\n"
+            => "vvsh: pkg sync returned [code {}] — packages were not built\n",
+        "vvsh: список корней store не прочитать (нужен store READ/WRITE)\n"
+            => "vvsh: cannot read the store root list (needs store READ/WRITE)\n",
+        "поколения системы (активно — *):\n" => "system generations (* marks the active one):\n",
+        "  (нет собранных поколений — `rebuild`)\n" => "  (no generations built yet — `rebuild`)\n",
+        "vvsh: НЕ УДАЛОСЬ записать " => "vvsh: FAILED to write ",
+        "vvsh: конфиг посеян НЕПОЛНО — чинить до `rebuild`\n"
+            => "vvsh: the config was seeded INCOMPLETELY — fix it before `rebuild`\n",
+        "vvsh: конфиг сверен: создано {}, обновлено {}, без изменений {}, оставлено с правками {}\n"
+            => "vvsh: config reconciled: created {}, updated {}, unchanged {}, kept as edited {}\n",
+        " — ваши правки сохранены; в шаблоне появилось:\n"
+            => " — your edits are kept; the template gained:\n",
+        "нет корней (или нет прав на store)\n" => "no roots (or no rights on the store)\n",
+        "выключаю машину…\n" => "powering the machine off…\n",
+        "vvsh: не удалось прочитать файл: " => "vvsh: could not read the file: ",
+        "vvsh: файл не UTF-8\n" => "vvsh: the file is not UTF-8\n",
+        "vvsh: выход из REPL — vsh продолжает\n" => "vvsh: leaving the REPL — vsh continues\n",
+        "ошибка: ввод не UTF-8\n" => "error: the input is not UTF-8\n",
+        "ошибка разбора: " => "parse error: ",
+        "vvsh: ввод не UTF-8\n" => "vvsh: the input is not UTF-8\n",
+        "vvsh: имя команды не UTF-8\n" => "vvsh: the command name is not UTF-8\n",
+        "' — значение, а не команда (даны аргументы)\n"
+            => "' is a value, not a command (arguments were given)\n",
+
+        // ── терминал ───────────────────────────────────────────────────────────────────────
+        "выше: прошлый сеанс" => "above: the previous session",
 
         // ── заголовки окон ─────────────────────────────────────────────────────────────────
         "Файлы" => "Files",

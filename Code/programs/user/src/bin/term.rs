@@ -896,7 +896,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 pane.parser.advance(&mut pane.grid, text.as_bytes());
                 pane.parser.advance(
                     &mut pane.grid,
-                    "\r\n\x1b[2m──── выше: прошлый сеанс ────\x1b[0m\r\n".as_bytes(),
+                    // Веха 195.1 — переводится и эта строка: человек читает её в окне, а не
+                    // в журнале, то есть она по нашу сторону границы (см. `void_user::i18n`).
+                    alloc::format!(
+                        "\r\n\x1b[2m──── {} ────\x1b[0m\r\n",
+                        ui::t("выше: прошлый сеанс")
+                    )
+                    .as_bytes(),
                 );
             }
         }

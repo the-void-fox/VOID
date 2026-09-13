@@ -132,6 +132,11 @@ use profile::{GEN_MAGIC, PROFILE};
 
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
+    // Веха 195.1 — ЯЗЫК ВЫВОДА из конфига поколения, как у шелла и у окон. Без этих строк `pkg`
+    // отвечал по-русски системе, говорящей по-английски: язык — свойство системы, а не программы,
+    // и каждая программа обязана спросить его сама (общего родителя, который бы его сообщил, в
+    // VOID нет — есть только capability на store).
+    set_language(sys::start_cap(1));
     let argv = sys::argv::Argv::take();
     let mut it = argv.rest();
     let (cmd, rest, third) = (it.next(), it.next(), it.next());
@@ -337,7 +342,13 @@ fn download(url: &str, root: &str) -> Result<[u8; 32], String> {
         if attempt >= DOWNLOAD_TRIES {
             return Err(format!("не скачалось ({} попытки): {}", DOWNLOAD_TRIES, url));
         }
-        sys::write(format!("  сеть отказала — попытка {} из {}\n", attempt + 1, DOWNLOAD_TRIES).as_bytes());
+        sys::write(
+            tf("  сеть отказала — попытка {} из {}\n", &[
+                &format!("{}", attempt + 1),
+                &format!("{}", DOWNLOAD_TRIES),
+            ])
+            .as_bytes(),
+        );
         pause_ns(attempt as u64 * 2_000_000_000);
     }
     let mut id = [0u8; 32];
@@ -1480,7 +1491,7 @@ fn cmd_search(what: &[u8]) -> Result<(), String> {
     })?;
 
     if hits.is_empty() {
-        sys::write(format!("в индексе канала ничего похожего на {}\n", q).as_bytes());
+        sys::write(tf("в индексе канала ничего похожего на {}\n", &[q]).as_bytes());
         return Ok(());
     }
     hits.sort_unstable();
@@ -1667,11 +1678,13 @@ fn cmd_sync() -> Result<(), String> {
     if names.is_empty() {
         let empty = Closure { paths: Vec::new(), fetched: 0, bytes: 0 };
         write_gen_at(scap, &root, &empty)?;
-        sys::write(format!("пакеты {}: конфиг не объявляет ни одного\n", gen).as_bytes());
+        sys::write(tf("пакеты {}: конфиг не объявляет ни одного\n", &[&gen]).as_bytes());
         return Ok(());
     }
 
-    sys::write(format!("пакеты {}: объявлено {}\n", gen, names.len()).as_bytes());
+    sys::write(
+        tf("пакеты {}: объявлено {}\n", &[&gen, &format!("{}", names.len())]).as_bytes(),
+    );
     let tops = resolve_declared(scap, &names)?;
 
     // Сверка ДО пересборки: `rebuild` зовёт `sync` каждый раз, и обычный случай — «всё уже так».
@@ -1679,7 +1692,7 @@ fn cmd_sync() -> Result<(), String> {
     if let Ok(items) = profile::read_root(scap, &root) {
         let have: Vec<&String> = items.iter().filter(|i| i.top).map(|i| &i.base).collect();
         if have.len() == tops.len() && tops.iter().all(|t| have.iter().any(|h| *h == t)) {
-            sys::write(format!("пакеты {}: без изменений\n", gen).as_bytes());
+            sys::write(tf("пакеты {}: без изменений\n", &[&gen]).as_bytes());
             return Ok(());
         }
     }
@@ -1710,7 +1723,7 @@ fn cmd_list() -> Result<(), String> {
     list_system(scap);
 
     let Some(cur) = read_current(scap) else {
-        sys::write(format!("профиль {} пуст — `pkg install <путь>`\n", PROFILE).as_bytes());
+        sys::write(tf("профиль {} пуст — `pkg install <путь>`\n", &[PROFILE]).as_bytes());
         return Ok(());
     };
     let paths = read_gen(scap, cur)?;
@@ -1720,11 +1733,52 @@ fn cmd_list() -> Result<(), String> {
 
 /// Что объявляет конфиг активного поколения системы. Отдельная секция, потому что это ДРУГАЯ
 /// вещь: не «что я поставил», а «что система обещает иметь».
+/// Включить язык интерфейса по активному поколению системы (Веха 195.1).
+///
+/// Содержимое корня `system/<gen>` — это и есть нормализованный конфиг, в нём же строка
+/// `ui("language", …)`. Нет права на store или нет поколения — остаёмся на русском: интерфейс
+/// обязан подняться на чём угодно.
+fn set_language(scap: usize) {
+    let Some(gen) = profile::system_current(scap) else { return };
+    let Some(id) = profile::root_id(scap, &format!("system/{}", gen)) else { return };
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let n = sys::obj_get(scap, &id, &mut buf);
+    if n == 0 || n > buf.len() {
+        return;
+    }
+    buf.truncate(n);
+    if let Ok(text) = String::from_utf8(buf) {
+        sys::i18n::set_from_config(&text);
+    }
+}
+
+/// Перевести и подставить (`{}` по порядку) — Веха 195.1. Тот же приём, что у `vvsh`: фразу
+/// переводим ЦЕЛИКОМ, а числа и имена встают в места подстановки (порядок слов в языках разный).
+fn tf(tmpl: &'static str, args: &[&str]) -> String {
+    let mut out = String::new();
+    let mut rest: &str = sys::i18n::t(tmpl);
+    for a in args {
+        match rest.find("{}") {
+            Some(i) => {
+                out.push_str(&rest[..i]);
+                out.push_str(a);
+                rest = &rest[i + 2..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn list_system(scap: usize) {
     let Some(gen) = profile::system_current(scap) else { return };
     match profile::read_root(scap, &profile::system_gen_root(&gen)) {
         Ok(items) if items.is_empty() => {
-            sys::write(format!("профиль {} ({}) — конфиг не объявляет пакетов\n", profile::SYSTEM, gen).as_bytes());
+            sys::write(
+                tf("профиль {} ({}) — конфиг не объявляет пакетов\n", &[profile::SYSTEM, &gen])
+                    .as_bytes(),
+            );
         }
         Ok(items) => show_gen(&format!("профиль {} — поколение системы {}", profile::SYSTEM, gen), &items),
         // Корня нет — про это поколение `sync` не отрабатывал. Хорошо это или плохо, знает
@@ -1756,7 +1810,7 @@ fn show_gen(title: &str, paths: &[profile::Item]) {
     }
     let deps: Vec<&String> = paths.iter().filter(|i| !i.top).map(|i| &i.base).collect();
     if !deps.is_empty() {
-        sys::write(format!("  зависимости ({}):\n", deps.len()).as_bytes());
+        sys::write(tf("  зависимости ({}):\n", &[&format!("{}", deps.len())]).as_bytes());
         for d in deps {
             sys::write(format!("    {}\n", d).as_bytes());
         }
@@ -1823,9 +1877,9 @@ fn cmd_gens() -> Result<(), String> {
     let scap = sys::start_cap(1);
     let nums = gen_numbers(scap)?;
     let cur = read_current(scap);
-    sys::write(format!("поколения профиля {} (активно — *):\n", PROFILE).as_bytes());
+    sys::write(tf("поколения профиля {} (активно — *):\n", &[PROFILE]).as_bytes());
     if nums.is_empty() {
-        sys::write("  (пусто — `pkg install <путь>`)\n".as_bytes());
+        sys::write(sys::i18n::t("  (пусто — `pkg install <путь>`)\n").as_bytes());
     }
     for n in nums {
         let count = read_gen(scap, n).map(|p| p.len()).unwrap_or(0);
