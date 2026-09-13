@@ -35,6 +35,8 @@ enum Medium {
     Ram = 2,
     /// Веха 194 — диск NVMe. У современных ноутбуков SATA часто нет вовсе.
     Nvme = 3,
+    /// Веха 196 — USB-накопитель (BOT поверх xHCI): та самая флешка, с которой систему ставят.
+    Usb = 4,
 }
 
 static MEDIUM: AtomicU8 = AtomicU8::new(Medium::Virtio as u8);
@@ -44,6 +46,7 @@ fn medium() -> Medium {
         1 => Medium::Ahci,
         2 => Medium::Ram,
         3 => Medium::Nvme,
+        4 => Medium::Usb,
         _ => Medium::Virtio,
     }
 }
@@ -56,6 +59,19 @@ pub fn use_ahci() {
 /// Веха 194 — носителем становится диск NVMe (современные машины: SATA там часто нет вовсе).
 pub fn use_nvme() {
     MEDIUM.store(Medium::Nvme as u8, Ordering::Relaxed);
+}
+
+/// Веха 196 — носителем становится USB-накопитель: система живёт на флешке и переживает
+/// перезагрузку, в отличие от живого ISO (там store в памяти и всё изменённое исчезает).
+pub fn use_usb() {
+    MEDIUM.store(Medium::Usb as u8, Ordering::Relaxed);
+}
+
+/// Работает ли система с флешки. Спрашивает установщик: ставить на носитель, с которого
+/// работаешь, — не установка, а потеря. На riscv спрашивать некому — xHCI там нет.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn on_usb() -> bool {
+    matches!(medium(), Medium::Usb)
 }
 
 /// Веха 171 — носителем становится образ в оперативной памяти (загрузка с ISO, диска нет).
@@ -71,6 +87,7 @@ impl BlockIo for Disk {
         match medium() {
             Medium::Ahci => ahci::read(sector, buf),
             Medium::Nvme => crate::nvme::read(sector, buf),
+            Medium::Usb => crate::xhci::read(sector, buf),
             Medium::Ram => crate::ramdisk::read(sector, buf),
             Medium::Virtio => virtio_blk::read(sector, buf),
         }
@@ -79,6 +96,7 @@ impl BlockIo for Disk {
         match medium() {
             Medium::Ahci => ahci::write(sector, buf),
             Medium::Nvme => crate::nvme::write(sector, buf),
+            Medium::Usb => crate::xhci::write(sector, buf),
             Medium::Ram => crate::ramdisk::write(sector, buf),
             Medium::Virtio => virtio_blk::write(sector, buf),
         }
@@ -89,6 +107,7 @@ impl BlockIo for Disk {
         match medium() {
             Medium::Ahci => ahci::capacity_sectors(),
             Medium::Nvme => crate::nvme::capacity_sectors(),
+            Medium::Usb => crate::xhci::capacity_sectors(),
             Medium::Ram => crate::ramdisk::capacity_sectors(),
             Medium::Virtio => virtio_blk::capacity_sectors(),
         }

@@ -121,7 +121,7 @@ pub use imp::power_off;
 /// Веха 50 — USB xHCI: поиск контроллера и байт клавиатуры в консоль. Только x86 (на riscv
 /// USB нет, `xhci`-модуль ядра там — заглушка).
 #[cfg(target_arch = "x86_64")]
-pub use imp::{intx_irq_setup, pci_dump, probe_bar, probe_bar0, probe_xhci, usb_key};
+pub use imp::{intx_irq_setup, pci_dump, probe_bar, probe_bar0, probe_xhci, usb_key, usb_key_event};
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).
@@ -154,6 +154,10 @@ pub enum UserTrap {
     /// Тик таймера — вытеснение процесса.
     TimerTick,
     /// Прерывание УСТРОЙСТВА, застигшее пользовательский код (Веха 195).
+    ///
+    /// На riscv не строится: там прерывания устройств в U-код не приходят этим путём (PLIC
+    /// обслуживается в ядре), поэтому вариант объявлен, но не конструируется.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     ///
     /// Нужен затем, что обработчик прерывания только ОТМЕЧАЕТ событие (брать замок таблицы
     /// процессов из прерванного контекста нельзя), а разбудить ждущего может лишь планировщик.

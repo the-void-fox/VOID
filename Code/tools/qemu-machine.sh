@@ -24,7 +24,7 @@
 #
 # ── Использование ────────────────────────────────────────────────────────────────────────────
 #
-#   source qemu-machine.sh                → функции void_qemu_machine / void_qemu_net
+#   source qemu-machine.sh                → функции void_qemu_machine / void_qemu_net / void_qemu_usb
 #   qemu-machine.sh machine <образ> [память]
 #   qemu-machine.sh net [сеть] [карта] [mac] [pcap] [задержка-мкс]
 #
@@ -57,13 +57,16 @@ void_qemu_machine() {
     # менять стенд значило бы обесценить все прежние замеры (они делались на одноядерной
     # машине). Многоядерные прогоны просят это явно: `VOID_QEMU_SMP=4`.
     local smp="${VOID_QEMU_SMP:-1}"
+    # Машина: q35, при VOID_QEMU_NO_PS2=1 — без контроллера i8042 (см. ниже).
+    local machine=q35
+    [ -n "${VOID_QEMU_NO_PS2:-}" ] && machine="q35,i8042=off"
     # Веха 171 — ISO подключается КОМПАКТ-ДИСКОМ, а не жёстким. Разница не косметическая: с
     # `.iso` в роли `ide-hd` гость получил бы записываемый диск, которого у живого носителя нет,
     # и проверка «работает ли ISO» проверяла бы совсем другую машину. Отличаем по расширению —
     # тем же способом, каким его выбирает человек.
     if [ "${img##*.}" = "iso" ]; then
         printf '%s\n' \
-            -machine q35 \
+            -machine "$machine" \
             -smp "$smp" \
             -m "$mem" \
             -cdrom "$img" \
@@ -121,13 +124,59 @@ void_qemu_machine() {
             echo "стенд: не понимаю диск '$disk' (ahci | nvme)" >&2
             return 2 ;;
     esac
+    # Веха 196 — машина БЕЗ PS/2 (`VOID_QEMU_NO_PS2=1`). Нужна ровно для одной проверки, зато
+    # честной: пока i8042 на месте, QEMU отдаёт нажатия ему, а не USB-клавиатуре — адресовать
+    # событие конкретному устройству QMP не умеет. Это же и настоящая машина новее ~2015: там
+    # контроллера PS/2 часто нет вовсе, и клавиатура только по USB.
     printf '%s\n' \
-        -machine q35 \
+        -machine "$machine" \
         -smp "$smp" \
         -m "$mem" \
         "${ctrl[@]}" \
         -boot c \
         -device virtio-rng-pci,disable-legacy=on
+}
+
+# ── USB (Веха 196) ────────────────────────────────────────────────────────────────────────────
+#
+# До этой вехи USB на стенде не было ВОВСЕ: драйвер xHCI (Веха 50) проверяли разовой командой
+# руками, а обычные прогоны шли без него. Значит весь код USB с тех пор не исполнялся ни разу —
+# ни в одном сценарии, ни в одном замере. Это ровно тот случай, про который [[void-notes-trust]]:
+# «проверено» относилось к тому дню, а не к сегодняшнему коду.
+#
+#   VOID_QEMU_USB=kbd              клавиатура (проверка Вехи 50)
+#   VOID_QEMU_USB=disk:<путь>      флешка (USB mass storage поверх BOT)
+#   VOID_QEMU_USB=boot:<путь>      флешка, с которой ЗАГРУЖАЕТСЯ машина (bootindex=0)
+#   VOID_QEMU_USB=kbd,disk:<путь>  и то и другое на одном контроллере
+void_qemu_usb() {
+    local spec="${VOID_QEMU_USB:-}"
+    [ -n "$spec" ] || return 0
+    printf '%s\n' -device qemu-xhci,id=xhci
+    local i=0 item rest="$spec"
+    while [ -n "$rest" ]; do
+        item="${rest%%,*}"
+        [ "$item" = "$rest" ] && rest="" || rest="${rest#*,}"
+        [ -n "$item" ] || continue
+        case "$item" in
+            kbd) printf '%s\n' -device usb-kbd,bus=xhci.0,id=usbkbd ;;
+            disk:*)
+                printf '%s\n' \
+                    -drive "if=none,id=usb$i,file=${item#disk:},format=raw" \
+                    -device "usb-storage,bus=xhci.0,drive=usb$i"
+                i=$((i + 1)) ;;
+            # `boot:` — та же флешка, но с неё ЗАГРУЖАЮТСЯ: BIOS предпочтёт её диску и
+            # компакт-диску. Ради этого веха и делалась — переносная система на съёмном
+            # носителе, а не «ещё одно блочное устройство».
+            boot:*)
+                printf '%s\n' \
+                    -drive "if=none,id=usb$i,file=${item#boot:},format=raw" \
+                    -device "usb-storage,bus=xhci.0,drive=usb$i,bootindex=0"
+                i=$((i + 1)) ;;
+            *)
+                echo "стенд: не понимаю USB-устройство '$item' (kbd | disk:<путь>)" >&2
+                return 2 ;;
+        esac
+    done
 }
 
 # Сетевой стенд (Веха 135).
@@ -208,8 +257,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     case "${1:-}" in
         machine) shift; void_qemu_machine "$@" ;;
         net)     shift; void_qemu_net "$@" ;;
+        usb)     shift; void_qemu_usb "$@" ;;
         *)
-            echo "qemu-machine.sh machine <образ> [память] | net [сеть] [карта] [mac] [pcap] [мкс]" >&2
+            echo "qemu-machine.sh machine <образ> [память] | net [сеть] [карта] [mac] [pcap] [мкс] | usb" >&2
             exit 2
             ;;
     esac

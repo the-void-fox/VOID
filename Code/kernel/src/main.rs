@@ -63,7 +63,39 @@ mod nvme;
 mod xhci;
 #[cfg(not(target_arch = "x86_64"))]
 mod xhci {
+    //! Заглушка: на riscv/QEMU-virt контроллера xHCI нет. Поверхность та же, что у настоящего
+    //! драйвера (Веха 196), чтобы общий код — выбор носителя store и установщик — не обрастал
+    //! `cfg`-ами: «устройства нет» здесь отвечают функции, а не условная компиляция.
+    pub const SLOT_BASE: usize = 200;
+
     pub fn init() -> bool {
+        false
+    }
+    pub fn store_init() -> bool {
+        false
+    }
+    pub fn capacity_sectors() -> u64 {
+        0
+    }
+    pub fn read(_sector: u64, _buf: &mut [u8; 512]) -> bool {
+        false
+    }
+    pub fn write(_sector: u64, _buf: &[u8; 512]) -> bool {
+        false
+    }
+    pub fn disks(_out: &mut [crate::ahci::Disk]) -> usize {
+        0
+    }
+    pub fn target_open(_slot: usize) -> bool {
+        false
+    }
+    pub fn target_sectors() -> u64 {
+        0
+    }
+    pub fn target_read(_sector: u64, _buf: &mut [u8; 512]) -> bool {
+        false
+    }
+    pub fn target_write(_sector: u64, _buf: &[u8; 512]) -> bool {
         false
     }
 }
@@ -395,6 +427,15 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     //
     // Живой носитель обязан быть живым: ничего на дисках машины не трогать, пока его об этом не
     // попросят словом `install`.
+    // Веха 50: контроллер USB xHCI (подъём HCD, перечисление устройств). Печатает свой статус
+    // сам; нет xHCI (QEMU без `-device qemu-xhci`, riscv) — тихо пропускаем.
+    //
+    // Веха 196 — стоит ДО выбора носителя store, и это не косметика: флешка теперь может БЫТЬ
+    // носителем, а спрашивать её раньше, чем она перечислена, значит не найти её никогда.
+    // Ровно так и вышло при первой проверке: система, установленная на флешку, загружалась и
+    // говорила «диск не найден», хотя тремя строками ниже сама же печатала её ёмкость.
+    xhci::init();
+
     let live_media = arch::boot_module().is_some();
     let ram = live_media && ramdisk::init();
     if ram {
@@ -413,6 +454,13 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("  [blk]  AHCI SATA: {} секторов", ahci::capacity_sectors());
     } else if virtio_blk::init() {
         println!("  [blk]  virtio-blk: {} секторов", virtio_blk::capacity_sectors());
+    } else if xhci::store_init() {
+        // Веха 196 — ПОСЛЕДНИМ, и это осознанный порядок: внутренний диск машины важнее
+        // воткнутой флешки. Если система стоит на диске, она и должна подняться с диска, а
+        // флешка остаётся просто носителем данных. Досюда доходит машина, где диска нет вовсе
+        // либо на нём нет раздела VOID, — то есть та самая «переносная система на флешке».
+        object::use_usb();
+        println!("  [blk]  USB-накопитель: {} секторов store", xhci::capacity_sectors());
     } else if ramdisk::init() {
         object::use_ramdisk();
         println!(
@@ -468,10 +516,6 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     if !random::has_strong_source() {
         println!("  [rng]  ВНИМАНИЕ: сильного источника нет — ключи здесь генерировать НЕЛЬЗЯ");
     }
-
-    // Веха 50: контроллер USB xHCI (часть A — подъём HCD). Печатает свой статус сам; нет xHCI
-    // (QEMU без `-device qemu-xhci`, riscv) — тихо пропускаем.
-    xhci::init();
 
     // Прерывания устройств (Веха 24: одним вызовом контракта — контроллер, IRQ диска и
     // приём консоли по прерыванию). Байты консоли копятся в кольцевом буфере ядра с этого

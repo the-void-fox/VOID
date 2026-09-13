@@ -280,6 +280,15 @@ net_args=$(void_qemu_net "$net") || exit 2
 mapfile -t qemu_net <<<"$net_args"
 qemu+=("${qemu_net[@]}")
 
+# Веха 196 — USB подмешивается тем же способом (VOID_QEMU_USB=kbd | disk:<путь>). Пусто — без
+# контроллера вовсе: xHCI на стенде появляется, только когда его просят, и прежние прогоны
+# машины не меняет.
+usb_args=$(void_qemu_usb) || exit 2
+if [ -n "$usb_args" ]; then
+    mapfile -t qemu_usb <<<"$usb_args"
+    qemu+=("${qemu_usb[@]}")
+fi
+
 # Писать во временный слой, а не в образ: прогон становится повторяемым (store каждый раз
 # стартует с одного поколения) и не мешает второй машине держать тот же файл.
 [ "$snapshot" = 1 ] && qemu+=(-snapshot)

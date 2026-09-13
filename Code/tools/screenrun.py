@@ -21,6 +21,8 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     raw <байты>        — то же БЕЗ перевода строки; \e = Esc (для CSI: raw \e[5;2~)
     type <строка>      — набрать строку НА КЛАВИАТУРЕ (PS/2): единственный ввод, доходящий
                          до шелла в ОКНЕ (mode = "wm"), куда serial не идёт вовсе
+    usb <строка>       — то же, но на USB-КЛАВИАТУРЕ (стенд с VOID_QEMU_USB=kbd)
+    usbhotkey <аккорд> — аккорд на USB-клавиатуре (Super+Return и т.п.)
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
@@ -118,6 +120,9 @@ qemu = [
     # повторяемым: store каждый раз стартует с одного и того же поколения.
     *(["-snapshot"] if os.environ.get("VOID_QEMU_SNAPSHOT") else []),
     *stand("net", net, nic, mac, pcap, delay_us),
+    # Веха 196 — USB: контроллер и устройства появляются, только когда их просят
+    # (VOID_QEMU_USB=kbd | disk:<путь>), поэтому прежние прогоны не меняются.
+    *stand("usb"),
     "-display", "none",
     "-serial", "stdio",
     "-qmp", f"unix:{qmp_path},server,nowait",
@@ -176,8 +181,14 @@ QCODE = {
 }
 
 
-def hotkey(combo):
-    """Аккорд как настоящая клавиатура: модификаторы зажимаются и отпускаются вокруг клавиши."""
+def hotkey(combo, device=None):
+    """Аккорд как настоящая клавиатура: модификаторы зажимаются и отпускаются вокруг клавиши.
+
+    `device` (Веха 196) — в КАКУЮ клавиатуру. Без него событие уходит туда, куда QEMU считает
+    нужным, то есть в PS/2; с `usbkbd` — именно в USB-клавиатуру на xHCI. Разница не
+    теоретическая: это два совершенно разных пути в ядре, и проверять один вместо другого
+    значит не проверять ничего.
+    """
     parts = combo.split("+")
     mods = [QCODE[p] for p in parts[:-1]]
     last = parts[-1]
@@ -185,7 +196,10 @@ def hotkey(combo):
     ev = lambda k, d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": k}}}
     events = [ev(m, True) for m in mods] + [ev(key, True), ev(key, False)]
     events += [ev(m, False) for m in reversed(mods)]
-    call("input-send-event", events=events)
+    if device:
+        call("input-send-event", device=device, events=events)
+    else:
+        call("input-send-event", events=events)
 
 
 # Печатные знаки, у которых имя qcode не совпадает с самим знаком. Верхний регистр и знаки из
@@ -204,19 +218,19 @@ SHIFTED = {"_": "minus", ":": "semicolon", '"': "apostrophe", "(": "9", ")": "0"
            "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7"}
 
 
-def typewrite(s):
-    """Строка НАСТОЯЩЕЙ клавиатурой (PS/2), а не в serial.
+def typewrite(s, device=None):
+    """Строка НАСТОЯЩЕЙ клавиатурой (PS/2 либо `device`), а не в serial.
 
     Нужно оконному режиму: там ввод идёт через композитор к окну, и серийная консоль до шелла
     в окне не доходит вовсе. Пауза между знаками та же, что у [`serial`], и по той же причине.
     """
     for ch in s:
         if ch.isalpha() and ch.isupper() or ch in SHIFTED:
-            hotkey("Shift+" + (SHIFTED[ch] if ch in SHIFTED else ch.lower()))
+            hotkey("Shift+" + (SHIFTED[ch] if ch in SHIFTED else ch.lower()), device)
         elif ch.isalnum():
-            hotkey(ch.lower())
+            hotkey(ch.lower(), device)
         elif ch in PRINTABLE:
-            hotkey(PRINTABLE[ch])
+            hotkey(PRINTABLE[ch], device)
         else:
             print(f"нечем набрать знак {ch!r}", file=sys.stderr)
         time.sleep(0.04)
@@ -291,6 +305,12 @@ try:
             serial(unescape(arg))
         elif cmd == "type":
             typewrite(arg)
+        elif cmd == "usbhotkey":
+            hotkey(arg.strip(), device="/machine/peripheral/usbkbd")
+        elif cmd == "usb":
+            # Веха 196 — набрать на USB-клавиатуре (`VOID_QEMU_USB=kbd`). Отдельный глагол, а не
+            # флаг у `type`: в сценарии должно быть видно, КАКОЕ железо проверяется.
+            typewrite(arg, device="/machine/peripheral/usbkbd")
         elif cmd == "mouse":
             # Двигаем ШАГАМИ: в пакете PS/2 смещение — девять знаковых бит, и всё, что больше,
             # мышь просто не умеет сказать. Один вызов с `dx = -3000` доезжал до гостя как

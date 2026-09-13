@@ -30,13 +30,18 @@
 enum Цель {
     Ahci,
     Nvme,
+    /// Веха 196 — USB-накопитель. Ставить НА флешку — не экзотика, а ровно то, ради чего
+    /// проект и затевался: переносная система на съёмном носителе.
+    Usb,
 }
 
 impl Цель {
     /// Выбрать шину по номеру диска и открыть цель. `None` — такого диска нет либо с него
     /// работает система (отказывает сам драйвер, и это правильное место для отказа).
     fn open(slot: usize) -> Option<Self> {
-        if slot >= crate::nvme::SLOT_BASE {
+        if slot >= crate::xhci::SLOT_BASE {
+            crate::xhci::target_open(slot).then_some(Цель::Usb)
+        } else if slot >= crate::nvme::SLOT_BASE {
             crate::nvme::target_open(slot).then_some(Цель::Nvme)
         } else {
             crate::ahci::target_open(slot).then_some(Цель::Ahci)
@@ -47,6 +52,7 @@ impl Цель {
         match self {
             Цель::Ahci => crate::ahci::target_sectors(),
             Цель::Nvme => crate::nvme::target_sectors(),
+            Цель::Usb => crate::xhci::target_sectors(),
         }
     }
 
@@ -54,6 +60,7 @@ impl Цель {
         match self {
             Цель::Ahci => crate::ahci::target_write(sector, buf),
             Цель::Nvme => crate::nvme::target_write(sector, buf),
+            Цель::Usb => crate::xhci::target_write(sector, buf),
         }
     }
 
@@ -61,6 +68,7 @@ impl Цель {
         match self {
             Цель::Ahci => crate::ahci::target_read(sector, buf),
             Цель::Nvme => crate::nvme::target_read(sector, buf),
+            Цель::Usb => crate::xhci::target_read(sector, buf),
         }
     }
 }
