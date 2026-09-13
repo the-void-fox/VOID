@@ -121,7 +121,9 @@ pub use imp::{power_off, reboot};
 /// Веха 50 — USB xHCI: поиск контроллера и байт клавиатуры в консоль. Только x86 (на riscv
 /// USB нет, `xhci`-модуль ядра там — заглушка).
 #[cfg(target_arch = "x86_64")]
-pub use imp::{intx_irq_setup, pci_dump, probe_bar, probe_bar0, probe_xhci, usb_key, usb_key_event};
+pub use imp::{
+    intx_irq_setup, pci_dump, probe_bar, probe_bar0, probe_xhci, touchpad, usb_key, usb_key_event,
+};
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).

@@ -588,6 +588,11 @@ pub fn mouse_present() -> bool {
     ps2::mouse_present()
 }
 
+/// Веха 198 — тачпад ли на втором порту (и включён ли у него абсолютный режим).
+pub fn touchpad() -> bool {
+    ps2::touchpad()
+}
+
 /// Отозвалась ли мышь колесом (Веха 123.1).
 pub fn mouse_wheel() -> bool {
     ps2::mouse_wheel()

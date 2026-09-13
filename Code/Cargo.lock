@@ -178,6 +178,7 @@ dependencies = [
  "void-conf",
  "void-fs",
  "void-store",
+ "void-touch",
  "void-tree",
 ]
 
@@ -198,6 +199,10 @@ version = "0.1.0"
 dependencies = [
  "void-abi",
 ]
+
+[[package]]
+name = "void-touch"
+version = "0.1.0"
 
 [[package]]
 name = "void-tree"
