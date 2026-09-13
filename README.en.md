@@ -31,7 +31,8 @@ qemu-system-x86_64 -machine q35 -m 1280M -smp 2 \
 
 Prebuilt ISOs are published under **Releases**. It is a **live image**: the system comes up
 straight into the windowed session and works in full, and everything you change lives until
-reboot. To keep it, run `install` (it deploys VOID onto a SATA disk; a disk that is not
+reboot. To keep it, run `install` (it deploys VOID onto a SATA disk, an NVMe drive or a USB
+STICK; a medium that is not
 partitioned for VOID is left untouched).
 
 Your first five minutes:
@@ -144,9 +145,14 @@ memory, rights, a network switch), bar, launcher, editor, image viewer, store-ro
 **The shell speaks English too** — one line in the config: `ui("language", "en")`. The kernel log
 stays in Russian: it is read by whoever repairs the system, not by whoever uses it.
 
-**Hardware.** Boots through GRUB (multiboot2) on a real machine: framebuffer, PS/2, AHCI,
-installation onto a SATA disk, e1000 and virtio-net, virtio-blk/rng, an xHCI keyboard, CMOS
-RTC, jitter entropy. Verified on an ASUS X54C.
+**Hardware.** Boots through GRUB (multiboot2) on a real machine: framebuffer, PS/2, AHCI, NVMe,
+USB (xHCI: keyboard and mass storage), e1000 and virtio-net, virtio-blk/rng, CMOS RTC, jitter
+entropy. Verified on an ASUS X54C.
+
+It installs onto any of those media, **including a USB stick**: the system then lives on a
+removable drive and travels with it — which is what the project was started for. On a machine
+with no PS/2 at all (any laptop newer than roughly 2015) the keyboard works over USB, shell
+chords included.
 
 **Networking.** Its own userspace stack (vendored smoltcp): DHCP, DNS, TCP/UDP and an HTTPS
 client on rustls — that is how packages are fetched.
