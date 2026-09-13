@@ -59,6 +59,20 @@ pub fn route_level_low(gsi: u32, vector: u8) {
     write(0x11 + 2 * gsi, boot_dest());
 }
 
+/// Веха 197 — завести линию с ЯВНО названными полярностью и типом (их говорит MADT). Маску не
+/// ставим: событие снимает обработчик, а не следующий заход в ожидание.
+pub fn route_flags(gsi: u32, vector: u8, active_low: bool, level: bool) {
+    let mut lo = vector as u32;
+    if active_low {
+        lo |= 1 << 13;
+    }
+    if level {
+        lo |= 1 << 15;
+    }
+    write(0x10 + 2 * gsi, lo);
+    write(0x11 + 2 * gsi, boot_dest());
+}
+
 /// Веха 52 — за/раз-маскировать все PCI INTx-линии (GSI 16..23), сведённые на вектор
 /// userspace-драйвера. Модель «oneshot»: `SYS_IRQ_WAIT` размаскирует (взвод перед сном),
 /// обработчик VEC_USERDRV маскирует (иначе level-линию, которую карта держит до чтения ICR,

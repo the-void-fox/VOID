@@ -809,6 +809,24 @@ pub fn init_device_interrupts() {
     // `console_drain` разбирает, чей байт, по биту статуса.
     ioapic::route(12, trap::VEC_CONSOLE);
     ps2::init();
+
+    // Веха 197 — КНОПКА ПИТАНИЯ. Чипсет сообщает о ней прерыванием SCI, номер которого объявлен
+    // в FADT; линия ACPI по стандарту level-triggered и active-low — как PCI INTx, и по той же
+    // причине: её держат, пока состояние не снято.
+    match acpi::enable_power_button() {
+        Some((sci, active_low, level)) => {
+            ioapic::route_flags(sci, trap::VEC_SCI, active_low, level);
+            crate::println!(
+                "  [acpi] кнопка питания включена (SCI {}, {}, {})",
+                sci,
+                if active_low { "активный низкий" } else { "активный высокий" },
+                if level { "уровень" } else { "фронт" },
+            );
+        }
+        // Машина без ACPI (PVH-загрузка, старое железо) — не событие: кнопка просто останется
+        // «жёсткой», как была. Молчать тут нельзя ровно настолько, насколько нечего чинить.
+        None => crate::println!("  [acpi] кнопки питания нет (FADT без блока событий PM1)"),
+    }
 }
 
 // ─── таймер (LAPIC) ─────────────────────────────────────────────────────────
@@ -1196,6 +1214,15 @@ pub const ELF_MACHINE: u16 = 62;
 pub fn power_off() -> ! {
     acpi::try_power_off();
     acpi::try_hypervisor_ports();
+    loop {
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
+    }
+}
+
+/// Веха 197 — перезагрузить машину. Возвращается только если не вышло ничем: тогда честнее
+/// остановиться, чем делать вид, что машина ушла в ребут.
+pub fn reboot() -> ! {
+    acpi::try_reboot();
     loop {
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }
     }

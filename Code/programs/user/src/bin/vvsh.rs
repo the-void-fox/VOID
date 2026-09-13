@@ -954,6 +954,7 @@ fn shell_env() -> Env {
         ("thaw", sh_thaw),
         ("switch", sh_switch),
         ("poweroff", sh_poweroff),
+        ("reboot", sh_reboot),
         ("store-probe", sh_store_probe),
         ("nar-unpack", sh_nar_unpack),
         ("sysdef", sh_sysdef),
@@ -1247,6 +1248,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"help", "эта справка");
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
     help_row(b"poweroff", "выключить машину");
+    help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
     help_row(b"nar-unpack", "разложить NAR из корня store в файлы");
     // Справка обязана показывать ТОТ синтаксис, что понимает reader. Здесь висели S-выражения,
@@ -1998,6 +2000,23 @@ fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
     }
     Err(EvalError::new(
         "poweroff: нет права `power` — в оконном режиме нужна строка `desktop power bin/vvsh`",
+    ))
+}
+
+/// `(reboot)` — перезагрузить машину (Веха 197). Право то же, что у выключения (`power`), и по
+/// той же причине: разница лишь в том, поднимется ли система обратно.
+///
+/// Нужна эта команда прежде всего после `rebuild`: поколение становится активным только на
+/// следующей загрузке, и до сих пор «перезагрузись» означало выключить машину и включить её
+/// руками — а на ноутбуке ещё и дойти до кнопки.
+fn sh_reboot(_args: &[Value]) -> Result<Value, EvalError> {
+    sys::write(sys::i18n::t("перезагружаю машину…\n").as_bytes());
+    let pc = sys::win::cap_or_grant(10);
+    if pc != sys::NO_CAP {
+        sys::reboot(pc);
+    }
+    Err(EvalError::new(
+        "reboot: нет права `power` — в оконном режиме нужна строка `desktop power bin/vvsh`",
     ))
 }
 

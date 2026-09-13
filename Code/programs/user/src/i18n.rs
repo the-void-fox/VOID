@@ -541,6 +541,8 @@ fn en(s: &'static str) -> &'static str {
             => " — your edits are kept; the template gained:\n",
         "нет корней (или нет прав на store)\n" => "no roots (or no rights on the store)\n",
         "выключаю машину…\n" => "powering the machine off…\n",
+        "перезагружаю машину…\n" => "rebooting the machine…\n",
+        "перезагрузить машину" => "reboot the machine",
         "vvsh: не удалось прочитать файл: " => "vvsh: could not read the file: ",
         "vvsh: файл не UTF-8\n" => "vvsh: the file is not UTF-8\n",
         "vvsh: выход из REPL — vsh продолжает\n" => "vvsh: leaving the REPL — vsh continues\n",

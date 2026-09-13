@@ -116,7 +116,7 @@ pub use imp::{
 
 /// Выключение машины — задел под автотесты (ядро само завершает QEMU); пока не зовётся.
 #[allow(unused_imports)]
-pub use imp::power_off;
+pub use imp::{power_off, reboot};
 
 /// Веха 50 — USB xHCI: поиск контроллера и байт клавиатуры в консоль. Только x86 (на riscv
 /// USB нет, `xhci`-модуль ядра там — заглушка).

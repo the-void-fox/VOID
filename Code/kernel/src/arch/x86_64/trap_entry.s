@@ -71,6 +71,7 @@ TRAP_STUB 35, 0                     # userspace-драйвер: IOAPIC IRQ ус�
 TRAP_STUB 36, 0                     # Веха 91: MSI-X приёма virtio-net
 TRAP_STUB 37, 0                     # Веха 170: побудка ядра (IPI) — обработчик пустой
 TRAP_STUB 38, 0                     # Веха 170: сброс TLB по просьбе соседа (IPI)
+TRAP_STUB 39, 0                     # Веха 197: SCI — событие ACPI (кнопка питания)
 TRAP_STUB 255, 0                    # spurious
 TRAP_STUB 128, 0                    # int 0x80 — syscall (шлюз DPL=3, Веха 26)
 
@@ -155,5 +156,6 @@ TRAP_STUBS:
     .quad trap_stub_36
     .quad trap_stub_37
     .quad trap_stub_38
+    .quad trap_stub_39
     .quad trap_stub_255
     .quad trap_stub_128

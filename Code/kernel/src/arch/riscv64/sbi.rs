@@ -54,3 +54,14 @@ pub fn shutdown() -> ! {
         unsafe { asm!("wfi") }
     }
 }
+
+/// Веха 197 — перезагрузить машину. Тот же вызов SRST, но `reset_type = 1` (холодный сброс):
+/// прошивка поднимает машину заново, как после выключателя.
+#[allow(dead_code)]
+#[inline]
+pub fn reboot() -> ! {
+    sbi_call(EID_SRST, 0, 1, 0, 0);
+    loop {
+        unsafe { asm!("wfi") }
+    }
+}

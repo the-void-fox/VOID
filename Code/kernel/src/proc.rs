@@ -630,6 +630,36 @@ static LAST_IDLE: [AtomicU64; cpu::MAX] = [const { AtomicU64::new(0) }; cpu::MAX
 /// планировщик снимает его и будит спящих в `SYS_IRQ_WAIT` ([`drain_userdrv_irq`]).
 static USERDRV_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Веха 197 — нажата КНОПКА ПИТАНИЯ (отметка из обработчика SCI).
+static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
+
+/// Зовётся из обработчика SCI. Здесь только отметка: выключать машину из прерванного контекста
+/// нельзя — синк store берёт замки, а мы могли прервать того, кто их держит.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn on_power_button() {
+    POWER_BUTTON.store(true, Ordering::Relaxed);
+}
+
+/// Нажата ли кнопка питания — и если да, выключить машину ЧИСТО: синк store, сообщение, питание.
+///
+/// Зовётся планировщиком (`resume`), то есть в месте, где замков мы не держим. Поведение выбрано
+/// самое простое из честных: нажатие = «выключи», как на любой машине без графической оболочки.
+/// Спрашивать человека «точно?» было бы приятнее, но это диалог, окно и ответ от композитора —
+/// то есть работа оболочки, а не ядра, и делать её видом, что ядро само справится, нельзя.
+fn drain_power_button() {
+    if !POWER_BUTTON.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    println!("  [power] нажата кнопка питания — выключаюсь");
+    crate::object::commit();
+    println!(
+        "  [store] финальный синк: поколение {} · записано за сессию: {} КиБ",
+        crate::object::generation(),
+        crate::object::bytes_written() / 1024,
+    );
+    arch::power_off();
+}
+
 /// Веха 52 — из обработчика прерывания (trap): просто отметить, что IRQ пришёл. Пробуждение —
 /// на планировщике, где замок таблицы берётся законно. Зовётся из x86-обработчика VEC_USERDRV;
 /// на riscv userspace-драйверов с IRQ пока нет (USB/e1000 — x86), поэтому там это мёртвый код.
@@ -1399,6 +1429,10 @@ fn wait_stdin(saved_sie: usize) -> bool {
         && !(wants_input && (arch::mouse_pending() || arch::key_pending()))
         && !USERDRV_IRQ_PENDING.load(Ordering::Relaxed)
         && !NET_IRQ_PENDING.load(Ordering::Relaxed) // Веха 91: кадр разбудит сетевой сервер
+        // Веха 197 — нажали кнопку питания. Без этой строки отметка лежала бы до ближайшего
+        // чужого повода проснуться: машина выключалась бы не сразу, а «когда-нибудь», и на
+        // спящей системе это «когда-нибудь» могло растянуться на секунды.
+        && !POWER_BUTTON.load(Ordering::Relaxed)
         && !deadline.is_some_and(|d| arch::now_ticks() >= d)
         // Веха 170 — пока мы спали, сосед мог сделать кого-то готовым. Спать дальше при живой
         // работе значило бы держать целое ядро без дела ровно тогда, когда оно нужно.
@@ -1941,6 +1975,7 @@ fn resume() -> ! {
     // Веха 52: пришёл IRQ userspace-драйвера — разбудить спящих в SYS_IRQ_WAIT.
     drain_userdrv_irq(&mut t);
     drain_net_irq(&mut t); // Веха 91: приехал кадр — разбудить сетевой сервер
+    drain_power_button(); // Веха 197: нажали кнопку питания — выключиться чисто
     // Веха 163 — закрыть отрезок исполнения того, кто сюда и привёл нас trap'ом. Время меряется
     // ЗДЕСЬ, а не в планировщике: `resume` — единственная дверь в U, и через неё проходит всё,
     // включая вытеснение таймером. Работа ядра по системному вызову засчитывается процессу,
@@ -4646,13 +4681,20 @@ fn syscall(t: &mut Table, cur: usize) {
         // остаются сервисы, и `run()` честно крутит их дальше).
         44 => {
             let (dom, ccap) = (t.procs[cur].domain, t.procs[cur].frame.arg(0));
+            // Веха 197 — ВТОРОЙ аргумент: 0 выключить, 1 перезагрузить. Право то же и по той же
+            // причине: и то и другое — одностороннее действие над всей системой, разница лишь в
+            // том, поднимется ли она обратно. Отдельного права на ребут заводить не за что.
+            let restart = t.procs[cur].frame.arg(1) == 1;
             if !cap::may_power_off(dom, Cap::from_bits(ccap as u64)) {
                 let f = &mut t.procs[cur].frame;
                 f.set_ret(usize::MAX);
                 f.advance();
                 return;
             }
-            println!("  [power] выключение по запросу процесса");
+            println!(
+                "  [power] {} по запросу процесса",
+                if restart { "перезагрузка" } else { "выключение" },
+            );
             // Синк ПЕРЕД снятием питания: иначе выключение съело бы хвост несинхронизированных
             // операций (окно group commit ~2 с).
             crate::object::commit();
@@ -4661,6 +4703,9 @@ fn syscall(t: &mut Table, cur: usize) {
                 crate::object::generation(),
                 crate::object::bytes_written() / 1024,
             );
+            if restart {
+                arch::reboot();
+            }
             arch::power_off();
         }
         // SYS_WAIT(pid, nonblock) -> код выхода | WOULD_BLOCK | MAX (Веха 98): забрать результат

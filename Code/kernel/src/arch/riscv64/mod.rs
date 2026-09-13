@@ -947,3 +947,9 @@ pub fn is_real_hardware() -> bool {
 pub fn power_off() -> ! {
     sbi::shutdown()
 }
+
+/// Веха 197 — перезагрузить машину. На riscv это тот же SBI: у прошивки просят «холодный
+/// сброс». Не вышло — честная остановка, как и при выключении.
+pub fn reboot() -> ! {
+    sbi::reboot()
+}

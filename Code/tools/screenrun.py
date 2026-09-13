@@ -23,6 +23,7 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
                          до шелла в ОКНЕ (mode = "wm"), куда serial не идёт вовсе
     usb <строка>       — то же, но на USB-КЛАВИАТУРЕ (стенд с VOID_QEMU_USB=kbd)
     usbhotkey <аккорд> — аккорд на USB-клавиатуре (Super+Return и т.п.)
+    power              — нажать кнопку питания машины (ACPI-событие)
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
     btn <кнопка> <down|up> — держать/отпустить (для перетаскивания и снимков «нажато»)
@@ -305,6 +306,10 @@ try:
             serial(unescape(arg))
         elif cmd == "type":
             typewrite(arg)
+        elif cmd == "power":
+            # Веха 197 — НАЖАТЬ КНОПКУ ПИТАНИЯ. В QEMU это `system_powerdown`: чипсет выставляет
+            # PWRBTN_STS и дёргает SCI — ровно то, что делает настоящая кнопка на ноутбуке.
+            call("system_powerdown")
         elif cmd == "usbhotkey":
             hotkey(arg.strip(), device="/machine/peripheral/usbkbd")
         elif cmd == "usb":
