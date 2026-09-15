@@ -398,6 +398,15 @@ void netif_device_detach(struct net_device *dev) { (void)dev; }
 #define LX_NAPI_MAX 4
 static struct napi_struct *lx_napi_pending[LX_NAPI_MAX];
 
+/* Веха 199.6 — счётчики ПУЛЬСА: по ним видно, на каком шаге рвётся приём. Заводятся не от
+ * любви к статистике: на живой машине владельца карта поднялась, кадр ушёл, а в ответ не пришло
+ * ничего — и отличить «прерывание не дошло» от «карта молчит» было нечем, кроме догадок.
+ * Считает их и планировщик (`lx_kit.c`), поэтому они не статические. */
+unsigned long lx_isr_calls;    /* сколько раз звали обработчик прерывания */
+unsigned long lx_isr_handled;  /* сколько раз он сказал «это моё» */
+unsigned long lx_napi_polls;   /* сколько раз крутился опрос NAPI */
+int lx_netdev_active(void);    /* определён ниже, в половине со syscall'ами */
+
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi, int (*poll)(struct napi_struct *, int))
 {
 	napi->dev = dev;
@@ -463,6 +472,7 @@ int lx_napi_run(void)
 
 		if (!n || !n->poll)
 			continue;
+		lx_napi_polls++;
 		/* Драйвер сам снимет себя через napi_complete_done, когда кольцо опустеет. Если он
 		 * этого не сделал (кадров больше, чем вес), опрос останется в очереди — и следующий
 		 * заход продолжит с того же места, как и положено NAPI. */
@@ -554,6 +564,30 @@ static void lx_netdev_rx(struct sk_buff *skb)
  * РАЗБУДИТЬ — и будит (`wake_netdev_owner`). Проснувшись, планировщик заходит сюда, находит
  * кадр и отправляет его. Вхолостую этот заход не делается: спящий процесс не крутится.
  */
+/* Веха 199.6 — ПУЛЬС: раз в две секунды, пока не принято ни одного кадра.
+ *
+ * Самоограничивается намеренно: пока приём не работает, эта строка — единственный способ
+ * увидеть, где цепочка рвётся; как только кадры пошли, она замолкает и журнал не засоряет.
+ *
+ *   ISR 0            — обработчик не зовут вовсе: прерывание не заведено или шим спит;
+ *   ISR>0, «моё» 0   — обработчик зовут, но карта говорит «это не я»: не доходит прерывание,
+ *                      и опрос регистра причин ничего не находит;
+ *   NAPI 0 при «моё»>0 — карта сказала «моё», а опрос не запланирован (ошибка в шиме);
+ *   NAPI>0, принято 0 — опрос идёт, а кольцо приёма пусто: карта не пишет кадры (DMA, фильтр).
+ */
+void lx_net_pulse(unsigned long now_jiffies)
+{
+	static unsigned long next;
+
+	if (!lx_netdev_active() || lx_rx_frames > 0)
+		return;
+	if (next && (long)(now_jiffies - next) < 0)
+		return;
+	next = now_jiffies + 2 * HZ;
+	printk("lx_net: пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, отправлено %lu\n",
+	       lx_isr_calls, lx_isr_handled, lx_napi_polls, lx_rx_frames, lx_tx_frames);
+}
+
 /// Веха 199.5 — работаем ли мы сейчас картой системы.
 int lx_netdev_active(void)
 {
@@ -599,6 +633,7 @@ int lx_netdev_pump(void)
 static void lx_netdev_rx(struct sk_buff *skb) { (void)skb; }
 int lx_netdev_pump(void) { return 0; }
 int lx_netdev_active(void) { return 0; }
+void lx_net_pulse(unsigned long now_jiffies) { (void)now_jiffies; }
 #endif
 
 void napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
@@ -807,10 +842,18 @@ int  request_irq(unsigned int irq, irq_handler_t h, unsigned long flags, const c
 	(void)flags;
 	printk("lx_net: request_irq('%s', линия %u)\n", name ? name : "?", irq);
 #ifdef LX_HAVE_SYSCALL
-	if (lx_irq_cap != VOID_NO_CAP) {
-		lx_irq_register((int)irq, lx_irq_cap, (lx_irq_handler_t)h, dev);
-		return 0;
-	}
+	/* Веха 199.6 — обработчик заводим ДАЖЕ БЕЗ ПРАВА НА ПРЕРЫВАНИЕ.
+	 *
+	 * Раньше здесь стояло условие: нет права — забыть обработчик и вернуть успех. Драйвер после
+	 * этого считал себя настроенным, а принять не мог НИЧЕГО: звать его было некому. И ни одной
+	 * строки об этом — то есть самый тихий вид поломки из возможных.
+	 *
+	 * Теперь планировщик в таком случае просто ОПРАШИВАЕТ карту (см. `lx_sched_run`): медленнее,
+	 * зато работает. Право на прерывание становится оптимизацией, а не условием жизни. */
+	lx_irq_register((int)irq, lx_irq_cap, (lx_irq_handler_t)h, dev);
+	if (lx_irq_cap == VOID_NO_CAP)
+		printk("lx_net: права на прерывание нет — карту буду опрашивать\n");
+	return 0;
 #endif
 	(void)irq; (void)h; (void)dev;
 	return 0;

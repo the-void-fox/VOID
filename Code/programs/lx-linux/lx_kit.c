@@ -36,6 +36,9 @@
 extern int lx_napi_run(void);
 extern int lx_netdev_pump(void);
 extern int lx_netdev_active(void);
+extern void lx_net_pulse(unsigned long now_jiffies);
+extern unsigned long lx_isr_calls;
+extern unsigned long lx_isr_handled;
 
 #ifdef LX_HAVE_SYSCALL
 #include <syscall.h> /* vsys_irq_wait — доставка IRQ в idle-пути планировщика (Веха 72) */
@@ -1154,6 +1157,20 @@ void lx_irq_unregister(int irq)
 	lx_the_irq.active = 0;
 }
 
+/* Веха 199.6 — позвать обработчик прерывания и посчитать вызовы: по этим числам видно, зовут ли
+ * его вообще и признаёт ли карта прерывание своим (см. `lx_net_pulse`). */
+static void lx_irq_call(void)
+{
+	int r;
+
+	if (!lx_the_irq.active || !lx_the_irq.handler)
+		return;
+	r = lx_the_irq.handler(lx_the_irq.irq, lx_the_irq.dev);
+	lx_isr_calls++;
+	if (r) /* IRQ_HANDLED — карта признала прерывание своим */
+		lx_isr_handled++;
+}
+
 void lx_sched_run(void)
 {
 	struct lx_task *t, *next;
@@ -1167,6 +1184,7 @@ void lx_sched_run(void)
 		 * и очередь `qdisc`, и оба живут ровно здесь — между сменами задач, где `sched_current`
 		 * ещё NULL. Сделанная работа считается: пока она есть, спать нельзя, иначе кадры ждут
 		 * ближайшего таймера. */
+		lx_net_pulse(jiffies); /* Веха 199.6 — пока приём не работает, говорим почему */
 		if (lx_napi_run() || lx_netdev_pump())
 			continue;
 
@@ -1220,12 +1238,18 @@ void lx_sched_run(void)
 				 * ветки ожидания прерывания ниже дело не доходило НИКОГДА. Обработчик не
 				 * звался, NAPI не планировался, `poll` не вынимал кадры из кольца — карта
 				 * поднята, кадров нет, и по логу не видно, почему. */
-				if (lx_the_irq.active) {
+				if (lx_the_irq.active && lx_the_irq.cap != VOID_NO_CAP) {
 					if (!vsys_irq_wait_to(lx_the_irq.cap, ns)) {
 						lx_the_irq.active = 0;
 						break;
 					}
-					lx_the_irq.handler(lx_the_irq.irq, lx_the_irq.dev);
+					lx_irq_call();
+				} else if (lx_the_irq.active) {
+					/* Веха 199.6 — права на прерывание нет: ОПРАШИВАЕМ карту. Медленнее, зато
+					 * она работает — обработчик сам сверится с регистром причин и ничего не
+					 * найдёт, если причин нет. Раньше такой драйвер молча не принимал ничего. */
+					vsys_sleep_ns(ns);
+					lx_irq_call();
 				} else {
 					vsys_sleep_ns(ns);
 				}
@@ -1247,7 +1271,7 @@ void lx_sched_run(void)
 				lx_the_irq.active = 0;
 				break;
 			}
-			lx_the_irq.handler(lx_the_irq.irq, lx_the_irq.dev);
+			lx_irq_call();
 			continue;
 		}
 #endif
