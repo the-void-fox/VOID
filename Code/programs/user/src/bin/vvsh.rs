@@ -756,6 +756,18 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     if words.is_empty() {
         return;
     }
+    // Веха 199.3 — КОНВЕЙЕР `>>`: слева команда, дающая текст, справа — команда, которая его
+    // берёт. `klog >> send 192.168.0.87 9000` читается ровно так, как звучит, и не плодит по
+    // команде на каждое сочетание («klog-send», «klog-save», «cat-send»…). Знак выбран
+    // владельцем и стоит рядом с `>`: тот пишет в файл, этот — передаёт дальше.
+    if let Some(i) = words.iter().position(|w| *w == b">>") {
+        if i == 0 || i + 1 >= words.len() {
+            return sys::write(
+                sys::i18n::t("vvsh: `>>` хочет команду слева и команду справа\n").as_bytes(),
+            );
+        }
+        return pipe_into(interp, env, &words[..i], &words[i + 1..]);
+    }
     let head = match core::str::from_utf8(words[0]) {
         Ok(s) => s,
         Err(_) => return sys::write(sys::i18n::t("vvsh: имя команды не UTF-8\n").as_bytes()),
@@ -782,6 +794,41 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
             }
         }
         None => spawn_program(words[0], &words[1..]), // PATH: несвязанное имя → программа
+    }
+}
+
+/// Веха 199.3 — выполнить левую команду и отдать её текст правой последним аргументом.
+///
+/// Левая обязана ВОЗВРАЩАТЬ текст, а не печатать его: перехватить чужую печать шелл не может —
+/// она идёт прямо в ядро. Поэтому `klog` стал встроенной командой, отдающей журнал значением
+/// (печатает его всё равно шелл, и снаружи ничего не изменилось), а программы в конвейер не
+/// годятся — и об этом говорится прямо, а не молчанием.
+fn pipe_into(interp: &vvsh_core::Interp, env: &Env, left: &[&[u8]], right: &[&[u8]]) {
+    let head = core::str::from_utf8(left[0]).unwrap_or("");
+    if !env.lookup(head).is_some_and(|v| is_callable(&v)) {
+        sys::write("vvsh: ".as_bytes());
+        sys::write(left[0]);
+        sys::write(
+            sys::i18n::t(" — программа, а не команда: её вывод в `>>` не взять\n").as_bytes(),
+        );
+        return;
+    }
+    let text = match build_command_form(left, env).map_err(EvalError::new) {
+        Ok(form) => match interp.eval(&form, env) {
+            Ok(Value::Str(s)) => String::from(&*s),
+            Ok(other) => alloc::format!("{}", other),
+            Err(e) => return print_err(&e),
+        },
+        Err(e) => return print_err(&e),
+    };
+    let mut form = match build_command_form(right, env) {
+        Ok(Value::List(items)) => items.to_vec(),
+        _ => return sys::write(sys::i18n::t("vvsh: справа от `>>` нужна команда\n").as_bytes()),
+    };
+    form.push(Value::str(&text));
+    match interp.eval(&Value::list(form), env) {
+        Ok(result) => render(&result),
+        Err(e) => print_err(&e),
     }
 }
 
@@ -954,8 +1001,8 @@ fn shell_env() -> Env {
         ("unroot", sh_unroot),
         ("thaw", sh_thaw),
         ("switch", sh_switch),
-        ("klog-save", sh_klog_save),
-        ("klog-send", sh_klog_send),
+        ("klog", sh_klog),
+        ("send", sh_send),
         ("poweroff", sh_poweroff),
         ("reboot", sh_reboot),
         ("store-probe", sh_store_probe),
@@ -1250,8 +1297,8 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"clear", "очистить экран");
     help_row(b"help", "эта справка");
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
-    help_row(b"klog-save F", "журнал ядра в файл (потом его можно вынести с машины)");
-    help_row(b"klog-send IP P", "журнал ядра на другой компьютер по TCP (там: nc -l -p P)");
+    help_row(b"klog [N]", "журнал ядра (N — последние строки); текст можно передать дальше");
+    help_row(b"send IP P", "отправить текст по TCP (там: nc -l P). Пример: klog >> send IP P");
     help_row(b"poweroff", "выключить машину");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
@@ -1577,6 +1624,7 @@ fn sh_ping(args: &[Value]) -> Result<Value, EvalError> {
     Err(EvalError::new(match rep.first() {
         Some(1) => "ping: адрес в своей подсети не отзывается (никого по этому адресу)",
         Some(3) => "ping: сокеты пинга кончились — слишком много мёртвых адресов до перезагрузки",
+        Some(7) => "ping: карта ещё не поднялась (или её нет) — стек ждёт драйвер",
         _ => "ping: нет ответа",
     }))
 }
@@ -1631,6 +1679,10 @@ fn net_err(who: &str, st: u8) -> EvalError {
             p::ST_ERR => "не удалось (адрес отверг соединение?)",
             p::ST_TIMEOUT => "не дождались ответа",
             p::ST_EOF => "соединение закрыто другой стороной",
+            // Веха 199.4 — «карты нет» отдельной строкой. Раньше этот случай приходил тем же
+            // кодом, что негодный запрос, и человек с живой картой читал про «хэндл».
+            p::ST_NODEV => "сетевая карта ещё не поднялась (или её нет) — стек ждёт драйвер",
+            p::ST_OFF => "сеть выключена",
             _ => "негодный запрос (хэндл?)",
         }
     ))
@@ -2013,31 +2065,52 @@ fn klog_text() -> Result<String, EvalError> {
     Ok(text)
 }
 
-/// `(klog-save "путь")` — сохранить журнал ядра в файл (Веха 199.2).
+/// `(klog [N])` — журнал ядра ТЕКСТОМ (Веха 199.3), необязательно последние `N` строк.
 ///
-/// Зачем это команда, а не перенаправление: у ноутбука нет COM-порта, и журнал загрузки с него
-/// физически нечем вынести — владелец фотографировал экран. Файл в store переносится вместе с
-/// носителем: система, поставленная на флешку (Веха 196), читается на другом компьютере мостом
-/// `void-store-import`.
-fn sh_klog_save(args: &[Value]) -> Result<Value, EvalError> {
-    let path = match args.first() {
-        Some(Value::Str(p)) => resolve(p.as_bytes()),
-        _ => return Err(EvalError::new("klog-save: (klog-save \"/путь/файл\")")),
+/// Встроенная команда, а не программа `klog`, ровно по одной причине: значение можно передать
+/// дальше — `klog > /etc/log.txt` кладёт его в файл, `klog >> send …` отправляет по сети. Вывод
+/// на экран при этом прежний: печатает его шелл, как и любое возвращённое значение.
+fn sh_klog(args: &[Value]) -> Result<Value, EvalError> {
+    // `klog > файл` — тот же знак и смысл, что у `echo` и `cat`.
+    let out = match args.iter().position(|a| matches!(a, Value::Str(s) if &**s == ">")) {
+        Some(i) => match args.get(i + 1) {
+            Some(Value::Str(p)) => Some(resolve(p.as_bytes())),
+            _ => return Err(EvalError::new("klog: после > нужен путь")),
+        },
+        None => None,
     };
-    let text = klog_text()?;
-    if !px::echo_to(cap_fs(), &path, text.as_bytes()) {
-        return Err(EvalError::new("klog-save: файл записан не полностью"));
+    let mut text = klog_text()?;
+    // Число первым аргументом — сколько ПОСЛЕДНИХ строк оставить.
+    let lines = match args.first() {
+        Some(Value::Int(n)) if *n > 0 => Some(*n as usize),
+        Some(Value::Str(s)) => s.trim().parse::<usize>().ok().filter(|n| *n > 0),
+        _ => None,
+    };
+    if let Some(n) = lines {
+        let keep: alloc::vec::Vec<&str> = text.lines().rev().take(n).collect();
+        text = keep.iter().rev().fold(String::new(), |mut acc, l| {
+            acc.push_str(l);
+            acc.push('\n');
+            acc
+        });
     }
-    sys::write(tf("журнал сохранён: {} байт\n", &[&alloc::format!("{}", text.len())]).as_bytes());
-    Ok(Value::nil())
+    if let Some(path) = out {
+        if !px::echo_to(cap_fs(), &path, text.as_bytes()) {
+            return Err(EvalError::new("klog: файл записан не полностью"));
+        }
+        sys::write(tf("журнал сохранён: {} байт\n", &[&alloc::format!("{}", text.len())]).as_bytes());
+        return Ok(Value::nil());
+    }
+    Ok(Value::str(&text))
 }
 
-/// `(klog-send "A.B.C.D" порт)` — отправить журнал ядра на другой компьютер по TCP.
+/// `(send "A.B.C.D" порт "текст")` — отправить текст по TCP (Веха 199.3).
 ///
-/// На той стороне достаточно `nc -l -p <порт> > log.txt`. Второй способ вынести журнал с
-/// машины без COM-порта, и он же — первая настоящая проверка сети на чужом железе: если
-/// журнал доехал, значит работает и карта, и стек.
-fn sh_klog_send(args: &[Value]) -> Result<Value, EvalError> {
+/// Обычно текст приходит слева по конвейеру: `klog >> send 192.168.0.87 9000`, а на той стороне
+/// достаточно `nc -l 9000 > log.txt`. Это единственный способ вынести диагностику с машины без
+/// COM-порта — и он же первая настоящая проверка сети на чужом железе: доехало, значит работают
+/// и карта, и стек.
+fn sh_send(args: &[Value]) -> Result<Value, EvalError> {
     // Номер порта принимаем и числом, и строкой: в командной строке шелла всё, что набрал
     // человек, приходит строкой, и требовать от него кавычек с обратным слэшем ради типа —
     // это язык, объясняющийся своей реализацией.
@@ -2045,23 +2118,28 @@ fn sh_klog_send(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Int(p)) if *p > 0 && *p < 65536 => *p as u16,
         Some(Value::Str(p)) => match p.trim().parse::<u16>() {
             Ok(p) if p > 0 => p,
-            _ => return Err(EvalError::new("klog-send: порт — число 1..65535")),
+            _ => return Err(EvalError::new("send: порт — число 1..65535")),
         },
-        _ => return Err(EvalError::new("klog-send: (klog-send \"A.B.C.D\" порт)")),
+        _ => return Err(EvalError::new("send: (send \"A.B.C.D\" порт \"текст\")")),
     };
     let host = match args.first() {
         Some(Value::Str(h)) => h.clone(),
-        _ => return Err(EvalError::new("klog-send: (klog-send \"A.B.C.D\" порт)")),
+        _ => return Err(EvalError::new("send: (send \"A.B.C.D\" порт \"текст\")")),
     };
     let ip = match sys::net_cli::parse_ipv4(host.as_bytes()) {
         Some(x) => x,
-        None => return Err(EvalError::new("klog-send: нужен адрес A.B.C.D (имя — через resolve)")),
+        None => return Err(EvalError::new("send: нужен адрес A.B.C.D (имя — через resolve)")),
     };
-    let text = klog_text()?;
-    let ep = net_ep("klog-send")?;
+    // Текст — третьим аргументом либо слева по конвейеру `>>` (он же кладётся последним).
+    let text = match args.get(2) {
+        Some(Value::Str(t)) => String::from(&**t),
+        Some(other) => alloc::format!("{}", other),
+        None => return Err(EvalError::new("send: нечего отправлять (слева нужен `>>`)")),
+    };
+    let ep = net_ep("send")?;
     let h = match sys::net_cli::tcp_connect(ep, ip, port) {
         Ok(h) => h,
-        Err(st) => return Err(net_err("klog-send", st)),
+        Err(st) => return Err(net_err("send", st)),
     };
     // Шлём кусками: сервер принимает столько, сколько готов, и остаток — наша забота (как у
     // `write(2)`). Без этого цикла ушёл бы только первый кусок, а выглядело бы как «журнал
@@ -2074,13 +2152,13 @@ fn sh_klog_send(args: &[Value]) -> Result<Value, EvalError> {
             Ok(n) => sent += n,
             Err(st) => {
                 let _ = sys::net_cli::tcp_close(ep, h);
-                return Err(net_err("klog-send", st));
+                return Err(net_err("send", st));
             }
         }
     }
     let _ = sys::net_cli::tcp_close(ep, h);
-    sys::write(tf("журнал отправлен: {} байт\n", &[&alloc::format!("{}", sent)]).as_bytes());
-    Ok(Value::Int(sent as i64))
+    sys::write(tf("отправлено: {} байт\n", &[&alloc::format!("{}", sent)]).as_bytes());
+    Ok(Value::nil())
 }
 
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —

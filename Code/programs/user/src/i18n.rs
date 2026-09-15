@@ -543,12 +543,17 @@ fn en(s: &'static str) -> &'static str {
         "выключаю машину…\n" => "powering the machine off…\n",
         "перезагружаю машину…\n" => "rebooting the machine…\n",
         "перезагрузить машину" => "reboot the machine",
-        "журнал ядра в файл (потом его можно вынести с машины)"
-            => "the kernel log into a file (to carry it off the machine)",
-        "журнал ядра на другой компьютер по TCP (там: nc -l -p P)"
-            => "the kernel log to another computer over TCP (there: nc -l -p P)",
+        "журнал ядра (N — последние строки); текст можно передать дальше"
+            => "the kernel log (N — the last lines); the text can be piped on",
+        "отправить текст по TCP (там: nc -l P). Пример: klog >> send IP P"
+            => "send text over TCP (there: nc -l P). Example: klog >> send IP P",
         "журнал сохранён: {} байт\n" => "log saved: {} bytes\n",
-        "журнал отправлен: {} байт\n" => "log sent: {} bytes\n",
+        "отправлено: {} байт\n" => "sent: {} bytes\n",
+        "vvsh: `>>` хочет команду слева и команду справа\n"
+            => "vvsh: `>>` wants a command on the left and a command on the right\n",
+        " — программа, а не команда: её вывод в `>>` не взять\n"
+            => " is a program, not a command: its output cannot be piped with `>>`\n",
+        "vvsh: справа от `>>` нужна команда\n" => "vvsh: `>>` needs a command on its right\n",
         "vvsh: не удалось прочитать файл: " => "vvsh: could not read the file: ",
         "vvsh: файл не UTF-8\n" => "vvsh: the file is not UTF-8\n",
         "vvsh: выход из REPL — vsh продолжает\n" => "vvsh: leaving the REPL — vsh continues\n",
