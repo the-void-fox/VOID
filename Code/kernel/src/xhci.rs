@@ -172,6 +172,7 @@ pub fn init() -> bool {
         return false;
     };
     unsafe {
+        let took = bios_handoff(base);
         let caplen = (rd(base + CAP_CAPLENGTH) & 0xff) as usize;
         let op = base + caplen;
         let db = base + (rd(base + CAP_DBOFF) & !0x3) as usize;
@@ -250,12 +251,14 @@ pub fn init() -> bool {
                 continue;
             }
             connected += 1;
-            // Сброс порта: PR=1, сохранив CCS/PP, не трогая RW1C-изменения.
+            // Сброс порта: PR=1, сохранив CCS/PP, не трогая RW1C-изменения. Ждём включения
+            // ПО ВРЕМЕНИ: на железе сброс занимает десятки миллисекунд.
             wr(psc, v & !PORTSC_CHANGES | PORTSC_PR);
-            for _ in 0..1_000_000 {
+            for _ in 0..40 {
                 if rd(psc) & PORTSC_PED != 0 {
                     break;
                 }
+                wait_ms(5);
             }
             wr(psc, rd(psc) & !PORTSC_CHANGES | PORTSC_CHANGES); // сбросить биты-изменения
             if rd(psc) & PORTSC_PED == 0 {
@@ -294,10 +297,96 @@ pub fn init() -> bool {
         if connected == 0 {
             crate::println!("  [usb]  xHCI: {} портов, ничего не подключено", max_ports);
         }
+        // Веха 199.1 — ничего нашего на контроллере нет: вернуть его прошивке. Пока он у неё,
+        // она эмулирует USB-клавиатуру через контроллер 8042, и на машине, где наш драйвер не
+        // справился, это единственный способ ввода. Тот же довод, что у EHCI: забрать и не дать
+        // взамен ничего — худшее из возможного.
+        if took && x.kbd.is_none() && x.msc.is_none() {
+            release_to_bios(base, op);
+            return false;
+        }
 
         *XHCI.lock_irq() = Some(x);
     }
     true
+}
+
+/// Где у xHCI лежит «кому принадлежит контроллер» (расширенная возможность номер 1).
+///
+/// В отличие от EHCI, список возможностей у xHCI живёт не в конфигурации PCI, а в самих
+/// регистрах: смещение первой — в старшей половине `HCCPARAMS1`, дальше список.
+unsafe fn legsup_offset(base: usize) -> Option<usize> {
+    let mut off = ((rd(base + CAP_HCCPARAMS1) >> 16) & 0xffff) as usize * 4;
+    if off == 0 {
+        return None;
+    }
+    for _ in 0..64 {
+        let cap = rd(base + off);
+        if cap & 0xff == 1 {
+            return Some(off);
+        }
+        let next = ((cap >> 8) & 0xff) as usize * 4;
+        if next == 0 {
+            return None;
+        }
+        off += next;
+    }
+    None
+}
+
+const OS_OWNED: u32 = 1 << 24;
+const BIOS_OWNED: u32 = 1 << 16;
+
+/// Отобрать управление у прошивки (Веха 199.1).
+///
+/// Этого шага у нас не было ВОВСЕ — и в QEMU он не нужен, потому что там прошивка контроллером
+/// не владеет. На живой машине владеет: пока её бит стоит, она обслуживает контроллер из
+/// системного режима, и два владельца у одного устройства — это состязание, в котором
+/// проигрывают оба.
+unsafe fn bios_handoff(base: usize) -> bool {
+    let Some(off) = legsup_offset(base) else { return false };
+    let legsup = rd(base + off);
+    if legsup & BIOS_OWNED == 0 {
+        return false;
+    }
+    wr(base + off, legsup | OS_OWNED);
+    for _ in 0..200 {
+        if rd(base + off) & BIOS_OWNED == 0 {
+            crate::println!("  [usb]  xHCI: управление отобрано у прошивки");
+            return true;
+        }
+        wait_ms(5);
+    }
+    crate::println!("  [usb]  xHCI: прошивка не отдала управление — работаем всё равно");
+    true
+}
+
+/// Вернуть контроллер прошивке: остановить и снять свой бит владения.
+unsafe fn release_to_bios(base: usize, op: usize) {
+    wr(op + OP_USBCMD, rd(op + OP_USBCMD) & !CMD_RS);
+    for _ in 0..100 {
+        if rd(op + OP_USBSTS) & STS_HCH != 0 {
+            break;
+        }
+        wait_ms(5);
+    }
+    if let Some(off) = legsup_offset(base) {
+        wr(base + off, rd(base + off) & !OS_OWNED);
+    }
+    crate::println!("  [usb]  xHCI: своих устройств нет — управление возвращено прошивке");
+}
+
+/// Подождать `ms` миллисекунд по измеренной таймбазе (Веха 199.1).
+///
+/// Здесь стояли холостые обороты («покрутиться миллион раз»), и на живом железе это значит
+/// «почти не ждать»: сброс порта USB занимает десятки миллисекунд, а устройство после подачи
+/// питания определяется за сотню. В эмуляторе всё происходит мгновенно, поэтому разницы не было
+/// видно — ровно до первой настоящей машины.
+fn wait_ms(ms: u64) {
+    let until = crate::clock::uptime_ns() + ms * 1_000_000;
+    while crate::clock::uptime_ns() < until {
+        core::hint::spin_loop();
+    }
 }
 
 /// Поставить TRB в кольцо передачи и продвинуть постановку — с ЧЕСТНЫМ заворотом (Веха 196).

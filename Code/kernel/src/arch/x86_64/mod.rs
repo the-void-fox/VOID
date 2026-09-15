@@ -595,8 +595,8 @@ pub fn touchpad() -> bool {
 
 /// Веха 199 — контроллер USB 2.0: база регистров и BDF (отъём управления у прошивки живёт в
 /// конфигурационном пространстве PCI, а не в регистрах).
-pub fn probe_ehci() -> Option<(usize, u16)> {
-    pci::probe_ehci()
+pub fn probe_ehci(out: &mut [(usize, u16)]) -> usize {
+    pci::probe_ehci(out)
 }
 
 /// Веха 199 — слово конфигурационного пространства PCI по BDF (для отъёма у прошивки).

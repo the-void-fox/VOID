@@ -210,11 +210,36 @@ unsafe fn release_to_bios(base: usize, op: usize, bdf: u16) {
     crate::println!("  [usb]  EHCI: своей клавиатуры нет — управление возвращено прошивке");
 }
 
-/// Поднять контроллер. `false` — EHCI на этой машине нет либо он не отозвался.
+/// Подождать `ms` миллисекунд по измеренной таймбазе.
+///
+/// Веха 199.1 — без НАСТОЯЩЕЙ задержки драйвер не работает на живом железе, и это первое, что
+/// показала машина владельца. Спецификация USB требует после подачи питания на порт выдержку
+/// в 100 мс: раньше этого срока порт честно отвечает «никого нет». В эмуляторе устройство
+/// подключено мгновенно, поэтому цикл «покрутиться сто тысяч раз» проходил — а на ноутбуке
+/// означал «спросить и уйти», и оба контроллера выглядели пустыми.
+fn wait_ms(ms: u64) {
+    let until = crate::clock::uptime_ns() + ms * 1_000_000;
+    while crate::clock::uptime_ns() < until {
+        core::hint::spin_loop();
+    }
+}
+
+/// Поднять контроллеры USB 2.0. `false` — их на машине нет либо своей клавиатуры на них не
+/// нашлось (тогда управление возвращено прошивке).
 pub fn init() -> bool {
-    let Some((base, bdf)) = crate::arch::probe_ehci() else {
-        return false;
-    };
+    // Контроллеров бывает несколько, и клавиатура может быть на любом из них.
+    let mut found = [(0usize, 0u16); 4];
+    let n = crate::arch::probe_ehci(&mut found);
+    for &(base, bdf) in found.iter().take(n) {
+        if init_one(base, bdf) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Поднять ОДИН контроллер. `true` — на нём нашлась своя клавиатура.
+fn init_one(base: usize, bdf: u16) -> bool {
     unsafe {
         let took = bios_handoff(base, bdf);
         let caplen = (read_volatile(base as *const u8)) as usize;
@@ -283,7 +308,10 @@ pub fn init() -> bool {
             }
         }
 
-        crate::println!("  [usb]  EHCI: контроллер поднят, портов {}", ports);
+        // Выдержка после подачи питания: спецификация требует 100 мс, берём с запасом. Без
+        // неё порты отвечают «никого нет» — см. `wait_ms`.
+        wait_ms(150);
+        crate::println!("  [usb]  EHCI: контроллер {:#x} поднят, портов {}", base, ports);
         let found = e.enumerate_root();
         // Клавиатуры не нашлось — вернуть контроллер прошивке. Пока он у неё, она эмулирует
         // USB-клавиатуру через 8042, и на машине, где наш драйвер не справился, это
@@ -306,11 +334,10 @@ impl Ehci {
             let v = rd(psc);
             if v & PORT_POWER == 0 {
                 wr(psc, (v & !PORT_CHANGES) | PORT_POWER);
-                for _ in 0..100_000 {
-                    core::hint::spin_loop();
-                }
+                wait_ms(120); // питание подано — ждём, пока порт определится
             }
             if rd(psc) & PORT_CONNECT == 0 {
+                crate::println!("  [usb]  EHCI: порт {} пуст ({:#010x})", p + 1, rd(psc));
                 continue;
             }
             crate::println!("  [usb]  EHCI: на порту {} что-то есть — сбрасываю", p + 1);
@@ -330,9 +357,7 @@ impl Ehci {
     unsafe fn reset_port(&mut self, psc: usize) -> bool {
         let v = rd(psc) & !PORT_CHANGES & !PORT_ENABLE;
         wr(psc, v | PORT_RESET);
-        for _ in 0..500_000 {
-            core::hint::spin_loop();
-        }
+        wait_ms(50); // спецификация: держать сброс не меньше 50 мс
         wr(psc, rd(psc) & !PORT_CHANGES & !PORT_RESET);
         for _ in 0..1_000_000 {
             if rd(psc) & PORT_RESET == 0 {
@@ -476,9 +501,7 @@ impl Ehci {
         }
         self.next_addr += 1;
         dev.addr = addr;
-        for _ in 0..200_000 {
-            core::hint::spin_loop(); // устройству дают время принять адрес
-        }
+        wait_ms(5); // устройству дают время принять адрес (спецификация: 2 мс)
 
         let mut desc = [0u8; 18];
         if !self.get_descriptor(&dev, 1, 0, &mut desc, mps) {
@@ -514,9 +537,7 @@ impl Ehci {
             // Включить питание порта: SET_FEATURE(PORT_POWER=8).
             self.control(hub, 0x23, 3, 8, port as u16, 0, mps);
         }
-        for _ in 0..1_000_000 {
-            core::hint::spin_loop(); // дать портам подняться
-        }
+        wait_ms(120); // дать портам хаба подняться после подачи питания
         for port in 1..=nports {
             let mut st = [0u8; 4];
             if !self.control(hub, 0xa3, 0, 0, port as u16, 4, mps) {
@@ -529,9 +550,7 @@ impl Ehci {
             }
             // Сброс порта: SET_FEATURE(PORT_RESET=4), затем ждём и читаем состояние снова.
             self.control(hub, 0x23, 3, 4, port as u16, 0, mps);
-            for _ in 0..2_000_000 {
-                core::hint::spin_loop();
-            }
+            wait_ms(60); // сброс порта хаба: те же 50 мс, что у корневого, с запасом
             if !self.control(hub, 0xa3, 0, 0, port as u16, 4, mps) {
                 continue;
             }
