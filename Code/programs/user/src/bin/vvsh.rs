@@ -954,6 +954,8 @@ fn shell_env() -> Env {
         ("unroot", sh_unroot),
         ("thaw", sh_thaw),
         ("switch", sh_switch),
+        ("klog-save", sh_klog_save),
+        ("klog-send", sh_klog_send),
         ("poweroff", sh_poweroff),
         ("reboot", sh_reboot),
         ("store-probe", sh_store_probe),
@@ -1248,6 +1250,8 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"clear", "очистить экран");
     help_row(b"help", "эта справка");
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
+    help_row(b"klog-save F", "журнал ядра в файл (потом его можно вынести с машины)");
+    help_row(b"klog-send IP P", "журнал ядра на другой компьютер по TCP (там: nc -l -p P)");
     help_row(b"poweroff", "выключить машину");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
@@ -1986,6 +1990,97 @@ fn sh_store_probe(args: &[Value]) -> Result<Value, EvalError> {
         alloc::format!("store-probe: принято {} МиБ без отказа\n", done / (1024 * 1024)).as_bytes(),
     );
     Ok(Value::Int((done / (1024 * 1024)) as i64))
+}
+
+/// Прочитать журнал ядра целиком. Общее для [`sh_klog_save`] и [`sh_klog_send`].
+///
+/// Буфер большой намеренно: журнал загрузки на живой машине — это сотни строк про PCI,
+/// контроллеры и драйверы, и обрезать его именно там, где началось интересное, было бы
+/// издевательством.
+fn klog_text() -> Result<String, EvalError> {
+    let mut buf = alloc::vec![0u8; 128 * 1024];
+    let (got, lost) = sys::klog(&mut buf);
+    if got == 0 {
+        return Err(EvalError::new("журнал ядра пуст или недоступен"));
+    }
+    buf.truncate(got);
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if lost > 0 {
+        // Сказать вслух, что начало не поместилось: иначе человек будет искать в журнале то,
+        // чего в нём уже нет, и винить себя.
+        text.push_str(&alloc::format!("\n[klog] начало журнала потеряно: {} байт\n", lost));
+    }
+    Ok(text)
+}
+
+/// `(klog-save "путь")` — сохранить журнал ядра в файл (Веха 199.2).
+///
+/// Зачем это команда, а не перенаправление: у ноутбука нет COM-порта, и журнал загрузки с него
+/// физически нечем вынести — владелец фотографировал экран. Файл в store переносится вместе с
+/// носителем: система, поставленная на флешку (Веха 196), читается на другом компьютере мостом
+/// `void-store-import`.
+fn sh_klog_save(args: &[Value]) -> Result<Value, EvalError> {
+    let path = match args.first() {
+        Some(Value::Str(p)) => resolve(p.as_bytes()),
+        _ => return Err(EvalError::new("klog-save: (klog-save \"/путь/файл\")")),
+    };
+    let text = klog_text()?;
+    if !px::echo_to(cap_fs(), &path, text.as_bytes()) {
+        return Err(EvalError::new("klog-save: файл записан не полностью"));
+    }
+    sys::write(tf("журнал сохранён: {} байт\n", &[&alloc::format!("{}", text.len())]).as_bytes());
+    Ok(Value::nil())
+}
+
+/// `(klog-send "A.B.C.D" порт)` — отправить журнал ядра на другой компьютер по TCP.
+///
+/// На той стороне достаточно `nc -l -p <порт> > log.txt`. Второй способ вынести журнал с
+/// машины без COM-порта, и он же — первая настоящая проверка сети на чужом железе: если
+/// журнал доехал, значит работает и карта, и стек.
+fn sh_klog_send(args: &[Value]) -> Result<Value, EvalError> {
+    // Номер порта принимаем и числом, и строкой: в командной строке шелла всё, что набрал
+    // человек, приходит строкой, и требовать от него кавычек с обратным слэшем ради типа —
+    // это язык, объясняющийся своей реализацией.
+    let port = match args.get(1) {
+        Some(Value::Int(p)) if *p > 0 && *p < 65536 => *p as u16,
+        Some(Value::Str(p)) => match p.trim().parse::<u16>() {
+            Ok(p) if p > 0 => p,
+            _ => return Err(EvalError::new("klog-send: порт — число 1..65535")),
+        },
+        _ => return Err(EvalError::new("klog-send: (klog-send \"A.B.C.D\" порт)")),
+    };
+    let host = match args.first() {
+        Some(Value::Str(h)) => h.clone(),
+        _ => return Err(EvalError::new("klog-send: (klog-send \"A.B.C.D\" порт)")),
+    };
+    let ip = match sys::net_cli::parse_ipv4(host.as_bytes()) {
+        Some(x) => x,
+        None => return Err(EvalError::new("klog-send: нужен адрес A.B.C.D (имя — через resolve)")),
+    };
+    let text = klog_text()?;
+    let ep = net_ep("klog-send")?;
+    let h = match sys::net_cli::tcp_connect(ep, ip, port) {
+        Ok(h) => h,
+        Err(st) => return Err(net_err("klog-send", st)),
+    };
+    // Шлём кусками: сервер принимает столько, сколько готов, и остаток — наша забота (как у
+    // `write(2)`). Без этого цикла ушёл бы только первый кусок, а выглядело бы как «журнал
+    // обрезан на ровном месте».
+    let bytes = text.as_bytes();
+    let mut sent = 0usize;
+    while sent < bytes.len() {
+        match sys::net_cli::tcp_send(ep, h, &bytes[sent..]) {
+            Ok(0) => break,
+            Ok(n) => sent += n,
+            Err(st) => {
+                let _ = sys::net_cli::tcp_close(ep, h);
+                return Err(net_err("klog-send", st));
+            }
+        }
+    }
+    let _ = sys::net_cli::tcp_close(ep, h);
+    sys::write(tf("журнал отправлен: {} байт\n", &[&alloc::format!("{}", sent)]).as_bytes());
+    Ok(Value::Int(sent as i64))
 }
 
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
