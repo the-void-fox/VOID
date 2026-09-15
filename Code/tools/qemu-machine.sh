@@ -148,9 +148,44 @@ void_qemu_machine() {
 #   VOID_QEMU_USB=disk:<путь>      флешка (USB mass storage поверх BOT)
 #   VOID_QEMU_USB=boot:<путь>      флешка, с которой ЗАГРУЖАЕТСЯ машина (bootindex=0)
 #   VOID_QEMU_USB=kbd,disk:<путь>  и то и другое на одном контроллере
+#   VOID_QEMU_USB=ehci:disk:<путь> USB 2.0 (EHCI) с высокоскоростным устройством (Веха 199).
+#                                  Клавиатуру сюда подключить НЕЛЬЗЯ: она полноскоростная, а
+#                                  высокоскоростного хаба у QEMU нет вовсе — см. ниже.
 void_qemu_usb() {
     local spec="${VOID_QEMU_USB:-}"
     [ -n "$spec" ] || return 0
+    # Веха 199 — КАКОЙ контроллер. `ehci:` в начале строки даёт USB 2.0 (EHCI) вместо xHCI, и не
+    # ради полноты: на машинах 2008–2015 годов весь USB идёт через него, а низко- и
+    # полноскоростные устройства (клавиатуры, мыши) висят за ХАБОМ с транслятором транзакций —
+    # у Intel он встроен в чипсет. Проверять клавиатуру в обход этой топологии бессмысленно:
+    # именно она и отличает EHCI от всего, что мы писали раньше.
+    if [ "${spec#ehci:}" != "$spec" ]; then
+        spec="${spec#ehci:}"
+        # ХАБА ЗДЕСЬ НЕТ, и это ограничение стенда, а не выбор: у QEMU есть только
+        # полноскоростной `usb-hub` (USB 1.1), а к EHCI можно подключить лишь высокоскоростной —
+        # с транслятором транзакций. То есть топологию живого ноутбука (встроенный хаб чипсета,
+        # клавиатура за ним) эмулятор не изображает ВООБЩЕ. Здесь проверяется то, что он может:
+        # контроллер, отъём у прошивки, сброс порта и перечисление высокоскоростного устройства.
+        printf '%s\n' -device ich9-usb-ehci1,id=ehci
+        local i=0 item rest="$spec"
+        while [ -n "$rest" ]; do
+            item="${rest%%,*}"
+            [ "$item" = "$rest" ] && rest="" || rest="${rest#*,}"
+            [ -n "$item" ] || continue
+            case "$item" in
+                kbd) printf '%s\n' -device usb-kbd,bus=ehci.0,id=usbkbd ;;
+                disk:*)
+                    printf '%s\n' \
+                        -drive "if=none,id=usb$i,file=${item#disk:},format=raw" \
+                        -device "usb-storage,bus=ehci.0,drive=usb$i"
+                    i=$((i + 1)) ;;
+                *)
+                    echo "стенд: не понимаю USB-устройство '$item' (kbd | disk:<путь>)" >&2
+                    return 2 ;;
+            esac
+        done
+        return 0
+    fi
     printf '%s\n' -device qemu-xhci,id=xhci
     local i=0 item rest="$spec"
     while [ -n "$rest" ]; do

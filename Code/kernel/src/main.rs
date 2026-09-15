@@ -58,6 +58,26 @@ mod e1000;
 mod install;
 mod net;
 mod nvme;
+// Веха 199 — разбор отчётов HID-клавиатуры: общий для xHCI и EHCI.
+#[cfg(target_arch = "x86_64")]
+mod usb_hid;
+// USB 2.0 (EHCI) — только x86 (Веха 199): на riscv его нет, как и xHCI.
+#[cfg(target_arch = "x86_64")]
+mod ehci;
+#[cfg(not(target_arch = "x86_64"))]
+mod ehci {
+    //! Заглушка: на riscv/QEMU-virt контроллера USB нет вовсе. Поверхность та же, что у
+    //! настоящего драйвера, чтобы общий путь консоли не обрастал `cfg`-ами.
+    #[allow(dead_code)] // зовёт только x86-путь консоли
+    pub fn poll() {}
+    #[allow(dead_code)]
+    pub fn has_keyboard() -> bool {
+        false
+    }
+    pub fn init() -> bool {
+        false
+    }
+}
 // USB xHCI — только x86 (Веха 50); на riscv/QEMU-virt xHCI нет → заглушка (init всегда false).
 #[cfg(target_arch = "x86_64")]
 mod xhci;
@@ -435,6 +455,9 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // Ровно так и вышло при первой проверке: система, установленная на флешку, загружалась и
     // говорила «диск не найден», хотя тремя строками ниже сама же печатала её ёмкость.
     xhci::init();
+    // Веха 199 — и USB 2.0. Порядок такой: на машине с обоими контроллерами xHCI ведёт порты
+    // USB 3.0, EHCI — остальные, и оба нужны. Печатает свой статус сам.
+    ehci::init();
 
     let live_media = arch::boot_module().is_some();
     let ram = live_media && ramdisk::init();

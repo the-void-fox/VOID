@@ -593,6 +593,21 @@ pub fn touchpad() -> bool {
     ps2::touchpad()
 }
 
+/// Веха 199 — контроллер USB 2.0: база регистров и BDF (отъём управления у прошивки живёт в
+/// конфигурационном пространстве PCI, а не в регистрах).
+pub fn probe_ehci() -> Option<(usize, u16)> {
+    pci::probe_ehci()
+}
+
+/// Веха 199 — слово конфигурационного пространства PCI по BDF (для отъёма у прошивки).
+pub fn pci_cfg_read32(bdf: u16, off: u8) -> u32 {
+    pci::cfg_read32(bdf, off)
+}
+
+pub fn pci_cfg_write32(bdf: u16, off: u8, v: u32) {
+    pci::cfg_write32(bdf, off, v)
+}
+
 /// Веха 198.1 — чувствительность тачпада из конфига.
 pub fn touchpad_tune(speed: u8, scroll_mm: u8) {
     ps2::touchpad_tune(speed, scroll_mm)
@@ -672,6 +687,7 @@ pub fn console_drain() {
     }
     ps2::drain();
     crate::xhci::poll(); // Веха 50: USB-клавиатура (если поднята) — тот же кольцевой буфер
+    crate::ehci::poll(); // Веха 199: та же клавиатура, но на контроллере USB 2.0
 }
 
 /// Веха 50 — байт от USB-HID-клавиатуры в кольцо консоли (как PS/2 [`rx_push`]).
@@ -780,7 +796,10 @@ pub fn irq_mask_preempt(_saved: usize) {
 /// опрос), таймер ОСТАВЛЯЕМ вкл, чтобы тики опрашивали её (`console_drain` → `xhci::poll`);
 /// иначе HLT спал бы до IRQ консоли и USB-нажатия терялись бы.
 pub fn irq_mask_stdin(_saved: usize) {
-    lapic::set_timer_masked(!crate::xhci::has_keyboard());
+    // Веха 199 — клавиатура может висеть на любом из двух контроллеров USB, и опрашивает её
+    // тик таймера: у USB прерывания мы не просим. Гасить таймер, пока такая клавиатура есть,
+    // значит не увидеть ни одного нажатия — сон до ввода стал бы сном навсегда.
+    lapic::set_timer_masked(!crate::xhci::has_keyboard() && !crate::ehci::has_keyboard());
 }
 
 /// Веха 91 — сон СО СРОКОМ: таймер нужен, чтобы заметить срок; прерывания устройств (в т.ч.
