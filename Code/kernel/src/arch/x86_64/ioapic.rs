@@ -78,8 +78,13 @@ pub fn route_flags(gsi: u32, vector: u8, active_low: bool, level: bool) {
 /// обработчик VEC_USERDRV маскирует (иначе level-линию, которую карта держит до чтения ICR,
 /// IOAPIC переотправлял бы штормом). Бит 16 RTE — маска.
 pub fn set_userdrv_masked(masked: bool) {
-    for gsi in 16..24u32 {
+    for gsi in 0..24u32 {
         let lo = read(0x10 + 2 * gsi);
+        // Трогаем ТОЛЬКО линии, заведённые на вектор драйвера в процессе: у соседей свои
+        // хозяева, и маскировать чужое прерывание — верный способ потерять ввод или диск.
+        if lo & 0xff != super::trap::VEC_USERDRV as u32 {
+            continue;
+        }
         let lo = if masked { lo | (1 << 16) } else { lo & !(1 << 16) };
         write(0x10 + 2 * gsi, lo);
     }

@@ -554,6 +554,12 @@ static void lx_netdev_rx(struct sk_buff *skb)
  * РАЗБУДИТЬ — и будит (`wake_netdev_owner`). Проснувшись, планировщик заходит сюда, находит
  * кадр и отправляет его. Вхолостую этот заход не делается: спящий процесс не крутится.
  */
+/// Веха 199.5 — работаем ли мы сейчас картой системы.
+int lx_netdev_active(void)
+{
+	return lx_netdev_cap != VOID_NO_CAP && lx_netdev_dev != 0;
+}
+
 int lx_netdev_pump(void)
 {
 	unsigned char buf[1600];
@@ -592,6 +598,7 @@ int lx_netdev_pump(void)
 /* Сборка-«вычислялка» (без syscall'ов): карты нет, отдавать кадры некому. */
 static void lx_netdev_rx(struct sk_buff *skb) { (void)skb; }
 int lx_netdev_pump(void) { return 0; }
+int lx_netdev_active(void) { return 0; }
 #endif
 
 void napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
