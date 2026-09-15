@@ -124,6 +124,10 @@ pub use imp::{power_off, reboot};
 pub use imp::{
     intx_irq_setup, pci_dump, probe_bar, probe_bar0, probe_xhci, touchpad, usb_key, usb_key_event,
 };
+/// Веха 198.1 — настройки железа из конфига поколения (только x86: на riscv нет ни тачпада,
+/// ни ACPI).
+#[cfg(target_arch = "x86_64")]
+pub use imp::{enable_power_button, touchpad_tune};
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).

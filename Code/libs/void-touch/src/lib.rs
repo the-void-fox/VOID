@@ -87,9 +87,13 @@ const Z_TOUCH: u8 = 25;
 /// Сколько единиц даёт один щелчок прокрутки: 4 мм — примерно ползунок на строку.
 const SCROLL_STEP: i32 = 4 * PER_MM;
 
-/// Во сколько раз движение пальца медленнее движения курсора. 1:2 — курсор пробегает экран
-/// (1280 точек) примерно за 14 мм, то есть за короткое движение большим пальцем.
-const CURSOR_DIV: i32 = 2;
+/// Во сколько раз движение пальца медленнее движения курсора — ПО УМОЛЧАНИЮ.
+///
+/// Веха 198.1 — было 2, стало 6. Владелец проверил на живой панели и сказал коротко:
+/// «чувствительность крайне высока». Цифра 2 бралась из расчёта «экран за 14 мм», и на бумаге
+/// это выглядело удобно; на панели ноутбука таким курсором невозможно попасть в кнопку.
+/// Настраивается строкой `touchpad("speed", N)` — см. [`Touchpad::tune`].
+const CURSOR_DIV: i32 = 6;
 
 /// Скачок больше этого — не движение пальца, а НОВОЕ касание в другом месте (палец подняли и
 /// поставили). Семь миллиметров за один пакет (тачпад шлёт их 80 раз в секунду) — это уже
@@ -109,8 +113,14 @@ pub enum Move {
 }
 
 /// Состояние жестов: где был палец в прошлый раз и сколько прокрутки накопилось.
-#[derive(Default)]
+///
+/// `Default` здесь НЕ выводится: нулевой делитель чувствительности — это деление на ноль в
+/// горячем пути. Единственный вход — [`Touchpad::new`], где стоят умолчания.
 pub struct Touchpad {
+    /// Во сколько раз курсор медленнее пальца (больше — медленнее).
+    cursor_div: i32,
+    /// Сколько единиц панели на один щелчок прокрутки (больше — крупнее шаг).
+    scroll_step: i32,
     /// Прошлая точка касания, пока палец на панели.
     prev: Option<(u16, u16)>,
     /// Сколько пальцев было в прошлом пакете — смена числа пальцев рвёт непрерывность
@@ -120,9 +130,34 @@ pub struct Touchpad {
     scroll: i32,
 }
 
+impl Default for Touchpad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Touchpad {
     pub const fn new() -> Self {
-        Touchpad { prev: None, fingers: 0, scroll: 0 }
+        Touchpad {
+            cursor_div: CURSOR_DIV,
+            scroll_step: SCROLL_STEP,
+            prev: None,
+            fingers: 0,
+            scroll: 0,
+        }
+    }
+
+    /// Веха 198.1 — настроить под руку хозяина. `speed` — во сколько раз курсор медленнее
+    /// пальца (1 — как палец, 16 — очень медленно), `scroll_mm` — сколько миллиметров на один
+    /// щелчок прокрутки. Ноль в любом из них значит «оставь как было»: пустая строка в конфиге
+    /// не должна превращать тачпад в неуправляемый.
+    pub fn tune(&mut self, speed: u8, scroll_mm: u8) {
+        if speed > 0 {
+            self.cursor_div = (speed as i32).clamp(1, 16);
+        }
+        if scroll_mm > 0 {
+            self.scroll_step = (scroll_mm as i32).clamp(1, 30) * PER_MM;
+        }
     }
 
     /// Сколько пальцев на панели по коду `w`. Ладонь (`w == 2`) считаем отсутствием пальцев:
@@ -178,12 +213,12 @@ impl Touchpad {
             // секунду, и щелчок на каждый превратил бы страницу в размазню.
             self.scroll += dy;
             let mut ticks = 0i32;
-            while self.scroll >= SCROLL_STEP {
-                self.scroll -= SCROLL_STEP;
+            while self.scroll >= self.scroll_step {
+                self.scroll -= self.scroll_step;
                 ticks += 1; // палец вверх = страница вверх (от себя)
             }
-            while self.scroll <= -SCROLL_STEP {
-                self.scroll += SCROLL_STEP;
+            while self.scroll <= -self.scroll_step {
+                self.scroll += self.scroll_step;
                 ticks -= 1;
             }
             return if ticks == 0 { Move::None } else { Move::Wheel(ticks.clamp(-8, 8) as i8) };
@@ -191,8 +226,8 @@ impl Touchpad {
 
         // КУРСОР. `y` у тачпада растёт вверх, у экрана вниз — знак меняем здесь, чтобы наружу
         // шло экранное соглашение и никто больше об этом не думал.
-        let mx = dx / CURSOR_DIV;
-        let my = -dy / CURSOR_DIV;
+        let mx = dx / self.cursor_div;
+        let my = -dy / self.cursor_div;
         if mx == 0 && my == 0 {
             return Move::None;
         }
@@ -267,9 +302,10 @@ mod tests {
     fn палец_ведёт_курсор() {
         let mut t = Touchpad::new();
         t.feed(&decode(&pack(3000, 3000, 60, 5, false, false)));
-        let m = t.feed(&decode(&pack(3100, 3050, 60, 5, false, false)));
-        // 100 единиц вправо и 50 вверх → курсор вправо и ВВЕРХ по-экранному (dy отрицательный).
-        assert_eq!(m, Move::Cursor { dx: 50, dy: -25 });
+        let m = t.feed(&decode(&pack(3120, 3060, 60, 5, false, false)));
+        // 120 единиц вправо и 60 вверх при умолчании «курсор вшестеро медленнее пальца» →
+        // 20 точек вправо и 10 ВВЕРХ по-экранному (dy отрицательный).
+        assert_eq!(m, Move::Cursor { dx: 20, dy: -10 });
     }
 
     #[test]
@@ -313,6 +349,45 @@ mod tests {
         t.feed(&decode(&pack(3020, 3000, 60, 5, false, false)));
         // Второй палец лёг в стороне: число пальцев сменилось — молчим.
         assert_eq!(t.feed(&decode(&pack(2000, 2500, 60, 0, false, false))), Move::None);
+    }
+
+    #[test]
+    fn настройка_меняет_скорость_курсора() {
+        let mut t = Touchpad::new();
+        t.tune(1, 0); // курсор один в один с пальцем
+        t.feed(&decode(&pack(3000, 3000, 60, 5, false, false)));
+        assert_eq!(
+            t.feed(&decode(&pack(3120, 3000, 60, 5, false, false))),
+            Move::Cursor { dx: 120, dy: 0 }
+        );
+        let mut t = Touchpad::new();
+        t.tune(12, 0); // вдвое медленнее умолчания
+        t.feed(&decode(&pack(3000, 3000, 60, 5, false, false)));
+        assert_eq!(
+            t.feed(&decode(&pack(3120, 3000, 60, 5, false, false))),
+            Move::Cursor { dx: 10, dy: 0 }
+        );
+    }
+
+    #[test]
+    fn настройка_меняет_шаг_прокрутки() {
+        let mut t = Touchpad::new();
+        t.tune(0, 2); // щелчок каждые два миллиметра
+        t.feed(&decode(&pack(3000, 3000, 60, 0, false, false)));
+        assert_eq!(t.feed(&decode(&pack(3000, 3090, 60, 0, false, false))), Move::Wheel(1));
+    }
+
+    #[test]
+    fn ноль_в_настройке_ничего_не_меняет() {
+        // Пустая строка конфига не должна превращать тачпад в неуправляемый (и уж точно не
+        // должна делить на ноль).
+        let mut t = Touchpad::new();
+        t.tune(0, 0);
+        t.feed(&decode(&pack(3000, 3000, 60, 5, false, false)));
+        assert_eq!(
+            t.feed(&decode(&pack(3060, 3000, 60, 5, false, false))),
+            Move::Cursor { dx: 10, dy: 0 }
+        );
     }
 
     #[test]

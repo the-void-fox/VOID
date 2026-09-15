@@ -177,6 +177,20 @@ pub const KINDS: &[Kind] = &[
         values: None,
         kernel: true,
     },
+    // Веха 198.1 — ЖЕЛЕЗО, которое настраивает человек. Читает ядро: это не украшение
+    // оболочки, а поведение драйверов, и знать о нём должен тот, кто их держит.
+    Kind {
+        name: "touchpad",
+        form: "(touchpad ключ значение)",
+        values: Some(2),
+        kernel: true,
+    },
+    Kind {
+        name: "acpi",
+        form: "(acpi ключ значение)",
+        values: Some(2),
+        kernel: true,
+    },
     Kind {
         name: "bind",
         form: "(bind режим клавиша действие)",

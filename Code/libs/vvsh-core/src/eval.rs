@@ -453,6 +453,9 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("packages", b_packages),
     ("autostart", b_autostart),
     ("channel", b_channel),
+    // Веха 198.1 — ЖЕЛЕЗО: настройки драйверов, которые держит ядро.
+    ("touchpad", b_touchpad),
+    ("acpi", b_acpi),
     ("system", b_system),
 ];
 
@@ -611,6 +614,11 @@ fn build_entry(kind: &'static str, args: &[Value]) -> Result<Value, EvalError> {
         match cap {
             Value::Str(_) => out.push(cap.clone()),
             Value::Int(n) => out.push(Value::str(&alloc::format!("{}", n))),
+            // Веха 198.1 — ДА и НЕТ значением записи. Раньше их не было, и `acpi("power-button",
+            // true)` отвергалось словами «право — строка или список строк»: в конфиге уже есть
+            // булевы значения (`net.vv` это ровно `true`), и заставлять писать их строкой ради
+            // внутреннего устройства разбора — это язык, объясняющийся своим кодом.
+            Value::Bool(b) => out.push(Value::str(if *b { "true" } else { "false" })),
             Value::List(items) => {
                 for it in items.iter() {
                     match it {
@@ -706,6 +714,22 @@ fn b_ui(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("ui", args)
 }
 
+/// Веха 198.1 — `(touchpad ключ значение)`: чувствительность тачпада. Читает ЯДРО, потому что
+/// тачпад держит оно; оболочке эти числа не нужны и знать их незачем.
+///
+/// Отдельный вид, а не ключ внутри `ui`, по тому же правилу, что отделило `bar` от `desktop`:
+/// `ui` — это как ВЫГЛЯДИТ интерфейс, а здесь — как ведёт себя железо. Читатели разные.
+fn b_touchpad(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("touchpad", args)
+}
+
+/// Веха 198.1 — `(acpi ключ значение)`: что из ACPI включать. Сегодня ключ один —
+/// `power-button`, и он выключен по умолчанию: его цена — эмуляция USB-клавиатуры прошивкой
+/// (см. `arch::enable_power_button`).
+fn b_acpi(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("acpi", args)
+}
+
 /// `(device ключ значение)` — КТО ЭТА МАШИНА (Веха 145.1): `name` — имя устройства, `avatar` —
 /// корень store с картинкой.
 ///
@@ -798,7 +822,7 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::list(out))
 }
 
-/// Виды записей конфига. `service`/`shell` читает ЯДРО, `terminal`/`bind` — терминал,
+/// Виды записей конфига. `service`/`shell`/`touchpad`/`acpi` читает ЯДРО, `terminal`/`bind` — терминал,
 /// `desktop` — композитор, `ui` — тулкит оболочки, `bar` — панель, `device` — «кто эта машина»,
 /// `packages`/`channel` — `pkg`: конфиг поколения один, читателей несколько, и каждый берёт
 /// свои строки.
@@ -806,5 +830,6 @@ fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
             "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
-                | "packages" | "autostart" | "channel" | "bar" | "default"))
+                | "packages" | "autostart" | "channel" | "bar" | "default"
+                | "touchpad" | "acpi"))
 }

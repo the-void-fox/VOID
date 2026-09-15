@@ -300,6 +300,13 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
         if !k.kernel {
             continue;
         }
+        // Веха 198.1 — записи о ЖЕЛЕЗЕ. Они не спавнят программ: это настройки драйверов,
+        // которые держит ядро, поэтому разбираются здесь и до общего пути ниже.
+        #[cfg(target_arch = "x86_64")]
+        if kind == "touchpad" || kind == "acpi" {
+            hardware_entry(kind, &entry);
+            continue;
+        }
         let Some(name) = entry.words().next() else { continue };
         let Some(pid) = spawn(name) else { continue };
 
@@ -402,6 +409,45 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
         }
     }
     services
+}
+
+/// Веха 198.1 — применить строку о железе: `touchpad("speed", 6)`, `acpi("power-button", true)`.
+///
+/// Обе настройки читает ядро, а не оболочка, потому что обе — поведение драйверов. И обе
+/// появились из живой машины владельца: тачпад оказался слишком чутким, а кнопка питания
+/// отняла клавиатуру (см. `arch::enable_power_button`).
+#[cfg(target_arch = "x86_64")]
+fn hardware_entry(kind: &str, entry: &void_conf::Entry<'_>) {
+    let mut w = entry.words();
+    let (Some(key), Some(value)) = (w.next(), w.next()) else {
+        println!("  [init] {}: жду (ключ значение)", kind);
+        return;
+    };
+    let num = |s: &str| s.trim().parse::<u8>().ok();
+    match (kind, key) {
+        ("touchpad", "speed") => match num(value) {
+            Some(n) => {
+                arch::touchpad_tune(n, 0);
+                println!("  [init] тачпад: скорость {} (больше — медленнее)", n);
+            }
+            None => println!("  [init] touchpad speed: жду число 1..16, а не '{}'", value),
+        },
+        ("touchpad", "scroll") => match num(value) {
+            Some(n) => {
+                arch::touchpad_tune(0, n);
+                println!("  [init] тачпад: шаг прокрутки {} мм", n);
+            }
+            None => println!("  [init] touchpad scroll: жду число 1..30 (мм), а не '{}'", value),
+        },
+        ("acpi", "power-button") => {
+            // Включаем ТОЛЬКО по явной просьбе: цена этой строки — эмуляция USB-клавиатуры
+            // прошивкой, и на машине без своего драйвера USB это означает «клавиатуры нет».
+            if value == "true" {
+                arch::enable_power_button();
+            }
+        }
+        _ => println!("  [init] {}: не знаю ключа '{}'", kind, key),
+    }
 }
 
 /// Веха 99.1 — короткое ИМЯ права по токену конфига: `endpoint:posixfs` → `POSIXFS`,

@@ -298,7 +298,7 @@ struct Tpl {
 }
 
 /// Посеять модульный конфиг в `/etc/system/` (posixfs, start-cap 0). Идемпотентно. Печатает итог.
-const TPLS: [Tpl; 9] = [
+const TPLS: [Tpl; 10] = [
     Tpl { path: b"/etc/system/net.vv", text: NET_VV, seed: "system/seed/net.vv" },
     Tpl { path: b"/etc/system/services.vv", text: SERVICES_VV, seed: "system/seed/services.vv" },
     Tpl {
@@ -311,6 +311,7 @@ const TPLS: [Tpl; 9] = [
     Tpl { path: b"/etc/system/packages.vv", text: PACKAGES_VV, seed: "system/seed/packages.vv" },
     Tpl { path: b"/etc/system/apps.vv", text: APPS_VV, seed: "system/seed/apps.vv" },
     Tpl { path: b"/etc/system/autostart.vv", text: AUTOSTART_VV, seed: "system/seed/autostart.vv" },
+    Tpl { path: b"/etc/system/hardware.vv", text: HARDWARE_VV, seed: "system/seed/hardware.vv" },
     Tpl { path: DEFAULT_PATH, text: DEFAULT_VV, seed: "system/seed/default.vv" },
 ];
 
@@ -2844,6 +2845,29 @@ open = [\"welcome\"]\n\
 \n\
 if null?(open) { [] } else { [autostart(open)] }\n";
 
+const HARDWARE_VV: &str = "# hardware.vv — ЖЕЛЕЗО: то, что настраивает человек, а держит ядро (Веха 198.1).\n\
+#\n\
+# Эти строки читает ЯДРО, а не оболочка: они меняют поведение драйверов, а не вид окон. Обе\n\
+# появились из живой машины, а не из головы.\n\
+#\n\
+# ТАЧПАД (Synaptics в абсолютном режиме):\n\
+#   touchpad(\"speed\", N)   — во сколько раз курсор медленнее пальца: 1 быстро, 16 очень\n\
+#                           медленно. По умолчанию 6.\n\
+#   touchpad(\"scroll\", N)  — сколько миллиметров пальца на один щелчок прокрутки (по\n\
+#                           умолчанию 4). Больше — прокрутка крупнее и спокойнее.\n\
+#\n\
+# КНОПКА ПИТАНИЯ. Выключена по умолчанию, и это не осторожность, а цена: чтобы кнопка давала\n\
+# событие, чипсет надо перевести в режим ACPI, а прошивка в ответ ВЫКЛЮЧАЕТ эмуляцию\n\
+# USB-клавиатуры через контроллер 8042 (в BIOS это `Legacy USB Support`). На машине, где\n\
+# клавиатура работает через эту эмуляцию, включение кнопки означает потерю клавиатуры.\n\
+# Включай, если клавиатура у тебя настоящая PS/2 либо её ведёт наш драйвер xHCI.\n\
+#   acpi(\"power-button\", true)\n\
+[\n\
+\x20 touchpad(\"speed\", 6),\n\
+\x20 touchpad(\"scroll\", 4),\n\
+\x20 # acpi(\"power-button\", true),\n\
+]\n";
+
 const DEFAULT_VV: &str = "# default.vv — верхний модуль конфигурации VOID (vvsh, ADR 0006).\n\
 # Собери систему из модулей: сеть — net.vv (true/false), терминал и его клавиши — terminal.vv,\n\
 # раскладка панели — bar.vv, пакеты — packages.vv.\n\
@@ -2857,4 +2881,5 @@ system(\n\
 \x20 import(\"packages.vv\"),\n\
 \x20 import(\"apps.vv\"),\n\
 \x20 import(\"autostart.vv\"),\n\
+\x20 import(\"hardware.vv\"),\n\
 )\n";
