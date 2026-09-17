@@ -1467,13 +1467,55 @@ void pci_disable_msi(struct pci_dev *dev) { (void)dev; }
 int pcie_get_readrq(struct pci_dev *dev) { (void)dev; return 512; }
 int pcie_set_readrq(struct pci_dev *dev, int rq) { (void)dev; (void)rq; return 0; }
 
-/* Регистры capability PCIe: мы держим только заголовок конфига (первые 64 байта), поэтому
- * чтение отдаёт нули, а запись уходит в никуда. Драйвер этим сбрасывает накопленные флаги
- * ошибок — операция, отсутствие которой ничего не ломает. */
+/* ─── Регистры capability PCIe (Веха 199.16 — НАСТОЯЩИЕ) ────────────────────────────────────
+ *
+ * Здесь стояло «чтение отдаёт нули, запись уходит в никуда» с припиской «драйвер этим сбрасывает
+ * накопленные флаги ошибок — операция, отсутствие которой ничего не ломает». Приписка оказалась
+ * неверной, и дорого: `atl1c_reset_pcie` гасит через неё `PCI_EXP_DEVSTA` — накопленные
+ * URD/NFED/CED/FED. Флаги эти ЗАЛИПАЮЩИЕ: никто их больше не трогает, в регистре причин карты
+ * они видны вечно, и отличить «ошибка шины прямо сейчас» от «эхо давнего сбоя» становится
+ * нечем. Ровно на этом застрял поиск приёма: `причины 03700001` с UR_DETECTED выглядели уликой,
+ * а могли быть отпечатком прошлой системы, из которой перезагрузились.
+ *
+ * Теперь, когда конфиг настоящий (Веха 199.11), эти два тела тоже могут быть настоящими:
+ * находим capability PCIe (ID 0x10) в списке и работаем по смещению внутри неё.
+ */
+static int lx_pcie_cap(struct pci_dev *dev)
+{
+	u8 cap = 0;
+	int guard;
+
+	pci_read_config_byte(dev, PCI_CAPABILITY_LIST, &cap);
+	for (guard = 0; cap >= 0x40 && guard < 48; guard++) {
+		u8 id = 0, next = 0;
+
+		pci_read_config_byte(dev, cap, &id);
+		pci_read_config_byte(dev, cap + 1, &next);
+		if (id == PCI_CAP_ID_EXP)
+			return cap;
+		cap = next;
+	}
+	return 0;
+}
+
 int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
-{ (void)dev; (void)pos; *val = 0; return 0; }
+{
+	int base = lx_pcie_cap(dev);
+
+	*val = 0;
+	if (!base)
+		return 0; /* устройство не PCIe (или списка нет) — нулей достаточно */
+	return pci_read_config_word(dev, base + pos, val);
+}
+
 int pcie_capability_write_word(struct pci_dev *dev, int pos, u16 val)
-{ (void)dev; (void)pos; (void)val; return 0; }
+{
+	int base = lx_pcie_cap(dev);
+
+	if (!base)
+		return 0;
+	return pci_write_config_word(dev, base + pos, val);
+}
 
 /* dev_err_probe (Веха 131): напечатать причину и вернуть тот же код — идиома выхода из probe
  * одной строкой. Смысл именно в ВОЗВРАТЕ: драйвер пишет `return dev_err_probe(dev, err, …)`. */

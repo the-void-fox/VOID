@@ -74,6 +74,10 @@ struct pci_device_id {
 #define PCI_CAPABILITY_LIST     0x34
 #define PCI_CAP_ID_MSI          0x05
 #define PCI_MSI_FLAGS_ENABLE    0x0001
+/* Веха 199.16 — capability PCIe: в ней живёт `PCI_EXP_DEVSTA` с ЗАЛИПАЮЩИМИ флагами ошибок
+ * (URD/NFED/CED/FED), которые драйвер гасит при подъёме. Без неё эти флаги висят вечно, и
+ * «ошибка шины сейчас» неотличима от эха давнего сбоя. */
+#define PCI_CAP_ID_EXP          0x10
 
 /* Регистр состояния устройства PCIe (смещение внутри capability PCIe) и его биты об ошибках.
  * atl1c при подъёме сбрасывает накопленные ошибки: карта в ноутбуке живёт за мостом, и

@@ -87,7 +87,8 @@ static struct pci_dev g_pdev = {
  * первую секунду и встал, вместе с передачей; отличить «кадр не ушёл на провод» от «ушёл, но
  * ответа нет» иначе нечем, а это два совершенно разных поиска.
  */
-#define AT_R32(off) (*(volatile u32 *)(ATL1C_BAR0_VA + (off)))
+#define AT_R32(off)     (*(volatile u32 *)(ATL1C_BAR0_VA + (off)))
+#define AT_W32(off, v)  (*(volatile u32 *)(ATL1C_BAR0_VA + (off)) = (v))
 
 /* Счётчики MAC идут подряд по 4 байта в порядке полей `struct atl1c_hw_stats`. Читаем диапазон
  * ЦЕЛИКОМ, а не выборочно: чтение их обнуляет, и пропущенный регистр молча копился бы до
@@ -137,10 +138,25 @@ static void atl1c_diag(void)
 	 *
 	 * ISR здесь ЧИТАЕТСЯ, а не пишется: чтение его не сбрасывает (`MASTER_CTRL_INT_RDCLR`
 	 * снят в `atl1c_configure_mac`), так что обработчику мы ничего не портим. */
-	printk("[atl1c] причины %08x, маска %08x, свободных буферов до %u, простой %08x\n",
-	       (unsigned)AT_R32(REG_ISR), (unsigned)AT_R32(REG_IMR),
-	       (unsigned)(AT_R32(REG_MB_RFD0_PROD_IDX) & 0xffff),
-	       (unsigned)AT_R32(REG_IDLE_STATUS));
+	{
+		u32 isr = AT_R32(REG_ISR);
+
+		printk("[atl1c] причины %08x, маска %08x, свободных буферов до %u, простой %08x\n",
+		       (unsigned)isr, (unsigned)AT_R32(REG_IMR),
+		       (unsigned)(AT_R32(REG_MB_RFD0_PROD_IDX) & 0xffff),
+		       (unsigned)AT_R32(REG_IDLE_STATUS));
+		/* Веха 199.16 — ГАСИМ БИТЫ ОШИБОК, чтобы следующий срез показал СВЕЖИЕ.
+		 *
+		 * Драйвер их не гасит никогда: он сбрасывает только то, что есть в его маске, а ошибки
+		 * шины (UR/NFERR/CERR) туда не входят — ими в Linux занимается AER. Из-за этого
+		 * `причины 03700001` висели неизменными от загрузки до загрузки и выглядели уликой,
+		 * хотя могли быть отпечатком одного давнего сбоя. Гасим только их и только здесь:
+		 * обработчику драйвера эти биты не нужны, а нам важно отличить «идёт сейчас» от
+		 * «случилось когда-то». */
+		if (isr & (ISR_UR_DETECTED | ISR_FERR_DETECTED | ISR_NFERR_DETECTED | ISR_CERR_DETECTED))
+			AT_W32(REG_ISR, isr & (ISR_UR_DETECTED | ISR_FERR_DETECTED |
+					       ISR_NFERR_DETECTED | ISR_CERR_DETECTED));
+	}
 }
 
 /* ─── Веха 199.11 — ПРИВЕСТИ КОНФИГ PCI В ЧУВСТВО ────────────────────────────────────────────
