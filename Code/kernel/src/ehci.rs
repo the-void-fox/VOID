@@ -156,7 +156,9 @@ pub struct Ehci {
     int_buf: usize,   // её буфер (восьмибайтные отчёты клавиатуры)
     next_addr: u8,    // какой адрес выдадим следующему устройству
     kbd: Option<Dev>, // клавиатура, если нашлась
-    kbd_toggle: u32,  // бит переключения данных прерывающей передачи
+    kbd_toggle: u32,
+    /// Веха 199.31 — когда последний раз говорили про молчащий опрос (нс аптайма).
+    kbd_said: u64,  // бит переключения данных прерывающей передачи
     prev: [u8; 6],    // прошлый набор нажатых клавиш
 }
 unsafe impl Send for Ehci {}
@@ -366,6 +368,7 @@ fn init_one(base: usize, bdf: u16) -> bool {
             next_addr: 1,
             kbd: None,
             kbd_toggle: 0,
+            kbd_said: 0,
             prev: [0; 6],
         };
 
@@ -812,9 +815,14 @@ impl Ehci {
     unsafe fn setup_interrupt(&mut self, dev: &Dev, ep: u32, mps: u32) {
         let qh = self.int_qh;
         write_volatile(dm(qh), LINK_TERM);
+        // Веха 199.31 — `NakCnt Reload` (биты 28..31) для ПЕРИОДИЧЕСКОГО эндпоинта обязан быть
+        // НУЛЁМ: спецификация EHCI (таблица 3-19) говорит это прямо, потому что счётчик NAK
+        // осмыслен только для асинхронных передач. Мы копировали сюда тройку из управляющей
+        // очереди — то есть просили контроллер вести на прерывающем эндпоинте учёт, которого у
+        // него там нет.
         write_volatile(
             dm(qh).add(1),
-            (dev.addr as u32) | (ep << 8) | (dev.speed << 12) | (mps << 16) | (3 << 28),
+            (dev.addr as u32) | (ep << 8) | (dev.speed << 12) | (mps << 16),
         );
         // S-mask: в каком микрокадре начинать (первый), C-mask: где забирать ответ у хаба —
         // для медленного устройства обязателен, иначе раздельная транзакция не завершится.
@@ -832,6 +840,15 @@ impl Ehci {
         for i in 0..FRAMES {
             write_volatile(dm(self.frames).add(i), qh as u32 | LINK_QH);
         }
+        crate::println!(
+            "  [usb]  EHCI: опрос клавиатуры: скорость {}, пакет {}, эндпоинт {}, хаб {}:{}",
+            match dev.speed {
+                EPS_LOW => "низкая",
+                EPS_FULL => "полная",
+                _ => "высокая",
+            },
+            mps, ep, dev.hub_addr, dev.hub_port,
+        );
         self.kbd_toggle = 0;
         self.queue_report();
     }
@@ -867,12 +884,39 @@ impl Ehci {
         }
         let token = read_volatile(dm(self.int_td).add(2));
         if token & TD_ACTIVE != 0 {
+            // Веха 199.31 — ЗАВИСШИЙ ОПРОС НАЗЫВАЕТ СЕБЯ. Клавиатура владельца нашлась, а
+            // нажатия не приходят, и отсюда не видно почему: дескриптор либо всё ещё
+            // выполняется (контроллер не дошёл до него — расписание, бюджет микрокадров), либо
+            // выполняется вечно (устройство не отвечает на раздельную транзакцию). Ждём
+            // терпеливо, но раз в десять секунд говорим, чем заняты.
+            let now = crate::clock::uptime_ns();
+            if now > self.kbd_said + 10_000_000_000 {
+                self.kbd_said = now;
+                crate::println!(
+                    "  [usb]  EHCI: отчёта от клавиатуры нет, дескриптор ещё выполняется                      (токен {:#010x})",
+                    token,
+                );
+            }
             return; // ещё выполняется
         }
         if token & TD_ERRORS == 0 {
             let r = core::slice::from_raw_parts(frame::ptr(self.int_buf), 8);
             crate::usb_hid::report(&mut self.prev, r);
             self.kbd_toggle ^= 1;
+        } else {
+            // Ошибка обмена с клавиатурой. Молчать нельзя: отчёты просто не идут, а причина —
+            // в этих битах (`Halted` — устройство ответило отказом, `ошибка транзакции` — не
+            // сложилась раздельная передача через хаб).
+            let now = crate::clock::uptime_ns();
+            if now > self.kbd_said + 10_000_000_000 {
+                self.kbd_said = now;
+                crate::println!(
+                    "  [usb]  EHCI: обмен с клавиатурой отвергнут (токен {:#010x}{}{})",
+                    token,
+                    if token & (1 << 6) != 0 { ", очередь остановлена" } else { "" },
+                    if token & (1 << 3) != 0 { ", ошибка транзакции" } else { "" },
+                );
+            }
         }
         self.queue_report();
     }
