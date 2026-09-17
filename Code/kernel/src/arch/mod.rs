@@ -131,6 +131,9 @@ pub use imp::{enable_power_button, touchpad_tune};
 /// Веха 199 — EHCI: поиск контроллера и доступ к его конфигурации PCI.
 #[cfg(target_arch = "x86_64")]
 pub use imp::{pci_bdf_by_bar, pci_cfg_read32, pci_cfg_write32, probe_ehci};
+/// Веха 200 — заглянуть в регистр устройства по физическому адресу (`SYS_HWPROBE`).
+#[cfg(target_arch = "x86_64")]
+pub use imp::{hw_read32, hw_write32};
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).

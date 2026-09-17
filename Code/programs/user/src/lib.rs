@@ -144,6 +144,8 @@ const SYS_SYSINFO: usize = 63;
 /// 65, а не 64: под 64 уже живёт `SYS_NETDEV` (он объявлен в `void-libc`, а не здесь, и найти
 /// его глазами в этом списке нельзя — номера у нас в двух местах).
 const SYS_PCI_CFG: usize = 65;
+/// Веха 200 — заглянуть в регистр устройства (окно MMIO или конфигурация PCI) по праву `hwprobe`.
+const SYS_HWPROBE: usize = 66;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -1474,6 +1476,36 @@ pub fn pci_cfg_read(mmio_cap: usize, off: usize) -> usize {
 /// `SYS_PCI_CFG` на запись. 0 — записано, `MAX` — отказ.
 pub fn pci_cfg_write(mmio_cap: usize, off: usize, val: u32) -> usize {
     abi::syscall(SYS_PCI_CFG, mmio_cap, off, val as usize, 1, 0, 0, 0).0
+}
+
+/// Веха 200 — прочитать слово регистра устройства по ФИЗИЧЕСКОМУ адресу (окно MMIO).
+///
+/// Нужно право `hwprobe` с `READ`. `None` — права нет, адрес не выровнен или принадлежит
+/// оперативной памяти: последнее ядро запрещает нарочно, иначе это право означало бы «читать
+/// чужие процессы».
+pub fn hw_read(hw_cap: usize, pa: usize) -> Option<u32> {
+    let r = abi::syscall(SYS_HWPROBE, hw_cap, 0, pa, 0, 0, 0, 0).0;
+    (r != NO_CAP).then_some(r as u32)
+}
+
+/// Записать слово в регистр устройства. Нужен `WRITE`. `false` — отказ.
+pub fn hw_write(hw_cap: usize, pa: usize, val: u32) -> bool {
+    abi::syscall(SYS_HWPROBE, hw_cap, 0, pa, 0, val as usize, 1, 0).0 == 0
+}
+
+/// Слово конфигурационного пространства PCI ЛЮБОГО устройства: `bdf` = `шина<<8 | устр<<3 | функция`.
+///
+/// Отличается от [`pci_cfg_read`] тем, что не требует права на окно регистров этого устройства:
+/// здесь право общее (`hwprobe`) и потому опасное — им можно смотреть всю шину. Для отладки это
+/// и нужно: чаще всего неизвестно как раз то устройство, к которому прав нет.
+pub fn hw_pci_read(hw_cap: usize, bdf: u16, off: usize) -> Option<u32> {
+    let r = abi::syscall(SYS_HWPROBE, hw_cap, 1, bdf as usize, off, 0, 0, 0).0;
+    (r != NO_CAP).then_some(r as u32)
+}
+
+/// Записать слово в конфигурацию PCI. Нужен `WRITE`. `false` — отказ.
+pub fn hw_pci_write(hw_cap: usize, bdf: u16, off: usize, val: u32) -> bool {
+    abi::syscall(SYS_HWPROBE, hw_cap, 1, bdf as usize, off, val as usize, 1, 0).0 == 0
 }
 
 /// `SYS_NET_RECV`: принять один кадр в `buf` (неблокирующе, опрос). Возвращает число байт

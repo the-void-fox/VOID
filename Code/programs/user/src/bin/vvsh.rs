@@ -1059,6 +1059,9 @@ fn shell_env() -> Env {
         ("switch", sh_switch),
         ("klog", sh_klog),
         ("send", sh_send),
+        // Веха 200 — заглянуть в регистры железа (см. `sh_mmio`/`sh_pci`).
+        ("mmio", sh_mmio),
+        ("pci", sh_pci),
         ("poweroff", sh_poweroff),
         ("reboot", sh_reboot),
         ("store-probe", sh_store_probe),
@@ -1365,6 +1368,9 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
         b"send IP P",
         "отправить по TCP. Там: nc -l P </dev/null > файл — иначе nc не выйдет сам",
     );
+    // Веха 200 — отладка железа на живой машине, без пересборки.
+    help_row(b"mmio A [V]", "слово регистра устройства по физ-адресу (со V — записать)");
+    help_row(b"pci B:D.F O [V]", "слово конфигурации PCI (адрес — как в описи шины)");
     help_row(b"poweroff", "выключить машину");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
@@ -2290,6 +2296,123 @@ fn sh_send(args: &[Value]) -> Result<Value, EvalError> {
             sent,
         ))),
         Err(st) => Err(net_err("send", st)),
+    }
+}
+
+// ── Веха 200 — ЗАГЛЯНУТЬ В ЖЕЛЕЗО ──────────────────────────────────────────────────────────
+//
+// Зачем это в шелле. Фаза драйверов (Вехи 191–199) шла циклами «пересобрал → записал на флешку →
+// загрузился → отправил журнал», и раз за разом выяснялось, что не хватает ОДНОГО ЧИСЛА из
+// регистра: предел кадра у сетевой карты, состояние порта у контроллера USB, флаги ошибок шины.
+// Каждое такое число стоило круга — а с этими двумя командами спрашивается на живой машине
+// одной строкой.
+//
+// Право спрашиваем у композитора (как выключение и сеть): в оконном сеансе своё оно шеллу не
+// достаётся, а конфиг называет получателя строкой `desktop hwprobe bin/vvsh`.
+fn cap_hw(who: &str) -> Result<usize, EvalError> {
+    let c = sys::win::cap_or_grant(15);
+    if c == sys::NO_CAP {
+        return Err(EvalError::new(alloc::format!(
+            "{}: нет права на регистры — нужна строка `desktop hwprobe bin/vvsh` в конфиге",
+            who,
+        )));
+    }
+    Ok(c)
+}
+
+/// Разобрать число: `0x…` шестнадцатеричное, иначе десятичное. Адреса регистров человек читает
+/// из спецификаций в шестнадцатеричном виде, и требовать перевода было бы издевательством.
+fn num(v: &Value) -> Option<u64> {
+    match v {
+        Value::Int(i) => Some(*i as u64),
+        Value::Str(s) => {
+            let t = s.trim();
+            match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                Some(h) => u64::from_str_radix(h, 16).ok(),
+                None => t.parse::<u64>().ok(),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `(mmio адрес [значение])` — слово регистра устройства по физическому адресу; со вторым
+/// аргументом ЗАПИСАТЬ.
+fn sh_mmio(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(pa) = args.first().and_then(num) else {
+        return Err(EvalError::new("mmio: (mmio \"0xdfc08000\" [значение])"));
+    };
+    let hw = cap_hw("mmio")?;
+    match args.get(1).and_then(num) {
+        Some(v) => {
+            if !sys::hw_write(hw, pa as usize, v as u32) {
+                return Err(EvalError::new(
+                    "mmio: записать не удалось (нет права `w`, адрес не выровнен или это ОЗУ)",
+                ));
+            }
+            sys::write(alloc::format!("{:#x} ← {:#010x}
+", pa, v).as_bytes());
+            Ok(Value::nil())
+        }
+        None => match sys::hw_read(hw, pa as usize) {
+            Some(v) => {
+                sys::write(alloc::format!("{:#x}: {:#010x} ({})
+", pa, v, v).as_bytes());
+                // Печатаем сами: вернуть ещё и значение — напечатать его дважды.
+                Ok(Value::nil())
+            }
+            // Отказ здесь значит вполне определённое, и это стоит сказать: чаще всего человек
+            // целится в оперативную память, а её ядро закрывает нарочно.
+            None => Err(EvalError::new(
+                "mmio: прочитать не удалось — адрес не выровнен по слову либо это ОЗУ (его нельзя)",
+            )),
+        },
+    }
+}
+
+/// `(pci "шина:устройство.функция" смещение [значение])` — слово конфигурации PCI.
+fn sh_pci(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(Value::Str(loc)) = args.first() else {
+        return Err(EvalError::new("pci: (pci \"04:00.0\" \"0x04\" [значение])"));
+    };
+    // `шина:устройство.функция` — та же запись, которой устройства называет опись шины в журнале
+    // ядра. Человек копирует строку оттуда, а не считает биты.
+    let (bus, rest) = loc.split_once(':').unwrap_or(("0", loc));
+    let (dev, func) = rest.split_once('.').unwrap_or((rest, "0"));
+    let parse = |s: &str| u16::from_str_radix(s.trim(), 16).ok();
+    let (Some(b), Some(d), Some(f)) = (parse(bus), parse(dev), parse(func)) else {
+        return Err(EvalError::new("pci: адрес вида \"04:00.0\" (шестнадцатеричный)"));
+    };
+    if d > 31 || f > 7 {
+        return Err(EvalError::new("pci: устройство 0..1f, функция 0..7"));
+    }
+    let bdf = b << 8 | d << 3 | f;
+    let Some(off) = args.get(1).and_then(num) else {
+        return Err(EvalError::new("pci: (pci \"04:00.0\" \"0x04\" [значение])"));
+    };
+    let hw = cap_hw("pci")?;
+    match args.get(2).and_then(num) {
+        Some(v) => {
+            if !sys::hw_pci_write(hw, bdf, off as usize, v as u32) {
+                return Err(EvalError::new(
+                    "pci: записать не удалось (нет права `w` либо смещение не то)",
+                ));
+            }
+            sys::write(alloc::format!("{} +{:#x} ← {:#010x}
+", loc, off, v).as_bytes());
+            Ok(Value::nil())
+        }
+        None => match sys::hw_pci_read(hw, bdf, off as usize) {
+            Some(v) => {
+                sys::write(alloc::format!("{} +{:#x}: {:#010x}
+", loc, off, v).as_bytes());
+                // Печатаем сами: вернуть ещё и значение — напечатать его дважды.
+                Ok(Value::nil())
+            }
+            None => Err(EvalError::new(
+                "pci: прочитать не удалось — смещение 0..0xfc, кратное четырём",
+            )),
+        },
     }
 }
 

@@ -106,6 +106,20 @@ pub enum Target {
     /// и по умолчанию его нет ни у кого, кроме диспетчера задач. init минтит его из конфига
     /// поколения (токен `sysview`); эфемерно — не переживает перезагрузку, минтится заново.
     Sysview,
+    /// Веха 200 — **ЗАГЛЯНУТЬ В ЖЕЛЕЗО**: прочитать или записать слово регистра устройства
+    /// (`SYS_HWPROBE`). Инструмент отладки, а не часть работы системы: за фазу драйверов
+    /// (Вехи 191–199) каждый заход упирался в одно недостающее число из регистра, и стоил
+    /// пересборки, записи на флешку и перезагрузки. С этим правом число спрашивается на живой
+    /// машине одной строкой.
+    ///
+    /// `READ` — читать, `WRITE` — писать. Разделены нарочно: чтение регистра редко что-то меняет
+    /// (хотя бывают clear-on-read), а запись способна остановить устройство.
+    ///
+    /// **Чего оно НЕ даёт: читать оперативную память.** Ядро отказывает, если адрес принадлежит
+    /// RAM ([`crate::frame::is_ram`]) — иначе это право было бы «читать чужие процессы», то есть
+    /// отменяло бы изоляцию целиком. Регистры устройств в RAM не живут, так что запрет ничего не
+    /// отнимает у настоящей задачи.
+    HwProbe,
 }
 
 /// Запись в c-space: цель + права на неё.
@@ -378,6 +392,7 @@ pub fn info_kind(t: &Target) -> u8 {
         Target::Shm(_) => 11,
         Target::Irq { .. } => 12,
         Target::Sysview => 13,
+        Target::HwProbe => 15,
     }
 }
 
@@ -400,7 +415,7 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power
-        | Target::Shm(_) | Target::Sysview => return Err(CapError::WrongKind),
+        | Target::Shm(_) | Target::Sysview | Target::HwProbe => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -421,7 +436,7 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
             Target::Root(name) => name,
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
             | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-            | Target::Power | Target::Shm(_) | Target::Sysview => return Err(CapError::WrongKind),
+            | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -553,6 +568,22 @@ pub fn sysview(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
     }
     match e.target {
         Target::Sysview => Ok(()),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Веха 200 — проверить право ЗАГЛЯНУТЬ В ЖЕЛЕЗО (`SYS_HWPROBE`): `READ` — читать регистр,
+/// `WRITE` — писать. Отдельное право, а не часть `sysview`: обзор процессов и доступ к регистрам
+/// устройств — разные виды власти, и складывать их в одно означало бы, что диспетчер задач умеет
+/// останавливать контроллеры.
+pub fn hwprobe(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::HwProbe => Ok(()),
         _ => Err(CapError::WrongKind),
     }
 }
@@ -693,6 +724,7 @@ fn target_eq(a: &Target, b: &Target) -> bool {
         (Target::Shm(x), Target::Shm(y)) => x == y,
         (Target::Irq { vector: v1 }, Target::Irq { vector: v2 }) => v1 == v2,
         (Target::Sysview, Target::Sysview) => true,
+        (Target::HwProbe, Target::HwProbe) => true,
         _ => false,
     }
 }
@@ -819,7 +851,7 @@ pub fn persist() {
                         // устройств на шине, ровно как MMIO.
                         Target::Endpoint(_) | Target::Reply(_)
                         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-                        | Target::Power | Target::Shm(_) | Target::Sysview
+                        | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
                         | Target::Device(Device::NetDrv) => 0,
                     },
                     None => 0,

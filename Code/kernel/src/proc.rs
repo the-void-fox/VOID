@@ -701,6 +701,51 @@ fn cfg_pci(_base: usize, _off: usize, _val: usize, _write: usize) -> usize {
     usize::MAX // riscv-virt: конфигурационного пространства PCI у нас нет
 }
 
+/// Веха 200 — тело `SYS_HWPROBE`: заглянуть в регистр устройства.
+///
+/// `kind` 0 — окно MMIO (`a` = физический адрес), 1 — конфигурация PCI (`a` = BDF, `b` =
+/// смещение). Разделено на два вида, а не сведено к «адресу», потому что это два разных
+/// пространства: у конфигурации PCI своя адресация и свой механизм доступа.
+#[cfg(target_arch = "x86_64")]
+fn hw_probe(kind: usize, a: usize, b: usize, val: usize, write: usize) -> usize {
+    match kind {
+        0 => {
+            // ГЛАВНАЯ ПРОВЕРКА: это не оперативная память.
+            //
+            // Без неё право «заглянуть в железо» означало бы «прочитать любую страницу любого
+            // процесса», то есть отменяло бы изоляцию целиком — и отменяло бы тихо, потому что
+            // выглядит инструмент отладки безобидно. Регистры устройств в RAM не живут, так что
+            // запрет ничего не отнимает у настоящей задачи.
+            // `in_ram`, а НЕ `is_ram`: второй исключает всё ниже границы выдачи фреймов, то есть
+            // сам образ ядра — и по его мнению адрес ядерного кода «не RAM». Для этого права
+            // такой ответ был бы приглашением прочитать ядро (см. `frame::in_ram`).
+            if a % 4 != 0 || crate::frame::in_ram(a) {
+                return usize::MAX;
+            }
+            if write == 0 {
+                arch::hw_read32(a) as usize
+            } else {
+                arch::hw_write32(a, val as u32);
+                0
+            }
+        }
+        1 if b < 256 && b % 4 == 0 => {
+            if write == 0 {
+                arch::pci_cfg_read32(a as u16, b as u8) as usize
+            } else {
+                arch::pci_cfg_write32(a as u16, b as u8, val as u32);
+                0
+            }
+        }
+        _ => usize::MAX,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn hw_probe(_k: usize, _a: usize, _b: usize, _v: usize, _w: usize) -> usize {
+    usize::MAX // riscv-virt: ни конфигурации PCI, ни привычных окон регистров
+}
+
 fn wake_netdev_owner(t: &mut Table) -> Option<usize> {
     let pid = crate::net::ext_owner()?;
     let mut woken = None;
@@ -4438,6 +4483,36 @@ fn syscall(t: &mut Table, cur: usize) {
             let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::READ) {
                 Ok((base, _len)) if off < 256 && off % 4 == 0 => cfg_pci(base, off, val, write),
                 _ => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_HWPROBE(hw_cap, kind, a, b, value, write) -> слово | MAX (Веха 200): прочитать или
+        // записать регистр устройства — окно MMIO (kind 0) либо конфигурацию PCI (kind 1).
+        //
+        // Зачем это в системе. Фаза драйверов (Вехи 191–199) шла циклами «пересобрал → записал
+        // на флешку → загрузился → отправил журнал», и раз за разом выяснялось, что не хватает
+        // ОДНОГО ЧИСЛА из регистра. Каждое такое число стоило круга. С этим вызовом оно
+        // спрашивается на живой машине одной строкой в шелле.
+        //
+        // Право отдельное (`hwprobe`), а не часть `sysview`: обзор процессов и доступ к
+        // регистрам устройств — разные виды власти, и складывать их значило бы, что диспетчер
+        // задач умеет останавливать контроллеры. `READ` и `WRITE` тоже разделены: чтение
+        // регистра редко что-то меняет, запись способна остановить устройство.
+        66 => {
+            let (hcap, kind, a, b, val, write) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4), f.arg(5))
+            };
+            let dom = t.procs[cur].domain;
+            let need = if write == 0 { Rights::READ } else { Rights::WRITE };
+            let result = match cap::hwprobe(dom, Cap::from_bits(hcap as u64), need) {
+                Ok(()) => hw_probe(kind, a, b, val, write),
+                Err(e) => {
+                    vprintln!("  [hw] P{} SYS_HWPROBE отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);

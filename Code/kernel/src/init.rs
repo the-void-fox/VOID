@@ -116,7 +116,7 @@ const DEFAULT_GEN4: &str = "\
 # под выключатель сети). `!` — чтобы канал не достался каждому окну наследством.
 service posixfs store:rw
 service net-srv dev:net:rw
-shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! env
+shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! hwprobe:rwg! env
 desktop sysview taskmgr
 desktop sysview bar
 desktop power bar
@@ -127,6 +127,11 @@ desktop net taskmgr
 # брал позиционное, и по той позиции в оконном сеансе лежит чужое право. Снаружи это выглядело
 # как «сеть не отвечает», и увело поиск в карту, провод и роутер.
 desktop net bin/vvsh
+# Веха 200 — ЗАГЛЯНУТЬ В ЖЕЛЕЗО (`mmio`, `pci` в шелле). Инструмент отладки драйверов: за фазу
+# 191–199 каждый заход на живой машине упирался в одно недостающее число из регистра и стоил
+# пересборки с перезагрузкой. Право названо вслух и снимается удалением этой строки; памяти
+# процессов через него не видно — ядро отказывает на адресах RAM.
+desktop hwprobe bin/vvsh
 # Веха 167 — ЧЕМ ОТКРЫВАТЬ: программы по умолчанию. Их спрашивает файловый менеджер («открыть
 # в терминале»), спросит и всякий следующий, кому понадобится чужая программа. Роли, которой
 # здесь нет, нет вовсе: спросивший честно скажет об этом, а не подставит своё мнение молча.
@@ -225,6 +230,16 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
     } else if let Some(r) = token.strip_prefix("sysview:") {
         // `sysview:rw` — обзор ПЛЮС управление (отзыв чужих прав на ходу, рубильник сети).
         Some(cap::mint(dom, cap::Target::Sysview, parse_rights(r)).bits() as usize)
+    } else if token == "hwprobe" || token.starts_with("hwprobe:") {
+        // Веха 200 — право ЗАГЛЯНУТЬ В ЖЕЛЕЗО: прочитать (`r`) или записать (`w`) слово регистра
+        // устройства. Инструмент отладки: за фазу драйверов каждый заход упирался в одно
+        // недостающее число из регистра и стоил пересборки с перезагрузкой.
+        //
+        // Названо правом, а не общедоступной командой, по той же причине, что выключение: это
+        // власть над машиной помимо её обычной работы. Оперативную память через него не
+        // прочитать — ядро отказывает, если адрес принадлежит RAM.
+        let r = token.strip_prefix("hwprobe:").map_or(Rights::READ, parse_rights);
+        Some(cap::mint(dom, cap::Target::HwProbe, r).bits() as usize)
     } else if token == "dma" {
         // Веха 51 — право выделять DMA-память (userspace-драйверу под кольца/буферы).
         Some(cap::mint(dom, cap::Target::Dma, Rights::WRITE).bits() as usize)
@@ -475,6 +490,8 @@ fn cap_name(token: &str) -> alloc::string::String {
         "power"
     } else if token == "sysview" || token.starts_with("sysview:") {
         "sysview"
+    } else if token == "hwprobe" || token.starts_with("hwprobe:") {
+        "hwprobe"
     } else {
         ""
     };
