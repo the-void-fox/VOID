@@ -178,6 +178,7 @@ pub fn init() -> bool {
     };
     crate::println!("  [usb]  xHCI: контроллер {:#x} — поднимаю", base);
     unsafe {
+        say_protocols(base); // Веха 199.28 — какие порты USB 2, какие USB 3 (см. выше)
         let took = bios_handoff(base);
         let caplen = (rd(base + CAP_CAPLENGTH) & 0xff) as usize;
         let op = base + caplen;
@@ -391,6 +392,45 @@ unsafe fn legsup_offset(base: usize) -> Option<usize> {
         off += next;
     }
     None
+}
+
+/// Веха 199.28 — ЧТО ЗА ПОРТЫ У КОНТРОЛЛЕРА.
+///
+/// У xHCI один физический разъём представлен ДВУМЯ портами — отдельно USB 2.0 и отдельно
+/// USB 3.x, — и какой номер какому протоколу принадлежит, контроллер объявляет сам: расширением
+/// `Supported Protocol` (ID 2) в своих возможностях. Там для каждого протокола названы старший
+/// номер порта и сколько портов подряд ему отдано.
+///
+/// Без этого «порт 3 не включился после сброса» неразрешимо в принципе: сброс SuperSpeed-порта,
+/// к которому подключено устройство USB 2.0, не поднимет его никогда, а выглядит это точно так
+/// же, как неисправность. На машине владельца на порту 3 сидит устройство со скоростью
+/// High-Speed — и первое, что нужно знать, это USB 2.0-порт или USB 3.0.
+unsafe fn say_protocols(base: usize) {
+    let mut off = ((rd(base + CAP_HCCPARAMS1) >> 16) & 0xffff) as usize * 4;
+    if off == 0 {
+        crate::println!("  [usb]  xHCI: расширений нет — протоколы портов неизвестны");
+        return;
+    }
+    for _ in 0..64 {
+        let cap = rd(base + off);
+        if cap & 0xff == 2 {
+            // Слово 2 расширения: младший порт [7:0], сколько портов [15:8].
+            let w2 = rd(base + off + 8);
+            let first = w2 & 0xff;
+            let count = (w2 >> 8) & 0xff;
+            let major = (cap >> 24) & 0xff;
+            let minor = (cap >> 16) & 0xff;
+            crate::println!(
+                "  [usb]  xHCI: USB {}.{} — порты {}..{}",
+                major, minor, first, first + count - 1,
+            );
+        }
+        let next = ((cap >> 8) & 0xff) as usize * 4;
+        if next == 0 {
+            return;
+        }
+        off += next;
+    }
 }
 
 const OS_OWNED: u32 = 1 << 24;

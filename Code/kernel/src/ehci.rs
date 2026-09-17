@@ -293,11 +293,24 @@ fn init_one(base: usize, bdf: u16) -> bool {
             }
         }
         wr(op + OP_USBCMD, CMD_RESET);
+        let mut reset_done = false;
         for _ in 0..1_000_000 {
             if rd(op + OP_USBCMD) & CMD_RESET == 0 {
+                reset_done = true;
                 break;
             }
         }
+        // Веха 199.28 — сброс не завершился, значит всё дальнейшее пишется в контроллер, который
+        // ещё сбрасывается: регистры не примутся, а выглядеть это будет как «железо странное».
+        // Возможности печатаем рядом: бит 0 `HCCPARAMS` говорит, 64-битный ли он адресами (тогда
+        // `CTRLDSSEGMENT` обязателен — мы его нулим), а старшие биты — где искать расширения.
+        if !reset_done {
+            crate::println!("  [usb]  EHCI: сброс контроллера не завершился");
+        }
+        crate::println!(
+            "  [usb]  EHCI: окно {:#x}+{:#x}, портов {}, возможности {:#010x}",
+            base, caplen, ports, rd(base + CAP_HCCPARAMS),
+        );
 
         let (Some(qh), Some(td), Some(buf)) = (frame::alloc(), frame::alloc(), frame::alloc())
         else {
@@ -339,8 +352,26 @@ fn init_one(base: usize, bdf: u16) -> bool {
         wr(op + OP_FRINDEX, 0);
         wr(op + OP_PERIODICLIST, frames as u32);
         wr(op + OP_ASYNCLIST, qh as u32);
-        wr(op + OP_USBCMD, CMD_RUN | CMD_ASYNC_EN | CMD_PERIODIC_EN | (8 << 16));
+        // Веха 199.28 — ПРОЧИТАТЬ НАПИСАННОЕ. Контроллер владельца стартует и тут же встаёт с
+        // `Host System Error`, то есть обращается к памяти и получает отказ. Первое, что стоит
+        // проверить в таком случае, — дошли ли до него адреса вообще: регистры расписаний
+        // принимаются только вне сброса, и контроллер, оставшийся в сбросе, отвечает нулями. А
+        // нуль в `ASYNCLISTADDR` значит, что он пойдёт за очередью по нулевому адресу — и
+        // получит ровно ту ошибку, которую мы видим.
+        //
+        // Порядок тоже поправлен: `CONFIGFLAG` теперь ДО запуска. Спецификация не настаивает,
+        // но смысл флага — «порты мои, а не спутников», и объявлять это после того, как
+        // контроллер уже пошёл по расписаниям, поздно по существу.
         wr(op + OP_CONFIGFLAG, 1); // порты — нам, а не спутникам (UHCI/OHCI)
+        let al = rd(op + OP_ASYNCLIST);
+        let pl = rd(op + OP_PERIODICLIST);
+        if al != qh as u32 || pl != frames as u32 {
+            crate::println!(
+                "  [usb]  EHCI: контроллер не принял адреса расписаний (кольцо {:#x}, ждали {:#x};                 кадры {:#x}, ждали {:#x}) — он всё ещё в сбросе?",
+                al, qh, pl, frames,
+            );
+        }
+        wr(op + OP_USBCMD, CMD_RUN | CMD_ASYNC_EN | CMD_PERIODIC_EN | (8 << 16));
         let mut started = false;
         for _ in 0..1_000_000 {
             if rd(op + OP_USBSTS) & STS_HALTED == 0 {
