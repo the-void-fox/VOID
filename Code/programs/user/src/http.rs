@@ -347,7 +347,7 @@ fn once(
         _ => "не удалось соединиться",
     })?;
     let r = request(net_ep, store_cap, h, u, root, sink);
-    net_cli::tcp_close(net_ep, h);
+    let _ = net_cli::tcp_close(net_ep, h); // Веха 199.21 — ответ теперь с причиной
     r
 }
 

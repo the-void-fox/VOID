@@ -143,7 +143,7 @@ fn run(url: &[u8], root: &[u8], quiet: bool) -> Result<(usize, usize, [u8; 32]),
         let mut conn = new_connection(host_str)?;
         let h = net_cli::tcp_connect(net_ep, ip, port).map_err(|_| "не удалось соединиться")?;
         let r = session(&mut conn, net_ep, store_cap, h, &host, &path, root);
-        net_cli::tcp_close(net_ep, h);
+        let _ = net_cli::tcp_close(net_ep, h); // Веха 199.21 — ответ теперь с причиной
 
         match r? {
             Step::Done(bytes, chunks, id) => return Ok((bytes, chunks, id)),

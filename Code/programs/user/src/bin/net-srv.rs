@@ -1011,8 +1011,29 @@ fn op_close(
     }
     conns[i].closing = true;
     conns[i].hold_len = 0;
-    sockets.get_mut::<tcp::Socket>(handles[i]).close();
-    reply_status(reply_cap, ST_OK);
+    let s = sockets.get_mut::<tcp::Socket>(handles[i]);
+    s.close();
+    // Веха 199.21 — ЖДЁМ НАСТОЯЩЕГО ЗАКРЫТИЯ, а не отвечаем «готово» сразу.
+    //
+    // `close()` лишь ставит FIN в очередь ПОСЛЕ данных, которые ещё лежат в буфере передачи. А
+    // мы отвечали успехом немедленно — и шелл честно печатал «отправлено 14834 байт», имея в
+    // виду «столько байт принял буфер». Владелец при этом получал на другой машине ПУСТОЙ файл:
+    // `nc` копит принятое и сбрасывает на диск по концу потока, а конца он не видел, пока наш
+    // FIN не доехал.
+    //
+    // Закрытие — единственная точка, где можно сказать правду о доставке: сокет уходит в
+    // `Closed`, только когда данные подтверждены и FIN подтверждён. Поэтому ответ ОТКЛАДЫВАЕМ
+    // (механизм уже есть — тот же, что у чтения) и отвечаем по факту.
+    if s.state() == tcp::State::Closed {
+        conns[i] = Conn::EMPTY;
+        return reply_status(reply_cap, ST_OK);
+    }
+    conns[i].pending = Some(Pending {
+        op: OP_TCP_CLOSE,
+        reply_cap,
+        deadline: sys::net_phy::now() + Duration::from_millis(RECV_MS),
+        want: 0,
+    });
 }
 
 /// Раздать ответы отложенным запросам, чьи сокеты дошли до нужного состояния, и прибрать
@@ -1076,6 +1097,33 @@ fn complete_pending(
                     }
                     None => false,
                 },
+                // Веха 199.21 — закрытие ждёт ФАКТА ДОСТАВКИ, а не полного упокоения сокета.
+                //
+                // Сперва здесь стояло ожидание `Closed` — и оно не наступало никогда: по TCP
+                // сторона, закрывшая соединение ПЕРВОЙ, обязана отсидеть `TIME_WAIT` (у smoltcp
+                // это секунды), и «доставка под вопросом» печаталась на совершенно исправной
+                // отправке. Правильный признак другой и точный: **очередь передачи пуста**
+                // (значит всё подтверждено другой стороной) **и наш FIN уже подтверждён** —
+                // а это в точности состояния за `FinWait1`.
+                OP_TCP_CLOSE => {
+                    let delivered = s.send_queue() == 0
+                        && matches!(
+                            state,
+                            tcp::State::FinWait2 | tcp::State::TimeWait | tcp::State::Closed
+                        );
+                    if delivered {
+                        reply_status(p.reply_cap, ST_OK);
+                        true
+                    } else if now > p.deadline {
+                        // Не дождались — сказать правду. `abort` здесь нужен: сокет иначе
+                        // останется висеть с неотданными байтами и займёт слот навсегда.
+                        s.abort();
+                        reply_status(p.reply_cap, ST_TIMEOUT);
+                        true
+                    } else {
+                        false
+                    }
+                }
                 _ => true, // такого быть не может; не держать клиента
             };
             if done {
@@ -1084,7 +1132,14 @@ fn complete_pending(
         }
 
         // Слот отпускаем ТОЛЬКО после закрытия по просьбе клиента (см. `Conn::closing`).
-        if conns[i].closing && conns[i].pending.is_none() && state == tcp::State::Closed {
+        //
+        // Веха 199.21 — и `TimeWait` считается: данные там уже подтверждены, сокет лишь
+        // выдерживает срок. Держать за ним слот до `Closed` значило бы занимать один из четырёх
+        // на секунды после каждой отправки — а `send` журнала человек делает подряд.
+        if conns[i].closing
+            && conns[i].pending.is_none()
+            && matches!(state, tcp::State::Closed | tcp::State::TimeWait)
+        {
             conns[i] = Conn::EMPTY;
         }
     }

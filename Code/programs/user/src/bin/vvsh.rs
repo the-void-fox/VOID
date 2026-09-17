@@ -1811,10 +1811,14 @@ fn sh_tcp_close(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Int(h)) => *h,
         _ => return Err(EvalError::new("tcp-close: (tcp-close хэндл)")),
     };
-    if sys::net_cli::tcp_close(net_ep("tcp-close")?, h as u8) {
-        Ok(Value::nil())
-    } else {
-        Err(EvalError::new("tcp-close: негодный хэндл"))
+    match sys::net_cli::tcp_close(net_ep("tcp-close")?, h as u8) {
+        Ok(()) => Ok(Value::nil()),
+        // Веха 199.21 — закрытие ждёт подтверждения, поэтому отказы теперь разные: негодный
+        // хэндл это одно, а «данные могли не доехать» — совсем другое.
+        Err(st) if st == sys::net_cli::ST_TIMEOUT => Err(EvalError::new(
+            "tcp-close: закрытие не подтвердилось — данные могли не доехать",
+        )),
+        Err(_) => Err(EvalError::new("tcp-close: негодный хэндл")),
     }
 }
 
@@ -2244,9 +2248,26 @@ fn sh_send(args: &[Value]) -> Result<Value, EvalError> {
             }
         }
     }
-    let _ = sys::net_cli::tcp_close(ep, h);
-    sys::write(tf("отправлено: {} байт\n", &[&alloc::format!("{}", sent)]).as_bytes());
-    Ok(Value::nil())
+    // Веха 199.21 — «отправлено» говорим ТОЛЬКО ПОСЛЕ закрытия, и не раньше.
+    //
+    // Раньше эта строка печаталась сразу за последним `tcp_send`, то есть сообщала, сколько
+    // байт принял БУФЕР, и выглядела как отчёт о доставке. Владелец получал «отправлено 14834
+    // байт» и пустой файл на другой машине: `nc` копит принятое и сбрасывает по концу потока, а
+    // конца не было, пока наш FIN не доехал. Теперь закрытие ждёт подтверждения (`net-srv`
+    // отвечает по факту `Closed`), и «отправлено» значит «доставлено».
+    match sys::net_cli::tcp_close(ep, h) {
+        Ok(()) => {
+            sys::write(tf("отправлено: {} байт\n", &[&alloc::format!("{}", sent)]).as_bytes());
+            Ok(Value::nil())
+        }
+        Err(st) if st == sys::net_cli::ST_TIMEOUT => Err(EvalError::new(alloc::format!(
+            "send: {} байт отдано сети, но закрытие не подтвердилось — доставка под вопросом.\n\
+             Другая сторона могла не получить конец потока: если она копит принятое в буфере\n\
+             (`nc … > файл`), файл окажется пустым или обрезанным.",
+            sent,
+        ))),
+        Err(st) => Err(net_err("send", st)),
+    }
 }
 
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
