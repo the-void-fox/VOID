@@ -168,6 +168,24 @@ unsafe fn bios_handoff(base: usize, bdf: u16) -> bool {
         return false; // прошивка и не владела — возвращать потом будет нечего
     }
     crate::arch::pci_cfg_write32(bdf, eecp, legsup | OS_OWNED);
+    // Веха 199.27 — ЗАГЛУШИТЬ SMI ПРОШИВКИ. Этого шага здесь не было, и он оказался причиной
+    // «контроллер остановлен»: в `USBLEGCTLSTS` (следующее слово за `USBLEGSUP`) прошивка
+    // держит разрешения на системное прерывание по событиям контроллера — смене порта, останову,
+    // записи в командный регистр. Пока они стоят, КАЖДОЕ наше действие вызывает SMI, прошивка в
+    // обработчике сама лезет в контроллер (она ведь всё ещё эмулирует клавиатуру через 8042), и
+    // у железа оказывается два хозяина. Контроллер отвечает на это `Host System Error` и
+    // ОСТАНАВЛИВАЕТСЯ — ровно то, что мы увидели в журнале владельца: `USBSTS` бит 4 и `RS`,
+    // сброшенный самим контроллером.
+    //
+    // Значение запоминаем: при возврате контроллера прошивке оно понадобится обратно, иначе её
+    // эмуляция клавиатуры останется без событий, а это единственный способ ввода на машине, где
+    // наш драйвер не справился.
+    let ctl = crate::arch::pci_cfg_read32(bdf, eecp + 4);
+    LEGCTL_SAVED.store(ctl, core::sync::atomic::Ordering::Relaxed);
+    if ctl != 0 {
+        crate::arch::pci_cfg_write32(bdf, eecp + 4, 0);
+        crate::println!("  [usb]  EHCI: SMI прошивки заглушены (было {:#010x})", ctl);
+    }
     for _ in 0..100_000 {
         if crate::arch::pci_cfg_read32(bdf, eecp) & BIOS_OWNED == 0 {
             crate::println!("  [usb]  EHCI: управление отобрано у прошивки");
@@ -194,6 +212,9 @@ fn legsup_offset(base: usize, bdf: u16) -> Option<u8> {
     (cap & 0xff == 1).then_some(eecp as u8)
 }
 
+/// Веха 199.27 — `USBLEGCTLSTS` прошивки, каким он был до нас (см. [`bios_handoff`]).
+static LEGCTL_SAVED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 const OS_OWNED: u32 = 1 << 24;
 const BIOS_OWNED: u32 = 1 << 16;
 
@@ -215,6 +236,13 @@ unsafe fn release_to_bios(base: usize, op: usize, bdf: u16) {
     }
     wr(op + OP_CONFIGFLAG, 0);
     if let Some(eecp) = legsup_offset(base, bdf) {
+        // Веха 199.27 — вернуть прошивке и её SMI: без них эмуляция клавиатуры через 8042
+        // останется без событий, а на машине, где наш драйвер не справился, это единственный
+        // способ ввода. Порядок важен: сперва события, потом владение.
+        let ctl = LEGCTL_SAVED.load(core::sync::atomic::Ordering::Relaxed);
+        if ctl != 0 {
+            crate::arch::pci_cfg_write32(bdf, eecp + 4, ctl);
+        }
         let legsup = crate::arch::pci_cfg_read32(bdf, eecp);
         crate::arch::pci_cfg_write32(bdf, eecp, legsup & !OS_OWNED);
     }
@@ -313,10 +341,25 @@ fn init_one(base: usize, bdf: u16) -> bool {
         wr(op + OP_ASYNCLIST, qh as u32);
         wr(op + OP_USBCMD, CMD_RUN | CMD_ASYNC_EN | CMD_PERIODIC_EN | (8 << 16));
         wr(op + OP_CONFIGFLAG, 1); // порты — нам, а не спутникам (UHCI/OHCI)
+        let mut started = false;
         for _ in 0..1_000_000 {
             if rd(op + OP_USBSTS) & STS_HALTED == 0 {
+                started = true;
                 break;
             }
+        }
+        // Веха 199.27 — НЕ ЗАПУСТИЛСЯ, СКАЖИ. Этот цикл молча истекал, и дальше драйвер вёл
+        // себя как при рабочем контроллере: раздавал адреса, ждал дескрипторы. А контроллер
+        // стоял, и единственным следом было «устройство не ответило» — то есть вина сваливалась
+        // на устройство. `Host System Error` (бит 4) тут же называет и причину: у железа было
+        // два хозяина.
+        if !started {
+            let sts = rd(op + OP_USBSTS);
+            crate::println!(
+                "  [usb]  EHCI: контроллер НЕ ЗАПУСТИЛСЯ (состояние {:#010x}{})",
+                sts,
+                if sts & (1 << 4) != 0 { ", ошибка обращения к памяти" } else { "" },
+            );
         }
 
         // Выдержка после подачи питания: спецификация требует 100 мс, берём с запасом. Без
