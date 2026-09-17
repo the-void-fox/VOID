@@ -7,6 +7,8 @@
 //! Буферы статические: smoltcp собран без `alloc` (см. `Cargo.toml`), поэтому кадры лежат
 //! прямо в токенах, а не в куче. MTU 1500 — обычный Ethernet.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
@@ -98,7 +100,36 @@ impl phy::TxToken for TxToken {
         let mut buf = [0u8; MTU];
         let n = len.min(MTU);
         let r = f(&mut buf[..n]);
-        crate::net_send(self.dev_cap, &buf[..n]);
+        // Веха 199.10 — ОТКАЗ ЯДРА БОЛЬШЕ НЕ МОЛЧИТ. Результат `net_send` здесь отбрасывался,
+        // и это ровно та «родовая болезнь», что записана в known-gaps: кадр не ушёл, стек об
+        // этом не узнал, а снаружи это выглядит как «сеть не отвечает» — с поиском в карте,
+        // проводе и роутере, то есть где угодно, кроме места. Отказать ядро может по трём
+        // причинам (нет права, кадр не влез, очередь передачи полна), и все три стоит увидеть.
+        //
+        // Говорим о ПЕРВОМ отказе и дальше каждом 64-м: на оборванной сети `send` зовётся
+        // десятки раз в секунду, и без счёта журнал утонул бы за минуту.
+        if crate::net_send(self.dev_cap, &buf[..n]) != 0 {
+            let c = TX_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if c == 1 || c % 64 == 0 {
+                crate::write("[net-phy] ядро не приняло кадр на отправку (отказов ".as_bytes());
+                let mut d = [0u8; 20];
+                let mut i = d.len();
+                let mut v = c;
+                loop {
+                    i -= 1;
+                    d[i] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                crate::write(&d[i..]);
+                crate::write(")\n".as_bytes());
+            }
+        }
         r
     }
 }
+
+/// Сколько раз ядро отказалось принять исходящий кадр (см. [`TxToken::consume`]).
+static TX_REFUSED: AtomicUsize = AtomicUsize::new(0);
