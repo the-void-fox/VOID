@@ -1413,6 +1413,8 @@ fn ping(
 ) -> Result<usize, u8> {
     let started = sys::now();
     let deadline = sys::net_phy::now() + Duration::from_millis(RESOLVE_MS);
+    // Веха 199.12 — отметка «сколько кадров стек отдал карте ДО пинга» (см. ветку `None` ниже).
+    let tx_before = sys::net_phy::tx_stats();
 
     if pool.cur >= PING_SOCKETS {
         return Err(PING_EXHAUSTED);
@@ -1483,7 +1485,21 @@ fn ping(
         // машине печатался втрое больше настоящего — цифра выглядела правдоподобной и потому
         // никого не настораживала.
         Some(ticks) => Ok(sys::ticks_to_ns(ticks as u64) as usize / 1000),
-        None => Err(PING_NO_REPLY),
+        None => {
+            // Веха 199.12 — СКОЛЬКО КАДРОВ УШЛО ЗА ЭТОТ ПИНГ. «Нет ответа» одинаково звучит и
+            // когда запрос ушёл в сеть, и когда стек его вообще не отправил, — а искать эти две
+            // вещи надо в разных концах системы. Счётчик моста отвечает на это прямо, и только
+            // при неудаче: на работающей сети строки не будет.
+            let (calls, refused) = sys::net_phy::tx_stats();
+            sys::write("[net-srv] за этот пинг стек отдал карте кадров: ".as_bytes());
+            write_dec(calls.wrapping_sub(tx_before.0));
+            if refused != tx_before.1 {
+                sys::write(", ядро отвергло ".as_bytes());
+                write_dec(refused.wrapping_sub(tx_before.1));
+            }
+            sys::write("\n".as_bytes());
+            Err(PING_NO_REPLY)
+        }
     }
 }
 

@@ -100,6 +100,7 @@ impl phy::TxToken for TxToken {
         let mut buf = [0u8; MTU];
         let n = len.min(MTU);
         let r = f(&mut buf[..n]);
+        TX_CALLS.fetch_add(1, Ordering::Relaxed);
         // Веха 199.10 — ОТКАЗ ЯДРА БОЛЬШЕ НЕ МОЛЧИТ. Результат `net_send` здесь отбрасывался,
         // и это ровно та «родовая болезнь», что записана в known-gaps: кадр не ушёл, стек об
         // этом не узнал, а снаружи это выглядит как «сеть не отвечает» — с поиском в карте,
@@ -133,3 +134,14 @@ impl phy::TxToken for TxToken {
 
 /// Сколько раз ядро отказалось принять исходящий кадр (см. [`TxToken::consume`]).
 static TX_REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// Сколько раз СТЕК вообще отдал кадр устройству (Веха 199.12).
+static TX_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Веха 199.12 — «отдано устройству / из них отвергнуто ядром».
+///
+/// Нужно там, где надо отличить «стек не отправлял» от «отправил, а дальше потерялось»: ноль в
+/// счётчике драйвера значит и то, и другое, а искать эти две вещи надо в разных концах системы.
+/// Считает МОСТ, потому что он и есть граница: выше него smoltcp, ниже — ядро.
+pub fn tx_stats() -> (usize, usize) {
+    (TX_CALLS.load(Ordering::Relaxed), TX_REFUSED.load(Ordering::Relaxed))
+}

@@ -539,6 +539,12 @@ int lx_napi_run(void)
 static uintptr_t lx_netdev_cap = VOID_NO_CAP;
 static struct net_device *lx_netdev_dev;
 static unsigned long lx_rx_frames, lx_rx_lost, lx_tx_frames;
+/* Веха 199.12 — ВЗЯТО из очереди ядра и СКОЛЬКО РАЗ карта отказалась взять кадр.
+ *
+ * «Отправлено» одно не отвечает на вопрос, где рвётся передача: ноль там значит и «кадра нам не
+ * давали», и «давали, но карта его не взяла», а искать эти две вещи надо в разных местах —
+ * первую в стеке и очереди ядра, вторую в драйвере. */
+static unsigned long lx_tx_taken, lx_tx_busy;
 
 void lx_net_set_netdev_cap(uintptr_t cap) { lx_netdev_cap = cap; }
 
@@ -667,8 +673,10 @@ void lx_net_pulse(unsigned long now_jiffies)
 	slice = now_jiffies + 30 * HZ;
 	said_once = 1;
 
-	printk("lx_net: пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, отправлено %lu\n",
-	       lx_isr_calls, lx_isr_handled, lx_napi_polls, lx_rx_frames, lx_tx_frames);
+	printk("lx_net: пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, взято %lu,"
+	       " отправлено %lu (отказов %lu)\n",
+	       lx_isr_calls, lx_isr_handled, lx_napi_polls, lx_rx_frames,
+	       lx_tx_taken, lx_tx_frames, lx_tx_busy);
 	/* Дальше своё слово говорит сама карта — то, чего шим знать не может (её регистры и её
 	 * собственные счётчики). Кто это печатает, решает драйвер-обёртка. */
 	if (lx_net_diag_fn)
@@ -681,6 +689,48 @@ int lx_netdev_active(void)
 	return lx_netdev_cap != VOID_NO_CAP && lx_netdev_dev != 0;
 }
 
+/* Веха 199.12 — ОТЛОЖЕННЫЙ КАДР. `NETDEV_TX_BUSY` в Linux означает «повтори позже», и повторять
+ * обязан тот, кто отдаёт. Раньше отказ драйвера здесь терялся дважды: кадр молча пропадал, а его
+ * буфер не возвращался в арену вовсе. Держим один кадр и пробуем его на следующем обороте — так
+ * же, как это делает очередь qdisc.
+ *
+ * Один, а не очередь: кадры ждут своего часа в очереди ЯДРА, и заводить вторую тут значило бы
+ * держать их в двух местах сразу. Пока отложенный не ушёл, из ядра мы не берём ничего. */
+static unsigned char lx_tx_hold[1600];
+static size_t lx_tx_hold_len;
+
+/* Отдать кадр драйверу. 1 — взял, 0 — занят (надо повторить позже). */
+static int lx_xmit_one(const unsigned char *frame, size_t n)
+{
+	const struct net_device_ops *ops = lx_netdev_dev->netdev_ops;
+	struct sk_buff *skb;
+
+	if (!ops || !ops->ndo_start_xmit)
+		return 0;
+	/* Буфер кадра берётся из АРЕНЫ DMA (`lx_skb_alloc`): карта будет читать его сама, и адрес
+	 * ей нужен физический. Кадр со стека сюда копируется — второй раз за путь, и это цена
+	 * того, что очереди живут в ядре (см. `kernel/src/net.rs`). */
+	skb = __netdev_alloc_skb(lx_netdev_dev, n, 0);
+	if (!skb) {
+		printk("lx_net: нет буфера под исходящий кадр — откладываю\n");
+		return 0;
+	}
+	memcpy(skb_put(skb, n), frame, n);
+	skb->dev = lx_netdev_dev;
+	if (ops->ndo_start_xmit(skb, lx_netdev_dev) == NETDEV_TX_OK) {
+		lx_tx_frames++;
+		if ((lx_tx_frames & 1023) == 1)
+			printk("lx_net: отправлено кадров %lu\n", lx_tx_frames);
+		return 1;
+	}
+	/* Драйвер не взял. Раньше об этом не знал никто, и кадр исчезал бесследно. */
+	lx_tx_busy++;
+	if (lx_tx_busy == 1 || (lx_tx_busy % 64) == 0)
+		printk("lx_net: карта не взяла кадр (занята) — отказов %lu\n", lx_tx_busy);
+	dev_kfree_skb(skb);
+	return 0;
+}
+
 int lx_netdev_pump(void)
 {
 	unsigned char buf[1600];
@@ -688,30 +738,25 @@ int lx_netdev_pump(void)
 
 	if (lx_netdev_cap == VOID_NO_CAP || !lx_netdev_dev)
 		return 0;
+	/* Сперва — отложенный: порядок кадров важнее скорости. */
+	if (lx_tx_hold_len) {
+		if (!lx_xmit_one(lx_tx_hold, lx_tx_hold_len))
+			return 0;
+		lx_tx_hold_len = 0;
+		sent++;
+	}
 	for (;;) {
 		size_t n = vsys_netdev_tx_pop(lx_netdev_cap, buf, sizeof(buf));
-		struct sk_buff *skb;
-		const struct net_device_ops *ops = lx_netdev_dev->netdev_ops;
 
 		if (!n)
 			break;
-		if (!ops || !ops->ndo_start_xmit)
-			break;
-		/* Буфер кадра берётся из АРЕНЫ DMA (`lx_skb_alloc`): карта будет читать его сама, и
-		 * адрес ей нужен физический. Кадр со стека сюда копируется — второй раз за путь, и
-		 * это цена того, что очереди живут в ядре (см. `kernel/src/net.rs`). */
-		skb = __netdev_alloc_skb(lx_netdev_dev, n, 0);
-		if (!skb) {
-			printk("lx_net: нет буфера под исходящий кадр — потерян\n");
+		lx_tx_taken++; /* ВЗЯЛИ из очереди; отдали ли карте — вопрос отдельный */
+		if (!lx_xmit_one(buf, n)) {
+			memcpy(lx_tx_hold, buf, n);
+			lx_tx_hold_len = n;
 			break;
 		}
-		memcpy(skb_put(skb, n), buf, n);
-		skb->dev = lx_netdev_dev;
-		if (ops->ndo_start_xmit(skb, lx_netdev_dev) == NETDEV_TX_OK)
-			lx_tx_frames++;
 		sent++;
-		if ((lx_tx_frames & 1023) == 1)
-			printk("lx_net: отправлено кадров %lu\n", lx_tx_frames);
 	}
 	return sent;
 }
