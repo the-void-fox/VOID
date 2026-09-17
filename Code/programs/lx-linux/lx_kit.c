@@ -834,17 +834,35 @@ void pci_unregister_driver(struct pci_driver *drv)
 /* Внести синтетическое устройство в шину PCI (роль перечислителя ядра). */
 int lx_pci_register_device(struct pci_dev *pdev)
 {
+	/* Веха 199.11 — сказать, ЧТО ВИДНО В ЖЕЛЕЗЕ. Строка не декоративная: она единственная
+	 * отличает настоящий конфиг PCI от прежнего массива в памяти процесса. Если идентификаторы
+	 * из шины совпали с теми, что вписал харнесс, — значит право на конфиг работает и всё
+	 * последующее (bus master, MSI, ASPM) доходит до устройства, а не до нашей памяти. */
+	u16 vid = 0, did = 0, cmd = 0;
+
+	pci_read_config_word(pdev, PCI_VENDOR_ID, &vid);
+	pci_read_config_word(pdev, PCI_DEVICE_ID, &did);
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (vid != 0xffff && vid != 0)
+		printk("lx_pci: шина отвечает %04x:%04x, команда %04x%s\n", vid, did, cmd,
+		       (vid == pdev->vendor && did == pdev->device) ? "" : " — НЕ ТО УСТРОЙСТВО");
+
 	pdev->dev.bus = &pci_bus_type;
 	return device_register(&pdev->dev);
 }
 
-/* Учётное конфиг-слово COMMAND: собираем/разбираем бит в lx_config[PCI_COMMAND]. */
+/* Веха 199.11 — конфиг-слово COMMAND теперь НАСТОЯЩЕЕ (см. `pci_read_config_word` ниже).
+ *
+ * Здесь стояла работа с `lx_config[]`, и это значило, что `pci_set_master` не включал bus master
+ * НИГДЕ, кроме памяти процесса. Карта могла ходить в память только если это уже разрешила
+ * прошивка — а «работает на одной машине и не работает на другой» выглядит как что угодно,
+ * кроме забытого бита. */
 static void lx_pci_cmd_set(struct pci_dev *pdev, u16 bits)
 {
-	u16 cmd = (u16)(pdev->lx_config[PCI_COMMAND] | (pdev->lx_config[PCI_COMMAND + 1] << 8));
-	cmd |= bits;
-	pdev->lx_config[PCI_COMMAND]     = (u8)(cmd & 0xff);
-	pdev->lx_config[PCI_COMMAND + 1] = (u8)(cmd >> 8);
+	u16 cmd = 0;
+
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	pci_write_config_word(pdev, PCI_COMMAND, (u16)(cmd | bits));
 }
 
 int pci_enable_device(struct pci_dev *dev)     { lx_pci_cmd_set(dev, PCI_COMMAND_IO | PCI_COMMAND_MEMORY); return 0; }
@@ -927,19 +945,70 @@ void pci_iounmap(struct pci_dev *dev, void __iomem *addr)
 	iounmap(addr);
 }
 
-/* ─ конфиг-пространство: little-endian чтение/запись над lx_config[] ─ */
+/* ─── конфиг-пространство PCI (Веха 199.11 — НАСТОЯЩЕЕ) ──────────────────────────────────────
+ *
+ * Здесь была память процесса: `lx_config[]`, куда писали и откуда читали. Драйвер получал назад
+ * ровно то, что записал, и считал дело сделанным — а в железе не менялось ни бита. Через это
+ * место проходит ВСЁ, чем драйвер управляет устройством помимо регистров: `pci_set_master` (без
+ * него карта не может ходить в память вовсе), MSI, ASPM, состояния питания, маскирование ошибок
+ * PCIe. Заглушка, которая не отказывает, а соглашается, — худшая из возможных: она не оставляет
+ * в журнале ни следа.
+ *
+ * Теперь чтение и запись идут в шину — через `SYS_PCI_CFG`, по тому же праву `mmio:<имя>`, по
+ * которому выдано окно регистров. Права нет (сборка-«вычислялка», харнесс без cap) — остаётся
+ * прежнее поведение над `lx_config[]`, и это честно: соврать там нечем, устройства всё равно нет.
+ *
+ * Механизм 0xCF8 читает СЛОВАМИ, поэтому байт и полуслово вырезаются из слова, а запись идёт
+ * чтением-изменением-записью. Расширенный конфиг (за 256 байт) недоступен — его дал бы только
+ * MMIO-механизм PCIe, и он ещё не нужен никому из наших драйверов.
+ */
+#ifdef LX_HAVE_SYSCALL
+static uintptr_t lx_pci_cfg_cap = VOID_NO_CAP;
+
+void lx_pci_set_cfg_cap(uintptr_t cap) { lx_pci_cfg_cap = cap; }
+
+static int lx_cfg_live(int where) { return lx_pci_cfg_cap != VOID_NO_CAP && where < 256; }
+
+static u32 lx_cfg_r32(int where)
+{
+	return vsys_pci_cfg_read(lx_pci_cfg_cap, (unsigned)(where & ~3));
+}
+
+static void lx_cfg_w32(int where, u32 v)
+{
+	vsys_pci_cfg_write(lx_pci_cfg_cap, (unsigned)(where & ~3), v);
+}
+#else
+void lx_pci_set_cfg_cap(uintptr_t cap) { (void)cap; }
+static int lx_cfg_live(int where) { (void)where; return 0; }
+static u32 lx_cfg_r32(int where) { (void)where; return 0; }
+static void lx_cfg_w32(int where, u32 v) { (void)where; (void)v; }
+#endif
+
 int pci_read_config_byte(struct pci_dev *dev, int where, u8 *val)
 {
+	if (lx_cfg_live(where)) {
+		*val = (u8)(lx_cfg_r32(where) >> ((where & 3) * 8));
+		return 0;
+	}
 	*val = dev->lx_config[where];
 	return 0;
 }
 int pci_read_config_word(struct pci_dev *dev, int where, u16 *val)
 {
+	if (lx_cfg_live(where)) {
+		*val = (u16)(lx_cfg_r32(where) >> ((where & 3) * 8));
+		return 0;
+	}
 	*val = (u16)(dev->lx_config[where] | (dev->lx_config[where + 1] << 8));
 	return 0;
 }
 int pci_read_config_dword(struct pci_dev *dev, int where, u32 *val)
 {
+	if (lx_cfg_live(where)) {
+		*val = lx_cfg_r32(where);
+		return 0;
+	}
 	*val = (u32)dev->lx_config[where]            | ((u32)dev->lx_config[where + 1] << 8) |
 	       ((u32)dev->lx_config[where + 2] << 16) | ((u32)dev->lx_config[where + 3] << 24);
 	return 0;
@@ -947,12 +1016,22 @@ int pci_read_config_dword(struct pci_dev *dev, int where, u32 *val)
 int pci_write_config_byte(struct pci_dev *dev, int where, u8 val)
 {
 	dev->lx_config[where] = val;
+	if (lx_cfg_live(where)) {
+		unsigned sh = (unsigned)(where & 3) * 8;
+
+		lx_cfg_w32(where, (lx_cfg_r32(where) & ~(0xffu << sh)) | ((u32)val << sh));
+	}
 	return 0;
 }
 int pci_write_config_word(struct pci_dev *dev, int where, u16 val)
 {
 	dev->lx_config[where]     = (u8)(val & 0xff);
 	dev->lx_config[where + 1] = (u8)(val >> 8);
+	if (lx_cfg_live(where)) {
+		unsigned sh = (unsigned)(where & 3) * 8;
+
+		lx_cfg_w32(where, (lx_cfg_r32(where) & ~(0xffffu << sh)) | ((u32)val << sh));
+	}
 	return 0;
 }
 int pci_write_config_dword(struct pci_dev *dev, int where, u32 val)
@@ -961,6 +1040,8 @@ int pci_write_config_dword(struct pci_dev *dev, int where, u32 val)
 	dev->lx_config[where + 1] = (u8)((val >> 8) & 0xff);
 	dev->lx_config[where + 2] = (u8)((val >> 16) & 0xff);
 	dev->lx_config[where + 3] = (u8)((val >> 24) & 0xff);
+	if (lx_cfg_live(where))
+		lx_cfg_w32(where, val);
 	return 0;
 }
 

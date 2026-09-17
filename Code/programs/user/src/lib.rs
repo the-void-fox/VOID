@@ -140,6 +140,10 @@ const SYS_PROC_CAPS: usize = 60;
 const SYS_PROC_STAT: usize = 61;
 const SYS_PROC_REVOKE: usize = 62;
 const SYS_SYSINFO: usize = 63;
+/// Веха 199.11 — конфигурационное пространство PCI своего устройства (по праву на его регистры).
+/// 65, а не 64: под 64 уже живёт `SYS_NETDEV` (он объявлен в `void-libc`, а не здесь, и найти
+/// его глазами в этом списке нельзя — номера у нас в двух местах).
+const SYS_PCI_CFG: usize = 65;
 
 /// «Capability отсутствует» — в аргументах и результатах IPC.
 pub const NO_CAP: usize = usize::MAX;
@@ -1433,6 +1437,18 @@ pub fn restore(exec_cap: usize, name: &[u8]) -> usize {
 /// право `WRITE`). Возвращает 0 или [`NO_CAP`]-подобный MAX при отказе.
 pub fn net_send(dev_cap: usize, frame: &[u8]) -> usize {
     abi::syscall(SYS_NET_SEND, dev_cap, frame.as_ptr() as usize, frame.len(), 0, 0, 0, 0).0
+}
+
+/// `SYS_PCI_CFG`: прочитать слово конфигурационного пространства PCI своего устройства.
+/// Право — то же `mmio:<имя>`, по которому выдано окно регистров: конфиг такая же часть
+/// устройства, как BAR. `MAX` — права нет, смещение негодное или окно не принадлежит PCI.
+pub fn pci_cfg_read(mmio_cap: usize, off: usize) -> usize {
+    abi::syscall(SYS_PCI_CFG, mmio_cap, off, 0, 0, 0, 0, 0).0
+}
+
+/// `SYS_PCI_CFG` на запись. 0 — записано, `MAX` — отказ.
+pub fn pci_cfg_write(mmio_cap: usize, off: usize, val: u32) -> usize {
+    abi::syscall(SYS_PCI_CFG, mmio_cap, off, val as usize, 1, 0, 0, 0).0
 }
 
 /// `SYS_NET_RECV`: принять один кадр в `buf` (неблокирующе, опрос). Возвращает число байт

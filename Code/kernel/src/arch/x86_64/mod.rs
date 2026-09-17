@@ -608,6 +608,11 @@ pub fn pci_cfg_write32(bdf: u16, off: u8, v: u32) {
     pci::cfg_write32(bdf, off, v)
 }
 
+/// Веха 199.11 — чьё это окно регистров (`SYS_PCI_CFG` ищет устройство по базе BAR).
+pub fn pci_bdf_by_bar(base: usize) -> Option<u16> {
+    pci::bdf_by_bar(base)
+}
+
 /// Веха 198.1 — чувствительность тачпада из конфига.
 pub fn touchpad_tune(speed: u8, scroll_mm: u8) {
     ps2::touchpad_tune(speed, scroll_mm)

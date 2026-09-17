@@ -45,6 +45,7 @@ extern void lx_net_set_dma_cap(uintptr_t cap);
 extern void lx_net_set_irq_cap(uintptr_t cap);
 extern void lx_net_set_netdev_cap(uintptr_t cap);
 extern void lx_net_set_diag(void (*fn)(void));
+extern void lx_pci_set_cfg_cap(uintptr_t cap);
 extern int  lx_netdev_open(struct net_device *dev);
 extern int  lx_netdev_attach(struct net_device *dev);
 extern int  lx_pci_register_device(struct pci_dev *pdev);
@@ -140,6 +141,57 @@ static void atl1c_diag(void)
 	       (unsigned)AT_R32(REG_ISR), (unsigned)AT_R32(REG_IMR),
 	       (unsigned)(AT_R32(REG_MB_RFD0_PROD_IDX) & 0xffff),
 	       (unsigned)AT_R32(REG_IDLE_STATUS));
+}
+
+/* ─── Веха 199.11 — ПРИВЕСТИ КОНФИГ PCI В ЧУВСТВО ────────────────────────────────────────────
+ *
+ * Мы загружаемся ТЁПЛОЙ перезагрузкой из другой системы, и конфигурационное пространство карты
+ * при этом не сбрасывается: в нём остаётся всё, что настроил прошлый хозяин. У Linux atl1c
+ * работает на MSI — значит в карте остаётся взведённым `MSI Enable`, а он по устройству шины
+ * ОТКЛЮЧАЕТ обычную линию прерывания (INTx). Наш драйвер MSI не умеет (`pci_enable_msi` честно
+ * отказывает), рассчитывает на INTx — и не получает его никогда, потому что карта продолжает
+ * слать сообщения по адресу, который назвала ей прошлая ОС.
+ *
+ * Поэтому перед подъёмом: снять `MSI Enable`, снять `INTx Disable`, включить память и bus master.
+ * И сказать вслух, что было, — «не наследуй чужих настроек» стоит одной строки в журнале.
+ */
+static void atl1c_pci_sanitize(void)
+{
+	u16 cmd = 0;
+	u8 cap;
+	int guard;
+
+	pci_read_config_word(&g_pdev, PCI_COMMAND, &cmd);
+	printk("[atl1c] конфиг PCI при входе: команда %04x%s%s%s\n", cmd,
+	       (cmd & PCI_COMMAND_MEMORY) ? ", память" : ", ПАМЯТЬ ВЫКЛ",
+	       (cmd & PCI_COMMAND_MASTER) ? ", bus master" : ", BUS MASTER ВЫКЛ",
+	       (cmd & PCI_COMMAND_INTX_DISABLE) ? ", ПРЕРЫВАНИЕ ЗАПРЕЩЕНО" : "");
+
+	/* Пройти список возможностей и погасить MSI, если прошлый хозяин его оставил. */
+	pci_read_config_byte(&g_pdev, PCI_CAPABILITY_LIST, &cap);
+	for (guard = 0; cap >= 0x40 && guard < 48; guard++) {
+		u8 id = 0, next = 0;
+
+		pci_read_config_byte(&g_pdev, cap, &id);
+		pci_read_config_byte(&g_pdev, cap + 1, &next);
+		if (id == PCI_CAP_ID_MSI) {
+			u16 ctl = 0;
+
+			pci_read_config_word(&g_pdev, cap + 2, &ctl);
+			if (ctl & PCI_MSI_FLAGS_ENABLE) {
+				pci_write_config_word(&g_pdev, cap + 2, (u16)(ctl & ~PCI_MSI_FLAGS_ENABLE));
+				printk("[atl1c] MSI остался включённым от прошлой системы — выключаю"
+				       " (иначе линия прерывания молчит)\n");
+			}
+		}
+		cap = next;
+	}
+
+	cmd &= (u16)~PCI_COMMAND_INTX_DISABLE;
+	cmd |= PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+	pci_write_config_word(&g_pdev, PCI_COMMAND, cmd);
+	pci_read_config_word(&g_pdev, PCI_COMMAND, &cmd);
+	printk("[atl1c] конфиг PCI приведён: команда %04x\n", cmd);
 }
 
 /* Задача-сторож: держит процесс живым и молча спит.
@@ -289,6 +341,11 @@ int main(void)
 	g_pdev.resource[0].start = ATL1C_BAR0_VA;
 	g_pdev.resource[0].end   = ATL1C_BAR0_VA + 0x40000 - 1;
 	g_pdev.resource[0].flags = IORESOURCE_MEM;
+
+	/* Веха 199.11 — конфиг PCI теперь НАСТОЯЩИЙ, по тому же праву, что и окно регистров.
+	 * Ставим ДО регистрации: `probe` первым делом читает оттуда ревизию и подсистему. */
+	lx_pci_set_cfg_cap(mmio_cap);
+	atl1c_pci_sanitize();
 
 	lx_pci_register_device(&g_pdev);
 	printf("[atl1c] DMA-право %s, IRQ-право %s\n",

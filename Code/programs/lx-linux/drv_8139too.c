@@ -43,6 +43,7 @@ extern void lx_net_set_netdev_cap(uintptr_t cap);
 extern int  lx_netdev_attach(struct net_device *dev);
 extern int  lx_netdev_open(struct net_device *dev);
 extern int  lx_pci_register_device(struct pci_dev *pdev);
+extern void lx_pci_set_cfg_cap(uintptr_t cap);
 extern int  lx_module_init(void);
 
 /* Устройство, как его заполнил бы перечислитель ядра. 10ec:8139 — RTL8139, то же, что отдаёт
@@ -136,6 +137,10 @@ int main(void)
 	g_pdev.resource[1].start = RTL8139_BAR1_VA;
 	g_pdev.resource[1].end   = RTL8139_BAR1_VA + RTL8139_BAR1_LEN - 1;
 	g_pdev.resource[1].flags = IORESOURCE_MEM;
+
+	/* Веха 199.11 — конфиг PCI настоящий (по праву на окно регистров). До этого `pci_set_master`
+	 * писал в массив в памяти процесса, то есть bus master включала только прошивка. */
+	lx_pci_set_cfg_cap(mmio_cap);
 
 	lx_pci_register_device(&g_pdev);
 	printf("[8139too] DMA-право %s, IRQ-право %s, право-карта %s\n",

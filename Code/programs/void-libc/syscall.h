@@ -27,6 +27,7 @@
 #define SYS_IRQ_WAIT 33
 #define SYS_SLEEP 47
 #define SYS_NETDEV 64
+#define SYS_PCI_CFG 65
 #define SYS_RANDOM 37
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
@@ -161,6 +162,24 @@ static inline uintptr_t vsys_futex_wake(const uint32_t *uaddr, uintptr_t count) 
 /* SYS_MMIO_MAP(cap, va): замапить окно регистров устройства в свой простор. 1 — успех. */
 static inline int vsys_mmio_map(uintptr_t cap, uintptr_t va) {
     return vsys(SYS_MMIO_MAP, cap, va, 0, 0, 0, 0, 0) == 0;
+}
+/* Веха 199.11 — КОНФИГУРАЦИОННОЕ ПРОСТРАНСТВО PCI своего устройства.
+ *
+ * Право — то же `mmio:<имя>`, по которому выдано окно регистров: конфиг такая же часть
+ * устройства, как BAR, и отдельное право тут означало бы лишь лишнюю строку в конфиге. Какое
+ * это устройство, ядро определяет САМО — по базе окна, которую оно и выдало; подменить его
+ * вызывающий не может.
+ *
+ * До этого шим держал свой `lx_config[]` в памяти процесса и возвращал из него записанное. То
+ * есть `pci_set_master` (без которого нет DMA), MSI, ASPM и питание — всё «срабатывало», не
+ * меняя в железе ни бита. Худший вид заглушки: она не отказывает, она соглашается.
+ *
+ * Смещение — до 256 байт, по слову. `VOID_NO_CAP` — отказ. */
+static inline uint32_t vsys_pci_cfg_read(uintptr_t cap, unsigned off) {
+    return (uint32_t)vsys(SYS_PCI_CFG, cap, off, 0, 0, 0, 0, 0);
+}
+static inline int vsys_pci_cfg_write(uintptr_t cap, unsigned off, uint32_t val) {
+    return vsys(SYS_PCI_CFG, cap, off, val, 1, 0, 0, 0) == 0;
 }
 /* SYS_DMA_ALLOC(cap, va): DMA-страница по va, возврат — её ФИЗ-адрес (VOID_NO_CAP — отказ). */
 static inline uintptr_t vsys_dma_alloc(uintptr_t cap, uintptr_t va) {

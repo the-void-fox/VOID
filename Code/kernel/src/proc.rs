@@ -679,6 +679,28 @@ pub fn on_userdrv_irq() {
 /// Ранний выход из сна безвреден по построению: шим в своём цикле заново сверяет `jiffies` и,
 /// если срок не вышел, засыпает снова. Пробуждение без кадра — тоже: драйвер просто не найдёт
 /// в очереди ничего.
+/// Веха 199.11 — тело `SYS_PCI_CFG` для машин, у которых PCI есть. На riscv-virt его нет вовсе,
+/// и отдельная функция здесь ровно затем, чтобы разница жила В ОДНОМ месте, а не `#[cfg]`-ом
+/// посреди разбора системного вызова.
+#[cfg(target_arch = "x86_64")]
+fn cfg_pci(base: usize, off: usize, val: usize, write: usize) -> usize {
+    match arch::pci_bdf_by_bar(base) {
+        Some(bdf) if write == 0 => arch::pci_cfg_read32(bdf, off as u8) as usize,
+        Some(bdf) => {
+            arch::pci_cfg_write32(bdf, off as u8, val as u32);
+            0
+        }
+        // Окно есть, а устройства с таким BAR на шине нет: право выдано не под PCI
+        // (фреймбуфер, контроллер платформы). Отказ — честный ответ, падать не за что.
+        None => usize::MAX,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cfg_pci(_base: usize, _off: usize, _val: usize, _write: usize) -> usize {
+    usize::MAX // riscv-virt: конфигурационного пространства PCI у нас нет
+}
+
 fn wake_netdev_owner(t: &mut Table) -> Option<usize> {
     let pid = crate::net::ext_owner()?;
     let mut woken = None;
@@ -4375,6 +4397,35 @@ fn syscall(t: &mut Table, cur: usize) {
                     0
                 }
                 _ => usize::MAX, // нет права Sysview READ, тесный буфер или он не наш
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_PCI_CFG(mmio_cap, off, val, write) -> слово | MAX (Веха 199.11): настоящее
+        // КОНФИГУРАЦИОННОЕ ПРОСТРАНСТВО своего устройства.
+        //
+        // Зачем. Хостируемые драйверы Linux ходят в конфиг PCI постоянно и по делу:
+        // `pci_set_master` (без него нет DMA), MSI, ASPM, управление питанием, маскирование
+        // ошибок PCIe. У нас всё это уходило в МАССИВ В ПАМЯТИ ПРОЦЕССА — шим держал свой
+        // `lx_config[]` и честно возвращал записанное, так что драйвер видел успех, а железо не
+        // менялось ни на бит. Худший вид заглушки: она не отказывает, она соглашается.
+        //
+        // Отдельного права на «конфиг PCI» нет и не нужно: `mmio:<имя>` уже означает владение
+        // устройством, а конфиг — такая же его часть, как BAR. Связь между правом и устройством
+        // даёт САМА БАЗА окна, которую ядро и выдало (`pci_bdf_by_bar`), поэтому подменить
+        // устройство вызывающий не может: он назовёт своё право, а BDF найдёт ядро.
+        //
+        // Смещение ограничено 256 байтами (механизм 0xCF8) и выравнено по слову.
+        65 => {
+            let (mcap, off, val, write) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::READ) {
+                Ok((base, _len)) if off < 256 && off % 4 == 0 => cfg_pci(base, off, val, write),
+                _ => usize::MAX,
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
