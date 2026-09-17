@@ -66,6 +66,16 @@ void lx_net_set_irq_cap(uintptr_t cap) { lx_irq_cap = cap; }
  * физической памяти на машине, где их четыре тысячи. */
 #define LX_DMA_ARENA_PAGES 512
 
+/* Веха 199.19 — возвращённые области `dma_alloc_coherent`. Колец у карты немного (кольцо
+ * дескрипторов и его спутники), поэтому восьми записей хватает с запасом. */
+#define LX_COH_MAX 8
+static struct {
+	uintptr_t va;
+	uintptr_t pa;
+	size_t    pages;
+} lx_coh[LX_COH_MAX];
+static unsigned lx_coh_n;
+
 static uintptr_t lx_arena_va;   /* начало арены в нашем пространстве */
 static uintptr_t lx_arena_pa;   /* её же физический адрес — карта ходит сюда */
 static size_t    lx_arena_size;
@@ -203,8 +213,30 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 	 * килобайт — всплыло бы сразу, порчей чужой памяти. */
 	if (lx_dma_cap != VOID_NO_CAP) {
 		size_t pages = (size + 4095) / 4096;
-		uintptr_t va = lx_dma_va_next;
-		uintptr_t pa = vsys_dma_alloc_n(lx_dma_cap, va, pages);
+		uintptr_t va;
+		uintptr_t pa;
+		unsigned i;
+
+		/* Веха 199.19 — СПЕРВА ИЗ ВОЗВРАЩЁННЫХ. Перезапуск интерфейса (`ndo_stop` + `ndo_open`,
+		 * им лечится застрявший приём — Веха 199.18) освобождает кольца и просит их заново. А
+		 * вернуть страницы ядру мы не умеем: права «отдать DMA обратно» нет, и заводить его ради
+		 * этого незачем — область той же длины нужна тому же драйверу через миг. Без
+		 * переиспользования каждый перезапуск съедал бы по сорок пять килобайт DMA навсегда,
+		 * и лечение медленно превращалось бы в новую болезнь. */
+		for (i = 0; i < lx_coh_n; i++) {
+			if (lx_coh[i].pages >= pages && lx_coh[i].va) {
+				va = lx_coh[i].va;
+				pa = lx_coh[i].pa;
+				lx_coh[i] = lx_coh[--lx_coh_n];
+				memset((void *)va, 0, size);
+				*handle = (dma_addr_t)pa;
+				printk("lx_net:   кольца легли по физ %lx (область переиспользована)\n",
+				       (unsigned long)pa);
+				return (void *)va;
+			}
+		}
+		va = lx_dma_va_next;
+		pa = vsys_dma_alloc_n(lx_dma_cap, va, pages);
 		if (pa == VOID_NO_CAP) { *handle = 0; return NULL; }
 		lx_dma_va_next += pages * 4096;
 		memset((void *)va, 0, size);
@@ -220,10 +252,25 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 }
 void dma_free_coherent(struct device *dev, size_t size, void *vaddr, dma_addr_t handle)
 {
-	(void)dev; (void)size; (void)handle;
+	(void)dev;
 #ifdef LX_HAVE_SYSCALL
-	if (lx_dma_cap != VOID_NO_CAP) return; /* DMA-страницы не возвращаем (одноразовый bring-up) */
+	if (lx_dma_cap != VOID_NO_CAP) {
+		/* Ядру страницы не возвращаем (права на это нет), но помним их за собой — следующий
+		 * `dma_alloc_coherent` той же длины заберёт эту же область (см. Веху 199.19 выше).
+		 * Не влезло в табличку — область просто теряется, и об этом говорим: молчаливая утечка
+		 * DMA кончилась бы «сеть перестала подниматься после N перезапусков». */
+		if (lx_coh_n < LX_COH_MAX) {
+			lx_coh[lx_coh_n].va = (uintptr_t)vaddr;
+			lx_coh[lx_coh_n].pa = (uintptr_t)handle;
+			lx_coh[lx_coh_n].pages = (size + 4095) / 4096;
+			lx_coh_n++;
+		} else {
+			printk("lx_net: некуда отложить область DMA (%u байт) — потеряна\n", (unsigned)size);
+		}
+		return;
+	}
 #endif
+	(void)size; (void)handle;
 	kfree(vaddr);
 }
 /* Веха 133 — адрес ДЛЯ КАРТЫ. Работает только для памяти из арены DMA; для всего прочего
