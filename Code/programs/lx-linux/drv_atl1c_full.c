@@ -234,6 +234,64 @@ static void atl1c_pci_sanitize(void)
  */
 extern unsigned long lx_net_rx_count(void);
 
+/* ─── Веха 199.23 — ГАСИМ ASPM ────────────────────────────────────────────────────────────────
+ *
+ * Почему первый подъём хуже второго — вот вероятный ответ. `atl1c_setup_mac_funcs` объявляет
+ * поддержку экономии линка БЕЗУСЛОВНО:
+ *
+ *     hw->ctrl_flags |= ATL1C_ASPM_L0S_SUPPORT | ATL1C_ASPM_L1_SUPPORT;
+ *
+ * а `atl1c_set_aspm` при каждом подъёме линка включает L0s/L1 в регистре карты. В Linux это
+ * решение не окончательное: там есть отдельная подсистема (`pcie_aspm`), которая по политике
+ * и по спискам известных карт может запретить состояния на уровне ЛИНКА — и для Atheros это
+ * делается регулярно. У нас такой подсистемы нет вовсе, и запрещать некому.
+ *
+ * Чем это похоже на нашу болезнь. В L1 линк PCIe спит, и карта, приняв кадр, обязана его
+ * разбудить, чтобы записать в память. Если пробуждение не срабатывает, движок приёма остаётся
+ * занятым (`IDLE_STATUS` = `RXQ_BUSY` — ровно то, что мы видим), кольцо не двигается, а на линке
+ * копятся исправимые ошибки (`CERR_DETECTED` — тоже ровно то, что мы видим). Передача при этом
+ * работает: её будим МЫ, записью в регистр.
+ *
+ * Гасим в двух местах, потому что включают тоже в двух: у карты (`REG_PM_CTRL`) и на линке
+ * (Link Control в конфиге PCI — стало доступно с Вехи 199.11). И повторяем в сторожевом цикле:
+ * драйвер включает ASPM заново на каждой смене линка, и спорить с ним бессмысленно — проще
+ * гасить после.
+ */
+static void atl1c_kill_aspm(int say)
+{
+	u32 pm = AT_R32(REG_PM_CTRL);
+	u32 pm_new = pm & ~(PM_CTRL_ASPM_L0S_EN | PM_CTRL_ASPM_L1_EN | PM_CTRL_MAC_ASPM_CHK);
+	u8 cap = 0;
+	u16 lnk = 0;
+	int guard, base = 0;
+
+	if (pm_new != pm)
+		AT_W32(REG_PM_CTRL, pm_new);
+
+	pci_read_config_byte(&g_pdev, PCI_CAPABILITY_LIST, &cap);
+	for (guard = 0; cap >= 0x40 && guard < 48; guard++) {
+		u8 id = 0, next = 0;
+
+		pci_read_config_byte(&g_pdev, cap, &id);
+		pci_read_config_byte(&g_pdev, cap + 1, &next);
+		if (id == PCI_CAP_ID_EXP) {
+			base = cap;
+			break;
+		}
+		cap = next;
+	}
+	if (base) {
+		pci_read_config_word(&g_pdev, base + PCI_EXP_LNKCTL, &lnk);
+		if (lnk & PCI_EXP_LNKCTL_ASPMC)
+			pci_write_config_word(&g_pdev, base + PCI_EXP_LNKCTL,
+					      (u16)(lnk & ~PCI_EXP_LNKCTL_ASPMC));
+	}
+	if (say)
+		printk("[atl1c] экономия линка: карта %s, линк %s → выключена\n",
+		       (pm & (PM_CTRL_ASPM_L0S_EN | PM_CTRL_ASPM_L1_EN)) ? "включала" : "не включала",
+		       (lnk & PCI_EXP_LNKCTL_ASPMC) ? "разрешал" : "не разрешал");
+}
+
 #define RX_WATCH_TRIES 3
 
 static void atl1c_rx_watchdog(struct net_device *ndev)
@@ -257,6 +315,7 @@ static void atl1c_rx_watchdog(struct net_device *ndev)
 	if (ndev->netdev_ops && ndev->netdev_ops->ndo_stop)
 		ndev->netdev_ops->ndo_stop(ndev);
 	if (lx_netdev_open(ndev) == 0) {
+		atl1c_kill_aspm(0); /* Веха 199.23 — `ndo_open` включил её заново */
 		printk("[atl1c] интерфейс поднят заново\n");
 		/* Счётчики карты читает срез; после перезапуска они начинают с нуля — обнулим и свою
 		 * отметку, иначе следующий заход сравнит несравнимое. */
@@ -290,8 +349,13 @@ static void atl1c_keepalive(void *arg)
 		 * пробуждений в минуту вместо одного; на фоне пятидесяти опросов карты в СЕКУНДУ это
 		 * не считается. */
 		msleep(10000); /* холостой ход планировщика спит по-настоящему (Веха 134) */
-		if (ndev)
+		if (ndev) {
+			/* Веха 199.23 — молча, без строки: драйвер включает экономию линка на каждой
+			 * смене линка, и печатать об этом каждые десять секунд значило бы утопить
+			 * журнал в починке, которая уже стала рутиной. */
+			atl1c_kill_aspm(0);
 			atl1c_rx_watchdog(ndev);
+		}
 	}
 }
 
@@ -383,6 +447,11 @@ static void atl1c_bringup(void *arg)
 		 * в QEMU (`ping` через неизменённый `8139too`); на живом AR8151 путь тот же, но на
 		 * железе владельца ещё не гонялся — об этом сказано в заметке вехи, а не умолчано. */
 		lx_netdev_attach(ndev);
+
+		/* Веха 199.23 — погасить экономию линка СРАЗУ после подъёма: `atl1c_set_aspm` включил
+		 * её внутри `ndo_open`, а спать линку, пока карта пытается отдать принятый кадр,
+		 * нельзя (см. `atl1c_kill_aspm`). */
+		atl1c_kill_aspm(1);
 
 		/* Веха 199.7 — пусть пульс спрашивает и саму карту (см. `atl1c_diag` выше). Ставим
 		 * ПОСЛЕ подъёма: до `ndo_open` регистры ещё ничего не значат. */
