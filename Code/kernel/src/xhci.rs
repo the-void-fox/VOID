@@ -279,14 +279,36 @@ pub fn init() -> bool {
                 wait_ms(5);
             }
             wr(psc, rd(psc) & !PORTSC_CHANGES | PORTSC_CHANGES); // сбросить биты-изменения
+            // ── Веха 199.25 — КАЖДЫЙ ОТКАЗ НАЗЫВАЕТ СЕБЯ ──
+            //
+            // Все четыре выхода отсюда были молчаливыми `continue`, и на машине владельца это
+            // выглядело так: «xHCI: контроллер 0xdde00000 — поднимаю», и больше НИ СЛОВА. Порты
+            // подключены (иначе напечаталось бы «ничего не подключено»), а перечислить не удалось
+            // ни одного — и на каком шаге, не видно. Шаги значат разное: порт не включился после
+            // сброса это одно, контроллер не дал слот — другое, устройство не приняло адрес —
+            // третье. Искать их надо в разных местах.
             if rd(psc) & PORTSC_PED == 0 {
+                crate::println!("  [usb]  xHCI: порт {} не включился после сброса", p);
                 continue; // порт не включился — устройства на нём для нас нет
             }
             let speed = (rd(psc) >> 10) & 0xf; // Port Speed [13:10]
-            let Some(slot) = x.enable_slot() else { continue };
-            let Some(di) = x.address_device(slot, p, speed) else { continue };
+            let Some(slot) = x.enable_slot() else {
+                crate::println!("  [usb]  xHCI: порт {} — контроллер не дал слот", p);
+                continue;
+            };
+            let Some(di) = x.address_device(slot, p, speed) else {
+                crate::println!(
+                    "  [usb]  xHCI: порт {} (скорость {}) — адрес выдать не удалось (slot {})",
+                    p, speed, slot,
+                );
+                continue;
+            };
             let mut desc = [0u8; 18];
             if !x.get_descriptor(di, 1, 0, &mut desc) {
+                crate::println!(
+                    "  [usb]  xHCI: порт {} — адрес выдан, а дескриптор не читается",
+                    p,
+                );
                 continue;
             }
             let vid = desc[8] as u16 | (desc[9] as u16) << 8;
@@ -314,6 +336,13 @@ pub fn init() -> bool {
         }
         if connected == 0 {
             crate::println!("  [usb]  xHCI: {} портов, ничего не подключено", max_ports);
+        } else if x.kbd.is_none() && x.msc.is_none() {
+            // Веха 199.25 — ИТОГ. Строки выше говорят про каждый порт отдельно, а здесь видно
+            // главное одним взглядом: устройства есть, ни одно не наше.
+            crate::println!(
+                "  [usb]  xHCI: портов {}, подключено {}, перечислить не удалось ни одного",
+                max_ports, connected,
+            );
         }
         // Веха 199.1 — ничего нашего на контроллере нет: вернуть его прошивке. Пока он у неё,
         // она эмулирует USB-клавиатуру через контроллер 8042, и на машине, где наш драйвер не
