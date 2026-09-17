@@ -81,43 +81,53 @@ static struct pci_dev g_pdev = {
  * Счётчики MAC сбрасываются ЧТЕНИЕМ (поэтому в Linux `atl1c_update_hw_stats` их складывает) —
  * складываем и мы. Отсюда же следует, что смотреть на них может только ОДИН читатель; в VOID
  * `ndo_get_stats` не зовёт никто, так что мы здесь одни.
+ *
+ * Веха 199.8 — и то же самое про ПЕРЕДАЧУ (0x1760…). Приём на машине владельца отработал ровно
+ * первую секунду и встал, вместе с передачей; отличить «кадр не ушёл на провод» от «ушёл, но
+ * ответа нет» иначе нечем, а это два совершенно разных поиска.
  */
 #define AT_R32(off) (*(volatile u32 *)(ATL1C_BAR0_VA + (off)))
 
-static unsigned long at_rx_ok, at_rx_bcast, at_rx_fcs, at_rx_len;
-static unsigned long at_rx_sz_ov, at_rx_fifo_ov, at_rx_rrd_ov, at_rx_align, at_rx_filtered;
+/* Счётчики MAC идут подряд по 4 байта в порядке полей `struct atl1c_hw_stats`. Читаем диапазон
+ * ЦЕЛИКОМ, а не выборочно: чтение их обнуляет, и пропущенный регистр молча копился бы до
+ * переполнения — то есть однажды соврал бы. Имена нужных индексов — ниже. */
+#define AT_RX_WORDS ((REG_MAC_RX_STATUS_END - REG_MAC_RX_STATUS_BIN) / 4 + 1)
+#define AT_TX_WORDS ((REG_MAC_TX_STATUS_END - REG_MAC_TX_STATUS_BIN) / 4 + 1)
+
+enum { RX_OK = 0, RX_BCAST = 1, RX_FCS = 5, RX_LEN = 6,
+       RX_SZ_OV = 17, RX_FIFO_OV = 18, RX_RRD_OV = 19, RX_ALIGN = 20, RX_FILTERED = 23 };
+enum { TX_OK = 0, TX_LATE_COL = 17, TX_ABORT_COL = 18, TX_UNDERRUN = 19,
+       TX_LEN_ERR = 21, TX_TRUNC = 22 };
+
+static unsigned long at_rx[AT_RX_WORDS], at_tx[AT_TX_WORDS];
 
 static void atl1c_diag(void)
 {
 	u32 mac = AT_R32(REG_MAC_CTRL);
 	u32 rxq = AT_R32(REG_RXQ_CTRL);
 	u32 txq = AT_R32(REG_TXQ_CTRL);
+	unsigned i;
 
-	/* Счётчики MAC идут подряд по 4 байта от 0x1700 в порядке полей `atl1c_hw_stats`. */
-	at_rx_ok       += AT_R32(REG_MAC_RX_STATUS_BIN + 0 * 4);
-	at_rx_bcast    += AT_R32(REG_MAC_RX_STATUS_BIN + 1 * 4);
-	AT_R32(REG_MAC_RX_STATUS_BIN + 2 * 4);  /* mcast   — читаем, чтобы не копился */
-	AT_R32(REG_MAC_RX_STATUS_BIN + 3 * 4);  /* pause */
-	AT_R32(REG_MAC_RX_STATUS_BIN + 4 * 4);  /* ctrl */
-	at_rx_fcs      += AT_R32(REG_MAC_RX_STATUS_BIN + 5 * 4);
-	at_rx_len      += AT_R32(REG_MAC_RX_STATUS_BIN + 6 * 4);
-	at_rx_sz_ov    += AT_R32(REG_MAC_RX_STATUS_BIN + 17 * 4);
-	at_rx_fifo_ov  += AT_R32(REG_MAC_RX_STATUS_BIN + 18 * 4);
-	at_rx_rrd_ov   += AT_R32(REG_MAC_RX_STATUS_BIN + 19 * 4);
-	at_rx_align    += AT_R32(REG_MAC_RX_STATUS_BIN + 20 * 4);
-	at_rx_filtered += AT_R32(REG_MAC_RX_STATUS_BIN + 23 * 4);
+	for (i = 0; i < AT_RX_WORDS; i++)
+		at_rx[i] += AT_R32(REG_MAC_RX_STATUS_BIN + i * 4);
+	for (i = 0; i < AT_TX_WORDS; i++)
+		at_tx[i] += AT_R32(REG_MAC_TX_STATUS_BIN + i * 4);
 
-	printk("[atl1c] карта: предел кадра %u, приём %s, очередь приёма %s, передача %s%s\n",
+	printk("[atl1c] карта: предел кадра %u, приём %s, очередь приёма %s, передача %s/%s%s\n",
 	       (unsigned)AT_R32(REG_MTU),
 	       (mac & MAC_CTRL_RX_EN) ? "ВКЛ" : "ВЫКЛ",
 	       (rxq & RXQ_CTRL_EN)    ? "ВКЛ" : "ВЫКЛ",
 	       (mac & MAC_CTRL_TX_EN) ? "ВКЛ" : "ВЫКЛ",
+	       (txq & TXQ_CTRL_EN)    ? "ВКЛ" : "ВЫКЛ",
 	       (mac & MAC_CTRL_BC_EN) ? ", широковещание берёт" : ", ШИРОКОВЕЩАНИЕ НЕ БЕРЁТ");
-	printk("[atl1c] счёт MAC: принято %lu (широк %lu), больше предела %lu, FCS %lu, длина %lu,"
+	printk("[atl1c] MAC принял: %lu (широк %lu), больше предела %lu, FCS %lu, длина %lu,"
 	       " переполнение FIFO %lu / кольца %lu, выравнивание %lu, не тот адрес %lu\n",
-	       at_rx_ok, at_rx_bcast, at_rx_sz_ov, at_rx_fcs, at_rx_len,
-	       at_rx_fifo_ov, at_rx_rrd_ov, at_rx_align, at_rx_filtered);
-	(void)txq;
+	       at_rx[RX_OK], at_rx[RX_BCAST], at_rx[RX_SZ_OV], at_rx[RX_FCS], at_rx[RX_LEN],
+	       at_rx[RX_FIFO_OV], at_rx[RX_RRD_OV], at_rx[RX_ALIGN], at_rx[RX_FILTERED]);
+	printk("[atl1c] MAC отдал в провод: %lu, обрезано по пределу %lu, опустошение %lu,"
+	       " длина %lu, поздних столкновений %lu, брошено %lu\n",
+	       at_tx[TX_OK], at_tx[TX_TRUNC], at_tx[TX_UNDERRUN], at_tx[TX_LEN_ERR],
+	       at_tx[TX_LATE_COL], at_tx[TX_ABORT_COL]);
 }
 
 /* Задача-сторож: держит процесс живым и молча спит.
