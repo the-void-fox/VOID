@@ -683,6 +683,10 @@ void lx_net_pulse(unsigned long now_jiffies)
 		lx_net_diag_fn();
 }
 
+/// Веха 199.18 — сколько кадров дошло до стека. Нужно СТОРОЖУ ПРИЁМА: только по этому числу
+/// видно, что карта принимает с провода, а в систему не попадает ничего.
+unsigned long lx_net_rx_count(void) { return lx_rx_frames; }
+
 /// Веха 199.5 — работаем ли мы сейчас картой системы.
 int lx_netdev_active(void)
 {
