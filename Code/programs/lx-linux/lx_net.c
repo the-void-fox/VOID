@@ -98,6 +98,14 @@ static void *lx_arena_alloc(size_t size)
 			lx_arena_va = va;
 			lx_arena_pa = pa;
 			lx_arena_size = (size_t)LX_DMA_ARENA_PAGES * 4096;
+			/* Веха 199.7 — ФИЗИЧЕСКИЙ адрес вслух. Это единственное число во всей цепочке
+			 * приёма, которое мы называем карте и проверить не можем ничем, кроме как
+			 * прочитав его же обратно. Карты семейства atl1c объявляют 32-битный DMA — если
+			 * арена окажется выше 4 ГиБ, старшая половина адреса просто не доедет, и приём
+			 * умрёт молча. Строка стоит одной; догадка о ней стоила бы перезагрузки. */
+			printk("lx_net: арена DMA %u КиБ: VA %lx → физ %lx\n",
+			       (unsigned)(lx_arena_size / 1024),
+			       (unsigned long)lx_arena_va, (unsigned long)lx_arena_pa);
 		}
 	}
 	/* Сперва — из возвращённых: без этого вечный вещатель журнала съел бы арену за минуты. */
@@ -201,6 +209,7 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 		lx_dma_va_next += pages * 4096;
 		memset((void *)va, 0, size);
 		*handle = (dma_addr_t)pa;
+		printk("lx_net:   кольца легли по физ %lx\n", (unsigned long)pa);
 		return (void *)va;
 	}
 #endif
@@ -273,6 +282,36 @@ struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int txqs)
 	INIT_LIST_HEAD(&dev->mc.list);
 	INIT_LIST_HEAD(&dev->uc.list);
 	dev->mc.count = 0; dev->uc.count = 0;
+
+	/* ── Веха 199.7 — `ether_setup`: то, что в Linux делает `alloc_etherdev` ВНУТРИ СЕБЯ ──
+	 *
+	 * Здесь стоял один `memset`, и поле `mtu` оставалось НУЛЁМ. Драйвер имеет полное право
+	 * считать, что размер кадра ему уже назвали: в Linux `alloc_etherdev` зовёт `ether_setup`,
+	 * а тот ставит 1500 ДО того, как драйвер впервые заглянет в `netdev->mtu`.
+	 *
+	 * Чего это стоило. atl1c берёт оттуда `hw->max_frame_size` и программирует им РЕГИСТР КАРТЫ:
+	 *
+	 *     AT_WRITE_REG(hw, REG_MTU, hw->max_frame_size + ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN);
+	 *
+	 * То есть карте говорилось: «кадры длиннее ДВАДЦАТИ ДВУХ байт не принимай». Самый короткий
+	 * Ethernet-кадр — шестьдесят. Карта честно выбрасывала ВСЁ, что приходило с провода, и столь
+	 * же честно молчала об этом: отброшенный по длине кадр не поднимает прерывания и не пишет
+	 * дескриптор. Снаружи это выглядело как «линк есть, кадр уходит, в ответ тишина» — и увело
+	 * поиск в прерывания, маршрутизацию линий и DMA, где всё было исправно.
+	 *
+	 * Почему не всплыло в QEMU: ни rtl8139, ни e1000 не программируют картe предел длины из
+	 * `netdev->mtu` — у первого его нет вовсе, у второго модель QEMU его не проверяет. Ошибка
+	 * ждала первой карты, которая этому полю верит.
+	 *
+	 * Мораль та же, что у голов списков выше: обнулённая структура — это не «пустая», а
+	 * НЕПРАВИЛЬНО ЗАПОЛНЕННАЯ, и ноль в ней значит ровно ноль, а не «по умолчанию».
+	 */
+	dev->mtu      = ETH_DATA_LEN;          /* 1500 — как ether_setup */
+	dev->min_mtu  = 68;                    /* ETH_MIN_MTU */
+	dev->max_mtu  = ETH_DATA_LEN;          /* драйвер поднимет сам, если умеет jumbo */
+	dev->addr_len = ETH_ALEN;
+	dev->flags    = IFF_BROADCAST | IFF_MULTICAST;
+
 	dev->lx_txq = kmalloc(sizeof(*dev->lx_txq), 0);
 	if (!dev->lx_txq) { kfree(dev->lx_priv); kfree(dev); return NULL; }
 	dev->lx_txq->dev = dev;
@@ -406,6 +445,14 @@ unsigned long lx_isr_calls;    /* сколько раз звали обрабо�
 unsigned long lx_isr_handled;  /* сколько раз он сказал «это моё» */
 unsigned long lx_napi_polls;   /* сколько раз крутился опрос NAPI */
 int lx_netdev_active(void);    /* определён ниже, в половине со syscall'ами */
+
+/* Веха 199.7 — слово САМОЙ КАРТЫ в пульсе. Счётчики выше считают наш путь, а он может быть
+ * исправен весь: карта принимает с провода и молча выбрасывает по своим правилам (так и вышло —
+ * предел длины кадра стоял в 22 байта). Знает об этом только она, через свои регистры, а лезть
+ * в них из общего шима нельзя: у каждой карты они свои. Поэтому ставит обработчик тот, кто
+ * карту и поднимает, — драйвер-обёртка. Не поставил — пульс печатает как раньше. */
+static void (*lx_net_diag_fn)(void);
+void lx_net_set_diag(void (*fn)(void)) { lx_net_diag_fn = fn; }
 
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi, int (*poll)(struct napi_struct *, int))
 {
@@ -583,9 +630,16 @@ void lx_net_pulse(unsigned long now_jiffies)
 		return;
 	if (next && (long)(now_jiffies - next) < 0)
 		return;
-	next = now_jiffies + 2 * HZ;
+	/* Веха 199.7 — раз в ПЯТЬ секунд, а не в две: с появлением рассказа карты (`lx_net_diag_fn`)
+	 * пульс стал тремя строками, а смотрят на него с фотографии экрана. Реже — значит вся
+	 * картина целиком влезает в один кадр. */
+	next = now_jiffies + 5 * HZ;
 	printk("lx_net: пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, отправлено %lu\n",
 	       lx_isr_calls, lx_isr_handled, lx_napi_polls, lx_rx_frames, lx_tx_frames);
+	/* Дальше своё слово говорит сама карта — то, чего шим знать не может (её регистры и её
+	 * собственные счётчики приёма). Кто это печатает, решает драйвер-обёртка. */
+	if (lx_net_diag_fn)
+		lx_net_diag_fn();
 }
 
 /// Веха 199.5 — работаем ли мы сейчас картой системы.

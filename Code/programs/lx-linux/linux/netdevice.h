@@ -53,6 +53,8 @@ typedef u64 netdev_features_t;
 
 /* ── флаги интерфейса ── */
 #define IFF_UP           0x1
+#define IFF_BROADCAST    0x2
+#define IFF_MULTICAST    0x1000
 #define IFF_PROMISC      0x100
 #define IFF_ALLMULTI     0x200
 #define IFF_DOWN         0x0

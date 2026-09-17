@@ -44,6 +44,7 @@
 extern void lx_net_set_dma_cap(uintptr_t cap);
 extern void lx_net_set_irq_cap(uintptr_t cap);
 extern void lx_net_set_netdev_cap(uintptr_t cap);
+extern void lx_net_set_diag(void (*fn)(void));
 extern int  lx_netdev_open(struct net_device *dev);
 extern int  lx_netdev_attach(struct net_device *dev);
 extern int  lx_pci_register_device(struct pci_dev *pdev);
@@ -60,6 +61,64 @@ static struct pci_dev g_pdev = {
 	.irq              = 5,
 	.lx_name          = "0000:04:00.0",
 };
+
+/* ─── Веха 199.7 — РАССКАЗ САМОЙ КАРТЫ ───────────────────────────────────────────────────────
+ *
+ * Пульс шима (`lx_net_pulse`) считает НАШ путь: звали ли обработчик, планировался ли опрос,
+ * дошёл ли кадр до стека. Три захода подряд он показывал одно и то же — путь исправен весь,
+ * кадров нет, — и этого оказалось мало: карта может честно принимать с провода и столь же
+ * честно выбрасывать принятое по СВОИМ правилам, ничего никому не сказав.
+ *
+ * Спросить об этом можно только её саму. У MAC есть собственные счётчики приёма (0x1700…),
+ * и они отвечают на единственный вопрос, который нельзя вывести ниоткуда больше: доходит ли
+ * кадр до карты вообще. Дальше картина читается однозначно:
+ *
+ *   принято 0 и все ошибки 0   — с провода не приходит НИЧЕГО (фильтр, RX выключен, PHY);
+ *   «больше предела» растёт    — приходит, но карта считает кадры слишком длинными (REG_MTU);
+ *   FCS/выравнивание растут    — приходит мусор (провод, скорость, дуплекс);
+ *   принято > 0, а у нас 0     — карта приняла, но не смогла отдать: кольцо или DMA.
+ *
+ * Счётчики MAC сбрасываются ЧТЕНИЕМ (поэтому в Linux `atl1c_update_hw_stats` их складывает) —
+ * складываем и мы. Отсюда же следует, что смотреть на них может только ОДИН читатель; в VOID
+ * `ndo_get_stats` не зовёт никто, так что мы здесь одни.
+ */
+#define AT_R32(off) (*(volatile u32 *)(ATL1C_BAR0_VA + (off)))
+
+static unsigned long at_rx_ok, at_rx_bcast, at_rx_fcs, at_rx_len;
+static unsigned long at_rx_sz_ov, at_rx_fifo_ov, at_rx_rrd_ov, at_rx_align, at_rx_filtered;
+
+static void atl1c_diag(void)
+{
+	u32 mac = AT_R32(REG_MAC_CTRL);
+	u32 rxq = AT_R32(REG_RXQ_CTRL);
+	u32 txq = AT_R32(REG_TXQ_CTRL);
+
+	/* Счётчики MAC идут подряд по 4 байта от 0x1700 в порядке полей `atl1c_hw_stats`. */
+	at_rx_ok       += AT_R32(REG_MAC_RX_STATUS_BIN + 0 * 4);
+	at_rx_bcast    += AT_R32(REG_MAC_RX_STATUS_BIN + 1 * 4);
+	AT_R32(REG_MAC_RX_STATUS_BIN + 2 * 4);  /* mcast   — читаем, чтобы не копился */
+	AT_R32(REG_MAC_RX_STATUS_BIN + 3 * 4);  /* pause */
+	AT_R32(REG_MAC_RX_STATUS_BIN + 4 * 4);  /* ctrl */
+	at_rx_fcs      += AT_R32(REG_MAC_RX_STATUS_BIN + 5 * 4);
+	at_rx_len      += AT_R32(REG_MAC_RX_STATUS_BIN + 6 * 4);
+	at_rx_sz_ov    += AT_R32(REG_MAC_RX_STATUS_BIN + 17 * 4);
+	at_rx_fifo_ov  += AT_R32(REG_MAC_RX_STATUS_BIN + 18 * 4);
+	at_rx_rrd_ov   += AT_R32(REG_MAC_RX_STATUS_BIN + 19 * 4);
+	at_rx_align    += AT_R32(REG_MAC_RX_STATUS_BIN + 20 * 4);
+	at_rx_filtered += AT_R32(REG_MAC_RX_STATUS_BIN + 23 * 4);
+
+	printk("[atl1c] карта: предел кадра %u, приём %s, очередь приёма %s, передача %s%s\n",
+	       (unsigned)AT_R32(REG_MTU),
+	       (mac & MAC_CTRL_RX_EN) ? "ВКЛ" : "ВЫКЛ",
+	       (rxq & RXQ_CTRL_EN)    ? "ВКЛ" : "ВЫКЛ",
+	       (mac & MAC_CTRL_TX_EN) ? "ВКЛ" : "ВЫКЛ",
+	       (mac & MAC_CTRL_BC_EN) ? ", широковещание берёт" : ", ШИРОКОВЕЩАНИЕ НЕ БЕРЁТ");
+	printk("[atl1c] счёт MAC: принято %lu (широк %lu), больше предела %lu, FCS %lu, длина %lu,"
+	       " переполнение FIFO %lu / кольца %lu, выравнивание %lu, не тот адрес %lu\n",
+	       at_rx_ok, at_rx_bcast, at_rx_sz_ov, at_rx_fcs, at_rx_len,
+	       at_rx_fifo_ov, at_rx_rrd_ov, at_rx_align, at_rx_filtered);
+	(void)txq;
+}
 
 /* Задача-сторож: держит процесс живым и молча спит.
  *
@@ -167,6 +226,10 @@ static void atl1c_bringup(void *arg)
 		 * в QEMU (`ping` через неизменённый `8139too`); на живом AR8151 путь тот же, но на
 		 * железе владельца ещё не гонялся — об этом сказано в заметке вехи, а не умолчано. */
 		lx_netdev_attach(ndev);
+
+		/* Веха 199.7 — пусть пульс спрашивает и саму карту (см. `atl1c_diag` выше). Ставим
+		 * ПОСЛЕ подъёма: до `ndo_open` регистры ещё ничего не значат. */
+		lx_net_set_diag(atl1c_diag);
 
 		/* Дальше карта остаётся поднятой и обслуживает приём сама (NAPI по прерыванию). */
 		lx_task_create(atl1c_keepalive, NULL, "atl1c-idle");
