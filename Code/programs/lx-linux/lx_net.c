@@ -636,7 +636,7 @@ static void lx_netdev_rx(struct sk_buff *skb)
  */
 void lx_net_pulse(unsigned long now_jiffies)
 {
-	static unsigned long next, seen_rx, seen_tx;
+	static unsigned long next, slice, seen_rx, seen_tx;
 	static int said_once;
 	int talking, deaf;
 
@@ -644,18 +644,27 @@ void lx_net_pulse(unsigned long now_jiffies)
 		return;
 	if (next && (long)(now_jiffies - next) < 0)
 		return;
-	/* Раз в ПЯТЬ секунд, а не в две: с рассказом карты (`lx_net_diag_fn`) пульс стал тремя
-	 * строками, а смотрят на него с фотографии экрана. Реже — значит вся картина целиком
-	 * влезает в один кадр. */
-	next = now_jiffies + 5 * HZ;
+	/* Веха 199.9 — снова ДВЕ секунды. Пять я поставил, чтобы три строки пульса влезали в одну
+	 * фотографию, — и это вышло боком: владелец пингует, получает «нет ответа» и сразу смотрит
+	 * `klog`, а пульс в это окно не попадает. Теперь он и так молчит, пока сеть жива, поэтому
+	 * частить ему нечем; важнее успеть сказать между командой и взглядом в журнал. */
+	next = now_jiffies + 2 * HZ;
 
 	talking = lx_tx_frames != seen_tx;  /* с прошлого раза мы что-то отправляли */
 	deaf    = lx_rx_frames == seen_rx;  /* и не приняли ничего */
 	seen_tx = lx_tx_frames;
 	seen_rx = lx_rx_frames;
 
-	if (said_once && !(talking && deaf))
+	/* Веха 199.9 — РЕДКИЙ СРЕЗ, даже когда всё выглядит хорошо.
+	 *
+	 * Условия «отправляли и не приняли» мало: в живой домашней сети широковещание идёт само
+	 * собой (ARP соседей), приём растёт — и пульс промолчит, хотя `ping` не отвечает. Раз в
+	 * полминуты говорим безусловно: три строки за тридцать секунд журнал переживёт, а
+	 * отладка на машине, куда можно смотреть только через фотографию экрана, без них встаёт.
+	 * Когда сеть на железе перестанет быть расследованием, этот срез уйдёт. */
+	if (said_once && !(talking && deaf) && (long)(now_jiffies - slice) < 0)
 		return;
+	slice = now_jiffies + 30 * HZ;
 	said_once = 1;
 
 	printk("lx_net: пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, отправлено %lu\n",

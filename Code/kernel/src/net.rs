@@ -162,7 +162,61 @@ pub fn ext_rx_push(f: &[u8]) -> bool {
 
 /// Драйвер забирает кадр, который стек просил отправить. 0 — отправлять нечего.
 pub fn ext_tx_pop(out: &mut [u8]) -> usize {
-    TX.lock().pop(out)
+    let n = TX.lock().pop(out);
+    if n > 0 {
+        TX_TAKEN.fetch_add(1, Ordering::Relaxed);
+        // Проснулся — сказать об этом, если до того мы жаловались. Молчаливое выздоровление
+        // ничем не лучше молчаливой поломки: без этой строки «сеть то работает, то нет»
+        // выглядит одинаково в обоих случаях.
+        if TX_COMPLAINED.swap(false, Ordering::Relaxed) {
+            crate::println!(
+                "  [net] драйвер снова забирает кадры (положено {}, забрано {})",
+                TX_PUT.load(Ordering::Relaxed),
+                TX_TAKEN.load(Ordering::Relaxed),
+            );
+        }
+    }
+    n
+}
+
+// ─── «драйвер не забирает кадры» (Веха 199.9) ──────────────────────────────────────────────────
+//
+// Отличить ДВЕ поломки, которые снаружи выглядят одинаково («сеть не отвечает»):
+//
+//   1. драйвер отправил кадр в провод, а ответа нет  — искать в карте, проводе, сети;
+//   2. драйвер вообще не забрал кадр из очереди      — искать в самом драйвере (спит, завис, умер).
+//
+// Ни один счётчик карты второго не покажет: карта о нём просто не знает. Зато знает ядро —
+// очередь передачи его собственная, и видно, опустошает её кто-нибудь или нет. На машине
+// владельца это ровно тот вопрос, который остался: `ping` говорит «нет ответа», а пульс драйвера
+// молчит — и непонятно, спит драйвер или карта не слышит провод.
+static TX_PUT: AtomicUsize = AtomicUsize::new(0);
+static TX_TAKEN: AtomicUsize = AtomicUsize::new(0);
+static TX_COMPLAINED: AtomicBool = AtomicBool::new(false);
+/// Когда в последний раз жаловались (нс аптайма) — чтобы не повторяться каждую отправку.
+static TX_SAID_AT: AtomicUsize = AtomicUsize::new(0);
+
+/// Сколько кадров легло в очередь и осталось невостребованным. Не «потеряно»: кадр на месте,
+/// его просто некому взять.
+fn tx_watch() {
+    let put = TX_PUT.fetch_add(1, Ordering::Relaxed) + 1;
+    let taken = TX_TAKEN.load(Ordering::Relaxed);
+    // Порог в четыре кадра, а не в один: один невзятый кадр — норма, драйвер заберёт его на
+    // ближайшем пробуждении. Четыре подряд означают, что будить оказалось некого.
+    if put < taken + 4 {
+        return;
+    }
+    let now = crate::clock::uptime_ns() as usize;
+    let last = TX_SAID_AT.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < 5_000_000_000 {
+        return;
+    }
+    TX_SAID_AT.store(now, Ordering::Relaxed);
+    TX_COMPLAINED.store(true, Ordering::Relaxed);
+    crate::println!(
+        "  [net] драйвер не забирает кадры из очереди передачи: положено {}, забрано {}",
+        put, taken,
+    );
 }
 
 
@@ -215,7 +269,11 @@ pub fn send(frame_bytes: &[u8]) -> bool {
     if ext() {
         // Кадр только КЛАДЁТСЯ в очередь: отправляет его драйвер, и разбудить его — дело
         // вызывающего (`proc::wake_netdev_owner`), у которого в руках таблица процессов.
-        return TX.lock().push(frame_bytes);
+        let ok = TX.lock().push(frame_bytes);
+        if ok {
+            tx_watch(); // Веха 199.9 — забирает ли кто-нибудь положенное
+        }
+        return ok;
     }
     if e1000() {
         crate::e1000::send(frame_bytes)
