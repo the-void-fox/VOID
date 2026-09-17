@@ -1054,6 +1054,8 @@ impl Xhci {
 
     /// Опрос: разобрать пришедшие boot-репорты клавиатуры, отдать НОВЫЕ нажатия в консоль.
     unsafe fn poll_hid(&mut self) {
+        // Веха 199.34 — повторы удерживаемой клавиши (см. `usb_hid::tick`).
+        crate::usb_hid::tick();
         while let Some(ev) = self.try_event() {
             if (ev[3] >> 10) & 0x3f != EV_TRANSFER || !self.is_kbd_event(&ev) {
                 continue; // не трансфер либо чужой эндпоинт — не наше дело
