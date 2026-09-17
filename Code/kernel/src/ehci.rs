@@ -107,6 +107,10 @@ const PID_SETUP: u32 = 2;
 ///
 /// Шаг 64 ставим ВСЕГДА, не глядя на бит: 32-битный контроллер лишние слова не читает, а
 /// развилка «а какой у нас формат» стоила бы двух путей в каждом месте работы с дескриптором.
+/// Веха 199.32 — сколько запросов отчёта держим заряженными одновременно (см. `queue_reports`).
+/// Восемь: столько же, сколько у xHCI после Вехи 196, и по той же причине.
+const INT_TDS: usize = 8;
+
 const TD_SIZE: usize = 64;
 const TD_DWORDS: usize = TD_SIZE / 4;
 
@@ -152,11 +156,12 @@ pub struct Ehci {
     buf: usize,       // фрейм под данные передач
     frames: usize,    // периодическая таблица кадров
     int_qh: usize,    // очередь прерывающей передачи (клавиатура)
-    int_td: usize,    // её дескриптор
-    int_buf: usize,   // её буфер (восьмибайтные отчёты клавиатуры)
+    int_td: usize,    // её дескрипторы: КОЛЬЦО из `INT_TDS` штук (см. `queue_reports`)
+    int_buf: usize,   // их буферы (восьмибайтные отчёты клавиатуры, по одному на дескриптор)
+    /// Какой дескриптор кольца проверяем следующим.
+    int_next: usize,
     next_addr: u8,    // какой адрес выдадим следующему устройству
     kbd: Option<Dev>, // клавиатура, если нашлась
-    kbd_toggle: u32,
     /// Веха 199.31 — когда последний раз говорили про молчащий опрос (нс аптайма).
     kbd_said: u64,  // бит переключения данных прерывающей передачи
     prev: [u8; 6],    // прошлый набор нажатых клавиш
@@ -365,9 +370,9 @@ fn init_one(base: usize, bdf: u16) -> bool {
         let mut e = Ehci {
             op, ports, qh, td, buf, frames,
             int_qh, int_td, int_buf,
+            int_next: 0,
             next_addr: 1,
             kbd: None,
-            kbd_toggle: 0,
             kbd_said: 0,
             prev: [0; 6],
         };
@@ -849,29 +854,48 @@ impl Ehci {
             },
             mps, ep, dev.hub_addr, dev.hub_port,
         );
-        self.kbd_toggle = 0;
-        self.queue_report();
+        self.queue_reports();
     }
 
-    /// Поставить запрос очередного отчёта клавиатуры.
-    unsafe fn queue_report(&mut self) {
-        let td = dm(self.int_td);
-        write_volatile(td, LINK_TERM);
+    /// Зарядить ОДИН дескриптор кольца: запрос очередного отчёта клавиатуры в свой буфер.
+    unsafe fn arm_report(&mut self, i: usize) {
+        let td = dm(self.int_td).add(i * TD_DWORDS);
+        let next = self.int_td + ((i + 1) % INT_TDS) * TD_SIZE;
+        write_volatile(td, next as u32); // кольцо: за последним снова первый
         write_volatile(td.add(1), LINK_TERM);
         write_volatile(
             td.add(2),
-            TD_ACTIVE | (PID_IN << 8) | (3 << 10) | (8 << 16) | (self.kbd_toggle << 31) | TD_IOC,
+            TD_ACTIVE | (PID_IN << 8) | (3 << 10) | (8 << 16) | TD_IOC,
         );
-        write_volatile(td.add(3), self.int_buf as u32);
+        write_volatile(td.add(3), (self.int_buf + i * 64) as u32);
         for k in 1..5 {
             write_volatile(td.add(3 + k), 0);
         }
-        // Веха 199.29 — и здесь старшие половины адресов в нуль: дескриптор прерывающей передачи
-        // переиспользуется на каждый отчёт клавиатуры, значит «страница пришла чистой» про него
+        // Веха 199.29 — и здесь старшие половины адресов в нуль: дескрипторы прерывающей передачи
+        // переиспользуются на каждый отчёт клавиатуры, значит «страница пришла чистой» про них
         // верно ровно один раз (см. `TD_SIZE`).
         for k in 8..13 {
             write_volatile(td.add(k), 0);
         }
+    }
+
+    /// Веха 199.32 — КОЛЬЦО ЗАПРОСОВ, а не один запрос.
+    ///
+    /// Здесь стоял ровно один дескриптор: мы его заряжали, ждали отчёт, разбирали и заряжали
+    /// снова. Значит **между разбором и следующей зарядкой клавиатуру не опрашивал никто**, и
+    /// всё, что человек нажал в этот промежуток, пропадало. Владелец описал это точнее всякого
+    /// журнала: «работает, просто надо попадать в тайминги».
+    ///
+    /// Та же ошибка была в xHCI и лечилась тем же (Веха 196: один буфер приёма вместо восьми —
+    /// «печатает через букву»). Здесь кольцо: дескрипторы связаны по кругу, контроллер идёт по
+    /// ним подряд, а мы разбираем готовые и заряжаем их обратно. Пока мы не пришли, у него есть
+    /// запас на восемь отчётов — при десятимиллисекундном опросе низкоскоростной клавиатуры это
+    /// почти десятая доля секунды.
+    unsafe fn queue_reports(&mut self) {
+        for i in 0..INT_TDS {
+            self.arm_report(i);
+        }
+        self.int_next = 0;
         compiler_fence(Ordering::SeqCst);
         write_volatile(dm(self.int_qh).add(4), self.int_td as u32);
         write_volatile(dm(self.int_qh).add(6), 0);
@@ -882,7 +906,38 @@ impl Ehci {
         if self.kbd.is_none() {
             return;
         }
-        let token = read_volatile(dm(self.int_td).add(2));
+        // Обойти кольцо от текущего: разобрать все готовые отчёты и зарядить их обратно.
+        // Ограничение на круг — чтобы не крутиться вечно, если контроллер заряжает быстрее,
+        // чем мы разбираем: остаток заберём на следующем заходе.
+        for _ in 0..INT_TDS {
+            let i = self.int_next;
+            let token = read_volatile(dm(self.int_td).add(i * TD_DWORDS + 2));
+            if token & TD_ACTIVE != 0 {
+                break;
+            }
+            if token & TD_ERRORS == 0 {
+                let r = core::slice::from_raw_parts(frame::ptr(self.int_buf + i * 64), 8);
+                crate::usb_hid::report(&mut self.prev, r);
+            } else {
+                let now = crate::clock::uptime_ns();
+                if now > self.kbd_said + 10_000_000_000 {
+                    self.kbd_said = now;
+                    crate::println!(
+                        "  [usb]  EHCI: обмен с клавиатурой отвергнут (токен {:#010x}{}{})",
+                        token,
+                        if token & (1 << 6) != 0 { ", очередь остановлена" } else { "" },
+                        if token & (1 << 3) != 0 { ", ошибка транзакции" } else { "" },
+                    );
+                }
+            }
+            self.arm_report(i);
+            self.int_next = (i + 1) % INT_TDS;
+            // Очередь могла остановиться на разобранном дескрипторе — подтолкнуть её обратно
+            // на кольцо и снять возможный `Halted` в накладке.
+            write_volatile(dm(self.int_qh).add(4), (self.int_td + i * TD_SIZE) as u32);
+            write_volatile(dm(self.int_qh).add(6), 0);
+        }
+        let token = read_volatile(dm(self.int_td).add(self.int_next * TD_DWORDS + 2));
         if token & TD_ACTIVE != 0 {
             // Веха 199.31 — ЗАВИСШИЙ ОПРОС НАЗЫВАЕТ СЕБЯ. Клавиатура владельца нашлась, а
             // нажатия не приходят, и отсюда не видно почему: дескриптор либо всё ещё
@@ -897,28 +952,7 @@ impl Ehci {
                     token,
                 );
             }
-            return; // ещё выполняется
         }
-        if token & TD_ERRORS == 0 {
-            let r = core::slice::from_raw_parts(frame::ptr(self.int_buf), 8);
-            crate::usb_hid::report(&mut self.prev, r);
-            self.kbd_toggle ^= 1;
-        } else {
-            // Ошибка обмена с клавиатурой. Молчать нельзя: отчёты просто не идут, а причина —
-            // в этих битах (`Halted` — устройство ответило отказом, `ошибка транзакции` — не
-            // сложилась раздельная передача через хаб).
-            let now = crate::clock::uptime_ns();
-            if now > self.kbd_said + 10_000_000_000 {
-                self.kbd_said = now;
-                crate::println!(
-                    "  [usb]  EHCI: обмен с клавиатурой отвергнут (токен {:#010x}{}{})",
-                    token,
-                    if token & (1 << 6) != 0 { ", очередь остановлена" } else { "" },
-                    if token & (1 << 3) != 0 { ", ошибка транзакции" } else { "" },
-                );
-            }
-        }
-        self.queue_report();
     }
 }
 
