@@ -48,6 +48,7 @@ impl phy::Device for VoidDevice {
         if n == 0 || n == usize::MAX || n > MTU {
             return None;
         }
+        RX_CALLS.fetch_add(1, Ordering::Relaxed); // Веха 199.17 — сколько кадров ВЗЯЛ стек
         Some((RxToken { frame: &self.rx[..n] }, TxToken { dev_cap: self.dev_cap }))
     }
 
@@ -136,6 +137,15 @@ impl phy::TxToken for TxToken {
 static TX_REFUSED: AtomicUsize = AtomicUsize::new(0);
 /// Сколько раз СТЕК вообще отдал кадр устройству (Веха 199.12).
 static TX_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Сколько кадров стек ЗАБРАЛ у устройства (Веха 199.17).
+static RX_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Веха 199.17 — сколько кадров стек забрал у карты. Пара к [`tx_stats`]: «ответа нет» бывает
+/// оттого, что в нашу сторону вообще ничего не идёт, и оттого, что идёт, но не то, — а лечится
+/// это в разных местах (провод и карта против стека и фильтров).
+pub fn rx_count() -> usize {
+    RX_CALLS.load(Ordering::Relaxed)
+}
 
 /// Веха 199.12 — «отдано устройству / из них отвергнуто ядром».
 ///

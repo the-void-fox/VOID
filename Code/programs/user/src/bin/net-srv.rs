@@ -1415,6 +1415,7 @@ fn ping(
     let deadline = sys::net_phy::now() + Duration::from_millis(RESOLVE_MS);
     // Веха 199.12 — отметка «сколько кадров стек отдал карте ДО пинга» (см. ветку `None` ниже).
     let tx_before = sys::net_phy::tx_stats();
+    let rx_before = sys::net_phy::rx_count();
 
     if pool.cur >= PING_SOCKETS {
         return Err(PING_EXHAUSTED);
@@ -1497,6 +1498,11 @@ fn ping(
                 sys::write(", ядро отвергло ".as_bytes());
                 write_dec(refused.wrapping_sub(tx_before.1));
             }
+            // Веха 199.17 — и СКОЛЬКО ПРИШЛО за то же время. «Нет ответа» при нуле означает, что
+            // в нашу сторону не идёт ничего (провод, карта, фильтр); при ненулевом — что кадры
+            // идут, а нужного среди них нет (адрес, чек-сумма, чужой ответ). Это разные поиски.
+            sys::write(", принял ".as_bytes());
+            write_dec(sys::net_phy::rx_count().wrapping_sub(rx_before));
             sys::write("\n".as_bytes());
             Err(PING_NO_REPLY)
         }
