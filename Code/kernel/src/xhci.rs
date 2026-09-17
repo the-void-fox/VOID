@@ -168,9 +168,15 @@ unsafe fn wr64(a: usize, v: u64) {
 /// Часть A — поднять контроллер xHCI, если он есть. `true` — кольца работают (проверено
 /// командой Enable Slot). Состояние сохраняется для частей B/C.
 pub fn init() -> bool {
+    // Веха 199.24 — ОТКАЗ НАЗЫВАЕТ СЕБЯ. Здесь стояло молчаливое `return false`, и на машине
+    // владельца это стоило захода: в описи шины ASMedia xHCI ВИДЕН (`03:00.0 1b21:1042`, класс
+    // 0c0330), а от драйвера в журнале не было ни строки — ни «нашёл», ни «не нашёл». Отличить
+    // «контроллера нет» от «нашёл и сломался на первом шаге» было нечем.
     let Some(base) = crate::arch::probe_xhci() else {
+        crate::println!("  [usb]  xHCI: контроллера на шине не нашлось (класс 0c/03/30)");
         return false;
     };
+    crate::println!("  [usb]  xHCI: контроллер {:#x} — поднимаю", base);
     unsafe {
         let took = bios_handoff(base);
         let caplen = (rd(base + CAP_CAPLENGTH) & 0xff) as usize;
@@ -200,19 +206,31 @@ pub fn init() -> bool {
         wr(op + OP_CONFIG, max_slots);
 
         // 3) DCBAA — массив базовых адресов контекстов (обнулён; scratchpad у QEMU 0).
-        let Some(dcbaa) = frame::alloc() else { return false };
+        let Some(dcbaa) = frame::alloc() else {
+            crate::println!("  [usb]  xHCI: не хватило памяти под массив контекстов");
+            return false;
+        };
         wr64(op + OP_DCBAAP, dcbaa as u64);
 
         // 4) Кольцо команд: Link TRB в конце заворачивает на начало (Toggle Cycle).
-        let Some(cmd_ring) = frame::alloc() else { return false };
+        let Some(cmd_ring) = frame::alloc() else {
+            crate::println!("  [usb]  xHCI: не хватило памяти под кольцо команд");
+            return false;
+        };
         let link = dm(cmd_ring + (RING_TRBS - 1) * 16) as *mut u32;
         write_volatile(link as *mut u64, cmd_ring as u64); // указатель назад на старт
         write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1); // тип Link | Toggle | Cycle
         wr64(op + OP_CRCR, cmd_ring as u64 | 1); // RCS=1
 
         // 5) Кольцо событий + таблица сегментов (ERST, 1 сегмент).
-        let Some(event_ring) = frame::alloc() else { return false };
-        let Some(erst) = frame::alloc() else { return false };
+        let Some(event_ring) = frame::alloc() else {
+            crate::println!("  [usb]  xHCI: не хватило памяти под кольцо событий");
+            return false;
+        };
+        let Some(erst) = frame::alloc() else {
+            crate::println!("  [usb]  xHCI: не хватило памяти под таблицу кольца событий");
+            return false;
+        };
         write_volatile(dm(erst) as *mut u64, event_ring as u64); // база сегмента
         write_volatile(dm(erst + 8) as *mut u32, RING_TRBS as u32); // размер сегмента (TRB)
         wr(rt + 0x20 + IR0_ERSTSZ, 1); // один сегмент
