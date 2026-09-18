@@ -145,6 +145,7 @@ void_qemu_machine() {
 # «проверено» относилось к тому дню, а не к сегодняшнему коду.
 #
 #   VOID_QEMU_USB=kbd              клавиатура (проверка Вехи 50)
+#   VOID_QEMU_USB=mouse            УКАЗАТЕЛЬ (Веха 200): обычная мышь загрузочного протокола
 #   VOID_QEMU_USB=disk:<путь>      флешка (USB mass storage поверх BOT)
 #   VOID_QEMU_USB=boot:<путь>      флешка, с которой ЗАГРУЖАЕТСЯ машина (bootindex=0)
 #   VOID_QEMU_USB=kbd,disk:<путь>  и то и другое на одном контроллере
@@ -174,13 +175,14 @@ void_qemu_usb() {
             [ -n "$item" ] || continue
             case "$item" in
                 kbd) printf '%s\n' -device usb-kbd,bus=ehci.0,id=usbkbd ;;
+                mouse) printf '%s\n' -device usb-mouse,bus=ehci.0,id=usbmouse ;;
                 disk:*)
                     printf '%s\n' \
                         -drive "if=none,id=usb$i,file=${item#disk:},format=raw" \
                         -device "usb-storage,bus=ehci.0,drive=usb$i"
                     i=$((i + 1)) ;;
                 *)
-                    echo "стенд: не понимаю USB-устройство '$item' (kbd | disk:<путь>)" >&2
+                    echo "стенд: не понимаю USB-устройство '$item' (kbd | mouse | disk:<путь>)" >&2
                     return 2 ;;
             esac
         done
@@ -194,6 +196,7 @@ void_qemu_usb() {
         [ -n "$item" ] || continue
         case "$item" in
             kbd) printf '%s\n' -device usb-kbd,bus=xhci.0,id=usbkbd ;;
+            mouse) printf '%s\n' -device usb-mouse,bus=xhci.0,id=usbmouse ;;
             disk:*)
                 printf '%s\n' \
                     -drive "if=none,id=usb$i,file=${item#disk:},format=raw" \
@@ -208,7 +211,7 @@ void_qemu_usb() {
                     -device "usb-storage,bus=xhci.0,drive=usb$i,bootindex=0"
                 i=$((i + 1)) ;;
             *)
-                echo "стенд: не понимаю USB-устройство '$item' (kbd | disk:<путь>)" >&2
+                echo "стенд: не понимаю USB-устройство '$item' (kbd | mouse | disk:<путь>)" >&2
                 return 2 ;;
         esac
     done

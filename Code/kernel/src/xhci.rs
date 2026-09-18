@@ -61,6 +61,33 @@ const SECTOR: usize = 512;
 /// букву» — хуже, чем если бы она не работала вовсе, потому что похоже на случайность.
 /// Восемь — с запасом на четыре быстрых нажатия (репорт на нажатие и на отпускание).
 const KBD_REPORTS: usize = 8;
+
+
+/// Один настроенный HID-эндпоинт: чьё это устройство, его кольцо, буферы и что оно такое.
+#[derive(Clone, Copy)]
+struct HidEp {
+    /// Индекс устройства в [`Xhci::devs`].
+    di: usize,
+    /// TR-кольцо interrupt-эндпоинта и состояние записи в него.
+    ring: usize,
+    enq: usize,
+    cycle: u32,
+    /// Device Context Index эндпоинта — им же звонят контроллеру.
+    dci: u32,
+    /// Фрейм под репорты: [`KBD_REPORTS`] буферов по восемь байт.
+    buf: usize,
+    /// Какой буфер читать следующим: завершения на одном эндпоинте приходят по порядку.
+    slot: usize,
+    /// Максимальный размер пакета эндпоинта. У клавиатуры он восемь байт, у мыши бывает
+    /// четыре — и просить у неё больше, чем она умеет отдать за пакет, значит просить
+    /// контроллер разбить запрос на два. Некоторые контроллеры на interrupt-эндпоинте этого
+    /// не делают вовсе: запрос просто не завершается, и устройство выглядит молчащим.
+    mps: u16,
+    /// Указатель (мышь, тачпад) — иначе клавиатура.
+    mouse: bool,
+    /// Прошлый набор нажатых клавиш; у указателя не используется.
+    prev: [u8; 6],
+}
 const TRB_NORMAL: u32 = 1; // Normal (данные interrupt/bulk)
 const TRB_SETUP: u32 = 2; // Setup Stage (control-трансфер)
 const TRB_DATA: u32 = 3; // Data Stage
@@ -111,14 +138,13 @@ pub struct Xhci {
     // Часть B — перечисленные устройства (Веха 196: до MAX_DEVS вместо одного).
     devs: [Option<Dev>; MAX_DEVS],
     // Часть C — HID-клавиатура (interrupt IN эндпоинт):
-    kbd: Option<usize>, // индекс устройства-клавиатуры в `devs`
-    int_ring: usize, // TR-кольцо interrupt-эндпоинта (0 — не настроен)
-    int_enq: usize,
-    int_cycle: u32,
-    int_dci: u32, // Device Context Index interrupt-эндпоинта (звонок)
-    int_buf: usize, // фрейм под boot-репорты: [`KBD_REPORTS`] буферов по 8 байт
-    int_slot: usize, // какой буфер читать следующим (завершения приходят по порядку)
-    prev: [u8; 6], // предыдущий набор нажатых клавиш (для детекта НОВЫХ нажатий)
+    kbd: Option<usize>, // индекс устройства-клавиатуры в `devs` (для совместимости строк журнала)
+    /// Веха 200 — настроенные HID-эндпоинты: клавиатура и указатель.
+    ///
+    /// Раньше этот набор полей лежал здесь в единственном экземпляре, и это означало ровно
+    /// ОДНО устройство ввода на контроллер. На ноутбуке без PS/2 такой выбор — между
+    /// клавиатурой и тачпадом, то есть не выбор вовсе.
+    hids: [Option<HidEp>; 2],
     // Веха 196 — накопитель (bulk IN/OUT, протокол BOT поверх SCSI):
     msc: Option<Msc>,
 }
@@ -256,8 +282,7 @@ pub fn init() -> bool {
             dcbaa,
             devs: [None; MAX_DEVS],
             kbd: None,
-            int_ring: 0, int_enq: 0, int_cycle: 1, int_dci: 0, int_buf: 0, int_slot: 0,
-            prev: [0; 6],
+            hids: [None, None],
             msc: None,
         };
 
@@ -361,10 +386,20 @@ pub fn init() -> bool {
             let pid = desc[10] as u16 | (desc[11] as u16) << 8;
             // Класс объявлен либо у устройства, либо (чаще) у интерфейса — поэтому решает
             // разбор config-дескриптора, а не байт `bDeviceClass`.
-            if x.kbd.is_none() && x.setup_hid(di) {
+            // Веха 200 — HID пробуем ВСЕГДА, пока есть свободное место: на ноутбуке без PS/2
+            // клавиатура и тачпад висят на одном контроллере, и «одно устройство ввода на
+            // машину» означало бы выбор между ними.
+            if x.setup_hid(di) {
+                let kind = if x.hids.iter().flatten().last().is_some_and(|h| h.mouse) {
+                    "указатель"
+                } else {
+                    "клавиатура"
+                };
+                let (mps, dci) = x.hids.iter().flatten().last()
+                    .map_or((0, 0), |h| (h.mps, h.dci));
                 crate::println!(
-                    "  [usb]  xHCI: HID-клавиатура {:04x}:{:04x} на порту {} (slot {})",
-                    vid, pid, p, slot,
+                    "  [usb]  xHCI: HID-{} {:04x}:{:04x} на порту {} (slot {}, пакет {} Б, dci {})",
+                    kind, vid, pid, p, slot, mps, dci,
                 );
             } else if x.msc.is_none() && x.setup_msc(di) {
                 let m = x.msc.expect("только что настроен");
@@ -382,7 +417,7 @@ pub fn init() -> bool {
         }
         if connected == 0 {
             crate::println!("  [usb]  xHCI: {} портов, ничего не подключено", max_ports);
-        } else if x.kbd.is_none() && x.msc.is_none() {
+        } else if !x.hids.iter().any(|h| h.is_some()) && x.msc.is_none() {
             // Веха 199.25 — ИТОГ. Строки выше говорят про каждый порт отдельно, а здесь видно
             // главное одним взглядом: устройства есть, ни одно не наше.
             crate::println!(
@@ -394,7 +429,7 @@ pub fn init() -> bool {
         // она эмулирует USB-клавиатуру через контроллер 8042, и на машине, где наш драйвер не
         // справился, это единственный способ ввода. Тот же довод, что у EHCI: забрать и не дать
         // взамен ничего — худшее из возможного.
-        if took && x.kbd.is_none() && x.msc.is_none() {
+        if took && !x.hids.iter().any(|h| h.is_some()) && x.msc.is_none() {
             release_to_bios(base, op);
             return false;
         }
@@ -733,9 +768,13 @@ impl Xhci {
         false
     }
 
-    /// Часть C — настроить HID-клавиатуру: разобрать config-дескриптор (найти interrupt-IN
+    /// Часть C — настроить HID-устройство: разобрать config-дескриптор (найти interrupt-IN
     /// эндпоинт + интерфейс), SET_CONFIGURATION, SET_PROTOCOL(boot), Configure Endpoint, поставить
-    /// первый interrupt-TRB. `true` — это HID-клавиатура и она готова слать репорты.
+    /// первый interrupt-TRB. `true` — это HID и оно готово слать репорты.
+    ///
+    /// Веха 200 — клавиатура И указатель. Кто именно, говорит `bInterfaceProtocol` интерфейса:
+    /// 1 — клавиатура, 2 — мышь. Загрузочный протокол у обоих, поэтому вся настройка одна и та
+    /// же, и разница только в том, как потом читать репорт.
     unsafe fn setup_hid(&mut self, di: usize) -> bool {
         let Some(speed) = self.devs[di].map(|d| d.speed) else { return false };
         let mut cfg = [0u8; 96];
@@ -744,12 +783,14 @@ impl Xhci {
         }
         // Пройти дескрипторы: интерфейс (тип 4, класс[5]=3 HID) + его interrupt-IN эндпоинт (тип 5).
         let (mut iface, mut is_hid, mut ep_addr, mut ep_mps, mut ep_ivl) = (0u8, false, 0u8, 8u16, 0u8);
+        let mut proto = 0u8;
         let mut i = cfg[0] as usize; // после шапки config
         while i + 4 <= cfg.len() && cfg[i] != 0 {
             let (blen, btype) = (cfg[i] as usize, cfg[i + 1]);
             if btype == 4 {
                 iface = cfg[i + 2];
                 is_hid = cfg[i + 5] == 3; // bInterfaceClass = HID
+                proto = cfg[i + 7]; // bInterfaceProtocol: 1 — клавиатура, 2 — указатель
             } else if btype == 5 && is_hid && cfg[i + 2] & 0x80 != 0 && cfg[i + 3] & 3 == 3 {
                 // Endpoint: IN (бит7 адреса) + Interrupt (атрибуты[1:0]=3).
                 ep_addr = cfg[i + 2];
@@ -758,40 +799,59 @@ impl Xhci {
             }
             i += blen.max(1);
         }
-        if ep_addr == 0 {
-            return false; // не HID с interrupt-IN эндпоинтом
+        if ep_addr == 0 || !(1..=2).contains(&proto) {
+            return false; // не HID с interrupt-IN эндпоинтом, либо не клавиатура и не указатель
         }
+        let Some(idx) = self.hids.iter().position(|h| h.is_none()) else {
+            return false; // оба места заняты — третьего устройства ввода мы не ведём
+        };
         // SET_CONFIGURATION(1); SET_PROTOCOL(boot=0) на интерфейс.
-        self.control_nodata(di, 0x00, 9, 1, 0);
-        self.control_nodata(di, 0x21, 0x0b, 0, iface as u16);
-        self.configure_endpoint(di, ep_addr, ep_mps, ep_ivl, speed) && {
-            self.kbd = Some(di);
-            self.int_slot = 0;
-            for slot in 0..KBD_REPORTS {
-                self.queue_report_at(slot); // все буферы сразу — иначе нажатия теряются
-            }
-            true
+        //
+        // Оба ответа СМОТРИМ: отказ (STALL) на управляющем запросе — это не мелочь, он оставляет
+        // эндпоинт в остановленном состоянии, и устройство после этого молчит навсегда. Снаружи
+        // это неотличимо от «мышь ничего не шлёт».
+        let cfg_ok = self.control_nodata(di, 0x00, 9, 1, 0);
+        let proto_ok = self.control_nodata(di, 0x21, 0x0b, 0, iface as u16);
+        if !cfg_ok || !proto_ok {
+            crate::println!(
+                "  [usb]  xHCI: устройство отказало: конфигурация {}, протокол {}",
+                cfg_ok, proto_ok,
+            );
         }
-    }
-
-    /// Configure Endpoint: добавить interrupt-IN эндпоинт в контекст устройства.
-    unsafe fn configure_endpoint(&mut self, di: usize, ep_addr: u8, mps: u16, ivl: u8, speed: u32) -> bool {
-        let Some(d) = self.devs[di] else { return false };
-        let cs = if self.ctx64 { 64 } else { 32 };
-        let dci = 2 * (ep_addr & 0x0f) as u32 + 1; // IN-эндпоинт: DCI = 2*n+1
-        let (Some(int_ring), Some(input), Some(int_buf)) =
-            (frame::alloc(), frame::alloc(), frame::alloc())
+        let Some(hid) = self.configure_endpoint(di, ep_addr, ep_mps, ep_ivl, speed, proto == 2)
         else {
             return false;
         };
+        self.hids[idx] = Some(hid);
+        if proto == 1 {
+            self.kbd = Some(di);
+        }
+        for slot in 0..KBD_REPORTS {
+            self.queue_report_at(idx, slot); // все буферы сразу — иначе события теряются
+        }
+        true
+    }
+
+    /// Есть ли настроенный указатель / клавиатура.
+    fn has_hid(&self, mouse: bool) -> bool {
+        self.hids.iter().flatten().any(|h| h.mouse == mouse)
+    }
+
+    /// Configure Endpoint: добавить interrupt-IN эндпоинт в контекст устройства.
+    unsafe fn configure_endpoint(
+        &mut self, di: usize, ep_addr: u8, mps: u16, ivl: u8, speed: u32, mouse: bool,
+    ) -> Option<HidEp> {
+        let d = self.devs[di]?;
+        let cs = if self.ctx64 { 64 } else { 32 };
+        let dci = 2 * (ep_addr & 0x0f) as u32 + 1; // IN-эндпоинт: DCI = 2*n+1
+        let (int_ring, input, int_buf) = (frame::alloc()?, frame::alloc()?, frame::alloc()?);
         let link = dm(int_ring + (RING_TRBS - 1) * 16) as *mut u32;
         write_volatile(link as *mut u64, int_ring as u64);
         write_volatile(link.add(3), TRB_LINK << 10 | 1 << 1 | 1);
-        self.int_ring = int_ring;
-        self.int_enq = 0;
-        self.int_cycle = 1;
-        self.int_dci = dci;
-        self.int_buf = int_buf;
+        let hid = HidEp {
+            di, ring: int_ring, enq: 0, cycle: 1, dci, buf: int_buf, slot: 0,
+            mps: mps.clamp(1, 8), mouse, prev: [0; 6],
+        };
         // Input Control: A0 (slot) | A(dci). Slot Context: Context Entries = dci.
         write_volatile(dm(input + 4) as *mut u32, 1 | 1 << dci);
         write_volatile(dm(input + cs) as *mut u32, dci << 27 | speed << 20);
@@ -805,22 +865,23 @@ impl Xhci {
         compiler_fence(Ordering::SeqCst);
         let ev = self.command(input as u32, (input as u64 >> 32) as u32,
             TRB_CONFIG_EP << 10 | (d.slot as u32) << 24);
-        matches!(ev, Some(e) if (e[2] >> 24) & 0xff == 1)
+        matches!(ev, Some(e) if (e[2] >> 24) & 0xff == 1).then_some(hid)
     }
 
-    /// Поставить Normal-TRB на interrupt-кольцо (приём одного 8-байтного репорта в буфер
-    /// `slot`) + звонок.
-    unsafe fn queue_report_at(&mut self, slot: usize) {
-        let (ring, buf) = (self.int_ring, self.int_buf + slot * 8);
+    /// Поставить Normal-TRB на interrupt-кольцо устройства `hi` (приём одного 8-байтного
+    /// репорта в буфер `slot`) + звонок.
+    unsafe fn queue_report_at(&mut self, hi: usize, slot: usize) {
+        let Some(mut h) = self.hids[hi] else { return };
+        let buf = h.buf + slot * 8;
         ring_push(
-            ring, &mut self.int_enq, &mut self.int_cycle,
-            buf as u32, (buf as u64 >> 32) as u32, 8,
+            h.ring, &mut h.enq, &mut h.cycle,
+            buf as u32, (buf as u64 >> 32) as u32, h.mps as u32,
             TRB_NORMAL << 10 | 1 << 5 | 1 << 2, // IOC | ISP
         );
+        self.hids[hi] = Some(h);
         compiler_fence(Ordering::SeqCst);
-        let Some(ki) = self.kbd else { return };
-        let Some(d) = self.devs[ki] else { return };
-        wr(self.db + d.slot as usize * 4, self.int_dci); // звонок interrupt-эндпоинта
+        let Some(d) = self.devs[h.di] else { return };
+        wr(self.db + d.slot as usize * 4, h.dci); // звонок interrupt-эндпоинта
     }
 
     // ─── накопитель: BOT поверх SCSI (Веха 196) ────────────────────────────────────────────
@@ -953,10 +1014,10 @@ impl Xhci {
             if (ev[3] >> 10) & 0x3f != EV_TRANSFER {
                 continue;
             }
-            // Чужое событие не выбрасываем: репорт клавиатуры, попавший сюда, — это нажатие
-            // человека, и потерять его значит «клавиатура иногда не работает».
-            if self.is_kbd_event(&ev) {
-                self.take_report();
+            // Чужое событие не выбрасываем: репорт клавиатуры или указателя, попавший сюда, —
+            // это движение человека, и потерять его значит «ввод иногда не работает».
+            if let Some(hi) = self.hid_of_event(&ev) {
+                self.take_report(hi);
                 continue;
             }
             let (slot, ev_dci) = Self::ev_addr(&ev);
@@ -1077,52 +1138,70 @@ impl Xhci {
         ((ev[3] >> 24) as u8, (ev[3] >> 16) & 0x1f)
     }
 
-    /// Клавиатура ли это (её слот и её эндпоинт).
-    fn is_kbd_event(&self, ev: &[u32; 4]) -> bool {
+    /// Чьё это завершение: индекс в [`Xhci::hids`] или `None`, если не наше.
+    fn hid_of_event(&self, ev: &[u32; 4]) -> Option<usize> {
         let (slot, dci) = Self::ev_addr(ev);
-        self.kbd
-            .and_then(|ki| self.devs[ki])
-            .is_some_and(|d| d.slot == slot && dci == self.int_dci)
+        self.hids.iter().position(|h| {
+            h.is_some_and(|h| {
+                self.devs[h.di].is_some_and(|d| d.slot == slot) && dci == h.dci
+            })
+        })
     }
 
-    /// Опрос: разобрать пришедшие boot-репорты клавиатуры, отдать НОВЫЕ нажатия в консоль.
+    /// Опрос: разобрать пришедшие boot-репорты, отдать нажатия и движения системе.
     unsafe fn poll_hid(&mut self) {
         // Веха 199.34 — повторы удерживаемой клавиши (см. `usb_hid::tick`).
         crate::usb_hid::tick();
         while let Some(ev) = self.try_event() {
-            if (ev[3] >> 10) & 0x3f != EV_TRANSFER || !self.is_kbd_event(&ev) {
-                continue; // не трансфер либо чужой эндпоинт — не наше дело
+            if (ev[3] >> 10) & 0x3f != EV_TRANSFER {
+                continue;
             }
-            self.take_report();
+            // Веха 196 — кольцо событий ОДНО на всех, и разобрать, чьё завершение пришло,
+            // обязан драйвер: иначе клавиатура съедает репорты указателя и наоборот.
+            let Some(hi) = self.hid_of_event(&ev) else { continue };
+            self.take_report(hi);
         }
     }
 
-    /// Разобрать один пришедший репорт клавиатуры и подставить буфер под следующий.
-    unsafe fn take_report(&mut self) {
+    /// Разобрать один пришедший репорт устройства `hi` и подставить буфер под следующий.
+    unsafe fn take_report(&mut self, hi: usize) {
+        let Some(mut h) = self.hids[hi] else { return };
         // Разбор отчёта — общий с EHCI ([`crate::usb_hid`]): протокол один и тот же, а две
         // копии одного разбора разошлись бы на первой же правке раскладки.
-        let r = core::slice::from_raw_parts(dm(self.int_buf + self.int_slot * 8) as *const u8, 8);
-        crate::usb_hid::report(&mut self.prev, r);
+        let r = core::slice::from_raw_parts(dm(h.buf + h.slot * 8) as *const u8, h.mps as usize);
+        if h.mouse {
+            crate::usb_hid::pointer_report(r);
+        } else {
+            crate::usb_hid::report(&mut h.prev, r);
+        }
         // Этот буфер свободен — вернуть его в кольцо и перейти к следующему по кругу:
         // завершения на одном эндпоинте приходят в том же порядке, в каком поставлены TRB.
-        let slot = self.int_slot;
-        self.queue_report_at(slot);
-        self.int_slot = (self.int_slot + 1) % KBD_REPORTS;
+        let slot = h.slot;
+        h.slot = (h.slot + 1) % KBD_REPORTS;
+        self.hids[hi] = Some(h);
+        self.queue_report_at(hi, slot);
     }
 }
 
 pub fn poll() {
     if let Some(x) = XHCI.lock_irq().as_mut() {
-        if x.int_ring != 0 {
+        if x.hids.iter().any(|h| h.is_some()) {
             unsafe { x.poll_hid() }
         }
     }
 }
 
+
 /// Поднята ли USB-клавиатура. Нужно `irq_mask_stdin`: у USB нет прерывания (опрос), поэтому в
 /// режиме сна-до-ввода таймер держим ВКЛ — иначе на её нажатия ничего не проснётся.
 pub fn has_keyboard() -> bool {
-    XHCI.lock_irq().as_ref().map_or(false, |x| x.int_ring != 0)
+    XHCI.lock_irq().as_ref().map_or(false, |x| x.has_hid(false))
+}
+
+/// Веха 200 — поднят ли USB-УКАЗАТЕЛЬ. Спрашивает композитор через ядро: на машине без PS/2
+/// курсор рисовать не для чего, если указателя нет вовсе.
+pub fn has_pointer() -> bool {
+    XHCI.lock_irq().as_ref().map_or(false, |x| x.has_hid(true))
 }
 
 // ─── накопитель наружу (Веха 196) ─────────────────────────────────────────────────────────────

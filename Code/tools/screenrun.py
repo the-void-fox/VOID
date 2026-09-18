@@ -21,8 +21,13 @@ r"""Прогон VOID с НАСТОЯЩИМ экраном: снимки кад�
     raw <байты>        — то же БЕЗ перевода строки; \e = Esc (для CSI: raw \e[5;2~)
     type <строка>      — набрать строку НА КЛАВИАТУРЕ (PS/2): единственный ввод, доходящий
                          до шелла в ОКНЕ (mode = "wm"), куда serial не идёт вовсе
-    usb <строка>       — то же, но на USB-КЛАВИАТУРЕ (стенд с VOID_QEMU_USB=kbd)
+    usb <строка>       — то же, но на USB-КЛАВИАТУРЕ (стенд: VOID_QEMU_USB=kbd + NO_PS2=1)
     usbhotkey <аккорд> — аккорд на USB-клавиатуре (Super+Return и т.п.)
+    usbmouse <dx> <dy> — подвинуть USB-МЫШЬ (стенд: VOID_QEMU_USB=mouse + NO_PS2=1)
+    usbclick <кнопка>  — щёлкнуть ею же
+                         Все четыре отличаются от PS/2-собратьев только СТЕНДОМ: направить
+                         событие в конкретное устройство QEMU не умеет (см. `hotkey`), поэтому
+                         USB проверяется на машине, где другого ввода нет.
     power              — нажать кнопку питания машины (ACPI-событие)
     mouse <dx> <dy>    — подвинуть мышь (относительное событие)
     click <кнопка>     — нажать и отпустить (left / right / middle)
@@ -126,10 +131,22 @@ qemu = [
     *stand("usb"),
     # Веха 202 — звук (VOID_QEMU_SND=wav:<путь> пишет сыгранное в файл).
     *stand("snd"),
+    # Веха 200 — ТРАССИРОВКА САМОГО QEMU: `VOID_QEMU_TRACE=usb_xhci_*` кладёт рядом с журналом
+    # файл `qemu-trace.log`. Нужна там, где гость молчит, а понять надо, доходит ли до
+    # устройства хоть что-нибудь: свои строки в такой ситуации сказать уже нечего.
+    # Масок можно назвать несколько через запятую — каждая уезжает своим `-trace`: один ключ
+    # с запятыми QEMU понимает не так, как выглядит, и молча включает не то.
+    *[arg for mask in os.environ.get("VOID_QEMU_TRACE", "").split(",") if mask
+      for arg in ("-trace", f"enable={mask},file={os.path.join(outdir, 'qemu-trace.log')}")],
     "-display", "none",
     "-serial", "stdio",
     "-qmp", f"unix:{qmp_path},server,nowait",
 ]
+# Командная строка QEMU — рядом с журналом. Разбираться, ПОЧЕМУ прогон вёл себя не так,
+# гораздо легче, когда видно, какую машину он на самом деле поднял: стенд собирается из
+# переменных окружения, и «забыл переменную» выглядит как «драйвер не работает».
+with open(os.path.join(outdir, "qemu-cmd.txt"), "w") as f:
+    f.write(" ".join(qemu) + "\n")
 log = open(os.path.join(outdir, "serial.log"), "wb")
 p = subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
 
@@ -157,8 +174,15 @@ def call(execute, **args):
         if not line:
             return None
         reply = json.loads(line)
-        if "event" not in reply:
-            return reply
+        if "event" in reply:
+            continue
+        # Ошибку QMP говорим ВСЛУХ. Молчащий отказ здесь дороже всего: сценарий отработает
+        # «успешно», снимок получится, и разбираться потом будешь не с опечаткой в имени
+        # устройства, а с драйвером, который «не видит ввода».
+        if "error" in reply:
+            print(f"QMP: {execute} → {reply['error'].get('desc', reply['error'])}",
+                  file=sys.stderr)
+        return reply
     return None
 
 
@@ -187,10 +211,14 @@ QCODE = {
 def hotkey(combo, device=None):
     """Аккорд как настоящая клавиатура: модификаторы зажимаются и отпускаются вокруг клавиши.
 
-    `device` (Веха 196) — в КАКУЮ клавиатуру. Без него событие уходит туда, куда QEMU считает
-    нужным, то есть в PS/2; с `usbkbd` — именно в USB-клавиатуру на xHCI. Разница не
-    теоретическая: это два совершенно разных пути в ядре, и проверять один вместо другого
-    значит не проверять ничего.
+    Веха 200 — параметр `device` у `input-send-event` адресует ДИСПЛЕЙ (голову при нескольких
+    экранах), а НЕ устройство ввода. Направить событие в конкретную клавиатуру им нельзя: путь
+    вида `/machine/peripheral/usbkbd` QEMU отвергает с `DeviceNotFound`, а идентификатор
+    заставляет его искать консоль с таким именем — и падать. До Вехи 200 этот отказ терялся
+    молча, потому что ответы QMP никто не читал.
+
+    Как адресовать USB-ввод на самом деле: собрать машину БЕЗ PS/2 (`VOID_QEMU_NO_PS2=1`).
+    Тогда USB-устройства — единственные, и событие идёт туда по необходимости, а не по просьбе.
     """
     parts = combo.split("+")
     mods = [QCODE[p] for p in parts[:-1]]
@@ -313,11 +341,32 @@ try:
             # PWRBTN_STS и дёргает SCI — ровно то, что делает настоящая кнопка на ноутбуке.
             call("system_powerdown")
         elif cmd == "usbhotkey":
-            hotkey(arg.strip(), device="/machine/peripheral/usbkbd")
+            hotkey(arg.strip())
         elif cmd == "usb":
             # Веха 196 — набрать на USB-клавиатуре (`VOID_QEMU_USB=kbd`). Отдельный глагол, а не
             # флаг у `type`: в сценарии должно быть видно, КАКОЕ железо проверяется.
-            typewrite(arg, device="/machine/peripheral/usbkbd")
+            typewrite(arg)
+        elif cmd in ("usbmouse", "usbclick"):
+            # Веха 200 — ввод в USB-УКАЗАТЕЛЬ. Адресовать его нечем: параметр `device` у
+            # `input-send-event` означает ДИСПЛЕЙ, а не устройство ввода (см. `hotkey`).
+            # Поэтому проверка идёт на машине БЕЗ PS/2 (`VOID_QEMU_NO_PS2=1`), где USB —
+            # единственный указатель, и события попадают к нему по необходимости.
+            if cmd == "usbclick":
+                btn = arg.strip() or "left"
+                call("input-send-event",
+                     events=[{"type": "btn", "data": {"down": True, "button": btn}}])
+                time.sleep(0.3)
+                call("input-send-event",
+                     events=[{"type": "btn", "data": {"down": False, "button": btn}}])
+            else:
+                dx, dy = (int(v) for v in arg.split())
+                step = 120
+                while dx or dy:
+                    sx = max(-step, min(step, dx))
+                    sy = max(-step, min(step, dy))
+                    call("input-send-event", events=[rel("x", sx), rel("y", sy)])
+                    dx -= sx
+                    dy -= sy
         elif cmd == "mouse":
             # Двигаем ШАГАМИ: в пакете PS/2 смещение — девять знаковых бит, и всё, что больше,
             # мышь просто не умеет сказать. Один вызов с `dx = -3000` доезжал до гостя как
