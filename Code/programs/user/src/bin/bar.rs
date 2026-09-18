@@ -206,8 +206,9 @@ impl ui::Client for Bar {
             // на самой панели колесу делать нечего, а отдавать его невидимому списку значило бы
             // менять состояние того, чего человек не видит.
             Event::Wheel { delta, .. } if self.showing == Menu::Notes => {
-                let total = win::notes(&self.notes_buf).count();
-                if self.notes_scroll.wheel(delta, total, Self::NOTES_SHOWN) {
+                if self.notes_scroll.wheel(
+                    delta, self.notes_row, self.notes_content, self.notes_view,
+                ) {
                     ui::Scope::All
                 } else {
                     ui::Scope::No // упёрлись в край — кадра это не стоит
@@ -367,6 +368,14 @@ struct Bar {
     /// Веха 202.9 — где мы в списке уведомлений. Общий виджет ([`ui::Scroll`]): ступенька
     /// колеса, края и сброс — те же, что у всех прокручиваемых списков системы.
     notes_scroll: ui::Scroll,
+    /// Меры списка с последней отрисовки: высота карточки с зазором, всего и в окне.
+    ///
+    /// Колесо приходит СОБЫТИЕМ, а высоту карточки знает только кадр (она считается по шрифту и
+    /// теме). Immediate-mode тем и живёт: рисование меряет, событие пользуется намерянным. До
+    /// первого кадра прокручивать нечего — там ноль, и колесо просто ничего не сдвинет.
+    notes_row: i32,
+    notes_content: i32,
+    notes_view: i32,
     /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт. Приезжает в снимке состояния.
     dnd: bool,
     /// Какое полотно СЕЙЧАС нарисовано. Отличается от `open` ровно на время ухода: пока оно
@@ -592,6 +601,9 @@ impl Bar {
             notes: 0,
             notes_buf: Vec::new(),
             notes_scroll: ui::Scroll::default(),
+            notes_row: 0,
+            notes_content: 0,
+            notes_view: 0,
             dnd: false,
             showing: Menu::None,
             morph: None,
@@ -754,9 +766,11 @@ impl Bar {
             let n = win::notes_read(&mut buf);
             buf.truncate(n);
             self.notes_buf = buf;
-            // Список стал короче — смещение могло оказаться за его концом.
-            let total = win::notes(&self.notes_buf).count();
-            self.notes_scroll.clamp(total, Self::NOTES_SHOWN);
+            // Список стал короче — смещение могло оказаться за его концом. Меры берём с
+            // последнего кадра: пересчитывать их здесь нечем и незачем, следующий кадр всё
+            // равно уточнит.
+            self.notes_content -= self.notes_row;
+            self.notes_scroll.clamp(self.notes_content, self.notes_view);
             self.mo.set(A_NOTE_GO, 256);
             return true;
         }
@@ -1381,50 +1395,73 @@ impl Bar {
                 Align::Center,
             );
         }
-        // Веха 202.10 — ПОЛОСА ПРОКРУТКИ у списка. Виджет общий ([`ui::Ui::scrollbar`]): он же
-        // у вьювера корней и диспетчера задач, и он же умеет перетаскивание — единственный
-        // способ листать длинный список для мыши без колеса и тачпада без жестов.
+        let note_h = Self::note_h(&*u.font, pad);
+        // Веха 202.9 — подпись «выше N · ещё M» забирает своё место СРАЗУ, до тела: иначе она
+        // рисуется тем, что осталось от `d`, а после пиксельной прокрутки от него ничего не
+        // убывает — и подпись уезжала на самый верх, поверх первой карточки.
+        let hint_r = if total > Self::NOTES_SHOWN { Some(d.cut_bottom(font_h)) } else { None };
+        // Веха 168.2 — сколько осталось от уходящего. Складывается сама карточка, а соседи
+        // съезжают следом сами собой.
+        let go = self.mo.peek(A_NOTE_GO).clamp(0, 256);
+        // Веха 202.11 — прокрутка ПИКСЕЛЬНАЯ: следующая карточка может быть видна наполовину.
+        // Высота содержимого считается по всем записям, а не по видимым, — иначе полоса
+        // прокрутки показывала бы не ту долю, и край списка был бы недостижим.
+        let row = note_h + m;
+        let content = (total as i32 * row - m).max(0);
+        let view = d.h;
+        self.notes_scroll.clamp(content, view);
+        // Запомнить меры для обработчика колеса (см. `Bar::notes_row`).
+        self.notes_row = row;
+        self.notes_content = content;
+        self.notes_view = view;
+
+        // ПОЛОСА ПРОКРУТКИ. Виджет общий ([`ui::Ui::scrollbar`]): он же у вьювера корней и
+        // диспетчера задач, и он же умеет перетаскивание — единственный способ листать длинный
+        // список для мыши без колеса и тачпада без жестов. Единицы ей безразличны, лишь бы
+        // совпадали: здесь это точки, а не записи.
         //
-        // Полоса появляется сама, только когда есть что прокручивать: при видимом целиком списке
-        // она была бы украшением, которое врёт.
-        if total > Self::NOTES_SHOWN {
-            let track = d.cut_right(th.px(4) + m).inset_xy(0, m);
-            if let Some(off) = u.scrollbar(
+        // Появляется сама, только когда есть что прокручивать: при видимом целиком списке она
+        // была бы украшением, которое врёт.
+        if content > view {
+            let track = d.cut_right(th.px(4) + m).inset_xy(0, 0);
+            if let Some(px) = u.scrollbar(
                 Rect::new(track.x + m, track.y, th.px(4), track.h),
-                self.notes_scroll.off,
-                Self::NOTES_SHOWN,
-                total,
+                self.notes_scroll.px as usize,
+                view as usize,
+                content as usize,
                 u.held(),
             ) {
-                if self.notes_scroll.set(off, total, Self::NOTES_SHOWN) {
+                if self.notes_scroll.set(px as i32, content, view) {
                     self.again = true;
                 }
             }
         }
-        let note_h = Self::note_h(&*u.font, pad);
-        // Веха 168.2 — сколько осталось от уходящего. Складывается сама карточка, а соседи
-        // съезжают следом сами собой: они режутся от того же `d`, что и она.
-        let go = self.mo.peek(A_NOTE_GO).clamp(0, 256);
+
+        // Тело списка режется ОКНОМ: карточка, попавшая в него наполовину, наполовину и
+        // рисуется. Без этого клипа половинки вылезали бы за полотно поверх рабочего стола.
+        let window = d;
+        let keep_body = u.c.clip();
+        u.clip(keep_body.intersect(window));
+        let mut y = window.y - self.notes_scroll.px;
         let mut shown = 0usize;
-        // Смещение применяем ЗДЕСЬ, а не при чтении списка: сам список приходит от композитора
-        // целиком и свежим, а прокрутка — это про то, какой его кусок показан сейчас.
-        let skipped = self.notes_scroll.off.min(total.saturating_sub(1));
-        for n in win::notes(&buf).skip(skipped) {
-            if shown >= Self::NOTES_SHOWN {
-                break;
-            }
+        let mut full = 0usize;
+        for n in win::notes(&buf) {
             let leaving = matches!(self.dying, Some(id) if id == 0 || id == n.id);
             let rh = if leaving { note_h * go / 256 } else { note_h };
-            if d.h < rh || rh <= 0 {
-                // Сложилось до нуля — карточки больше нет; место под ней уже отдано соседям.
-                if leaving {
-                    shown += 1;
-                }
+            if rh <= 0 {
+                continue; // сложилось до нуля — карточки больше нет
+            }
+            let r = Rect::new(window.x, y, window.w, rh);
+            y += rh + m * rh / note_h;
+            // Видна ли она хоть краем. Невидимые пропускаем целиком: рисовать под клипом можно,
+            // но это работа впустую, а список бывает длинным.
+            if r.bottom() <= window.y || r.y >= window.bottom() {
                 continue;
             }
             shown += 1;
-            let r = d.cut_top(rh);
-            d.cut_top(m * rh / note_h);
+            if r.y >= window.y && r.bottom() <= window.bottom() {
+                full += 1; // видна целиком — только такие считаются «показанными» в подписи
+            }
             u.card(r);
             // Содержимое режется КАРТОЧКОЙ: текст, уезжающий вместе с её краем, читался бы как
             // второе движение внутри первого — то же правило, что у выезда полотна.
@@ -1446,24 +1483,39 @@ impl Bar {
                 alloc::format!("{from}: {text}")
             };
             u.label(Rect::new(c.x, c.y + font_h, c.w, font_h), &sub, th.muted, Align::Left);
-            let hot = if u.hot(x) { 256 } else { 0 };
-            if u.icon_button(x, ui::icon::CLOSE, hot, false) && self.dying.is_none() {
-                drop_id = Some(n.id);
+            // Крестик — только у карточки, видимой ЦЕЛИКОМ: у обрезанной он либо не виден, либо
+            // виден наполовину, а нажимать вслепую человек не должен.
+            if r.y >= window.y && r.bottom() <= window.bottom() {
+                let hot = if u.hot(x) { 256 } else { 0 };
+                if u.icon_button(x, ui::icon::CLOSE, hot, false) && self.dying.is_none() {
+                    drop_id = Some(n.id);
+                }
             }
             u.clip(keep);
         }
+        u.clip(keep_body);
         self.notes_buf = buf;
         // Сколько не поместилось — вслух: молча спрятанный хвост списка это ровно та ложь,
         // которой в системе быть не должно. С прокруткой этого мало: надо сказать и про то, что
         // осталось ВЫШЕ, иначе человек, прокрутивший список, не поймёт, куда делось начало.
-        let below = total.saturating_sub(skipped + shown);
-        if (skipped > 0 || below > 0) && d.h >= font_h {
-            let more = match (skipped, below) {
+        //
+        // Считаем по ЦЕЛЫМ карточкам: «ещё половина» не то, что человек хочет знать, — он хочет
+        // знать, сколько уведомлений он ещё не видел.
+        if let Some(r) = hint_r {
+            // Карточка, видимая наполовину, в счёт «показанных» не идёт: человек спрашивает,
+            // сколько уведомлений он ещё НЕ ПРОЧИТАЛ, а половину заголовка не читают.
+            let above = self.notes_scroll.rows_above(row);
+            let below = total.saturating_sub(above + full);
+            let more = match (above, below) {
                 (0, b) => ui::f1(ui::t("ещё {}"), &alloc::format!("{b}")),
                 (a, 0) => ui::f1(ui::t("выше {}"), &alloc::format!("{a}")),
-                (a, b) => ui::f2(ui::t("выше {} · ещё {}"), &alloc::format!("{a}"), &alloc::format!("{b}")),
+                (a, b) => ui::f2(
+                    ui::t("выше {} · ещё {}"),
+                    &alloc::format!("{a}"),
+                    &alloc::format!("{b}"),
+                ),
             };
-            u.label(d.cut_top(font_h), &more, th.muted, Align::Right);
+            u.label(r, &more, th.muted, Align::Right);
         }
 
         if dnd_click {
