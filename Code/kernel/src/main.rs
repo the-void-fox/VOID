@@ -291,6 +291,15 @@ pub fn prog_root(name: &str) -> alloc::string::String {
     alloc::format!("bin/{}/{}", arch::ARCH_NAME, short)
 }
 
+/// Веха 202.5 — ЗВУКИ СИСТЕМЫ: файлы, которые едут в образе и доступны как обычные файлы.
+///
+/// Почему в образе, а не «пусть человек принесёт». Звук — часть системы ровно в той же мере,
+/// что обои и шрифт: без него `play` нечем проверить на живой машине, а уведомлению нечем
+/// звучать иначе как синтезированным тоном. Здесь один короткий файл на 68 КиБ, и это дешевле
+/// любого способа его доставить.
+static SOUNDS: &[(&str, &[u8])] =
+    &[("/chime.wav", include_bytes!("../../assets/sounds/chime.wav"))];
+
 /// Веха 146.1 — корень ЯРЛЫКА: `app/<arch>/<имя>` рядом с `bin/<arch>/<имя>`.
 ///
 /// Отдельное пространство имён, а не суффикс у корня программы: ярлык — это ДАННЫЕ о программе, и
@@ -832,6 +841,40 @@ fn seed_programs() {
             migrated += 1; // legacy-корень снят — байты уйдут ближайшим GC
         }
     }
+    // Веха 202.5 — ЗВУКИ: сеются как обычные файлы файловой персоналии, то есть под корнем
+    // `f<путь>` плюс запись в индексе своего каталога (`d<путь>`). Иначе файл существовал бы в
+    // store, но `ls` его не показывал бы, а это ровно то состояние, которое человек читает как
+    // «файла нет» — мы на нём уже постояли, пока искали, куда положить звук для проверки.
+    let mut sounds = 0usize;
+    for (path, bytes) in SOUNDS {
+        let root = alloc::format!("{}{}", void_fs::K_FILE as char, path);
+        let id = object::put(bytes);
+        if object::root(&root) != Some(id) {
+            object::set_root(&root, id);
+        }
+        // Запись в индексе корневого каталога. Имя — без ведущей косой черты.
+        let dir_root = alloc::format!("{}/", void_fs::K_DIR as char);
+        let name = path.trim_start_matches('/').as_bytes();
+        let mut dir = [0u8; void_fs::DIR_MAX];
+        let len = match object::root(&dir_root) {
+            Some(did) => object::with(&did, |b| {
+                let b = b.unwrap_or(&[]);
+                let n = b.len().min(dir.len());
+                dir[..n].copy_from_slice(&b[..n]);
+                n
+            }),
+            None => 0,
+        };
+        let len = if len >= 2 { len } else { dir[..2].fill(0); 2 };
+        if void_fs::idx_type(&dir, len, name).is_none() {
+            let len = void_fs::idx_add(&mut dir, len, name, false);
+            let did = object::put(&dir[..len]);
+            object::set_root(&dir_root, did);
+        }
+        sounds += 1;
+    }
+    let _ = sounds;
+
     // Веха 146.1 — ярлыки: сеются РЯДОМ с программами и ровно тогда, когда программа есть. Корень
     // ярлыка без программы снимается: `install` живёт только на носителе, и его ярлык (появись он)
     // обязан исчезнуть вместе с ним, иначе строка запуска показывала бы то, чего в store нет.
