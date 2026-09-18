@@ -1369,8 +1369,8 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
         "отправить по TCP. Там: nc -l P </dev/null > файл — иначе nc не выйдет сам",
     );
     // Веха 200 — отладка железа на живой машине, без пересборки.
-    help_row(b"mmio A [V]", "слово регистра устройства по физ-адресу (со V — записать)");
-    help_row(b"pci B:D.F O [V]", "слово конфигурации PCI (адрес — как в описи шины)");
+    help_row(b"mmio A...", "слова регистров по физ-адресам; `mmio A = V` — записать");
+    help_row(b"pci B:D.F O...", "слова конфигурации PCI; `pci B:D.F O = V` — записать");
     help_row(b"poweroff", "выключить машину");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
@@ -2336,44 +2336,63 @@ fn num(v: &Value) -> Option<u64> {
     }
 }
 
-/// `(mmio адрес [значение])` — слово регистра устройства по физическому адресу; со вторым
-/// аргументом ЗАПИСАТЬ.
+/// `(mmio адрес…)` — слова регистров устройства по физическим адресам; `(mmio адрес = значение)`
+/// — ЗАПИСАТЬ.
+///
+/// Веха 200.2 — адресов можно несколько, и результат ВОЗВРАЩАЕТСЯ текстом, а не печатается.
+/// Снятый с железа набор чисел человек не должен переписывать руками: `mmio … >> send` уносит
+/// его целиком (см. `pipe_into` — конвейер берёт текст только у того, кто его отдаёт значением).
+/// Запись отделена знаком `=`, иначе второй адрес и записываемое значение неразличимы.
 fn sh_mmio(args: &[Value]) -> Result<Value, EvalError> {
-    let Some(pa) = args.first().and_then(num) else {
-        return Err(EvalError::new("mmio: (mmio \"0xdfc08000\" [значение])"));
-    };
+    const USAGE: &str = "mmio: (mmio \"0xdfc08000\" …) либо (mmio \"0xdfc08000\" = значение)";
+    if args.is_empty() {
+        return Err(EvalError::new(USAGE));
+    }
     let hw = cap_hw("mmio")?;
-    match args.get(1).and_then(num) {
-        Some(v) => {
-            if !sys::hw_write(hw, pa as usize, v as u32) {
-                return Err(EvalError::new(
-                    "mmio: записать не удалось (нет права `w`, адрес не выровнен или это ОЗУ)",
-                ));
-            }
-            sys::write(alloc::format!("{:#x} ← {:#010x}
-", pa, v).as_bytes());
-            Ok(Value::nil())
+    if let Some(i) = args.iter().position(|a| matches!(a, Value::Str(s) if &**s == "=")) {
+        if i != 1 || args.len() != 3 {
+            return Err(EvalError::new("mmio: записывается один адрес за раз"));
         }
-        None => match sys::hw_read(hw, pa as usize) {
+        let (Some(pa), Some(v)) = (num(&args[0]), args.get(2).and_then(num)) else {
+            return Err(EvalError::new(USAGE));
+        };
+        if !sys::hw_write(hw, pa as usize, v as u32) {
+            return Err(EvalError::new(
+                "mmio: записать не удалось (нет права `w`, адрес не выровнен или это ОЗУ)",
+            ));
+        }
+        return Ok(Value::str(&alloc::format!("{:#x} ← {:#010x}", pa, v)));
+    }
+    let mut out = String::new();
+    for a in args {
+        let Some(pa) = num(a) else {
+            return Err(EvalError::new(USAGE));
+        };
+        match sys::hw_read(hw, pa as usize) {
             Some(v) => {
-                sys::write(alloc::format!("{:#x}: {:#010x} ({})
-", pa, v, v).as_bytes());
-                // Печатаем сами: вернуть ещё и значение — напечатать его дважды.
-                Ok(Value::nil())
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&alloc::format!("{:#x}: {:#010x} ({})", pa, v, v));
             }
             // Отказ здесь значит вполне определённое, и это стоит сказать: чаще всего человек
-            // целится в оперативную память, а её ядро закрывает нарочно.
-            None => Err(EvalError::new(
-                "mmio: прочитать не удалось — адрес не выровнен по слову либо это ОЗУ (его нельзя)",
-            )),
-        },
+            // целится в оперативную память, а её ядро закрывает нарочно. Адрес называем: при
+            // списке из пяти регистров «не удалось» без имени виновника бесполезно.
+            None => {
+                return Err(EvalError::new(alloc::format!(
+                    "mmio {:#x}: прочитать не удалось — адрес не выровнен по слову либо это ОЗУ (его нельзя)",
+                    pa
+                )))
+            }
+        }
     }
+    Ok(Value::str(&out))
 }
 
 /// `(pci "шина:устройство.функция" смещение [значение])` — слово конфигурации PCI.
 fn sh_pci(args: &[Value]) -> Result<Value, EvalError> {
     let Some(Value::Str(loc)) = args.first() else {
-        return Err(EvalError::new("pci: (pci \"04:00.0\" \"0x04\" [значение])"));
+        return Err(EvalError::new(PCI_USAGE));
     };
     // `шина:устройство.функция` — та же запись, которой устройства называет опись шины в журнале
     // ядра. Человек копирует строку оттуда, а не считает биты.
@@ -2387,34 +2406,50 @@ fn sh_pci(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::new("pci: устройство 0..1f, функция 0..7"));
     }
     let bdf = b << 8 | d << 3 | f;
-    let Some(off) = args.get(1).and_then(num) else {
-        return Err(EvalError::new("pci: (pci \"04:00.0\" \"0x04\" [значение])"));
-    };
-    let hw = cap_hw("pci")?;
-    match args.get(2).and_then(num) {
-        Some(v) => {
-            if !sys::hw_pci_write(hw, bdf, off as usize, v as u32) {
-                return Err(EvalError::new(
-                    "pci: записать не удалось (нет права `w` либо смещение не то)",
-                ));
-            }
-            sys::write(alloc::format!("{} +{:#x} ← {:#010x}
-", loc, off, v).as_bytes());
-            Ok(Value::nil())
-        }
-        None => match sys::hw_pci_read(hw, bdf, off as usize) {
-            Some(v) => {
-                sys::write(alloc::format!("{} +{:#x}: {:#010x}
-", loc, off, v).as_bytes());
-                // Печатаем сами: вернуть ещё и значение — напечатать его дважды.
-                Ok(Value::nil())
-            }
-            None => Err(EvalError::new(
-                "pci: прочитать не удалось — смещение 0..0xfc, кратное четырём",
-            )),
-        },
+    if args.len() < 2 {
+        return Err(EvalError::new(PCI_USAGE));
     }
+    let hw = cap_hw("pci")?;
+    // Смещений, как и адресов у `mmio`, может быть несколько; запись отделена знаком `=`.
+    if let Some(i) = args.iter().position(|a| matches!(a, Value::Str(s) if &**s == "=")) {
+        if i != 2 || args.len() != 4 {
+            return Err(EvalError::new("pci: записывается одно смещение за раз"));
+        }
+        let (Some(off), Some(v)) = (num(&args[1]), args.get(3).and_then(num)) else {
+            return Err(EvalError::new(PCI_USAGE));
+        };
+        if !sys::hw_pci_write(hw, bdf, off as usize, v as u32) {
+            return Err(EvalError::new(
+                "pci: записать не удалось (нет права `w` либо смещение не то)",
+            ));
+        }
+        return Ok(Value::str(&alloc::format!("{} +{:#x} ← {:#010x}", loc, off, v)));
+    }
+    let mut out = String::new();
+    for a in &args[1..] {
+        let Some(off) = num(a) else {
+            return Err(EvalError::new(PCI_USAGE));
+        };
+        match sys::hw_pci_read(hw, bdf, off as usize) {
+            Some(v) => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&alloc::format!("{} +{:#x}: {:#010x}", loc, off, v));
+            }
+            None => {
+                return Err(EvalError::new(alloc::format!(
+                    "pci +{:#x}: прочитать не удалось — смещение 0..0xfc, кратное четырём",
+                    off
+                )))
+            }
+        }
+    }
+    Ok(Value::str(&out))
 }
+
+/// Как звать `pci` — в одном месте: строка нужна четырежды, и расходиться копиям незачем.
+const PCI_USAGE: &str = "pci: (pci \"04:00.0\" \"0x04\" …) либо (pci \"04:00.0\" \"0x04\" = значение)";
 
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
 /// одностороннее действие над всей системой, и оно названо правом, а не считается общедоступным.
