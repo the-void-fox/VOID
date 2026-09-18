@@ -940,6 +940,7 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         if let Some(m) = msg {
             let mut extra = [0u8; 4];
             let mut extra_len = 0usize;
+            let mut start_after_reply = false;
             let status = match m.op {
                 snd::OP_BEEP if m.len >= 8 => {
                     let hz = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
@@ -1054,6 +1055,13 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
             body[0] = status;
             body[1..1 + extra_len].copy_from_slice(&extra[..extra_len]);
             sys::reply(m.reply_cap, &body[..1 + extra_len]);
+            // Тяжёлое — после ответа: клиент уже свободен и занимается своим делом.
+            if start_after_reply {
+                fill_half(0, &mut src);
+                fill_half(1, &mut src);
+                last_half = 0;
+                playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, FORMAT);
+            }
         }
 
         // Клиент, который замолчал надолго, считается ушедшим: общая память у нас одна, и
