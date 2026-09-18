@@ -162,6 +162,9 @@ fn resolve(rel: &[u8]) -> Vec<u8> {
 static FS_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
 static STORE_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
 static NET_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Веха 202.2 — канал к звуковому серверу. Ищется ПО ИМЕНИ и никогда по позиции: с сетью мы
+/// этот урок уже оплатили заходом (см. ниже).
+static SND_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Разобрать окружение и запомнить права. Зовётся первой строкой `_start`.
 fn resolve_caps() {
@@ -200,6 +203,9 @@ fn resolve_caps() {
         (_, Some(_)) => sys::NO_CAP,
         (_, None) => by_name("NET_SRV", 2),
     };
+    // Звук — по имени, и без запасного позиционного пути: взять «что-то вида 4» значило бы
+    // слать просьбы играть файловому серверу. Нет имени — нет звука, и это честный ответ.
+    SND_CAP.store(sys::snd_cli::find_cap().unwrap_or(sys::NO_CAP), Ordering::Relaxed);
     let net_ok = net != sys::NO_CAP && matches!(sys::cap_info(net), Some((4, _)));
     NET_CAP.store(if net_ok { net } else { sys::NO_CAP }, Ordering::Relaxed);
     if !net_ok {
@@ -240,6 +246,10 @@ fn cap_store() -> usize {
 /// Сетевой сервер.
 fn cap_net() -> usize {
     NET_CAP.load(Ordering::Relaxed)
+}
+/// Звуковой сервер. `NO_CAP` — звука в системе нет, и это нормальный случай.
+fn cap_snd() -> usize {
+    SND_CAP.load(Ordering::Relaxed)
 }
 
 // ── программа ───────────────────────────────────────────────────────────────
@@ -1059,6 +1069,8 @@ fn shell_env() -> Env {
         ("switch", sh_switch),
         ("klog", sh_klog),
         ("send", sh_send),
+        // Веха 202.2 — звук: короткий сигнал.
+        ("beep", sh_beep),
         // Веха 200 — заглянуть в регистры железа (см. `sh_mmio`/`sh_pci`).
         ("mmio", sh_mmio),
         ("pci", sh_pci),
@@ -1368,6 +1380,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
         b"send IP P",
         "отправить по TCP. Там: nc -l P </dev/null > файл — иначе nc не выйдет сам",
     );
+    help_row(b"beep [Hz] [ms]", "короткий сигнал (по умолчанию 880 Гц, 120 мс)");
     // Веха 200 — отладка железа на живой машине, без пересборки.
     help_row(b"mmio A...", "слова регистров по физ-адресам; `mmio A = V` — записать");
     help_row(b"pci B:D.F O...", "слова конфигурации PCI; `pci B:D.F O = V` — записать");
@@ -2333,6 +2346,29 @@ fn num(v: &Value) -> Option<u64> {
             }
         }
         _ => None,
+    }
+}
+
+/// `(beep [частота] [миллисекунды])` — короткий сигнал. Без аргументов — 880 Гц на 120 мс.
+///
+/// Команда шелла, а не программа: звук нужен ровно там, где длинная работа кончилась и человек
+/// смотрит в другую сторону (`rebuild && beep`), — и заводить ради двух чисел отдельный процесс
+/// значило бы платить за него больше, чем стоит сам сигнал.
+fn sh_beep(args: &[Value]) -> Result<Value, EvalError> {
+    let ep = cap_snd();
+    if ep == sys::NO_CAP {
+        return Err(EvalError::new(
+            "beep: звука нет — ни строки `service hda` в поколении, ни звуковой карты в машине",
+        ));
+    }
+    let hz = args.first().and_then(num).unwrap_or(880) as u32;
+    let ms = args.get(1).and_then(num).unwrap_or(120) as u32;
+    match sys::snd_cli::beep(ep, hz, ms) {
+        sys::snd_cli::ST_OK => Ok(Value::nil()),
+        sys::snd_cli::ST_NO_SOUND => Err(EvalError::new(
+            "beep: звука в этой машине нет (сервер `hda` не поднялся — нет звуковой карты)",
+        )),
+        _ => Err(EvalError::new("beep: частота 20..20000 Гц, длительность больше нуля")),
     }
 }
 

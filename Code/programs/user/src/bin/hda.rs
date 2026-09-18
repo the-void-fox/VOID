@@ -34,6 +34,7 @@ extern crate alloc;
 use core::ptr::{read_volatile, write_volatile};
 
 use void_user as sys;
+use void_user::snd_cli as snd;
 
 /// Куча нужна только печати (`format!`): числа этого драйвера человек читает часто.
 #[global_allocator]
@@ -444,28 +445,88 @@ fn sine(phase: u8) -> i16 {
     }
 }
 
-/// Залить буфер тоном: `millis` миллисекунд звука, дальше до конца — тишина.
-fn fill_tone(hz: usize, millis: usize) {
-    let frames = (RATE * millis / 1000).min(PCM_BYTES / 4);
-    // Шаг фазы в неподвижной точке: 256 делений на период, 16 дробных бит.
-    let step = (hz * 256 * 65536 / RATE) as u32;
-    let mut phase: u32 = 0;
-    let buf = PCM_VA as *mut i16;
+/// Источник звука: что играть прямо сейчас.
+///
+/// Тон, а не готовая дорожка, потому что это и есть системный звук: короткий сигнал. Держать
+/// его дорожкой значило бы хранить в памяти то, что считается тремя действиями на отсчёт.
+struct Tone {
+    /// Шаг фазы в неподвижной точке (256 делений на период, 16 дробных бит).
+    step: u32,
+    phase: u32,
+    /// Сколько кадров тона ещё осталось выдать.
+    left: usize,
+    /// Сколько всего было — нужно краям: тон, начатый и оборванный отвесно, даёт щелчок,
+    /// который слышно лучше самого тона.
+    total: usize,
+    /// Сколько кадров тишины выдать ПЕРЕД тоном.
+    ///
+    /// Нужно только что запущенному потоку. Контроллер, пущенный на кольцо, первые десятки
+    /// миллисекунд читает его быстрее реального времени — догоняет то, что «должно было
+    /// прозвучать» с момента запуска, — и начало сигнала съедается. Измерено: у первого сигнала
+    /// после подъёма драйвера нарастание громкости на месте, у каждого следующего (то есть
+    /// после перезапуска потока) звук начинается отвесно, и не хватает ровно сорока с лишним
+    /// миллисекунд. Пусть эти миллисекунды будут тишиной.
+    lead: usize,
+}
+
+/// Сколько кадров занимают края, где громкость нарастает и спадает (по 5 мс).
+const EDGE: usize = RATE / 200;
+
+impl Tone {
+    fn new(hz: u32, ms: u32, lead: usize) -> Self {
+        let frames = (RATE * ms as usize / 1000).max(EDGE * 2);
+        Tone {
+            step: (hz as usize * 256 * 65536 / RATE) as u32,
+            phase: 0,
+            left: frames,
+            total: frames,
+            lead,
+        }
+    }
+
+    fn silent() -> Self {
+        Tone { step: 0, phase: 0, left: 0, total: 0, lead: 0 }
+    }
+
+    /// Следующий отсчёт. Ноль, когда тон кончился, — дальше кольцо доигрывает тишину.
+    fn next(&mut self) -> i16 {
+        if self.lead > 0 {
+            self.lead -= 1;
+            return 0;
+        }
+        if self.left == 0 {
+            return 0;
+        }
+        let done = self.total - self.left;
+        let v = sine((self.phase >> 16) as u8) as i32;
+        // Края: линейный подъём и спад. Дешевле, чем кажется, — деление на константу.
+        let v = if done < EDGE {
+            v * done as i32 / EDGE as i32
+        } else if self.left < EDGE {
+            v * self.left as i32 / EDGE as i32
+        } else {
+            v
+        };
+        self.phase = self.phase.wrapping_add(self.step);
+        self.left -= 1;
+        v as i16
+    }
+}
+
+/// Заполнить ПОЛОВИНУ кольца тем, что даёт источник. Возвращает `true`, если источнику ещё
+/// есть что играть, — а не «были ли ненулевые отсчёты»: тишина перед тоном тоже работа, и
+/// гасить поток на ней значило бы гасить его ровно перед сигналом.
+fn fill_half(half: usize, tone: &mut Tone) -> bool {
+    let frames = PCM_BYTES / 2 / 4;
+    let base = unsafe { (PCM_VA as *mut i16).add(half * frames * 2) };
     for i in 0..frames {
-        let v = sine((phase >> 16) as u8);
+        let v = tone.next();
         unsafe {
-            write_volatile(buf.add(i * 2), v);
-            write_volatile(buf.add(i * 2 + 1), v);
-        }
-        phase = phase.wrapping_add(step);
-    }
-    // Хвост буфера — тишина: контроллер идёт по кольцу и без неё повторил бы обрывок тона.
-    for i in frames..PCM_BYTES / 4 {
-        unsafe {
-            write_volatile(buf.add(i * 2), 0);
-            write_volatile(buf.add(i * 2 + 1), 0);
+            write_volatile(base.add(i * 2), v);
+            write_volatile(base.add(i * 2 + 1), v);
         }
     }
+    tone.left > 0 || tone.lead > 0
 }
 
 // ── подъём контроллера ───────────────────────────────────────────────────────────────────────
@@ -568,22 +629,37 @@ fn stream_start(sd: usize, bdl_pa: usize, bytes: usize) -> bool {
     true
 }
 
+/// Жить дальше БЕЗ звука: отвечать на просьбы «звука нет» и не умирать.
+///
+/// Выйти было бы короче, но дороже для всей системы. Право играть — это канал к этому серверу,
+/// и он роздан всем по конфигу; умерший сервер превращает его в мёртвый дескриптор, а мёртвый
+/// дескриптор отличается от живого только тем, что ядро отказывает по нему молча. Клиент видит
+/// «отказ», не понимая, отказали ему по существу просьбы или в системе просто нет карты, и
+/// сообщает человеку чушь. Поэтому сервер живёт всегда и на всякую просьбу отвечает честно:
+/// звука в этой машине нет. Стоит это одного спящего процесса.
+fn deaf(reason: &str) -> ! {
+    sys::write(alloc::format!("[hda] {} — звука в этой машине не будет\n", reason).as_bytes());
+    let mut req = [0u8; 64];
+    loop {
+        let m = sys::recv(&mut req);
+        sys::reply(m.reply_cap, &[snd::ST_NO_SOUND]);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     if !sys::mmio_map(mmio_cap, MMIO_VA) {
-        w("[hda] окно регистров не замаплено (нет права?)\n");
-        sys::exit(1);
+        deaf("окна регистров нет (звуковой карты в машине не нашлось)");
     }
     let (Some(ring_pa), Some(pcm_pa)) = (
         sys::dma_alloc(dma_cap, RING_VA),
         sys::dma_alloc_pages(dma_cap, PCM_VA, PCM_PAGES),
     ) else {
-        w("[hda] DMA-память не выделена (нет права?)\n");
-        sys::exit(1);
+        deaf("DMA-памяти не дали");
     };
 
     if !controller_up(ring_pa) {
-        sys::exit(1);
+        deaf("контроллер не ожил");
     }
     let version = unsafe { (rd8(0x03), rd8(0x02)) };
     let present = unsafe { rd16(STATESTS) };
@@ -596,14 +672,14 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     );
 
     let Some(path) = find_path() else {
-        w("[hda] выхода у кодека не нашлось — звука не будет; вот что он о себе говорит:\n");
+        w("[hda] выхода у кодека не нашлось; вот что он о себе говорит:\n");
         say_rings();
         for cad in 0..15u8 {
             if present & (1 << cad) != 0 {
                 say_codec(cad);
             }
         }
-        sys::exit(1);
+        deaf("выхода у кодека нет");
     };
     sys::write(
         alloc::format!(
@@ -632,9 +708,8 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         let _ = cmd(path.cad, path.pin, VERB_SET_EAPD, 0x2);
     }
 
-    // Тон и список кусков: две записи по половине буфера. Список из одной записи спецификация
-    // не допускает вовсе — минимум два куска, даже если буфер один.
-    fill_tone(440, 300);
+    // Список кусков: две записи по половине буфера. Из одной записи список спецификация не
+    // допускает вовсе — минимум два куска, даже если память под ними одна.
     let bdl = (RING_VA + BDL_OFF) as *mut u32;
     unsafe {
         for i in 0..2 {
@@ -646,23 +721,98 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
             write_volatile(bdl.add(i * 4 + 3), 0); // прерывание по куску нам не нужно
         }
     }
-
     let sd = out_stream_off();
-    if !stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES) {
-        sys::exit(1);
-    }
+    w("[hda] звук готов, жду просьб\n");
 
-    // Дать буферу проиграться и посмотреть, ШЁЛ ЛИ контроллер по нему: позиция в буфере —
-    // единственное честное свидетельство того, что звук ушёл в железо, а не остался в памяти.
-    sys::sleep_ns(400_000_000);
-    let pos = unsafe { rd32(sd + SD_LPIB) };
-    unsafe { wr32(sd + SD_CTL, 0) }; // остановить поток: DMA-память сейчас уйдёт вместе с нами
-    sys::write(
-        alloc::format!(
-            "[hda] тон 440 Гц сыгран, контроллер прошёл {} байт буфера\n",
-            pos
-        )
-        .as_bytes(),
-    );
-    sys::exit(0);
+    // ── сервер ───────────────────────────────────────────────────────────────────────────────
+    //
+    // Поток железа запускается ТОЛЬКО когда есть что играть, и гасится, как только кончилось.
+    // Иначе контроллер вечно ходил бы по кольцу тишины, а сервер — просыпался бы подсыпать ему
+    // нули: звук в простое стоил бы системе больше, чем звук во время игры (см. «простой жжёт
+    // ядро», Веха 168).
+    //
+    // Пока играем, просыпаемся раз в половину куска: к этому времени контроллер успевает уйти
+    // из той половины, которую мы заполняли, и её можно заполнять снова.
+    let half_ns = (PCM_BYTES / 2 / 4 * 1_000_000_000 / RATE) as u64;
+    /// Тишина перед тоном на только что запущенном потоке — чуть больше измеренной потери.
+    const LEAD_FRAMES: usize = RATE / 16;
+    /// Сколько тихих половин держать поток живым (≈3 секунды): столько стоит не перезапускать.
+    const QUIET_HALVES_OFF: usize = 18;
+    let mut tone = Tone::silent();
+    let mut playing = false;
+    // Половина, в которой контроллер был в прошлый раз. НОЛЬ, а не единица: пущенный поток
+    // начинает с нулевой, и «прошлой» для него сразу является она же. С единицы первое
+    // пробуждение решало, что контроллер только что покинул половину 1, и заполняло её — то
+    // есть затирало ещё не сыгранное. Слышно это как звук, обрывающийся на середине.
+    let mut last_half = 0usize;
+    let mut quiet_halves = 0usize;
+    let mut req = [0u8; 64];
+    loop {
+        let msg = if playing {
+            sys::recv_timeout(&mut req, half_ns / 2)
+        } else {
+            Some(sys::recv(&mut req))
+        };
+        if let Some(m) = msg {
+            let status = match m.op {
+                snd::OP_BEEP if m.len >= 8 => {
+                    let hz = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+                    let ms = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
+                    if !(20..=20_000).contains(&hz) || ms == 0 {
+                        snd::ST_BAD
+                    } else if playing {
+                        // Поток уже идёт — трогать его нельзя: перезапуск съедает начало звука
+                        // (см. `Tone::lead`) и даёт щелчок. Просто меняем источник, а в кольцо
+                        // новый тон попадёт ближайшей подкачкой.
+                        tone = Tone::new(hz, ms.min(snd::MAX_MS), 0);
+                        quiet_halves = 0;
+                        snd::ST_OK
+                    } else {
+                        tone = Tone::new(hz, ms.min(snd::MAX_MS), LEAD_FRAMES);
+                        // Обе половины заполняются ДО запуска: контроллер, пущенный на кольцо, в
+                        // котором ещё нет звука, честно сыграет его пустоту.
+                        fill_half(0, &mut tone);
+                        fill_half(1, &mut tone);
+                        last_half = 0;
+                        quiet_halves = 0;
+                        playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES);
+                        if playing { snd::ST_OK } else { snd::ST_NO_SOUND }
+                    }
+                }
+                snd::OP_HUSH => {
+                    tone = Tone::silent();
+                    if playing {
+                        unsafe { wr32(sd + SD_CTL, 0) };
+                        playing = false;
+                    }
+                    snd::ST_OK
+                }
+                _ => snd::ST_BAD,
+            };
+            sys::reply(m.reply_cap, &[status]);
+        }
+
+        if !playing {
+            continue;
+        }
+        // Где контроллер — там трогать нельзя; заполняем ту половину, которую он прошёл.
+        let pos = unsafe { rd32(sd + SD_LPIB) } as usize;
+        let cur = (pos / (PCM_BYTES / 2)).min(1);
+        if cur != last_half {
+            if fill_half(last_half, &mut tone) {
+                quiet_halves = 0;
+            } else {
+                quiet_halves += 1;
+            }
+            last_half = cur;
+        }
+        // Поток гасится НЕ сразу после звука, а через несколько секунд тишины. Причина в цене
+        // перезапуска: он съедает начало следующего сигнала и даёт щелчок, а серия сигналов
+        // подряд — обычное дело (уведомление за уведомлением). Зато молчащая система не платит
+        // за звук ничем: погашенный поток не читает память, а сервер спит в `recv` без срока.
+        if quiet_halves >= QUIET_HALVES_OFF {
+            unsafe { wr32(sd + SD_CTL, 0) };
+            playing = false;
+        }
+    }
 }

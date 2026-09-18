@@ -79,7 +79,8 @@ const DEFAULT_GEN3: &str = "\
 # VOID — поколение с графическим терминалом (Веха 97)
 service posixfs store:rw
 service net-srv dev:net:rw
-shell term endpoint:posixfs store:rwx mmio:fb power env
+service hda mmio:hda dma
+shell term endpoint:posixfs store:rwx mmio:fb power endpoint:hda env
 ";
 
 /// Четвёртое поколение (`gen4`, Веха 129) — **оконный режим**: композитор владеет экраном, а
@@ -116,7 +117,17 @@ const DEFAULT_GEN4: &str = "\
 # под выключатель сети). `!` — чтобы канал не достался каждому окну наследством.
 service posixfs store:rw
 service net-srv dev:net:rw
-shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! hwprobe:rwg! env
+# Веха 202 — ЗВУК: драйвер Intel HDA обычным сервисом, под правом на окно регистров и DMA.
+# Машина без звуковой карты просто не поднимет его — строка при этом остаётся верной.
+service hda mmio:hda dma
+# Канал к звуку — БЕЗ пометки «не наследуется», в отличие от экрана, выключения и сети. Играть
+# умеет любая программа в любой системе, и прятать за правом то, что делается тремя строками в
+# своём процессе, значит не защитить, а усложнить: окну звук нужен ровно так же, как шеллу.
+#
+# Стоит он В КОНЦЕ списка, и это не косметика: порядок прав значим (Веха 99), дети наследуют его
+# как есть, и вставленное в середину сдвигает всё, что правее. Проверено на себе — звук, дописанный
+# третьим, сдвинул остальные права, и окно приветствия перестало отдавать композитору свой буфер.
+shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! hwprobe:rwg! endpoint:hda env
 desktop sysview taskmgr
 desktop sysview bar
 desktop power bar
@@ -741,34 +752,6 @@ pub fn boot() {
             }
             // Драйвер едет семенем в образе ядра (Веха 132.1). Нет его — карта без драйвера.
             None => println!("  [init] AR8151 есть, а драйвера в образе нет"),
-        }
-    }
-
-    // Веха 202 — ЗВУК. Драйвер Intel HDA живёт в обычном процессе: MMIO — окно регистров,
-    // DMA — кольца команд и сам буфер звука. Прерывание ему НЕ выдаётся, и это не упущение:
-    // линию INTx мы умеем заводить ровно одному устройству (`intx_irq_setup` глушит её всем
-    // остальным, иначе разделяемая линия устраивает шторм), и занята она сетевой картой.
-    // Вывод звука прекрасно живёт опросом позиции в буфере — как AHCI, NVMe и xHCI у нас.
-    //
-    // Молчит, если контроллера нет: на стенде он появляется только по `VOID_QEMU_SND=…`.
-    #[cfg(target_arch = "x86_64")]
-    if let Some((base, bdf)) = arch::probe_class_bar0(0x04, 0x03, 0x4000) {
-        println!(
-            "  [init] звуковой контроллер HDA на {:02x}:{:02x}.{}, регистры {:#x}",
-            bdf >> 8, bdf >> 3 & 0x1f, bdf & 7, base,
-        );
-        match spawn("hda") {
-            Some(pid) => match (mint_cap(pid, "mmio:hda", &[]), mint_cap(pid, "dma", &[])) {
-                (Some(m), Some(d)) => {
-                    proc::set_arg(pid, m);
-                    proc::set_arg2(pid, d);
-                    proc::push_start_cap(pid, m);
-                    proc::push_start_cap(pid, d);
-                    println!("  [init] драйвер звука hda P{} — выданы MMIO+DMA права", pid);
-                }
-                _ => println!("  [init] hda: MMIO/DMA права выдать не удалось"),
-            },
-            None => println!("  [init] HDA есть, а драйвера в образе нет"),
         }
     }
 
