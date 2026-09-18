@@ -207,14 +207,11 @@ impl ui::Client for Bar {
             // менять состояние того, чего человек не видит.
             Event::Wheel { delta, .. } if self.showing == Menu::Notes => {
                 let total = win::notes(&self.notes_buf).count();
-                let max = total.saturating_sub(Self::NOTES_SHOWN);
-                let off = if delta < 0 { self.notes_off + 1 } else { self.notes_off.saturating_sub(1) };
-                let off = off.min(max);
-                if off == self.notes_off {
-                    return ui::Scope::No; // упёрлись в край — кадра не надо
+                if self.notes_scroll.wheel(delta, total, Self::NOTES_SHOWN) {
+                    ui::Scope::All
+                } else {
+                    ui::Scope::No // упёрлись в край — кадра это не стоит
                 }
-                self.notes_off = off;
-                ui::Scope::All
             }
             Event::Resize { w, h } => {
                 self.screen(w as i32, h as i32);
@@ -367,13 +364,9 @@ struct Bar {
     /// открытии меню. Список не держим постоянно: он нужен ровно тогда, когда на него смотрят.
     notes: u8,
     notes_buf: Vec<u8>,
-    /// Веха 202.9 — сколько уведомлений ПРОКРУЧЕНО вверх (сколько пропущено сверху списка).
-    ///
-    /// До этой вехи хвост списка был недостижим: помещается шесть, остальное честно считалось
-    /// строкой «ещё N», но добраться до него было нечем. Смещение живёт в записях, а не в
-    /// пикселях, потому что единица здесь — уведомление: прокрутка на полкарточки не значит
-    /// ничего, а вот «показать следующее» значит.
-    notes_off: usize,
+    /// Веха 202.9 — где мы в списке уведомлений. Общий виджет ([`ui::Scroll`]): ступенька
+    /// колеса, края и сброс — те же, что у всех прокручиваемых списков системы.
+    notes_scroll: ui::Scroll,
     /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт. Приезжает в снимке состояния.
     dnd: bool,
     /// Какое полотно СЕЙЧАС нарисовано. Отличается от `open` ровно на время ухода: пока оно
@@ -598,7 +591,7 @@ impl Bar {
             grown: false,
             notes: 0,
             notes_buf: Vec::new(),
-            notes_off: 0,
+            notes_scroll: ui::Scroll::default(),
             dnd: false,
             showing: Menu::None,
             morph: None,
@@ -757,12 +750,13 @@ impl Bar {
         if self.dying.is_some() && self.mo.peek(A_NOTE_GO) == 0 {
             let id = self.dying.take().unwrap_or(0);
             win::note_drop(id);
-            // Список стал короче — смещение может указывать за его конец.
-            self.notes_off = 0;
             let mut buf = alloc::vec![0u8; 8 * 1024];
             let n = win::notes_read(&mut buf);
             buf.truncate(n);
             self.notes_buf = buf;
+            // Список стал короче — смещение могло оказаться за его концом.
+            let total = win::notes(&self.notes_buf).count();
+            self.notes_scroll.clamp(total, Self::NOTES_SHOWN);
             self.mo.set(A_NOTE_GO, 256);
             return true;
         }
@@ -786,7 +780,7 @@ impl Bar {
                 self.notes_buf = buf;
                 // Открыли заново — показываем СВЕЖИЕ, а не то место, где закончили в прошлый
                 // раз. Список пришёл другой, и старое смещение указывало бы в него наугад.
-                self.notes_off = 0;
+                self.notes_scroll.reset();
             }
             Menu::None => {}
         }
@@ -1387,6 +1381,26 @@ impl Bar {
                 Align::Center,
             );
         }
+        // Веха 202.10 — ПОЛОСА ПРОКРУТКИ у списка. Виджет общий ([`ui::Ui::scrollbar`]): он же
+        // у вьювера корней и диспетчера задач, и он же умеет перетаскивание — единственный
+        // способ листать длинный список для мыши без колеса и тачпада без жестов.
+        //
+        // Полоса появляется сама, только когда есть что прокручивать: при видимом целиком списке
+        // она была бы украшением, которое врёт.
+        if total > Self::NOTES_SHOWN {
+            let track = d.cut_right(th.px(4) + m).inset_xy(0, m);
+            if let Some(off) = u.scrollbar(
+                Rect::new(track.x + m, track.y, th.px(4), track.h),
+                self.notes_scroll.off,
+                Self::NOTES_SHOWN,
+                total,
+                u.held(),
+            ) {
+                if self.notes_scroll.set(off, total, Self::NOTES_SHOWN) {
+                    self.again = true;
+                }
+            }
+        }
         let note_h = Self::note_h(&*u.font, pad);
         // Веха 168.2 — сколько осталось от уходящего. Складывается сама карточка, а соседи
         // съезжают следом сами собой: они режутся от того же `d`, что и она.
@@ -1394,7 +1408,7 @@ impl Bar {
         let mut shown = 0usize;
         // Смещение применяем ЗДЕСЬ, а не при чтении списка: сам список приходит от композитора
         // целиком и свежим, а прокрутка — это про то, какой его кусок показан сейчас.
-        let skipped = self.notes_off.min(total.saturating_sub(1));
+        let skipped = self.notes_scroll.off.min(total.saturating_sub(1));
         for n in win::notes(&buf).skip(skipped) {
             if shown >= Self::NOTES_SHOWN {
                 break;

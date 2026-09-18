@@ -134,15 +134,13 @@ impl List {
     /// Крутится СПИСОК, а не выбор: выбранное остаётся на месте, пока человек смотрит, что рядом.
     /// Так ведут себя списки везде, где их крутят мышью.
     pub fn wheel(&mut self, delta: i8) -> bool {
-        const STEP: usize = 3;
-        let max = self.hits.len().saturating_sub(self.rows);
-        let was = self.top;
-        self.top = if delta > 0 {
-            self.top.saturating_sub(STEP)
-        } else {
-            (self.top + STEP).min(max)
-        };
-        self.top != was
+        // Ступенька — общая для системы ([`super::Scroll::STEP`]): список, панель уведомлений и
+        // всё следующее обязаны листаться одинаково, иначе «медленно» и «быстро» будут зависеть
+        // от того, на что смотришь.
+        let mut sc = super::Scroll { off: self.top };
+        let moved = sc.wheel(delta, self.hits.len(), self.rows);
+        self.top = sc.off;
+        moved
     }
 
     /// Клавиша списка. Enter, Escape и свои аккорды сюда не входят — они значат разное у разных

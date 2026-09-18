@@ -63,6 +63,8 @@ pub mod font;
 pub mod i18n;
 pub mod icon;
 pub mod list;
+/// Веха 202.10 — прокрутка списка: смещение в записях, ступенька колеса, края.
+pub mod scroll;
 pub mod paint;
 pub mod text;
 pub mod theme;
@@ -80,6 +82,7 @@ pub use edit::Edit;
 pub use i18n::{f1, f2, f3, t};
 #[allow(unused_imports)]
 pub use list::{Hit, List};
+pub use scroll::Scroll;
 pub use paint::{Align, Canvas, Rect, Rgba};
 pub use text::Font;
 pub use theme::Theme;
