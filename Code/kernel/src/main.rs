@@ -272,6 +272,8 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 202 — драйвер звука (Intel HDA) в обычном процессе: MMIO-окно регистров и DMA-буфер.
     // x86-only — звуковой шины на riscv-стенде нет вовсе.
     ("hda", include_bytes!(env!("PROG_HDA"))),
+    // Веха 202.4 — проигрыватель WAV поверх того же сервера.
+    ("play", include_bytes!(env!("PROG_PLAY"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

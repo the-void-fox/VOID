@@ -96,6 +96,32 @@ const SD_CTL_RUN: u32 = 1 << 1;
 /// кладёт данные «в поток N», кодек берёт их «из потока N». Ноль означает «не назначен».
 const STREAM_TAG: u32 = 1;
 
+/// Слово формата для частоты: 16 бит, два канала. `None` — такой частоты у HDA нет.
+///
+/// Частот в спецификации ровно два семейства — от 48 кГц и от 44.1 (бит 14), и каждое делится
+/// и умножается целыми множителями. Пересчитывать чужую частоту в свою (ресемплинг) мы не
+/// станем: кодек умеет и ту и другую сам, а честно сказанное «такой частоты не умею» лучше
+/// тихо испорченного звука.
+fn fmt_for(rate: u32) -> Option<u16> {
+    // Биты слова: 14 — семейство (0 = от 48 кГц, 1 = от 44.1), 13:11 — множитель,
+    // 10:8 — делитель, 6:4 — разрядность (001 = 16 бит), 3:0 — каналы минус один.
+    const BITS16_STEREO: u16 = 0x0011;
+    let (base, mult, div) = match rate {
+        192_000 => (0, 3, 0),
+        176_400 => (1, 3, 0),
+        96_000 => (0, 1, 0),
+        88_200 => (1, 1, 0),
+        48_000 => (0, 0, 0),
+        44_100 => (1, 0, 0),
+        32_000 => (0, 1, 2), // 48 × 2 ÷ 3 — не делением, а дробью: в HDA она задаётся так
+        24_000 => (0, 0, 1),
+        22_050 => (1, 0, 1),
+        16_000 => (0, 0, 2),
+        _ => return None,
+    };
+    Some((base as u16) << 14 | (mult as u16) << 11 | (div as u16) << 8 | BITS16_STEREO)
+}
+
 /// Формат: 48 кГц, 16 бит, два канала. Разложение по битам регистра — база 48 кГц (бит 14 = 0),
 /// без умножения и деления, `001` = 16 бит, `0001` = два канала.
 const FORMAT: u16 = 0x0011;
@@ -515,20 +541,87 @@ impl Tone {
     }
 }
 
+/// Поток из общей памяти: кольцо, которое пишет клиент, а читаем мы.
+///
+/// Позиции — счётчики в байтах от начала потока, а не индексы: так «пусто» и «полно» не
+/// путаются между собой, и не нужно держать отдельный признак.
+struct Ring {
+    va: usize,
+    len: usize,
+    /// Докуда дописал клиент и докуда дочитали мы.
+    write: u32,
+    read: u32,
+    cap: usize,
+    /// Когда клиент в последний раз о себе напоминал: умерший клиент иначе держал бы общую
+    /// память вечно, а место в ней — единственное.
+    seen_ns: u64,
+}
+
+impl Ring {
+    /// Следующий отсчёт или `None`, если клиент не успел дописать.
+    fn next(&mut self) -> Option<i16> {
+        if self.read.wrapping_add(2) > self.write {
+            return None;
+        }
+        let at = (self.read as usize) % self.len;
+        // Кадр может лежать на стыке конца кольца и начала — читаем побайтно, это дешевле
+        // ветвления на каждый отсчёт.
+        let lo = unsafe { read_volatile((self.va + at) as *const u8) };
+        let hi = unsafe { read_volatile((self.va + (at + 1) % self.len) as *const u8) };
+        self.read = self.read.wrapping_add(2);
+        Some(i16::from_le_bytes([lo, hi]))
+    }
+}
+
+/// Что играем сейчас.
+enum Source {
+    Tone(Tone),
+    Stream(Ring),
+}
+
+impl Source {
+    fn next(&mut self) -> i16 {
+        match self {
+            Source::Tone(t) => t.next(),
+            Source::Stream(r) => r.next().unwrap_or(0),
+        }
+    }
+
+    /// Есть ли ещё что играть (иначе поток пора гасить).
+    fn alive(&self) -> bool {
+        match self {
+            Source::Tone(t) => t.left > 0 || t.lead > 0,
+            Source::Stream(r) => r.read.wrapping_add(2) <= r.write,
+        }
+    }
+}
+
 /// Заполнить ПОЛОВИНУ кольца тем, что даёт источник. Возвращает `true`, если источнику ещё
 /// есть что играть, — а не «были ли ненулевые отсчёты»: тишина перед тоном тоже работа, и
 /// гасить поток на ней значило бы гасить его ровно перед сигналом.
-fn fill_half(half: usize, tone: &mut Tone) -> bool {
+fn fill_half(half: usize, src: &mut Source) -> bool {
     let frames = PCM_BYTES / 2 / 4;
     let base = unsafe { (PCM_VA as *mut i16).add(half * frames * 2) };
-    for i in 0..frames {
-        let v = tone.next();
-        unsafe {
-            write_volatile(base.add(i * 2), v);
-            write_volatile(base.add(i * 2 + 1), v);
+    match src {
+        // Тон моно по своей природе: один отсчёт в оба канала.
+        Source::Tone(_) => {
+            for i in 0..frames {
+                let v = src.next();
+                unsafe {
+                    write_volatile(base.add(i * 2), v);
+                    write_volatile(base.add(i * 2 + 1), v);
+                }
+            }
+        }
+        // Поток уже стерео: отсчёты идут парами, как в файле.
+        Source::Stream(_) => {
+            for i in 0..frames * 2 {
+                let v = src.next();
+                unsafe { write_volatile(base.add(i), v) };
+            }
         }
     }
-    tone.left > 0 || tone.lead > 0
+    src.alive()
 }
 
 // ── чипсет: то, чего нет в спецификации HDA, но без чего она не работает ─────────────────────
@@ -658,8 +751,8 @@ fn out_stream_off() -> usize {
     0x80 + iss * 0x20
 }
 
-/// Завести поток вывода на готовый буфер.
-fn stream_start(sd: usize, bdl_pa: usize, bytes: usize) -> bool {
+/// Завести поток вывода на готовый буфер в заданном формате.
+fn stream_start(sd: usize, bdl_pa: usize, bytes: usize, fmt: u16) -> bool {
     unsafe {
         // Сброс дескриптора — с тем же рукопожатием, что у CORB.
         wr32(sd + SD_CTL, SD_CTL_SRST);
@@ -675,7 +768,7 @@ fn stream_start(sd: usize, bdl_pa: usize, bytes: usize) -> bool {
         wr8(sd + SD_STS, 0x1c); // снять залипшие признаки (пишутся единицей)
         wr32(sd + SD_CBL, bytes as u32);
         wr16(sd + SD_LVI, 1); // две записи в списке кусков
-        wr16(sd + SD_FMT, FORMAT);
+        wr16(sd + SD_FMT, fmt);
         wr32(sd + SD_BDPL, bdl_pa as u32);
         wr32(sd + SD_BDPU, (bdl_pa as u64 >> 32) as u32);
         // Номер потока — в старшие биты управления; им контроллер и кодек узнают друг друга.
@@ -819,7 +912,15 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     const LEAD_FRAMES: usize = RATE / 16;
     /// Сколько тихих половин держать поток живым (≈3 секунды): столько стоит не перезапускать.
     const QUIET_HALVES_OFF: usize = 18;
-    let mut tone = Tone::silent();
+    /// Куда отображаем кольцо клиента. Одно место: поток у нас один.
+    const RING_CLIENT_VA: usize = 0x5200_0000;
+    /// Сколько ждать напоминаний от клиента, прежде чем считать его ушедшим.
+    const CLIENT_SILENCE_NS: u64 = 10_000_000_000;
+
+    let mut src = Source::Tone(Tone::silent());
+    /// Формат, в котором сейчас настроен кодек: поток запускается не там, где формат менялся
+    /// (на `OP_OPEN`), а позже — когда клиент накопит данных.
+    let mut cur_fmt = FORMAT;
     let mut playing = false;
     // Половина, в которой контроллер был в прошлый раз. НОЛЬ, а не единица: пущенный поток
     // начинает с нулевой, и «прошлой» для него сразу является она же. С единицы первое
@@ -837,33 +938,110 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
             Some(sys::recv(&mut req))
         };
         if let Some(m) = msg {
+            let mut extra = [0u8; 4];
+            let mut extra_len = 0usize;
             let status = match m.op {
                 snd::OP_BEEP if m.len >= 8 => {
                     let hz = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
                     let ms = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
                     if !(20..=20_000).contains(&hz) || ms == 0 {
                         snd::ST_BAD
-                    } else if playing {
-                        // Поток уже идёт — трогать его нельзя: перезапуск съедает начало звука
-                        // (см. `Tone::lead`) и даёт щелчок. Просто меняем источник, а в кольцо
-                        // новый тон попадёт ближайшей подкачкой.
-                        tone = Tone::new(hz, ms.min(snd::MAX_MS), 0);
-                        quiet_halves = 0;
-                        snd::ST_OK
+                    } else if matches!(src, Source::Stream(_)) {
+                        // Микшера у нас нет, и сигнал поверх музыки пришлось бы либо сложить с
+                        // ней (это и есть микшер), либо оборвать её. Второе — обман: человек
+                        // просил играть. Честнее сказать занято.
+                        snd::ST_BUSY
                     } else {
-                        tone = Tone::new(hz, ms.min(snd::MAX_MS), LEAD_FRAMES);
-                        // Обе половины заполняются ДО запуска: контроллер, пущенный на кольцо, в
-                        // котором ещё нет звука, честно сыграет его пустоту.
-                        fill_half(0, &mut tone);
-                        fill_half(1, &mut tone);
-                        last_half = 0;
+                        let lead = if playing { 0 } else { LEAD_FRAMES };
+                        // Сигнал всегда на своей частоте: генератор считает при 48 кГц, и
+                        // играть его в формате, оставшемся от чужой дорожки, значило бы врать
+                        // на высоту тона.
+                        if cur_fmt != FORMAT {
+                            let _ = cmd(path.cad, path.dac, VERB_SET_STREAM_FORMAT, FORMAT as u32);
+                            cur_fmt = FORMAT;
+                        }
+                        src = Source::Tone(Tone::new(hz, ms.min(snd::MAX_MS), lead));
                         quiet_halves = 0;
-                        playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES);
+                        if !playing {
+                            // Обе половины заполняются ДО запуска: контроллер, пущенный на
+                            // кольцо, в котором ещё нет звука, честно сыграет его пустоту.
+                            fill_half(0, &mut src);
+                            fill_half(1, &mut src);
+                            last_half = 0;
+                            playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, FORMAT);
+                        }
                         if playing { snd::ST_OK } else { snd::ST_NO_SOUND }
                     }
                 }
+                snd::OP_OPEN if m.len >= 4 && m.cap != sys::NO_CAP => {
+                    let rate = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+                    match (fmt_for(rate), &src) {
+                        (None, _) => snd::ST_BAD,
+                        (_, Source::Stream(_)) => snd::ST_BUSY,
+                        (Some(fmt), _) => match sys::shm_map(m.cap, RING_CLIENT_VA) {
+                            None => snd::ST_BAD,
+                            Some(len) => {
+                                // Формат меняется у ОБОИХ концов: у дескриптора потока и у
+                                // конвертера кодека. Сказать только одному — получить скорость,
+                                // не равную задуманной, то есть писк вместо музыки.
+                                let _ = cmd(path.cad, path.dac, VERB_SET_STREAM_FORMAT, fmt as u32);
+                                cur_fmt = fmt;
+                                src = Source::Stream(Ring {
+                                    va: RING_CLIENT_VA,
+                                    len,
+                                    write: 0,
+                                    read: 0,
+                                    cap: m.cap,
+                                    seen_ns: sys::monotonic_ns(),
+                                });
+                                quiet_halves = 0;
+                                if playing {
+                                    unsafe { wr32(sd + SD_CTL, 0) };
+                                }
+                                // Поток пойдёт с первым `OP_ADVANCE`: пускать его сейчас
+                                // значило бы сыграть пустое кольцо.
+                                playing = false;
+                                snd::ST_OK
+                            }
+                        },
+                    }
+                }
+                snd::OP_ADVANCE if m.len >= 4 => {
+                    let w = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+                    match &mut src {
+                        Source::Stream(r) => {
+                            r.write = w;
+                            r.seen_ns = sys::monotonic_ns();
+                            extra[..4].copy_from_slice(&r.read.to_le_bytes());
+                            extra_len = 4;
+                            if !playing && r.write >= PCM_BYTES as u32 {
+                                // Ждём, пока клиент накопит ЦЕЛЫЙ буфер, а не половину: перед
+                                // запуском мы заполняем обе половины, и если звука хватило
+                                // только на первую, вторая уедет тишиной — в записи это дыра
+                                // ровно в половину кольца, и слышно её как проглоченную ноту.
+                                fill_half(0, &mut src);
+                                fill_half(1, &mut src);
+                                last_half = 0;
+                                quiet_halves = 0;
+                                playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, cur_fmt);
+                            }
+                            snd::ST_OK
+                        }
+                        _ => snd::ST_BAD,
+                    }
+                }
+                snd::OP_CLOSE => {
+                    if let Source::Stream(r) = &src {
+                        sys::shm_unmap(r.cap, r.va);
+                    }
+                    src = Source::Tone(Tone::silent());
+                    snd::ST_OK
+                }
                 snd::OP_HUSH => {
-                    tone = Tone::silent();
+                    if let Source::Stream(r) = &src {
+                        sys::shm_unmap(r.cap, r.va);
+                    }
+                    src = Source::Tone(Tone::silent());
                     if playing {
                         unsafe { wr32(sd + SD_CTL, 0) };
                         playing = false;
@@ -872,7 +1050,19 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
                 }
                 _ => snd::ST_BAD,
             };
-            sys::reply(m.reply_cap, &[status]);
+            let mut body = [0u8; 8];
+            body[0] = status;
+            body[1..1 + extra_len].copy_from_slice(&extra[..extra_len]);
+            sys::reply(m.reply_cap, &body[..1 + extra_len]);
+        }
+
+        // Клиент, который замолчал надолго, считается ушедшим: общая память у нас одна, и
+        // держать её ради процесса, которого, возможно, уже нет, значит не дать играть никому.
+        if let Source::Stream(r) = &src {
+            if sys::monotonic_ns().saturating_sub(r.seen_ns) > CLIENT_SILENCE_NS {
+                sys::shm_unmap(r.cap, r.va);
+                src = Source::Tone(Tone::silent());
+            }
         }
 
         if !playing {
@@ -882,7 +1072,7 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         let pos = unsafe { rd32(sd + SD_LPIB) } as usize;
         let cur = (pos / (PCM_BYTES / 2)).min(1);
         if cur != last_half {
-            if fill_half(last_half, &mut tone) {
+            if fill_half(last_half, &mut src) {
                 quiet_halves = 0;
             } else {
                 quiet_halves += 1;
