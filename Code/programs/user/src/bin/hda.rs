@@ -123,6 +123,8 @@ const PARAM_WIDGET_CAP: u32 = 0x09;
 const PARAM_PIN_CAP: u32 = 0x0c;
 const PARAM_AMP_OUT_CAP: u32 = 0x12;
 const PARAM_CONN_LEN: u32 = 0x0e;
+/// Какие частоты и разрядности умеет конвертер (биты частот — 0..11, разрядностей — 16..20).
+const PARAM_PCM: u32 = 0x0a;
 
 const WIDGET_DAC: u32 = 0x0;
 const WIDGET_MIXER: u32 = 0x2;
@@ -529,6 +531,60 @@ fn fill_half(half: usize, tone: &mut Tone) -> bool {
     tone.left > 0 || tone.lead > 0
 }
 
+// ── чипсет: то, чего нет в спецификации HDA, но без чего она не работает ─────────────────────
+
+/// Смещения в конфигурации PCI, которые трогает Linux (`azx_init_pci`) — и не от хорошей жизни.
+const PCI_VENDOR: usize = 0x00;
+const PCI_TCSEL: usize = 0x44;
+const INTEL_DEVC: usize = 0x78;
+const INTEL_NOSNOOP: u32 = 1 << 11;
+const ATI_MISC_CNTR2: usize = 0x42;
+const ATI_SNOOP_ON: u32 = 0x02;
+
+/// Подготовить контроллер СРЕДСТВАМИ ЧИПСЕТА: класс трафика и слежение за кэшем.
+///
+/// Обе настройки живут в конфигурации PCI, обеих нет в спецификации HDA, и обе решают, будет
+/// звук или будет треск.
+///
+/// **Класс трафика (`TCSEL`).** Linux чистит младшие три бита с комментарием «clear TCSEL to
+/// clear playback on some HD Audio codecs» — то есть на части чипсетов воспроизведение без
+/// этого попросту сломано. Прошивка оставляет там что угодно.
+///
+/// **Слежение за кэшем (snoop).** Вот это главное. Если у контроллера выставлен `NOSNOOP`, его
+/// обращения к памяти идут МИМО кэш-когерентности: он читает то, что лежит в оперативной
+/// памяти, а наши только что записанные отсчёты в этот момент могут ещё сидеть в кэше
+/// процессора. Контроллер играет содержимое памяти «как получилось» — обрывки прошлого звука,
+/// нули, мусор. На слух это ровно треск, и он не воспроизводится в QEMU вовсе: у эмулятора нет
+/// ни кэша, ни разницы между «записал» и «дошло до памяти».
+///
+/// Регистр у каждого вендора свой, общего нет — поэтому смотрим, чей это чипсет.
+fn chipset_prepare(mmio_cap: usize) -> (u16, u16) {
+    let id = sys::pci_cfg_read(mmio_cap, PCI_VENDOR);
+    let (vendor, device) = (id as u16, (id >> 16) as u16);
+    let tcsel = sys::pci_cfg_read(mmio_cap, PCI_TCSEL);
+    if tcsel != usize::MAX {
+        let _ = sys::pci_cfg_write(mmio_cap, PCI_TCSEL, tcsel as u32 & !0x07);
+    }
+    match vendor {
+        // Intel: слежение включено, когда бит `NOSNOOP` СНЯТ.
+        0x8086 => {
+            let devc = sys::pci_cfg_read(mmio_cap, INTEL_DEVC);
+            if devc != usize::MAX {
+                let _ = sys::pci_cfg_write(mmio_cap, INTEL_DEVC, devc as u32 & !INTEL_NOSNOOP);
+            }
+        }
+        // AMD/ATI: наоборот, слежение включается установкой бита.
+        0x1002 | 0x1022 => {
+            let misc = sys::pci_cfg_read(mmio_cap, ATI_MISC_CNTR2);
+            if misc != usize::MAX {
+                let _ = sys::pci_cfg_write(mmio_cap, ATI_MISC_CNTR2, misc as u32 | ATI_SNOOP_ON);
+            }
+        }
+        _ => {}
+    }
+    (vendor, device)
+}
+
 // ── подъём контроллера ───────────────────────────────────────────────────────────────────────
 
 /// Сброс и кольца. `false` — контроллер не ожил.
@@ -658,18 +714,33 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         deaf("DMA-памяти не дали");
     };
 
+    // ДО подъёма: класс трафика и слежение за кэшем (см. `chipset_prepare`).
+    let (vendor, device) = chipset_prepare(mmio_cap);
+
     if !controller_up(ring_pa) {
         deaf("контроллер не ожил");
     }
     let version = unsafe { (rd8(0x03), rd8(0x02)) };
     let present = unsafe { rd16(STATESTS) };
+    let gcap = unsafe { rd16(GCAP) };
+    // Числа, которых не хватало бы при первом же разборе на живой машине: чей чипсет, сколько
+    // потоков, умеет ли контроллер 64-битные адреса и КУДА мы положили буфер. Последнее важно
+    // вместе с предпоследним: 32-битный контроллер с буфером выше четырёх гигабайт читает не
+    // то, что мы написали, и это опять же треск.
     sys::write(
         alloc::format!(
-            "[hda] контроллер {}.{} поднят, кодеки {:#06x}\n",
-            version.0, version.1, present
+            "[hda] контроллер {:04x}:{:04x} версия {}.{}, потоков вход/выход {}/{}, адреса {}-бит\n\
+             [hda] кодеки {:#06x}, кольца физ {:#x}, буфер физ {:#x} ({} КиБ)\n",
+            vendor, device, version.0, version.1,
+            (gcap >> 8) & 0xf, (gcap >> 12) & 0xf,
+            if gcap & 1 != 0 { 64 } else { 32 },
+            present, ring_pa, pcm_pa, PCM_BYTES / 1024,
         )
         .as_bytes(),
     );
+    if gcap & 1 == 0 && pcm_pa >> 32 != 0 {
+        deaf("буфер лёг выше четырёх гигабайт, а контроллер столько не адресует");
+    }
 
     let Some(path) = find_path() else {
         w("[hda] выхода у кодека не нашлось; вот что он о себе говорит:\n");
@@ -681,10 +752,20 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         }
         deaf("выхода у кодека нет");
     };
+    // Что за пин мы выбрали — словом, а не номером: «играет не туда» и «не играет вовсе»
+    // лечатся по-разному, а на живой машине пинов у кодека бывает десяток.
+    let cfg = cmd(path.cad, path.pin, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(0);
+    let what = match (cfg >> 20) & 0xf {
+        0 => "линейный выход",
+        1 => "динамик",
+        2 => "наушники",
+        4 => "SPDIF",
+        _ => "выход",
+    };
     sys::write(
         alloc::format!(
-            "[hda] кодек {}: выход — пин {}, конвертер {}\n",
-            path.cad, path.pin, path.dac
+            "[hda] кодек {}: {} (пин {}) ← конвертер {}; формат 48000/16/2, кодек умеет {:#010x}\n",
+            path.cad, what, path.pin, path.dac, param(path.cad, path.dac, PARAM_PCM),
         )
         .as_bytes(),
     );
@@ -749,7 +830,9 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     let mut req = [0u8; 64];
     loop {
         let msg = if playing {
-            sys::recv_timeout(&mut req, half_ns / 2)
+            // Треть половины, а не половина: на живой машине между «проснулся» и «записал»
+            // лежит планировщик, и просыпаться ровно на границе значит однажды опоздать.
+            sys::recv_timeout(&mut req, half_ns / 3)
         } else {
             Some(sys::recv(&mut req))
         };
