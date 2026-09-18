@@ -202,6 +202,20 @@ impl ui::Client for Bar {
                 self.ptr = input.ptr;
                 ui::Scope::All
             }
+            // Веха 202.9 — КОЛЕСО прокручивает список уведомлений. Только когда он открыт:
+            // на самой панели колесу делать нечего, а отдавать его невидимому списку значило бы
+            // менять состояние того, чего человек не видит.
+            Event::Wheel { delta, .. } if self.showing == Menu::Notes => {
+                let total = win::notes(&self.notes_buf).count();
+                let max = total.saturating_sub(Self::NOTES_SHOWN);
+                let off = if delta < 0 { self.notes_off + 1 } else { self.notes_off.saturating_sub(1) };
+                let off = off.min(max);
+                if off == self.notes_off {
+                    return ui::Scope::No; // упёрлись в край — кадра не надо
+                }
+                self.notes_off = off;
+                ui::Scope::All
+            }
             Event::Resize { w, h } => {
                 self.screen(w as i32, h as i32);
                 ui::Scope::All
@@ -353,6 +367,13 @@ struct Bar {
     /// открытии меню. Список не держим постоянно: он нужен ровно тогда, когда на него смотрят.
     notes: u8,
     notes_buf: Vec<u8>,
+    /// Веха 202.9 — сколько уведомлений ПРОКРУЧЕНО вверх (сколько пропущено сверху списка).
+    ///
+    /// До этой вехи хвост списка был недостижим: помещается шесть, остальное честно считалось
+    /// строкой «ещё N», но добраться до него было нечем. Смещение живёт в записях, а не в
+    /// пикселях, потому что единица здесь — уведомление: прокрутка на полкарточки не значит
+    /// ничего, а вот «показать следующее» значит.
+    notes_off: usize,
     /// Веха 168.1 — «не беспокоить»: всплывашек нет, счёт идёт. Приезжает в снимке состояния.
     dnd: bool,
     /// Какое полотно СЕЙЧАС нарисовано. Отличается от `open` ровно на время ухода: пока оно
@@ -577,6 +598,7 @@ impl Bar {
             grown: false,
             notes: 0,
             notes_buf: Vec::new(),
+            notes_off: 0,
             dnd: false,
             showing: Menu::None,
             morph: None,
@@ -735,6 +757,8 @@ impl Bar {
         if self.dying.is_some() && self.mo.peek(A_NOTE_GO) == 0 {
             let id = self.dying.take().unwrap_or(0);
             win::note_drop(id);
+            // Список стал короче — смещение может указывать за его конец.
+            self.notes_off = 0;
             let mut buf = alloc::vec![0u8; 8 * 1024];
             let n = win::notes_read(&mut buf);
             buf.truncate(n);
@@ -760,6 +784,9 @@ impl Bar {
                 let n = win::notes_read(&mut buf);
                 buf.truncate(n);
                 self.notes_buf = buf;
+                // Открыли заново — показываем СВЕЖИЕ, а не то место, где закончили в прошлый
+                // раз. Список пришёл другой, и старое смещение указывало бы в него наугад.
+                self.notes_off = 0;
             }
             Menu::None => {}
         }
@@ -1365,7 +1392,10 @@ impl Bar {
         // съезжают следом сами собой: они режутся от того же `d`, что и она.
         let go = self.mo.peek(A_NOTE_GO).clamp(0, 256);
         let mut shown = 0usize;
-        for n in win::notes(&buf) {
+        // Смещение применяем ЗДЕСЬ, а не при чтении списка: сам список приходит от композитора
+        // целиком и свежим, а прокрутка — это про то, какой его кусок показан сейчас.
+        let skipped = self.notes_off.min(total.saturating_sub(1));
+        for n in win::notes(&buf).skip(skipped) {
             if shown >= Self::NOTES_SHOWN {
                 break;
             }
@@ -1410,9 +1440,15 @@ impl Bar {
         }
         self.notes_buf = buf;
         // Сколько не поместилось — вслух: молча спрятанный хвост списка это ровно та ложь,
-        // которой в системе быть не должно.
-        if total > shown && d.h >= font_h {
-            let more = ui::f1(ui::t("ещё {}"), &alloc::format!("{}", total - shown));
+        // которой в системе быть не должно. С прокруткой этого мало: надо сказать и про то, что
+        // осталось ВЫШЕ, иначе человек, прокрутивший список, не поймёт, куда делось начало.
+        let below = total.saturating_sub(skipped + shown);
+        if (skipped > 0 || below > 0) && d.h >= font_h {
+            let more = match (skipped, below) {
+                (0, b) => ui::f1(ui::t("ещё {}"), &alloc::format!("{b}")),
+                (a, 0) => ui::f1(ui::t("выше {}"), &alloc::format!("{a}")),
+                (a, b) => ui::f2(ui::t("выше {} · ещё {}"), &alloc::format!("{a}"), &alloc::format!("{b}")),
+            };
             u.label(d.cut_top(font_h), &more, th.muted, Align::Right);
         }
 
@@ -1509,7 +1545,12 @@ impl Bar {
                     after + (full(n) - after) * go / 256
                 }
             };
-            let h = 2 * m + head + m + body;
+            // Веха 202.9 — строка «выше N · ещё M» получает СВОЮ высоту. Без неё она не
+            // рисовалась вовсе (в теле не оставалось места), и прокрутка была невидима: список
+            // ехал, а сказать, что выше есть ещё, было нечем.
+            let total = win::notes(&self.notes_buf).count();
+            let hint = if total > Self::NOTES_SHOWN { font.line_h() + m } else { 0 };
+            let h = 2 * m + head + m + body + hint;
             return Rect::new(self.sw - w, self.strip, w, h);
         }
         let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));
