@@ -332,6 +332,29 @@ pub fn probe_bar0(vendor_want: u16, device_want: u16, len: usize) -> Option<usiz
     probe_bar(vendor_want, device_want, 0, len)
 }
 
+/// Веха 202 — найти устройство по КЛАССУ, а не по идентификатору, и отдать его BAR0.
+///
+/// Звуковой контроллер Intel HDA приезжает под доброй сотней `vendor:device`: у одного только
+/// Intel их десятки по поколениям чипсета, плюс AMD, NVIDIA (HDMI-аудио), VIA. Перечислять их
+/// списком — значит гарантированно не завестись на чужой машине. А вот класс у всех один и
+/// записан в спецификации: `04:03` (мультимедиа, Audio Device). Искать надо по нему.
+///
+/// Возвращает и адрес окна, и `bus:dev.func` — второе нужно, чтобы выдать право на ТО ЖЕ
+/// устройство и назвать его человеку теми же цифрами, что печатает опись шины.
+pub fn probe_class_bar0(class_want: u8, sub_want: u8, len: usize) -> Option<(usize, u16)> {
+    let d = find(ALL_BUSES, |d| {
+        d.id()?;
+        let (class, sub, _) = d.class();
+        (class == class_want && sub == sub_want).then_some(d)
+    })?;
+    d.enable();
+    let base = d.bar(0);
+    (base != 0).then(|| {
+        unsafe { paging::map_mmio(base, len) };
+        (base, (d.bus() as u16) << 8 | (d.dev() as u16) << 3 | d.func() as u16)
+    })
+}
+
 /// То же, но с НОМЕРОМ окна (Веха 193).
 ///
 /// Нулевое окно не у всех: RTL8139 держит в BAR0 порты ввода-вывода, а регистры — в BAR1, и

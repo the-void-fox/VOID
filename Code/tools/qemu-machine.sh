@@ -214,6 +214,34 @@ void_qemu_usb() {
     done
 }
 
+# ── Звук (Веха 202) ───────────────────────────────────────────────────────────────────────────
+#
+#   VOID_QEMU_SND=wav:<путь>   контроллер Intel HDA, всё сыгранное ПИШЕТСЯ В ФАЙЛ .wav
+#   VOID_QEMU_SND=1            контроллер есть, звук уходит в никуда (проверка перечисления)
+#   VOID_QEMU_SND=alsa|pipewire|sdl  играть по-настоящему на хосте
+#
+# `wav:` — главный режим и причина, по которой звук вообще можно разрабатывать здесь, а не
+# только на живой машине: результат становится ФАЙЛОМ, который видно глазами и можно измерить
+# (частота, амплитуда, тишина). Без него «звук пошёл» проверялось бы ушами владельца — то есть
+# ещё одним кругом «пересобрал → флешка → загрузился».
+#
+# Контроллер — `ich9-intel-hda` (8086:293e), а не `intel-hda` (ICH6): у живой машины владельца
+# чипсет HM65, и его HDA — той же родословной. Регистры у них общие, но пусть стенд будет ближе.
+void_qemu_snd() {
+    local spec="${VOID_QEMU_SND:-}"
+    [ -n "$spec" ] || return 0
+    local backend
+    case "$spec" in
+        wav:*) backend="wav,id=snd0,path=${spec#wav:}" ;;
+        1|none) backend="none,id=snd0" ;;
+        *)     backend="$spec,id=snd0" ;;
+    esac
+    printf '%s\n' \
+        -audiodev "$backend" \
+        -device ich9-intel-hda,id=hda \
+        -device hda-output,bus=hda.0,audiodev=snd0
+}
+
 # Сетевой стенд (Веха 135).
 #
 #   сеть    user | seg:<путь> | join:<путь> | tap:<имя> | none
@@ -293,8 +321,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         machine) shift; void_qemu_machine "$@" ;;
         net)     shift; void_qemu_net "$@" ;;
         usb)     shift; void_qemu_usb "$@" ;;
+        snd)     shift; void_qemu_snd "$@" ;;
         *)
-            echo "qemu-machine.sh machine <образ> [память] | net [сеть] [карта] [mac] [pcap] [мкс] | usb" >&2
+            echo "qemu-machine.sh machine <образ> [память] | net [сеть] [карта] [mac] [pcap] [мкс] | usb | snd" >&2
             exit 2
             ;;
     esac

@@ -124,6 +124,8 @@ qemu = [
     # Веха 196 — USB: контроллер и устройства появляются, только когда их просят
     # (VOID_QEMU_USB=kbd | disk:<путь>), поэтому прежние прогоны не меняются.
     *stand("usb"),
+    # Веха 202 — звук (VOID_QEMU_SND=wav:<путь> пишет сыгранное в файл).
+    *stand("snd"),
     "-display", "none",
     "-serial", "stdio",
     "-qmp", f"unix:{qmp_path},server,nowait",

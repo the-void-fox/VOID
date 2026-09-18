@@ -269,6 +269,9 @@ static PROGRAMS_ARCH: &[(&str, &[u8])] = &[
     // Веха 174 — установщик: окно со списком дисков. Сеется только на живом носителе (см. ниже),
     // но x86-only теперь и по второй причине — у него есть экран.
     ("install", include_bytes!(env!("PROG_INSTALL"))),
+    // Веха 202 — драйвер звука (Intel HDA) в обычном процессе: MMIO-окно регистров и DMA-буфер.
+    // x86-only — звуковой шины на riscv-стенде нет вовсе.
+    ("hda", include_bytes!(env!("PROG_HDA"))),
 ];
 #[cfg(not(target_arch = "x86_64"))]
 static PROGRAMS_ARCH: &[(&str, &[u8])] = &[];

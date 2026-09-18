@@ -1355,7 +1355,15 @@ pub fn video_info(mmio_cap: usize) -> Option<VideoInfo> {
 /// `SYS_DMA_ALLOC(dma_cap, va)` (Веха 51): выделить DMA-страницу, замапить по `va`, вернуть её
 /// ФИЗИЧЕСКИЙ адрес — им драйвер программирует DMA устройства. `None` — отказ.
 pub fn dma_alloc(dma_cap: usize, va: usize) -> Option<usize> {
-    let r = abi::syscall(SYS_DMA_ALLOC, dma_cap, va, 0, 0, 0, 0, 0).0;
+    dma_alloc_pages(dma_cap, va, 1)
+}
+
+/// То же, но `pages` ПОДРЯД идущих страниц (ядро умело это с Вехи 133, обёртки не было).
+///
+/// Непрерывность здесь не оптимизация: буфер звука устройство обходит само, по физическим
+/// адресам, о таблицах страниц не зная. Склеить его из отдельных вызовов нельзя.
+pub fn dma_alloc_pages(dma_cap: usize, va: usize, pages: usize) -> Option<usize> {
+    let r = abi::syscall(SYS_DMA_ALLOC, dma_cap, va, pages, 0, 0, 0, 0).0;
     (r != NO_CAP).then_some(r)
 }
 
