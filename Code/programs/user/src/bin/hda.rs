@@ -31,6 +31,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use void_user as sys;
@@ -96,34 +97,14 @@ const SD_CTL_RUN: u32 = 1 << 1;
 /// кладёт данные «в поток N», кодек берёт их «из потока N». Ноль означает «не назначен».
 const STREAM_TAG: u32 = 1;
 
-/// Слово формата для частоты: 16 бит, два канала. `None` — такой частоты у HDA нет.
+/// Формат ВЫВОДА: 48 кГц, 16 бит, два канала. Разложение по битам регистра — база 48 кГц
+/// (бит 14 = 0), без умножения и деления, `001` = 16 бит, `0001` = два канала.
 ///
-/// Частот в спецификации ровно два семейства — от 48 кГц и от 44.1 (бит 14), и каждое делится
-/// и умножается целыми множителями. Пересчитывать чужую частоту в свою (ресемплинг) мы не
-/// станем: кодек умеет и ту и другую сам, а честно сказанное «такой частоты не умею» лучше
-/// тихо испорченного звука.
-fn fmt_for(rate: u32) -> Option<u16> {
-    // Биты слова: 14 — семейство (0 = от 48 кГц, 1 = от 44.1), 13:11 — множитель,
-    // 10:8 — делитель, 6:4 — разрядность (001 = 16 бит), 3:0 — каналы минус один.
-    const BITS16_STEREO: u16 = 0x0011;
-    let (base, mult, div) = match rate {
-        192_000 => (0, 3, 0),
-        176_400 => (1, 3, 0),
-        96_000 => (0, 1, 0),
-        88_200 => (1, 1, 0),
-        48_000 => (0, 0, 0),
-        44_100 => (1, 0, 0),
-        32_000 => (0, 1, 2), // 48 × 2 ÷ 3 — не делением, а дробью: в HDA она задаётся так
-        24_000 => (0, 0, 1),
-        22_050 => (1, 0, 1),
-        16_000 => (0, 0, 2),
-        _ => return None,
-    };
-    Some((base as u16) << 14 | (mult as u16) << 11 | (div as u16) << 8 | BITS16_STEREO)
-}
-
-/// Формат: 48 кГц, 16 бит, два канала. Разложение по битам регистра — база 48 кГц (бит 14 = 0),
-/// без умножения и деления, `001` = 16 бит, `0001` = два канала.
+/// Веха 204 — он теперь ПОСТОЯННЫЙ. Кодек умеет перестраиваться под частоту дорожки, и до
+/// миксера мы этим пользовались: один голос — одна частота, пересчитывать нечего. Голосов стало
+/// несколько, у каждого своя частота, и перестроить кодек можно только под одну из них —
+/// остальные играли бы не с той скоростью. Поэтому частоту пересчитываем мы сами
+/// (`Ring::next_frame`), а кодек всегда стоит на 48 кГц.
 const FORMAT: u16 = 0x0011;
 const RATE: usize = 48_000;
 
@@ -246,6 +227,7 @@ fn subnodes(cad: u8, nid: u8) -> (u8, u8) {
 // ── поиск пути «пин → конвертер» ─────────────────────────────────────────────────────────────
 
 /// Что мы ищем у кодека: куда воткнут динамик (пин) и что превращает числа в звук (DAC).
+#[derive(Clone, Copy)]
 struct Path {
     cad: u8,
     dac: u8,
@@ -380,9 +362,18 @@ fn say_codec(cad: u8) {
     }
 }
 
-/// Найти кодек, а у него — выход. Предпочтение отдаём встроенному динамику: на ноутбуке звук
-/// должен пойти именно в него, а не в разъём, куда ничего не воткнуто.
-fn find_path() -> Option<Path> {
+/// Веха 204 — ВСЕ ВЫХОДЫ кодека, годные для звука, в порядке предпочтения.
+///
+/// До этой вехи драйвер искал ровно один — лучший — и о существовании остальных не сообщал
+/// никому. На ноутбуке это значит «звук всегда в динамике»: воткнутые наушники системе просто
+/// негде было выбрать. Теперь список отдаётся наружу (`OP_OUTPUTS`), а выбор делает человек в
+/// меню звука.
+///
+/// Предпочтение то же, что и было, и оно определяет ПЕРВЫЙ выход: встроенный динамик, потом
+/// линейный выход, потом наушники. Разъём, о котором кодек говорит «никуда не подключён»
+/// (связность 0x1), не годится вовсе — звук в нём просто некуда деть.
+fn find_outputs() -> Vec<Path> {
+    let mut out: Vec<(u32, Path)> = Vec::new();
     let present = unsafe { rd16(STATESTS) };
     for cad in 0..15u8 {
         if present & (1 << cad) == 0 {
@@ -397,7 +388,6 @@ fn find_path() -> Option<Path> {
             // Питание группе — иначе она не ответит про свои узлы ничего осмысленного.
             let _ = cmd(cad, fg, VERB_SET_POWER, 0);
             let (wstart, wcount) = subnodes(cad, fg);
-            let mut best: Option<(u32, u8)> = None; // (предпочтение, пин)
             for nid in wstart..wstart.saturating_add(wcount) {
                 if widget_type(cad, nid) != WIDGET_PIN {
                     continue;
@@ -422,19 +412,62 @@ fn find_path() -> Option<Path> {
                 if rank == 0 {
                     continue;
                 }
-                if best.map_or(true, |(r, _)| rank > r) {
-                    best = Some((rank, nid));
-                }
-            }
-            if let Some((_, pin)) = best {
-                let mut path = Path { cad, dac: 0, pin, hops: [0; 4], nhops: 0 };
-                if trace(cad, pin, &mut path) {
-                    return Some(path);
+                let mut path = Path { cad, dac: 0, pin: nid, hops: [0; 4], nhops: 0 };
+                // Путь до конвертера обязан найтись: пин, от которого некуда вести звук, — это
+                // не выход, как бы он себя ни называл в конфигурации.
+                if trace(cad, nid, &mut path) {
+                    out.push((rank, path));
                 }
             }
         }
     }
-    None
+    // Лучший — первым: им драйвер и пользуется, пока человек не выбрал другой.
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Чем этот выход называется для человека: тип устройства из конфигурации пина.
+fn out_name(p: &Path) -> &'static str {
+    let cfg = cmd(p.cad, p.pin, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(0);
+    match (cfg >> 20) & 0xf {
+        0 => "линейный выход",
+        1 => "динамики",
+        2 => "наушники",
+        4 => "SPDIF",
+        _ => "выход",
+    }
+}
+
+/// Веха 204 — ОТКРЫТЬ ТРАКТ: разбудить узлы, назначить поток и выпустить звук в пин.
+///
+/// Вынесено из подъёма отдельной функцией, потому что делается теперь дважды: при старте и при
+/// смене выхода в меню. Порядок важен и он тот же, что был: питание → формат → поток →
+/// громкость → и только в конце пин, чтобы наружу не вышел щелчок недонастроенного тракта.
+fn path_open(p: &Path) {
+    for &nid in [p.dac, p.pin].iter().chain(p.hops[..p.nhops].iter()) {
+        let _ = cmd(p.cad, nid, VERB_SET_POWER, 0);
+    }
+    let _ = cmd(p.cad, p.dac, VERB_SET_STREAM_FORMAT, FORMAT as u32);
+    let _ = cmd(p.cad, p.dac, VERB_SET_CONV_STREAM, STREAM_TAG << 4);
+    unmute(p.cad, p.dac);
+    for &nid in &p.hops[..p.nhops] {
+        unmute(p.cad, nid);
+    }
+    unmute(p.cad, p.pin);
+    let _ = cmd(p.cad, p.pin, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN | PIN_CTL_HP_EN);
+    // Внешний усилитель динамика: на ноутбуках без него звук просто не выходит наружу, а
+    // регистры при этом выглядят совершенно здоровыми. Бит 16 возможностей пина — есть ли он.
+    if param(p.cad, p.pin, PARAM_PIN_CAP) & (1 << 16) != 0 {
+        let _ = cmd(p.cad, p.pin, VERB_SET_EAPD, 0x2);
+    }
+}
+
+/// Закрыть тракт: погасить пин, чтобы из него ничего не шло.
+///
+/// Нужен при смене выхода: без этого звук пошёл бы сразу в оба (динамик И наушники), а смысл
+/// выбора ровно обратный — человек втыкает наушники, чтобы динамик замолчал.
+fn path_close(p: &Path) {
+    let _ = cmd(p.cad, p.pin, VERB_SET_PIN_CTL, 0);
 }
 
 /// Снять заглушку с выходного усилителя узла и вывести громкость на «нулевые децибелы» —
@@ -512,9 +545,6 @@ impl Tone {
         }
     }
 
-    fn silent() -> Self {
-        Tone { step: 0, phase: 0, left: 0, total: 0, lead: 0 }
-    }
 
     /// Следующий отсчёт. Ноль, когда тон кончился, — дальше кольцо доигрывает тишину.
     fn next(&mut self) -> i16 {
@@ -553,13 +583,21 @@ struct Ring {
     read: u32,
     cap: usize,
     /// Когда клиент в последний раз о себе напоминал: умерший клиент иначе держал бы общую
-    /// память вечно, а место в ней — единственное.
+    /// память вечно, а места в ней столько же, сколько голосов.
     seen_ns: u64,
+    /// Веха 204 — ПЕРЕСЧЁТ ЧАСТОТЫ. Шаг чтения в неподвижной точке 16.16: сколько исходных
+    /// кадров приходится на один выходной. У дорожки в 48 кГц он ровно 1.0, и пересчёт
+    /// вырождается в точную копию — платит только тот, у кого частота другая.
+    step: u32,
+    /// Дробная часть позиции чтения (те же 16 бит), для линейной интерполяции.
+    frac: u32,
+    /// Прошлый кадр — второй конец отрезка, по которому интерполируем.
+    prev: (i16, i16),
 }
 
 impl Ring {
     /// Следующий отсчёт или `None`, если клиент не успел дописать.
-    fn next(&mut self) -> Option<i16> {
+    fn next_sample(&mut self) -> Option<i16> {
         if self.read.wrapping_add(2) > self.write {
             return None;
         }
@@ -571,57 +609,143 @@ impl Ring {
         self.read = self.read.wrapping_add(2);
         Some(i16::from_le_bytes([lo, hi]))
     }
+
+    /// Следующий КАДР (левый и правый) в частоте ВЫВОДА.
+    ///
+    /// Пересчёт линейный: между соседними исходными кадрами проводится отрезок. Для 44,1 → 48
+    /// это слышно как чуть приглушённые верхи — и это честная цена за то, что несколько
+    /// дорожек с разными частотами звучат одновременно. До Вехи 204 частоту под дорожку
+    /// перестраивал сам кодек, но так умеет ровно ОДИН голос: второй пришлось бы играть
+    /// не с той скоростью.
+    fn next_frame(&mut self) -> Option<(i16, i16)> {
+        while self.frac >= 0x1_0000 {
+            let l = self.next_sample()?;
+            let r = self.next_sample()?;
+            self.prev = (l, r);
+            self.frac -= 0x1_0000;
+        }
+        // Заглянуть вперёд нельзя (кольцо читается только вперёд), поэтому отрезок строится
+        // между ПРОШЛЫМ и следующим кадром, а не между текущим и будущим.
+        let out = self.prev;
+        self.frac += self.step;
+        Some(out)
+    }
+
+    /// Есть ли ещё что читать.
+    fn ready(&self) -> bool {
+        self.read.wrapping_add(4) <= self.write
+    }
 }
 
-/// Что играем сейчас.
-enum Source {
+/// Откуда берёт звук один голос миксера.
+enum Src {
     Tone(Tone),
     Stream(Ring),
 }
 
-impl Source {
-    fn next(&mut self) -> i16 {
-        match self {
-            Source::Tone(t) => t.next(),
-            Source::Stream(r) => r.next().unwrap_or(0),
-        }
-    }
+/// Веха 204 — ГОЛОС МИКСЕРА: один источник со своей громкостью и своим именем.
+///
+/// До этой вехи источник был один на всю систему, и второй звук получал отказ «занято». Теперь
+/// голосов несколько, они складываются, и у каждого своя громкость — то, что человек видит в
+/// меню строкой с ползунком.
+struct Voice {
+    /// Номер, по которому на голос ссылается меню. Нумерация с единицы: ноль — это мастер.
+    id: u16,
+    src: Src,
+    /// Громкость голоса в процентах.
+    vol: u8,
+    name: [u8; snd::NAME_MAX],
+    name_len: u8,
+    /// Кто попросил — по нему находятся `OP_ADVANCE` и `OP_CLOSE` того же клиента.
+    owner: usize,
+}
 
-    /// Есть ли ещё что играть (иначе поток пора гасить).
+impl Voice {
+    /// Есть ли ещё что играть (иначе голос пора убирать).
     fn alive(&self) -> bool {
-        match self {
-            Source::Tone(t) => t.left > 0 || t.lead > 0,
-            Source::Stream(r) => r.read.wrapping_add(2) <= r.write,
+        match &self.src {
+            Src::Tone(t) => t.left > 0 || t.lead > 0,
+            Src::Stream(r) => r.ready(),
         }
     }
 }
 
-/// Заполнить ПОЛОВИНУ кольца тем, что даёт источник. Возвращает `true`, если источнику ещё
+/// Громкость, с которой сервер поднялся. Половина, а не максимум: первый звук в системе не
+/// должен быть самым громким, который она умеет.
+const VOL_DEFAULT: u8 = 70;
+
+/// Заполнить ПОЛОВИНУ кольца СУММОЙ голосов. Возвращает `true`, если хоть одному голосу ещё
 /// есть что играть, — а не «были ли ненулевые отсчёты»: тишина перед тоном тоже работа, и
 /// гасить поток на ней значило бы гасить его ровно перед сигналом.
-fn fill_half(half: usize, src: &mut Source) -> bool {
+///
+/// Складываем в 32 битах и зажимаем в 16 (насыщение). Складывать в 16 нельзя: два громких
+/// голоса дают переполнение, а переполнение знакового числа — это переход от максимума к
+/// минимуму, то есть громкий треск ровно в тех местах, где музыка и так громкая.
+fn fill_half(half: usize, voices: &mut [Voice], master: u8) -> bool {
     let frames = PCM_BYTES / 2 / 4;
     let base = unsafe { (PCM_VA as *mut i16).add(half * frames * 2) };
-    match src {
-        // Тон моно по своей природе: один отсчёт в оба канала.
-        Source::Tone(_) => {
-            for i in 0..frames {
-                let v = src.next();
-                unsafe {
-                    write_volatile(base.add(i * 2), v);
-                    write_volatile(base.add(i * 2 + 1), v);
+    let mut alive = false;
+    // Тишина сперва: половина заполняется всегда целиком, а голоса могут кончиться на середине.
+    for i in 0..frames * 2 {
+        unsafe { write_volatile(base.add(i), 0) };
+    }
+    for v in voices.iter_mut() {
+        // Громкость голоса и общая — одним множителем на отсчёт: делить дважды дороже, а
+        // разница округления ниже слышимого.
+        let gain = v.vol as i32 * master as i32;
+        if gain == 0 {
+            // Тихий голос всё равно ДОЛЖЕН читать своё кольцо: иначе клиент упрётся в
+            // переполнение и остановится, а выкрученная обратно громкость оживит звук с того
+            // места, где его выключили, — то есть с опозданием на всю паузу.
+            alive |= drain(v);
+            continue;
+        }
+        match &mut v.src {
+            Src::Tone(t) => {
+                for i in 0..frames {
+                    let s = t.next() as i32 * gain / 10_000;
+                    // Тон моно по своей природе: один отсчёт в оба канала.
+                    unsafe {
+                        add_sample(base.add(i * 2), s);
+                        add_sample(base.add(i * 2 + 1), s);
+                    }
+                }
+            }
+            Src::Stream(r) => {
+                for i in 0..frames {
+                    let Some((l, rr)) = r.next_frame() else { break };
+                    unsafe {
+                        add_sample(base.add(i * 2), l as i32 * gain / 10_000);
+                        add_sample(base.add(i * 2 + 1), rr as i32 * gain / 10_000);
+                    }
                 }
             }
         }
-        // Поток уже стерео: отсчёты идут парами, как в файле.
-        Source::Stream(_) => {
-            for i in 0..frames * 2 {
-                let v = src.next();
-                unsafe { write_volatile(base.add(i), v) };
+        alive |= v.alive();
+    }
+    alive
+}
+
+/// Прочитать голос вхолостую — ровно столько, сколько ушло бы в звук на полной громкости.
+fn drain(v: &mut Voice) -> bool {
+    if let Src::Stream(r) = &mut v.src {
+        for _ in 0..PCM_BYTES / 2 / 4 {
+            if r.next_frame().is_none() {
+                break;
             }
         }
+    } else if let Src::Tone(t) = &mut v.src {
+        for _ in 0..PCM_BYTES / 2 / 4 {
+            t.next();
+        }
     }
-    src.alive()
+    v.alive()
+}
+
+/// Прибавить отсчёт к тому, что уже лежит, с насыщением.
+unsafe fn add_sample(at: *mut i16, add: i32) {
+    let v = read_volatile(at) as i32 + add;
+    write_volatile(at, v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
 }
 
 // ── чипсет: то, чего нет в спецификации HDA, но без чего она не работает ─────────────────────
@@ -835,7 +959,8 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         deaf("буфер лёг выше четырёх гигабайт, а контроллер столько не адресует");
     }
 
-    let Some(path) = find_path() else {
+    let outs = find_outputs();
+    if outs.is_empty() {
         w("[hda] выхода у кодека не нашлось; вот что он о себе говорит:\n");
         say_rings();
         for cad in 0..15u8 {
@@ -844,43 +969,25 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
             }
         }
         deaf("выхода у кодека нет");
-    };
-    // Что за пин мы выбрали — словом, а не номером: «играет не туда» и «не играет вовсе»
-    // лечатся по-разному, а на живой машине пинов у кодека бывает десяток.
-    let cfg = cmd(path.cad, path.pin, VERB_GET_CONFIG_DEFAULT, 0).unwrap_or(0);
-    let what = match (cfg >> 20) & 0xf {
-        0 => "линейный выход",
-        1 => "динамик",
-        2 => "наушники",
-        4 => "SPDIF",
-        _ => "выход",
-    };
+    }
+    // Какие выходы нашлись и куда играем — словом, а не номером: «играет не туда» и «не играет
+    // вовсе» лечатся по-разному, а на живой машине пинов у кодека бывает десяток.
+    let mut line = alloc::format!("[hda] выходы ({}):", outs.len());
+    for (i, p) in outs.iter().enumerate() {
+        line += &alloc::format!(" {}{} (пин {})", if i == 0 { "→" } else { "" }, out_name(p), p.pin);
+    }
+    sys::write((line + "\n").as_bytes());
+    let mut cur_out = 0usize;
+    let path = outs[cur_out];
     sys::write(
         alloc::format!(
             "[hda] кодек {}: {} (пин {}) ← конвертер {}; формат 48000/16/2, кодек умеет {:#010x}\n",
-            path.cad, what, path.pin, path.dac, param(path.cad, path.dac, PARAM_PCM),
+            path.cad, out_name(&path), path.pin, path.dac,
+            param(path.cad, path.dac, PARAM_PCM),
         )
         .as_bytes(),
     );
-
-    // Разбудить и открыть весь путь. Порядок важен: питание → формат → поток → громкость →
-    // и только в конце пин, чтобы наружу не вышел щелчок недонастроенного тракта.
-    for &nid in [path.dac, path.pin].iter().chain(path.hops[..path.nhops].iter()) {
-        let _ = cmd(path.cad, nid, VERB_SET_POWER, 0);
-    }
-    let _ = cmd(path.cad, path.dac, VERB_SET_STREAM_FORMAT, FORMAT as u32);
-    let _ = cmd(path.cad, path.dac, VERB_SET_CONV_STREAM, STREAM_TAG << 4);
-    unmute(path.cad, path.dac);
-    for &nid in &path.hops[..path.nhops] {
-        unmute(path.cad, nid);
-    }
-    unmute(path.cad, path.pin);
-    let _ = cmd(path.cad, path.pin, VERB_SET_PIN_CTL, PIN_CTL_OUT_EN | PIN_CTL_HP_EN);
-    // Внешний усилитель динамика: на ноутбуках без него звук просто не выходит наружу, а
-    // регистры при этом выглядят совершенно здоровыми. Бит 16 возможностей пина — есть ли он.
-    if param(path.cad, path.pin, PARAM_PIN_CAP) & (1 << 16) != 0 {
-        let _ = cmd(path.cad, path.pin, VERB_SET_EAPD, 0x2);
-    }
+    path_open(&path);
 
     // Список кусков: две записи по половине буфера. Из одной записи список спецификация не
     // допускает вовсе — минимум два куска, даже если память под ними одна.
@@ -912,15 +1019,26 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     const LEAD_FRAMES: usize = RATE / 16;
     /// Сколько тихих половин держать поток живым (≈3 секунды): столько стоит не перезапускать.
     const QUIET_HALVES_OFF: usize = 18;
-    /// Куда отображаем кольцо клиента. Одно место: поток у нас один.
+    /// Куда отображаются кольца клиентов: по два мегабайта на голос, с запасом на кольцо в 192 КиБ.
     const RING_CLIENT_VA: usize = 0x5200_0000;
+    const RING_CLIENT_STEP: usize = 0x0020_0000;
     /// Сколько ждать напоминаний от клиента, прежде чем считать его ушедшим.
     const CLIENT_SILENCE_NS: u64 = 10_000_000_000;
 
-    let mut src = Source::Tone(Tone::silent());
-    /// Формат, в котором сейчас настроен кодек: поток запускается не там, где формат менялся
-    /// (на `OP_OPEN`), а позже — когда клиент накопит данных.
-    let mut cur_fmt = FORMAT;
+    // ── миксер (Веха 204) ────────────────────────────────────────────────────────────────────
+    //
+    // Голосов несколько, и они СКЛАДЫВАЮТСЯ. До этой вехи источник был один: второй звук
+    // получал «занято», то есть уведомление молчало, пока играет музыка. Теперь у каждого
+    // голоса своя громкость, а над ними общая, — это и есть миксер, который человек видит в
+    // меню панели.
+    //
+    // Частота вывода ВСЕГДА 48 кГц: кодек умеет перестраиваться под дорожку, но ровно под одну,
+    // а голосов теперь много. Чужие частоты пересчитывает `Ring::next_frame`.
+    let mut voices: Vec<Voice> = Vec::new();
+    let mut master: u8 = VOL_DEFAULT;
+    // Номер следующего голоса. Растёт всегда: номер, выданный повторно, означал бы, что
+    // ползунок в меню однажды подвинет громкость не тому, кто под ним написан.
+    let mut next_id: u16 = 1;
     let mut playing = false;
     // Половина, в которой контроллер был в прошлый раз. НОЛЬ, а не единица: пущенный поток
     // начинает с нулевой, и «прошлой» для него сразу является она же. С единицы первое
@@ -938,36 +1056,32 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
             Some(sys::recv(&mut req))
         };
         if let Some(m) = msg {
-            let mut extra = [0u8; 4];
+            let mut extra = [0u8; snd::STATE_BYTES];
             let mut extra_len = 0usize;
-            let mut start_after_reply = false;
             let status = match m.op {
                 snd::OP_BEEP if m.len >= 8 => {
                     let hz = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
                     let ms = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
                     if !(20..=20_000).contains(&hz) || ms == 0 {
                         snd::ST_BAD
-                    } else if matches!(src, Source::Stream(_)) {
-                        // Микшера у нас нет, и сигнал поверх музыки пришлось бы либо сложить с
-                        // ней (это и есть микшер), либо оборвать её. Второе — обман: человек
-                        // просил играть. Честнее сказать занято.
+                    } else if voices.len() >= snd::MAX_VOICES {
                         snd::ST_BUSY
                     } else {
                         let lead = if playing { 0 } else { LEAD_FRAMES };
-                        // Сигнал всегда на своей частоте: генератор считает при 48 кГц, и
-                        // играть его в формате, оставшемся от чужой дорожки, значило бы врать
-                        // на высоту тона.
-                        if cur_fmt != FORMAT {
-                            let _ = cmd(path.cad, path.dac, VERB_SET_STREAM_FORMAT, FORMAT as u32);
-                            cur_fmt = FORMAT;
-                        }
-                        src = Source::Tone(Tone::new(hz, ms.min(snd::MAX_MS), lead));
+                        voices.push(Voice {
+                            id: take_id(&mut next_id),
+                            src: Src::Tone(Tone::new(hz, ms.min(snd::MAX_MS), lead)),
+                            vol: 100,
+                            name: name_bytes("Система"),
+                            name_len: "Система".len() as u8,
+                            owner: m.sender,
+                        });
                         quiet_halves = 0;
                         if !playing {
                             // Обе половины заполняются ДО запуска: контроллер, пущенный на
                             // кольцо, в котором ещё нет звука, честно сыграет его пустоту.
-                            fill_half(0, &mut src);
-                            fill_half(1, &mut src);
+                            fill_half(0, &mut voices, master);
+                            fill_half(1, &mut voices, master);
                             last_half = 0;
                             playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, FORMAT);
                         }
@@ -976,55 +1090,77 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
                 }
                 snd::OP_OPEN if m.len >= 4 && m.cap != sys::NO_CAP => {
                     let rate = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
-                    match (fmt_for(rate), &src) {
-                        (None, _) => snd::ST_BAD,
-                        (_, Source::Stream(_)) => snd::ST_BUSY,
-                        (Some(fmt), _) => match sys::shm_map(m.cap, RING_CLIENT_VA) {
+                    let name = core::str::from_utf8(&req[4..m.len.min(req.len())]).unwrap_or("");
+                    if !(8_000..=192_000).contains(&rate) {
+                        snd::ST_BAD
+                    } else if voices.len() >= snd::MAX_VOICES {
+                        snd::ST_BUSY
+                    } else {
+                        // Место отображения ищется по СВОБОДНОМУ слоту, а не по числу голосов:
+                        // голоса кончаются вразнобой, и «следующий по счёту» однажды указал бы
+                        // на адрес, где ещё живёт чужое кольцо.
+                        let slot = (0..snd::MAX_VOICES)
+                            .find(|i| {
+                                let va = RING_CLIENT_VA + i * RING_CLIENT_STEP;
+                                !voices.iter().any(|v| matches!(&v.src, Src::Stream(r) if r.va == va))
+                            })
+                            .unwrap_or(0);
+                        let va = RING_CLIENT_VA + slot * RING_CLIENT_STEP;
+                        match sys::shm_map(m.cap, va) {
                             None => snd::ST_BAD,
                             Some(len) => {
-                                // Формат меняется у ОБОИХ концов: у дескриптора потока и у
-                                // конвертера кодека. Сказать только одному — получить скорость,
-                                // не равную задуманной, то есть писк вместо музыки.
-                                let _ = cmd(path.cad, path.dac, VERB_SET_STREAM_FORMAT, fmt as u32);
-                                cur_fmt = fmt;
-                                src = Source::Stream(Ring {
-                                    va: RING_CLIENT_VA,
-                                    len,
-                                    write: 0,
-                                    read: 0,
-                                    cap: m.cap,
-                                    seen_ns: sys::monotonic_ns(),
+                                let name = if name.is_empty() { "Звук" } else { name };
+                                voices.push(Voice {
+                                    id: take_id(&mut next_id),
+                                    src: Src::Stream(Ring {
+                                        va,
+                                        len,
+                                        write: 0,
+                                        read: 0,
+                                        cap: m.cap,
+                                        seen_ns: sys::monotonic_ns(),
+                                        // Шаг пересчёта: во столько раз частота дорожки быстрее
+                                        // нашей. Ровно 1.0 у дорожки в 48 кГц.
+                                        step: (rate as u64 * 0x1_0000 / RATE as u64) as u32,
+                                        // Первый кадр читается сразу: дробная часть начинается
+                                        // за границей отрезка, и `next_frame` возьмёт кадр.
+                                        frac: 0x1_0000,
+                                        prev: (0, 0),
+                                    }),
+                                    vol: 100,
+                                    name: name_bytes(name),
+                                    name_len: name.len().min(snd::NAME_MAX) as u8,
+                                    owner: m.sender,
                                 });
                                 quiet_halves = 0;
-                                if playing {
-                                    unsafe { wr32(sd + SD_CTL, 0) };
-                                }
                                 // Поток пойдёт с первым `OP_ADVANCE`: пускать его сейчас
                                 // значило бы сыграть пустое кольцо.
-                                playing = false;
                                 snd::ST_OK
                             }
-                        },
+                        }
                     }
                 }
                 snd::OP_ADVANCE if m.len >= 4 => {
-                    let w = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
-                    match &mut src {
-                        Source::Stream(r) => {
-                            r.write = w;
+                    let wpos = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+                    // Свой голос клиент находит по ОТПРАВИТЕЛЮ, а не по номеру в сообщении:
+                    // чужой номер иначе двигал бы чужую позицию чтения.
+                    match voices.iter_mut().find(|v| v.owner == m.sender) {
+                        Some(Voice { src: Src::Stream(r), .. }) => {
+                            r.write = wpos;
                             r.seen_ns = sys::monotonic_ns();
                             extra[..4].copy_from_slice(&r.read.to_le_bytes());
                             extra_len = 4;
-                            if !playing && r.write >= PCM_BYTES as u32 {
+                            let enough = r.write >= PCM_BYTES as u32;
+                            if !playing && enough {
                                 // Ждём, пока клиент накопит ЦЕЛЫЙ буфер, а не половину: перед
                                 // запуском мы заполняем обе половины, и если звука хватило
                                 // только на первую, вторая уедет тишиной — в записи это дыра
                                 // ровно в половину кольца, и слышно её как проглоченную ноту.
-                                fill_half(0, &mut src);
-                                fill_half(1, &mut src);
+                                fill_half(0, &mut voices, master);
+                                fill_half(1, &mut voices, master);
                                 last_half = 0;
                                 quiet_halves = 0;
-                                playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, cur_fmt);
+                                playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, FORMAT);
                             }
                             snd::ST_OK
                         }
@@ -1032,46 +1168,89 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
                     }
                 }
                 snd::OP_CLOSE => {
-                    if let Source::Stream(r) = &src {
-                        sys::shm_unmap(r.cap, r.va);
-                    }
-                    src = Source::Tone(Tone::silent());
+                    drop_voices(&mut voices, |v| v.owner == m.sender);
                     snd::ST_OK
                 }
                 snd::OP_HUSH => {
-                    if let Source::Stream(r) = &src {
-                        sys::shm_unmap(r.cap, r.va);
-                    }
-                    src = Source::Tone(Tone::silent());
+                    drop_voices(&mut voices, |_| true);
                     if playing {
                         unsafe { wr32(sd + SD_CTL, 0) };
                         playing = false;
                     }
                     snd::ST_OK
                 }
+                // Веха 204 — СОСТОЯНИЕ для меню: мастер, куда играем и кто играет.
+                snd::OP_STATE => {
+                    extra_len =
+                        write_state(&mut extra, master, playing, out_name(&outs[cur_out]), &voices);
+                    snd::ST_OK
+                }
+                // Веха 204 — ГРОМКОСТЬ: нулевой номер значит общую, иначе голос.
+                snd::OP_VOLUME if m.len >= 3 => {
+                    let id = u16::from_le_bytes([req[0], req[1]]);
+                    let vol = req[2].min(100);
+                    if id == 0 {
+                        master = vol;
+                        snd::ST_OK
+                    } else if let Some(v) = voices.iter_mut().find(|v| v.id == id) {
+                        v.vol = vol;
+                        snd::ST_OK
+                    } else {
+                        // Голос кончился, пока человек вёл ползунок, — это не ошибка вызова, а
+                        // обычная гонка: меню просто перерисуется без него.
+                        snd::ST_BAD
+                    }
+                }
+                // Веха 204 — КУДА МОЖНО ИГРАТЬ: список выходов кодека и тот, что выбран.
+                snd::OP_OUTPUTS => {
+                    extra[0] = outs.len().min(snd::MAX_VOICES) as u8;
+                    extra[1] = cur_out as u8;
+                    let mut at = 2;
+                    for p in outs.iter().take(snd::MAX_VOICES) {
+                        let name = out_name(p);
+                        extra[at] = name.len().min(snd::NAME_MAX) as u8;
+                        extra[at + 1..at + 1 + snd::NAME_MAX].copy_from_slice(&name_bytes(name));
+                        at += 1 + snd::NAME_MAX;
+                    }
+                    extra_len = at;
+                    snd::ST_OK
+                }
+                // Веха 204 — ВЫБРАТЬ ВЫХОД: погасить прежний пин и открыть новый тракт.
+                //
+                // Гасим обязательно: иначе звук пошёл бы сразу в оба, а смысл выбора ровно
+                // обратный — наушники втыкают, чтобы динамик замолчал.
+                snd::OP_PICK if m.len >= 1 => {
+                    let want = req[0] as usize;
+                    if want >= outs.len() {
+                        snd::ST_BAD
+                    } else if want == cur_out {
+                        snd::ST_OK
+                    } else {
+                        path_close(&outs[cur_out]);
+                        cur_out = want;
+                        path_open(&outs[cur_out]);
+                        // Поток при этом не трогаем: он привязан к НОМЕРУ (`STREAM_TAG`), а не
+                        // к пину, и новый конвертер забирает те же данные с того же места.
+                        snd::ST_OK
+                    }
+                }
                 _ => snd::ST_BAD,
             };
-            let mut body = [0u8; 8];
+            let mut body = [0u8; 1 + snd::STATE_BYTES];
             body[0] = status;
             body[1..1 + extra_len].copy_from_slice(&extra[..extra_len]);
             sys::reply(m.reply_cap, &body[..1 + extra_len]);
-            // Тяжёлое — после ответа: клиент уже свободен и занимается своим делом.
-            if start_after_reply {
-                fill_half(0, &mut src);
-                fill_half(1, &mut src);
-                last_half = 0;
-                playing = stream_start(sd, ring_pa + BDL_OFF, PCM_BYTES, FORMAT);
-            }
         }
 
-        // Клиент, который замолчал надолго, считается ушедшим: общая память у нас одна, и
-        // держать её ради процесса, которого, возможно, уже нет, значит не дать играть никому.
-        if let Source::Stream(r) = &src {
-            if sys::monotonic_ns().saturating_sub(r.seen_ns) > CLIENT_SILENCE_NS {
-                sys::shm_unmap(r.cap, r.va);
-                src = Source::Tone(Tone::silent());
-            }
-        }
+        // Клиент, который замолчал надолго, считается ушедшим: его кольцо занимает и общую
+        // память, и место в миксере, а процесса за ним может уже не быть.
+        let now = sys::monotonic_ns();
+        drop_voices(&mut voices, |v| {
+            matches!(&v.src, Src::Stream(r) if now.saturating_sub(r.seen_ns) > CLIENT_SILENCE_NS)
+        });
+        // Догоревшие голоса — тоны, которые доиграли. Поток при этом не гасим: он ждёт тишины
+        // несколько секунд (см. ниже).
+        drop_voices(&mut voices, |v| matches!(&v.src, Src::Tone(t) if t.left == 0 && t.lead == 0));
 
         if !playing {
             continue;
@@ -1080,7 +1259,7 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         let pos = unsafe { rd32(sd + SD_LPIB) } as usize;
         let cur = (pos / (PCM_BYTES / 2)).min(1);
         if cur != last_half {
-            if fill_half(last_half, &mut src) {
+            if fill_half(last_half, &mut voices, master) {
                 quiet_halves = 0;
             } else {
                 quiet_halves += 1;
@@ -1096,4 +1275,62 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
             playing = false;
         }
     }
+}
+
+/// Выдать номер следующему голосу, перешагнув ноль: нулём обозначен МАСТЕР.
+fn take_id(next: &mut u16) -> u16 {
+    let id = *next;
+    *next = next.wrapping_add(1).max(1);
+    id
+}
+
+/// Имя голоса в поле фиксированной длины, с обрезкой по границе символа.
+fn name_bytes(s: &str) -> [u8; snd::NAME_MAX] {
+    let mut out = [0u8; snd::NAME_MAX];
+    let mut end = s.len().min(snd::NAME_MAX);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    out[..end].copy_from_slice(&s.as_bytes()[..end]);
+    out
+}
+
+/// Убрать голоса по условию, отпустив их общую память.
+///
+/// Отдельной функцией, потому что забыть `shm_unmap` можно ровно один раз: отображения копятся
+/// молча, а кончаются адреса — через сутки работы и в чужом месте.
+fn drop_voices(voices: &mut Vec<Voice>, pred: impl Fn(&Voice) -> bool) {
+    let mut i = 0;
+    while i < voices.len() {
+        if pred(&voices[i]) {
+            if let Src::Stream(r) = &voices[i].src {
+                sys::shm_unmap(r.cap, r.va);
+            }
+            voices.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Собрать ответ `OP_STATE`: заголовок и голоса подряд (разбирает его `snd::parse_state`).
+fn write_state(out: &mut [u8], master: u8, playing: bool, outname: &str, voices: &[Voice]) -> usize {
+    out[0] = master;
+    out[1] = playing as u8;
+    let name = name_bytes(outname);
+    let mut len = outname.len().min(snd::NAME_MAX) as u8;
+    while len > 0 && !outname.is_char_boundary(len as usize) {
+        len -= 1;
+    }
+    out[2] = len;
+    out[3..3 + snd::NAME_MAX].copy_from_slice(&name);
+    let mut at = 3 + snd::NAME_MAX;
+    for v in voices.iter().take(snd::MAX_VOICES) {
+        out[at..at + 2].copy_from_slice(&v.id.to_le_bytes());
+        out[at + 2] = v.vol;
+        out[at + 3] = v.name_len;
+        out[at + 4..at + 4 + snd::NAME_MAX].copy_from_slice(&v.name);
+        at += 4 + snd::NAME_MAX;
+    }
+    at
 }

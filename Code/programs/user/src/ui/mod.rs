@@ -897,6 +897,51 @@ impl<'a> Ui<'a> {
         grab.map(|_| top)
     }
 
+    /// Веха 204 — ПОЛЗУНОК (значение 0..100): дорожка, заполненная часть и кольцо-бегунок.
+    ///
+    /// Вид взят с макета владельца (меню звука): дорожка в четыре точки со скруглением в две,
+    /// пройденная часть светлее, бегунок — светлое кольцо с тёмной серединой. Кольцо, а не
+    /// кружок: сплошная точка на светлой дорожке сливается с ней ровно в середине хода.
+    ///
+    /// `r` — вся полоса вместе с местом под бегунок; дорожка ложится по её середине. Возвращает
+    /// НОВОЕ значение, если человек держит в ней кнопку, иначе `None`. Как у полосы прокрутки
+    /// ([`Ui::scrollbar_from`]), виджет без памяти: где ползунок стоит — знает вызывающий, а
+    /// наше дело показать и посчитать.
+    ///
+    /// Ловим ВЫСОТОЙ БОЛЬШЕ дорожки: попасть пальцем в четыре точки — работа, которой человек
+    /// заниматься не обязан (то же правило и по той же причине, что у полосы прокрутки).
+    pub fn slider(&mut self, r: Rect, value: u8, press: Option<(i32, i32)>) -> Option<u8> {
+        const TRACK: i32 = 4;
+        const KNOB: i32 = 4;
+        if r.w <= TRACK {
+            return None;
+        }
+        let grab = press.filter(|&(x, y)| {
+            x >= r.x - KNOB && x < r.right() + KNOB && y >= r.y && y < r.bottom()
+        });
+        // Значение под пальцем: доля пути по дорожке. Считается ДО рисования — кадр обязан
+        // показать то, где палец сейчас, а не где он был на прошлом (правило Вехи 202.17).
+        let value = match grab {
+            Some((x, _)) => (((x - r.x).clamp(0, r.w) as i64 * 100 / r.w as i64) as u8).min(100),
+            None => value.min(100),
+        };
+        let mid = r.y + r.h / 2;
+        let track = Rect::new(r.x, mid - TRACK / 2, r.w, TRACK);
+        self.c.rrect(track, TRACK / 2, self.tint(self.th.muted));
+        let done = r.w * value as i32 / 100;
+        if done > 0 {
+            self.c.rrect(Rect::new(r.x, track.y, done, TRACK), TRACK / 2, self.tint(self.th.text));
+        }
+        // Бегунок: квадрат со скруглением в половину — он же круг, другого круга у холста нет.
+        let cx = r.x + done;
+        let ring = Rect::new(cx - KNOB, mid - KNOB, KNOB * 2, KNOB * 2);
+        self.c.rrect(ring, KNOB, self.tint(self.th.text));
+        let hole = Rect::new(ring.x + 1, ring.y + 1, ring.w - 2, ring.h - 2);
+        self.c.rrect(hole, KNOB - 1, self.tint(self.th.bg.with_a(0xff)));
+        self.mark(Rect::new(r.x - KNOB, r.y, r.w + KNOB * 2, r.h));
+        grab.map(|_| value)
+    }
+
     /// Ширина строки — раскладке ряда её надо знать заранее.
     pub fn text_w(&mut self, s: &str) -> i32 {
         self.font.width(s)

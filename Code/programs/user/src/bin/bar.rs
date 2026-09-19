@@ -339,7 +339,11 @@ impl ui::Client for Bar {
         // при тех же числах ни один пиксель не тронется.
         Some(match () {
             _ if self.busy() => ui::anim::FRAME_MS,
-            _ if self.sysview != sys::NO_CAP => ms_to_next_minute().min(METRIC_MS),
+            // Веха 204 — звук считается тем же «раз в секунду»: громкость меняют и мимо нас
+            // (`volume` из шелла, чужая программа), а число в панели обязано за этим поспевать.
+            _ if self.sysview != sys::NO_CAP || self.snd != sys::NO_CAP => {
+                ms_to_next_minute().min(METRIC_MS)
+            }
             _ => ms_to_next_minute(),
         })
     }
@@ -386,6 +390,8 @@ const A_NOTES: u32 = 10;
 /// Величина одна на всё полотно: убирают их по одному, а «очистить» убирает сразу все — и в
 /// обоих случаях это одно движение, а не шесть независимых.
 const A_NOTE_GO: u32 = 11;
+/// Веха 204 — подсветка острова звука.
+const A_SOUND: u32 = 13;
 /// Веха 169 — доля ПЕРЕЕЗДА между полотнами (0 — только что нажали, 256 — новое полотно своего
 /// размера). См. [`Bar::morph`].
 const A_MORPH: u32 = 12;
@@ -463,6 +469,23 @@ struct Bar {
     /// Прямоугольник ПОЛОСЫ прокрутки с последней отрисовки: по нему обработчик события
     /// решает, схватили её или нет, и считает новое смещение (Веха 202.17).
     notes_track: Rect,
+    /// Веха 204 — КАНАЛ К ЗВУКУ. `NO_CAP` — звука в системе нет (нет строки `service hda` в
+    /// поколении либо карты в машине): острова тогда не будет вовсе, как и острова метрик без
+    /// права обзора. Пустой ползунок, который ничем не управляет, хуже отсутствия ползунка.
+    snd: usize,
+    /// Состояние миксера, снятое при открытии меню и при каждой правке громкости.
+    mix: Option<sys::snd_cli::State>,
+    /// Какая вкладка меню открыта: 0 — «Тома», 1 — «Устройства» (по макету).
+    mix_tab: u8,
+    /// Веха 204 — куда звуковая карта умеет играть и куда играет сейчас. Спрашивается вместе с
+    /// состоянием миксера: список короткий и меняться может только вместе с железом.
+    outs: Option<sys::snd_cli::Outputs>,
+    /// Ползунок, который держат прямо сейчас: 0 — общая громкость, иначе номер голоса.
+    ///
+    /// Нужен затем же, зачем якорь у полосы прокрутки: пока кнопку держат, громкость ведёт
+    /// ИМЕННО ЭТОТ ползунок, даже если рука ушла за его прямоугольник. Без этого быстрое
+    /// движение вниз-вбок бросало бы один ползунок и хватало соседний.
+    vol_drag: Option<u16>,
     /// Прямоугольник полотна с последней отрисовки — им ограничивается кадр прокрутки.
     ///
     /// Веха 202.13 — без этого прокрутка просила `Scope::All`, то есть перерисовку ВСЕЙ
@@ -555,6 +578,8 @@ enum Menu {
     Shell,
     /// Уведомления: колокольчик.
     Notes,
+    /// Веха 204 — ЗВУК: громкость общая и по программам (миксер).
+    Sound,
 }
 
 /// Веха 160 — ОСТРОВ ПАНЕЛИ как выбор человека: что стоит и в каком порядке, решает `bar.vv`
@@ -574,11 +599,13 @@ enum Slot {
     Gen = 5,
     /// Веха 168 — колокольчик уведомлений.
     Notes = 6,
+    /// Веха 204 — динамик с громкостью; за ним меню-миксер.
+    Sound = 7,
 }
 
 /// Сколько всего островов знает панель. Карточка меню идёт следом отдельным индексом: она не
 /// остров ряда — её нельзя ни переставить, ни убрать, она принадлежит кнопке поколения.
-const SLOTS: usize = 7;
+const SLOTS: usize = 8;
 
 impl Slot {
     fn parse(s: &str) -> Option<Slot> {
@@ -590,6 +617,7 @@ impl Slot {
             "title" => Slot::Title,
             "gen" => Slot::Gen,
             "notes" => Slot::Notes,
+            "sound" => Slot::Sound,
             _ => return None,
         })
     }
@@ -629,7 +657,7 @@ fn layout_from(text: &str) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>, bool) {
         (
             alloc::vec![Slot::Clock, Slot::Lang, Slot::Metrics, Slot::Spaces],
             alloc::vec![Slot::Title],
-            alloc::vec![Slot::Notes, Slot::Gen],
+            alloc::vec![Slot::Sound, Slot::Notes, Slot::Gen],
             false,
         )
     }
@@ -653,6 +681,7 @@ fn slot_names(v: &[Slot]) -> String {
             Slot::Title => "title",
             Slot::Gen => "gen",
             Slot::Notes => "notes",
+            Slot::Sound => "sound",
         });
     }
     s
@@ -707,6 +736,11 @@ impl Bar {
             wheels: 0,
             notes_drag: None,
             notes_track: Rect::ZERO,
+            snd: sys::snd_cli::find_cap().unwrap_or(sys::NO_CAP),
+            mix: None,
+            mix_tab: 0,
+            outs: None,
+            vol_drag: None,
             notes_card: Rect::ZERO,
             notes_row: 0,
             notes_content: 0,
@@ -903,8 +937,36 @@ impl Bar {
                 // раз. Список пришёл другой, и старое смещение указывало бы в него наугад.
                 self.notes_scroll.reset();
             }
+            // Веха 204 — состояние миксера спрашивается у сервера звука в момент открытия:
+            // держать его свежим постоянно значило бы дёргать сервер ради того, на что никто
+            // не смотрит. Пока меню открыто, оно обновляется после каждой правки громкости.
+            Menu::Sound => {
+                self.mix = self.mixer();
+                self.outs = (self.snd != sys::NO_CAP)
+                    .then(|| sys::snd_cli::outputs(self.snd))
+                    .flatten();
+                self.mix_tab = 0;
+            }
             Menu::None => {}
         }
+    }
+
+    /// Веха 204 — спросить сервер звука о громкости и голосах. `None` — звука нет.
+    fn mixer(&self) -> Option<sys::snd_cli::State> {
+        (self.snd != sys::NO_CAP).then(|| sys::snd_cli::state(self.snd)).flatten()
+    }
+
+    /// Веха 204 — поставить громкость и СРАЗУ перечитать состояние.
+    ///
+    /// Перечитываем, а не правим у себя: сервер — хозяин этих чисел, и он же мог за это время
+    /// потерять голос (дорожка кончилась). Своя копия разошлась бы с ним молча, и ползунок
+    /// показывал бы громкость того, кто уже смолк.
+    fn set_volume(&mut self, id: u16, vol: u8) {
+        if self.snd == sys::NO_CAP {
+            return;
+        }
+        sys::snd_cli::volume(self.snd, id, vol);
+        self.mix = self.mixer();
     }
 
     fn paint(&mut self, u: &mut Ui) {
@@ -954,6 +1016,10 @@ impl Bar {
         let title_w = u.font.width(&self.shown) + 2 * th.pad;
         let note_text = alloc::format!("{}", self.notes.min(99));
         let note_w = u.font.width(&note_text) + th.px(4);
+        // Веха 204 — остров звука: знак и процент рядом (по макету — одна карточка на двоих).
+        // Пока меню закрыто, число берётся из последнего снимка; открытие его освежит.
+        let vol_text = alloc::format!("{}%", self.mix.as_ref().map_or(0, |m| m.master));
+        let vol_w = u.font.width(&vol_text) + th.px(4);
         let gen_w = u.font.width(&self.gen) + 2 * th.pad;
         // Все ширины сняты со шрифта ЗАРАНЕЕ: измерение строки просит шрифт изменяемо (глиф
         // может лечь в кэш), а замыкание, которое так делает, нельзя звать из `map`.
@@ -971,6 +1037,10 @@ impl Bar {
                 Slot::Gen => gen_w,
                 // Веха 168 — колокольчик: знак, а при накопившемся — ещё и число рядом.
                 Slot::Notes => ico + 2 * th.pad + if self.notes > 0 { note_w } else { 0 },
+                // Веха 204 — звука нет в системе, значит нет и острова: ползунок, который ничем
+                // не управляет, хуже отсутствия ползунка (то же правило, что у метрик выше).
+                Slot::Sound if self.snd == sys::NO_CAP => 0,
+                Slot::Sound => ico + 2 * th.pad + vol_w,
             }
         };
 
@@ -1026,6 +1096,7 @@ impl Bar {
         );
         let lang_isle = at[Slot::Lang.at()];
         let n_isle = at[Slot::Notes.at()];
+        let v_isle = at[Slot::Sound.at()];
         let t_isle = at[Slot::Title.at()];
 
         // Заголовок меняется в ДВА ТАКТА: старый гаснет, подменяется и загорается новый. Смена
@@ -1067,6 +1138,7 @@ impl Bar {
         let lang_hot = self.mo.val(A_LANG, if hot(lang_isle) { 256 } else { 0 }) as u32;
         let sys_hot = self.mo.val(A_SYS, if hot(s_isle) { 256 } else { 0 }) as u32;
         let notes_hot = self.mo.val(A_NOTES, if hot(n_isle) { 256 } else { 0 }) as u32;
+        let vol_hot = self.mo.val(A_SOUND, if hot(v_isle) { 256 } else { 0 }) as u32;
 
         // ── карточка меню ──────────────────────────────────────────────────────────────────
         let menu_t =
@@ -1119,7 +1191,9 @@ impl Bar {
             // не загорался вовсе (и гас не там, где надо). Берём только когда курсор внутри
             // полотна — иначе любое движение мыши по экрану заставляло бы перерисовывать список.
             match self.ptr.filter(|&(px, py)| {
-                let c = self.notes_card;
+                // Веха 204 — у меню звука полотно своё, и ползунок под рукой обязан ехать по
+                // тем же правилам, что подсветка крестика: кадр рисуется, пока курсор внутри.
+                let c = if self.showing == Menu::Sound { card } else { self.notes_card };
                 !c.is_empty() && px >= c.x && px < c.right() && py >= c.y && py < c.bottom()
             }) {
                 Some((px, py)) => sig(&[px as u64, py as u64]),
@@ -1132,6 +1206,25 @@ impl Bar {
             // владелец: «покрутил, оно подумало, а после резко переместилось», причём «подумало»
             // не зависело от числа уведомлений — оно зависело от часов.
             self.notes_scroll.px as u64,
+            // Веха 204 — СОСТОЯНИЕ МИКСЕРА в подписи целиком: общая громкость, вкладка, кто
+            // играет и с какой громкостью. Без него ползунок, уехавший под рукой, не
+            // перерисовался бы до следующего тика часов — та же беда, что была у прокрутки.
+            // Курсор над полотном в подписи уже есть (выше), и протяжка ползунка ловится им.
+            self.mix_tab as u64,
+            self.outs.as_ref().map_or(0, |o| sig(&[o.count as u64, o.cur as u64])),
+            self.vol_drag.unwrap_or(u16::MAX) as u64,
+            match &self.mix {
+                None => 0,
+                Some(m) => sig(&[
+                    m.master as u64,
+                    m.count as u64,
+                    sig(&m
+                        .voices()
+                        .iter()
+                        .flat_map(|v| [v.id as u64, v.vol as u64, sig_str(v.name())])
+                        .collect::<Vec<_>>()),
+                ]),
+            },
             self.confirm as u64,
             self.space as u64,
             self.spaces as u64,
@@ -1169,6 +1262,14 @@ impl Bar {
                     notes_hot as u64,
                     self.dnd as u64,
                     (self.open == Menu::Notes) as u64,
+                ]),
+            },
+            Isle {
+                rect: v_isle,
+                sig: sig(&[
+                    sig_str(&vol_text),
+                    vol_hot as u64,
+                    (self.open == Menu::Sound) as u64,
                 ]),
             },
             Isle {
@@ -1288,6 +1389,22 @@ impl Bar {
             }
         }
 
+        // Веха 204 — ЗВУК: знак динамика и общая громкость числом. Перечёркнутый — на нуле:
+        // «почему не слышно» должно отвечаться одним взглядом на панель, как у «не беспокоить».
+        if redraw[Slot::Sound.at()] && !v_isle.is_empty() {
+            let inner = u.island(v_isle);
+            let mut d = inner;
+            let ir = d.cut_left(ico);
+            let vol = self.mix.as_ref().map_or(0, |m| m.master);
+            let col = if self.open == Menu::Sound || vol > 0 { th.text } else { th.muted };
+            let art = if vol == 0 { ui::icon::VOLUME_OFF } else { ui::icon::VOLUME };
+            u.icon(Rect::new(ir.x, v_isle.y + (isle_h - ico) / 2, ico, ico), art, col);
+            u.label(d, &vol_text, col, Align::Right);
+            if u.clicked(v_isle) {
+                self.toggle = Some(Menu::Sound);
+            }
+        }
+
         if redraw[I_CARD] {
             // Стереть надо и УГОЛКИ карточки: они торчат за её прямоугольник (слева сверху и
             // справа снизу), и без запаса от прошлого кадра остался бы их след.
@@ -1336,7 +1453,8 @@ impl Bar {
                     || l_isle.contains(cx, cy)
                     || t_isle.contains(cx, cy)
                     || r_isle.contains(cx, cy)
-                    || s_isle.contains(cx, cy);
+                    || s_isle.contains(cx, cy)
+                    || v_isle.contains(cx, cy);
                 if !inside {
                     self.toggle = Some(self.open);
                 }
@@ -1374,8 +1492,12 @@ impl Bar {
 
     /// Новый замер. `true` — показанные числа изменились, нужен кадр.
     fn sample(&mut self) -> bool {
+        // Веха 204 — заодно ГРОМКОСТЬ: её число стоит в панели постоянно, а не только при
+        // открытом меню. Спрашивать его лишь на открытии значило бы показывать «0 %» до
+        // первого щелчка — то есть врать знаком «звук выключен» на исправной системе.
+        let mix_changed = self.sample_mix();
         if self.sysview == sys::NO_CAP {
-            return false;
+            return mix_changed;
         }
         let Some(now) = sys::sysinfo(self.sysview) else { return false };
         // Слишком близкие замеры не считаем: на промежутке короче полусекунды разница времён
@@ -1388,6 +1510,26 @@ impl Bar {
         let changed = (cpu, ram) != (self.cpu, self.ram);
         self.cpu = cpu;
         self.ram = ram;
+        changed || mix_changed
+    }
+
+    /// Веха 204 — переспросить миксер. `true` — изменилось то, что видно снаружи.
+    ///
+    /// Пока ползунок ДЕРЖАТ, не спрашиваем вовсе: ответ сервера приезжает в тот же кадр, что и
+    /// движение руки, и лишний опрос здесь только мешал бы — а на секунду отстающее число под
+    /// рукой выглядит как рывок ползунка назад.
+    fn sample_mix(&mut self) -> bool {
+        if self.snd == sys::NO_CAP || self.vol_drag.is_some() {
+            return false;
+        }
+        let now = self.mixer();
+        let seen = |m: &Option<sys::snd_cli::State>| {
+            m.as_ref().map(|m| {
+                (m.master, m.count, m.voices().iter().map(|v| (v.id, v.vol)).collect::<Vec<_>>())
+            })
+        };
+        let changed = seen(&now) != seen(&self.mix);
+        self.mix = now;
         changed
     }
 
@@ -1457,6 +1599,211 @@ impl Bar {
         let pad = th.px(3);
         let head = 2 * font.line_h() + 2 * pad;
         (row, head, pad)
+    }
+
+    /// Веха 204 — сколько КАРТОЧЕК в меню звука на текущей вкладке.
+    ///
+    /// «Тома»: вывод, ввод и по карточке на каждый голос. Ввод показан, хотя записи у нас нет:
+    /// в макете он есть, а молча пропустить его значило бы соврать, что звук у системы
+    /// односторонний по замыслу. Вместо ползунка там сказано, чего не хватает.
+    fn vol_rows(&self) -> usize {
+        match self.mix_tab {
+            0 => 2 + self.mix.as_ref().map_or(0, |m| m.count),
+            _ => self.outs.as_ref().map_or(1, |o| o.count.max(1)),
+        }
+    }
+
+    /// Веха 204 — МЕНЮ ЗВУКА: общая громкость, вход и ползунок на каждую играющую программу.
+    ///
+    /// Вид взят с макета (`ScreanAudioMenuOpen`): шапка со знаком, названием и двумя вкладками,
+    /// под ней карточки «подпись сверху, ползунок снизу». Числа те же, что у сервера: панель
+    /// ничего не помнит о громкости сама (см. [`Bar::set_volume`]).
+    fn draw_sound(&mut self, u: &mut Ui, th: &Theme, card: Rect) {
+        let font_h = u.font.line_h();
+        let (_, _, pad) = Self::metrics(th, &*u.font);
+        let m = th.px(5);
+        let mut d = card.inset(m);
+
+        // ── шапка: знак, «Звук» и вкладки ──────────────────────────────────────────────────
+        let head = d.cut_top(Self::vol_head(&*u.font, pad, th));
+        d.cut_top(m);
+        u.card(head);
+        let mut inner = head.inset(pad);
+        let mut title = inner.cut_top(font_h);
+        let ico = title.cut_left(font_h);
+        let master = self.mix.as_ref().map_or(0, |m| m.master);
+        let art = if master == 0 { ui::icon::VOLUME_OFF } else { ui::icon::VOLUME };
+        u.icon(ico, art, th.muted);
+        title.cut_left(th.px(4));
+        u.label(title, ui::t("Звук"), th.text, Align::Left);
+        inner.cut_top(pad);
+
+        // Вкладки: две равные половины ряда, выбранная — на светлой подложке (по макету).
+        let tabs = inner.cut_top(Self::vol_tabs(&*u.font, th));
+        let half = tabs.w / 2;
+        for (i, name) in [ui::t("Тома"), ui::t("Устройства")].into_iter().enumerate() {
+            let r = Rect::new(tabs.x + i as i32 * half, tabs.y, half, tabs.h);
+            let on = self.mix_tab == i as u8;
+            if on {
+                u.c.rrect(r, th.radius.min(r.h / 2), u.tint(th.muted));
+            }
+            let col = if on { th.on_accent } else { th.muted };
+            u.label(r, name, col, Align::Center);
+            if u.clicked(r) {
+                self.mix_tab = i as u8;
+            }
+        }
+
+        // ── вкладка «Устройства» ───────────────────────────────────────────────────────────
+        //
+        // Выход у нас пока ОДИН: драйвер выбирает его сам (динамик, если он есть, иначе первый
+        // подходящий), а переключать выходы не умеет. Показываем то, что есть, и говорим, чего
+        // нет, — по тому же правилу, что и «нет драйверов» в остальных местах системы.
+        if self.mix_tab != 0 {
+            let outs = self.outs;
+            let Some(outs) = outs.filter(|o| o.count > 0) else {
+                // Карта есть, а выходов нет — так бывает на машине без звука вовсе. Молчать
+                // нельзя: пустая вкладка читается как «сломалось», а не как «нечего выбирать».
+                let row = d.cut_top(Self::vol_row(&*u.font, pad));
+                u.card(row);
+                let mut r = row.inset(pad);
+                u.label(r.cut_top(font_h), ui::t("Выходов нет"), th.muted, Align::Left);
+                u.label(r, ui::t("звуковая карта не отвечает"), th.muted, Align::Left);
+                return;
+            };
+            let mut pick: Option<usize> = None;
+            for i in 0..outs.count {
+                if i > 0 {
+                    d.cut_top(m);
+                }
+                let row = d.cut_top(Self::vol_row(&*u.font, pad));
+                u.card(row);
+                let mut r = row.inset(pad);
+                let on = i == outs.cur;
+                let line = r.cut_top(font_h);
+                u.label(line, outs.name(i), if on { th.text } else { th.muted }, Align::Left);
+                // Выбранный говорит об этом словом, а не точкой: знак пришлось бы объяснять,
+                // а слово «играет сюда» объясняет себя само.
+                let note = if on { ui::t("играет сюда") } else { ui::t("нажать, чтобы выбрать") };
+                u.label(r, note, th.muted, Align::Left);
+                if u.clicked(row) && !on {
+                    pick = Some(i);
+                }
+            }
+            if let Some(i) = pick {
+                if self.snd != sys::NO_CAP {
+                    sys::snd_cli::pick(self.snd, i);
+                    self.outs = sys::snd_cli::outputs(self.snd);
+                    self.mix = self.mixer();
+                }
+            }
+            return;
+        }
+
+        // ── вкладка «Тома»: вывод, вход и программы ────────────────────────────────────────
+        let out_name = self.mix.as_ref().map(|m| m.out()).unwrap_or("");
+        let mut set: Option<(u16, u8)> = None;
+        let held = u.held();
+        let click = u.click();
+        // Пока кнопку держат, громкость ведёт ТОТ ползунок, на котором НАЖАЛИ. Владельца
+        // назначает нажатие, а не «кнопка держится и курсор рядом»:
+        //
+        // - без этого рука, ушедшая вниз с чужого ползунка, хватала бы соседний, а стоят они
+        //   плотно;
+        // - хуже того, ползунок поймал бы ЧУЖОЕ нажатие: щелчок по острову в панели открывает
+        //   меню, и в том же кадре нарисованный ползунок увидел бы «кнопку держат» с
+        //   координатой острова — то есть левее своей дорожки — и поставил громкость в ноль.
+        let owner = self.vol_drag;
+        // Дорожка отступает от краёв карточки на радиус бегунка: иначе на нуле и на сотне он
+        // наполовину вылезает за карточку и срезается её краем.
+        let knob = th.px(4);
+        let mut grab: Option<u16> = None;
+        let me = |u: &mut Ui,
+                      r: Rect,
+                      id: u16,
+                      val: u8,
+                      set: &mut Option<(u16, u8)>,
+                      grab: &mut Option<u16>| {
+            let r = Rect::new(r.x + knob, r.y, (r.w - 2 * knob).max(1), r.h);
+            let inside = |&(x, y): &(i32, i32)| {
+                x >= r.x - knob && x < r.right() + knob && y >= r.y && y < r.bottom()
+            };
+            // Ведём, если ползунок УЖЕ наш, либо если нажали именно в нём — и никак иначе.
+            let drag = match owner {
+                Some(o) if o == id => held,
+                Some(_) => None,
+                None => match click.filter(inside) {
+                    Some(p) => {
+                        *grab = Some(id);
+                        Some(p)
+                    }
+                    None => None,
+                },
+            };
+            if let Some(v) = u.slider(r, val, drag) {
+                *set = Some((id, v));
+            }
+        };
+
+        // Вывод — общая громкость системы.
+        let row = d.cut_top(Self::vol_row(&*u.font, pad));
+        d.cut_top(m);
+        u.card(row);
+        let mut r = row.inset(pad);
+        let mut line = r.cut_top(font_h);
+        let pct = alloc::format!("{}%", master);
+        let pct_w = u.font.width(&pct) + th.px(4);
+        u.label(line.cut_right(pct_w), &pct, th.muted, Align::Right);
+        // «Вывод» — своё слово, имя устройства — приписка к нему: в макете они разного цвета,
+        // и это не украшение. Слово отвечает на «что это за ползунок», имя — на «куда играет».
+        let word = ui::t("Вывод");
+        let ww = u.font.width(word);
+        u.label(line.cut_left(ww), word, th.text, Align::Left);
+        u.label(line, &alloc::format!(" — {}", out_name), th.muted, Align::Left);
+        me(u, r, 0, master, &mut set, &mut grab);
+
+        // Вход — его нет, и об этом сказано прямо.
+        let row = d.cut_top(Self::vol_row(&*u.font, pad));
+        u.card(row);
+        let mut r = row.inset(pad);
+        u.label(r.cut_top(font_h), ui::t("Ввод"), th.muted, Align::Left);
+        u.label(r, ui::t("нет драйверов"), th.muted, Align::Left);
+
+        // Программы: по карточке на голос. Играющих может не быть вовсе — это нормальный вид
+        // системы, а не пустое место: в ней просто сейчас тихо.
+        let voices: Vec<(u16, u8, String)> = self
+            .mix
+            .as_ref()
+            .map(|m| m.voices().iter().map(|v| (v.id, v.vol, v.name().to_string())).collect())
+            .unwrap_or_default();
+        for (id, vol, name) in voices {
+            d.cut_top(m);
+            let row = d.cut_top(Self::vol_row(&*u.font, pad));
+            u.card(row);
+            let mut r = row.inset(pad);
+            let mut line = r.cut_top(font_h);
+            let pct = alloc::format!("{}%", vol);
+            let pct_w = u.font.width(&pct) + th.px(4);
+            u.label(line, &name, th.text, Align::Left);
+            u.label(line.cut_right(pct_w), &pct, th.muted, Align::Right);
+            me(u, r, id, vol, &mut set, &mut grab);
+        }
+
+        // Правка громкости — ПОСЛЕ кадра: сервер отвечает состоянием, и менять его посреди
+        // отрисовки значило бы рисовать половину кадра по старым числам, половину по новым.
+        if let Some(id) = grab {
+            self.vol_drag = Some(id);
+        }
+        match set {
+            Some((id, v)) => {
+                self.vol_drag = Some(id);
+                self.set_volume(id, v);
+            }
+            // Кнопку отпустили — протяжка кончилась. Проверяем именно кнопку, а не попадание:
+            // рука во время протяжки свободно уходит за пределы ползунка, и это не конец.
+            None if held.is_none() => self.vol_drag = None,
+            None => {}
+        }
     }
 
     /// Веха 168 — ПОЛОТНО УВЕДОМЛЕНИЙ: что накопилось, свежее сверху.
@@ -1678,6 +2025,25 @@ impl Bar {
     /// Веха 168.2 — высота карточки уведомления и высота шапки полотна. ОДИН расчёт на всех:
     /// высоту полотна считает [`Bar::card_rect`], а карточки режет [`Bar::draw_notes`], и два
     /// ответа на «сколько это в точках» разъехались бы на первой же правке размера.
+    /// Веха 204 — меры МЕНЮ ЗВУКА, снятые с макета (`ScreanAudioMenuOpen`, полотно 206 при
+    /// экране 1280): шапка 55 (строка заголовка и ряд вкладок), карточка громкости 40, шаг 46.
+    /// Здесь они выражены через кегль и поля темы — так меню остаётся соразмерным при другом
+    /// шрифте, а пропорции макета сохраняются.
+    fn vol_head(font: &Font, pad: i32, th: &Theme) -> i32 {
+        // Строка заголовка, ряд вкладок и поля: в макете 55 при строке 14 и полях 7.
+        2 * font.line_h() + 3 * pad + th.px(4)
+    }
+
+    /// Высота карточки громкости: подпись и под ней ползунок.
+    fn vol_row(font: &Font, pad: i32) -> i32 {
+        2 * font.line_h() + pad
+    }
+
+    /// Высота ряда вкладок («Тома» / «Устройства»).
+    fn vol_tabs(font: &Font, th: &Theme) -> i32 {
+        font.line_h() + th.px(4)
+    }
+
     fn note_h(font: &Font, pad: i32) -> i32 {
         2 * font.line_h() + 2 * pad + 6
     }
@@ -1764,6 +2130,15 @@ impl Bar {
             // ехал, а сказать, что выше есть ещё, было нечем.
             let hint = if count > Self::NOTES_SHOWN { font.line_h() + m } else { 0 };
             let h = 2 * m + head + m + body + hint;
+            return Rect::new(self.sw - w, self.strip, w, h);
+        }
+        // Веха 204 — МЕНЮ ЗВУКА: шапка с вкладками и по карточке на каждый ползунок.
+        if self.showing == Menu::Sound {
+            let w = th.px(300).min(self.sw - th.px(20));
+            let head = Self::vol_head(font, pad, th);
+            let rows = self.vol_rows();
+            let body: i32 = rows as i32 * (Self::vol_row(font, pad) + m) - m;
+            let h = 2 * m + head + m + body.max(font.line_h() + 2 * pad);
             return Rect::new(self.sw - w, self.strip, w, h);
         }
         let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));
@@ -1856,6 +2231,10 @@ impl Bar {
     ) {
         if self.showing == Menu::Notes {
             self.draw_notes(u, th, card);
+            return;
+        }
+        if self.showing == Menu::Sound {
+            self.draw_sound(u, th, card);
             return;
         }
         let (row, head_h, pad) = Self::metrics(th, &*u.font);

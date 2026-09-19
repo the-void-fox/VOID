@@ -50,6 +50,10 @@ pub const CLOSE: &[u8] = include_bytes!("../../../../assets/icons/close.vg");
 pub const BELL_OFF: &[u8] = include_bytes!("../../../../assets/icons/bell-off.vg");
 pub const TRASH: &[u8] = include_bytes!("../../../../assets/icons/trash.vg");
 
+/// Веха 204 — ЗВУК: динамик в панели и он же перечёркнутый, когда громкость на нуле.
+pub const VOLUME: &[u8] = include_bytes!("../../../../assets/icons/volume.vg");
+pub const VOLUME_OFF: &[u8] = include_bytes!("../../../../assets/icons/volume-off.vg");
+
 /// Веха 165 — ОТНЯТЬ ПРАВО: перечёркнутая рамка. В макете диспетчера на месте кнопки «отнять»
 /// стоит знак — строка права коротка, и слово в ней занимает больше места, чем сама строка.
 ///

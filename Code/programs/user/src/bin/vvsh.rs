@@ -1199,8 +1199,9 @@ fn shell_env() -> Env {
         ("switch", sh_switch),
         ("klog", sh_klog),
         ("send", sh_send),
-        // Веха 202.2 — звук: короткий сигнал.
+        // Веха 202.2 — звук: короткий сигнал. Веха 204 — громкость и миксер.
         ("beep", sh_beep),
+        ("volume", sh_volume),
         // Веха 200 — заглянуть в регистры железа (см. `sh_mmio`/`sh_pci`).
         ("mmio", sh_mmio),
         ("pci", sh_pci),
@@ -2502,6 +2503,51 @@ fn sh_beep(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+/// Веха 204 — `volume` БЕЗ АРГУМЕНТОВ показывает миксер, `volume(N)` ставит общую громкость,
+/// `volume(номер, N)` — громкость одного голоса.
+///
+/// Тот же миксер, что в меню панели, только словами: меню читает и пишет ровно эти же две
+/// операции сервера. Терминальный путь нужен не для красоты — им проверяется звук на машине,
+/// где панели может и не быть (`mode = "term"`), и им же видно то, чего в меню не показывают:
+/// номера голосов.
+fn sh_volume(args: &[Value]) -> Result<Value, EvalError> {
+    let ep = cap_snd();
+    if ep == sys::NO_CAP {
+        return Err(EvalError::new(
+            "volume: звука нет — ни строки `service hda` в поколении, ни звуковой карты в машине",
+        ));
+    }
+    // Один аргумент — общая громкость, два — громкость голоса. Ноль как номер голоса не
+    // годится: им обозначен мастер, и `volume(0, 50)` значило бы то же, что `volume(50)`.
+    let nums: Vec<u64> = args.iter().filter_map(num).collect();
+    match nums.len() {
+        0 => {}
+        1 => {
+            let v = nums[0].min(100) as u8;
+            if sys::snd_cli::volume(ep, 0, v) != sys::snd_cli::ST_OK {
+                return Err(EvalError::new("volume: сервер звука не принял громкость"));
+            }
+        }
+        _ => {
+            let (id, v) = (nums[0].clamp(1, 65535) as u16, nums[1].min(100) as u8);
+            if sys::snd_cli::volume(ep, id, v) != sys::snd_cli::ST_OK {
+                return Err(EvalError::new("volume: такого голоса у сервера нет (он уже смолк?)"));
+            }
+        }
+    }
+    let Some(st) = sys::snd_cli::state(ep) else {
+        return Err(EvalError::new("volume: сервер звука не ответил"));
+    };
+    let mut out = alloc::format!("общая {} % → {}\n", st.master, st.out());
+    if st.voices().is_empty() {
+        out.push_str("сейчас никто не играет\n");
+    }
+    for v in st.voices() {
+        out.push_str(&alloc::format!("  {:>3}  {:>3} %  {}\n", v.id, v.vol, v.name()));
+    }
+    Ok(Value::str(&out))
+}
+
 /// `(mmio адрес…)` — слова регистров устройства по физическим адресам; `(mmio адрес = значение)`
 /// — ЗАПИСАТЬ.
 ///
@@ -3181,8 +3227,15 @@ impl vvsh_core::ModuleLoader for FsLoader {
 
 const NET_VV: &str = "# net.vv — сеть: true (вкл) или false (выкл)\ntrue\n";
 
-const SERVICES_VV: &str = "# services.vv — базовые сервисы (файлы)\n\
-[service(\"posixfs\", \"store:rw\")]\n";
+const SERVICES_VV: &str = "# services.vv — базовые сервисы\n\
+#\n\
+# posixfs — файлы (личность Linux в store). hda — ЗВУК: драйвер Intel HDA под правом на окно\n\
+# регистров и DMA. Машина без звуковой карты просто не поднимет его, и строка при этом остаётся\n\
+# верной: сервер живёт и честно отвечает «звука в этой машине нет».\n\
+[\n\
+\x20 service(\"posixfs\", \"store:rw\"),\n\
+\x20 service(\"hda\", \"mmio:hda\", \"dma\"),\n\
+]\n";
 
 const NETWORKING_VV: &str = "# networking.vv — сетевой сервис и РЕЗОЛВЕР ИМЁН\n\
 #\n\
@@ -3375,10 +3428,15 @@ sysviewcap = \"sysview:rwg!\"\n\
 # прав родителя, поэтому без пометки КАЖДОЕ окно наследовало бы у композитора прямой фреймбуфер\n\
 # (рисовать поверх чужих окон и читать их пиксели), право выключить машину и обзор процессов.\n\
 # Рисуют окна в свой буфер, гасит систему сам композитор — эти права им не нужны.\n\
+#\n\
+# ЗВУК (endpoint:hda) пометки НЕ несёт: играть умеет любая программа, и окну он нужен так же,\n\
+# как шеллу. Стоит он В КОНЦЕ, и это не косметика — порядок прав значим, дети наследуют его как\n\
+# есть, и вставленное в середину сдвигает всё, что правее (на этом уже попались: звук, дописанный\n\
+# третьим, сдвинул права, и окно приветствия перестало отдавать композитору свой буфер).\n\
 if mode == \"wm\" {\n\
 \x20 append(\n\
 \x20   [shell(\"wm\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb!\", \"power:wg!\", sysviewcap,\n\
-\x20          \"env\")],\n\
+\x20          \"hwprobe:rwg!\", \"endpoint:hda\", \"env\")],\n\
 \x20   map(|p| desktop(\"sysview\", p), sysview),\n\
 \x20   map(|p| desktop(\"power\", p), poweroff),\n\
 \x20   if wallpaper == \"\" { [] } else { [desktop(\"wallpaper\", wallpaper)] },\n\
@@ -3392,7 +3450,8 @@ if mode == \"wm\" {\n\
 } else {\n\
 \x20 if mode == \"term\" {\n\
 \x20   append(\n\
-\x20     [shell(\"term\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb\", \"power\", \"env\")],\n\
+\x20     [shell(\"term\", \"endpoint:posixfs\", \"store:rwx\", netcap, \"mmio:fb\", \"power\",\n\
+\x20            \"endpoint:hda\", \"env\")],\n\
 \x20     [terminal(\"font-size\", 18),\n\
 \x20      terminal(\"shell\", \"bin/vvsh\"),\n\
 \x20      terminal(\"shell-args\", \"repl\")],\n\
@@ -3421,6 +3480,8 @@ const BAR_VV: &str = "# bar.vv — ЧТО СТОИТ В ПАНЕЛИ и в ка�
 #   title   — заголовок окна в фокусе\n\
 #   gen     — имя поколения, нажатие открывает меню оболочки\n\
 #   notes   — колокольчик уведомлений с числом накопившихся (Веха 168)\n\
+#   sound   — громкость: знак динамика и число, нажатие открывает миксер (Веха 204).\n\
+#             Нет звуковой карты или строки `service hda` — нет и острова\n\
 #\n\
 # Убрать остров — вычеркнуть из списка. Пустая группа — законна: панель без часов и без столов\n\
 # это по-прежнему панель. Незнакомое имя пропускается, но `rebuild` о нём скажет.\n\
@@ -3429,7 +3490,7 @@ const BAR_VV: &str = "# bar.vv — ЧТО СТОИТ В ПАНЕЛИ и в ка�
 # она, а здесь — какая.\n\
 left = [\"clock\", \"lang\", \"metrics\", \"spaces\"]\n\
 center = [\"title\"]\n\
-right = [\"notes\", \"gen\"]\n\
+right = [\"sound\", \"notes\", \"gen\"]\n\
 \n\
 append(\n\
 \x20 map(|i| bar(\"left\", i), left),\n\
