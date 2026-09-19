@@ -1184,6 +1184,22 @@ pub struct MouseEvent {
     pub wheel: i8,
 }
 
+/// Веха 203 — признак «это ЖЕСТ ТАЧПАДА, а не мышь» в маске кнопок события.
+///
+/// Жест едет по тому же кольцу и тем же шестибайтным событием: кнопок у нас пять (биты 0..4),
+/// старший бит свободен. Своё кольцо понадобилось бы только затем, чтобы потерять порядок:
+/// «три пальца влево» обязано встать между движениями курсора ровно там, где случилось.
+pub const MOUSE_GESTURE: u8 = 0x80;
+
+/// Сторона свайпа — та же, что у [`void_touch::Dir`], только уже доехавшая до userspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Swipe {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 impl MouseEvent {
     pub fn left(&self) -> bool {
         self.buttons & 1 != 0
@@ -1193,6 +1209,24 @@ impl MouseEvent {
     }
     pub fn middle(&self) -> bool {
         self.buttons & 4 != 0
+    }
+    /// Веха 203 — жест тачпада: сколько пальцев и в какую сторону. `None` — обычное событие мыши.
+    ///
+    /// Спрашивать это ПЕРВЫМ делом: у жеста `dx`/`dy` значат сторону (−1/0/+1), а не смещение
+    /// курсора, и маска кнопок занята признаком. Принять его за мышь — значит увезти курсор в
+    /// угол и «нажать» несуществующую кнопку.
+    pub fn gesture(&self) -> Option<(u8, Swipe)> {
+        if self.buttons & MOUSE_GESTURE == 0 {
+            return None;
+        }
+        let dir = match (self.dx, self.dy) {
+            (d, _) if d < 0 => Swipe::Left,
+            (d, _) if d > 0 => Swipe::Right,
+            (_, d) if d < 0 => Swipe::Up,
+            (_, d) if d > 0 => Swipe::Down,
+            _ => return None,
+        };
+        Some((self.wheel as u8, dir))
     }
 }
 

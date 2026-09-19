@@ -261,6 +261,17 @@ unsafe fn touchpad_byte(b: u8) {
     match (*core::ptr::addr_of_mut!(TP)).feed(&p) {
         void_touch::Move::Cursor { dx, dy } => super::mouse_push(dx, dy, btn, 0),
         void_touch::Move::Wheel(ticks) => super::mouse_push(0, 0, btn, ticks),
+        // Веха 203 — СВАЙП. Кнопки сюда не кладём вовсе: жест делают пальцы на весу, и маска
+        // тут занята признаком жеста. Сторона едет в `dx`/`dy`, число пальцев — в `wheel`.
+        void_touch::Move::Swipe { fingers, dir } => {
+            let (dx, dy) = match dir {
+                void_touch::Dir::Left => (-1, 0),
+                void_touch::Dir::Right => (1, 0),
+                void_touch::Dir::Up => (0, -1),
+                void_touch::Dir::Down => (0, 1),
+            };
+            super::mouse_push(dx, dy, super::MOUSE_GESTURE, fingers as i8);
+        }
         // Кнопки отдаём отдельным событием, и только когда они изменились: иначе каждый пакет
         // лежащего пальца был бы «кнопку не нажимали», а таких пакетов восемьдесят в секунду.
         void_touch::Move::None if btn != TP_BTN => super::mouse_push(0, 0, btn, 0),
@@ -273,8 +284,8 @@ unsafe fn touchpad_byte(b: u8) {
 ///
 /// Зовётся ПОСЛЕ чтения конфига, то есть позже подъёма драйвера: до этого момента работают
 /// умолчания. Так и правильно — курсор обязан ездить ещё до того, как система нашла свой store.
-pub fn touchpad_tune(speed: u8, scroll_mm: u8) {
-    unsafe { (*core::ptr::addr_of_mut!(TP)).tune(speed, scroll_mm) }
+pub fn touchpad_tune(speed: u8, scroll_mm: u8, swipe_mm: u8) {
+    unsafe { (*core::ptr::addr_of_mut!(TP)).tune(speed, scroll_mm, swipe_mm) }
 }
 
 /// Веха 198 — тачпад ли на втором порту (для отчёта на загрузке).

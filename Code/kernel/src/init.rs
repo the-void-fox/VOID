@@ -464,17 +464,27 @@ fn hardware_entry(kind: &str, entry: &void_conf::Entry<'_>) {
     match (kind, key) {
         ("touchpad", "speed") => match num(value) {
             Some(n) => {
-                arch::touchpad_tune(n, 0);
+                arch::touchpad_tune(n, 0, 0);
                 println!("  [init] тачпад: скорость {} (больше — медленнее)", n);
             }
             None => println!("  [init] touchpad speed: жду число 1..16, а не '{}'", value),
         },
         ("touchpad", "scroll") => match num(value) {
             Some(n) => {
-                arch::touchpad_tune(0, n);
+                arch::touchpad_tune(0, n, 0);
                 println!("  [init] тачпад: шаг прокрутки {} мм", n);
             }
             None => println!("  [init] touchpad scroll: жду число 1..30 (мм), а не '{}'", value),
+        },
+        // Веха 203 — сколько миллиметров пальца на ОДИН шаг свайпа: чем меньше, тем чаще
+        // срабатывает жест. Что именно он делает — не здесь: стороны жеста привязывает к
+        // действиям композитор строками `gesture wm …`.
+        ("touchpad", "swipe") => match num(value) {
+            Some(n) => {
+                arch::touchpad_tune(0, 0, n);
+                println!("  [init] тачпад: шаг свайпа {} мм", n);
+            }
+            None => println!("  [init] touchpad swipe: жду число 3..60 (мм), а не '{}'", value),
         },
         ("acpi", "power-button") => {
             // Включаем ТОЛЬКО по явной просьбе: цена этой строки — эмуляция USB-клавиатуры

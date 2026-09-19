@@ -485,6 +485,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("shell", b_shell),
     ("terminal", b_terminal),
     ("bind", b_bind),
+    ("gesture", b_gesture),
     ("desktop", b_desktop),
     ("ui", b_ui),
     ("bar", b_bar),
@@ -699,6 +700,16 @@ fn b_bind(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("bind", args)
 }
 
+/// Веха 203 — `(gesture режим жест действие)`: жест ТАЧПАДА, `(gesture "wm" "Swipe3+Up"
+/// "workspace-prev")`. Читает композитор.
+///
+/// Свой вид записи, а не `bind`, потому что у `bind` правило «хоть одна строка — и схема
+/// ЦЕЛИКОМ из конфига»: жесты в нём отменялись бы всяким конфигом, посеянным раньше их
+/// появления (это уже случалось с клавишами — Веха 121.1).
+fn b_gesture(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("gesture", args)
+}
+
 /// `(packages имя…)` — пакеты, которые система обязана иметь (Веха 112). Читатель этой строки —
 /// не ядро и не терминал, а `pkg sync`: он резолвит имена в пути store и собирает поколение
 /// профиля, привязанное к поколению СИСТЕМЫ.
@@ -863,13 +874,13 @@ fn b_system(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// Виды записей конфига. `service`/`shell`/`touchpad`/`acpi` читает ЯДРО, `terminal`/`bind` — терминал,
-/// `desktop` — композитор, `ui` — тулкит оболочки, `bar` — панель, `device` — «кто эта машина»,
+/// `desktop`/`gesture` — композитор, `ui` — тулкит оболочки, `bar` — панель, `device` — «кто эта машина»,
 /// `packages`/`channel` — `pkg`: конфиг поколения один, читателей несколько, и каждый берёт
 /// свои строки.
 fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
             "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
-                | "packages" | "autostart" | "channel" | "bar" | "default"
+                | "gesture" | "packages" | "autostart" | "channel" | "bar" | "default"
                 | "touchpad" | "acpi"))
 }

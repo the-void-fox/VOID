@@ -569,6 +569,78 @@ bind wm Super+Shift+9 move-to-workspace-9
 bind wm Super+Shift+Q quit
 ";
 
+// ── жесты тачпада (Веха 203, [[void-touch]]) ────────────────────────────────
+//
+// Раскладка взята из niri владельца: там три пальца по вертикали переключают столы, три по
+// горизонтали двигают вид по ленте, четыре по вертикали открывают обзор. Строки —
+// `gesture wm <жест> <действие>`, жест пишется как `Swipe3+Up`.
+//
+// СВОЙ ключ конфига, а не `bind`, хотя действия те же. Довод — Веха 121.1: у `bind` правило
+// «хоть одна строка в конфиге — и схема ЦЕЛИКОМ оттуда», и поселись жесты там, всякий конфиг,
+// посеянный до этой вехи (а у владельца он такой), молча остался бы без жестов. Отдельный ключ
+// молчит о клавишах, клавиши молчат о нём.
+//
+// СТОРОНА ЖЕСТА — это сторона, в которую едет ФОКУС, а не картинка: три пальца вверх уводят к
+// предыдущему столу, влево — к левой колонке. То же соглашение, что у колеса с Super и у
+// прокрутки двумя пальцами (палец вверх — список вверх). В niri наоборот: там картинка следует
+// за пальцами. Если владельцу привычнее так — это ровно четыре строки в конфиге, местами.
+const DEFAULT_GESTURES: &str = "\
+gesture wm Swipe3+Up workspace-prev
+gesture wm Swipe3+Down workspace-next
+gesture wm Swipe3+Left focus-column-left
+gesture wm Swipe3+Right focus-column-right
+gesture wm Swipe4+Up toggle-overview
+gesture wm Swipe4+Down close-overview
+";
+
+/// Разобранная строка жеста.
+struct Gesture {
+    fingers: u8,
+    dir: sys::Swipe,
+    action: String,
+}
+
+/// `"Swipe3+Up"` → (пальцы, сторона). Форма как у аккорда клавиш: имя и `+`.
+fn parse_swipe(tok: &str) -> Option<(u8, sys::Swipe)> {
+    let (what, side) = tok.split_once('+')?;
+    let fingers = what.strip_prefix("Swipe").or_else(|| what.strip_prefix("swipe"))?;
+    let fingers = fingers.parse::<u8>().ok().filter(|&n| (2..=5).contains(&n))?;
+    let dir = match side {
+        "Up" | "up" => sys::Swipe::Up,
+        "Down" | "down" => sys::Swipe::Down,
+        "Left" | "left" => sys::Swipe::Left,
+        "Right" | "right" => sys::Swipe::Right,
+        _ => return None,
+    };
+    Some((fingers, dir))
+}
+
+fn parse_gestures(text: &str) -> Vec<Gesture> {
+    let mut out = Vec::new();
+    for e in void_conf::of(text, "gesture") {
+        let mut w = e.words();
+        if w.next() != Some("wm") {
+            continue;
+        }
+        let (Some(tok), Some(action)) = (w.next(), w.next()) else { continue };
+        if let Some((fingers, dir)) = parse_swipe(tok) {
+            out.push(Gesture { fingers, dir, action: String::from(action) });
+        }
+    }
+    out
+}
+
+/// Собрать раскладку жестов: строки `gesture wm …` из конфига, иначе зашитая.
+/// Второе значение — откуда она взялась (для той же строки отчёта, что у клавиш).
+fn load_gestures(text: &str) -> (Vec<Gesture>, bool) {
+    let out = parse_gestures(text);
+    if out.is_empty() {
+        (parse_gestures(DEFAULT_GESTURES), false)
+    } else {
+        (out, true)
+    }
+}
+
 /// Код клавиши Super — тот же, что кладёт ядро (`ps2.rs::keysym`).
 use win::sym::SUPER as SYM_SUPER;
 
@@ -1151,6 +1223,18 @@ fn main_loop() -> ! {
         );
     }
 
+    // Веха 203 — ЖЕСТЫ ТАЧПАДА. Отдельная раскладка и отдельная строка отчёта: на машине без
+    // тачпада они не сработают ни разу, и знать, что они вообще загрузились, можно только отсюда.
+    let (gestures, gest_from_config) = load_gestures(&generation);
+    sys::write_console(
+        alloc::format!(
+            "[wm] жесты: {} {}\n",
+            gestures.len(),
+            if gest_from_config { "ИЗ КОНФИГА ПОКОЛЕНИЯ" } else { "— зашитая схема" },
+        )
+        .as_bytes(),
+    );
+
     let mut msg = [0u8; 1024];
     let mut mouse = [sys::MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 }; 32];
     // Начало прошлой отрисовки — точка отсчёта бюджета кадра (`FRAME_NS`).
@@ -1181,7 +1265,12 @@ fn main_loop() -> ! {
         if mn > 0 {
             worked = true;
             for e in &mouse[..mn] {
-                wm.on_mouse(e);
+                // Веха 203 — жест разбирается ДО всего остального: у него `dx`/`dy` значат
+                // сторону, а не смещение курсора (см. `MouseEvent::gesture`).
+                match e.gesture() {
+                    Some((fingers, dir)) => wm.on_gesture(fingers, dir, &gestures, store, me),
+                    None => wm.on_mouse(e),
+                }
             }
         }
 
@@ -4081,6 +4170,29 @@ impl Wm {
 
     // ── ввод ───────────────────────────────────────────────────────────────────────────
 
+    /// Веха 203 — ЖЕСТ ТАЧПАДА: найти действие по числу пальцев и стороне и сделать его.
+    ///
+    /// Курсора жест не касается вовсе — ни двигать, ни отдавать его окну под ним. Жест адресован
+    /// СИСТЕМЕ, как аккорд с Super: пальцы на весу не показывают ни на что, и «отправить свайп в
+    /// окно под курсором» означало бы, что смысл жеста зависит от того, где человек оставил
+    /// указатель в прошлый раз.
+    fn on_gesture(
+        &mut self,
+        fingers: u8,
+        dir: sys::Swipe,
+        gestures: &[Gesture],
+        store: usize,
+        me: usize,
+    ) {
+        let Some(g) = gestures.iter().find(|g| g.fingers == fingers && g.dir == dir) else {
+            return;
+        };
+        // Своей копией строки: `action` берёт `&mut self`, а `g` одолжен у раскладки, которая
+        // живёт в цикле событий, а не в нас.
+        let name = g.action.clone();
+        self.action(&name, store, me);
+    }
+
     fn on_mouse(&mut self, e: &sys::MouseEvent) {
         let old = self.cursor;
         self.cursor.x = (self.cursor.x + e.dx as i32).clamp(0, self.info.width as i32 - 1);
@@ -4340,18 +4452,9 @@ impl Wm {
             }
         }
         if e.wheel != 0 && (self.overview || self.super_held) {
-            let step = if e.wheel > 0 { -1i32 } else { 1i32 };
-            let mut to = self.space as i32 + step;
-            to = to.clamp(0, self.space_count() as i32 - 1);
-            if to as usize != self.space {
-                self.switch_space(to as usize);
-                self.sync_focus();
-                if self.overview {
-                    self.build_overview(true);
-                } else {
-                    self.relayout();
-                }
-            }
+            // Колесо ОТ СЕБЯ — вверх по списку столов, то есть к предыдущему.
+            let name = if e.wheel > 0 { "workspace-prev" } else { "workspace-next" };
+            self.action_inner(name, 0, 0);
             return;
         }
 
@@ -4654,6 +4757,31 @@ impl Wm {
                     // Выходя, показываем стол ТОГО окна, что выбрано: обзор для того и нужен —
                     // ткнуть в окно и оказаться при нём, а не вернуться откуда пришёл.
                     self.leave_overview();
+                }
+            }
+            // Веха 203 — СОСЕДНИЙ стол. До жестов этого действия не было: столы переключались
+            // только по номеру (`Super+3`) да колесом с Super, и та арифметика жила прямо в
+            // обработчике колеса. Жест же обязан называться словом — иначе его не написать в
+            // конфиге, — а два места, одинаково считающие «соседний», разошлись бы молча.
+            //
+            // По кругу не ходим по тому же правилу, что и лента (Веха 121.1): дошёл до края —
+            // там и остался.
+            //
+            // СТОИТ ВЫШЕ `workspace-<цифра>` НАМЕРЕННО. Образец `starts_with("workspace-")`
+            // ловит и эти два имени, а `digit("workspace-next")` не разбирает «next» в число и
+            // молча выходит. Именно так эта ветка и не работала полпрогона: жест доезжал,
+            // действие находилось, а дальше — тишина без единой жалобы.
+            "workspace-next" | "workspace-prev" => {
+                let step = if name.ends_with("next") { 1 } else { -1 };
+                let to = (self.space as i32 + step).clamp(0, self.space_count() as i32 - 1);
+                if to as usize != self.space {
+                    self.switch_space(to as usize);
+                    self.sync_focus();
+                    if self.overview {
+                        self.build_overview(true);
+                    } else {
+                        self.relayout();
+                    }
                 }
             }
             // ── рабочие столы (Веха 122) ──

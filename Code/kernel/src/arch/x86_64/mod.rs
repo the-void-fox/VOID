@@ -490,6 +490,15 @@ pub struct MouseEvent {
     pub wheel: i8,
 }
 
+/// Веха 203 — признак «это не мышь, а ЖЕСТ ТАЧПАДА» в маске кнопок.
+///
+/// Отдельного кольца и системного вызова жест не заслужил: он приходит оттуда же, читает его
+/// тот же владелец экрана, и поток у него общий с мышью — событие «три пальца влево» обязано
+/// встать между движениями курсора ровно там, где случилось. Кнопок у нас пять (биты 0..4),
+/// старший бит свободен с самого начала; `dx`/`dy` при этом значат СТОРОНУ (−1/0/+1), а
+/// `wheel` — число пальцев.
+pub const MOUSE_GESTURE: u8 = 0x80;
+
 const MOUSE_CAP: usize = 128;
 static mut MOUSE_BUF: [MouseEvent; MOUSE_CAP] =
     [MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: 0 }; MOUSE_CAP];
@@ -637,9 +646,9 @@ pub fn hw_write32(pa: usize, v: u32) {
     }
 }
 
-/// Веха 198.1 — чувствительность тачпада из конфига.
-pub fn touchpad_tune(speed: u8, scroll_mm: u8) {
-    ps2::touchpad_tune(speed, scroll_mm)
+/// Веха 198.1 — чувствительность тачпада из конфига (Веха 203 — и шаг свайпа).
+pub fn touchpad_tune(speed: u8, scroll_mm: u8, swipe_mm: u8) {
+    ps2::touchpad_tune(speed, scroll_mm, swipe_mm)
 }
 
 /// Отозвалась ли мышь колесом (Веха 123.1).

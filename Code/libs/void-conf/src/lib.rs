@@ -197,6 +197,16 @@ pub const KINDS: &[Kind] = &[
         values: Some(3),
         kernel: false,
     },
+    // Веха 203 — ЖЕСТ ТАЧПАДА: `(gesture "wm" "Swipe3+Up" "workspace-prev")`. Читает композитор.
+    // Отдельно от `bind` не по форме (она та же), а по правилу умолчаний: у `bind` хоть одна
+    // строка отменяет всю зашитую схему, и жесты внутри него умирали бы в каждом конфиге,
+    // написанном до их появления.
+    Kind {
+        name: "gesture",
+        form: "(gesture режим жест действие)",
+        values: Some(3),
+        kernel: false,
+    },
     Kind {
         name: "terminal",
         form: "(terminal ключ значение)",
