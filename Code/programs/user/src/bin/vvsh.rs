@@ -736,7 +736,8 @@ fn cmd_repl() -> ! {
         sys::write(line.as_bytes());
     }
     let loader = vvsh_core::NoLoader;
-    let interp = vvsh_core::Interp::new(&loader);
+    let programs = Programs;
+    let interp = vvsh_core::Interp::new(&loader).with_runner(&programs);
     let env = shell_env(); // ПЕРСИСТЕНТНОЕ окружение сессии (чистые builtins + команды-эффекты)
     let mut line = [0u8; LINE_CAP];
     let mut hist = History::new();
@@ -944,24 +945,34 @@ fn capture(
         };
     }
     // Программа — запускаем её ХОЗЯИНОМ ЕЁ ВЫВОДА и собираем всё, что она напишет.
+    let args: alloc::vec::Vec<&[u8]> = words[1..].to_vec();
+    run_captured(words[0], &args).ok_or_else(|| {
+        alloc::format!(
+            "{}{}\n",
+            sys::i18n::t("vvsh: команда не найдена: "),
+            core::str::from_utf8(words[0]).unwrap_or("?"),
+        )
+    })
+}
+
+/// Веха 202.13/202.20 — запустить программу, СОБРАВ её вывод. `None` — программы нет.
+///
+/// Тот же приём, что у терминала и сторожа запуска `run`: хост чужого stdio даёт ребёнку право
+/// на свой эндпоинт и объявляет `STDIO` (Веха 98). Здесь он нужен дважды — конвейеру (`>>`,
+/// `>`) и языку: `\(fps 4)` тоже обязан получить вывод значением, иначе форма языка умеет
+/// меньше, чем строка над ней.
+fn run_captured(name: &[u8], args: &[&[u8]]) -> Option<alloc::string::String> {
     let mut blob = alloc::vec::Vec::new();
-    for w in &words[1..] {
+    for w in args {
         blob.extend_from_slice(w);
         blob.push(0);
     }
-    let name = words[0];
     let pid = sys::spawn_with_stdio(cap_store(), name, &blob, sys::self_endpoint()).or_else(|| {
         path_candidates(name)
             .into_iter()
             .find_map(|p| sys::spawn_with_stdio(cap_store(), p.as_bytes(), &blob, sys::self_endpoint()))
     });
-    let Some(pid) = pid else {
-        return Err(alloc::format!(
-            "{}{}\n",
-            sys::i18n::t("vvsh: команда не найдена: "),
-            core::str::from_utf8(name).unwrap_or("?"),
-        ));
-    };
+    let pid = pid?;
     let mut out = alloc::string::String::new();
     let mut msg = [0u8; sys::stdio::CHUNK + 64];
     loop {
@@ -996,7 +1007,25 @@ fn capture(
             _ => break, // вышел, или его забрал кто-то другой — ждать больше нечего
         }
     }
-    Ok(out)
+    Some(out)
+}
+
+/// Веха 202.20 — язык умеет запускать программы: `(fps 4)` — обычная форма.
+///
+/// Вывод приходит ЗНАЧЕНИЕМ, поэтому он сразу годится всему остальному языку: его можно
+/// связать (`(define f (fps 4))`), передать дальше, отправить (`(send "192.168.0.223" 9000
+/// (fps 4))`). Третий вид конвейера после этого не нужен: он был обходом ровно этой дыры.
+struct Programs;
+
+impl vvsh_core::Runner for Programs {
+    fn run(&self, name: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
+        // Аргументы — теми же строками, что у командной строки: число становится числом,
+        // строка — собой. Так `(beep 440 200)` и `beep 440 200` значат одно и то же.
+        let owned: alloc::vec::Vec<alloc::string::String> =
+            args.iter().map(arg_string).collect();
+        let refs: alloc::vec::Vec<&[u8]> = owned.iter().map(|s| s.as_bytes()).collect();
+        run_captured(name.as_bytes(), &refs).map(|out| Ok(Value::str(&out)))
+    }
 }
 
 /// Собрать форму применения `(имя "арг"…)` из слов команды (первое — символ, остальные — строки).

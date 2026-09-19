@@ -26,6 +26,24 @@ pub trait ModuleLoader {
     fn load(&self, name: &str) -> Result<String, String>;
 }
 
+/// Веха 202.20 — кто умеет ЗАПУСКАТЬ ПРОГРАММЫ.
+///
+/// Сам язык этого не умеет и уметь не должен: тот же вычислитель читает конфиг поколения в ядре,
+/// где никаких программ ещё нет. Поэтому запуск — такая же внешняя способность, как загрузка
+/// модулей: её приносит потребитель.
+///
+/// Зачем это языку вообще. Язык у нас общий — один и для конфига, и для шелла, — и владелец
+/// справедливо назвал это преимуществом. Но в выражении `\(fps 4)` имя программы до сих пор было
+/// просто неизвестным символом: программы запускались ТОЛЬКО голой строкой команды, то есть язык
+/// умел меньше, чем строка над ним.
+pub trait Runner {
+    /// Запустить `name` с уже вычисленными аргументами и вернуть её вывод.
+    ///
+    /// `None` — такой программы нет; тогда неизвестный символ так и остаётся неизвестным, и
+    /// сказать об этом надо теми же словами, что и раньше.
+    fn run(&self, name: &str, args: &[Value]) -> Option<Result<Value, EvalError>>;
+}
+
 /// Загрузчик-заглушка: любой `import` — ошибка. Для чисто-вычислительных вызовов/тестов.
 pub struct NoLoader;
 
@@ -41,6 +59,8 @@ impl ModuleLoader for NoLoader {
 /// Вычислитель с контекстом: загрузчик модулей + кэш импортов + стек загрузки (детект циклов).
 pub struct Interp<'a> {
     loader: &'a dyn ModuleLoader,
+    /// Веха 202.20 — чем запускать программы; `None` — нечем (конфиг в ядре).
+    runner: Option<&'a dyn Runner>,
     cache: RefCell<Vec<(String, Value)>>,
     loading: RefCell<Vec<String>>,
 }
@@ -49,6 +69,7 @@ impl<'a> Interp<'a> {
     pub fn new(loader: &'a dyn ModuleLoader) -> Self {
         Interp {
             loader,
+            runner: None,
             cache: RefCell::new(Vec::new()),
             loading: RefCell::new(Vec::new()),
         }
@@ -65,6 +86,12 @@ impl<'a> Interp<'a> {
     }
 
     /// Вычислить одну форму.
+    /// Дать вычислителю умение запускать программы (см. [`Runner`]).
+    pub fn with_runner(mut self, runner: &'a dyn Runner) -> Self {
+        self.runner = Some(runner);
+        self
+    }
+
     pub fn eval(&self, expr: &Value, env: &Env) -> Result<Value, EvalError> {
         match expr {
             // Самовычислимые.
@@ -99,11 +126,24 @@ impl<'a> Interp<'a> {
                     }
                 }
                 // Применение: вычислить голову и аргументы, применить.
-                let func = self.eval(&items[0], env)?;
+                //
+                // Веха 202.20 — голова, которой нет в окружении, может оказаться ПРОГРАММОЙ.
+                // Спрашиваем об этом того, кто умеет запускать ([`Runner`]), и только если и он
+                // не знает такого имени — говорим «неизвестный символ», как раньше.
+                let unbound = match &items[0] {
+                    Value::Sym(s) => env.lookup(s).is_none().then(|| s.clone()),
+                    _ => None,
+                };
                 let mut args = Vec::with_capacity(items.len() - 1);
                 for a in &items[1..] {
                     args.push(self.eval(a, env)?);
                 }
+                if let (Some(name), Some(runner)) = (&unbound, self.runner) {
+                    if let Some(result) = runner.run(name, &args) {
+                        return result;
+                    }
+                }
+                let func = self.eval(&items[0], env)?;
                 self.apply(&func, &args)
             }
         }
