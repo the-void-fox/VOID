@@ -71,6 +71,38 @@ impl Scroll {
         self.px = 0;
     }
 
+    /// Веха 202.17 — ГДЕ БЕГУНОК на полосе высотой `track`: (верх, высота).
+    ///
+    /// Считается здесь, а не в рисующем виджете, потому что нужен обоим: виджет его рисует, а
+    /// обработчик события решает по нему, схватили бегунок или ткнули мимо. Пока формула жила
+    /// только внутри рисования, смещение и могло меняться ТОЛЬКО во время кадра — а кадр
+    /// рисуется по состоянию, посчитанному до него, и список отставал от бегунка.
+    pub fn knob(track: i32, view: i32, content: i32, off: i32, min_h: i32) -> (i32, i32) {
+        if content <= view || track <= 0 {
+            return (0, track);
+        }
+        let h = (track * view / content).max(min_h).min(track);
+        let span = (track - h).max(0);
+        let last = (content - view).max(1);
+        (span * off.clamp(0, last) / last, h)
+    }
+
+    /// Смещение, отвечающее протяжке бегунка на `dy` точек от места захвата.
+    pub fn drag(track: i32, view: i32, content: i32, off0: i32, dy: i32, min_h: i32) -> i32 {
+        let (_, h) = Self::knob(track, view, content, off0, min_h);
+        let span = (track - h).max(1);
+        let last = (content - view).max(0);
+        (off0 as i64 + dy as i64 * last as i64 / span as i64).clamp(0, last as i64) as i32
+    }
+
+    /// Смещение, при котором центр бегунка встаёт в точку `y` полосы (щелчок мимо бегунка).
+    pub fn jump(track: i32, view: i32, content: i32, y: i32, min_h: i32) -> i32 {
+        let (_, h) = Self::knob(track, view, content, 0, min_h);
+        let span = (track - h).max(1);
+        let last = (content - view).max(0);
+        ((y - h / 2).clamp(0, span) as i64 * last as i64 / span as i64) as i32
+    }
+
     /// Сколько ЦЕЛЫХ записей ушло вверх — для подписи «выше N».
     pub fn rows_above(&self, row_h: i32) -> usize {
         // С ОКРУГЛЕНИЕМ ВВЕРХ: уехавшая наполовину запись уже не читается целиком, и не

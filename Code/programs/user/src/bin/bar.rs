@@ -178,6 +178,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     sys::exit(0);
 }
 
+/// Попали ли в полосу прокрутки. Ловим ШИРЕ самой полосы: она тонкая, и попадать в неё точно —
+/// работа, которой человек заниматься не обязан (то же правило, что в `Ui::scrollbar`).
+fn grabbed(track: Rect, p: (i32, i32)) -> bool {
+    let pad = track.w * 2;
+    p.0 >= track.x - pad && p.0 < track.right() + pad && p.1 >= track.y && p.1 < track.bottom()
+}
+
 impl ui::Client for Bar {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
         match e {
@@ -192,9 +199,28 @@ impl ui::Client for Bar {
             Event::Button { x, y, down: true, .. } => {
                 let p = (x as i32, y as i32);
                 self.ptr = Some(p);
-                // Нажали — запоминаем, откуда поедет полоса прокрутки. Попали мы в неё или нет,
-                // решит сам виджет: он знает, где бегунок.
-                self.notes_drag = Some((p, self.notes_scroll.px));
+                // Веха 202.17 — полоса прокрутки обрабатывается ЗДЕСЬ, а не во время рисования.
+                // Кадр рисуется по состоянию, посчитанному ДО него, поэтому смещение, менявшееся
+                // внутри кадра, доезжало до списка на кадр-два позже бегунка: бегунок ехал за
+                // рукой, список — рывками следом.
+                let t = self.notes_track;
+                if self.showing == Menu::Notes && !t.is_empty() && grabbed(t, p) {
+                    let (ky, kh) = ui::Scroll::knob(
+                        t.h, self.notes_view, self.notes_content, self.notes_scroll.px, t.w * 2,
+                    );
+                    let local = p.1 - t.y;
+                    // Ткнули МИМО бегунка — прыжок туда, куда показали; попали — просто ставим
+                    // якорь и дальше ведём относительно.
+                    if local < ky || local >= ky + kh {
+                        let px = ui::Scroll::jump(
+                            t.h, self.notes_view, self.notes_content, local, t.w * 2,
+                        );
+                        self.notes_scroll.set(px, self.notes_content, self.notes_view);
+                    }
+                    self.notes_drag = Some((p, self.notes_scroll.px));
+                    return ui::Scope::Part(self.notes_card);
+                }
+                self.notes_drag = None;
                 ui::Scope::All
             }
             // Кнопку отпустили — протяжка кончилась, якорь снимаем.
@@ -202,7 +228,22 @@ impl ui::Client for Bar {
                 self.notes_drag = None;
                 ui::Scope::No
             }
-            Event::Motion { .. } => {
+            Event::Motion { x, y } => {
+                // Ведём полосу прокрутки: смещение считается СРАЗУ, до кадра, и потому список
+                // едет вместе с бегунком, а не догоняет его.
+                if let Some((start, off0)) = self.notes_drag {
+                    let t = self.notes_track;
+                    if !t.is_empty() {
+                        let px = ui::Scroll::drag(
+                            t.h, self.notes_view, self.notes_content, off0,
+                            y as i32 - start.1, t.w * 2,
+                        );
+                        let moved = self.notes_scroll.set(px, self.notes_content, self.notes_view);
+                        self.ptr = input.ptr;
+                        return if moved { ui::Scope::Part(self.notes_card) } else { ui::Scope::No };
+                    }
+                }
+                let _ = (x, y);
                 // Курсор мог уйти с панели — цикл говорит это через `None` (Веха 144). Пока он
                 // стоит на месте, кадра не надо: подписи островов не изменились бы всё равно.
                 if input.ptr == self.ptr {
@@ -407,6 +448,9 @@ struct Bar {
     /// пока рука не прошла его половину, список стоял, а потом прыгал. С якорем он едет ровно
     /// за рукой.
     notes_drag: Option<((i32, i32), i32)>,
+    /// Прямоугольник ПОЛОСЫ прокрутки с последней отрисовки: по нему обработчик события
+    /// решает, схватили её или нет, и считает новое смещение (Веха 202.17).
+    notes_track: Rect,
     /// Прямоугольник полотна с последней отрисовки — им ограничивается кадр прокрутки.
     ///
     /// Веха 202.13 — без этого прокрутка просила `Scope::All`, то есть перерисовку ВСЕЙ
@@ -650,6 +694,7 @@ impl Bar {
             notes_scroll: ui::Scroll::default(),
             wheels: 0,
             notes_drag: None,
+            notes_track: Rect::ZERO,
             notes_card: Rect::ZERO,
             notes_row: 0,
             notes_content: 0,
@@ -1482,18 +1527,13 @@ impl Bar {
         // была бы украшением, которое врёт.
         if content > view {
             let track = d.cut_right(th.px(4) + m).inset_xy(0, 0);
-            if let Some(px) = u.scrollbar_from(
-                Rect::new(track.x + m, track.y, th.px(4), track.h),
-                self.notes_scroll.px as usize,
-                view as usize,
-                content as usize,
-                u.held(),
-                self.notes_drag.map(|(p, off)| (p, off.max(0) as usize)),
-            ) {
-                if self.notes_scroll.set(px as i32, content, view) {
-                    self.again = true;
-                }
-            }
+            let bar = Rect::new(track.x + m, track.y, th.px(4), track.h);
+            self.notes_track = bar;
+            // Рисуем — и только. Смещение к этому моменту уже посчитано обработчиком события
+            // (Веха 202.17); считать его здесь значит отдать списку прошлое состояние.
+            u.scrollbar(bar, self.notes_scroll.px as usize, view as usize, content as usize, None);
+        } else {
+            self.notes_track = Rect::ZERO;
         }
 
         // Тело списка режется ОКНОМ: карточка, попавшая в него наполовину, наполовину и
@@ -1502,7 +1542,8 @@ impl Bar {
         let keep_body = u.c.clip();
         u.clip(keep_body.intersect(window));
         let mut y = window.y - self.notes_scroll.px;
-        let mut shown = 0usize;
+        // Сколько карточек видно ЦЕЛИКОМ — только такие идут в подпись «выше N · ещё M»:
+        // человек спрашивает, сколько уведомлений он ещё не прочитал, а половину не читают.
         let mut full = 0usize;
         for n in win::notes(&buf) {
             let leaving = matches!(self.dying, Some(id) if id == 0 || id == n.id);
@@ -1517,9 +1558,8 @@ impl Bar {
             if r.bottom() <= window.y || r.y >= window.bottom() {
                 continue;
             }
-            shown += 1;
             if r.y >= window.y && r.bottom() <= window.bottom() {
-                full += 1; // видна целиком — только такие считаются «показанными» в подписи
+                full += 1;
             }
             u.card(r);
             // Содержимое режется КАРТОЧКОЙ: текст, уезжающий вместе с её краем, читался бы как
