@@ -132,6 +132,8 @@ struct App {
     /// Запоминаем ТОЧКУ НАЖАТИЯ, потому что перетаскиванию нужен ПОРОГ: без него любой щелчок по
     /// строке был бы перетаскиванием, и ярлык вспыхивал бы под курсором на каждый выбор.
     press: Option<(i32, i32, usize)>,
+    /// Веха 202.14 — якорь протяжки полосы прокрутки: где схватили и каким был верх списка.
+    drag: Option<((i32, i32), usize)>,
     /// Тащим прямо сейчас — второй раз в том же нажатии не начинаем.
     dragging: bool,
 }
@@ -215,12 +217,15 @@ impl App {
 
         u.field(lay.head, &self.ls.query, ui::t("поиск по имени корня"), true);
 
-        if let Some(t) = u.scrollbar(
+        // Веха 202.14 — с ЯКОРЕМ: схваченный бегунок едет за рукой, а не ждёт, пока палец
+        // пройдёт его половину (`Ui::scrollbar_from`).
+        if let Some(t) = u.scrollbar_from(
             lay.bar.inset_xy(th.px(1), th.px(2)),
             self.ls.top,
             lay.rows,
             self.ls.hits.len(),
             u.held(),
+            self.drag,
         ) {
             self.ls.top = t;
         }
@@ -468,11 +473,13 @@ impl ui::Client for App {
                         .row_at(p)
                         .and_then(|k| self.ls.hits.get(self.ls.top + k).copied())
                         .map(|i| (x as i32, y as i32, i));
+                    self.drag = Some(((x as i32, y as i32), self.ls.top));
                     // Сбрасываем и здесь: отпускание кнопки к нам не приходит, если курсор к
                     // тому времени ушёл в чужое окно, — а именно так перетаскивание и кончается.
                     self.dragging = false;
                 } else if !down {
                     self.press = None;
+                    self.drag = None;
                     self.dragging = false;
                 }
                 ui::Scope::All
@@ -556,6 +563,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         store,
         copied: None,
         press: None,
+        drag: None,
         dragging: false,
     };
     app.filter();

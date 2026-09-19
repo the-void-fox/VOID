@@ -190,8 +190,17 @@ impl ui::Client for Bar {
             // Отвечаем ТОЛЬКО на нажатие: реагировать и на отпускание значило бы два
             // переключения на один щелчок.
             Event::Button { x, y, down: true, .. } => {
-                self.ptr = Some((x as i32, y as i32));
+                let p = (x as i32, y as i32);
+                self.ptr = Some(p);
+                // Нажали — запоминаем, откуда поедет полоса прокрутки. Попали мы в неё или нет,
+                // решит сам виджет: он знает, где бегунок.
+                self.notes_drag = Some((p, self.notes_scroll.px));
                 ui::Scope::All
+            }
+            // Кнопку отпустили — протяжка кончилась, якорь снимаем.
+            Event::Button { down: false, .. } => {
+                self.notes_drag = None;
+                ui::Scope::No
             }
             Event::Motion { .. } => {
                 // Курсор мог уйти с панели — цикл говорит это через `None` (Веха 144). Пока он
@@ -205,7 +214,26 @@ impl ui::Client for Bar {
             // Веха 202.9 — КОЛЕСО прокручивает список уведомлений. Только когда он открыт:
             // на самой панели колесу делать нечего, а отдавать его невидимому списку значило бы
             // менять состояние того, чего человек не видит.
-            Event::Wheel { delta, .. } if self.showing == Menu::Notes => {
+            // Веха 202.14 — КАЖДОЕ колесо считаем и раз в десяток говорим об этом в журнал.
+            //
+            // Нужно ровно затем, чтобы различить «события не доходят» и «доходят, а список не
+            // едет»: снаружи это одно и то же — неподвижный список. Строка редкая (раз в десять
+            // щелчков) и появляется, только когда человек действительно крутит.
+            Event::Wheel { delta, .. } => {
+                let n = self.wheels.wrapping_add(1);
+                self.wheels = n;
+                if n % 10 == 1 {
+                    sys::write_console(
+                        alloc::format!(
+                            "[bar] колесо: {} событий, меню {}, смещение {}\n",
+                            n, self.showing as u8, self.notes_scroll.px,
+                        )
+                        .as_bytes(),
+                    );
+                }
+                if self.showing != Menu::Notes {
+                    return ui::Scope::No;
+                }
                 if self.notes_scroll.wheel(
                     delta, self.notes_row, self.notes_content, self.notes_view,
                 ) {
@@ -371,6 +399,14 @@ struct Bar {
     /// Веха 202.9 — где мы в списке уведомлений. Общий виджет ([`ui::Scroll`]): ступенька
     /// колеса, края и сброс — те же, что у всех прокручиваемых списков системы.
     notes_scroll: ui::Scroll,
+    /// Сколько событий колеса видели — для строки в журнале (см. обработчик `Event::Wheel`).
+    wheels: u32,
+    /// Веха 202.14 — ЯКОРЬ протяжки полосы прокрутки: где схватили и каким было смещение.
+    ///
+    /// Без него полоса ставила центр бегунка под палец — на длинном списке бегунок большой, и
+    /// пока рука не прошла его половину, список стоял, а потом прыгал. С якорем он едет ровно
+    /// за рукой.
+    notes_drag: Option<((i32, i32), i32)>,
     /// Прямоугольник полотна с последней отрисовки — им ограничивается кадр прокрутки.
     ///
     /// Веха 202.13 — без этого прокрутка просила `Scope::All`, то есть перерисовку ВСЕЙ
@@ -612,6 +648,8 @@ impl Bar {
             notes: 0,
             notes_buf: Vec::new(),
             notes_scroll: ui::Scroll::default(),
+            wheels: 0,
+            notes_drag: None,
             notes_card: Rect::ZERO,
             notes_row: 0,
             notes_content: 0,
@@ -1437,12 +1475,13 @@ impl Bar {
         // была бы украшением, которое врёт.
         if content > view {
             let track = d.cut_right(th.px(4) + m).inset_xy(0, 0);
-            if let Some(px) = u.scrollbar(
+            if let Some(px) = u.scrollbar_from(
                 Rect::new(track.x + m, track.y, th.px(4), track.h),
                 self.notes_scroll.px as usize,
                 view as usize,
                 content as usize,
                 u.held(),
+                self.notes_drag.map(|(p, off)| (p, off.max(0) as usize)),
             ) {
                 if self.notes_scroll.set(px as i32, content, view) {
                     self.again = true;

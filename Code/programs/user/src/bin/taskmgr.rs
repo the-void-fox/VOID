@@ -160,6 +160,8 @@ struct App {
     prev: Vec<(u16, u64)>,
     prev_at: u64,
     ls: ui::List,
+    /// Веха 202.14 — якорь протяжки полосы прокрутки.
+    drag: Option<((i32, i32), usize)>,
     tab: Tab,
     caps: Vec<Capp>,
     /// Выбранное ПРАВО в списке прав — под пояснение справа.
@@ -578,12 +580,14 @@ impl App {
         cols.label(u, h, ui::t("имя"), "PID", ui::t("ЦП"), ui::t("куча"), ui::t("состояние"), th.muted, th.muted);
         u.hsep(Rect::new(h.x, h.bottom(), h.w, th.px(2)));
 
-        if let Some(t) = u.scrollbar(
+        // Веха 202.14 — с ЯКОРЕМ: схваченный бегунок едет за рукой (`Ui::scrollbar_from`).
+        if let Some(t) = u.scrollbar_from(
             lay.bar.inset_xy(th.px(1), th.px(2)),
             self.ls.top,
             lay.rows,
             self.ls.hits.len(),
             u.held(),
+            self.drag,
         ) {
             self.ls.top = t;
         }
@@ -1299,7 +1303,12 @@ impl ui::Client for App {
                 // Подсветка живёт и в таблице, и в плитках, и на кнопках — перерисовываем всё.
                 ui::Scope::All
             }
-            Event::Button { .. } => ui::Scope::All,
+            // Веха 202.14 — запоминаем, откуда поедет полоса прокрутки: без якоря схваченный
+            // бегунок стоит, пока рука не пройдёт его половину.
+            Event::Button { x, y, down, .. } => {
+                self.drag = down.then(|| ((x as i32, y as i32), self.ls.top));
+                ui::Scope::All
+            }
             Event::Resize { w, h } => {
                 self.w = w as i32;
                 self.h = h as i32;
@@ -1367,6 +1376,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     };
 
     let mut app = App {
+        drag: None,
         w: w as i32,
         h: h as i32,
         sysview,
