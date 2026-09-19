@@ -683,15 +683,38 @@ fn wallpaper_name(text: &str) -> Option<&str> {
 /// процесс на том конце, а имя процесса — обзор (`sysview`). Имя, а не позиция в конфиге:
 /// порядок прав в строке — дело владельца, и привязываться к нему значит ломаться от
 /// перестановки (тот же довод, что у `sysview` строкой выше).
+/// Веха 202.15 — ВЕСЬ список процессов, сколько бы их ни было.
+///
+/// `sys::proc_list` заполняет буфер вызывающего и возвращает ПОЛНОЕ число процессов — то есть
+/// «сколько не влезло» он честно говорит, но заметить это должен вызывающий. Не заметил никто:
+/// буфер брали на 48–64 записи, и это работало ровно до тех пор, пока номера процессов не
+/// перевалили за это число. Система живёт долго, номера растут — и композитор переставал
+/// находить отправителя уведомления (имя «от кого» пропадало у всех сразу), поиск сетевого
+/// сервера мог не найти его вовсе, а проверка «жив ли хозяин окна» рисковала объявить мёртвым
+/// живого.
+fn proc_snapshot(sysview: usize) -> Option<Vec<u8>> {
+    let rec = sys::PROC_REC;
+    let mut buf = vec![0u8; rec * 64];
+    let total = sys::proc_list(sysview, &mut buf)?;
+    if total > buf.len() / rec {
+        // С запасом: пока мы читали, мог появиться ещё один-другой.
+        buf = vec![0u8; rec * (total + 8)];
+        sys::proc_list(sysview, &mut buf)?;
+    }
+    buf.truncate(total.min(buf.len() / rec) * rec);
+    Some(buf)
+}
+
 fn find_net_ep() -> usize {
     let sysview = match sys::start_cap_of_kind(13) {
         Some((c, _)) => c,
         None => return sys::NO_CAP,
     };
-    let mut buf = alloc::vec![0u8; sys::PROC_REC * 48];
-    let Some(total) = sys::proc_list(sysview, &mut buf) else { return sys::NO_CAP };
+    // Весь список: сетевой сервер поднимается рано, но его НОМЕР к моменту поиска может быть
+    // любым, а обрезанный список нашёл бы его не всегда.
+    let Some(buf) = proc_snapshot(sysview) else { return sys::NO_CAP };
     let mut net = u16::MAX;
-    for k in 0..total.min(buf.len() / sys::PROC_REC) {
+    for k in 0..buf.len() / sys::PROC_REC {
         let r = &buf[k * sys::PROC_REC..(k + 1) * sys::PROC_REC];
         let nlen = (r[7] as usize).min(24);
         if &r[40..40 + nlen] == b"net-srv" {
@@ -4728,9 +4751,12 @@ impl Wm {
             return String::new();
         }
         let rec = sys::PROC_REC;
-        let mut buf = vec![0u8; rec * 64];
-        let Some(total) = sys::proc_list(self.sysview, &mut buf) else { return String::new() };
-        for k in 0..total.min(buf.len() / rec) {
+        // Список берём ЦЕЛИКОМ ([`sys::proc_list_all`]): здесь стоял буфер на 64 записи, и это
+        // работало ровно до тех пор, пока номера процессов не перевалили за это число. Система
+        // живёт долго, номера растут, и отправитель с номером 74 в первые шестьдесят четыре
+        // записи просто не попадал. Снаружи это выглядело как уведомления БЕЗ имени отправителя.
+        let Some(buf) = proc_snapshot(self.sysview) else { return String::new() };
+        for k in 0..buf.len() / rec {
             let r = &buf[k * rec..k * rec + rec];
             if u16::from_le_bytes([r[0], r[1]]) as usize == pid {
                 let nlen = (r[7] as usize).min(24);
@@ -5012,20 +5038,20 @@ impl Wm {
         }
         self.liveness_at = now;
         let rec = sys::PROC_REC;
-        let mut buf = vec![0u8; rec * 64];
-        let Some(total) = sys::proc_list(self.sysview, &mut buf) else { return };
-        let shown = total.min(buf.len() / rec);
+        // ВЕСЬ список: не найденный в обрезанном списке живой хозяин окна был бы объявлен
+        // мёртвым, и окно закрылось бы само собой.
+        let Some(buf) = proc_snapshot(self.sysview) else { return };
+        let shown = buf.len() / rec;
         let alive = |pid: usize| {
             (0..shown).any(|k| {
                 let r = &buf[k * rec..k * rec + rec];
                 u16::from_le_bytes([r[0], r[1]]) as usize == pid
             })
         };
-        // Список неполон (процессов больше, чем влезло) — не закрываем НИЧЕГО: отсутствие в
-        // обрезанном списке не значит смерть, а закрытое по ошибке окно не вернуть.
-        if total > shown {
-            return;
-        }
+        // Прежде здесь стояла защита «список неполон — не закрываем НИЧЕГО»: отсутствие в
+        // обрезанном списке не значит смерть, а закрытое по ошибке окно не вернуть. Защита была
+        // правильная, но лечила следствие: при большом числе процессов `reap` переставал делать
+        // хоть что-нибудь, и окна умерших так и висели. Теперь список полон, и проверять нечего.
         for i in 0..self.wins.len() {
             if self.wins[i].closing || alive(self.wins[i].owner) {
                 continue;
@@ -5401,9 +5427,8 @@ impl Wm {
             return sys::NO_CAP;
         }
         let rec = sys::PROC_REC;
-        let mut buf = vec![0u8; rec * 64];
-        let Some(total) = sys::proc_list(self.sysview, &mut buf) else { return sys::NO_CAP };
-        for k in 0..total.min(buf.len() / rec) {
+        let Some(buf) = proc_snapshot(self.sysview) else { return sys::NO_CAP };
+        for k in 0..buf.len() / rec {
             let r = &buf[k * rec..k * rec + rec];
             if u16::from_le_bytes([r[0], r[1]]) as usize != pid {
                 continue;

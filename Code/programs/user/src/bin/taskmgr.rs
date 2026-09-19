@@ -196,8 +196,18 @@ impl App {
     /// Прочитать снимок всех живых процессов.
     fn read_procs(&self) -> Vec<Proc> {
         let mut out = Vec::new();
+        // Весь список: обрезанный показывал бы не всё, а диспетчер задач для того и нужен,
+        // чтобы видеть ВСЁ, что запущено.
+        // Весь список: `proc_list` возвращает ПОЛНОЕ число процессов, и буфер «на сколько
+        // обычно бывает» однажды оказывается мал (Веха 202.15).
         let mut buf = vec![0u8; REC * 64];
         let Some(total) = sys::proc_list(self.sysview, &mut buf) else { return out };
+        if total > buf.len() / REC {
+            buf = vec![0u8; REC * (total + 8)];
+            if sys::proc_list(self.sysview, &mut buf).is_none() {
+                return out;
+            }
+        }
         let shown = total.min(buf.len() / REC);
         for k in 0..shown {
             let r = &buf[k * REC..k * REC + REC];
