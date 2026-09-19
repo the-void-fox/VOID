@@ -1620,12 +1620,12 @@ impl Bar {
     /// ничего не помнит о громкости сама (см. [`Bar::set_volume`]).
     fn draw_sound(&mut self, u: &mut Ui, th: &Theme, card: Rect) {
         let font_h = u.font.line_h();
-        let (_, _, pad) = Self::metrics(th, &*u.font);
-        let m = th.px(5);
+        let pad = Self::vol_pad(th);
+        let m = Self::vol_gap(th);
         let mut d = card.inset(m);
 
         // ── шапка: знак, «Звук» и вкладки ──────────────────────────────────────────────────
-        let head = d.cut_top(Self::vol_head(&*u.font, pad, th));
+        let head = d.cut_top(Self::vol_head(&*u.font, th));
         d.cut_top(m);
         u.card(head);
         let mut inner = head.inset(pad);
@@ -1636,7 +1636,7 @@ impl Bar {
         u.icon(ico, art, th.muted);
         title.cut_left(th.px(4));
         u.label(title, ui::t("Звук"), th.text, Align::Left);
-        inner.cut_top(pad);
+        inner.cut_top(th.px(2));
 
         // Вкладки: две равные половины ряда, выбранная — на светлой подложке (по макету).
         let tabs = inner.cut_top(Self::vol_tabs(&*u.font, th));
@@ -1654,49 +1654,8 @@ impl Bar {
             }
         }
 
-        // ── вкладка «Устройства» ───────────────────────────────────────────────────────────
-        //
-        // Выход у нас пока ОДИН: драйвер выбирает его сам (динамик, если он есть, иначе первый
-        // подходящий), а переключать выходы не умеет. Показываем то, что есть, и говорим, чего
-        // нет, — по тому же правилу, что и «нет драйверов» в остальных местах системы.
         if self.mix_tab != 0 {
-            let outs = self.outs;
-            let Some(outs) = outs.filter(|o| o.count > 0) else {
-                // Карта есть, а выходов нет — так бывает на машине без звука вовсе. Молчать
-                // нельзя: пустая вкладка читается как «сломалось», а не как «нечего выбирать».
-                let row = d.cut_top(Self::vol_row(&*u.font, pad));
-                u.card(row);
-                let mut r = row.inset(pad);
-                u.label(r.cut_top(font_h), ui::t("Выходов нет"), th.muted, Align::Left);
-                u.label(r, ui::t("звуковая карта не отвечает"), th.muted, Align::Left);
-                return;
-            };
-            let mut pick: Option<usize> = None;
-            for i in 0..outs.count {
-                if i > 0 {
-                    d.cut_top(m);
-                }
-                let row = d.cut_top(Self::vol_row(&*u.font, pad));
-                u.card(row);
-                let mut r = row.inset(pad);
-                let on = i == outs.cur;
-                let line = r.cut_top(font_h);
-                u.label(line, outs.name(i), if on { th.text } else { th.muted }, Align::Left);
-                // Выбранный говорит об этом словом, а не точкой: знак пришлось бы объяснять,
-                // а слово «играет сюда» объясняет себя само.
-                let note = if on { ui::t("играет сюда") } else { ui::t("нажать, чтобы выбрать") };
-                u.label(r, note, th.muted, Align::Left);
-                if u.clicked(row) && !on {
-                    pick = Some(i);
-                }
-            }
-            if let Some(i) = pick {
-                if self.snd != sys::NO_CAP {
-                    sys::snd_cli::pick(self.snd, i);
-                    self.outs = sys::snd_cli::outputs(self.snd);
-                    self.mix = self.mixer();
-                }
-            }
+            self.draw_devices(u, th, d);
             return;
         }
 
@@ -1719,11 +1678,11 @@ impl Bar {
         let knob = th.px(4);
         let mut grab: Option<u16> = None;
         let me = |u: &mut Ui,
-                      r: Rect,
-                      id: u16,
-                      val: u8,
-                      set: &mut Option<(u16, u8)>,
-                      grab: &mut Option<u16>| {
+                  r: Rect,
+                  id: u16,
+                  val: u8,
+                  set: &mut Option<(u16, u8)>,
+                  grab: &mut Option<u16>| {
             let r = Rect::new(r.x + knob, r.y, (r.w - 2 * knob).max(1), r.h);
             let inside = |&(x, y): &(i32, i32)| {
                 x >= r.x - knob && x < r.right() + knob && y >= r.y && y < r.bottom()
@@ -1746,7 +1705,7 @@ impl Bar {
         };
 
         // Вывод — общая громкость системы.
-        let row = d.cut_top(Self::vol_row(&*u.font, pad));
+        let row = d.cut_top(Self::vol_row(&*u.font, th));
         d.cut_top(m);
         u.card(row);
         let mut r = row.inset(pad);
@@ -1763,7 +1722,7 @@ impl Bar {
         me(u, r, 0, master, &mut set, &mut grab);
 
         // Вход — его нет, и об этом сказано прямо.
-        let row = d.cut_top(Self::vol_row(&*u.font, pad));
+        let row = d.cut_top(Self::vol_row(&*u.font, th));
         u.card(row);
         let mut r = row.inset(pad);
         u.label(r.cut_top(font_h), ui::t("Ввод"), th.muted, Align::Left);
@@ -1778,7 +1737,7 @@ impl Bar {
             .unwrap_or_default();
         for (id, vol, name) in voices {
             d.cut_top(m);
-            let row = d.cut_top(Self::vol_row(&*u.font, pad));
+            let row = d.cut_top(Self::vol_row(&*u.font, th));
             u.card(row);
             let mut r = row.inset(pad);
             let mut line = r.cut_top(font_h);
@@ -1789,11 +1748,11 @@ impl Bar {
             me(u, r, id, vol, &mut set, &mut grab);
         }
 
-        // Правка громкости — ПОСЛЕ кадра: сервер отвечает состоянием, и менять его посреди
-        // отрисовки значило бы рисовать половину кадра по старым числам, половину по новым.
         if let Some(id) = grab {
             self.vol_drag = Some(id);
         }
+        // Правка громкости — ПОСЛЕ кадра: сервер отвечает состоянием, и менять его посреди
+        // отрисовки значило бы рисовать половину кадра по старым числам, половину по новым.
         match set {
             Some((id, v)) => {
                 self.vol_drag = Some(id);
@@ -1806,7 +1765,75 @@ impl Bar {
         }
     }
 
-    /// Веха 168 — ПОЛОТНО УВЕДОМЛЕНИЙ: что накопилось, свежее сверху.
+    /// Веха 204.1 — вкладка «УСТРОЙСТВА»: куда звук идёт и откуда он мог бы приходить.
+    ///
+    /// Вид задан картинкой владельца (`IMG/2026-09-19 18-52-55.png`): две группы — «Устройство
+    /// вывода» и «Устройство ввода», в каждой список строк с кружком выбора. Группа карточкой, а
+    /// не карточка на строку: выбор здесь ОДИН ИЗ НЕСКОЛЬКИХ, и строки обязаны читаться как один
+    /// список. До этой вехи каждый выход был отдельной карточкой — выглядело как набор кнопок,
+    /// у которых непонятно, связаны ли они между собой.
+    fn draw_devices(&mut self, u: &mut Ui, th: &Theme, area: Rect) {
+        let font_h = u.font.line_h();
+        let pad = Self::vol_pad(th);
+        let m = Self::vol_gap(th);
+        let mut d = area;
+        let item_h = Self::vol_item(&*u.font, th);
+
+        // ── вывод ──────────────────────────────────────────────────────────────────────────
+        let outs = self.outs;
+        let n = outs.as_ref().map_or(1, |o| o.count.max(1));
+        let group = d.cut_top(Self::vol_group(&*u.font, th, n));
+        u.card(group);
+        let mut g = group.inset(pad);
+        u.label(g.cut_top(font_h), ui::t("Устройство вывода"), th.text, Align::Left);
+        g.cut_top(th.px(2));
+        let mut pick: Option<usize> = None;
+        match outs.filter(|o| o.count > 0) {
+            Some(o) => {
+                for i in 0..o.count {
+                    let row = g.cut_top(item_h);
+                    let mut r = row;
+                    let dot = r.cut_left(font_h);
+                    r.cut_left(th.px(6));
+                    let on = i == o.cur;
+                    u.radio(dot, on);
+                    u.label(r, o.name(i), if on { th.text } else { th.muted }, Align::Left);
+                    // Нажимается ВСЯ строка, а не кружок: целиться в четырнадцать точек, когда
+                    // рядом есть очевидная строка, — значит мериться с пикселями.
+                    if u.clicked(row) && !on {
+                        pick = Some(i);
+                    }
+                }
+            }
+            // Карта есть, а выходов нет — так бывает на машине без звука вовсе. Молчать нельзя:
+            // пустая группа читается как «сломалось», а не как «нечего выбирать».
+            None => {
+                u.label(g.cut_top(item_h), ui::t("звука в этой машине нет"), th.muted, Align::Left);
+            }
+        }
+        if let Some(i) = pick {
+            if self.snd != sys::NO_CAP {
+                sys::snd_cli::pick(self.snd, i);
+                self.outs = sys::snd_cli::outputs(self.snd);
+                self.mix = self.mixer();
+            }
+        }
+
+        // ── ввод ───────────────────────────────────────────────────────────────────────────
+        //
+        // Записи у нас нет вовсе, и группа говорит это прямо — ровно как договорились с
+        // владельцем: «просто пишем "нет драйверов" и всё». Пропустить её было бы враньём:
+        // отсутствие строки читается как «так задумано», а задумано не так.
+        d.cut_top(m);
+        let group = d.cut_top(Self::vol_group(&*u.font, th, 1));
+        u.card(group);
+        let mut g = group.inset(pad);
+        u.label(g.cut_top(font_h), ui::t("Устройство ввода"), th.muted, Align::Left);
+        g.cut_top(th.px(2));
+        u.label(g.cut_top(item_h), ui::t("нет драйверов"), th.muted, Align::Left);
+    }
+
+    /// Веха 168 — ПОЛОТНО УВЕДОМЛЕНИЙ: что накопилось, свежее сверху.    /// Веха 168 — ПОЛОТНО УВЕДОМЛЕНИЙ: что накопилось, свежее сверху.
     ///
     /// Каждое — своя карточка: заголовок, под ним «от кого» и текст, справа крестик. «От кого» —
     /// имя, которое назвало ЯДРО, а не то, которым программа представилась: подписаться чужим
@@ -2029,19 +2056,47 @@ impl Bar {
     /// экране 1280): шапка 55 (строка заголовка и ряд вкладок), карточка громкости 40, шаг 46.
     /// Здесь они выражены через кегль и поля темы — так меню остаётся соразмерным при другом
     /// шрифте, а пропорции макета сохраняются.
-    fn vol_head(font: &Font, pad: i32, th: &Theme) -> i32 {
+    ///
+    /// Веха 204.1 — ПОЛЕ У КАРТОЧЕК СВОЁ и крупнее общего ([`Bar::metrics`] даёт три точки).
+    /// Владелец сказал прямо: «отступы от края прямоугольника маловаты, из-за чего они
+    /// сливаются». В меню оболочки строки — это пары «подпись — значение», им поле в три точки
+    /// в самый раз; здесь же у карточки есть СОДЕРЖИМОЕ (ползунок во всю ширину, список
+    /// устройств), и прижатое к краю содержимое читается как продолжение самой карточки.
+    fn vol_pad(th: &Theme) -> i32 {
+        th.px(8)
+    }
+
+    /// Поле вокруг карточек и зазор между ними. Тоже своё: в образце владельца оно заметное
+    /// (восемь точек при ширине меню в четыреста), и карточки не липнут к краю полотна.
+    fn vol_gap(th: &Theme) -> i32 {
+        th.px(6)
+    }
+
+    fn vol_head(font: &Font, th: &Theme) -> i32 {
         // Строка заголовка, ряд вкладок и поля: в макете 55 при строке 14 и полях 7.
-        2 * font.line_h() + 3 * pad + th.px(4)
+        let pad = Self::vol_pad(th);
+        2 * font.line_h() + 2 * pad + Self::vol_tabs(font, th) - font.line_h() + th.px(2)
     }
 
     /// Высота карточки громкости: подпись и под ней ползунок.
-    fn vol_row(font: &Font, pad: i32) -> i32 {
-        2 * font.line_h() + pad
+    fn vol_row(font: &Font, th: &Theme) -> i32 {
+        2 * font.line_h() + 2 * Self::vol_pad(th)
+    }
+
+    /// Высота строки в списке устройств: кружок выбора и подпись рядом.
+    fn vol_item(font: &Font, th: &Theme) -> i32 {
+        font.line_h() + th.px(6)
     }
 
     /// Высота ряда вкладок («Тома» / «Устройства»).
     fn vol_tabs(font: &Font, th: &Theme) -> i32 {
-        font.line_h() + th.px(4)
+        font.line_h() + th.px(8)
+    }
+
+    /// Веха 204.1 — высота ГРУППЫ устройств: заголовок и под ним строки выбора.
+    fn vol_group(font: &Font, th: &Theme, items: usize) -> i32 {
+        let pad = Self::vol_pad(th);
+        2 * pad + font.line_h() + th.px(2) + items.max(1) as i32 * Self::vol_item(font, th)
     }
 
     fn note_h(font: &Font, pad: i32) -> i32 {
@@ -2132,13 +2187,21 @@ impl Bar {
             let h = 2 * m + head + m + body + hint;
             return Rect::new(self.sw - w, self.strip, w, h);
         }
-        // Веха 204 — МЕНЮ ЗВУКА: шапка с вкладками и по карточке на каждый ползунок.
+        // Веха 204 — МЕНЮ ЗВУКА: шапка с вкладками, а под ней либо ползунки («Тома»), либо две
+        // группы устройств («Устройства», Веха 204.1 — по картинке владельца).
         if self.showing == Menu::Sound {
-            let w = th.px(300).min(self.sw - th.px(20));
-            let head = Self::vol_head(font, pad, th);
-            let rows = self.vol_rows();
-            let body: i32 = rows as i32 * (Self::vol_row(font, pad) + m) - m;
-            let h = 2 * m + head + m + body.max(font.line_h() + 2 * pad);
+            let w = th.px(310).min(self.sw - th.px(20));
+            let m = Self::vol_gap(th);
+            let head = Self::vol_head(font, th);
+            let body = if self.mix_tab == 0 {
+                let rows = self.vol_rows();
+                (rows as i32 * (Self::vol_row(font, th) + m) - m).max(font.line_h())
+            } else {
+                // Две группы: вывод (сколько выходов нашлось) и ввод (его нет — одна строка).
+                let outs = self.outs.as_ref().map_or(1, |o| o.count.max(1));
+                Self::vol_group(font, th, outs) + m + Self::vol_group(font, th, 1)
+            };
+            let h = 2 * m + head + m + body;
             return Rect::new(self.sw - w, self.strip, w, h);
         }
         let w = (Self::widest_row(font, th.gap) + 2 * th.pad + 2 * m).max(th.px(200));

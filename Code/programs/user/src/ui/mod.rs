@@ -942,6 +942,30 @@ impl<'a> Ui<'a> {
         grab.map(|_| value)
     }
 
+    /// Веха 204.1 — РАДИОКНОПКА: кружок-обводка, у выбранного — точка внутри.
+    ///
+    /// Только рисование: попадание ловит строка целиком (`u.clicked(row)`), потому что целиться
+    /// в кружок в четырнадцать точек — работа, которой человек заниматься не обязан. То же
+    /// правило, что у полосы прокрутки и ползунка.
+    ///
+    /// Кружок, а не галочка, потому что выбор здесь ОДИН ИЗ НЕСКОЛЬКИХ: галочка обещает, что
+    /// пунктов можно отметить много, и это обещание пришлось бы объяснять.
+    pub fn radio(&mut self, r: Rect, on: bool) {
+        let side = r.w.min(r.h);
+        let box_r = Rect::new(r.x + (r.w - side) / 2, r.y + (r.h - side) / 2, side, side);
+        let line = (side / 7).max(1);
+        let col = if on { self.th.text } else { self.th.muted };
+        self.c.rrect_bordered(box_r, side / 2, line, Rgba::CLEAR, self.tint(col));
+        if on {
+            // Точка заметно меньше кружка: вплотную к обводке она сливается с ней в жирный
+            // кружок, и «выбрано» перестаёт отличаться от «не выбрано» на беглый взгляд.
+            let d = (side * 2 / 5).max(2);
+            let dot = Rect::new(box_r.x + (side - d) / 2, box_r.y + (side - d) / 2, d, d);
+            self.c.rrect(dot, d / 2, self.tint(self.th.text));
+        }
+        self.mark(box_r);
+    }
+
     /// Ширина строки — раскладке ряда её надо знать заранее.
     pub fn text_w(&mut self, s: &str) -> i32 {
         self.font.width(s)

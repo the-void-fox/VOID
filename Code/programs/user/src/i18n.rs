@@ -96,10 +96,9 @@ fn en(s: &'static str) -> &'static str {
         "Вывод" => "Output",
         "Ввод" => "Input",
         "нет драйверов" => "no drivers",
-        "играет сюда" => "playing here",
-        "нажать, чтобы выбрать" => "click to select",
-        "Выходов нет" => "No outputs",
-        "звуковая карта не отвечает" => "the sound card does not answer",
+        "Устройство вывода" => "Output device",
+        "Устройство ввода" => "Input device",
+        "звука в этой машине нет" => "this machine has no sound",
         // Веха 202.9 — прокрутка списка уведомлений: сколько осталось выше и ниже.
         "выше {}" => "{} above",
         "выше {} · ещё {}" => "{} above · {} more",
