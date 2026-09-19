@@ -834,6 +834,44 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
         }
         return pipe_into(interp, env, &words[..i], &words[i + 1..]);
     }
+    // Веха 202.13 — `>` В ФАЙЛ теперь тоже общий. Раньше его понимали ТРИ команды, каждая
+    // по-своему (`klog`, `echo`, `cat`), а у программ его не было вовсе: вывод `fps` записать
+    // было нечем. Оба знака стоят на одном механизме — «взять текст чего угодно» ([`capture`]),
+    // и отличаются только тем, куда этот текст уезжает: в файл или следующей команде.
+    //
+    // Команды, разбирающие `>` сами, сюда не попадают: их имя проверяется первым. Ломать их
+    // незачем — они пишут потоком, а мы собираем целиком.
+    if let Some(i) = words.iter().position(|w| *w == b">") {
+        let own = matches!(core::str::from_utf8(words[0]), Ok("klog" | "echo" | "cat"));
+        if !own {
+            if i == 0 || i + 1 >= words.len() {
+                return sys::write(
+                    sys::i18n::t("vvsh: `>` хочет команду слева и путь справа\n").as_bytes(),
+                );
+            }
+            let text = match capture(interp, env, &words[..i]) {
+                Ok(t) => t,
+                Err(e) => return sys::write(e.as_bytes()),
+            };
+            let path = resolve(words[i + 1]);
+            let fd = px::open(cap_fs(), &path, px::O_TRUNC);
+            if fd == usize::MAX {
+                return sys::write(
+                    alloc::format!("vvsh: не открывается {}\n", String::from_utf8_lossy(&path))
+                        .as_bytes(),
+                );
+            }
+            let n = px::write(cap_fs(), fd, text.as_bytes());
+            px::close(cap_fs(), fd);
+            return sys::write(
+                alloc::format!(
+                    "{} {} {}\n",
+                    sys::i18n::t("записано"), n, sys::i18n::t("байт"),
+                )
+                .as_bytes(),
+            );
+        }
+    }
     let head = match core::str::from_utf8(words[0]) {
         Ok(s) => s,
         Err(_) => return sys::write(sys::i18n::t("vvsh: имя команды не UTF-8\n").as_bytes()),
@@ -870,22 +908,9 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
 /// (печатает его всё равно шелл, и снаружи ничего не изменилось), а программы в конвейер не
 /// годятся — и об этом говорится прямо, а не молчанием.
 fn pipe_into(interp: &vvsh_core::Interp, env: &Env, left: &[&[u8]], right: &[&[u8]]) {
-    let head = core::str::from_utf8(left[0]).unwrap_or("");
-    if !env.lookup(head).is_some_and(|v| is_callable(&v)) {
-        sys::write("vvsh: ".as_bytes());
-        sys::write(left[0]);
-        sys::write(
-            sys::i18n::t(" — программа, а не команда: её вывод в `>>` не взять\n").as_bytes(),
-        );
-        return;
-    }
-    let text = match build_command_form(left, env).map_err(EvalError::new) {
-        Ok(form) => match interp.eval(&form, env) {
-            Ok(Value::Str(s)) => String::from(&*s),
-            Ok(other) => alloc::format!("{}", other),
-            Err(e) => return print_err(&e),
-        },
-        Err(e) => return print_err(&e),
+    let text = match capture(interp, env, left) {
+        Ok(t) => t,
+        Err(e) => return sys::write(e.as_bytes()),
     };
     let mut form = match build_command_form(right, env) {
         Ok(Value::List(items)) => items.to_vec(),
@@ -896,6 +921,82 @@ fn pipe_into(interp: &vvsh_core::Interp, env: &Env, left: &[&[u8]], right: &[&[u
         Ok(result) => render(&result),
         Err(e) => print_err(&e),
     }
+}
+
+/// Веха 202.13 — ВЫВОД ЧЕГО УГОДНО текстом: и команды шелла, и программы.
+///
+/// Раньше конвейер брал текст только у команд, ВОЗВРАЩАЮЩИХ его значением, а программам отвечал
+/// «это программа, её вывод в `>>` не взять». На деле именно программы и нужны: владелец хотел
+/// прислать вывод `fps`, и ни один из трёх способов не подошёл — при том, что механизм давно
+/// есть. Хост чужого stdio (Веха 98) даёт ребёнку право на свой эндпоинт и объявляет `STDIO`;
+/// так работают терминал и сторож запуска `run`. Шеллу оставалось им воспользоваться.
+fn capture(
+    interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]],
+) -> Result<alloc::string::String, alloc::string::String> {
+    let head = core::str::from_utf8(words[0]).unwrap_or("");
+    // Команда шелла — вычисляем и берём значение (печатает его всё равно шелл).
+    if env.lookup(head).is_some_and(|v| is_callable(&v)) {
+        let form = build_command_form(words, env).map_err(|e| alloc::format!("vvsh: {e}\n"))?;
+        return match interp.eval(&form, env) {
+            Ok(Value::Str(s)) => Ok(String::from(&*s)),
+            Ok(other) => Ok(alloc::format!("{}", other)),
+            Err(e) => Err(alloc::format!("vvsh: {}\n", e.0)),
+        };
+    }
+    // Программа — запускаем её ХОЗЯИНОМ ЕЁ ВЫВОДА и собираем всё, что она напишет.
+    let mut blob = alloc::vec::Vec::new();
+    for w in &words[1..] {
+        blob.extend_from_slice(w);
+        blob.push(0);
+    }
+    let name = words[0];
+    let pid = sys::spawn_with_stdio(cap_store(), name, &blob, sys::self_endpoint()).or_else(|| {
+        path_candidates(name)
+            .into_iter()
+            .find_map(|p| sys::spawn_with_stdio(cap_store(), p.as_bytes(), &blob, sys::self_endpoint()))
+    });
+    let Some(pid) = pid else {
+        return Err(alloc::format!(
+            "{}{}\n",
+            sys::i18n::t("vvsh: команда не найдена: "),
+            core::str::from_utf8(name).unwrap_or("?"),
+        ));
+    };
+    let mut out = alloc::string::String::new();
+    let mut msg = [0u8; sys::stdio::CHUNK + 64];
+    loop {
+        // Спим коротко: пока ребёнок пишет — просыпаемся на его сообщения, пока молчит — на
+        // свой срок, чтобы спросить, жив ли он. Блокирующего `wait` тут быть не может: мы его
+        // stdio-хозяин, и уснув в ожидании смерти, повесили бы его на первом же `write`.
+        if let Some(m) = sys::recv_timeout(&mut msg, 2_000_000) {
+            match m.op & 0xff {
+                sys::stdio::OP_STDOUT => {
+                    let len = m.len.min(msg.len());
+                    out.push_str(&alloc::string::String::from_utf8_lossy(&msg[..len]));
+                    // Ответ пустой, но обязательный: он же и регулировка потока.
+                    sys::reply(m.reply_cap, &[]);
+                }
+                // Ввода у перехваченной программы нет: клавиатура принадлежит шеллу, а не ей.
+                // Пустой ответ — это конец ввода, и он честнее молчания: на молчании программа
+                // повисла бы навсегда.
+                sys::stdio::OP_STDIN => {
+                    sys::reply(m.reply_cap, &[]);
+                }
+                sys::stdio::OP_WINSIZE => {
+                    sys::reply(m.reply_cap, &[80, 0, 25, 0]);
+                }
+                _ => {
+                    sys::reply(m.reply_cap, &[]);
+                }
+            }
+            continue;
+        }
+        match sys::wait(pid, true) {
+            sys::Wait::Running => {}
+            _ => break, // вышел, или его забрал кто-то другой — ждать больше нечего
+        }
+    }
+    Ok(out)
 }
 
 /// Собрать форму применения `(имя "арг"…)` из слов команды (первое — символ, остальные — строки).
