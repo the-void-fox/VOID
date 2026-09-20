@@ -178,13 +178,6 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     sys::exit(0);
 }
 
-/// Попали ли в полосу прокрутки. Ловим ШИРЕ самой полосы: она тонкая, и попадать в неё точно —
-/// работа, которой человек заниматься не обязан (то же правило, что в `Ui::scrollbar`).
-fn grabbed(track: Rect, p: (i32, i32)) -> bool {
-    let pad = track.w * 2;
-    p.0 >= track.x - pad && p.0 < track.right() + pad && p.1 >= track.y && p.1 < track.bottom()
-}
-
 impl ui::Client for Bar {
     fn event(&mut self, e: Event, input: &ui::Input) -> ui::Scope {
         match e {
@@ -204,7 +197,7 @@ impl ui::Client for Bar {
                 // внутри кадра, доезжало до списка на кадр-два позже бегунка: бегунок ехал за
                 // рукой, список — рывками следом.
                 let t = self.notes_track;
-                if self.showing == Menu::Notes && !t.is_empty() && grabbed(t, p) {
+                if self.showing == Menu::Notes && !t.is_empty() && ui::scroll::on_track(t, p) {
                     let (ky, kh) = ui::Scroll::knob(
                         t.h, self.notes_view, self.notes_content, self.notes_scroll.px, t.w * 2,
                     );
@@ -218,7 +211,7 @@ impl ui::Client for Bar {
                         self.notes_scroll.set(px, self.notes_content, self.notes_view);
                     }
                     self.notes_drag = Some((p, self.notes_scroll.px));
-                    return ui::Scope::Part(self.notes_card);
+                    return ui::Scope::Part(self.menu_card);
                 }
                 self.notes_drag = None;
                 ui::Scope::All
@@ -240,10 +233,19 @@ impl ui::Client for Bar {
                         );
                         let moved = self.notes_scroll.set(px, self.notes_content, self.notes_view);
                         self.ptr = input.ptr;
-                        return if moved { ui::Scope::Part(self.notes_card) } else { ui::Scope::No };
+                        return if moved { ui::Scope::Part(self.menu_card) } else { ui::Scope::No };
                     }
                 }
                 let _ = (x, y);
+                // Веха 204.2 — ВЕДЁМ ПОЛЗУНОК ГРОМКОСТИ. Схваченный ползунок принадлежит руке,
+                // пока кнопку держат, — где курсор, неважно; значение посчитает сам виджет по
+                // `Ui::held`. Нам здесь нужно лишь попросить кадр, и ровно полотна: панель во
+                // всю ширину экрана, и просить её целиком на каждое движение руки значит платить
+                // за протяжку вчетверо (то же правило, что у прокрутки выше).
+                if self.vol_drag.is_some() && !self.menu_card.is_empty() {
+                    self.ptr = input.ptr;
+                    return ui::Scope::Part(self.menu_card);
+                }
                 // Курсор мог уйти с панели — цикл говорит это через `None` (Веха 144). Пока он
                 // стоит на месте, кадра не надо: подписи островов не изменились бы всё равно.
                 if input.ptr == self.ptr {
@@ -253,7 +255,7 @@ impl ui::Client for Bar {
                 self.ptr = input.ptr;
                 // Внутри открытого полотна довольно перерисовать его одно: там меняется только
                 // подсветка под курсором, а панель — во всю ширину экрана.
-                let c = self.notes_card;
+                let c = self.menu_card;
                 let inside = |p: Option<(i32, i32)>| {
                     p.is_some_and(|(px, py)| {
                         !c.is_empty() && px >= c.x && px < c.right() && py >= c.y && py < c.bottom()
@@ -292,8 +294,8 @@ impl ui::Client for Bar {
                 ) {
                     // Меняется только полотно — его и перерисовываем. Панель шириной во весь
                     // экран, и просить её целиком ради списка в четверть площади значит платить
-                    // за прокрутку вчетверо (см. `Bar::notes_card`).
-                    ui::Scope::Part(self.notes_card)
+                    // за прокрутку вчетверо (см. `Bar::menu_card`).
+                    ui::Scope::Part(self.menu_card)
                 } else {
                     ui::Scope::No // упёрлись в край — кадра это не стоит
                 }
@@ -493,7 +495,7 @@ struct Bar {
     /// точек на кадр и сборку до двадцати семи миллисекунд. События колеса при этом копились,
     /// и владелец видел ровно то, что описал: «прокрутил, оно подумало, а после резко
     /// переместилось». Полотно занимает четверть этой площади.
-    notes_card: Rect,
+    menu_card: Rect,
     /// Меры списка с последней отрисовки: высота карточки с зазором, всего и в окне.
     ///
     /// Колесо приходит СОБЫТИЕМ, а высоту карточки знает только кадр (она считается по шрифту и
@@ -741,7 +743,7 @@ impl Bar {
             mix_tab: 0,
             outs: None,
             vol_drag: None,
-            notes_card: Rect::ZERO,
+            menu_card: Rect::ZERO,
             notes_row: 0,
             notes_content: 0,
             notes_view: 0,
@@ -1193,7 +1195,14 @@ impl Bar {
             match self.ptr.filter(|&(px, py)| {
                 // Веха 204 — у меню звука полотно своё, и ползунок под рукой обязан ехать по
                 // тем же правилам, что подсветка крестика: кадр рисуется, пока курсор внутри.
-                let c = if self.showing == Menu::Sound { card } else { self.notes_card };
+                //
+                // Веха 204.2 — а пока ползунок СХВАЧЕН, курсор считается всегда, даже уведённый
+                // за полотно: без этого подпись кадра не менялась бы, кадра не было бы вовсе, и
+                // громкость замирала бы ровно там, где человек увёл руку в сторону.
+                if self.vol_drag.is_some() {
+                    return true;
+                }
+                let c = if self.showing == Menu::Sound { card } else { self.menu_card };
                 !c.is_empty() && px >= c.x && px < c.right() && py >= c.y && py < c.bottom()
             }) {
                 Some((px, py)) => sig(&[px as u64, py as u64]),
@@ -1619,6 +1628,10 @@ impl Bar {
     /// под ней карточки «подпись сверху, ползунок снизу». Числа те же, что у сервера: панель
     /// ничего не помнит о громкости сама (см. [`Bar::set_volume`]).
     fn draw_sound(&mut self, u: &mut Ui, th: &Theme, card: Rect) {
+        // Веха 204.2 — полотно запоминаем и здесь: им обработчик события ограничивает кадр,
+        // пока человек ведёт ползунок (иначе панель шириной во весь экран перерисовывалась бы
+        // целиком на каждое движение руки).
+        self.menu_card = card;
         let font_h = u.font.line_h();
         let pad = Self::vol_pad(th);
         let m = Self::vol_gap(th);
@@ -1918,7 +1931,7 @@ impl Bar {
         let view = d.h;
         self.notes_scroll.clamp(content, view);
         // Запомнить меры для обработчика колеса (см. `Bar::notes_row`).
-        self.notes_card = card;
+        self.menu_card = card;
         self.notes_row = row;
         self.notes_content = content;
         self.notes_view = view;

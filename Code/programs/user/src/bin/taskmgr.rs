@@ -1316,7 +1316,10 @@ impl ui::Client for App {
             // Веха 202.14 — запоминаем, откуда поедет полоса прокрутки: без якоря схваченный
             // бегунок стоит, пока рука не пройдёт его половину.
             Event::Button { x, y, down, .. } => {
-                self.drag = down.then(|| ((x as i32, y as i32), self.ls.top));
+                // Веха 204.2 — якорь ТОЛЬКО при нажатии в полосе: схваченная полоса ведётся,
+                // пока держат кнопку, где бы ни был курсор (`Ui::scrollbar_from`).
+                self.drag = (down && ui::scroll::on_track(self.lay.bar, (x as i32, y as i32)))
+                    .then(|| ((x as i32, y as i32), self.ls.top));
                 ui::Scope::All
             }
             Event::Resize { w, h } => {
