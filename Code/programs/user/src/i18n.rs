@@ -89,6 +89,8 @@ fn en(s: &'static str) -> &'static str {
         "Уведомления" => "Notifications",
         "нет уведомлений" => "no notifications",
         "ещё {}" => "{} more",
+        // Веха 205 — снимок экрана.
+        "Снимок экрана" => "Screenshot",
         // Веха 204 — меню звука (миксер).
         "Звук" => "Sound",
         "Тома" => "Volumes",

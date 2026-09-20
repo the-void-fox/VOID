@@ -543,6 +543,7 @@ bind wm Super+Equal width-plus
 bind wm Super+Minus width-minus
 bind wm Super+F maximize-column
 bind wm Super+Shift+S save-session
+bind wm Super+S screenshot
 bind wm Super+Shift+Q poweroff
 bind wm Super+Tab toggle-overview
 bind wm Super+Z switch-layout
@@ -4157,6 +4158,69 @@ impl Wm {
         }
     }
 
+    /// Веха 205 — СНИМОК ЭКРАНА в файл: PNG рядом с прочими файлами, с именем по времени.
+    ///
+    /// Пишем через файловый сервер, а не корнем в store напрямую: каталог ведёт он, и снимок,
+    /// положенный мимо него, не увидели бы ни `ls`, ни файловый менеджер — он существовал бы,
+    /// но был бы недостижим для человека.
+    ///
+    /// PNG без сжатия (см. `void_img::png::encode`): четыре мегабайта вместо примерно одного,
+    /// зато в системе не появляется компрессор ради картинки, которую смотрит один человек.
+    fn screenshot(&mut self) {
+        let (w, h) = (self.info.width as u32, self.info.height as u32);
+        // Теневой кадр лежит словами по 32 бита в порядке хоста (0xAARRGGBB), а PNG ждёт байты
+        // R,G,B,A. Перекладываем здесь: единственное место, где эти два порядка встречаются.
+        let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
+        for (i, &v) in self.shadow.iter().take(px.len() / 4).enumerate() {
+            px[i * 4] = (v >> 16) as u8;
+            px[i * 4 + 1] = (v >> 8) as u8;
+            px[i * 4 + 2] = v as u8;
+            px[i * 4 + 3] = 0xff; // экран непрозрачен по определению
+        }
+        let Some(png) = void_img::png::encode(&px, w, h) else {
+            sys::write_console("[wm] снимок: кадр не сходится с размером экрана\n".as_bytes());
+            return;
+        };
+        let (y, mo, d, hh, mm, ss) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
+        let name = alloc::format!("/снимок-{y:04}-{mo:02}-{d:02}-{hh:02}{mm:02}{ss:02}.png");
+        // Канал к файловому серверу спрашиваем ПО ИМЕНИ: позиция прав меняется от поколения к
+        // поколению, и взятое по номеру однажды окажется чужим эндпоинтом (Веха 199.14).
+        let Some(fs) = sys::cap_named("POSIXFS") else {
+            sys::write_console("[wm] снимок: нет канала к файловому серверу\n".as_bytes());
+            return;
+        };
+        // Флаг 1 — «создать»: так же пишет файлы шелл (`klog > файл`).
+        let fd = sys::posix::open(fs, name.as_bytes(), 1);
+        if fd == usize::MAX {
+            sys::write_console(alloc::format!("[wm] снимок: не создаётся {}\n", name).as_bytes());
+            return;
+        }
+        let wrote = sys::posix::write(fs, fd, &png);
+        sys::posix::close(fs, fd);
+        if wrote < png.len() {
+            sys::write_console(
+                alloc::format!(
+                    "[wm] снимок: записано {} из {} байт — диск полон?\n",
+                    wrote,
+                    png.len()
+                )
+                .as_bytes(),
+            );
+            return;
+        }
+        sys::write_console(
+            alloc::format!("[wm] снимок: {} ({} КиБ)\n", name, png.len() / 1024).as_bytes(),
+        );
+        // Сказать человеку: снимок — действие без видимого следа, и без сообщения непонятно,
+        // сработала ли клавиша вообще.
+        self.post_note(
+            win::NOTE_INFO,
+            "VOID",
+            ui::t("Снимок экрана"),
+            &name,
+        );
+    }
+
     /// Положить кадр окна в store: `(имя, ширина, высота)`. `None` — кадра нет.
     ///
     /// Кадр берётся ТОТ ЖЕ, что рисуется на экране (`px`), поэтому «сохранённое» и «увиденное»
@@ -4832,6 +4896,14 @@ impl Wm {
                     sys::write_console("[wm] раскладку не переключить: экран не наш\n".as_bytes());
                 }
             }
+            // Веха 205 — СНИМОК ЭКРАНА. Кадр берётся из теневого буфера — того самого, который
+            // уходит на экран, — поэтому «снято» и «увидено» не могут разойтись (тот же довод,
+            // что у снимков окон в сеансе).
+            //
+            // Файлом, а не объектом store: снимок человек показывает другим, то есть его надо
+            // открыть просмотрщиком, увидеть в файловом менеджере и унести с машины. Объект без
+            // имени в каталоге для этого пришлось бы сначала найти.
+            "screenshot" => self.screenshot(),
             "quit" => {
                 sys::write_console("[wm] выход по запросу\n".as_bytes());
                 sys::exit(0);

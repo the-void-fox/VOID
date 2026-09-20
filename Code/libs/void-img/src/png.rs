@@ -464,3 +464,110 @@ fn expand(
     }
     Ok(())
 }
+
+// ── запись (Веха 205) ────────────────────────────────────────────────────────────────────────
+//
+// Кодировщик нужен снимку экрана: кадр композитора — это RGBA-буфер, а человек ждёт файл,
+// который откроется и здесь, и на чужой машине.
+//
+// СЖАТИЯ НЕТ: deflate пишется «сохранёнными» блоками, то есть данные едут как есть плюс пять
+// байт на каждые 64 КиБ. Полсотни строк против целого компрессора — и это осознанный размен:
+// снимок экрана 1280×800 занимает четыре мегабайта вместо примерно одного, зато в системе не
+// появляется второй сложный алгоритм ради картинки, которую смотрит один человек. Захочется
+// меньше — ставится настоящий deflate, формат при этом не меняется ни на байт.
+//
+// Тот же код живёт в хостовых утилитах (`Code/tools/png-write.rs`) с Вехи 158; здесь он в
+// no_std-виде, потому что писать PNG теперь умеет и сама система.
+
+// CRC у нас уже есть — тот самый, которым проверяются чужие чанки при чтении (см. `crc32`
+// выше). Вторая копия рядом разошлась бы с первой ровно тогда, когда в одной нашли бы ошибку.
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(tag);
+    out.extend_from_slice(body);
+    let mut crc = [0u8; 4];
+    crc.copy_from_slice(tag);
+    // CRC считается по ТИПУ и ДАННЫМ вместе — без типа он сойдётся только на пустом чанке.
+    let mut all = Vec::with_capacity(4 + body.len());
+    all.extend_from_slice(&crc);
+    all.extend_from_slice(body);
+    out.extend_from_slice(&crc32(&all).to_be_bytes());
+}
+
+/// Закодировать RGBA8888 в PNG. `px` — построчно, без выравнивания; длина не меньше `w*h*4`.
+///
+/// `None` — размеры не сходятся с буфером: лучше не отдать файла вовсе, чем отдать обрезанный,
+/// который откроется и покажет мусор в нижней половине.
+pub fn encode(px: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let stride = (w as usize).checked_mul(4)?;
+    let need = stride.checked_mul(h as usize)?;
+    if w == 0 || h == 0 || px.len() < need {
+        return None;
+    }
+    // Строка PNG начинается с байта фильтра. Ноль — «без фильтра»: фильтры существуют, чтобы
+    // лучше сжималось, а мы не сжимаем вовсе.
+    let mut raw = Vec::with_capacity(h as usize * (1 + stride));
+    for y in 0..h as usize {
+        raw.push(0);
+        raw.extend_from_slice(&px[y * stride..y * stride + stride]);
+    }
+    let mut z = alloc::vec![0x78, 0x01];
+    let parts = raw.chunks(65535).count().max(1);
+    for (i, part) in raw.chunks(65535).enumerate() {
+        z.push((i + 1 == parts) as u8);
+        z.extend_from_slice(&(part.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(part.len() as u16)).to_le_bytes());
+        z.extend_from_slice(part);
+    }
+    z.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut out = alloc::vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    // 8 бит на канал, тип 6 (RGBA), сжатие 0, фильтрация 0, без чересстрочности.
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    Some(out)
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    /// Что записали — то и прочли: кодировщик проверяется СВОИМ ЖЕ декодером, который у нас
+    /// давно есть и проверен на чужих файлах.
+    #[test]
+    fn кадр_переживает_кодирование() {
+        let (w, h) = (7u32, 3u32);
+        let mut px = alloc::vec![0u8; (w * h * 4) as usize];
+        for i in 0..(w * h) as usize {
+            px[i * 4] = i as u8;
+            px[i * 4 + 1] = (255 - i) as u8;
+            px[i * 4 + 2] = (i * 3) as u8;
+            px[i * 4 + 3] = 255;
+        }
+        let bytes = encode(&px, w, h).expect("кодируется");
+        let img = crate::decode(&bytes, 1 << 20).expect("читается своим же декодером");
+        assert_eq!((img.w, img.h), (w, h));
+        assert_eq!(img.px, px);
+    }
+
+    #[test]
+    fn короткий_буфер_не_кодируется() {
+        // Обрезанный файл открылся бы и показал мусор — лучше не отдавать его вовсе.
+        assert!(encode(&[0u8; 8], 4, 4).is_none());
+    }
+}
