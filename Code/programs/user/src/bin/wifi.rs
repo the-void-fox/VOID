@@ -481,6 +481,20 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
     // карты, и обращение к ним идёт через регистры-посредники; первое, что стоит спросить, —
     // версию BBP: это ответ самой цифровой части, а не памяти карты.
     unsafe { rt2800::attach(MMIO_VA) };
+    // Сперва СНЯТЬ СБРОС. Карта после загрузки прошивки остаётся в нём (это видно по
+    // `MAC_SYS_CTRL 0x7003` выше), и удерживаемая в ресете цифровая часть честно отвечает нулём
+    // — первый заход принял этот ноль за поломку.
+    if !rt2800::wake_mac() {
+        sys::write(
+            alloc::format!(
+                "[wifi] BBP не проснулся: MAC_SYS_CTRL {:#010x}, MAC_STATUS_CFG {:#010x}\n",
+                rt2800::rd32(rt2800::MAC_SYS_CTRL),
+                rt2800::rd32(rt2800::MAC_STATUS_CFG),
+            )
+            .as_bytes(),
+        );
+        sys::exit(1);
+    }
     match rt2800::bbp_read(0) {
         Some(v) if v != 0 && v != 0xff => {
             sys::write(alloc::format!("[wifi] BBP отвечает: версия {:#04x}\n", v).as_bytes());

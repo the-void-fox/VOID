@@ -89,6 +89,18 @@ pub const AUTO_RSP_CFG: usize = 0x1404;
 pub const LEGACY_BASIC_RATE: usize = 0x1408;
 pub const HT_BASIC_RATE: usize = 0x140c;
 pub const TXRX_CSR1: usize = 0x77d0;
+pub const MAC_STATUS_CFG: usize = 0x1200;
+/// Биты 0 и 1 — «шина BBP/радио занята передачей/приёмом». Пока они стоят, к BBP не подступиться.
+pub const BBP_RF_BUSY: u32 = 0x0000_0003;
+pub const WPDMA_RST_IDX: usize = 0x020c;
+pub const PBF_SYS_CTRL: usize = 0x0400;
+pub const WPDMA_GLO_CFG: usize = 0x0208;
+pub const H2M_MAILBOX_CSR: usize = 0x7010;
+pub const H2M_BBP_AGENT: usize = 0x7028;
+pub const AUX_CTRL: usize = 0x010c;
+pub const PWR_PIN_CFG: usize = 0x1204;
+pub const AUX_WAKE_PCIE_EN: u32 = 1 << 1;
+pub const AUX_FORCE_PCIE_CLK: u32 = 1 << 10;
 
 /// Биты `MAC_SYS_CTRL`: сброс MAC, сброс BBP, включение передачи и приёма.
 pub const MAC_SRST: u32 = 1 << 0;
@@ -169,6 +181,48 @@ pub fn rfcsr_read(reg: u8) -> Option<u8> {
         return None;
     }
     Some((rd32(RF_CSR_CFG) & RF_DATA) as u8)
+}
+
+/// Веха 208.1 — РАЗБУДИТЬ MAC, чтобы к BBP вообще можно было обратиться.
+///
+/// Первый заход спрашивал версию BBP сразу после загрузки прошивки и получал ноль. Причина
+/// видна в том же выводе, если на него посмотреть: `MAC_SYS_CTRL 0x7003` — стоят биты сброса
+/// MAC и BBP. Карта после прошивки ОСТАЁТСЯ В СБРОСЕ, и цифровая часть в нём молчит по
+/// определению; ноль был не поломкой, а честным ответом удерживаемого в ресете блока.
+///
+/// Порядок взят из `rt2800mmio_init_registers` и `rt2800_wait_bbp_ready` (Linux 6.18.7).
+/// `false` — BBP так и не отозвался.
+pub fn wake_mac() -> bool {
+    // Сбросить индексы колец DMA: они могли остаться от прошлой жизни карты. Шесть младших
+    // битов — очереди передачи, бит 16 — очередь приёма (нумерация не подряд, и это именно та
+    // мелочь, из-за которой «сброс» делают наполовину).
+    wr32(WPDMA_RST_IDX, 0x0001_003f);
+    wr32(PBF_SYS_CTRL, 0x0000_0e1f);
+    wr32(PBF_SYS_CTRL, 0x0000_0e00);
+    // Разбудить PCIe-часть и подать питание на выводы.
+    let aux = rd32(AUX_CTRL) | AUX_FORCE_PCIE_CLK | AUX_WAKE_PCIE_EN;
+    wr32(AUX_CTRL, aux);
+    wr32(PWR_PIN_CFG, 0x0000_0003);
+    // Дёрнуть сброс MAC и BBP — и СНЯТЬ его. Второй записи и не хватало.
+    wr32(MAC_SYS_CTRL, MAC_SRST | BBP_HRST);
+    wr32(MAC_SYS_CTRL, 0);
+    // Дождаться, пока шина к BBP освободится.
+    if !wait32(MAC_STATUS_CFG, BBP_RF_BUSY, 0, 100) {
+        return false;
+    }
+    // Прошивка включила BBP при старте, но его надо «переоткрыть»: обнулить оба почтовых ящика
+    // и дать ему миллисекунду (так делает `rt2800_wait_bbp_ready`).
+    wr32(H2M_BBP_AGENT, 0);
+    wr32(H2M_MAILBOX_CSR, 0);
+    sys::sleep_ns(1_000_000);
+    // И только теперь спрашивать версию: ответ обязан быть не нулём и не «ffff».
+    for _ in 0..1000 {
+        match bbp_read(0) {
+            Some(v) if v != 0 && v != 0xff => return true,
+            _ => sys::sleep_ns(100_000),
+        }
+    }
+    false
 }
 
 // ── таблицы инициализации для RT5390 ─────────────────────────────────────────────────────────
