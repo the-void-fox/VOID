@@ -100,6 +100,8 @@ const EE_FREQ: usize = 0x1d;
 /// чувствительности приёмника, и без него они остаются при значениях по умолчанию, то есть
 /// глухими к слабому сигналу.
 const EE_LNA: usize = 0x22;
+/// Поправка уровня сигнала, своя у каждого экземпляра карты (младший байт — знаковый).
+const EE_RSSI_BG: usize = 0x23;
 
 // ── регистры, нужные для загрузки прошивки (Веха 207) ────────────────────────────────────────
 //
@@ -203,31 +205,107 @@ fn efuse_block(word: usize, out: &mut [u16]) -> Option<()> {
 ///
 /// Скрытая сеть шлёт его пустым или из одних нулей: это не ошибка разбора, а выбор её хозяина,
 /// и в списке она появится безымянной.
-fn beacon_ssid(f: &[u8]) -> Option<alloc::string::String> {
-    if f.len() < 38 {
+/// Что маяк рассказывает о сети (Веха 211.3).
+struct Beacon {
+    /// Адрес точки доступа. Именно он, а не имя, отличает сети друг от друга: имя могут носить
+    /// одинаковое несколько точек одной сети, и две разные сети тоже могут назваться одинаково.
+    bssid: [u8; 6],
+    ssid: alloc::string::String,
+    /// Канал, который точка называет сама. Ноль — не назвала; тогда считаем, что это тот, на
+    /// котором мы её услышали. Спрашивать стоит: соседний канал «протекает» в наш, и точка с
+    /// пятого бывает слышна на шестом.
+    ch: u8,
+    /// Требует ли сеть ключа.
+    secure: bool,
+}
+
+/// Разобрать маяк. `None` — это не маяк или кадр оборван.
+///
+/// Кадр 802.11 начинается с двух байт управления: в них тип и подтип, маяк — тип 0 подтип 8.
+/// Дальше фиксированная часть (адреса, номер, метка времени, интервал, возможности) и только
+/// потом элементы вида «номер, длина, данные».
+fn parse_beacon(f: &[u8]) -> Option<Beacon> {
+    if f.len() < 36 {
         return None;
     }
     let (ftype, subtype) = ((f[0] >> 2) & 0x3, (f[0] >> 4) & 0xf);
     if ftype != 0 || subtype != 8 {
         return None;
     }
-    let mut at = 24 + 12;
+    let mut bssid = [0u8; 6];
+    bssid.copy_from_slice(&f[16..22]);
+    // Возможности — два байта сразу после метки времени и интервала. Бит 4 значит «сеть с
+    // ключом». Это ответ на «защищена ли», но не на «чем»: старую WEP и современную WPA2 он не
+    // различает, для этого дальше смотрим элементы.
+    let caps = u16::from_le_bytes([f[34], f[35]]);
+    let mut b = Beacon {
+        bssid,
+        ssid: alloc::string::String::new(),
+        ch: 0,
+        secure: caps & 0x0010 != 0,
+    };
+    let mut named = false;
+    let mut at = 36;
     while at + 2 <= f.len() {
         let (id, len) = (f[at], f[at + 1] as usize);
         let body = at + 2;
         if body + len > f.len() {
-            return None; // кадр оборван — дальше уже не элементы
+            break; // кадр оборван — дальше уже не элементы
         }
-        if id == 0 {
-            let raw = &f[body..body + len];
-            if raw.is_empty() || raw.iter().all(|&b| b == 0) {
-                return Some(alloc::string::String::from("<скрытая>"));
+        let data = &f[body..body + len];
+        match id {
+            // Имя сети. Пустое или из одних нулей — скрытая: это не ошибка разбора, а выбор
+            // хозяина сети, и в списке она появится безымянной.
+            0 => {
+                named = true;
+                b.ssid = if data.is_empty() || data.iter().all(|&x| x == 0) {
+                    alloc::string::String::from("<скрытая>")
+                } else {
+                    match core::str::from_utf8(data) {
+                        Ok(s) => alloc::string::String::from(s),
+                        // Имя — произвольные байты, а не обязательно текст. Своё «не читается»
+                        // честнее, чем выбросить сеть из списка.
+                        Err(_) => alloc::string::String::from("<не текст>"),
+                    }
+                };
             }
-            return core::str::from_utf8(raw).ok().map(alloc::string::String::from);
+            // Номер канала, названный самой точкой.
+            3 if len == 1 => b.ch = data[0],
+            // Современная защита (WPA2/WPA3) — элемент есть, значит ключ нужен.
+            48 => b.secure = true,
+            // Старая WPA жила в элементе производителя: код 00:50:f2, вид 1.
+            221 if len >= 4 && data[..4] == [0x00, 0x50, 0xf2, 0x01] => b.secure = true,
+            _ => {}
         }
         at = body + len;
     }
-    None
+    named.then_some(b)
+}
+
+/// Сеть в списке: то же, что в маяке, плюс где и как громко её слышно.
+struct Net {
+    bssid: [u8; 6],
+    ssid: alloc::string::String,
+    ch: u8,
+    /// Лучший уровень из всех услышанных маяков, дБм.
+    rssi: i32,
+    secure: bool,
+    beacons: u32,
+}
+
+/// Веха 211.3 — перевести число из заголовка приёма в дБм.
+///
+/// В заголовке лежит не уровень, а положение регулировки усиления, и отсчитывается оно ВНИЗ:
+/// чем больше число, тем слабее сигнал. Поправки две — общая для карты (`base`, у нашей `-12`) и
+/// своя для экземпляра (из EEPROM), плюс усиление усилителя, которое мы уже знаем по каналу.
+///
+/// Ноль значит «уровень не измерен», а не «тишина»: так его и понимает Linux, отдавая в этом
+/// случае заведомо низкое значение.
+fn rssi_dbm(raw: u8, offset: i32, lna_gain: u8) -> i32 {
+    if raw == 0 {
+        return -128;
+    }
+    -12 - offset - lna_gain as i32 - raw as i32
 }
 
 fn w(s: &str) {
@@ -679,45 +757,95 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
         .as_bytes(),
     );
 
-    // Слушаем три секунды. Маяки точка доступа шлёт примерно десять раз в секунду, так что
-    // этого хватает с избытком даже для одной сети; больше — просто задержит загрузку.
-    let mut seen = 0usize;
+    // ── обход каналов (Веха 211.3) ───────────────────────────────────────────────────────
+    //
+    // Радио слышит один канал за раз — значит обойти надо все тринадцать. Задержка на канале
+    // выбрана не «на глаз»: маяк точка шлёт примерно каждые сто миллисекунд, и четверти секунды
+    // хватает, чтобы услышать её дважды и не принять пропуск за отсутствие сети. Тринадцать
+    // каналов по 250 мс — три с небольшим секунды на весь обзор.
+    const DWELL_NS: u64 = 250_000_000;
+    // Поправка уровня своя у каждого экземпляра карты и лежит в EEPROM знаковым байтом. Значение
+    // больше десяти по модулю означает испорченную память — Linux в этом случае берёт ноль, и мы
+    // тоже: лучше показать уровень без поправки, чем с заведомо ложной.
+    let rssi_offset = {
+        let v = (ee[EE_RSSI_BG] & 0xff) as i8 as i32;
+        if v.abs() > 10 { 0 } else { v }
+    };
+    let mut nets: alloc::vec::Vec<Net> = alloc::vec::Vec::new();
+    let mut beacons = 0usize;
     let mut idx = 0usize;
-    let until = sys::monotonic_ns() + 3_000_000_000;
-    while sys::monotonic_ns() < until {
-        let d = (DESC_VA + idx * rt2800::RXD_WORDS * 4) as *mut u32;
-        let w1 = unsafe { core::ptr::read_volatile(d.add(1)) };
-        if w1 & rt2800::RXD_DMA_DONE == 0 {
-            sys::sleep_ns(2_000_000);
+    for ch in 1u8..=13 {
+        if !rt2800::set_channel(ch, freq_offset, lna_gain) {
             continue;
         }
-        let len = ((w1 >> rt2800::RXD_SDL0_SHIFT) & rt2800::RXD_SDL0_MASK) as usize;
-        if len > rt2800::RXWI_SIZE {
-            let at = buf_va + idx * rt2800::RX_BUF + rt2800::RXWI_SIZE;
-            let n = (len - rt2800::RXWI_SIZE).min(rt2800::RX_BUF - rt2800::RXWI_SIZE);
-            let body = unsafe { core::slice::from_raw_parts(at as *const u8, n) };
-            if let Some(name) = beacon_ssid(body) {
-                seen += 1;
-                sys::write(alloc::format!("[wifi] СЕТЬ: {}\n", name).as_bytes());
+        let until = sys::monotonic_ns() + DWELL_NS;
+        while sys::monotonic_ns() < until {
+            let d = (DESC_VA + idx * rt2800::RXD_WORDS * 4) as *mut u32;
+            let w1 = unsafe { core::ptr::read_volatile(d.add(1)) };
+            if w1 & rt2800::RXD_DMA_DONE == 0 {
+                sys::sleep_ns(2_000_000);
+                continue;
             }
+            let len = ((w1 >> rt2800::RXD_SDL0_SHIFT) & rt2800::RXD_SDL0_MASK) as usize;
+            if len > rt2800::RXWI_SIZE {
+                let head = buf_va + idx * rt2800::RX_BUF;
+                // Уровень лежит в заголовке приёма, который карта кладёт ПЕРЕД кадром.
+                let raw = unsafe { core::ptr::read_volatile((head + 8) as *const u32) } as u8;
+                let n = (len - rt2800::RXWI_SIZE).min(rt2800::RX_BUF - rt2800::RXWI_SIZE);
+                let body = unsafe {
+                    core::slice::from_raw_parts((head + rt2800::RXWI_SIZE) as *const u8, n)
+                };
+                if let Some(b) = parse_beacon(body) {
+                    beacons += 1;
+                    let rssi = rssi_dbm(raw, rssi_offset, lna_gain);
+                    match nets.iter_mut().find(|n| n.bssid == b.bssid) {
+                        // Уже знакомая точка: берём ЛУЧШИЙ уровень, а не последний. Маяки ловятся
+                        // неровно, и одно слабое попадание не повод занизить всю сеть.
+                        Some(n) => {
+                            n.beacons += 1;
+                            n.rssi = n.rssi.max(rssi);
+                        }
+                        None => nets.push(Net {
+                            bssid: b.bssid,
+                            ssid: b.ssid,
+                            ch: if b.ch != 0 { b.ch } else { ch },
+                            rssi,
+                            secure: b.secure,
+                            beacons: 1,
+                        }),
+                    }
+                }
+            }
+            // Буфер забрали — вернуть его карте: снять признак готовности и подвинуть свой индекс.
+            unsafe { core::ptr::write_volatile(d.add(1), 0) };
+            rt2800::wr32(rt2800::RX_CRX_IDX, idx as u32);
+            idx = (idx + 1) % rt2800::RX_RING;
         }
-        // Буфер забрали — вернуть его карте: снять признак готовности и подвинуть свой индекс.
-        unsafe { core::ptr::write_volatile(d.add(1), 0) };
-        rt2800::wr32(rt2800::RX_CRX_IDX, idx as u32);
-        idx = (idx + 1) % rt2800::RX_RING;
     }
-    // Занятость канала — доказательство ОТДЕЛЬНО ОТ КАДРОВ: счётчик тикает от самой энергии в
-    // эфире, ещё до того, как из неё соберётся кадр. Ноль кадров при ненулевой занятости значит
-    // «слышим, но не разбираем»; ноль и там и там — «антенна всё ещё отключена». Два захода
-    // подряд я не мог отличить одно от другого, потому что мерить было нечем.
+    // Сильные сверху: список сетей читают глазами, и порядок здесь — половина пользы.
+    nets.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+    sys::write(
+        alloc::format!("[wifi] ЭФИР: сетей {}, маяков {}\n", nets.len(), beacons).as_bytes(),
+    );
+    for n in &nets {
+        sys::write(
+            alloc::format!(
+                "[wifi]   {:<24} к{:<3} {:>4} дБм  {}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} маяков)\n",
+                n.ssid,
+                n.ch,
+                n.rssi,
+                if n.secure { "с ключом " } else { "открытая " },
+                n.bssid[0], n.bssid[1], n.bssid[2], n.bssid[3], n.bssid[4], n.bssid[5],
+                n.beacons,
+            )
+            .as_bytes(),
+        );
+    }
     sys::write(
         alloc::format!(
-            "[wifi] эфир: маяков разобрано {}, индекс карты {}, наш {}; канал занят {} / свободен {}\n",
-            seen,
+            "[wifi] кольцо: индекс карты {}, наш {}\n",
             rt2800::rd32(rt2800::RX_DRX_IDX),
             rt2800::rd32(rt2800::RX_CRX_IDX),
-            rt2800::rd32(rt2800::CH_BUSY_STA),
-            rt2800::rd32(rt2800::CH_IDLE_STA),
         )
         .as_bytes(),
     );
