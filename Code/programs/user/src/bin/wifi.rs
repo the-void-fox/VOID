@@ -96,6 +96,10 @@ const EE_MAC0: usize = 0x02;
 const EE_NIC_CONF0: usize = 0x1a;
 const EE_NIC_CONF1: usize = 0x1b;
 const EE_FREQ: usize = 0x1d;
+/// Усиление малошумящего усилителя: младший байт — для 2,4 ГГц. От него считаются пороги
+/// чувствительности приёмника, и без него они остаются при значениях по умолчанию, то есть
+/// глухими к слабому сигналу.
+const EE_LNA: usize = 0x22;
 
 // ── регистры, нужные для загрузки прошивки (Веха 207) ────────────────────────────────────────
 //
@@ -131,13 +135,17 @@ const H2M_OWNER: u32 = 0xff00_0000;
 /// «Проснись» — самая безобидная из команд: ничего не включает, а ответить на неё может только
 /// работающая прошивка.
 const MCU_WAKEUP: u32 = 0x31;
+/// «Загрузка закончена» — этим письмом Linux открывает работу с радио. Прошивка по нему
+/// переходит из режима загрузки в рабочий; без него она жива, но ждёт.
+const MCU_BOOT_SIGNAL: u32 = 0x72;
 
 /// Имя корня, под которым прошивка лежит в store (сеет ядро, см. `FIRMWARE` в `main.rs`).
 const FW_ROOT: &[u8] = b"fw/rt2860";
 
-/// Сколько слов EEPROM читаем. Дальше лежат калибровки по каналам — они понадобятся драйверу,
-/// а разведке хватает начала.
-const EE_WORDS: usize = 32;
+/// Сколько слов EEPROM читаем. Дальше лежат калибровки по каналам — они понадобятся передаче,
+/// а приёму хватает начала. Сорок, а не тридцать два: усиление усилителя лежит по `0x22`, и
+/// прежней границы на него не хватало — пороги чувствительности считались от нуля.
+const EE_WORDS: usize = 40;
 
 unsafe fn rd32(off: usize) -> u32 {
     read_volatile((MMIO_VA + off) as *const u32)
@@ -531,6 +539,10 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         );
         sys::exit(1);
     }
+    // Сказать прошивке, что загрузка позади: с этого Linux начинает работу с радио. Ответа не
+    // ждём — письмо без обязательств, и карта на него не отвечает.
+    mcu_command(MCU_BOOT_SIGNAL, 0, 0);
+    sys::sleep_ns(1_000_000);
     match rt2800::bbp_read(0) {
         Some(v) if v != 0 && v != 0xff => {
             sys::write(alloc::format!("[wifi] BBP отвечает: версия {:#04x}\n", v).as_bytes());
@@ -595,23 +607,26 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     // «правильный» пока незачем — сканирование по каналам будет следующей вехой.
     let ch = 6u8;
     let freq_offset = (ee[EE_FREQ] & 0xff) as u8;
-    if !rt2800::set_channel(ch, freq_offset) {
+    let lna_gain = (ee[EE_LNA] & 0xff) as u8;
+    // Инициализация MAC — ДО настройки канала: она снимает часть регистров в исходное, и канал,
+    // настроенный раньше неё, частью потерялся бы.
+    rt2800::init_mac();
+    if !rt2800::set_channel(ch, freq_offset, lna_gain) {
         sys::write(alloc::format!("[wifi] канала {} в таблице нет\n", ch).as_bytes());
         sys::exit(1);
     }
-    // Инициализация MAC — до включения приёма: без таймингов и длин он не считает кадр
-    // состоявшимся и не отдаёт его в DMA (на этом и встал первый заход).
-    rt2800::init_mac();
     rt2800::rx_enable();
-    let (rf1, sys_ctrl, filt) = (
+    let (rf1, sys_ctrl, filt, pin) = (
         rt2800::rfcsr_read(1).unwrap_or(0),
         rt2800::rd32(rt2800::MAC_SYS_CTRL),
         rt2800::rd32(rt2800::RX_FILTER_CFG),
+        rt2800::rd32(rt2800::TX_PIN_CFG),
     );
     sys::write(
         alloc::format!(
-            "[wifi] канал {} (поправка {:#04x}): радио {:#04x}, MAC_SYS_CTRL {:#010x}, фильтр {:#010x}\n",
-            ch, freq_offset, rf1, sys_ctrl, filt
+            "[wifi] канал {} (поправка {:#04x}, усиление {:#04x}): радио {:#04x}, \
+MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n",
+            ch, freq_offset, lna_gain, rf1, sys_ctrl, filt, pin
         )
         .as_bytes(),
     );
@@ -650,12 +665,16 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     };
     let buf_va = DESC_VA + 4096;
     let buf_pa = dma_pa + 4096;
+    rt2800::tx_rings_idle();
     rt2800::rx_ring_init(DESC_VA, dma_pa, buf_pa);
     rt2800::wpdma_rx_on();
     sys::write(
         alloc::format!(
-            "[wifi] кольцо приёма: {} буферов по {} Б, физ {:#x}; слушаю эфир\n",
-            rt2800::RX_RING, rt2800::RX_BUF, dma_pa
+            "[wifi] кольцо приёма: {} буферов по {} Б, физ {:#x}, движок {:#010x}; слушаю эфир\n",
+            rt2800::RX_RING,
+            rt2800::RX_BUF,
+            dma_pa,
+            rt2800::rd32(rt2800::WPDMA_GLO_CFG),
         )
         .as_bytes(),
     );
@@ -687,12 +706,18 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         rt2800::wr32(rt2800::RX_CRX_IDX, idx as u32);
         idx = (idx + 1) % rt2800::RX_RING;
     }
+    // Занятость канала — доказательство ОТДЕЛЬНО ОТ КАДРОВ: счётчик тикает от самой энергии в
+    // эфире, ещё до того, как из неё соберётся кадр. Ноль кадров при ненулевой занятости значит
+    // «слышим, но не разбираем»; ноль и там и там — «антенна всё ещё отключена». Два захода
+    // подряд я не мог отличить одно от другого, потому что мерить было нечем.
     sys::write(
         alloc::format!(
-            "[wifi] эфир: маяков разобрано {}, индекс карты {}, наш {}\n",
+            "[wifi] эфир: маяков разобрано {}, индекс карты {}, наш {}; канал занят {} / свободен {}\n",
             seen,
             rt2800::rd32(rt2800::RX_DRX_IDX),
             rt2800::rd32(rt2800::RX_CRX_IDX),
+            rt2800::rd32(rt2800::CH_BUSY_STA),
+            rt2800::rd32(rt2800::CH_IDLE_STA),
         )
         .as_bytes(),
     );
