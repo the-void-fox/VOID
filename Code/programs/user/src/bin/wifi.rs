@@ -599,6 +599,9 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
         sys::write(alloc::format!("[wifi] канала {} в таблице нет\n", ch).as_bytes());
         sys::exit(1);
     }
+    // Инициализация MAC — до включения приёма: без таймингов и длин он не считает кадр
+    // состоявшимся и не отдаёт его в DMA (на этом и встал первый заход).
+    rt2800::init_mac();
     rt2800::rx_enable();
     let (rf1, sys_ctrl, filt) = (
         rt2800::rfcsr_read(1).unwrap_or(0),
