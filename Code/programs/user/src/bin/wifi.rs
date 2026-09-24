@@ -37,7 +37,7 @@
 
 extern crate alloc;
 
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 
 use void_user as sys;
 
@@ -59,9 +59,74 @@ const MAC_SYS_CTRL: usize = 0x1004;
 const MAC_ADDR_DW0: usize = 0x1008;
 const MAC_ADDR_DW1: usize = 0x100c;
 const EFUSE_CTRL: usize = 0x0580;
+/// Данные EFUSE приезжают четырьмя словами — и, вопреки ожиданию, С КОНЦА: `DATA3` содержит
+/// первые байты блока, `DATA0` — последние. Это не наша догадка, так устроено железо (в Linux
+/// об этом стоит комментарий «Apparently the data is read from end to start»).
+const EFUSE_DATA0: usize = 0x0590;
+const EFUSE_DATA3: usize = 0x059c;
+
+/// Поля `EFUSE_CTRL`.
+const EFUSE_KICK: u32 = 1 << 30;
+const EFUSE_PRESENT: u32 = 1 << 31;
+/// Адрес блока стоит в битах 17..25.
+const EFUSE_ADDR_SHIFT: u32 = 17;
+const EFUSE_ADDR_MASK: u32 = 0x03fe_0000;
+/// Режим работы — биты 6..7; ноль значит «читать».
+const EFUSE_MODE_MASK: u32 = 0x0000_00c0;
+
+/// Слова EEPROM, которые нам нужны (нумерация в СЛОВАХ по 16 бит, как в самой EEPROM).
+const EE_CHIP_ID: usize = 0;
+const EE_VERSION: usize = 1;
+const EE_MAC0: usize = 2;
+const EE_NIC_CONF0: usize = 5;
+const EE_NIC_CONF1: usize = 6;
+const EE_FREQ: usize = 7;
+
+/// Сколько слов EEPROM читаем. Дальше лежат калибровки по каналам — они понадобятся драйверу,
+/// а разведке хватает начала.
+const EE_WORDS: usize = 32;
 
 unsafe fn rd32(off: usize) -> u32 {
     read_volatile((MMIO_VA + off) as *const u32)
+}
+
+unsafe fn wr32(off: usize, v: u32) {
+    write_volatile((MMIO_VA + off) as *mut u32, v);
+}
+
+/// Прочитать блок EFUSE в 16 байт, начиная со слова `word` (адрес — в БАЙТАХ, кратен 16).
+///
+/// Это первая и единственная запись, которую делает разведка: в `EFUSE_CTRL` кладётся адрес,
+/// режим «чтение» (ноль) и бит «поехали», после чего железо само гасит этот бит. Ничего в карте
+/// при этом не меняется — EFUSE только читается.
+///
+/// `None` — бит «поехали» не погас: карта не ответила, и верить содержимому регистров нельзя.
+fn efuse_block(word: usize, out: &mut [u16]) -> Option<()> {
+    let addr = ((word * 2) as u32) << EFUSE_ADDR_SHIFT & EFUSE_ADDR_MASK;
+    unsafe {
+        let reg = (rd32(EFUSE_CTRL) & !(EFUSE_ADDR_MASK | EFUSE_MODE_MASK)) | addr | EFUSE_KICK;
+        wr32(EFUSE_CTRL, reg);
+    }
+    // Ждём СНОМ, а не пустым циклом: EFUSE отвечает за микросекунды, но мы в обычном процессе,
+    // и крутить процессор ради чужой задержки — отнимать его у всей системы (правило Вехи 168).
+    let mut left = 100;
+    while left > 0 && unsafe { rd32(EFUSE_CTRL) } & EFUSE_KICK != 0 {
+        sys::sleep_ns(100_000);
+        left -= 1;
+    }
+    if left == 0 {
+        return None;
+    }
+    // Слова приезжают с конца блока: DATA3 — первые четыре байта, DATA0 — последние.
+    for i in 0..4 {
+        let v = unsafe { rd32(EFUSE_DATA3 - i * 4) };
+        let at = i * 2;
+        if at + 1 < out.len() {
+            out[at] = v as u16;
+            out[at + 1] = (v >> 16) as u16;
+        }
+    }
+    Some(())
 }
 
 fn w(s: &str) {
@@ -135,8 +200,57 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
         )
         .as_bytes(),
     );
+    // ── EFUSE: то, что карта знает о себе (Веха 206.2) ───────────────────────────────────
+    //
+    // Адрес, число антенн, тип радиочасти и опорная частота лежат не в регистрах, а в
+    // однократно прошитой памяти карты. Без них драйвер не может ни назваться в эфире, ни
+    // настроить приём: RF-тип выбирает таблицы инициализации, а поправка частоты — то, попадём
+    // ли мы вообще в канал.
+    if efuse & EFUSE_PRESENT == 0 {
+        w("[wifi] EFUSE нет — калибровки во внешней EEPROM, её чтение ещё не написано\n");
+        sys::exit(0);
+    }
+    let mut ee = [0u16; EE_WORDS];
+    for blk in 0..EE_WORDS / 8 {
+        let mut part = [0u16; 8];
+        if efuse_block(blk * 8, &mut part).is_none() {
+            sys::write(
+                alloc::format!("[wifi] EFUSE молчит на блоке {} — дальше читать нечего\n", blk)
+                    .as_bytes(),
+            );
+            sys::exit(1);
+        }
+        ee[blk * 8..blk * 8 + 8].copy_from_slice(&part);
+    }
+    // Адрес лежит тремя словами, по два байта в каждом, младшим вперёд.
+    let mut addr = [0u8; 6];
+    for i in 0..3 {
+        addr[i * 2] = ee[EE_MAC0 + i] as u8;
+        addr[i * 2 + 1] = (ee[EE_MAC0 + i] >> 8) as u8;
+    }
+    let conf0 = ee[EE_NIC_CONF0];
+    let (rx_path, tx_path, rf_type) = (conf0 & 0xf, (conf0 >> 4) & 0xf, (conf0 >> 8) & 0xf);
+    sys::write(
+        alloc::format!(
+            "[wifi] EFUSE: chip-id {:04x} версия {:04x}\n\
+             [wifi] адрес в EFUSE {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n\
+             [wifi] антенн приём {} передача {}, RF-тип {:#x}, conf1 {:04x}, частота {:04x}\n",
+            ee[EE_CHIP_ID], ee[EE_VERSION],
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+            rx_path, tx_path, rf_type, ee[EE_NIC_CONF1], ee[EE_FREQ],
+        )
+        .as_bytes(),
+    );
+    // Сырые слова — по той же причине, что и дамп регистров: разбор может соврать, а числа нет.
+    for row in 0..EE_WORDS / 8 {
+        let mut line = alloc::format!("[wifi] ee {:02}:", row * 8);
+        for i in 0..8 {
+            line += &alloc::format!(" {:04x}", ee[row * 8 + i]);
+        }
+        sys::write((line + "\n").as_bytes());
+    }
     // Вывод УХОДИТ ЗНАЧЕНИЕМ в журнал ядра, поэтому его видно и через `klog` — на машине без
     // COM-порта это единственный способ прочитать сказанное (Веха 199.2).
-    w("[wifi] разведка окончена, в карту не записано ни байта\n");
+    w("[wifi] разведка окончена: в карту записан только запрос чтения EFUSE\n");
     sys::exit(0);
 }
