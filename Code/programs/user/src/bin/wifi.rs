@@ -75,12 +75,18 @@ const EFUSE_ADDR_MASK: u32 = 0x03fe_0000;
 const EFUSE_MODE_MASK: u32 = 0x0000_00c0;
 
 /// Слова EEPROM, которые нам нужны (нумерация в СЛОВАХ по 16 бит, как в самой EEPROM).
-const EE_CHIP_ID: usize = 0;
-const EE_VERSION: usize = 1;
-const EE_MAC0: usize = 2;
-const EE_NIC_CONF0: usize = 5;
-const EE_NIC_CONF1: usize = 6;
-const EE_FREQ: usize = 7;
+///
+/// Веха 206.3 — адреса взяты из ТАБЛИЦЫ СООТВЕТСТВИЯ `rt2800_eeprom_map`, а не из порядка
+/// перечисления. Первый разбор читал настройки по словам 5–7, потому что там они стоят в
+/// `enum rt2800_eeprom_word`, — но enum в Linux это ИМЕНА, а адреса живут отдельной таблицей, и
+/// там `NIC_CONF0` лежит по `0x1a`. Сырой дамп это и показал: по словам 5–6 карта отдала
+/// `5390 1814` — собственные идентификаторы PCI, которые ни на какую конфигурацию не похожи.
+const EE_CHIP_ID: usize = 0x00;
+const EE_VERSION: usize = 0x01;
+const EE_MAC0: usize = 0x02;
+const EE_NIC_CONF0: usize = 0x1a;
+const EE_NIC_CONF1: usize = 0x1b;
+const EE_FREQ: usize = 0x1d;
 
 /// Сколько слов EEPROM читаем. Дальше лежат калибровки по каналам — они понадобятся драйверу,
 /// а разведке хватает начала.
@@ -102,7 +108,11 @@ unsafe fn wr32(off: usize, v: u32) {
 ///
 /// `None` — бит «поехали» не погас: карта не ответила, и верить содержимому регистров нельзя.
 fn efuse_block(word: usize, out: &mut [u16]) -> Option<()> {
-    let addr = ((word * 2) as u32) << EFUSE_ADDR_SHIFT & EFUSE_ADDR_MASK;
+    // Адрес задаётся В СЛОВАХ, а не в байтах (так его ставит Linux: `EFUSE_CTRL_ADDRESS_IN, i`,
+    // где `i` — индекс слова с шагом 8). Первый заход умножал на два, и все блоки, кроме
+    // нулевого, приезжали из вдвое более далёкого места — дамп выглядел правдоподобно и был
+    // сдвинут целиком.
+    let addr = (word as u32) << EFUSE_ADDR_SHIFT & EFUSE_ADDR_MASK;
     unsafe {
         let reg = (rd32(EFUSE_CTRL) & !(EFUSE_ADDR_MASK | EFUSE_MODE_MASK)) | addr | EFUSE_KICK;
         wr32(EFUSE_CTRL, reg);
