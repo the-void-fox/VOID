@@ -546,6 +546,10 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
             .as_bytes(),
         );
     }
+    // Нормальный режим: одноантенной карте второй тракт не нужен — он тратит питание и добавляет
+    // шум, а сигнала по нему нет. Числа антенн берём из EFUSE, а не из предположений.
+    rt2800::normal_mode_5xxx(rx_path, tx_path);
+    w("[wifi] радио в нормальном режиме: лишние тракты выключены, калибровка сделана\n");
     if n_diff > diff.len() {
         sys::write(alloc::format!("[wifi]   …и ещё {}\n", n_diff - diff.len()).as_bytes());
     }
