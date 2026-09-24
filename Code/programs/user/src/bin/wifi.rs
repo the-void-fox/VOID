@@ -186,6 +186,42 @@ fn efuse_block(word: usize, out: &mut [u16]) -> Option<()> {
     Some(())
 }
 
+/// Веха 211 — ВЫТАЩИТЬ ИМЯ СЕТИ из кадра-маяка. `None` — это не маяк.
+///
+/// Кадр 802.11 начинается с двух байт управления: в них тип (биты 2–3) и подтип (4–7). Маяк —
+/// тип 0 (управляющий) и подтип 8. Дальше 24 байта заголовка (длительность, три адреса, номер),
+/// затем 12 байт тела маяка (метка времени, интервал, возможности), и только потом элементы
+/// вида «номер, длина, данные». Имя сети — элемент с номером 0.
+///
+/// Скрытая сеть шлёт его пустым или из одних нулей: это не ошибка разбора, а выбор её хозяина,
+/// и в списке она появится безымянной.
+fn beacon_ssid(f: &[u8]) -> Option<alloc::string::String> {
+    if f.len() < 38 {
+        return None;
+    }
+    let (ftype, subtype) = ((f[0] >> 2) & 0x3, (f[0] >> 4) & 0xf);
+    if ftype != 0 || subtype != 8 {
+        return None;
+    }
+    let mut at = 24 + 12;
+    while at + 2 <= f.len() {
+        let (id, len) = (f[at], f[at + 1] as usize);
+        let body = at + 2;
+        if body + len > f.len() {
+            return None; // кадр оборван — дальше уже не элементы
+        }
+        if id == 0 {
+            let raw = &f[body..body + len];
+            if raw.is_empty() || raw.iter().all(|&b| b == 0) {
+                return Some(alloc::string::String::from("<скрытая>"));
+            }
+            return core::str::from_utf8(raw).ok().map(alloc::string::String::from);
+        }
+        at = body + len;
+    }
+    None
+}
+
 fn w(s: &str) {
     sys::write(s.as_bytes());
 }
@@ -295,7 +331,7 @@ fn disable_wpdma() {
 }
 
 #[no_mangle]
-pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
+pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     if !sys::mmio_map(mmio_cap, MMIO_VA) {
         // Веха 206.1 — РАЗЛИЧАЕМ ДВА СЛУЧАЯ. Программа это СЕРВИС: окно регистров ей выдаёт
         // ядро по строке `service wifi mmio:wifi dma`, первым аргументом. Запущенная руками из
@@ -599,6 +635,64 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
             .as_bytes(),
         );
     }
+    // ── кольцо приёма и первые кадры из эфира (Веха 211) ─────────────────────────────────
+    //
+    // Дескрипторы и буферы просим ОДНИМ куском DMA-памяти: карта ходит по ней сама, по
+    // физическим адресам, и разрывы ей объяснить нечем.
+    const DESC_VA: usize = 0x5400_0000;
+    const PAGES: usize = 8; // страница под дескрипторы, остальные под буферы
+    let Some(dma_pa) = sys::dma_alloc_pages(dma_cap, DESC_VA, PAGES) else {
+        w("[wifi] DMA-памяти не дали — кольцо приёма не завести\n");
+        sys::exit(1);
+    };
+    let buf_va = DESC_VA + 4096;
+    let buf_pa = dma_pa + 4096;
+    rt2800::rx_ring_init(DESC_VA, dma_pa, buf_pa);
+    rt2800::wpdma_rx_on();
+    sys::write(
+        alloc::format!(
+            "[wifi] кольцо приёма: {} буферов по {} Б, физ {:#x}; слушаю эфир\n",
+            rt2800::RX_RING, rt2800::RX_BUF, dma_pa
+        )
+        .as_bytes(),
+    );
+
+    // Слушаем три секунды. Маяки точка доступа шлёт примерно десять раз в секунду, так что
+    // этого хватает с избытком даже для одной сети; больше — просто задержит загрузку.
+    let mut seen = 0usize;
+    let mut idx = 0usize;
+    let until = sys::monotonic_ns() + 3_000_000_000;
+    while sys::monotonic_ns() < until {
+        let d = (DESC_VA + idx * rt2800::RXD_WORDS * 4) as *mut u32;
+        let w1 = unsafe { core::ptr::read_volatile(d.add(1)) };
+        if w1 & rt2800::RXD_DMA_DONE == 0 {
+            sys::sleep_ns(2_000_000);
+            continue;
+        }
+        let len = ((w1 >> rt2800::RXD_SDL0_SHIFT) & rt2800::RXD_SDL0_MASK) as usize;
+        if len > rt2800::RXWI_SIZE {
+            let at = buf_va + idx * rt2800::RX_BUF + rt2800::RXWI_SIZE;
+            let n = (len - rt2800::RXWI_SIZE).min(rt2800::RX_BUF - rt2800::RXWI_SIZE);
+            let body = unsafe { core::slice::from_raw_parts(at as *const u8, n) };
+            if let Some(name) = beacon_ssid(body) {
+                seen += 1;
+                sys::write(alloc::format!("[wifi] СЕТЬ: {}\n", name).as_bytes());
+            }
+        }
+        // Буфер забрали — вернуть его карте: снять признак готовности и подвинуть свой индекс.
+        unsafe { core::ptr::write_volatile(d.add(1), 0) };
+        rt2800::wr32(rt2800::RX_CRX_IDX, idx as u32);
+        idx = (idx + 1) % rt2800::RX_RING;
+    }
+    sys::write(
+        alloc::format!(
+            "[wifi] эфир: маяков разобрано {}, индекс карты {}, наш {}\n",
+            seen,
+            rt2800::rd32(rt2800::RX_DRX_IDX),
+            rt2800::rd32(rt2800::RX_CRX_IDX),
+        )
+        .as_bytes(),
+    );
     // Вывод УХОДИТ ЗНАЧЕНИЕМ в журнал ядра, поэтому его видно и через `klog` — на машине без
     // COM-порта это единственный способ прочитать сказанное (Веха 199.2).
     w("[wifi] шаг закончен: карта опознана, EFUSE прочитан, прошивка в буферном процессоре\n");
