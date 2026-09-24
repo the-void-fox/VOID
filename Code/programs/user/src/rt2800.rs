@@ -234,28 +234,40 @@ pub fn wake_mac() -> bool {
 /// Сверяем не всё подряд: часть регистров радио на чтение отдаёт не то, что в них писали (там
 /// живут биты состояния), и «расхождение» на них означало бы ложную тревогу. Берём те, что
 /// читаются как записаны.
-pub fn load_tables(rev: u16) -> (usize, usize) {
+pub fn load_tables(rev: u16, diff: &mut [(u8, u8, u8)]) -> (usize, usize, usize) {
     let mut bbp_ok = 0;
+    let mut n_diff = 0;
+    let mut note = |reg: u8, want: u8, got: u8, n: &mut usize| {
+        if *n < diff.len() {
+            diff[*n] = (reg, want, got);
+        }
+        *n += 1;
+    };
     for &(reg, val) in BBP_53XX {
-        if bbp_write(reg, val) && bbp_read(reg) == Some(val) {
-            bbp_ok += 1;
+        match (bbp_write(reg, val), bbp_read(reg)) {
+            (true, Some(v)) if v == val => bbp_ok += 1,
+            (_, got) => note(reg, val, got.unwrap_or(0xff), &mut n_diff),
         }
     }
     // Ревизия R и новее: программный выбор антенны отключается, за него отвечает железо.
     if rev >= REV_5390R {
         for &(reg, val) in BBP_53XX_REV_R {
-            if bbp_write(reg, val) && bbp_read(reg) == Some(val) {
-                bbp_ok += 1;
+            match (bbp_write(reg, val), bbp_read(reg)) {
+                (true, Some(v)) if v == val => bbp_ok += 1,
+                (_, got) => note(reg, val, got.unwrap_or(0xff), &mut n_diff),
             }
         }
     }
     let mut rf_ok = 0;
     for &(reg, val) in RFCSR_5390 {
-        if rfcsr_write(reg, val) && rfcsr_read(reg) == Some(val) {
-            rf_ok += 1;
+        match (rfcsr_write(reg, val), rfcsr_read(reg)) {
+            (true, Some(v)) if v == val => rf_ok += 1,
+            // Номер радио-регистра помечаем старшим битом: в отчёте одна таблица на двоих, и
+            // «регистр 2» у BBP и у радио — разные вещи.
+            (_, got) => note(reg | 0x80, val, got.unwrap_or(0xff), &mut n_diff),
         }
     }
-    (bbp_ok, rf_ok)
+    (bbp_ok, rf_ok, n_diff)
 }
 
 /// Сколько записей в таблицах — чтобы вызывающий мог сказать «легло столько-то из стольких-то».

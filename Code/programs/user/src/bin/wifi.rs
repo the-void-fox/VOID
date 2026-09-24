@@ -524,7 +524,8 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
     // у BBP и радио свои шины, и запись в занятую шину теряется МОЛЧА, оставляя драйвер в
     // уверенности, что карта настроена.
     let (bbp_n, rf_n) = rt2800::table_sizes(rev);
-    let (bbp_ok, rf_ok) = rt2800::load_tables(rev);
+    let mut diff = [(0u8, 0u8, 0u8); 12];
+    let (bbp_ok, rf_ok, n_diff) = rt2800::load_tables(rev, &mut diff);
     sys::write(
         alloc::format!(
             "[wifi] таблицы: BBP {} из {}, радио {} из {}\n",
@@ -532,8 +533,21 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
         )
         .as_bytes(),
     );
-    if bbp_ok < bbp_n || rf_ok < rf_n {
-        w("[wifi] часть записей не легла — шина занята либо значение читается иначе, чем пишется\n");
+    // Какие именно не сошлись — называем поимённо. «Часть записей не легла» без списка
+    // отправляет искать вслепую, а половина таких расхождений — не поломка, а регистры, где
+    // живут биты состояния: их значение по чтению и не обязано совпадать с записанным.
+    for &(reg, want, got) in diff.iter().take(n_diff.min(diff.len())) {
+        let (kind, num) = if reg & 0x80 != 0 { ("радио", reg & 0x7f) } else { ("BBP", reg) };
+        sys::write(
+            alloc::format!(
+                "[wifi]   {} {}: писали {:#04x}, читается {:#04x}\n",
+                kind, num, want, got
+            )
+            .as_bytes(),
+        );
+    }
+    if n_diff > diff.len() {
+        sys::write(alloc::format!("[wifi]   …и ещё {}\n", n_diff - diff.len()).as_bytes());
     }
     // Вывод УХОДИТ ЗНАЧЕНИЕМ в журнал ядра, поэтому его видно и через `klog` — на машине без
     // COM-порта это единственный способ прочитать сказанное (Веха 199.2).
