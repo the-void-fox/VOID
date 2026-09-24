@@ -60,7 +60,34 @@ fn c_drivers(kernel_dir: &PathBuf) -> Vec<String> {
         .collect()
 }
 
+/// Веха 207 — ПРОШИВКА БЕСПРОВОДНОЙ КАРТЫ, если она положена рядом.
+///
+/// `Code/assets/firmware/rt2860.bin` — блоб производителя (Ralink), и в репозиторий он не едет:
+/// у нас правило не хранить чужие бинарные куски, а у блоба своя лицензия. Поэтому сборка
+/// смотрит, лежит ли он на месте, и говорит ядру `FW_RT2860=<путь>` либо `FW_RT2860=` (пусто).
+///
+/// Так собирается и образ без прошивки — система при этом поднимается целиком, просто
+/// беспроводная карта честно скажет, что ей нечем ожить. Это лучше, чем сборка, падающая
+/// из-за отсутствия файла, которого у человека может не быть по закону.
+fn firmware_env(root: &std::path::Path) {
+    let fw = root.join("assets").join("firmware").join("rt2860.bin");
+    println!("cargo:rerun-if-changed={}", fw.display());
+    // Признаком служит `cfg`, а не пустая строка в переменной: `include_bytes!` пустого пути не
+    // умеет, и «нет файла» обязано различаться на этапе компиляции, а не в рантайме.
+    println!("cargo:rustc-check-cfg=cfg(have_fw)");
+    if fw.exists() {
+        println!("cargo:rustc-env=FW_RT2860={}", fw.display());
+        println!("cargo:rustc-cfg=have_fw");
+    } else {
+        println!(
+            "cargo:warning=прошивки rt2860.bin нет ({}) — образ соберётся без неё, Wi-Fi не оживёт",
+            fw.display()
+        );
+    }
+}
+
 fn main() {
+    firmware_env(&std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).parent().unwrap().to_path_buf());
     let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()); // .../Code/kernel
 
     // Веха 24: скрипт линковки — по архитектуре таргета (один проект, N образов).

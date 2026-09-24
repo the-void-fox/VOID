@@ -88,6 +88,34 @@ const EE_NIC_CONF0: usize = 0x1a;
 const EE_NIC_CONF1: usize = 0x1b;
 const EE_FREQ: usize = 0x1d;
 
+// ── регистры, нужные для загрузки прошивки (Веха 207) ────────────────────────────────────────
+//
+// Смещения и порядок действий сверены с `rt2800pci`/`rt2800lib` из Linux 6.18.7
+// (GPL-2.0-or-later — совместимо с нашей GPL-3). Своего даташита у Ralink нет.
+
+/// Куда пишется образ прошивки: окно памяти карты внутри того же BAR.
+const FIRMWARE_BASE: usize = 0x2000;
+/// Управление буферным процессором: бит 16 — «хост пишет в его память», бит 7 — «готов».
+const PBF_SYS_CTRL: usize = 0x0400;
+const PBF_READY: u32 = 1 << 7;
+const PBF_HOST_RAM_WRITE: u32 = 1 << 16;
+/// Общий переключатель DMA: перед загрузкой его надо погасить.
+const WPDMA_GLO_CFG: usize = 0x0208;
+/// Почтовые ящики к прошивке — обнуляются, чтобы она стартовала с чистого листа.
+const H2M_MAILBOX_CSR: usize = 0x7010;
+const H2M_BBP_AGENT: usize = 0x7028;
+/// Питание и тактирование: на PCIe карту надо «разбудить» явно.
+const AUX_CTRL: usize = 0x010c;
+const AUX_WAKE_PCIE_EN: u32 = 1 << 1;
+const AUX_FORCE_PCIE_CLK: u32 = 1 << 10;
+const PWR_PIN_CFG: usize = 0x1204;
+/// Автопробуждение: если его не снять, загрузка прошивки виснет намертво (об этом прямо
+/// написано в Linux — «иначе rt2800_load_firmware будет висеть вечно»).
+const AUTOWAKEUP_CFG: usize = 0x1208;
+
+/// Имя корня, под которым прошивка лежит в store (сеет ядро, см. `FIRMWARE` в `main.rs`).
+const FW_ROOT: &[u8] = b"fw/rt2860";
+
 /// Сколько слов EEPROM читаем. Дальше лежат калибровки по каналам — они понадобятся драйверу,
 /// а разведке хватает начала.
 const EE_WORDS: usize = 32;
@@ -141,6 +169,90 @@ fn efuse_block(word: usize, out: &mut [u16]) -> Option<()> {
 
 fn w(s: &str) {
     sys::write(s.as_bytes());
+}
+
+/// Ждать, пока бит `mask` в регистре `off` примет значение `want`. `false` — не дождались.
+///
+/// Сном, а не пустым циклом: мы в обычном процессе, и крутить процессор, пока железо думает
+/// свою миллисекунду, значит отнимать его у всей системы (правило Вехи 168).
+fn wait32(off: usize, mask: u32, want: u32, ms: usize) -> bool {
+    for _ in 0..ms * 10 {
+        if unsafe { rd32(off) } & mask == want {
+            return true;
+        }
+        sys::sleep_ns(100_000);
+    }
+    false
+}
+
+/// Веха 207 — ЗАГРУЗИТЬ ПРОШИВКУ в буферный процессор карты.
+///
+/// Порядок действий взят из `rt2800_load_firmware` и `rt2800pci_write_firmware` (Linux
+/// 6.18.7, GPL-2.0-or-later). Он не выводится из общих соображений: каждый шаг здесь лечит
+/// свою болезнь железа, и это тот случай, когда «сделать по-своему» значит не сделать вовсе.
+///
+/// `Err` — на каком шаге карта не ответила. Человеку это и нужно знать: «не грузится» без места
+/// отказа ничего не говорит.
+fn load_firmware(fw: &[u8]) -> Result<(), &'static str> {
+    // 1. Снять автопробуждение. Без этого загрузка виснет намертво — прямое предупреждение из
+    //    Linux, а не наша осторожность.
+    unsafe { wr32(AUTOWAKEUP_CFG, 0) };
+    // 2. Дождаться, пока железо вообще отвечает осмысленно.
+    let mut stable = false;
+    for _ in 0..1000 {
+        let v = unsafe { rd32(MAC_CSR0) };
+        if v != 0 && v != 0xffff_ffff {
+            stable = true;
+            break;
+        }
+        sys::sleep_ns(1_000_000);
+    }
+    if !stable {
+        return Err("железо не стабилизировалось (MAC_CSR0 молчит)");
+    }
+    // 3. Разбудить PCIe-часть и включить её такт: у RT5390 это обязательный шаг.
+    unsafe {
+        let aux = rd32(AUX_CTRL) | AUX_FORCE_PCIE_CLK | AUX_WAKE_PCIE_EN;
+        wr32(AUX_CTRL, aux);
+        wr32(PWR_PIN_CFG, 0x0000_0002);
+    }
+    // 4. Погасить DMA: прошивка грузится в память карты, и движок в это время трогать нельзя.
+    disable_wpdma();
+    // 5. Открыть хосту запись в память буферного процессора и вылить туда образ.
+    unsafe {
+        wr32(PBF_SYS_CTRL, PBF_HOST_RAM_WRITE);
+        for (i, chunk) in fw.chunks(4).enumerate() {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            wr32(FIRMWARE_BASE + i * 4, u32::from_le_bytes(word));
+        }
+        // Закрыть окно записи и дать процессору стартовать.
+        wr32(PBF_SYS_CTRL, 0);
+        wr32(PBF_SYS_CTRL, 1);
+        wr32(H2M_BBP_AGENT, 0);
+        wr32(H2M_MAILBOX_CSR, 0);
+    }
+    // 6. Дождаться, пока он скажет «готов».
+    if !wait32(PBF_SYS_CTRL, PBF_READY, PBF_READY, 100) {
+        return Err("буферный процессор не поднялся (PBF_SYS_CTRL без бита готовности)");
+    }
+    // 7. DMA снова гасим: включит его тот, кто будет заводить кольца.
+    disable_wpdma();
+    unsafe {
+        wr32(H2M_BBP_AGENT, 0);
+        wr32(H2M_MAILBOX_CSR, 0);
+    }
+    sys::sleep_ns(1_000_000);
+    Ok(())
+}
+
+/// Погасить движок DMA: приём, передача и признаки занятости — в ноль, «запись результата» — в
+/// единицу (так делает Linux; бит отвечает за то, куда движок кладёт отчёт о передаче).
+fn disable_wpdma() {
+    unsafe {
+        let reg = rd32(WPDMA_GLO_CFG) & !0x0000_000f | 0x0000_0020;
+        wr32(WPDMA_GLO_CFG, reg);
+    }
 }
 
 #[no_mangle]
@@ -239,15 +351,24 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
         addr[i * 2 + 1] = (ee[EE_MAC0 + i] >> 8) as u8;
     }
     let conf0 = ee[EE_NIC_CONF0];
-    let (rx_path, tx_path, rf_type) = (conf0 & 0xf, (conf0 >> 4) & 0xf, (conf0 >> 8) & 0xf);
+    // Тип радиочасти у RT53xx лежит НЕ в конфигурации, а в `CHIP_ID` — так его и читает Linux
+    // (`rf = rt2800_eeprom_read(EEPROM_CHIP_ID)` для RT3290/RT5390/RT5392/RT6352). По
+    // конфигурации там приезжает `0xf`, то есть чужой чип: разбор выглядел бы правдоподобно и
+    // врал бы о самом главном — по типу RF выбираются все таблицы инициализации.
+    let (rx_path, tx_path) = (conf0 & 0xf, (conf0 >> 4) & 0xf);
+    let rf_type = if chip == 0x5390 || chip == 0x5392 || chip == 0x3290 {
+        ee[EE_CHIP_ID]
+    } else {
+        (conf0 >> 8) & 0xf
+    };
     sys::write(
         alloc::format!(
             "[wifi] EFUSE: chip-id {:04x} версия {:04x}\n\
              [wifi] адрес в EFUSE {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n\
-             [wifi] антенн приём {} передача {}, RF-тип {:#x}, conf1 {:04x}, частота {:04x}\n",
+             [wifi] антенн приём {} передача {}, RF {:#06x}, conf1 {:04x}, поправка частоты {:#04x}\n",
             ee[EE_CHIP_ID], ee[EE_VERSION],
             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
-            rx_path, tx_path, rf_type, ee[EE_NIC_CONF1], ee[EE_FREQ],
+            rx_path, tx_path, rf_type, ee[EE_NIC_CONF1], ee[EE_FREQ] & 0xff,
         )
         .as_bytes(),
     );
@@ -259,8 +380,49 @@ pub extern "C" fn _start(mmio_cap: usize, _dma_cap: usize) -> ! {
         }
         sys::write((line + "\n").as_bytes());
     }
+    // ── прошивка (Веха 207) ──────────────────────────────────────────────────────────────
+    //
+    // Без неё карта не делает ничего: в ней живёт буферный процессор, который и принимает кадры.
+    // Прошивка — блоб производителя, приезжает в образе корнем `fw/rt2860` (если её положили в
+    // сборку). Нет — так и скажем: система при этом целая, просто Wi-Fi не оживёт.
+    let store = sys::cap_named("STORE").unwrap_or(sys::NO_CAP);
+    if store == sys::NO_CAP {
+        w("[wifi] нет права на store — прошивку не прочитать (нужен `store:r` в строке сервиса)\n");
+        sys::exit(0);
+    }
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(store, FW_ROOT, &mut id) != 32 {
+        w("[wifi] прошивки rt2860 в образе нет — положи её в Code/assets/firmware и пересобери\n");
+        sys::exit(0);
+    }
+    let mut fw = alloc::vec![0u8; 16 * 1024];
+    let (got, full) = sys::obj_get_ex(store, &id, &mut fw);
+    if got == 0 || got > fw.len() {
+        w("[wifi] прошивка не читается из store\n");
+        sys::exit(1);
+    }
+    fw.truncate(got);
+    sys::write(
+        alloc::format!("[wifi] прошивка: {} Б (в объекте {} Б), гружу\n", got, full).as_bytes(),
+    );
+    match load_firmware(&fw) {
+        Ok(()) => {
+            let (pbf, mac_ctrl) = unsafe { (rd32(PBF_SYS_CTRL), rd32(MAC_SYS_CTRL)) };
+            sys::write(
+                alloc::format!(
+                    "[wifi] ПРОШИВКА ПРИНЯТА: PBF_SYS_CTRL {:#010x}, MAC_SYS_CTRL {:#010x}\n",
+                    pbf, mac_ctrl
+                )
+                .as_bytes(),
+            );
+        }
+        Err(why) => {
+            sys::write(alloc::format!("[wifi] прошивка НЕ загрузилась: {}\n", why).as_bytes());
+            sys::exit(1);
+        }
+    }
     // Вывод УХОДИТ ЗНАЧЕНИЕМ в журнал ядра, поэтому его видно и через `klog` — на машине без
     // COM-порта это единственный способ прочитать сказанное (Веха 199.2).
-    w("[wifi] разведка окончена: в карту записан только запрос чтения EFUSE\n");
+    w("[wifi] шаг закончен: карта опознана, EFUSE прочитан, прошивка в буферном процессоре\n");
     sys::exit(0);
 }
