@@ -568,7 +568,22 @@ static mut KEY_BUF: [KeyEvent; KEY_CAP] =
 static KEY_HEAD: AtomicUsize = AtomicUsize::new(0);
 static KEY_TAIL: AtomicUsize = AtomicUsize::new(0);
 
+/// Веха 212 — СПАСАТЕЛЬНЫЙ АККОРД `Ctrl+Alt+F1`: снять сеанс и дать текстовую консоль.
+///
+/// Разбирается здесь, а не в композиторе, и это главное в нём: композитор — ровно то, что
+/// ломается. Аккорд, который читает упавшая программа, спасает только пока она жива, то есть
+/// никогда — в тот момент, когда он нужен.
+///
+/// Здесь же он один на обе клавиатуры: и PS/2, и USB кладут события в это кольцо, и маска
+/// модификаторов у них общая (2 — Ctrl, 4 — Alt). Разводить проверку по двум драйверам значило
+/// бы однажды починить её в одном, а на машине владельца пользоваться другим.
+const SYM_F1: u16 = 0x120;
+const MOD_CTRL_ALT: u8 = 2 | 4;
+
 pub(super) fn key_push(sym: u16, mods: u8, down: bool, ch: u16) {
+    if down && sym == SYM_F1 && mods & MOD_CTRL_ALT == MOD_CTRL_ALT {
+        crate::proc::request_rescue();
+    }
     let head = KEY_HEAD.load(Ordering::Relaxed);
     if head.wrapping_sub(KEY_TAIL.load(Ordering::Relaxed)) < KEY_CAP {
         unsafe { KEY_BUF[head % KEY_CAP] = KeyEvent { sym, mods, down, ch } };
