@@ -351,14 +351,47 @@ pub(crate) fn break_output_lock() {
 }
 
 pub fn _print(args: core::fmt::Arguments) {
+    print_inner(args, false)
+}
+
+/// Веха 214 — печать ПРОГРАММЫ (`SYS_WRITE`), а не ядра.
+///
+/// Разделение нужно консоли: пока программа набирает команду, её строка на экране недописана, и
+/// всякая строка журнала, пришедшая в этот миг, вклинивается прямо в неё. Консоль умеет снять
+/// набранное перед чужой печатью и вернуть следом — но для этого обязана знать, чьё оно.
+///
+/// Сам шелл при этом не меняется ни на строку: он как писал байты, так и пишет.
+pub fn _print_user(args: core::fmt::Arguments) {
+    print_inner(args, true)
+}
+
+fn print_inner(args: core::fmt::Arguments, from_program: bool) {
     let sie = arch::irq_save_disable();
     let out = OUT.lock();
+    // ПОРЯДОК: сперва снять набранное, и только потом объявлять нового писателя. Наоборот —
+    // значит сказать консоли «пишет ядро» и тут же спросить её, программа ли писала строку;
+    // ответ будет «нет», и снимать она ничего не станет. Первый заход так и сделал, и строка
+    // по-прежнему затиралась.
+    if !from_program {
+        arch::console_stash_input(); // ядро печатает — убрать набранное с глаз
+    }
+    arch::console_writer_is_program(from_program);
     let _ = arch::Console.write_fmt(args);
     // Веха 116 — то же самое уходит в кольцо журнала. Иначе на машине без COM-порта вывод ядра
     // живёт ровно до того мгновения, пока его не затрёт первый кадр терминала.
     let _ = klog::Tee.write_fmt(args);
+    if !from_program {
+        arch::console_unstash_input(); // ...и вернуть под напечатанным
+    }
     drop(out);
     arch::irq_restore(sie);
+}
+
+/// Печать от имени ПРОГРАММЫ (`SYS_WRITE`). Отличается от [`print!`] только этим, и отличие
+/// живёт в консоли — см. [`_print_user`].
+#[macro_export]
+macro_rules! print_user {
+    ($($arg:tt)*) => { $crate::_print_user(format_args!($($arg)*)) };
 }
 
 #[macro_export]

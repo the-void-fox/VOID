@@ -2417,7 +2417,9 @@ fn syscall(t: &mut Table, cur: usize) {
             // Веха 23: буфер может лежать в ленивой куче — доотобразить до чтения ядром.
             let result = if ensure_heap_range(t, cur, ptr, len) {
                 let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-                crate::print!("{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
+                // Веха 214 — печать ПРОГРАММЫ: консоль по этому и отличает недописанную строку
+                // шелла от своей (см. [`crate::_print_user`]).
+                crate::print_user!("{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
                 len
             } else {
                 usize::MAX

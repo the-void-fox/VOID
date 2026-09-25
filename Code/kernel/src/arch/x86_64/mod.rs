@@ -705,6 +705,18 @@ pub(super) fn phys_low_top() -> usize {
 /// Размер консоли в знакоместах (Веха 120). Экран у неё бывает текстовый (80×25) и пиксельный
 /// (сколько дал GRUB) — программа снаружи различить их не может, а редактору во весь экран это
 /// первое, что нужно знать.
+/// Веха 214 — консоль разнимает двух писателей: журнал ядра и программу, живущую в этой же
+/// консоли. Разбор — в [`vga`]; сюда вынесены только три точки, которые зовёт [`crate::_print`].
+pub fn console_writer_is_program(prog: bool) {
+    vga::set_writer_is_program(prog);
+}
+pub fn console_stash_input() {
+    vga::stash_input();
+}
+pub fn console_unstash_input() {
+    vga::unstash_input();
+}
+
 pub fn console_size() -> (usize, usize) {
     vga::size()
 }
