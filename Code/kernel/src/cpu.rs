@@ -234,7 +234,8 @@ pub fn lock() -> bool {
             serve_flush();
             // И заметить аварию: ядро, упавшее с замком в руках, не отпустит его никогда, а
             // крутиться на нём молча — значит спрятать дамп за зависанием (см. [`stop_others`]).
-            if panicked() {
+            // Веха 213.1 — именно «не у меня»: разбор в [`panicked_elsewhere`].
+            if panicked_elsewhere() {
                 halt_here();
             }
             if OWNER.load(Ordering::Relaxed) == FREE {
@@ -259,10 +260,19 @@ pub fn unlock() {
 // вроде бы жива, дамп на экране перемешан со свежим выводом, а состояние уже недостоверно.
 
 static PANICKED: AtomicBool = AtomicBool::new(false);
+/// Кто объявил аварию. Веха 213.1 — без этого числа «есть авария» и «авария не у меня» неразличимы.
+static PANICKER: AtomicUsize = AtomicUsize::new(FREE);
 
-/// Объявлена ли авария.
-pub fn panicked() -> bool {
-    PANICKED.load(Ordering::Acquire)
+
+/// Веха 213.1 — авария объявлена ДРУГИМ ядром, значит нам остаётся только остановиться.
+///
+/// Раньше здесь спрашивали просто «есть ли авария». Разница невелика на вид и велика по
+/// последствиям. Ядро, печатающее дамп,
+/// само берёт замки — журнала, консоли; встретив на них проверку «есть ли авария», оно
+/// остановило бы себя посреди собственного дампа. То есть авария гасила бы ровно тот вывод,
+/// ради которого существует.
+pub fn panicked_elsewhere() -> bool {
+    PANICKED.load(Ordering::Acquire) && PANICKER.load(Ordering::Acquire) != id()
 }
 
 /// Остановиться навсегда. Прерывания запрещены: обслуживать их нечем и незачем.
@@ -278,8 +288,9 @@ pub fn halt_here() -> ! {
 ///
 /// Возвращается сразу, не дожидаясь: ждать здесь нечего и не у кого — мы уже в аварии.
 pub fn stop_others() {
-    PANICKED.store(true, Ordering::Release);
     let me = id();
+    PANICKER.store(me, Ordering::Release);
+    PANICKED.store(true, Ordering::Release);
     for j in 0..MAX {
         if j != me {
             arch::wake_cpu(j);
