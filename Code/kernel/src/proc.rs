@@ -1346,6 +1346,7 @@ fn close_scheduler() {
     // Ждать, отпустив замок: без него прикладным ядрам не выйти из ядра, и ожидание стало бы
     // взаимной блокировкой.
     cpu::unlock();
+    let mut since = 0u64;
     loop {
         let busy = {
             let t = TABLE.lock();
@@ -1353,6 +1354,14 @@ fn close_scheduler() {
         };
         if !busy {
             break;
+        }
+        // Веха 213 — прикладное ядро, не выходящее из ядра, остановит всю систему вместе с
+        // собой, и молча: выход сеанса ждёт здесь.
+        if since == 0 {
+            since = crate::clock::uptime_ns().max(1);
+        } else if crate::clock::uptime_ns().saturating_sub(since) > cpu::STUCK_NS {
+            cpu::stuck_alarm(format_args!("выхода прикладных ядер из ядра"));
+            since = crate::clock::uptime_ns().max(1);
         }
         core::hint::spin_loop();
     }
@@ -2219,6 +2228,7 @@ fn resume() -> ! {
             t.set_cur(n);
             t.bound[me] = n;
             t.procs[n].last_cpu = me as u8; // Веха 170.7 — сюда его и вернём в следующий раз
+            cpu::note_running(n); // Веха 213 — для отчёта о зависании: кого мы исполняли
             open_slice(n);
             let frame = t.procs[n].frame;
             let space = t.procs[n].space;
@@ -2393,6 +2403,10 @@ fn syscall(t: &mut Table, cur: usize) {
     // атомики на syscall стоят ничего, а отвечают на главный вопрос: кто именно.
     LAST_SYSCALL.store(num, Ordering::Relaxed);
     LAST_PROC.store(cur, Ordering::Relaxed);
+    // Веха 213 — и та же крошка ПО ЯДРАМ. Две записи выше отвечают на «кто звал последним во
+    // всей системе» (этого хватает аварийному дампу: авария одна). Зависание — другой вопрос:
+    // там важно, чем занято КАЖДОЕ ядро, потому что тупик — это всегда двое.
+    cpu::note_syscall(num);
     match num {
         // SYS_WRITE(ptr, len): напечатать буфер процесса (ядро читает U-память, SUM=1).
         1 => {
