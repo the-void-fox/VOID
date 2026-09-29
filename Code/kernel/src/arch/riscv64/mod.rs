@@ -49,11 +49,10 @@ pub fn console_size() -> (usize, usize) {
     (0, 0)
 }
 
-/// Веха 214 — разнимать писателей консоли здесь не надо и нечем: консоль — UART, экрана у
+/// Веха 214.1 — разнимать писателей консоли здесь не надо и нечем: консоль — UART, экрана у
 /// ядра нет, а что делает с потоком терминал на другом конце провода, мы не решаем.
-pub fn console_writer_is_program(_prog: bool) {}
-pub fn console_stash_input() {}
-pub fn console_unstash_input() {}
+pub fn console_begin_write(_reads_input: bool) {}
+pub fn console_end_write(_reads_input: bool) {}
 
 /// Веха 96 — пиксельной консоли на riscv нет (в QEMU `virt` дисплея нет вовсе; понадобится
 /// virtio-gpu или ramfb). Заглушка арх-контракта, парная x86-версии.

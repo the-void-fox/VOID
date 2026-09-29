@@ -66,8 +66,8 @@ pub use imp::{
     CONSOLE_IRQ,
     // Веха 120: размер консоли в знакоместах (`(0, 0)` — арх его не знает: serial)
     console_size,
-    // Веха 214: консоль разнимает двух писателей — журнал ядра и программу, живущую в ней же
-    console_stash_input, console_unstash_input, console_writer_is_program,
+    // Веха 214.1: консоль разнимает писателей — набранную строку шелла и всех остальных
+    console_begin_write, console_end_write,
     // мышь (Веха 115): события с провода, позицию курсора ведёт владелец экрана
     mouse_five, mouse_pending, mouse_pop, mouse_present, mouse_take_lost, mouse_wheel,
     // раскладка клавиатуры (Веха 143): таблицы у драйвера, переключение — системным вызовом

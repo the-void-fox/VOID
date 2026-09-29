@@ -1705,6 +1705,65 @@ fn wait_stdin(saved_sie: usize) -> bool {
     true
 }
 
+/// Веха 214.1 — снять ВСЁ ПОТОМСТВО умершего, не только его группу.
+///
+/// Группа — это нити одного процесса; `SYS_SPAWN` заводит ребёнку СВОЮ группу. Значит смерть
+/// композитора оставляла его окна сиротами — а окно, потерявшее композитора, не кончается: оно
+/// зовёт мёртвый эндпоинт, получает отказ и зовёт снова, вечно, сжигая ядро процессора.
+///
+/// Видно это было в спасательной консоли сразу после `Ctrl+Alt+F1`: два процесса без остановки
+/// печатали «CALL отклонён: Stale». Они не мешали (сообщение видно только при `log on`), но
+/// крутились — и именно они делали машину горячей и медленной ровно тогда, когда человек пришёл
+/// разбираться, почему ему плохо.
+///
+/// Сервисов это не касается: их родитель — init, а не шелл.
+fn kill_descendants(t: &mut Table, root: usize) {
+    // Обходим до неподвижной точки: ребёнок мог сам завести детей. Таблица мала (десятки
+    // слотов), и честный обход дешевле, чем дерево, которое пришлось бы поддерживать.
+    loop {
+        let mut killed = 0;
+        for i in 0..t.procs.len() {
+            if t.procs[i].state == State::Finished {
+                continue;
+            }
+            let p = t.procs[i].parent;
+            let orphan = p < t.procs.len() && p != i && t.procs[p].state == State::Finished;
+            if !orphan || !descends_from(t, i, root) {
+                continue;
+            }
+            let leader = t.procs[i].group;
+            for j in 0..t.procs.len() {
+                if t.procs[j].group == leader && t.procs[j].state != State::Finished {
+                    t.procs[j].state = State::Finished;
+                    lx_close_all(t, j);
+                    killed += 1;
+                }
+            }
+            crate::net::ext_detach(leader);
+        }
+        if killed == 0 {
+            return;
+        }
+    }
+}
+
+/// Потомок ли `who` процесса `root` (по цепочке родителей). Глубина ограничена длиной таблицы —
+/// от кольца в цепочке родителей это не спасёт, но и повиснуть не даст.
+fn descends_from(t: &Table, who: usize, root: usize) -> bool {
+    let mut cur = who;
+    for _ in 0..t.procs.len() {
+        let p = t.procs[cur].parent;
+        if p >= t.procs.len() || p == cur {
+            return false;
+        }
+        if p == root {
+            return true;
+        }
+        cur = p;
+    }
+    false
+}
+
 /// Разбудить процессы, ждущие в `SYS_EXEC` завершения ребёнка `child` (Веха 20.3): вернуть им
 /// код выхода `code`, продвинуть sepc (их ecall завершён) и сделать готовыми.
 fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
@@ -1723,6 +1782,7 @@ fn wake_exec_waiters(t: &mut Table, child: usize, code: usize) {
         // ждать, пока планировщику станет нечего исполнять, нельзя — хостируемый драйвер карты
         // опрашивает железо и готов почти всегда.
         SESSION_OVER.store(true, Ordering::Relaxed);
+        kill_descendants(t, child);
     }
     for i in 0..t.procs.len() {
         if t.procs[i].state == State::ExecWait(child) {
@@ -2417,9 +2477,12 @@ fn syscall(t: &mut Table, cur: usize) {
             // Веха 23: буфер может лежать в ленивой куче — доотобразить до чтения ядром.
             let result = if ensure_heap_range(t, cur, ptr, len) {
                 let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-                // Веха 214 — печать ПРОГРАММЫ: консоль по этому и отличает недописанную строку
-                // шелла от своей (см. [`crate::_print_user`]).
-                crate::print_user!("{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
+                // Веха 214.1 — консоль защищает набранную строку ТОГО, КТО ЧИТАЕТ ввод: у
+                // него одного на экране живёт приглашение с эхом набора. Признак берём у
+                // ядра (`reads_console`, Веха 141.1), а не у пишущего: назвать себя шеллом
+                // не должно быть возможно.
+                let reads = t.procs[cur].reads_console;
+                crate::print_user!(reads, "{}", core::str::from_utf8(bytes).unwrap_or("<?>"));
                 len
             } else {
                 usize::MAX
