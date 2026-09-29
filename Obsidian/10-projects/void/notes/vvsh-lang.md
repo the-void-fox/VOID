@@ -154,4 +154,4 @@ gen2) → `rebuild` (net #t → gen3, «было gen1») → `gens` (gen3\*) →
 ## Связано
 - [[0006-vvsh-lisp-config-shell]] (ADR) · [[vvsh-config-layout]] (раскладка/bootstrap/вехи) ·
   [[vvsh-bidirectional-config]] (overlay/promote — поверх этого) · [[declarative-init]] (формат норм.
-  данных, куда целимся) · [[void-dev-env-workflow]] (сборка/QEMU).
+  данных, куда целимся) · void-dev-env-workflow (сборка/QEMU).

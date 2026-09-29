@@ -121,4 +121,4 @@ shell fm endpoint:posixfs:/etc/apps/fm store:r …
 ## Связано
 
 - [[0017-settings-from-config]] (описание настроек рядом со значением — оттуда берутся умолчания) ·
-  [[0006-vvsh-config-language]] · [[capabilities]] · [[fm]] · [[session]] · [[known-gaps]]
+  [[0006-vvsh-lisp-config-shell]] · [[capabilities]] · fm · [[session]] · [[known-gaps]]

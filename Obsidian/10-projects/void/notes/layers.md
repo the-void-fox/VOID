@@ -183,4 +183,4 @@ QEMU + KVM, экран 1280×800, время = разбор + заполнени
 ## Связано
 - [[compositor]] · [[void-ui]] · [[images]] · [[compositor-damage]] · [[workspaces]] · [[overview]] ·
   [[vvsh-config-layout]] · [[framebuffer]] · [[0007-graphics-native-compositor]] ·
-  [[0016-ui-toolkit-from-first-app]]
+  [[0016-void-ui-toolkit]]

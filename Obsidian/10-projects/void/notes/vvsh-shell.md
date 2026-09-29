@@ -27,7 +27,7 @@ status: active
   `px::*`/`sys::write` — глобальны; состояние не нужно). Бинарь регистрирует их в окружение REPL
   (`env.define(name, Value::Builtin(...))` — всё публично). `vvsh-core` остаётся ЧИСТЫМ: конфиг
   использует `root_env` (без команд), команды — только в шелл-окружении. (S2b — сделано так.)
-- **Ни root, ни юзеров** — capability-модель ([[void-no-users-root]]): шелл владеет своими cap'ами,
+- **Ни root, ни юзеров** — capability-модель ([[capabilities]]): шелл владеет своими cap'ами,
   никакого `sudo`/identity. Больше прав — только через `GRANT`.
 
 ## Разбиение
@@ -187,4 +187,4 @@ vvsh перестал зависеть от vsh по функционалу: в�
 
 ## Связано
 - [[0006-vvsh-lisp-config-shell]] (ADR) · [[vvsh-lang]] (крейт/язык) · [[vvsh-config-layout]] (конфиг,
-  фаза M1) · [[void-no-users-root]] (без root/юзеров) · [[tty]]/[[interactive-shell]] (нынешний vsh).
+  фаза M1) · [[capabilities]] (без root/юзеров) · [[tty]]/[[interactive-shell]] (нынешний vsh).

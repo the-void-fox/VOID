@@ -105,4 +105,4 @@ x86/neon (там intrinsics и рантайм-детект, которых у н
 
 ## Связано
 - [[compositor]] · [[layers]] · [[framebuffer]] · [[void-qemu-run]] · [[known-gaps]] ·
-  [[0016-ui-toolkit-from-first-app]] · [[0011-foreign-software-personalities]]
+  [[0016-void-ui-toolkit]] · [[0011-foreign-software-personalities]]

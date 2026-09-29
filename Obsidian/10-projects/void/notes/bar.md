@@ -145,4 +145,4 @@ QEMU + KVM, 1280×800, снимки в прогоне `screenrun.py`:
 
 ## Связано
 - [[layers]] · [[void-ui]] · [[compositor]] · [[workspaces]] · [[vvsh-config-layout]] · [[known-gaps]] ·
-  [[0007-graphics-native-compositor]] · [[0016-ui-toolkit-from-first-app]]
+  [[0007-graphics-native-compositor]] · [[0016-void-ui-toolkit]]

@@ -17,6 +17,9 @@ r"""doclinks.py — проверить ССЫЛКИ ИЗ КОДА В ДОКУМ�
     python3 Code/tools/doclinks.py          проверить, код выхода = число битых
     python3 Code/tools/doclinks.py --list   заодно показать все живые ссылки
 
+Проверяются И комментарии кода, И сами заметки с ADR: ссылка из документа в документ гниёт
+ровно так же.
+
 Вендоренные крейты и портированный код Linux не проверяются: там чужие комментарии.
 """
 import re
@@ -25,27 +28,58 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CODE = ROOT / "Code"
-DOCS = ROOT / "Obsidian" / "10-projects" / "void"
+# Цели ищутся во ВСЁМ хранилище заметок, а не только в папке проекта: записи ссылаются и на
+# общий список дел (`30-todo/`), и на соседние проекты. Сузить поиск до `10-projects/void`
+# значило бы объявить битыми живые ссылки — проверка, кричащая на исправное, перестаёт работать
+# через неделю, потому что на неё перестают смотреть.
+VAULT = ROOT / "Obsidian"
+DOCS = VAULT / "10-projects" / "void"
 SKIP = ("vendor", "lx-linux", "target")
 
 
 def notes():
-    """Имена всех заметок и ADR (без расширения)."""
-    return {p.stem for p in DOCS.rglob("*.md")}
+    """Имена всех заметок хранилища (без расширения)."""
+    return {p.stem for p in VAULT.rglob("*.md")}
 
 
 def links():
-    """[(имя, файл, строка)] всех `[[…]]` из КОММЕНТАРИЕВ кода."""
+    """[(имя, файл, строка)] всех `[[…]]` — из комментариев кода И из самой документации.
+
+    Веха 214.7.1 — документация проверяется ТОЖЕ, и это не расширение ради полноты. Первая
+    версия смотрела только в `.rs`, и в тот же день я поставил битую ссылку в свежую ADR: она
+    вела в документ, которого в репозитории нет. Проверка, не покрывающая того, что чинила,
+    создаёт ложное спокойствие — а это хуже, чем её отсутствие.
+    """
     out = []
-    for p in sorted(CODE.rglob("*.rs")):
+    sources = [(p, True) for p in sorted(CODE.rglob("*.rs"))]
+    sources += [(p, False) for p in sorted(DOCS.rglob("*.md"))]  # проверяем свои, цели — любые
+    for p, only_comments in sources:
         if any(s in str(p) for s in SKIP):
             continue
+        в_примере = False
         for n, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
-            if not line.strip().startswith("//"):
+            if only_comments and not line.strip().startswith("//"):
                 continue
+            # ПРИМЕРЫ КОДА — не ссылки. `[[x, 2]]` в примере языка vvsh и `[[имя]]` в рассказе
+            # про саму эту проверку выглядят как ссылки и ими не являются. Проверка, ругающаяся
+            # на исправное, через неделю перестаёт читаться — поэтому примеры пропускаются:
+            # блоки в тройных кавычках целиком, вставки в одинарных — вырезанием.
+            голый = line.strip().lstrip("/").strip()
+            if голый.startswith("```") or голый.startswith("~~~"):
+                в_примере = not в_примере
+                continue
+            if в_примере:
+                continue
+            line = re.sub(r"`[^`]*`", "", line)
             # `[[имя|подпись]]` и `[[имя#якорь]]` — цель это то, что до `|` и `#`
             for m in re.findall(r"\[\[([^\]]+)\]\]", line):
-                out.append((m.split("|")[0].split("#")[0].strip(), p, n))
+                цель = m.split("|")[0].split("#")[0].strip()
+                # Ссылка путём (`[[../../30-todo/todo]]`) — Obsidian разрешает её по имени
+                # файла, и мы тоже: проверяем существование, а не совпадение написания.
+                # Ссылка на ПАПКУ (`[[notes/]]`) целью-заметкой не является и не проверяется.
+                if цель.endswith("/"):
+                    continue
+                out.append((цель.rsplit("/", 1)[-1], p, n))
     return out
 
 
@@ -60,7 +94,9 @@ def main():
             print(f" {mark} {p.relative_to(ROOT)}:{n}  [[{t}]]")
         print()
 
-    print(f"ссылок в коде : {len(all_links)} на {len({t for t, _, _ in all_links})} имён")
+    в_коде = sum(1 for _, p, _ in all_links if p.suffix == ".rs")
+    print(f"ссылок в коде : {в_коде}")
+    print(f"ссылок в доках: {len(all_links) - в_коде}")
     print(f"заметок и ADR : {len(known)}")
     if not broken:
         print("битых         : нет — каждая ссылка ведёт в существующий документ")
