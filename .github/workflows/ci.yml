@@ -1,0 +1,104 @@
+# CI VOID (Веха 214.8) — сборка под обе архитектуры, хост-тесты и проверка ссылок.
+#
+# Зачем это появилось. До сих пор каждая сборка была ОДНИМ прогоном на ОДНОЙ машине — машине
+# владельца, внутри nix-shell с прибитым тулчейном. Этого хватало, пока проект был один; но
+# bare-metal-ядро с LTO и `panic = "abort"`, собираемое под две архитектуры, ломается от смены
+# версии rustc, от новой зависимости, от чужого окружения — и узнаёт об этом тот, кто клонировал
+# репозиторий, а не тот, кто сломал.
+#
+# Чего здесь НЕТ и почему. Прогонов в QEMU (`run.sh --script`, `redteam.py`) — они требуют
+# эмулятора, снимков экрана и сроков ожидания, то есть отдельной работы и отдельного времени.
+# Это следующий шаг, а не этот: сперва пусть перестанет молча ломаться сборка.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Сборка ядра не должна молча обновить зависимость: собираем ровно то, что записано в
+  # `Cargo.lock`. Несовпадение — это ошибка сборки, а не повод пересчитать версии.
+  CARGO_NET_LOCKED: "true"
+
+jobs:
+  build:
+    name: ядро ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Обе архитектуры доводятся до конца, даже если первая упала: смысл границы `arch/` в том,
+      # что сломаться может одна и не сломаться другая, — и знать надо про обе сразу.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            target: riscv64gc-unknown-none-elf
+          - arch: x86_64
+            target: x86_64-unknown-none
+    steps:
+      - uses: actions/checkout@v4
+
+      # Тулчейн берётся из `rust-toolchain.toml` (channel + targets объявлены там). Отдельный
+      # шаг — чтобы падение установки было видно как установка, а не как непонятная сборка.
+      - name: тулчейн
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - name: кэш cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Code/target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('Code/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      # Собирается ЯДРО, а вместе с ним и весь userspace: программы собирает `kernel/build.rs`
+      # своим `cargo build` (у них свой линкер-скрипт и свой профиль, поэтому они не члены
+      # workspace). Хостируемых драйверов Linux в сборке не будет — их кладёт `nix-build` в
+      # `programs/lx-linux/prebuilt/`, которого в репозитории нет; `build.rs` это предусматривает
+      # и сеет пустые заглушки. Проверяется здесь сборка, а не полнота образа.
+      - name: собрать
+        working-directory: Code
+        run: cargo build --release -p void-kernel --target ${{ matrix.target }}
+
+  test:
+    name: хост-тесты и ссылки
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: тулчейн
+        run: rustup toolchain install stable --profile minimal
+
+      - name: кэш cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Code/target
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('Code/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
+
+      # `--target` ОБЯЗАТЕЛЕН, и это не перестраховка: в `Code/.cargo/config.toml` цель по
+      # умолчанию — bare-metal riscv, а `cargo test` собирал бы под неё тестовый харнесс, где
+      # нет ни `std`, ни крейта `test`. Ошибка выглядит как «не найден тип Option» в чужом
+      # файле и уводит далеко.
+      #
+      # Ядро исключено: его тесты — это прогон в QEMU, а не `cargo test` (долг записан в
+      # [[internal-debt]], пункт «хост-тесты ядра»).
+      - name: хост-тесты библиотек
+        working-directory: Code
+        run: cargo test --workspace --exclude void-kernel --target x86_64-unknown-linux-gnu
+
+      # Проза в коде адресует документацию записью `[[имя]]`. Ссылка в никуда — это проза,
+      # которую нельзя проверить; однажды таких набралось тридцать из двухсот восемнадцати.
+      - name: ссылки из кода в документацию
+        run: python3 Code/tools/doclinks.py
