@@ -1213,6 +1213,9 @@ fn shell_env() -> Env {
         ("rebuild", sh_rebuild),
         ("gens", sh_gens),
         ("init-config", sh_init_config),
+        ("root", sh_root),
+        ("root-del", sh_root_del),
+        ("secret", sh_secret),
     ];
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
@@ -1488,6 +1491,9 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"roots", "сырые корни store (bin/*, system/*, …)");
     help_row(b"init-config", "посеять /etc/system/*.vv");
     help_row(b"pkg", "пакеты nixpkgs: install/list/remove/rollback/gc (программа)");
+    help_row("root ИМЯ [ЗНАЧЕНИЕ]".as_bytes(), "показать или задать корень store");
+    help_row("root-del ИМЯ".as_bytes(), "снять корень");
+    help_row("secret ИМЯ".as_bytes(), "задать корень, не показывая значения (пароли)");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
     help_row(b"gens", "показать поколения системы (активно — *)");
     help_row(b"switch GEN", "выбрать поколение (после ребута)");
@@ -2706,7 +2712,7 @@ fn sh_switch(args: &[Value]) -> Result<Value, EvalError> {
     if sys::obj_put(scap, name.as_bytes(), &mut id) == 0
         && sys::obj_set_root(scap, CURRENT_ROOT, &id) == 0
     {
-        sys::write(tf("поколение выбрано, перезагрузи QEMU: {}\n", &[&name]).as_bytes());
+        sys::write(tf("поколение {} выбрано — перезагрузи машину\n", &[&name]).as_bytes());
         Ok(Value::nil())
     } else {
         Err(EvalError::new("switch не удался (нет права WRITE на store?)"))
@@ -2745,6 +2751,119 @@ fn sh_sysdef(args: &[Value]) -> Result<Value, EvalError> {
 fn sh_rebuild(_args: &[Value]) -> Result<Value, EvalError> {
     run_rebuild();
     Ok(Value::nil())
+}
+
+// ── корни store прямой командой (Веха 218) ──────────────────────────────────
+//
+// Корни можно было только ПОСМОТРЕТЬ (`roots`). Завести — нечем, и это упиралось в стену всякий
+// раз, когда рядом с конфигом должно лежать что-то, чему в конфиге не место: пароль сети, список
+// блокировки, закладки файлового менеджера.
+//
+// Замысел владельца: завести корень командой, а в конфиге назвать его ИМЯ. Тогда конфиг можно
+// показывать и копировать — в нём ссылка, а не секрет.
+
+/// `(root "имя")` — показать значение; `(root "имя" "значение")` — задать.
+fn sh_root(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(Value::Str(name)) = args.first() else {
+        return Err(EvalError::new("root: (root \"имя\" [\"значение\"])"));
+    };
+    let scap = cap_store();
+    match args.get(1) {
+        Some(Value::Str(val)) => put_root(scap, name.as_bytes(), val.as_bytes()),
+        None => show_root(scap, name.as_bytes()),
+        _ => Err(EvalError::new("root: значение — строка")),
+    }
+}
+
+/// `(root-del "имя")` — снять корень. Содержимое переживёт снятие до сборки мусора.
+fn sh_root_del(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(Value::Str(name)) = args.first() else {
+        return Err(EvalError::new("root-del: (root-del \"имя\")"));
+    };
+    if sys::obj_del_root(cap_store(), name.as_bytes()) == 0 {
+        sys::write(tf("корень {} снят\n", &[name]).as_bytes());
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("root-del: такого корня нет (или нет права WRITE на store)"))
+    }
+}
+
+/// `(secret "имя")` — спросить значение и НЕ ПОКАЗЫВАТЬ его.
+///
+/// Отдельная команда, а не ключ к `root`, ровно по одной причине: пароль, набранный обычной
+/// командой, остаётся на экране и в истории строк. Здесь его не видно ни там, ни там.
+fn sh_secret(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(Value::Str(name)) = args.first() else {
+        return Err(EvalError::new("secret: (secret \"имя\")"));
+    };
+    let mut buf = [0u8; 256];
+    let n = read_hidden("значение (не показывается): ".as_bytes(), &mut buf);
+    if n == 0 {
+        return Err(EvalError::new("secret: пусто — корень не тронут"));
+    }
+    let r = put_root(cap_store(), name.as_bytes(), &buf[..n]);
+    buf.fill(0); // не оставлять пароль в стеке дольше, чем нужно
+    r
+}
+
+fn put_root(scap: usize, name: &[u8], value: &[u8]) -> Result<Value, EvalError> {
+    let mut id = [0u8; 32];
+    if sys::obj_put(scap, value, &mut id) == 0 && sys::obj_set_root(scap, name, &id) == 0 {
+        sys::write(tf("корень {} задан ({} Б)\n", &[
+            core::str::from_utf8(name).unwrap_or("?"),
+            &alloc::format!("{}", value.len()),
+        ]).as_bytes());
+        Ok(Value::nil())
+    } else {
+        Err(EvalError::new("root: не записалось (нет права WRITE на store?)"))
+    }
+}
+
+fn show_root(scap: usize, name: &[u8]) -> Result<Value, EvalError> {
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(scap, name, &mut id) != 32 {
+        return Err(EvalError::new("root: такого корня нет"));
+    }
+    let mut buf = [0u8; 4096];
+    let n = sys::obj_get(scap, &id, &mut buf);
+    if n == usize::MAX {
+        return Err(EvalError::new("root: значение не читается (нет права READ на store?)"));
+    }
+    sys::write(&buf[..n.min(buf.len())]);
+    if n > 0 && buf[n.min(buf.len()) - 1] != b'\n' {
+        sys::write(b"\n");
+    }
+    Ok(Value::nil())
+}
+
+/// Прочитать строку, НЕ отображая набранное. Свой маленький читатель, а не ключ к редактору
+/// строк: тому нужны история, курсор и перерисовка — то есть ровно то, чего здесь быть не должно.
+fn read_hidden(prompt: &[u8], out: &mut [u8]) -> usize {
+    sys::write(prompt);
+    let mut n = 0usize;
+    let mut inb = [0u8; 16];
+    loop {
+        let got = sys::read_stdin(&mut inb);
+        if got == 0 {
+            break;
+        }
+        for &b in &inb[..got] {
+            match b {
+                b'\n' | b'\r' => {
+                    sys::write(b"\n");
+                    return n;
+                }
+                0x08 | 0x7f => n = n.saturating_sub(1),
+                _ if n < out.len() => {
+                    out[n] = b;
+                    n += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    sys::write(b"\n");
+    n
 }
 
 /// `(gens)` — показать поколения системы.
