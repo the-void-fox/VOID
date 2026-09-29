@@ -1132,6 +1132,7 @@ dependencies = [
  "void-nix",
  "void-tree",
  "void-vec",
+ "void-wpa",
  "vte",
  "vvsh-core",
  "webpki-roots 0.26.11",
@@ -1140,6 +1141,13 @@ dependencies = [
 [[package]]
 name = "void-vec"
 version = "0.0.1"
+
+[[package]]
+name = "void-wpa"
+version = "0.0.1"
+dependencies = [
+ "aes",
+]
 
 [[package]]
 name = "vte"
