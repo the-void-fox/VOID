@@ -324,7 +324,7 @@ impl Future for ReadFuture {
                 return Poll::Ready(None); // диск не инициализирован
             };
             // Зарегистрировать ожидание ДО notify, чтобы не разминуться с прерыванием.
-            // Веха 89: `lock_irq` — замок берёт и `on_irq` (см. [[sync]]).
+            // Веха 89: `lock_irq` — замок берёт и `on_irq` (см. `crate::sync`).
             {
                 let mut a = ASYNC.lock_irq();
                 a.active = true;

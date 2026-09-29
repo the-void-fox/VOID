@@ -1574,7 +1574,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             let cloexec = named && nr != 33 && a2 & O_CLOEXEC != 0;
             ret = lx_dup_fd(t, cur, a0, to, 0, cloexec);
         }
-        // Веха 190 — `umask`. Прав у файлов в VOID нет по замыслу ([[no-users-root]]), поэтому
+        // Веха 190 — `umask`. Прав у файлов в VOID нет по замыслу ([[posix-personality]]), поэтому
         // маска не значит ничего. Но отвечать отказом нельзя: POSIX не позволяет этому вызову
         // падать, и звонящий разбирает ответ как ПРЕЖНЮЮ маску. `busybox mkdir` считает по ней
         // режим создаваемого каталога и на `-ENOSYS` уезжает в бессмыслицу.
