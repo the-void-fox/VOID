@@ -179,7 +179,13 @@ capability, а не правило файрвола. Меш оказываетс
 ([[0012-mesh-distributed-work]]), звук, персоналия Windows ([[0011-foreign-software-personalities]]),
 третья архитектура.
 
+## Внутренние работы
+
+Всё, что здесь, — про то, что система УМЕЕТ. Что мешает её развивать (размер `proc.rs`, проза в
+коде, отсутствие CI и тестов ядра), лежит отдельно: [[internal-debt]]. Разделены нарочно — иначе
+внутренний долг либо теряется среди возможностей, либо съедает их очередь.
+
 ## Связано
 
-[[known-gaps]] · [[target-system]] · [[0020-mesh-over-store]] · [[0018-gpu-ladder]] · [[0011-foreign-software-personalities]] ·
+[[internal-debt]] · [[known-gaps]] · [[target-system]] · [[0020-mesh-over-store]] · [[0018-gpu-ladder]] · [[0011-foreign-software-personalities]] ·
 [[0019-nix-on-device]] · [[capabilities]] · [[net-stack]]
