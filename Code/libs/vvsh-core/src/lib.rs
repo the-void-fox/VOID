@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod config;
 pub mod eval;
+pub mod templates;
 pub mod reader;
 pub mod value;
 pub mod words;
