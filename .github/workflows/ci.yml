@@ -104,7 +104,7 @@ jobs:
       # у системы сеть. Молчащий тест хуже отсутствующего: он создаёт уверенность.
       - name: хост-тесты обособленных крейтов
         run: |
-          for c in libs/vvsh-core libs/void-img libs/void-vec; do
+          for c in libs/vvsh-core libs/void-img libs/void-vec libs/void-wpa; do
             echo "── $c"
             ( cd "Code/$c" && cargo test )
           done
