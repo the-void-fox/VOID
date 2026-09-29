@@ -108,3 +108,139 @@ impl Cap {
         self.0
     }
 }
+
+// ─── тесты (Веха 214.9) ──────────────────────────────────────────────────────
+//
+// Здесь живут ДВЕ вещи, на которых стоит вся модель прав: аттенуация (право можно только сузить)
+// и поколение слота (отзыв). Обе — чистая арифметика над числами, то есть проверяемы на хосте
+// без ядра, QEMU и железа. До Вехи 214.9 их не проверял никто: у ядра не было ни одного теста,
+// а эти функции — его фундамент.
+//
+// Тесты пишутся про то, что ЕСТЬ, а не про то, как хотелось бы. Там, где поведение удивляет
+// (`ALL` — не «все права»), тест это фиксирует и объясняет: сюрприз, записанный в тест, перестаёт
+// быть ловушкой.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── права: аттенуация ────────────────────────────────────────────────────
+
+    #[test]
+    fn пересечение_только_сужает() {
+        let rw = Rights::READ.union(Rights::WRITE);
+        // Пересечение с чем угодно не может дать бит, которого не было слева.
+        for other in [Rights::NONE, Rights::READ, Rights::GRANT, Rights::ALL] {
+            assert!(rw.intersect(other).is_subset_of(rw));
+        }
+        // И наоборот: объединением расширить МОЖНО — поэтому передача права пользуется
+        // пересечением, а не объединением.
+        assert!(!rw.union(Rights::GRANT).is_subset_of(rw));
+    }
+
+    #[test]
+    fn пересечение_коммутативно_и_идемпотентно() {
+        let a = Rights::READ.union(Rights::GRANT);
+        let b = Rights::WRITE.union(Rights::GRANT);
+        assert_eq!(a.intersect(b), b.intersect(a));
+        assert_eq!(a.intersect(a), a);
+    }
+
+    #[test]
+    fn пустое_право_подмножество_любого() {
+        for r in [Rights::NONE, Rights::READ, Rights::ALL, Rights::EXEC] {
+            assert!(Rights::NONE.is_subset_of(r));
+            assert_eq!(r.intersect(Rights::NONE), Rights::NONE);
+            assert!(r.contains(Rights::NONE));
+        }
+    }
+
+    #[test]
+    fn contains_и_is_subset_of_смотрят_в_разные_стороны() {
+        let rw = Rights::READ.union(Rights::WRITE);
+        assert!(rw.contains(Rights::READ));
+        assert!(Rights::READ.is_subset_of(rw));
+        assert!(!Rights::READ.contains(rw));
+        assert!(!rw.is_subset_of(Rights::READ));
+    }
+
+    /// `ALL` — НЕ «все права», а только права на значение/ячейку: `READ|WRITE|GRANT`.
+    ///
+    /// `SEND` (вызвать эндпоинт) и `EXEC` (запустить программу) в него не входят, и это замысел:
+    /// владелец объекта не получает право звать чужие серверы просто потому, что он владелец.
+    /// Имя при этом обманчиво, поэтому здесь тест, а не надежда на внимательность.
+    #[test]
+    fn all_это_права_на_значение_а_не_все_подряд() {
+        assert!(Rights::ALL.contains(Rights::READ));
+        assert!(Rights::ALL.contains(Rights::WRITE));
+        assert!(Rights::ALL.contains(Rights::GRANT));
+        assert!(!Rights::ALL.contains(Rights::SEND));
+        assert!(!Rights::ALL.contains(Rights::EXEC));
+    }
+
+    #[test]
+    fn биты_прав_не_пересекаются() {
+        let all = [
+            Rights::READ, Rights::WRITE, Rights::GRANT, Rights::SEND, Rights::EXEC,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_eq!(a.intersect(*b), Rights::NONE, "два права делят один бит");
+            }
+        }
+    }
+
+    // ── дескриптор: слот и поколение ─────────────────────────────────────────
+
+    #[test]
+    fn слот_и_поколение_достаются_обратно() {
+        for (slot, gen) in [(0, 0), (1, 7), (0xffff_ffff, 0), (0, 0xffff_ffff), (42, 1)] {
+            let c = Cap::new(slot, gen);
+            assert_eq!(c.slot(), slot);
+            assert_eq!(c.generation(), gen);
+        }
+    }
+
+    #[test]
+    fn сырые_биты_пересекают_границу_без_потерь() {
+        let c = Cap::new(0x1234_5678, 0x9abc_def0);
+        assert_eq!(Cap::from_bits(c.bits()), c);
+    }
+
+    /// Отзыв: слот тот же, поколение выросло — значит СТАРЫЙ дескриптор больше не тот.
+    /// Именно на этом держится механизм отзыва, и проверять его надо здесь, а не гадать.
+    #[test]
+    fn рост_поколения_обесценивает_прежний_дескриптор() {
+        let было = Cap::new(5, 1);
+        let стало = Cap::new(5, 2);
+        assert_ne!(было, стало);
+        assert_eq!(было.slot(), стало.slot());
+        assert!(стало.generation() > было.generation());
+    }
+
+    #[test]
+    fn разные_слоты_разные_дескрипторы() {
+        assert_ne!(Cap::new(1, 0), Cap::new(2, 0));
+    }
+
+    // ── контент-адрес ────────────────────────────────────────────────────────
+
+    #[test]
+    fn один_и_тот_же_вход_даёт_один_адрес() {
+        assert_eq!(ContentId::hash(b"void"), ContentId::hash(b"void"));
+        assert_ne!(ContentId::hash(b"void"), ContentId::hash(b"voip"));
+        // Пустой вход — тоже вход, а не ошибка: у пустого значения есть адрес.
+        assert_ne!(ContentId::hash(b""), ContentId::hash(b"\0"));
+    }
+
+    /// Сверка с ЭТАЛОНОМ BLAKE3, а не с самим собой: тест «хэш равен хэшу» прошёл бы и на
+    /// сломанной реализации. Вектор — официальный для пустого входа.
+    #[test]
+    fn адрес_пустого_значения_совпадает_с_эталоном_blake3() {
+        let ожидание = [
+            0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc,
+            0xc9, 0x49, 0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca,
+            0xe4, 0x1f, 0x32, 0x62,
+        ];
+        assert_eq!(ContentId::hash(b"").0, ожидание);
+    }
+}
