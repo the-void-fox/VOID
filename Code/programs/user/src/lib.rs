@@ -1056,6 +1056,16 @@ pub fn install(store_cap: usize, slot: usize) -> Option<u64> {
     (r != NO_CAP).then_some(r as u64)
 }
 
+/// Веха 222 — ОБНОВИТЬ установленную систему, не трогая данные.
+///
+/// Отличается от [`install`] ровно тем, чего НЕ делает: не переписывает таблицу разделов и не
+/// касается store. Новое ядро, загрузившись, само сверит программы системы с теми, что лежат в
+/// store, и перепишет разошедшиеся — файлы, поколения, пакеты и секреты при этом ни при чём.
+pub fn update(store_cap: usize, slot: usize) -> Option<u64> {
+    let r = abi::syscall(SYS_INSTALL, store_cap, 2, slot, 0, 0, 0, 0).0;
+    (r != NO_CAP).then_some(r as u64)
+}
+
 /// Веха 174 — размер записи о диске в [`disks`]. Тот же в ядре (`proc::INSTALL_REC`).
 pub const INSTALL_REC: usize = 56;
 

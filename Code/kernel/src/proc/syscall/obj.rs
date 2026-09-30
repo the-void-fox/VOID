@@ -331,6 +331,20 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         n
                     }
                 }
+                // Веха 222 — op 2: ОБНОВИТЬ, не трогая данные (разбор в `install::update`).
+                Ok(()) if op == 2 => match crate::install::update(slot) {
+                    Ok(p2) => {
+                        crate::println!(
+                            "  [install] VOID обновлён на диске {} (store с сектора {} не тронут) — перезагрузись без носителя",
+                            slot, p2
+                        );
+                        p2 as usize
+                    }
+                    Err(e) => {
+                        crate::println!("  [install] обновление отклонено: {}", e);
+                        usize::MAX
+                    }
+                },
                 Ok(()) => match crate::install::run(slot) {
                     Ok(p2) => {
                         crate::println!("  [install] VOID установлен на диск {} (store с сектора {}) — перезагрузись без носителя", slot, p2);

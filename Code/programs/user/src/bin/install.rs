@@ -302,8 +302,8 @@ fn wrap(u: &mut Ui, x: i32, y: i32, w: i32, s: &str, col: ui::Rgba) -> i32 {
     y
 }
 
-/// Без композитора: список словами и установка по номеру.
-fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>) -> ! {
+/// Без композитора: список словами, установка и ОБНОВЛЕНИЕ по номеру.
+fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>, обновить: bool) -> ! {
     match arg {
         None => {
             sys::write("install: куда ставить? Диски машины:\n".as_bytes());
@@ -322,15 +322,33 @@ fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>) -> ! {
             if disks.is_empty() {
                 sys::write("  (ни одного)\n".as_bytes());
             }
-            sys::write("\nПоставить: install <номер>. ДИСК БУДЕТ СТЁРТ ЦЕЛИКОМ.\n".as_bytes());
+            sys::write(
+                "\nПоставить:  install <номер>       ДИСК БУДЕТ СТЁРТ ЦЕЛИКОМ\n\
+Обновить:   install update <номер>  данные останутся на месте\n"
+                    .as_bytes(),
+            );
             sys::exit(0)
         }
         Some(slot) => {
-            sys::write(
-                alloc::format!("install: ставлю на диск {} — он будет стёрт целиком…\n", slot)
+            // Веха 222 — два разных действия и два разных предупреждения. Путать их нельзя ни
+            // на слово: одно стирает диск, другое обещает этого не делать.
+            let итог = if обновить {
+                sys::write(
+                    alloc::format!(
+                        "install: обновляю диск {} — файлы, поколения и пакеты останутся…\n",
+                        slot
+                    )
                     .as_bytes(),
-            );
-            match sys::install(store, slot) {
+                );
+                sys::update(store, slot)
+            } else {
+                sys::write(
+                    alloc::format!("install: ставлю на диск {} — он будет стёрт целиком…\n", slot)
+                        .as_bytes(),
+                );
+                sys::install(store, slot)
+            };
+            match итог {
                 Some(_) => {
                     sys::write(
                         "Готово. Выключи машину, вынь носитель и включи снова.\n".as_bytes(),
@@ -355,11 +373,21 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let disks = read_disks(store);
 
     let argv = sys::argv::Argv::take();
-    let arg = argv.str(0).and_then(|s| s.parse::<usize>().ok());
+    // Веха 222 — `install update <номер>` обновляет, `install <номер>` ставит. Слово впереди
+    // числа, а не ключ после него: человек сперва решает ЧТО делает, и только потом — с чем.
+    let обновить = argv.str(0) == Some("update");
+    let arg = argv
+        .str(if обновить { 1 } else { 0 })
+        .and_then(|s| s.parse::<usize>().ok());
 
+    // Обновление словами и делается словами: окно со списком дисков — про выбор, а человек
+    // выбор уже сделал, назвав действие и номер.
+    if обновить {
+        text_mode(store, &disks, arg, обновить);
+    }
     let (w, h) = (720u16, 520u16);
     let Some(mut surf) = Window::create(w, h, ui::t("Установка VOID")) else {
-        text_mode(store, &disks, arg);
+        text_mode(store, &disks, arg, обновить);
     };
     // Номер, названный словами, слушаемся и в окне: человек уже сказал, куда ставить.
     let sel = arg.and_then(|s| disks.iter().position(|d| d.slot == s)).unwrap_or(0);

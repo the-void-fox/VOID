@@ -226,14 +226,13 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         let mut mac = [0u8; 6];
                         let src = unsafe { core::slice::from_raw_parts(buf as *const u8, 6) };
                         mac.copy_from_slice(src);
-                        crate::net::ext_attach(leader, mac);
-                        0
+                        if crate::net::ext_attach(leader, mac) { 0 } else { usize::MAX }
                     }
                     1 if len <= 2048 && ensure_heap_range(t, cur, buf, len) => {
                         let mut tmp = [0u8; 2048];
                         let src = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
                         tmp[..len].copy_from_slice(src);
-                        let ok = crate::net::ext_rx_push(&tmp[..len]);
+                        let ok = crate::net::ext_rx_push(leader, &tmp[..len]);
 
                         // Разбудить СТЕК тем же признаком, каким его будит прерывание настоящей
                         // карты (Веха 91). Без этой строки кадр лежал в очереди до следующего
@@ -250,7 +249,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     2 if ensure_heap_range(t, cur, buf, len.min(2048)) => {
                         let mut tmp = [0u8; 2048];
                         let cap_len = len.min(2048);
-                        let n = crate::net::ext_tx_pop(&mut tmp[..cap_len]);
+                        let n = crate::net::ext_tx_pop(leader, &mut tmp[..cap_len]);
 
                         if n > 0 {
                             let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
