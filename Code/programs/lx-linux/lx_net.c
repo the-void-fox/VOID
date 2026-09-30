@@ -585,6 +585,14 @@ int lx_napi_run(void)
 #ifdef LX_HAVE_SYSCALL
 static uintptr_t lx_netdev_cap = VOID_NO_CAP;
 static struct net_device *lx_netdev_dev;
+/* Веха 222.2 — ПРИНЯЛИ ЛИ НАС картой системы. Право быть картой есть у обоих драйверов машины
+ * (проводного и беспроводного), а карта в системе одна: кто первый представился, тот ею и
+ * работает, второму ядро отказывает.
+ *
+ * Раньше отказ только печатался, а кадры шли дальше — каждый вызовом в ядро, с копией до двух
+ * килобайт, и каждый отвергался. На живом проводе это сотни тысяч пустых вызовов в секунду:
+ * система вязла, и первой умирала USB-клавиатура — её ядро опрашивает, а опрос не успевал. */
+static int lx_netdev_ours;
 static unsigned long lx_rx_frames, lx_rx_lost, lx_tx_frames;
 /* Веха 199.12 — ВЗЯТО из очереди ядра и СКОЛЬКО РАЗ карта отказалась взять кадр.
  *
@@ -635,16 +643,20 @@ int lx_netdev_attach(struct net_device *dev)
 	}
 	lx_netdev_dev = dev;
 	if (!vsys_netdev_attach(lx_netdev_cap, dev->dev_addr)) {
-		printk("lx_net: ядро не приняло нас картой\n");
+		/* Картой работает другой драйвер. Наше дело — замолчать: кадры этой карты стеку не
+		 * нужны, и носить их туда значит жечь процессор за двоих. */
+		lx_netdev_ours = 0;
+		printk("lx_net: картой системы работает другой драйвер — наши кадры в стек не идут\n");
 		return 0;
 	}
+	lx_netdev_ours = 1;
 	printk("lx_net: мы — сетевая карта системы, кадры идут в стек\n");
 	return 1;
 }
 
 static void lx_netdev_rx(struct sk_buff *skb)
 {
-	if (lx_netdev_cap == VOID_NO_CAP || !skb->len)
+	if (lx_netdev_cap == VOID_NO_CAP || !lx_netdev_ours || !skb->len)
 		return;
 	if (vsys_netdev_rx(lx_netdev_cap, skb->data, skb->len))
 		lx_rx_frames++;
@@ -787,7 +799,7 @@ int lx_netdev_pump(void)
 	unsigned char buf[1600];
 	int sent = 0;
 
-	if (lx_netdev_cap == VOID_NO_CAP || !lx_netdev_dev)
+	if (lx_netdev_cap == VOID_NO_CAP || !lx_netdev_ours || !lx_netdev_dev)
 		return 0;
 	/* Сперва — отложенный: порядок кадров важнее скорости. */
 	if (lx_tx_hold_len) {
