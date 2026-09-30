@@ -953,55 +953,13 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     if words.is_empty() {
         return;
     }
-    // Веха 199.3 — КОНВЕЙЕР `>>`: слева команда, дающая текст, справа — команда, которая его
-    // берёт. `klog >> send 192.168.0.87 9000` читается ровно так, как звучит, и не плодит по
-    // команде на каждое сочетание («klog-send», «klog-save», «cat-send»…). Знак выбран
-    // владельцем и стоит рядом с `>`: тот пишет в файл, этот — передаёт дальше.
-    if let Some(i) = words.iter().position(|w| *w == b">>") {
-        if i == 0 || i + 1 >= words.len() {
-            return sys::write(
-                sys::i18n::t("vvsh: `>>` хочет команду слева и команду справа\n").as_bytes(),
-            );
-        }
-        return pipe_into(interp, env, &words[..i], &words[i + 1..]);
-    }
-    // Веха 202.13 — `>` В ФАЙЛ теперь тоже общий. Раньше его понимали ТРИ команды, каждая
-    // по-своему (`klog`, `echo`, `cat`), а у программ его не было вовсе: вывод `fps` записать
-    // было нечем. Оба знака стоят на одном механизме — «взять текст чего угодно» ([`capture`]),
-    // и отличаются только тем, куда этот текст уезжает: в файл или следующей команде.
+    // Веха 221 — КОНВЕЙЕР ЦЕПОЧКОЙ, а не одним звеном.
     //
-    // Команды, разбирающие `>` сами, сюда не попадают: их имя проверяется первым. Ломать их
-    // незачем — они пишут потоком, а мы собираем целиком.
-    if let Some(i) = words.iter().position(|w| *w == b">") {
-        let own = matches!(core::str::from_utf8(words[0]), Ok("klog" | "echo" | "cat"));
-        if !own {
-            if i == 0 || i + 1 >= words.len() {
-                return sys::write(
-                    sys::i18n::t("vvsh: `>` хочет команду слева и путь справа\n").as_bytes(),
-                );
-            }
-            let text = match capture(interp, env, &words[..i]) {
-                Ok(t) => t,
-                Err(e) => return sys::write(e.as_bytes()),
-            };
-            let path = resolve(words[i + 1]);
-            let fd = px::open(cap_fs(), &path, px::O_TRUNC);
-            if fd == usize::MAX {
-                return sys::write(
-                    alloc::format!("vvsh: не открывается {}\n", String::from_utf8_lossy(&path))
-                        .as_bytes(),
-                );
-            }
-            let n = px::write(cap_fs(), fd, text.as_bytes());
-            px::close(cap_fs(), fd);
-            return sys::write(
-                alloc::format!(
-                    "{} {} {}\n",
-                    sys::i18n::t("записано"), n, sys::i18n::t("байт"),
-                )
-                .as_bytes(),
-            );
-        }
+    // `klog |> grep wifi |> send 192.168.0.87 9000 > /etc/копия.txt` читается ровно так, как
+    // звучит: каждая команда берёт текст предыдущей последним аргументом, а `>` в конце кладёт
+    // итог в файл. Разбор — в [`run_pipeline`]; здесь только развилка «есть ли в строке знак».
+    if words.iter().any(|w| *w == b">>" || *w == b"|>" || *w == b">") {
+        return run_pipeline(interp, env, &words);
     }
     let head = match core::str::from_utf8(words[0]) {
         Ok(s) => s,
@@ -1032,57 +990,167 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     }
 }
 
-/// Веха 199.3 — выполнить левую команду и отдать её текст правой последним аргументом.
+/// Веха 221 — КОНВЕЙЕР: `первая |> вторая |> третья [> файл]`.
 ///
-/// Левая обязана ВОЗВРАЩАТЬ текст, а не печатать его: перехватить чужую печать шелл не может —
-/// она идёт прямо в ядро. Поэтому `klog` стал встроенной командой, отдающей журнал значением
-/// (печатает его всё равно шелл, и снаружи ничего не изменилось), а программы в конвейер не
-/// годятся — и об этом говорится прямо, а не молчанием.
-fn pipe_into(interp: &vvsh_core::Interp, env: &Env, left: &[&[u8]], right: &[&[u8]]) {
-    let text = match capture(interp, env, left) {
-        Ok(t) => t,
-        Err(e) => return sys::write(e.as_bytes()),
-    };
-    let mut form = match build_command_form(right, env) {
-        Ok(Value::List(items)) => items.to_vec(),
-        _ => return sys::write(sys::i18n::t("vvsh: справа от `>>` нужна команда\n").as_bytes()),
-    };
-    form.push(Value::str(&text));
-    match interp.eval(&Value::list(form), env) {
-        Ok(result) => render(&result),
-        Err(e) => print_err(&e),
+/// ## Почему это переписано
+///
+/// Конвейер был на одно звено (`klog >> send`) и брал текст только у команд, ВОЗВРАЩАЮЩИХ его
+/// значением. Половина команд его печатала — и владелец наткнулся на это ровно тогда, когда
+/// конвейер был нужен по делу: `cat /etc/лог.txt >> send …` отправлял пустоту, потому что `cat`
+/// печатал файл, а возвращал ничто. Это не мелочь в одной команде, а расхождение в устройстве:
+/// **команда отдаёт текст, печатает его шелл** — правило было записано у `ls` и не соблюдено
+/// у остальных.
+///
+/// ## Как теперь
+///
+/// - звенья разделяются `|>` или `>>` — это одно и то же; первый знак родной языку (там он уже
+///   работает), второй выбрал владелец для командной строки, и отнимать его незачем;
+/// - текст левого звена приезжает правому ПОСЛЕДНИМ аргументом (thread-last, как в языке);
+/// - `> путь` в конце пишет итог в файл;
+/// - звеном может быть и программа: её вывод шелл собирает, будучи хозяином её stdio
+///   ([`run_captured`]).
+///
+/// Пустой ответ звена — ошибка ВСЛУХ, а не пустой файл на той стороне: молчаливая пустота и была
+/// тем, что владелец разбирал руками.
+fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
+    // Хвост `> путь` отрезаем первым: он не звено, а место назначения.
+    let mut тело = words;
+    let mut файл: Option<alloc::vec::Vec<u8>> = None;
+    if let Some(i) = words.iter().rposition(|w| *w == b">") {
+        if i + 2 != words.len() {
+            return sys::write(sys::i18n::t("vvsh: `>` хочет ПУТЬ и ничего после\n").as_bytes());
+        }
+        // Команды, разбирающие `>` сами (они пишут потоком, а не собранным текстом), остаются
+        // при своём: их имя стоит первым, и звено у строки одно.
+        let сама = matches!(core::str::from_utf8(words[0]), Ok("klog" | "echo" | "cat"))
+            && !words[..i].iter().any(|w| *w == b">>" || *w == b"|>");
+        if !сама {
+            файл = Some(resolve(words[i + 1]));
+            тело = &words[..i];
+        }
     }
+    // Звенья.
+    let mut звенья: alloc::vec::Vec<&[&[u8]]> = alloc::vec::Vec::new();
+    let mut от = 0usize;
+    for (i, w) in тело.iter().enumerate() {
+        if *w == b">>" || *w == b"|>" {
+            звенья.push(&тело[от..i]);
+            от = i + 1;
+        }
+    }
+    звенья.push(&тело[от..]);
+    if звенья.iter().any(|з| з.is_empty()) {
+        return sys::write(
+            sys::i18n::t("vvsh: у конвейера пустое звено — нужна команда с обеих сторон знака\n")
+                .as_bytes(),
+        );
+    }
+    // Гоним текст слева направо. Первое звено идёт без входа, каждое следующее получает текст
+    // предыдущего последним аргументом.
+    let mut текст: Option<String> = None;
+    let последнее = звенья.len() - 1;
+    for (n, звено) in звенья.iter().enumerate() {
+        // Последнему звену текст нужен, только если итог никуда не уезжает дальше: иначе его
+        // значение тоже надо взять, а не напечатать.
+        let берём_значение = n < последнее || файл.is_some();
+        let итог = run_stage(interp, env, звено, текст.as_deref(), берём_значение);
+        match итог {
+            Ok(t) => текст = t,
+            Err(e) => return sys::write(e.as_bytes()),
+        }
+        if берём_значение && текст.is_none() {
+            return sys::write(
+                alloc::format!(
+                    "vvsh: `{}` ничего не отдала — передавать дальше нечего\n",
+                    String::from_utf8_lossy(звено[0]),
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    // Итог: в файл либо на экран.
+    let Some(path) = файл else { return };
+    let Some(text) = текст else { return };
+    let fd = px::open(cap_fs(), &path, px::O_TRUNC);
+    if fd == usize::MAX {
+        return sys::write(
+            alloc::format!("vvsh: не открывается {}\n", String::from_utf8_lossy(&path)).as_bytes(),
+        );
+    }
+    let n = px::write(cap_fs(), fd, text.as_bytes());
+    px::close(cap_fs(), fd);
+    sys::write(
+        alloc::format!("{} {} {}\n", sys::i18n::t("записано"), n, sys::i18n::t("байт")).as_bytes(),
+    );
 }
 
-/// Веха 202.13 — ВЫВОД ЧЕГО УГОДНО текстом: и команды шелла, и программы.
+/// Веха 221 — одно звено конвейера. `вход` — текст предыдущего звена (последним аргументом).
 ///
-/// Раньше конвейер брал текст только у команд, ВОЗВРАЩАЮЩИХ его значением, а программам отвечал
-/// «это программа, её вывод в `>>` не взять». На деле именно программы и нужны: владелец хотел
-/// прислать вывод `fps`, и ни один из трёх способов не подошёл — при том, что механизм давно
-/// есть. Хост чужого stdio (Веха 98) даёт ребёнку право на свой эндпоинт и объявляет `STDIO`;
-/// так работают терминал и сторож запуска `run`. Шеллу оставалось им воспользоваться.
-fn capture(
-    interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]],
-) -> Result<alloc::string::String, alloc::string::String> {
-    let head = core::str::from_utf8(words[0]).unwrap_or("");
-    // Команда шелла — вычисляем и берём значение (печатает его всё равно шелл).
-    if env.lookup(head).is_some_and(|v| is_callable(&v)) {
-        let form = build_command_form(words, env).map_err(|e| alloc::format!("vvsh: {e}\n"))?;
-        return match interp.eval(&form, env) {
-            Ok(Value::Str(s)) => Ok(String::from(&*s)),
-            Ok(other) => Ok(alloc::format!("{}", other)),
-            Err(e) => Err(alloc::format!("vvsh: {}\n", e.0)),
-        };
+/// `нужен_текст` решает, что делать с результатом: отдать дальше или показать человеку. Печатает
+/// звено только в последнем случае — иначе вывод оказался бы и на экране, и в файле.
+fn run_stage(
+    interp: &vvsh_core::Interp,
+    env: &Env,
+    звено: &[&[u8]],
+    вход: Option<&str>,
+    нужен_текст: bool,
+) -> Result<Option<String>, String> {
+    let head = core::str::from_utf8(звено[0]).unwrap_or("");
+    // Программа: запускаем, собрав её вывод. Текста на вход ей передать пока нечем — у
+    // перехваченной программы ввода нет (см. [`run_captured`]), и это честнее, чем сделать вид.
+    if !env.lookup(head).is_some_and(|v| is_callable(&v)) {
+        if вход.is_some() {
+            return Err(alloc::format!(
+                "vvsh: `{head}` — программа, а программе вход конвейера передать нечем\n"
+            ));
+        }
+        let args: alloc::vec::Vec<&[u8]> = звено[1..].to_vec();
+        let out = run_captured(звено[0], &args).ok_or_else(|| {
+            alloc::format!(
+                "{}{}\n",
+                sys::i18n::t("vvsh: команда не найдена: "),
+                head,
+            )
+        })?;
+        if !нужен_текст {
+            sys::write(out.as_bytes());
+            return Ok(None);
+        }
+        return Ok(Some(out));
     }
-    // Программа — запускаем её ХОЗЯИНОМ ЕЁ ВЫВОДА и собираем всё, что она напишет.
-    let args: alloc::vec::Vec<&[u8]> = words[1..].to_vec();
-    run_captured(words[0], &args).ok_or_else(|| {
-        alloc::format!(
-            "{}{}\n",
-            sys::i18n::t("vvsh: команда не найдена: "),
-            core::str::from_utf8(words[0]).unwrap_or("?"),
-        )
-    })
+    // Команда шелла: вычисляем форму, дописав вход последним аргументом.
+    let form = build_command_form(звено, env).map_err(|e| alloc::format!("vvsh: {e}\n"))?;
+    let form = match (вход, form) {
+        (Some(t), Value::List(items)) => {
+            let mut v = items.to_vec();
+            v.push(Value::str(t));
+            Value::list(v)
+        }
+        (_, f) => f,
+    };
+    match interp.eval(&form, env) {
+        Ok(Value::Str(s)) => Ok(Some(String::from(&*s))),
+        Ok(v) if !нужен_текст => {
+            render(&v);
+            Ok(None)
+        }
+        // Пустой список — это `nil`, то есть «команда сделала дело и текста не дала».
+        Ok(Value::List(items)) if items.is_empty() => Ok(None),
+        // Список (его отдаёт `ls`, `grep`) склеивается строками: так его и видит человек.
+        Ok(Value::List(items)) => {
+            let mut t = String::new();
+            for it in items.iter() {
+                match it {
+                    Value::Str(s) => t.push_str(s),
+                    other => t.push_str(&alloc::format!("{}", other)),
+                }
+                t.push('\n');
+            }
+            Ok(Some(t))
+        }
+        Ok(other) => Ok(Some(alloc::format!("{}", other))),
+        Err(e) => Err(alloc::format!("vvsh: {}\n", e.0)),
+    }
 }
 
 /// Веха 202.13/202.20 — запустить программу, СОБРАВ её вывод. `None` — программы нет.
@@ -1277,7 +1345,11 @@ fn render_atom(v: &Value) {
     match v {
         Value::Str(s) => {
             sys::write(s.as_bytes());
-            sys::write(b"\n");
+            // Веха 221 — перевод строки только если его нет: содержимое файла (`cat`) им уже
+            // кончается, и лишний давал бы пустую строку после каждого показа.
+            if !s.ends_with('\n') {
+                sys::write(b"\n");
+            }
         }
         other => sys::write(alloc::format!("{}\n", other).as_bytes()),
     }
@@ -1407,17 +1479,28 @@ fn sh_grep(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.as_bytes(),
         _ => return Err(EvalError::new("grep: (grep \"подстрока\" список)")),
     };
-    let lst = match args.get(1) {
-        Some(Value::List(items)) => items,
-        _ => return Err(EvalError::new("grep: второй аргумент — список")),
-    };
+    // Веха 221 — берём И СПИСОК, И ТЕКСТ. Список отдаёт `ls`, текст — `cat` и `klog`; конвейеру
+    // приезжает то, что отдало предыдущее звено, и заставлять человека помнить, кто чем отвечает,
+    // значит сделать конвейер непригодным ровно там, где он нужен: `cat лог |> grep wifi`.
     let mut out = alloc::vec::Vec::new();
-    for e in lst.iter() {
-        if let Value::Str(s) = e {
-            if contains(s.as_bytes(), sub) {
-                out.push(e.clone());
+    match args.get(1) {
+        Some(Value::List(items)) => {
+            for e in items.iter() {
+                if let Value::Str(s) = e {
+                    if contains(s.as_bytes(), sub) {
+                        out.push(e.clone());
+                    }
+                }
             }
         }
+        Some(Value::Str(text)) => {
+            for line in text.lines() {
+                if contains(line.as_bytes(), sub) {
+                    out.push(Value::str(line));
+                }
+            }
+        }
+        _ => return Err(EvalError::new("grep: (grep \"подстрока\" текст-или-список)")),
     }
     Ok(Value::list(out))
 }
@@ -1701,13 +1784,18 @@ fn sh_cat(args: &[Value]) -> Result<Value, EvalError> {
                 }
                 return Ok(Value::nil());
             }
-            if !bytes.is_empty() {
-                sys::write(&bytes);
-                if *bytes.last().unwrap() != b'\n' {
-                    sys::write(b"\n");
-                }
+            // Веха 221 — ОТДАЁМ текст, а не печатаем его. Печатает его всё равно шелл (`render`),
+            // и человеку ничего не изменилось; а вот конвейеру изменилось всё: `cat файл |> send`
+            // раньше отправлял пустоту, потому что брать у `cat` было нечего.
+            match String::from_utf8(bytes) {
+                Ok(t) => Ok(Value::str(&t)),
+                // Двоичный файл текстом не притворяется: конвейер из него ничего не сделает, а
+                // печать испортит терминал. Говорим прямо.
+                Err(_) => Err(EvalError::new(alloc::format!(
+                    "cat: {} — не текст",
+                    core::str::from_utf8(&path).unwrap_or("?")
+                ))),
             }
-            Ok(Value::nil())
         }
         // Веха 161 — путь В СООБЩЕНИИ: без него «файл не найден» винит файл, а спрашивали часто
         // не тот путь, который человек написал (кавычки, `..`, cwd).
@@ -1744,17 +1832,18 @@ fn sh_echo(args: &[Value]) -> Result<Value, EvalError> {
         }
         return Ok(Value::nil());
     }
+    // Веха 221 — та же правка, что у `cat`: слова склеиваются и ОТДАЮТСЯ. Печатает шелл.
+    let mut text = String::new();
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
-            sys::write(b" ");
+            text.push(' ');
         }
         match a {
-            Value::Str(s) => sys::write(s.as_bytes()),
-            other => sys::write(alloc::format!("{}", other).as_bytes()),
+            Value::Str(s) => text.push_str(s),
+            other => text.push_str(&alloc::format!("{}", other)),
         }
     }
-    sys::write(b"\n");
-    Ok(Value::nil())
+    Ok(Value::str(&text))
 }
 
 /// `(run "имя" "арг"…)` — запустить программу из store, вернуть код выхода (число).

@@ -574,9 +574,9 @@ system(
             r#"service("a", "endpoint:")"#,     // сервер без имени
             r#"shell("s", "power:z")"#,         // буква права и у одиночных
         ];
-        for с in случаи {
-            let norm = build_config(&alloc::format!("system([{}])", с)).expect("конфиг");
-            assert_eq!(check_config(&norm).len(), 1, "не поймано: {}", с);
+        for строка in случаи {
+            let norm = build_config(&alloc::format!("system([{}])", строка)).expect("конфиг");
+            assert_eq!(check_config(&norm).len(), 1, "не поймано: {}", строка);
         }
     }
 
