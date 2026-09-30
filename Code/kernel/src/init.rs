@@ -257,6 +257,23 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
     } else if token == "dma" {
         // Веха 51 — право выделять DMA-память (userspace-драйверу под кольца/буферы).
         Some(cap::mint(dom, cap::Target::Dma, Rights::WRITE).bits() as usize)
+    } else if token == "netdev" {
+        // Веха 220 — БЫТЬ КАРТОЙ СИСТЕМЫ: принятые кадры уходят в стек, исходящие приходят из
+        // него (`SYS_NETDEV`, Веха 195). До сих пор это право минтил только сам init и только
+        // своим встроенным драйверам; беспроводная карта поднимается СТРОКОЙ КОНФИГА, и без
+        // токена её кадрам было бы некуда идти.
+        //
+        // Право отдельного вида, а не часть `dev:net`: говорить ОТ ИМЕНИ провода — не то же, что
+        // ходить в сеть, и смешивать их значило бы разрешить первое каждому, кому разрешили
+        // второе.
+        Some(
+            cap::mint(
+                dom,
+                cap::Target::Device(cap::Device::NetDrv),
+                Rights::READ.union(Rights::WRITE),
+            )
+            .bits() as usize,
+        )
     } else if let Some(dev) = token.strip_prefix("mmio:") {
         // Веха 51 — окно MMIO устройства: найти его на PCI, отдать (физ. база + длина).
         let region = match dev {
@@ -363,7 +380,15 @@ fn apply_with(config: &str, known: Vec<(String, usize)>) -> Vec<(String, usize)>
             continue;
         }
         let Some(name) = entry.words().next() else { continue };
-        let Some(pid) = spawn(name) else { continue };
+        // Веха 220.1 — ГОВОРИМ ВСЛУХ. Раньше здесь стоял молчаливый `continue`: названной
+        // программы нет в store — строка конфига просто исчезала, и снаружи это выглядело как
+        // «сервис почему-то не работает». Теперь эту опечатку ловит ещё и `rebuild` (он не
+        // соберёт такое поколение), но конфиг приходит не только от него — свои поколения ядро
+        // сеет исходником, а человек правит их руками.
+        let Some(pid) = spawn(name) else {
+            println!("  [init] {} '{}': программы нет в store — строка пропущена", kind, name);
+            continue;
+        };
 
         // Права по порядку: собрать дескрипторы, разложить в a0/a1 + стартовую таблицу.
         let mut caps: Vec<usize> = Vec::new();
@@ -534,6 +559,8 @@ fn cap_name(token: &str) -> alloc::string::String {
         d
     } else if token == "dma" {
         "dma"
+    } else if token == "netdev" {
+        "netdev"
     } else if token == "power" || token.starts_with("power:") {
         // Веха 157 — имя одно и то же, сколько бы прав ни назвал токен: `power` и `power:wg` —
         // одно и то же полномочие, просто второе можно ещё и передать.

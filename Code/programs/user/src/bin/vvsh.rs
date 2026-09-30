@@ -588,6 +588,12 @@ fn run_rebuild() {
             return;
         }
     };
+    // Веха 220.1 — СТРОГОСТЬ. Несоответствие в конфиге — ошибка СБОРКИ, а не строка «(пропуск)»
+    // в журнале загрузки, которую на машине без COM-порта не читает никто.
+    if !check_strict(scap, &norm) {
+        return;
+    }
+
     // Веха 219.1 — КОРНИ, НАЗВАННЫЕ КОНФИГОМ, обязаны существовать.
     //
     // Секретов в конфиге нет: пароль сети — объект store, а в строке сервиса стоит имя его корня
@@ -623,6 +629,26 @@ fn run_rebuild() {
         }
     }
 
+    // Веха 220.1 — СКАЗАТЬ, ЧТО ТЕРЯЕТСЯ. Не отказ: убрать сервис можно и нарочно. Но молча
+    // система меняется только в одну сторону — становится беднее, а человек узнаёт об этом
+    // последним. Ровно так дважды пропадала сеть.
+    if let Some(cn) = &cur {
+        if let Some(старый) = gen_content_id(scap, cn).and_then(|id| gen_text(scap, &id)) {
+            let потери = vvsh_core::lost_entries(&старый, &norm);
+            if !потери.is_empty() {
+                sys::write(
+                    tf("vvsh: ВНИМАНИЕ — по сравнению с {} теряется:\n", &[
+                        core::str::from_utf8(cn).unwrap_or("?"),
+                    ])
+                    .as_bytes(),
+                );
+                for p in &потери {
+                    sys::write(tf("vvsh:   {}\n", &[p]).as_bytes());
+                }
+            }
+        }
+    }
+
     // Новое поколение gen<N> (N = max существующих + 1) + активировать (current).
     let Some(num) = next_gen_number(scap) else {
         sys::write(
@@ -654,6 +680,63 @@ fn run_rebuild() {
         ),
     }
     sync_packages();
+}
+
+/// Арх-измерение корней программ: они лежат как `bin/<арх>/<имя>` (зеркало `prog_root` в ядре).
+#[cfg(target_arch = "x86_64")]
+const ARCH: &str = "x86_64";
+#[cfg(target_arch = "riscv64")]
+const ARCH: &str = "riscv64";
+
+/// Веха 220.1 — ПРОВЕРИТЬ КОНФИГ СТРОГО. `false` — собирать нельзя, претензии напечатаны.
+///
+/// Владелец сформулировал правило прямо: «лучше давать по рукам программисту за любое
+/// несоответствие, как это делает Rust» — и отдельно назвал класс, который ненавидит: молчаливые
+/// ошибки. До этой вехи конфиг с опечаткой собирался, система поднималась, и единственным следом
+/// была строка в журнале загрузки:
+///
+/// ```text
+/// [init] mmio:wifii — устройство не найдено (пропуск)
+/// ```
+///
+/// Проверяется двумя источниками. ПО ТЕКСТУ (`vvsh_core::check_config`, host-тесты) — вид и
+/// буквы прав, имя устройства, ссылка на объявленный сервер. ПО STORE — есть ли названная
+/// программа: `service имя` спавнит `bin/<арх>/имя`, и опечатка в нём до сих пор означала
+/// молчаливо пропущенную строку конфига (в ядре `let Some(pid) = spawn(name) else { continue }`).
+///
+/// Чего НЕ проверяем: есть ли в ЭТОЙ машине названное устройство. Один конфиг ездит по разным
+/// машинам, и `mmio:wifi` на машине без беспроводной карты — верная строка, а не ошибка.
+fn check_strict(scap: usize, norm: &str) -> bool {
+    let mut беды = vvsh_core::check_config(norm);
+    // Программы — по списку корней store. Читается он один раз и целиком: частичный список
+    // сказал бы «программы нет» о программе, которая есть.
+    match roots::text(scap) {
+        Some(list) => {
+            for line in norm.lines() {
+                let mut w = line.split_whitespace();
+                let Some(kind) = w.next() else { continue };
+                if !void_conf::spawns_program(kind) {
+                    continue;
+                }
+                let Some(имя) = w.next() else { continue };
+                let корень = alloc::format!("bin/{}/{}", ARCH, имя);
+                if !roots::has(&list, корень.as_bytes()) {
+                    беды.push(alloc::format!("{} {}: такой программы в store нет", kind, имя));
+                }
+            }
+        }
+        None => беды.push(alloc::string::String::from(
+            "список корней store не читается — проверить программы нечем",
+        )),
+    }
+    if беды.is_empty() {
+        return true;
+    }
+    for b in &беды {
+        sys::write(tf("vvsh: {}\n", &[b]).as_bytes());
+    }
+    sys::write(sys::i18n::t("vvsh: поколение не собрано\n").as_bytes());
+    false
 }
 
 /// Веха 219.1 — проверить корни, названные конфигом. `false` — собирать нельзя, причина напечатана.
@@ -3248,6 +3331,18 @@ fn read_current_name(scap: usize) -> Option<Vec<u8>> {
 }
 
 /// Content-id поколения `system/<имя>`. `None` — нет/нет READ.
+/// Веха 220.1 — текст поколения по его content-id. `None` — не читается (нет права либо объект
+/// больше буфера; конфиг в двадцать килобайт — это уже не конфиг).
+fn gen_text(scap: usize, id: &[u8; 32]) -> Option<String> {
+    let mut buf = alloc::vec![0u8; 20 * 1024];
+    let (got, full) = sys::obj_get_ex(scap, id, &mut buf);
+    if got == 0 || got != full {
+        return None;
+    }
+    buf.truncate(got);
+    String::from_utf8(buf).ok()
+}
+
 fn gen_content_id(scap: usize, gen: &[u8]) -> Option<[u8; 32]> {
     let mut root = Vec::with_capacity(7 + gen.len());
     root.extend_from_slice(b"system/");

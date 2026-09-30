@@ -22,7 +22,7 @@ pub mod reader;
 pub mod value;
 pub mod words;
 
-pub use config::{normalize_config, store_refs};
+pub use config::{check_config, lost_entries, normalize_config, store_refs};
 pub use eval::{eval_program, root_env, Interp, ModuleLoader, NoLoader, Runner};
 pub use reader::{read_all, ReadError};
 pub use value::{Env, EvalError, Value};
@@ -540,6 +540,106 @@ system(
             build_config_with(r#"system(import("packages.vv"))"#, &loader).expect("с именами"),
             "channel https://ch/nixos-unstable\npackages hello which\n"
         );
+    }
+
+    // ── Веха 220.1: строгость конфига ───────────────────────────────────────
+
+    /// Верный конфиг обязан пройти молча. Это половина ценности проверки: ругань на верное
+    /// учит не читать сообщения, и тогда не читают и верные.
+    #[test]
+    fn правильный_конфиг_не_вызывает_претензий() {
+        let norm = build_config(
+            r#"system([service("posixfs", "store:rw"),
+                       service("net-srv", "dev:net:rw", "store:r", "arg:dhcp=off"),
+                       service("wifi", "mmio:wifi", "dma", "netdev", "store:r"),
+                       shell("wm", "endpoint:posixfs", "store:rwx", "mmio:fb!", "power:wg!",
+                             "sysview", "hwprobe:rw", "env", "arg:term")])"#,
+        )
+        .expect("конфиг");
+        assert!(check_config(&norm).is_empty(), "{:?}", check_config(&norm));
+    }
+
+    /// Опечатка в праве до этой вехи означала строку `(пропуск)` в журнале загрузки, которую
+    /// никто не читает. Теперь — претензия на каждую.
+    #[test]
+    fn опечатки_в_правах_ловятся() {
+        let случаи = [
+            r#"service("a", "stroe:rw")"#,      // вид права
+            r#"service("a", "store:q")"#,       // буква права
+            r#"service("a", "store:")"#,        // права не названы
+            r#"service("a", "mmio:wifii")"#,    // устройство
+            r#"service("a", "dev:usb:rw")"#,    // устройств два
+            r#"service("a", "dev:net")"#,       // без прав
+            r#"service("a", "arg:")"#,          // аргумент без аргумента
+            r#"service("a", "endpoint:")"#,     // сервер без имени
+            r#"shell("s", "power:z")"#,         // буква права и у одиночных
+        ];
+        for с in случаи {
+            let norm = build_config(&alloc::format!("system([{}])", с)).expect("конфиг");
+            assert_eq!(check_config(&norm).len(), 1, "не поймано: {}", с);
+        }
+    }
+
+    /// `endpoint:ИМЯ` без объявленного сервера — самая коварная из опечаток: система поднимается,
+    /// а один сервис молча не видит другого. Проверяется по конфигу целиком, а не по токену.
+    #[test]
+    fn ссылка_на_несуществующий_сервер_ловится() {
+        let norm = build_config(
+            r#"system([service("posixfs", "store:rw"), shell("wm", "endpoint:hda")])"#,
+        )
+        .expect("конфиг");
+        let беды = check_config(&norm);
+        assert_eq!(беды.len(), 1);
+        assert!(беды[0].contains("endpoint:hda"), "{}", беды[0]);
+
+        // А объявленный — проходит, в том числе с правами и с пометкой «не наследуется».
+        let norm = build_config(
+            r#"system([service("hda", "mmio:hda"), shell("wm", "endpoint:hda:sg!")])"#,
+        )
+        .expect("конфиг");
+        assert!(check_config(&norm).is_empty());
+    }
+
+    /// Проверяются только строки, объявляющие программу. У `desktop`, `ui` и `bind` свои
+    /// значения, и разбор их как прав заругался бы на верный конфиг.
+    #[test]
+    fn чужие_записи_не_проверяются_как_права() {
+        let norm = build_config(
+            r##"system([desktop("wallpaper", "мои обои.png"), ui("accent", "#4c7dfd"),
+                       bind("wm", "Super+Return", "spawn-term")])"##,
+        )
+        .expect("конфиг");
+        assert!(check_config(&norm).is_empty(), "{:?}", check_config(&norm));
+    }
+
+    /// Веха 220.1 — потеря возможности при пересборке обязана быть названа.
+    ///
+    /// Этот класс кусал владельца дважды: пересборка отняла сеть, и узналось это после
+    /// перезагрузки. Здесь проверяется и то, что НЕ считается потерей: правка аргумента.
+    #[test]
+    fn потеря_возможности_видна() {
+        let было = build_config(
+            r#"system([service("net-srv", "dev:net:rw", "store:r", "arg:dhcp=on"),
+                       service("hda", "mmio:hda", "dma")])"#,
+        )
+        .expect("конфиг");
+        let стало = build_config(
+            r#"system([service("net-srv", "dev:net:rw", "arg:dhcp=off")])"#,
+        )
+        .expect("конфиг");
+        let потери = lost_entries(&было, &стало);
+        assert_eq!(потери.len(), 2, "{:?}", потери);
+        assert!(потери.iter().any(|p| p.contains("store:r")), "{:?}", потери);
+        assert!(потери.iter().any(|p| p.contains("hda")), "{:?}", потери);
+        // Тот же конфиг сам с собой — потерь нет.
+        assert!(lost_entries(&было, &было).is_empty());
+        // Добавление — не потеря.
+        let шире = build_config(
+            r#"system([service("net-srv", "dev:net:rw", "store:r", "arg:dhcp=on", "netdev"),
+                       service("hda", "mmio:hda", "dma"), service("wifi", "mmio:wifi")])"#,
+        )
+        .expect("конфиг");
+        assert!(lost_entries(&было, &шире).is_empty(), "{:?}", lost_entries(&было, &шире));
     }
 
     /// Веха 219.1 — имя корня со знаком `@` находится, а обычное значение — нет.

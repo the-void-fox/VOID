@@ -291,6 +291,118 @@ pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().find(|k| k.name == name)
 }
 
+// ─── токены прав (Веха 220.1) ─────────────────────────────────────────────────
+//
+// ## Зачем это здесь
+//
+// Строка `service`/`shell` перечисляет ПРАВА процесса, и до этой вехи их разбирал один только
+// `init` — на загрузке, молча пропуская непонятное:
+//
+// ```text
+// [init] mmio:wifii — устройство не найдено (пропуск)
+// [init] endpoint:hda — нет такого сервера (пропуск)
+// ```
+//
+// Строку эту на машине без COM-порта не читает никто, и опечатка в праве даёт ровно то, чего
+// быть не должно: система поднимается «как будто нормально», а сервис молча без права. Хуже
+// того, `parse_rights` глотает неизвестную букву: `store:q` — это НОЛЬ прав, и тоже молча.
+//
+// Теперь разбор живёт здесь, рядом со словарём видов, и им пользуются оба: `rebuild` — чтобы
+// отказаться собирать конфиг с опечаткой, `init` — чтобы поднять систему. Один словарь на двоих;
+// разъехаться им не на чем.
+
+/// Буквы прав: чтение, запись, исполнение, посылка сообщения, передача права дальше.
+pub const RIGHT_LETTERS: &str = "rwxsg";
+
+/// Устройства, окно регистров которых умеет выдавать `init` (`mmio:ИМЯ`).
+///
+/// Список ИМЁН, а не поиска: сам поиск (по идентификаторам PCI или по классу) живёт в ядре и
+/// зависит от архитектуры. Здесь важно другое — отличить опечатку от устройства, которого просто
+/// нет в этой машине. Первое всегда ошибка; второе — нормальный случай, один конфиг ездит по
+/// разным машинам.
+pub const MMIO_DEVICES: &[&str] = &["e1000", "atl1c", "rtl8139", "hda", "wifi", "fb"];
+
+/// Токены, которые правом не являются и разбираются отдельно.
+const NOT_A_RIGHT: &[&str] = &["env"];
+
+/// Проверить букву за буквой строку прав. Пустая — тоже ошибка: `store:` не значит ничего.
+fn check_rights(r: &str) -> Result<(), &'static str> {
+    if r.is_empty() {
+        return Err("права не названы (бывают r, w, x, s, g)");
+    }
+    match r.chars().all(|c| RIGHT_LETTERS.contains(c)) {
+        true => Ok(()),
+        false => Err("в правах чужая буква (бывают r, w, x, s, g)"),
+    }
+}
+
+/// Веха 220.1 — РАЗОБРАТЬ токен строки запуска. `Err` — текст претензии, готовый к печати.
+///
+/// Проверяется ФОРМА и словарь, но не машина: `mmio:wifi` на машине без беспроводной карты —
+/// верный токен, и ошибкой он здесь не считается. А вот `endpoint:ИМЯ` проверяется только на
+/// форму: есть ли такой сервер, видно по конфигу целиком, а не по одному токену.
+pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
+    // Веха 154 — суффикс «не наследуется»; к виду права отношения не имеет.
+    let tok = tok.strip_suffix('!').unwrap_or(tok);
+    if tok.is_empty() {
+        return Err("пустой токен");
+    }
+    if NOT_A_RIGHT.contains(&tok) || tok == "dma" || tok == "netdev" {
+        return Ok(());
+    }
+    if let Some(a) = tok.strip_prefix("arg:") {
+        return if a.is_empty() { Err("`arg:` без самого аргумента") } else { Ok(()) };
+    }
+    if let Some(r) = tok.strip_prefix("store:") {
+        return check_rights(r);
+    }
+    if let Some(rest) = tok.strip_prefix("dev:") {
+        let Some((вид, r)) = rest.split_once(':') else {
+            return Err("жду `dev:net:ПРАВА` или `dev:block:ПРАВА`");
+        };
+        if вид != "net" && вид != "block" {
+            return Err("устройств в строке запуска два: `dev:net` и `dev:block`");
+        }
+        return check_rights(r);
+    }
+    if let Some(dev) = tok.strip_prefix("mmio:") {
+        return match MMIO_DEVICES.contains(&dev) {
+            true => Ok(()),
+            false => Err("такого устройства нет (бывают e1000, atl1c, rtl8139, hda, wifi, fb)"),
+        };
+    }
+    if let Some(rest) = tok.strip_prefix("endpoint:") {
+        let (имя, права) = match rest.split_once(':') {
+            Some((n, r)) => (n, Some(r)),
+            None => (rest, None),
+        };
+        if имя.is_empty() {
+            return Err("`endpoint:` без имени сервера");
+        }
+        return match права {
+            Some(r) => check_rights(r),
+            None => Ok(()),
+        };
+    }
+    for одиночный in ["power", "sysview", "hwprobe"] {
+        if tok == одиночный {
+            return Ok(());
+        }
+        if let Some(r) = tok.strip_prefix(одиночный).and_then(|s| s.strip_prefix(':')) {
+            return check_rights(r);
+        }
+    }
+    Err("такого права нет")
+}
+
+/// Объявляет ли запись ПРОГРАММУ с правами: только `service` и `shell`.
+///
+/// Прочие виды (`desktop`, `ui`, `bind`, …) несут свои значения, и проверять их как права значило
+/// бы ругаться на верный конфиг.
+pub fn spawns_program(kind: &str) -> bool {
+    kind == "service" || kind == "shell"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
