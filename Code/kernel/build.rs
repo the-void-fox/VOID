@@ -244,7 +244,7 @@ fn build_user_programs(kernel_dir: &PathBuf, target: &str, x86: bool) {
     println!("cargo:rerun-if-changed={}", workspace_dir.join("assets").display());
     // Крейты-зависимости вне workspace ядра: их правку внешний cargo тоже не видит, потому что
     // собирает их ВЛОЖЕННЫЙ вызов, о котором он не знает.
-    for lib in ["void-vec", "void-img", "vvsh-core", "void-tree"] {
+    for lib in ["void-vec", "void-img", "vvsh-core", "void-tree", "void-wpa"] {
         println!("cargo:rerun-if-changed={}", workspace_dir.join("libs").join(lib).join("src").display());
     }
 
