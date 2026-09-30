@@ -22,7 +22,7 @@ pub mod reader;
 pub mod value;
 pub mod words;
 
-pub use config::normalize_config;
+pub use config::{normalize_config, store_refs};
 pub use eval::{eval_program, root_env, Interp, ModuleLoader, NoLoader, Runner};
 pub use reader::{read_all, ReadError};
 pub use value::{Env, EvalError, Value};
@@ -540,5 +540,36 @@ system(
             build_config_with(r#"system(import("packages.vv"))"#, &loader).expect("с именами"),
             "channel https://ch/nixos-unstable\npackages hello which\n"
         );
+    }
+
+    /// Веха 219.1 — имя корня со знаком `@` находится, а обычное значение — нет.
+    ///
+    /// Это вся разница между «rebuild проверяет то, что просили» и «rebuild ругается на верный
+    /// конфиг»: в тех же аргументах ходят пути, имена и адреса, и гадать по их виду нельзя.
+    #[test]
+    fn store_refs_finds_marked_names() {
+        let norm = build_config(
+            r#"system([service("wifi", "store:r", "arg:ssid=ДОМ", "arg:key=@wifi/upc"),
+                       service("net-srv", "dev:net:rw", "arg:block=@dns/block",
+                               "arg:host=роутер.дом=192.168.1.1", "arg:dns=1.1.1.1")])"#,
+        )
+        .expect("конфиг");
+        assert_eq!(store_refs(&norm), vec!["wifi/upc", "dns/block"]);
+    }
+
+    #[test]
+    fn store_refs_empty_without_marks() {
+        let norm = build_config(
+            r#"system([service("net-srv", "dev:net:rw", "arg:ip=10.0.2.15/24", "arg:block=dns/block")])"#,
+        )
+        .expect("конфиг");
+        assert!(store_refs(&norm).is_empty(), "нашли корень там, где знака нет");
+    }
+
+    /// `=@` без имени — ошибка конфига, и она обязана дойти до `rebuild`, а не пропасть.
+    #[test]
+    fn store_refs_keeps_empty_name() {
+        let norm = build_config(r#"system([service("wifi", "arg:key=@")])"#).expect("конфиг");
+        assert_eq!(store_refs(&norm), vec![""]);
     }
 }

@@ -487,6 +487,10 @@ impl Cfg {
                 // Веха 136 — список блокировки: корень store или content-id. Сам список читается
                 // позже, когда известно, дали ли нам право на store.
                 b"block" if val.len() <= cfg.block.len() => {
+                    // Веха 219.1 — знак `@` в начале значит «это имя корня store». Нужен он не
+                    // нам, а `rebuild`: по нему он проверяет, что корень существует, и не собирает
+                    // конфиг, ссылающийся в никуда. Программе остаётся его снять.
+                    let val = val.strip_prefix(b"@".as_slice()).unwrap_or(val);
                     cfg.block[..val.len()].copy_from_slice(val);
                     cfg.block_len = val.len();
                     true
