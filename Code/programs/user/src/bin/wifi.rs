@@ -427,14 +427,6 @@ fn rssi_dbm(raw: u8, offset: i32, lna_gain: u8) -> i32 {
 // забыть вернуть буфер карте, вернуть дважды, сдвинуть индекс не тогда. Поэтому обход здесь один,
 // а разбор кадров — снаружи.
 
-/// Принятый кадр и то, что карта о нём сообщила.
-struct Frame {
-    /// Сам кадр 802.11, без заголовка приёма и без набивки.
-    body: alloc::vec::Vec<u8>,
-    /// Положение регулировки усиления из заголовка приёма — сырьё для [`rssi_dbm`].
-    rssi_raw: u8,
-}
-
 /// Кольцо приёма: где дескрипторы, где буферы и на каком месте мы стоим.
 struct Rx {
     desc_va: usize,
@@ -443,6 +435,17 @@ struct Rx {
     /// Сколько кадров карта не сумела расшифровать. Веха 220 — считаем, а не молчим: ноль здесь
     /// и растущее число — разные поломки, и по journal-строке их надо различать.
     порченых: u64,
+    /// Веха 220.3 — ОДИН БУФЕР НА ВСЕ КАДРЫ, а не вектор на каждый.
+    ///
+    /// Первая редакция копировала каждый принятый кадр в кучу. В эфире владельца двенадцать
+    /// сетей и сосед в тридцати сантиметрах; при обзоре карта отдаёт всё подряд, и программа
+    /// половину времени выделяла и освобождала память вместо работы — система при этом заметно
+    /// вязла, клавиши дублировались и терялись.
+    buf: [u8; rt2800::RX_BUF],
+    /// Сколько в нём лежит сейчас.
+    len: usize,
+    /// Положение регулировки усиления из заголовка приёма — сырьё для [`rssi_dbm`].
+    rssi_raw: u8,
 }
 
 impl Rx {
@@ -450,23 +453,24 @@ impl Rx {
     ///
     /// Кадр КОПИРУЕТСЯ в кучу, а не отдаётся ссылкой в DMA-буфер: буфер тут же возвращается карте,
     /// и ссылка на него прожила бы до первого же принятого кадра, после чего указывала бы в эфир.
-    fn next(&mut self) -> Option<Frame> {
+    fn next(&mut self) -> bool {
         let d = (self.desc_va + self.idx * rt2800::RXD_WORDS * 4) as *mut u32;
         let w1 = unsafe { core::ptr::read_volatile(d.add(1)) };
         if w1 & rt2800::RXD_DMA_DONE == 0 {
-            return None;
+            return false;
         }
         let w3 = unsafe { core::ptr::read_volatile(d.add(3)) };
         let len = ((w1 >> rt2800::RXD_SDL0_SHIFT) & rt2800::RXD_SDL0_MASK) as usize;
         let head = self.buf_va + self.idx * rt2800::RX_BUF;
-        let mut кадр = Frame { body: alloc::vec::Vec::new(), rssi_raw: 0 };
+        self.len = 0;
+        self.rssi_raw = 0;
         // Кадр, который карта не сумела расшифровать, — мусор: длины и адреса в нём случайные.
         // Отдать такой сети значит накормить стек выдумкой.
         if w3 & rt2800::RXD_CIPHER_ERROR != 0 {
             self.порченых += 1;
         } else if len > rt2800::RXWI_SIZE {
             // Уровень сигнала лежит в заголовке приёма, который карта кладёт ПЕРЕД кадром.
-            кадр.rssi_raw = unsafe { core::ptr::read_volatile((head + 8) as *const u32) } as u8;
+            self.rssi_raw = unsafe { core::ptr::read_volatile((head + 8) as *const u32) } as u8;
             // Веха 220.2 — длину берём ИЗ ЗАГОЛОВКА ПРИЁМА, а не из дескриптора: в дескрипторе
             // лежит длина положенного в память, то есть с контрольной суммой и выравниванием
             // (разбор — у `RXWI_LEN_SHIFT`). Дескриптор при этом остаётся потолком: карта не
@@ -477,18 +481,24 @@ impl Rx {
             // Ноль значит «карта длины не назвала» — тогда берём всё, что положено: лучше лишний
             // хвост, чем потерянный кадр.
             let n = if mpdu == 0 { влезло } else { mpdu.min(влезло) };
-            кадр.body.extend_from_slice(unsafe {
+            self.buf[..n].copy_from_slice(unsafe {
                 core::slice::from_raw_parts((head + rt2800::RXWI_SIZE) as *const u8, n)
             });
+            self.len = n;
             if w3 & rt2800::RXD_L2PAD != 0 {
-                wpa::strip_l2pad(&mut кадр.body);
+                self.len = wpa::strip_l2pad(&mut self.buf[..n]);
             }
         }
         // Буфер забрали — вернуть его карте: снять признак готовности и подвинуть свой индекс.
         unsafe { core::ptr::write_volatile(d.add(1), 0) };
         rt2800::wr32(rt2800::RX_CRX_IDX, self.idx as u32);
         self.idx = (self.idx + 1) % rt2800::RX_RING;
-        (!кадр.body.is_empty()).then_some(кадр)
+        self.len != 0
+    }
+
+    /// Кадр, лежащий в буфере сейчас.
+    fn frame(&self) -> &[u8] {
+        &self.buf[..self.len]
     }
 }
 
@@ -551,12 +561,12 @@ fn wait_mgmt(
 ) -> Option<alloc::vec::Vec<u8>> {
     let until = sys::monotonic_ns() + мс * 1_000_000;
     loop {
-        while let Some(f) = rx.next() {
-            if let Some((подтип, хвост)) = mgmt_reply(&f.body, mac) {
+        while rx.next() {
+            if let Some((подтип, хвост)) = mgmt_reply(rx.frame(), mac) {
                 if подтип == subtype {
                     return Some(alloc::vec::Vec::from(хвост));
                 }
-            } else if let Some(b) = wpa::eapol_of(&f.body, mac) {
+            } else if let Some(b) = wpa::eapol_of(rx.frame(), mac) {
                 отложенные.push(alloc::vec::Vec::from(b));
             }
         }
@@ -579,8 +589,8 @@ fn wait_eapol(
     }
     let until = sys::monotonic_ns() + мс * 1_000_000;
     loop {
-        while let Some(f) = rx.next() {
-            if let Some(b) = wpa::eapol_of(&f.body, mac) {
+        while rx.next() {
+            if let Some(b) = wpa::eapol_of(rx.frame(), mac) {
                 return Some(alloc::vec::Vec::from(b));
             }
         }
@@ -757,11 +767,18 @@ fn serve(
         let mut дело = false;
 
         // ── из эфира в стек ──
-        while let Some(f) = rx.next() {
+        let mut подряд = 0u32;
+        while rx.next() {
             дело = true;
+            // Та же уступка, что и в обзоре: поток кадров не должен запирать процессор.
+            подряд += 1;
+            if подряд >= 16 {
+                подряд = 0;
+                sys::sleep_ns(1_000_000);
+            }
             // Точка прощается — управляющим кадром, и это конец соединения, а не сбой связи.
             // Подтип 10 — «выходи из сети», 12 — «я тебя не знаю».
-            if let Some((подтип, хвост)) = mgmt_reply(&f.body, addr) {
+            if let Some((подтип, хвост)) = mgmt_reply(rx.frame(), addr) {
                 if подтип == 10 || подтип == 12 {
                     let причина =
                         if хвост.len() >= 2 { u16::from_le_bytes([хвост[0], хвост[1]]) } else { 0 };
@@ -775,11 +792,12 @@ fn serve(
                 continue;
             }
             // Разговор о ключах: точка меняет групповой ключ, не спрашивая станцию.
-            if let Some(тело) = wpa::eapol_of(&f.body, addr) {
-                rekey(tx, addr, bssid, &alloc::vec::Vec::from(тело), keys);
+            if let Some(тело) = wpa::eapol_of(rx.frame(), addr) {
+                let кадр = alloc::vec::Vec::from(тело);
+                rekey(tx, addr, bssid, &кадр, keys);
                 continue;
             }
-            match wpa::wifi_to_eth(&f.body) {
+            match wpa::wifi_to_eth(rx.frame()) {
                 Some(eth) => {
                     if sys::netdev_rx(netdev, &eth) {
                         из_эфира += 1;
@@ -1021,7 +1039,20 @@ fn disable_wpdma() {
 }
 
 #[no_mangle]
-pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
+pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
+    // Веха 220.3 — ПРАВА БЕРЁМ ПО ИМЕНИ, а не по месту в строке сервиса.
+    //
+    // Позиция — плохой договор, и это уже стоило системы однажды (Веха 99.1: в конфиге поменяли
+    // порядок токенов, и `vvsh` принял фреймбуфер за файловый сервер). Здесь повторилось в
+    // точности: владелец дописал в строку `netdev`, тот встал вторым — и `dma_alloc` пошёл с
+    // правом «быть картой» вместо права на DMA. Наружу это вышло как «DMA-памяти не дали», то
+    // есть жалобой на память при полном её наличии.
+    //
+    // Имя право получает от ядра само (`CAP_WIFI`, `CAP_DMA` в окружении, Веха 99.1), и токен
+    // `env` для этого не нужен. Позиция остаётся запасным путём: так программа работает и
+    // запущенная руками, и в старом конфиге.
+    let mmio_cap = sys::cap_named("WIFI").unwrap_or(a0);
+    let dma_cap = sys::cap_named("DMA").unwrap_or(a1);
     if !sys::mmio_map(mmio_cap, MMIO_VA) {
         // Веха 206.1 — РАЗЛИЧАЕМ ДВА СЛУЧАЯ. Программа это СЕРВИС: окно регистров ей выдаёт
         // ядро по строке `service wifi mmio:wifi dma`, первым аргументом. Запущенная руками из
@@ -1295,6 +1326,7 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     rt2800::init_mac();
     if !rt2800::set_channel(ch, freq_offset, lna_gain) {
         sys::write(alloc::format!("[wifi] канала {} в таблице нет\n", ch).as_bytes());
+        rt2800::stop();
         sys::exit(1);
     }
     rt2800::rx_enable();
@@ -1345,7 +1377,17 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // до двух килобайт, потому что кадр с данными длиннее управляющего втрое.
     const PAGES: usize = 10;
     let Some(dma_pa) = sys::dma_alloc_pages(dma_cap, DESC_VA, PAGES) else {
-        w("[wifi] DMA-памяти не дали — кольцо приёма не завести\n");
+        // Веха 220.3 — ОСТАНОВИТЬ КАРТУ И ЗДЕСЬ. Приёмник уже включён; уйти, оставив его
+        // работать, — та самая ошибка, что стоила системе целостности памяти (см. `stop`).
+        rt2800::stop();
+        sys::write(
+            alloc::format!(
+                "[wifi] DMA-памяти не дали ({} страниц) — кольцо приёма не завести. Обычно это \
+значит, что право `dma` в строке сервиса не выдано\n",
+                PAGES
+            )
+            .as_bytes(),
+        );
         sys::exit(1);
     };
     let buf_va = DESC_VA + 4096;
@@ -1380,20 +1422,38 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     };
     let mut nets: alloc::vec::Vec<Net> = alloc::vec::Vec::new();
     let mut beacons = 0usize;
-    let mut rx = Rx { desc_va: DESC_VA, buf_va, idx: 0, порченых: 0 };
+    let mut rx = Rx {
+        desc_va: DESC_VA,
+        buf_va,
+        idx: 0,
+        порченых: 0,
+        buf: [0; rt2800::RX_BUF],
+        len: 0,
+        rssi_raw: 0,
+    };
     for ch in 1u8..=13 {
         if !rt2800::set_channel(ch, freq_offset, lna_gain) {
             continue;
         }
         let until = sys::monotonic_ns() + DWELL_NS;
+        let mut подряд = 0u32;
         while sys::monotonic_ns() < until {
-            let Some(f) = rx.next() else {
+            if !rx.next() {
                 sys::sleep_ns(2_000_000);
                 continue;
-            };
-            if let Some(b) = parse_beacon(&f.body) {
+            }
+            // Веха 220.3 — УСТУПИТЬ ПРОЦЕССОР, даже когда кадры идут сплошным потоком. Прежде
+            // цикл спал, только НЕ НАЙДЯ кадра, а в людном эфире кадр находится всегда — и
+            // четверть секунды на канал программа не отпускала процессор вовсе. Снаружи это
+            // выглядело как вязнущая система: нажатия клавиш дублировались и терялись.
+            подряд += 1;
+            if подряд >= 16 {
+                подряд = 0;
+                sys::sleep_ns(1_000_000);
+            }
+            if let Some(b) = parse_beacon(rx.frame()) {
                 beacons += 1;
-                let rssi = rssi_dbm(f.rssi_raw, rssi_offset, lna_gain);
+                let rssi = rssi_dbm(rx.rssi_raw, rssi_offset, lna_gain);
                 match nets.iter_mut().find(|n| n.bssid == b.bssid) {
                     // Уже знакомая точка: берём ЛУЧШИЙ уровень, а не последний. Маяки ловятся
                     // неровно, и одно слабое попадание не повод занизить всю сеть.
