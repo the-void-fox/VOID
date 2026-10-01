@@ -688,6 +688,92 @@ const ARCH: &str = "x86_64";
 #[cfg(target_arch = "riscv64")]
 const ARCH: &str = "riscv64";
 
+/// `(doc [раздел])` — РУКОВОДСТВО СИСТЕМЫ. Без имени — список разделов.
+///
+/// ## Почему руководство живёт в системе
+///
+/// Система описывает саму себя текстом, но узнать, ЧТО в этом тексте можно написать, до сих пор
+/// было неоткуда: ключи конфига документируются комментарием в шаблоне, а установленная машина
+/// шаблон больше не видит. Человек мог дописать строку — но только зная, что такая строка
+/// существует. Отправлять его за этим наружу нельзя: описание системы нужнее всего тогда, когда
+/// сети как раз и нет.
+///
+/// ## Почему один раздел считается, а не лежит
+///
+/// `doc entries` печатает виды записей конфига ИЗ СЛОВАРЯ ЯДРА (`void_conf::KINDS`) — того же,
+/// по которому `rebuild` проверяет конфиг, а ядро его читает. Написанный руками, этот список
+/// разошёлся бы с кодом на первой же вехе, и разошёлся бы молча. Здесь расходиться не на чем.
+fn sh_doc(args: &[Value]) -> Result<Value, EvalError> {
+    let scap = cap_store();
+    let Some(раздел) = args.first() else {
+        // Без имени — что вообще есть. Список берётся из store, а не из таблицы здесь: разделы
+        // приезжают с образом, и знать их наперёд шеллу неоткуда.
+        let mut out = String::from("разделы руководства (`doc ИМЯ`):
+");
+        match roots::text(scap) {
+            Some(list) => {
+                for имя in roots::suffixes(&list, b"doc/") {
+                    out.push_str("  ");
+                    out.push_str(core::str::from_utf8(имя).unwrap_or("?"));
+                    out.push('\n');
+                }
+            }
+            None => out.push_str("  (список корней store не читается)
+"),
+        }
+        out.push_str("  entries   все виды записей конфига (считается из словаря системы)
+");
+        return Ok(Value::str(&out));
+    };
+    let Value::Str(имя) = раздел else {
+        return Err(EvalError::new("doc: (doc \"имя раздела\")"));
+    };
+    if &**имя == "entries" {
+        return Ok(Value::str(&config_entries()));
+    }
+    let корень = alloc::format!("doc/{}", имя);
+    let mut id = [0u8; 32];
+    if sys::obj_get_root(scap, корень.as_bytes(), &mut id) != 32 {
+        return Err(EvalError::new(alloc::format!(
+            "doc: нет раздела «{}» — список покажет `doc` без имени",
+            имя
+        )));
+    }
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let (got, full) = sys::obj_get_ex(scap, &id, &mut buf);
+    if got == 0 || got != full {
+        return Err(EvalError::new("doc: раздел не читается целиком"));
+    }
+    buf.truncate(got);
+    match String::from_utf8(buf) {
+        Ok(t) => Ok(Value::str(&t)),
+        Err(_) => Err(EvalError::new("doc: раздел не текст")),
+    }
+}
+
+/// Веха 223 — виды записей конфига ИЗ СЛОВАРЯ. Не список здесь, а то, по чему система работает.
+fn config_entries() -> String {
+    let mut out = String::from(
+        "виды записей конфига. «ядро» — читает ли запись само ядро на загрузке;
+         прочие адресованы программам (композитору, терминалу, панели, `pkg`).
+
+",
+    );
+    for k in void_conf::KINDS {
+        out.push_str(&alloc::format!(
+            "  {:<10} {:<34} {}
+",
+            k.name,
+            k.form,
+            if k.kernel { "ядро" } else { "" }
+        ));
+    }
+    out.push_str("
+права в строках `service`/`shell` — `doc caps`
+");
+    out
+}
+
 /// Веха 220.1 — ПРОВЕРИТЬ КОНФИГ СТРОГО. `false` — собирать нельзя, претензии напечатаны.
 ///
 /// Владелец сформулировал правило прямо: «лучше давать по рукам программисту за любое
@@ -1415,6 +1501,7 @@ fn shell_env() -> Env {
         ("rebuild", sh_rebuild),
         ("gens", sh_gens),
         ("init-config", sh_init_config),
+        ("doc", sh_doc), // Веха 223 — руководство системы
         ("root", sh_root),
         ("root-del", sh_root_del),
         ("secret", sh_secret),
@@ -1707,6 +1794,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row("root ИМЯ [ЗНАЧЕНИЕ]".as_bytes(), "показать или задать корень store");
     help_row("root-del ИМЯ".as_bytes(), "снять корень");
     help_row("secret ИМЯ".as_bytes(), "задать корень, не показывая значения (пароли)");
+    help_row("doc [раздел]".as_bytes(), "руководство системы (без имени — список разделов)");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
     help_row(b"gens", "показать поколения системы (активно — *)");
     help_row(b"switch GEN", "выбрать поколение (после ребута)");
