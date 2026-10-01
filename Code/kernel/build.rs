@@ -29,6 +29,8 @@ const PROGRAMS: &[&str] = &[
 const PROGRAMS_X86: &[&str] = &[
     "term", "wm", "winbox", "img", "wall", "bar", "launcher", "roots", "taskmgr", "fm", "fps",
     "welcome",
+    // Веха 223.2 — руководство системы окном (devdocs-раскладка: перечень слева, текст справа).
+    "docs",
     // Веха 202 — драйвер звука (Intel HDA). Только x86: на riscv в QEMU звуковой шины нет вовсе.
     "hda",
     // Веха 206 — разведка беспроводной карты (ADR 0021, шаг 1).
@@ -244,7 +246,7 @@ fn build_user_programs(kernel_dir: &PathBuf, target: &str, x86: bool) {
     println!("cargo:rerun-if-changed={}", workspace_dir.join("assets").display());
     // Крейты-зависимости вне workspace ядра: их правку внешний cargo тоже не видит, потому что
     // собирает их ВЛОЖЕННЫЙ вызов, о котором он не знает.
-    for lib in ["void-vec", "void-img", "vvsh-core", "void-tree", "void-wpa"] {
+    for lib in ["void-vec", "void-img", "vvsh-core", "void-tree", "void-wpa", "void-md"] {
         println!("cargo:rerun-if-changed={}", workspace_dir.join("libs").join(lib).join("src").display());
     }
 

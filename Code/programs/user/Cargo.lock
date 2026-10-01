@@ -1093,6 +1093,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "void-md"
+version = "0.0.1"
+
+[[package]]
 name = "void-nar"
 version = "0.1.0"
 
@@ -1128,6 +1132,7 @@ dependencies = [
  "void-drv",
  "void-fs",
  "void-img",
+ "void-md",
  "void-nar",
  "void-nix",
  "void-tree",
