@@ -32,27 +32,38 @@ fn reference(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     (info.width as u32, info.height as u32, px)
 }
 
-/// Файлы корпуса: первый baseline (снимок с телефона) и первый прогрессивный.
+/// Файлы корпуса: baseline и прогрессивный.
+///
+/// Веха 223.11 — корпус теперь ЛЕЖИТ В РЕПОЗИТОРИИ (`tests/corpus/`), и это исправление
+/// молчащего теста. Раньше файлы искались в `IMG/` — каталоге со снимками владельца, из которого
+/// в репозиторий не попал ни один JPEG. На чужой машине и на CI `corpus()` возвращал пусто, тест
+/// печатал «нет корпуса, пропускаю» и рапортовал `ok`. Пять дней он так и значился зелёным,
+/// не проверив ни байта: ровно то, о чём предупреждает ci.yml — «молчащий тест хуже
+/// отсутствующего, он создаёт уверенность».
+///
+/// Образцы маленькие (полтора килобайта) и сделаны из `IMG/shots/desktop.png` двумя проходами
+/// ImageMagick — `-interlace none` и `-interlace JPEG`. Снимок владельца на мегабайт в
+/// репозитории не нужен: тесту важны РЕЖИМЫ кодирования, а не мегапиксели.
+///
+/// Снимки из `IMG/` добавляются СВЕРХУ, когда они есть: у владельца там живые фотографии с
+/// телефона, и если декодер споткнётся о такую, узнать об этом надо. Обязателен же только
+/// репозиторный корпус — иначе проверка опять зависела бы от машины.
 fn corpus() -> Vec<std::path::PathBuf> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../IMG");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<_> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "jpg" || e == "jpeg"))
-        .collect();
-    files.sort();
-    let progressive = |p: &std::path::PathBuf| {
-        let b = std::fs::read(p).unwrap_or_default();
-        b.windows(2).any(|w| w == [0xff, 0xc2])
-    };
-    let mut out = Vec::new();
-    if let Some(p) = files.iter().find(|p| !progressive(p)) {
-        out.push(p.clone());
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = vec![
+        here.join("tests/corpus/baseline.jpg"),
+        here.join("tests/corpus/progressive.jpg"),
+    ];
+    for p in &out {
+        assert!(p.is_file(), "нет образца корпуса {}", p.display());
     }
-    if let Some(p) = files.iter().find(|p| progressive(p)) {
-        out.push(p.clone());
+    if let Ok(entries) = std::fs::read_dir(here.join("../../../IMG")) {
+        let mut extra: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg" || e == "jpeg"))
+            .collect();
+        extra.sort();
+        out.extend(extra);
     }
     out
 }
@@ -60,10 +71,6 @@ fn corpus() -> Vec<std::path::PathBuf> {
 #[test]
 fn matches_independent_decoder() {
     let files = corpus();
-    if files.is_empty() {
-        eprintln!("нет корпуса IMG/, пропускаю");
-        return;
-    }
     for path in &files {
         let bytes = std::fs::read(path).unwrap();
         let (rw, rh, want) = reference(&bytes);
