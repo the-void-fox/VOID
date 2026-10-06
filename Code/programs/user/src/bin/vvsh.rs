@@ -605,6 +605,17 @@ fn run_rebuild() {
         return;
     }
 
+    // Веха 223.8 — ОТЛОЖЕННОЕ ДИСПЕТЧЕРОМ УХОДИТ В ОТСТАВКУ.
+    //
+    // Диспетчер задач умеет отдать право на ходу и кладёт рядом готовую строку декларации
+    // (`/etc/granted/`). Пересборка — это и есть ответ на вопрос «что кому можно»: человек либо
+    // перенёс нужное в конфиг, либо решил не переносить. В обоих случаях записка больше не в
+    // силе, и держать её рядом с новым поколением значило бы врать о правах системы.
+    //
+    // Убираем в `granted.old`, а НЕ стираем: выброшенная записка хуже устаревшей — человек мог
+    // не успеть перечитать. Прежняя `granted.old` при этом уходит: две истории никому не нужны.
+    retire_granted(ep);
+
     // Содержимое поколения — нормализованный текст (контент-адресуемо).
     let mut new_id = [0u8; 32];
     sys::obj_put(scap, norm.as_bytes(), &mut new_id);
@@ -3061,6 +3072,28 @@ fn sh_sysdef(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 /// `(rebuild)` — собрать поколение из `/etc/system/default.vv` (та же логика, что у подкоманды).
+/// Веха 223.8 — отправить `/etc/granted` в отставку: переименовать в `granted.old`.
+///
+/// Зовётся из [`run_rebuild`] ПЕРЕД коммитом поколения. Ничего не стирает безвозвратно и ничего
+/// не требует: нет папки — нечего и делать.
+fn retire_granted(ep: usize) {
+    const NEW: &[u8] = b"/etc/granted";
+    const OLD: &[u8] = b"/etc/granted.old";
+    if sys::posix::stat(ep, NEW).is_none() {
+        return;
+    }
+    // Прежняя отставка уступает место новой: две истории подряд никому не нужны.
+    if sys::posix::stat(ep, OLD).is_some() {
+        sys::posix::unlink_all(ep, OLD);
+    }
+    if sys::posix::rename(ep, NEW, OLD) == 0 {
+        sys::write(
+            sys::i18n::t("vvsh: выданное на ходу больше не в силе — записки в /etc/granted.old\n")
+                .as_bytes(),
+        );
+    }
+}
+
 fn sh_rebuild(_args: &[Value]) -> Result<Value, EvalError> {
     run_rebuild();
     Ok(Value::nil())
@@ -3268,7 +3301,26 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
     let mut inb = [0u8; 16];
     sys::write(prompt);
     loop {
-        let n = sys::read_stdin(&mut inb);
+        // Веха 223.7 — спрашиваем ВИД ответа, а не только байты: прерывание и смена размера
+        // приходят теперь этим путём, а не байтом 0x03 (его шлёт лишь текстовая консоль ядра,
+        // у которой хоста stdio нет вовсе — её ветка ниже цела).
+        let n = match sys::stdio::read_ex(&mut inb) {
+            sys::stdio::In::Bytes(k) => k,
+            sys::stdio::In::Eof => return if llen == 0 { None } else { Some(llen) },
+            // Прервали — отменить набранное. Ровно то, что делал `Ctrl-C` байтом; разница в
+            // том, что теперь это доходит и до программы, которая ввод не читает.
+            sys::stdio::In::Interrupted => {
+                sys::write(b"^C\r\n");
+                return Some(0);
+            }
+            // Окно стало другим — перерисовать строку в новых границах и ждать дальше.
+            sys::stdio::In::Resized => {
+                redraw(prompt, line, llen, pos);
+                continue;
+            }
+            // Хоста stdio нет: мы в текстовой консоли, читаем ядром по-старому.
+            sys::stdio::In::NoHost => sys::read_stdin(&mut inb),
+        };
         if n == 0 {
             return if llen == 0 { None } else { Some(llen) };
         }

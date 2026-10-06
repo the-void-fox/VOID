@@ -66,7 +66,6 @@ use void_user::win::{self, Event, Window};
 
 // Тулкит — библиотека, и панель пользуется не всем, что в нём есть: следующий потребитель
 // (лаунчер, Веха 146) возьмёт остальное. Поэтому неиспользованное здесь не ошибка.
-#[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
 use ui::{Align, Font, Motion, Rect, Theme, Ui};
@@ -196,45 +195,31 @@ impl ui::Client for Bar {
                 // Кадр рисуется по состоянию, посчитанному ДО него, поэтому смещение, менявшееся
                 // внутри кадра, доезжало до списка на кадр-два позже бегунка: бегунок ехал за
                 // рукой, список — рывками следом.
-                let t = self.notes_track;
-                if self.showing == Menu::Notes && !t.is_empty() && ui::scroll::on_track(t, p) {
-                    let (ky, kh) = ui::Scroll::knob(
-                        t.h, self.notes_view, self.notes_content, self.notes_scroll.px, t.w * 2,
-                    );
-                    let local = p.1 - t.y;
-                    // Ткнули МИМО бегунка — прыжок туда, куда показали; попали — просто ставим
-                    // якорь и дальше ведём относительно.
-                    if local < ky || local >= ky + kh {
-                        let px = ui::Scroll::jump(
-                            t.h, self.notes_view, self.notes_content, local, t.w * 2,
-                        );
-                        self.notes_scroll.set(px, self.notes_content, self.notes_view);
+                // Щелчок мимо бегунка — прыжок, попадание — якорь: решает это общий виджет.
+                if self.showing == Menu::Notes {
+                    let (view, content) = (self.notes_view, self.notes_content);
+                    if let Some(px) = self.notes_grab.press(p, self.notes_scroll.px, view, content)
+                    {
+                        self.notes_scroll.set(px, content, view);
+                        return ui::Scope::Part(self.menu_card);
                     }
-                    self.notes_drag = Some((p, self.notes_scroll.px));
-                    return ui::Scope::Part(self.menu_card);
                 }
-                self.notes_drag = None;
+                self.notes_grab.release();
                 ui::Scope::All
             }
             // Кнопку отпустили — протяжка кончилась, якорь снимаем.
             Event::Button { down: false, .. } => {
-                self.notes_drag = None;
+                self.notes_grab.release();
                 ui::Scope::No
             }
             Event::Motion { x, y } => {
                 // Ведём полосу прокрутки: смещение считается СРАЗУ, до кадра, и потому список
                 // едет вместе с бегунком, а не догоняет его.
-                if let Some((start, off0)) = self.notes_drag {
-                    let t = self.notes_track;
-                    if !t.is_empty() {
-                        let px = ui::Scroll::drag(
-                            t.h, self.notes_view, self.notes_content, off0,
-                            y as i32 - start.1, t.w * 2,
-                        );
-                        let moved = self.notes_scroll.set(px, self.notes_content, self.notes_view);
-                        self.ptr = input.ptr;
-                        return if moved { ui::Scope::Part(self.menu_card) } else { ui::Scope::No };
-                    }
+                let (view, content) = (self.notes_view, self.notes_content);
+                if let Some(px) = self.notes_grab.motion((x as i32, y as i32), view, content) {
+                    let moved = self.notes_scroll.set(px, content, view);
+                    self.ptr = input.ptr;
+                    return if moved { ui::Scope::Part(self.menu_card) } else { ui::Scope::No };
                 }
                 let _ = (x, y);
                 // Веха 204.2 — ВЕДЁМ ПОЛЗУНОК ГРОМКОСТИ. Схваченный ползунок принадлежит руке,
@@ -462,15 +447,16 @@ struct Bar {
     notes_scroll: ui::Scroll,
     /// Сколько событий колеса видели — для строки в журнале (см. обработчик `Event::Wheel`).
     wheels: u32,
-    /// Веха 202.14 — ЯКОРЬ протяжки полосы прокрутки: где схватили и каким было смещение.
+    /// Веха 223.4 — ПОЛОСА прокрутки уведомлений и её захват, общим виджетом ([`ui::Grab`]).
     ///
-    /// Без него полоса ставила центр бегунка под палец — на длинном списке бегунок большой, и
-    /// пока рука не прошла его половину, список стоял, а потом прыгал. С якорем он едет ровно
-    /// за рукой.
-    notes_drag: Option<((i32, i32), i32)>,
-    /// Прямоугольник ПОЛОСЫ прокрутки с последней отрисовки: по нему обработчик события
-    /// решает, схватили её или нет, и считает новое смещение (Веха 202.17).
-    notes_track: Rect,
+    /// Прежде здесь лежали якорь протяжки и прямоугольник полосы по отдельности, а щелчок мимо
+    /// бегунка, прыжок и протяжку панель считала сама — четвёртой копией того же счёта (он же у
+    /// вьювера корней, диспетчера задач и окна руководства). Вынесено в тулкит целиком.
+    ///
+    /// `Pane` панели не годится: у неё ряды РАЗНОЙ высоты — уходящая карточка складывается, и
+    /// высота содержимого меняется посреди движения. Поэтому смещение по-прежнему своё
+    /// ([`Bar::notes_scroll`]), а общий здесь только захват.
+    notes_grab: ui::Grab,
     /// Веха 204 — КАНАЛ К ЗВУКУ. `NO_CAP` — звука в системе нет (нет строки `service hda` в
     /// поколении либо карты в машине): острова тогда не будет вовсе, как и острова метрик без
     /// права обзора. Пустой ползунок, который ничем не управляет, хуже отсутствия ползунка.
@@ -736,8 +722,7 @@ impl Bar {
             notes_buf: Vec::new(),
             notes_scroll: ui::Scroll::default(),
             wheels: 0,
-            notes_drag: None,
-            notes_track: Rect::ZERO,
+            notes_grab: ui::Grab::default(),
             snd: sys::snd_cli::find_cap().unwrap_or(sys::NO_CAP),
             mix: None,
             mix_tab: 0,
@@ -1959,12 +1944,12 @@ impl Bar {
         if content > view {
             let track = d.cut_right(th.px(4) + m).inset_xy(0, 0);
             let bar = Rect::new(track.x + m, track.y, th.px(4), track.h);
-            self.notes_track = bar;
+            self.notes_grab.measure(bar);
             // Рисуем — и только. Смещение к этому моменту уже посчитано обработчиком события
             // (Веха 202.17); считать его здесь значит отдать списку прошлое состояние.
             u.scrollbar(bar, self.notes_scroll.px as usize, view as usize, content as usize, None);
         } else {
-            self.notes_track = Rect::ZERO;
+            self.notes_grab.measure(Rect::ZERO);
         }
 
         // Тело списка режется ОКНОМ: карточка, попавшая в него наполовину, наполовину и

@@ -51,7 +51,6 @@ use alloc::vec::Vec;
 use void_user as sys;
 use void_user::win::{self, sym, Event, Window};
 
-#[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
 #[allow(dead_code)]
@@ -132,8 +131,6 @@ struct App {
     /// Запоминаем ТОЧКУ НАЖАТИЯ, потому что перетаскиванию нужен ПОРОГ: без него любой щелчок по
     /// строке был бы перетаскиванием, и ярлык вспыхивал бы под курсором на каждый выбор.
     press: Option<(i32, i32, usize)>,
-    /// Веха 202.14 — якорь протяжки полосы прокрутки: где схватили и каким был верх списка.
-    drag: Option<((i32, i32), usize)>,
     /// Тащим прямо сейчас — второй раз в том же нажатии не начинаем.
     dragging: bool,
 }
@@ -161,7 +158,9 @@ impl App {
         let col = body.cut_left(list_w);
         body.cut_left(th.gap);
         let mut list = col;
-        let bar = list.cut_right(th.px(6));
+        // Веха 223.4 — полоса СРАЗУ такая, какой рисуется: по ней же считается попадание. Прежде
+        // рисовали с полями, а попадание спрашивали без них.
+        let bar = list.cut_right(th.px(6)).inset_xy(th.px(1), th.px(2));
         let rows = (list.h / row_h).max(1) as usize;
         Lay { head, foot, col, list, bar, body, row_h, rows }
     }
@@ -217,18 +216,9 @@ impl App {
 
         u.field(lay.head, &self.ls.query, ui::t("поиск по имени корня"), true);
 
-        // Веха 202.14 — с ЯКОРЕМ: схваченный бегунок едет за рукой, а не ждёт, пока палец
-        // пройдёт его половину (`Ui::scrollbar_from`).
-        if let Some(t) = u.scrollbar_from(
-            lay.bar.inset_xy(th.px(1), th.px(2)),
-            self.ls.top,
-            lay.rows,
-            self.ls.hits.len(),
-            u.held(),
-            self.drag,
-        ) {
-            self.ls.top = t;
-        }
+        // Веха 223.4 — полоса только РИСУЕТСЯ: начало списка посчитано событием, а не кадром.
+        // Пока оно считалось здесь, список доезжал до бегунка на кадр-два позже руки.
+        self.ls.bar(u);
 
         let was = self.ls.sel;
         let mut list = lay.list;
@@ -453,6 +443,14 @@ impl ui::Client for App {
                 // Движение с зажатой кнопкой — это либо протяжка полосы, либо начало
                 // перетаскивания корня. Разбирает их место нажатия: по строке списка — тащим,
                 // по полосе прокрутки — крутим ([`App::press`] заводится только над строкой).
+                //
+                // Веха 223.4 — полосу ведём СРАЗУ, до кадра: иначе список догоняет бегунок.
+                if self.ls.bar_dragging() {
+                    return match input.ptr {
+                        Some(p) if self.ls.bar_motion(p) => ui::Scope::Part(self.lay.col),
+                        _ => ui::Scope::No,
+                    };
+                }
                 self.start_drag(input.ptr);
                 if input.held.is_some() {
                     return ui::Scope::Part(self.lay.col);
@@ -476,15 +474,14 @@ impl ui::Client for App {
                     // Веха 204.2 — якорь ТОЛЬКО при нажатии в полосе прокрутки. Схваченная
                     // полоса теперь ведётся, пока держат кнопку, где бы ни был курсор, — и
                     // якорь, поставленный на любое нажатие в окне, означал бы, что список
-                    // едет от протяжки по самому списку.
-                    self.drag = ui::scroll::on_track(self.lay.bar, p.unwrap_or((0, 0)))
-                        .then(|| ((x as i32, y as i32), self.ls.top));
+                    // едет от протяжки по самому списку. Решает это сам список (Веха 223.4).
+                    self.ls.bar_press((x as i32, y as i32));
                     // Сбрасываем и здесь: отпускание кнопки к нам не приходит, если курсор к
                     // тому времени ушёл в чужое окно, — а именно так перетаскивание и кончается.
                     self.dragging = false;
                 } else if !down {
                     self.press = None;
-                    self.drag = None;
+                    self.ls.bar_release();
                     self.dragging = false;
                 }
                 ui::Scope::All
@@ -518,7 +515,7 @@ impl ui::Client for App {
     fn draw(&mut self, u: &mut Ui) -> ui::Scope {
         let th = u.th.clone();
         self.lay = self.measure(u.font, &th);
-        self.ls.measure(self.lay.list, self.lay.row_h, self.lay.rows);
+        self.ls.measure(self.lay.list, self.lay.bar, self.lay.row_h, self.lay.rows);
         self.sync_detail();
         let lay = core::mem::take(&mut self.lay);
         let picked = self.paint(u, &th, &lay);
@@ -568,7 +565,6 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         store,
         copied: None,
         press: None,
-        drag: None,
         dragging: false,
     };
     app.filter();

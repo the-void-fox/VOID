@@ -83,7 +83,6 @@ use bitfont::BitmapFont;
 // Веха 144 — поиск файла шрифта в пакетах профиля переехал в тулкит: за тем же самым пришла
 // панель, и вторая копия неминуемо разошлась бы с этой («терминал шрифт нашёл, панель нет»).
 // Терминалу из тулкита нужен только этот модуль; остальное отсечёт LTO.
-#[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
 
@@ -776,6 +775,16 @@ struct Pane {
     /// На сколько строк вьюпорт поднят в историю (0 — «внизу», как обычно). Веха 116:
     /// у грида scrollback был с самого начала, но смотреть в него было нечем.
     scroll: usize,
+    /// Веха 223.7 — человек нажал Ctrl+C: ответить этим на ближайшее чтение.
+    intr: bool,
+    /// Веха 223.7 — размер панели сменился: сказать об этом ближайшему чтению.
+    ///
+    /// Это замена `SIGWINCH`, и она дешевле его: программа и так ходит к нам за вводом, а
+    /// спрашивать размер (`OP_WINSIZE`) умела всегда — ей не хватало лишь повода.
+    resized: bool,
+    /// Веха 223.7 — сколько раз подряд просили прервать, а программа всё живёт. Второй раз
+    /// кладёт насмерть: человек попросил дважды, и отказывать ему больше не за что.
+    intr_count: u8,
 }
 
 #[no_mangle]
@@ -1027,7 +1036,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     sys::win::Event::Wheel { delta, .. } => {
                         if let Some(p) = panes.get_mut(focus) {
                             let max = p.grid.scrollback_len();
-                            let step = 3usize;
+                            // Веха 223.4 — ступенька ОБЩАЯ с остальной системой: здесь стояла
+                            // своя тройка, и «три строки» держались только на памяти человека.
+                            let step = ui::Scroll::STEP_ROWS as usize;
                             p.scroll = if delta > 0 {
                                 (p.scroll + step).min(max)
                             } else {
@@ -1371,11 +1382,29 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         }
 
         // ── 3. отдать накопленный ввод тем, кто его ждёт ───────────────────────────────────
+        // Веха 223.7 — ВИД ОТВЕТА вперёд байтов: человек нажал Ctrl+C не затем, чтобы его
+        // услышали после следующей строки. Байты при этом НЕ теряются — они ждут в ящике.
         for p in panes.iter_mut() {
-            if p.pending_read.is_some() && !p.inbox.is_empty() {
+            if p.pending_read.is_none() {
+                continue;
+            }
+            if p.intr {
+                p.intr = false;
+                sys::reply(p.pending_read.take().unwrap(), &[stdio::IN_INTERRUPTED]);
+                worked = true;
+            } else if p.resized {
+                p.resized = false;
+                sys::reply(p.pending_read.take().unwrap(), &[stdio::IN_RESIZED]);
+                worked = true;
+            } else if !p.inbox.is_empty() {
                 let take = p.inbox.len().min(p.pending_want.max(1));
-                sys::reply(p.pending_read.take().unwrap(), &p.inbox[..take]);
+                let mut rep = Vec::with_capacity(take + 1);
+                rep.push(stdio::IN_BYTES);
+                rep.extend_from_slice(&p.inbox[..take]);
+                sys::reply(p.pending_read.take().unwrap(), &rep);
                 p.inbox.drain(..take);
+                // Шелл снова читает строку — значит прошлое прерывание отработало.
+                p.intr_count = 0;
                 worked = true;
             }
         }
@@ -1626,7 +1655,9 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
             } else {
                 stdio::CHUNK
             };
-            panes[i].pending_want = want.clamp(1, stdio::CHUNK);
+            // Веха 223.7 — на единицу меньше: ответ теперь начинается с ВИДА (один байт), и
+            // целый `CHUNK` байтов сверх него перерос бы согласованный размер посылки.
+            panes[i].pending_want = want.clamp(1, stdio::CHUNK - 1);
             false
         }
         // Чужой или непонятный запрос — ответить пусто, а не молчать: молчание повесило бы
@@ -1669,6 +1700,9 @@ fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize, con
         child,
         pending_read: None,
         pending_want: 0,
+        intr: false,
+        resized: false,
+        intr_count: 0,
         inbox: Vec::new(),
         scroll: 0,
     };
@@ -1762,6 +1796,9 @@ fn resize_all(panes: &mut [Pane], rects: &[PaneRect]) {
             // `Grid::resize` переносит содержимое; раньше здесь создавался НОВЫЙ грид, и при
             // каждом разбиении соседние панели чернели — самая заметная ошибка первой версии.
             p.grid.resize(w, h);
+            // Веха 223.7 — сказать программе. До этого она узнавала размер ОДИН раз, на старте,
+            // и растянутое окно заставало её врасплох: `ved` рисовал в старых границах.
+            p.resized = true;
         }
     }
 }
@@ -1900,6 +1937,25 @@ fn push_input(panes: &mut [Pane], focus: usize, byte: u8) {
         // Набрал что-то — вернулись вниз. Так ведут себя все терминалы, и по делу: человек,
         // который начал печатать, хочет видеть, что печатает, а не то место, куда листал.
         p.scroll = 0;
+        // Веха 223.7 — Ctrl+C (0x03) это НЕ байт для программы, а ПРОСЬБА ПРЕРВАТЬСЯ.
+        //
+        // Раньше он уезжал в ящик обычным байтом, и всё, чего добивался человек, — отмена
+        // набранной строки в шелле: программа, которая не читает ввод (сборка, долгий счёт),
+        // его не видела вовсе. Теперь он идёт ДВУМЯ путями сразу, и это не дублирование, а два
+        // разных адресата: ждущий ввода узнает из ответа на чтение ([`stdio::IN_INTERRUPTED`]),
+        // считающий в цикле — из флажка ядра (`SYS_INTERRUPTED`).
+        //
+        // Второе нажатие подряд кладёт насмерть. Довод простой: человек попросил дважды, а
+        // программа, не спросившая флажок ни разу, не спросит его и на третий.
+        if byte == 0x03 {
+            p.intr = true;
+            p.intr_count = p.intr_count.saturating_add(1);
+            if let Some(child) = p.child {
+                let hard = p.intr_count >= 2;
+                let _ = sys::interrupt(child, hard);
+            }
+            return;
+        }
         p.inbox.push(byte);
     }
 }

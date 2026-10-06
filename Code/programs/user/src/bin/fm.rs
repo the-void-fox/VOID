@@ -35,7 +35,6 @@ use void_user as sys;
 use void_user::posix as px;
 use void_user::win::{self as win, sym, Event, Window};
 
-#[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
 use ui::{Align, Font, Rect, Rgba, Theme, Ui};
@@ -1953,7 +1952,13 @@ impl ui::Client for App {
                 ui::Scope::All
             }
             Event::Wheel { delta, .. } => {
-                let step = if self.grid { (self.lay.cols as usize).max(1) } else { 1 };
+                // Веха 223.4 — ступенька ОБЩАЯ ([`ui::Scroll::STEP_ROWS`]). Здесь стояла единица,
+                // и файловый менеджер листался втрое медленнее всего остального в системе: ровно
+                // та жалоба («крайне медленно»), из-за которой константа и появилась.
+                //
+                // В сетке ступенька — ряд значков, то есть `STEP_ROWS` рядов по `cols` штук.
+                let rows = ui::Scroll::STEP_ROWS as usize;
+                let step = if self.grid { (self.lay.cols as usize).max(1) * rows } else { rows };
                 if delta < 0 {
                     self.top = (self.top + step).min(self.max_top());
                 } else {

@@ -52,7 +52,6 @@ use void_user::win::{self, sym, Event, Window};
 
 // Тулкит и разбор корней store — общие модули по пути (см. `ui/mod.rs`, почему не крейт).
 // Строка запуска берёт из тулкита далеко не всё: неиспользованное здесь не ошибка.
-#[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
 #[allow(dead_code)]
@@ -293,7 +292,14 @@ impl App {
         let row = 2 * u.font.line_h() + th.px(14);
         // Раскладку списка оставляем списку: в событии ни темы, ни шрифта нет.
         let rows = self.rows() as usize;
-        self.ls.measure(Rect::new(inner.x, inner.y, inner.w, row * self.rows()), row, rows);
+        // Полосы прокрутки у строки запуска нет (`Rect::ZERO`): список в ней короткий и
+        // обрезан нарочно — показывать долю от десяти записей нечего.
+        self.ls.measure(
+            Rect::new(inner.x, inner.y, inner.w, row * self.rows()),
+            Rect::ZERO,
+            row,
+            rows,
+        );
         let mut hit = None;
         for k in 0..self.rows() as usize {
             let rr = inner.cut_top(row);

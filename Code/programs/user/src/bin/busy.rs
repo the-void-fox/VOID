@@ -31,6 +31,16 @@ pub extern "C" fn _start(which: usize, _a1: usize) -> ! {
         black_box(acc);
         void_user::write(label);
         round += 1;
+        // Веха 223.7 — СПРОСИТЬ, НЕ ПРОСИЛИ ЛИ ПРЕРВАТЬСЯ. Вся поддержка Ctrl+C в программе,
+        // которая не читает ввод, — вот эта строка: сигналов в VOID нет, и прерывание не
+        // врывается в счёт само, а ждёт, пока его спросят.
+        //
+        // Не спросишь — человек нажмёт второй раз, и тогда тебя положат. Это честно: он
+        // попросил дважды.
+        if void_user::interrupted() {
+            void_user::write("\r\nbusy: прервано\r\n".as_bytes());
+            break;
+        }
         match deadline {
             Some(t) if void_user::monotonic_ns() >= t => break,
             None if round >= 5 => break,

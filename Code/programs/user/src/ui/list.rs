@@ -68,14 +68,86 @@ pub struct List {
     area: Rect,
     row_h: i32,
     rows: usize,
+    /// Веха 223.4 — ПОЛОСА ПРОКРУТКИ списка и её захват.
+    ///
+    /// До этой вехи полосы у списка не было, и каждая программа заводила её сама: поле
+    /// `drag: Option<((i32, i32), usize)>`, [`super::scroll::on_track`] в обработчике кнопки и
+    /// `Ui::scrollbar_from` в кадре. Три копии — вьювер корней, диспетчер задач, окно
+    /// руководства, — и во всех трёх смещение считалось ВО ВРЕМЯ КАДРА, то есть список отставал
+    /// от бегунка на кадр-два (та самая Веха 202.17, починенная тогда только в панели).
+    ///
+    /// Теперь это дело списка: он и так владеет `top`, а полоса — всего лишь второй способ его
+    /// менять, рядом с колесом и клавишами.
+    grab: super::scroll::Grab,
 }
 
 impl List {
     /// Сказать списку, где он нарисован. Зовётся из кадра, до первой строки.
-    pub fn measure(&mut self, area: Rect, row_h: i32, rows: usize) {
+    ///
+    /// `bar` — прямоугольник полосы прокрутки ровно такой, каким она БУДЕТ НАРИСОВАНА (с полями
+    /// внутрь, если они есть); [`Rect::ZERO`] — полосы у списка нет вовсе (строка запуска).
+    ///
+    /// Веха 223.4 — полоса приехала в сам список, и её прямоугольник теперь ОДИН. Прежде
+    /// программы рисовали её от `lay.bar.inset_xy(...)`, а попадание спрашивали у `lay.bar` без
+    /// полей — две меры одного места, расходящиеся молча.
+    pub fn measure(&mut self, area: Rect, bar: Rect, row_h: i32, rows: usize) {
         self.area = area;
         self.row_h = row_h;
         self.rows = rows;
+        self.grab.measure(bar);
+        // Отбор мог укоротиться: начало за концом списка даёт пустоту при непустом отборе, и
+        // выглядит это как пропажа записей (то же правило, что у [`super::Pane::measure`]).
+        self.top = self.top.min(self.hits.len().saturating_sub(self.rows));
+    }
+
+    /// Нарисовать полосу — и только. Смещение к этому моменту уже посчитано событием.
+    ///
+    /// Сама решает, нужна ли она: при полностью видимом списке полоса — украшение, которое врёт.
+    pub fn bar(&self, u: &mut super::Ui) {
+        let track = self.grab.track();
+        if track.is_empty() {
+            return;
+        }
+        u.scrollbar(track, self.top, self.rows, self.hits.len(), None);
+    }
+
+    /// Нажали левую кнопку. `true` — нажатие НАШЕ (попали в полосу), и строке его отдавать не надо.
+    ///
+    /// Зовётся из обработчика события, а НЕ из кадра: кадр рисуется по состоянию, посчитанному до
+    /// него, и список, менявший начало внутри кадра, отставал от бегунка (Веха 202.17).
+    pub fn bar_press(&mut self, p: (i32, i32)) -> bool {
+        let (view, total) = (self.rows as i32, self.hits.len() as i32);
+        match self.grab.press(p, self.top as i32, view, total) {
+            Some(t) => {
+                self.top = t.max(0) as usize;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Движение мыши при схваченной полосе. `true` — список правда поехал.
+    pub fn bar_motion(&mut self, p: (i32, i32)) -> bool {
+        let (view, total) = (self.rows as i32, self.hits.len() as i32);
+        match self.grab.motion(p, view, total) {
+            Some(t) => {
+                let t = t.max(0) as usize;
+                let moved = t != self.top;
+                self.top = t;
+                moved
+            }
+            None => false,
+        }
+    }
+
+    /// Ведут ли полосу сейчас.
+    pub fn bar_dragging(&self) -> bool {
+        self.grab.active()
+    }
+
+    /// Кнопку отпустили — протяжка кончилась.
+    pub fn bar_release(&mut self) {
+        self.grab.release();
     }
 
     /// Сколько строк видно.

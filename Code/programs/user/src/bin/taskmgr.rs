@@ -45,7 +45,6 @@ use alloc::vec::Vec;
 use void_user as sys;
 use void_user::win::{sym, Event, Window};
 
-#[allow(dead_code)]
 #[path = "../ui/mod.rs"]
 mod ui;
 
@@ -149,6 +148,13 @@ struct App {
     w: i32,
     h: i32,
     sysview: usize,
+    /// Веха 223.8 — свой номер процесса: нужен, чтобы перечислить СВОИ права (отдать можно
+    /// только своё) и чтобы отметить себя в таблице.
+    me: u16,
+    /// Веха 223.8 — свои РАЗДАВАЕМЫЕ права (с битом `GRANT`). Перечитываются вместе с графом.
+    own: Vec<Capp>,
+    /// Веха 223.8 — показываем список «что я могу отдать» вместо прав выбранного процесса.
+    granting: bool,
     /// Право включает WRITE — можно отзывать (иначе диспетчер только смотрит).
     can_write: bool,
     procs: Vec<Proc>,
@@ -160,8 +166,6 @@ struct App {
     prev: Vec<(u16, u64)>,
     prev_at: u64,
     ls: ui::List,
-    /// Веха 202.14 — якорь протяжки полосы прокрутки.
-    drag: Option<((i32, i32), usize)>,
     tab: Tab,
     caps: Vec<Capp>,
     /// Выбранное ПРАВО в списке прав — под пояснение справа.
@@ -326,6 +330,13 @@ impl App {
         }
         self.detail_pid = Some(pid);
         self.caps = read_caps(self.sysview, pid);
+        // Веха 223.8 — СВОИ раздаваемые права: отдать можно только своё, и только помеченное
+        // `g` в конфиге. Перечитываем вместе с графом: отдали одно — список не должен врать.
+        const GRANT_BIT: u32 = 1 << 2;
+        self.own = read_caps(self.sysview, self.me)
+            .into_iter()
+            .filter(|c| c.rights & GRANT_BIT != 0)
+            .collect();
         self.cap_sel = self.cap_sel.min(self.caps.len().saturating_sub(1));
     }
 
@@ -366,6 +377,8 @@ impl App {
         body.h = table.bottom() - th.pad - body.y;
         lay.bar = body;
         lay.list = lay.bar.cut_left(lay.bar.w - th.px(6));
+        // Веха 223.4 — полоса СРАЗУ такая, какой рисуется: по ней же считается попадание.
+        lay.bar = lay.bar.inset_xy(th.px(1), th.px(2));
         table.h = 0; // сам прямоугольник карточки восстановим при рисовании
         lay.rows = (lay.list.h / row_h).max(1) as usize;
         // Права: список слева, пояснение справа (в макете — ровно так). Пополам, а не 5/9:
@@ -424,6 +437,101 @@ impl App {
             self.flash = Some(String::from(ui::t("отзыв не удался")));
         }
         self.detail_pid = None; // перечитать граф на следующем проходе
+    }
+
+    /// Веха 223.8 — ОТДАТЬ выбранному процессу своё право из слота `slot`.
+    ///
+    /// Две половины, и вторая не менее важна первой. Ядро отдаёт КОПИЮ права — она живёт до
+    /// перезагрузки и нигде не записана. Чтобы конфиг остался ПОЛНЫМ описанием системы, тут же
+    /// откладываем готовую строку декларации в `/etc/granted/` — отдельной папкой, а не правкой
+    /// конфига: конфиг пишет человек, и машине в его текст лезть нельзя (тот же довод, по
+    /// которому Веха 191 перестала перезаписывать правленые файлы).
+    fn give(&mut self, pid: u16, slot: u16) {
+        if !sys::proc_grant(self.sysview, pid as usize, slot as usize) {
+            self.flash = Some(String::from(ui::t("выдать не удалось")));
+            return;
+        }
+        let (kind, rights, aux) = self
+            .own
+            .iter()
+            .find(|c| c.slot == slot)
+            .map(|c| (c.kind, c.rights, c.aux))
+            .unwrap_or((0, 0, 0xFFFF));
+        let name = self.procs.iter().find(|p| p.pid == pid).map(|p| p.name.clone());
+        let name = name.unwrap_or_else(|| alloc::format!("P{pid}"));
+        self.note_grant(&name, kind, rights, aux);
+        self.flash = Some(ui::f2(
+            ui::t("отдано: {} → P{}"),
+            ui::t(kind_name(kind)),
+            &alloc::format!("{pid}"),
+        ));
+        self.detail_pid = None; // перечитать граф на следующем проходе
+    }
+
+    /// Веха 223.8 — ОТЛОЖИТЬ выданное в `/etc/granted/<имя>.vv`.
+    ///
+    /// Зачем отдельная папка, а не правка конфига. Конфиг — текст ЧЕЛОВЕКА: его комментарии,
+    /// его порядок, его форматирование. Машина, которая в него дописывает, рано или поздно
+    /// затрёт то, чего не поняла (ровно поэтому Веха 191 перестала перезаписывать правленые
+    /// файлы). Поэтому пишем РЯДОМ и ровно то, что можно скопировать руками, — а решает
+    /// по-прежнему человек.
+    ///
+    /// Папка живёт до ближайшей пересборки: `rebuild` объявляет новое поколение, то есть ответ
+    /// на вопрос «что кому можно» уже дан, и отложенное больше не в силе.
+    ///
+    /// **Строку декларации пишем только там, где можем назвать её честно.** `desktop` знает
+    /// четыре вида (`sysview`, `power`, `net`, `hwprobe`), и для них строка готова к вставке.
+    /// Для остального пишем, ЧТО было отдано, и не притворяемся, будто это можно вставить: лучше
+    /// честная запись, чем строка, которую конфиг отвергнет.
+    fn note_grant(&mut self, who: &str, kind: u8, rights: u32, aux: u16) {
+        let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
+        if ep == sys::NO_CAP {
+            self.flash = Some(String::from(ui::t("выдано, но записать некуда")));
+            return;
+        }
+        // Чей это эндпоинт — по имени процесса-адресата: `desktop net` это канал к `net-srv`.
+        let target = self.procs.iter().find(|p| p.pid == aux).map(|p| p.name.as_str());
+        let token = match (kind_name(kind), target) {
+            ("sysview", _) => Some("sysview"),
+            ("power", _) => Some("power"),
+            ("hwprobe", _) => Some("hwprobe"),
+            ("endpoint", Some("net-srv")) => Some("net"),
+            _ => None,
+        };
+        let line = match token {
+            Some(t) => alloc::format!("desktop(\"{t}\", \"{who}\")\n"),
+            None => alloc::format!(
+                "# вставить нечем: такое право `desktop` не раздаёт.\n\
+                 # отдано было: {} [{}]{}\n",
+                kind_name(kind),
+                // Записываем то, что ПОЛУЧИЛ адресат, а не то, что лежало у нас: с копии бит
+                // раздачи снят, и записка, обещающая `g`, обещала бы несуществующее.
+                rights_str(rights & !(1 << 2)),
+                if aux != 0xFFFF { alloc::format!(" →P{aux}") } else { String::new() },
+            ),
+        };
+        let path = alloc::format!("/etc/granted/{who}.vv");
+        let mut text = String::new();
+        if sys::posix::stat(ep, path.as_bytes()).is_none() {
+            // Шапка пишется один раз: она объясняет, что это за файл и почему он отдельно.
+            text.push_str(
+                "# Выдано диспетчером задач НА ХОДУ. Конфиг я не трогаю — это ваш текст.\n\
+                 # Нужное перенесите в /etc/system/*.vv сами; остальное пропадёт при пересборке.\n",
+            );
+        } else {
+            let mut buf = alloc::vec![0u8; 8 * 1024];
+            let fd = sys::posix::open(ep, path.as_bytes(), 0);
+            if fd != usize::MAX {
+                let n = sys::posix::read(ep, fd, &mut buf);
+                sys::posix::close(ep, fd);
+                text.push_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+            }
+        }
+        text.push_str(&line);
+        sys::posix::mkdir(ep, b"/etc/granted");
+        if !sys::posix::echo_to(ep, path.as_bytes(), text.as_bytes()) {
+            self.flash = Some(String::from(ui::t("выдано, но записать не вышло")));
+        }
     }
 
     /// Свой канал к СЕРВЕРУ СЕТИ — один раз за жизнь окна.
@@ -590,17 +698,8 @@ impl App {
         cols.label(u, h, ui::t("имя"), "PID", ui::t("ЦП"), ui::t("куча"), ui::t("состояние"), th.muted, th.muted);
         u.hsep(Rect::new(h.x, h.bottom(), h.w, th.px(2)));
 
-        // Веха 202.14 — с ЯКОРЕМ: схваченный бегунок едет за рукой (`Ui::scrollbar_from`).
-        if let Some(t) = u.scrollbar_from(
-            lay.bar.inset_xy(th.px(1), th.px(2)),
-            self.ls.top,
-            lay.rows,
-            self.ls.hits.len(),
-            u.held(),
-            self.drag,
-        ) {
-            self.ls.top = t;
-        }
+        // Веха 223.4 — полоса только РИСУЕТСЯ: начало списка посчитано событием, а не кадром.
+        self.ls.bar(u);
         let was = self.ls.sel;
         let mut list = lay.list;
         for k in 0..lay.rows {
@@ -655,14 +754,115 @@ impl App {
             let p = &self.procs[i];
             (p.pid, p.name.clone(), p.system, p.linux, p.has_hash, p.hash)
         };
-        u.label(
-            d.cut_top(font_h + th.px(2)),
-            &ui::f2(ui::t("права процесса {} (P{})"), &name, &alloc::format!("{pid}")),
-            th.text,
-            Align::Left,
-        );
+        // Веха 223.8 — ЗАГОЛОВОК С ПЕРЕКЛЮЧАТЕЛЕМ. Кнопка «плюс» переводит список в режим
+        // выдачи: вместо прав выбранного процесса — СВОИ раздаваемые. Режим, а не вторая
+        // карточка, потому что места под вторую нет, а списки эти не смотрят одновременно:
+        // сперва решают, чего не хватает, потом отдают.
+        let mut head = d.cut_top(font_h + th.px(2));
+        let mut toggled = false;
+        if self.can_write && !self.own.is_empty() {
+            let bw = font_h + th.px(4);
+            let btn = head.cut_right(bw);
+            let hot = if u.hot(btn) { 256 } else { 0 };
+            let art = if self.granting { ui::icon::CLOSE } else { ui::icon::PLUS };
+            if u.icon_button(btn, art, hot, false) {
+                toggled = true;
+            }
+            head.cut_right(th.gap);
+        }
+        let title = if self.granting {
+            ui::f2(ui::t("выдать {} (P{}) своё право"), &name, &alloc::format!("{pid}"))
+        } else {
+            ui::f2(ui::t("права процесса {} (P{})"), &name, &alloc::format!("{pid}"))
+        };
+        u.label(head, &title, th.text, Align::Left);
         u.hsep(d.cut_top(th.px(4)));
         d.cut_top(th.px(2));
+        // Веха 223.9 — переключаем режим И ПРОДОЛЖАЕМ рисовать этим же кадром.
+        //
+        // Раньше здесь стоял `return`: кадр обрывался сразу после заголовка, правая карточка на
+        // нём не рисовалась вовсе, и следующий кадр рисовал её заново — ровно один кадр пустоты,
+        // то есть видимое моргание. Выходить из кадра посередине нельзя: кадр обязан нарисовать
+        // ВСЁ, что в нём есть, даже если состояние только что сменилось.
+        if toggled {
+            self.granting = !self.granting;
+        }
+
+        // ── режим выдачи: перечисляем СВОИ раздаваемые права ───────────────────────────────
+        if self.granting {
+            let btn_w = font_h + th.px(4);
+            let row_h = font_h + th.px(6);
+            let mut give: Option<u16> = None;
+            for k in 0..self.own.len() {
+                if d.h < row_h {
+                    break;
+                }
+                let (slot, kind, rights, aux) = {
+                    let c = &self.own[k];
+                    (c.slot, c.kind, c.rights, c.aux)
+                };
+                let mut rr = d.cut_top(row_h).inset_xy(th.px(4), 0);
+                let btn = rr.cut_right(btn_w);
+                rr.cut_right(th.gap);
+                let mut txt = String::new();
+                txt.push_str(kind_name(kind));
+                txt.push_str(" [");
+                txt.push_str(&rights_str(rights));
+                txt.push(']');
+                if aux != 0xFFFF {
+                    txt.push_str(&alloc::format!(" →P{aux}"));
+                }
+                u.label(rr, &txt, th.text, Align::Left);
+                let hot = if u.hot(btn) { 256 } else { 0 };
+                if u.icon_button(btn, ui::icon::PLUS, hot, false) {
+                    give = Some(slot);
+                }
+            }
+            if self.own.is_empty() {
+                u.label(d.cut_top(font_h), ui::t("отдавать нечего"), th.muted, Align::Left);
+            }
+            // Веха 223.9 — СПРАВА ОБЪЯСНЯЕМ ПРАВИЛА, а не оставляем пустую карточку.
+            //
+            // Пустая карточка не только моргала — она ещё и молчала о главном: почему список
+            // короткий. Короткий он не от бедности, а потому что отдать можно лишь помеченное
+            // раздаваемым, и это решение КОНФИГА. Человек, не знающий правил, прочтёт пустоту
+            // как поломку.
+            let ci = u.card(lay.capinfo);
+            let mut c = ci.inset(th.pad);
+            u.label(c.cut_top(font_h + th.px(2)), ui::t("выдать право"), th.text, Align::Left);
+            u.hsep(c.cut_top(th.px(4)));
+            c.cut_top(th.px(2));
+            for line in [
+                ui::t("отдать можно только СВОЁ:"),
+                ui::t("права не берутся из воздуха"),
+                "",
+                ui::t("и только помеченное `g`"),
+                ui::t("в конфиге поколения —"),
+                ui::t("решает декларация, не я"),
+                "",
+                ui::t("копия идёт БЕЗ `g`:"),
+                ui::t("отдали право, а не право"),
+                ui::t("раздавать его дальше"),
+                "",
+                ui::t("выданное записываю в"),
+                ui::t("/etc/granted — ваш конфиг"),
+                ui::t("я не трогаю"),
+            ] {
+                if c.h < font_h {
+                    break;
+                }
+                let r = c.cut_top(font_h);
+                if !line.is_empty() {
+                    u.label(r, line, th.muted, Align::Left);
+                }
+            }
+            if let Some(slot) = give {
+                self.give(pid, slot);
+                self.granting = false;
+                return true;
+            }
+            return false;
+        }
 
         let mut acted: Option<u16> = None; // слот, у которого нажали «отнять»
         let mut picked: Option<usize> = None;
@@ -776,12 +976,19 @@ impl App {
             );
         }
 
-        if let Some(k) = picked {
-            self.cap_sel = k;
-            return true;
-        }
+        // Веха 223.8 — ОТЗЫВ ПРОВЕРЯЕТСЯ ПЕРВЫМ, и порядок здесь не вкусовщина.
+        //
+        // Кнопка отзыва лежит ВНУТРИ строки права, а попадание в строку считается по ВСЕЙ её
+        // ширине — вместе с кнопкой. Пока выбор проверялся раньше, щелчок по кнопке засчитывался
+        // как «выбрать это право» и выходил по `return` до отзыва: кнопка подсвечивалась, курсор
+        // попадал, а не работало ничего. Снаружи это выглядело как «отзыв сломан» — хотя сломан
+        // был порядок двух `if`.
         if let Some(slot) = acted {
             self.revoke(pid, slot);
+            return true;
+        }
+        if let Some(k) = picked {
+            self.cap_sel = k;
             return true;
         }
         false
@@ -1214,17 +1421,22 @@ fn dev_help(k: usize) -> &'static [&'static str] {
 /// Короткое имя состояния (для колонки таблицы).
 fn state_name(s: u8) -> &'static str {
     ui::t(match s {
+        // Веха 223.6 — ВЫВЕРЕНО ПО ЯДРУ (`proc/syscall/sys.rs`). Три кода стояли не на своих
+        // местах, а «завершён» не показывался вовсе: таблицы разъехались молча, как и всё,
+        // что написано дважды. Меняешь состояние в ядре — меняй здесь же.
         0 => "готов",
         1 => "ждёт IPC",
         2 => "ждёт ответа",
-        3 => "ждёт ребёнка",
-        4 => "завершён",
-        5 => "ждёт ввода",
+        3 => "ждёт ввода",
+        4 => "ждёт ребёнка",
+        5 => "ждёт нить",
         6 => "ждёт futex",
         7 => "ждёт IRQ",
         8 => "спит",
+        9 => "завершён",
         10 => "ждёт трубы",
         11 => "ждёт ребёнка",
+        12 => "опрашивает",
         _ => "неизвестно",
     })
 }
@@ -1307,6 +1519,13 @@ impl ui::Client for App {
                 }
             }
             Event::Motion { .. } => {
+                // Веха 223.4 — схваченную полосу ведём СРАЗУ, до кадра.
+                if self.ls.bar_dragging() {
+                    return match input.ptr {
+                        Some(p) if self.ls.bar_motion(p) => ui::Scope::All,
+                        _ => ui::Scope::No,
+                    };
+                }
                 if self.tab != Tab::Perf {
                     self.ls.motion(input.ptr);
                 }
@@ -1318,8 +1537,11 @@ impl ui::Client for App {
             Event::Button { x, y, down, .. } => {
                 // Веха 204.2 — якорь ТОЛЬКО при нажатии в полосе: схваченная полоса ведётся,
                 // пока держат кнопку, где бы ни был курсор (`Ui::scrollbar_from`).
-                self.drag = (down && ui::scroll::on_track(self.lay.bar, (x as i32, y as i32)))
-                    .then(|| ((x as i32, y as i32), self.ls.top));
+                if down {
+                    self.ls.bar_press((x as i32, y as i32));
+                } else {
+                    self.ls.bar_release();
+                }
                 ui::Scope::All
             }
             Event::Resize { w, h } => {
@@ -1355,7 +1577,11 @@ impl ui::Client for App {
     fn draw(&mut self, u: &mut Ui) -> ui::Scope {
         let th = u.th.clone();
         self.lay = self.measure(u.font, &th);
-        self.ls.measure(self.lay.list, self.lay.row_h, self.lay.rows);
+        // Веха 223.4 — на вкладке «производительность» таблицы нет вовсе, а значит нет и полосы:
+        // пустой прямоугольник. Иначе её можно было бы схватить ровно там, где её не рисуют, —
+        // список поехал бы от нажатия в пустое место.
+        let bar = if self.tab == Tab::Perf { Rect::ZERO } else { self.lay.bar };
+        self.ls.measure(self.lay.list, bar, self.lay.row_h, self.lay.rows);
         self.sync_detail();
         let lay = core::mem::take(&mut self.lay);
         let dirty = self.paint(u, &th, &lay);
@@ -1389,11 +1615,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     };
 
     let mut app = App {
-        drag: None,
         w: w as i32,
         h: h as i32,
         sysview,
         can_write,
+        me: sys::self_pid() as u16,
+        own: Vec::new(),
+        granting: false,
         procs: Vec::new(),
         stats: Vec::new(),
         cpu: Vec::new(),
