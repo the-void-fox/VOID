@@ -598,6 +598,17 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret(ppid);
             f.advance();
         }
+        // SYS_SELF() -> свой номер процесса (Веха 223.8). Прав не требует: узнать, кто ты, —
+        // не полномочие, а самоочевидность; ровно так же ничего не требует `SYS_PARENT`.
+        //
+        // Понадобилось диспетчеру задач: чтобы отдать СВОЁ право, надо сперва перечислить свои
+        // права, а перечень просится по номеру процесса (`SYS_PROC_CAPS`). Заодно он отмечает
+        // себя в таблице — человеку полезно видеть, какая строка про смотрящего.
+        70 => {
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(cur);
+            f.advance();
+        }
         // SYS_SETENV(buf, len) -> 0 / MAX (Веха 120.1): заменить СВОЁ окружение (`KEY=VAL\0…`).
         //
         // Зачем понадобилось: у программ VOID нет текущего каталога — его ведёт шелл, и до сих
@@ -675,6 +686,76 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             wake_exec_waiters(t, leader, 137);
             let f = &mut t.procs[cur].frame;
             f.set_ret(0);
+            f.advance();
+        }
+        // SYS_INTERRUPT(pid, hard) -> сколько задето | MAX (Веха 223.7) — ПРЕРВАТЬ то, что
+        // запустил наш ребёнок.
+        //
+        // Сигналов в VOID нет и не будет: система живёт без юниксовых пользователей и root, и
+        // тащить в неё юниксовую модель значило бы копировать ровно то, от чего ушли. Вместо
+        // `SIGINT` — ОДИН ФЛАЖОК, который процесс спрашивает сам ([`SYS_INTERRUPTED`]).
+        //
+        // Право то же, что у `SYS_KILL` и `SYS_WAIT`, — РОДИТЕЛЬСТВО. Терминалу этого хватает:
+        // панель держит шелл своим ребёнком, а прерывать надо то, что ЗАПУСТИЛ шелл.
+        //
+        // `hard = 0` — поставить флажок `pid` и всем его потомкам. `hard = 1` — положить
+        // ПОТОМКОВ насмерть, а сам `pid` оставить жить: это второй Ctrl+C, когда программа
+        // флажок не спросила. Шелл при этом цел — иначе человек терял бы вместе с программой и
+        // панель, в которой работал.
+        67 => {
+            let (pid, hard) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let ok = pid < t.procs.len()
+                && pid != cur
+                && t.procs[pid].parent == cur
+                && t.procs[pid].state != State::Finished;
+            let ret = if !ok {
+                usize::MAX
+            } else {
+                let mut touched = 0usize;
+                for i in 0..t.procs.len() {
+                    if t.procs[i].state == State::Finished {
+                        continue;
+                    }
+                    if i != pid && !descends_from(t, i, pid) {
+                        continue;
+                    }
+                    if hard != 0 && i != pid {
+                        let leader = t.procs[i].group;
+                        for j in 0..t.procs.len() {
+                            if t.procs[j].group == leader && t.procs[j].state != State::Finished {
+                                t.procs[j].state = State::Finished;
+                                lx_close_all(t, j);
+                            }
+                        }
+                        crate::net::ext_detach(leader);
+                        // 130 = 128 + SIGINT: так код выхода «убит по Ctrl+C» называют оболочки,
+                        // и нашей незачем выдумывать своё число.
+                        wake_exec_waiters(t, leader, 130);
+                    } else {
+                        t.procs[i].interrupted = true;
+                    }
+                    touched += 1;
+                }
+                vprintln!("  [proc] P{} SYS_INTERRUPT P{} hard={} — задето {}", cur, pid, hard, touched);
+                touched
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(ret);
+            f.advance();
+        }
+        // SYS_INTERRUPTED() -> 1 | 0 (Веха 223.7): спросить И СНЯТЬ свой флажок.
+        //
+        // Снимаем при чтении нарочно: флажок — это СОБЫТИЕ («попросили прерваться»), а не
+        // состояние. Оставь мы его взведённым, цикл, решивший прерывание пережить, увидел бы
+        // его и на следующем круге, и на всех дальнейших.
+        68 => {
+            let was = t.procs[cur].interrupted;
+            t.procs[cur].interrupted = false;
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(was as usize);
             f.advance();
         }
         // SYS_WAIT(pid, nonblock) -> код выхода | WOULD_BLOCK | MAX (Веха 98): забрать результат

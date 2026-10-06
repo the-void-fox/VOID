@@ -40,7 +40,10 @@ fn lx_put(t: &mut Table, cur: usize, va: usize, data: &[u8]) -> bool {
     if data.is_empty() {
         return true;
     }
-    if !ensure_heap_range(t, cur, va, data.len()) {
+    // Веха 223.6 — СНАЧАЛА доотобразить ленивую кучу, ПОТОМ убедиться, что память вообще
+    // существует. Второе не следует из первого: `ensure_heap_range` пропускает всё, что не
+    // куча, — включая нулевой адрес (см. [`user_range_ok`]).
+    if !ensure_heap_range(t, cur, va, data.len()) || !user_range_ok(t, cur, va, data.len()) {
         return false;
     }
     unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), va as *mut u8, data.len()) };
@@ -53,7 +56,7 @@ fn lx_get<'a>(t: &mut Table, cur: usize, va: usize, len: usize) -> Option<&'a [u
     if len == 0 {
         return Some(&[]);
     }
-    if !ensure_heap_range(t, cur, va, len) {
+    if !ensure_heap_range(t, cur, va, len) || !user_range_ok(t, cur, va, len) {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(va as *const u8, len) })
@@ -163,10 +166,11 @@ fn lx_release_fd(t: &mut Table, pid: usize, sl: LxFd) -> bool {
 /// конца файла, которого никто не объявит. `execve` сюда НЕ ходит: там процесс не умирает, а
 /// меняет образ, и дескрипторы обязаны его пережить.
 pub(super) fn lx_close_all(t: &mut Table, pid: usize) {
-    if t.procs[pid].lx_fds.is_empty() {
+    let own = fd_own(t, pid);
+    if t.procs[own].lx_fds.is_empty() {
         return;
     }
-    let fds: Vec<LxFd> = t.procs[pid].lx_fds.iter_mut().filter_map(|s| s.take()).collect();
+    let fds: Vec<LxFd> = t.procs[own].lx_fds.iter_mut().filter_map(|s| s.take()).collect();
     for sl in fds {
         let _ = lx_release_fd(t, pid, sl);
     }
@@ -199,6 +203,7 @@ fn exec_linux_in_place(
     args_blob: Vec<u8>,
     env_blob: Vec<u8>,
 ) -> bool {
+    let own = fd_own(t, cur);
     let Some(root) = new_address_space() else { return false };
     let fail = |root: usize| {
         unsafe { arch::free_address_space(root) };
@@ -260,7 +265,7 @@ fn exec_linux_in_place(
     // программы (Веха 156), и подменять его здесь значило бы выдать процессу права чужой
     // программы по одному лишь её названию — то есть отдать повышение прав любому, кто умеет
     // звать `execve`. Права наследуются от того, кто был, ровно как при спавне ребёнка.
-    let doomed: Vec<LxFd> = t.procs[cur]
+    let doomed: Vec<LxFd> = t.procs[own]
         .lx_fds
         .iter_mut()
         .filter(|s| s.as_ref().map(|f| f.cloexec).unwrap_or(false))
@@ -284,8 +289,23 @@ enum FdKind {
     File,
 }
 
+/// Веха 223.5 — ТАБЛИЦА ДЕСКРИПТОРОВ ПРИНАДЛЕЖИТ ГРУППЕ НИТЕЙ, а не нити.
+///
+/// `pthread_create` передаёт `CLONE_FILES`: нити одного процесса делят открытые файлы, и
+/// `open` в одной обязан быть виден в другой, а `close` — закрыть для всех. У нас нить — запись
+/// той же таблицы процессов, поэтому «делят» означает «резолвятся у лидера группы» — ровно тем
+/// же приёмом, каким уже живут куча (`ensure_heap_range`) и стартовые права (`SYS_STARTCAP`).
+///
+/// Для всего, что было до нитей, не меняется НИЧЕГО: у процесса без нитей `group` равен его
+/// собственному индексу.
+#[inline]
+fn fd_own(t: &Table, pid: usize) -> usize {
+    t.procs[pid].group
+}
+
 fn fd_kind(t: &Table, cur: usize, fd: usize) -> FdKind {
-    match t.procs[cur].lx_fds.get(fd).and_then(|s| s.as_ref()) {
+    let own = fd_own(t, cur);
+    match t.procs[own].lx_fds.get(fd).and_then(|s| s.as_ref()) {
         None => FdKind::None,
         Some(f) if f.console => FdKind::Console,
         Some(f) => match f.pipe {
@@ -312,7 +332,8 @@ fn lx_dup_fd(
     min: usize,
     cloexec: bool,
 ) -> usize {
-    let Some(mut copy) = t.procs[cur].lx_fds.get(old).cloned().flatten() else {
+    let own = fd_own(t, cur);
+    let Some(mut copy) = t.procs[own].lx_fds.get(old).cloned().flatten() else {
         return crate::linux::err(crate::linux::EBADF);
     };
     // dup2(x, x) — тождество, а не работа: закрывать при этом нельзя (POSIX особо оговаривает).
@@ -339,10 +360,10 @@ fn lx_dup_fd(
             // Занятый номер сперва ЗАКРЫВАЕТСЯ — так велит POSIX, и на этом стоит
             // перенаправление: `dup2(труба, 1)` обязан убрать прежний stdout, иначе тот остался
             // бы держателем.
-            if let Some(Some(prev)) = t.procs[cur].lx_fds.get_mut(newfd).map(|s| s.take()) {
+            if let Some(Some(prev)) = t.procs[own].lx_fds.get_mut(newfd).map(|s| s.take()) {
                 let _ = lx_release_fd(t, cur, prev);
             }
-            let tbl = &mut t.procs[cur].lx_fds;
+            let tbl = &mut t.procs[own].lx_fds;
             while tbl.len() <= newfd {
                 tbl.push(None);
             }
@@ -350,7 +371,7 @@ fn lx_dup_fd(
             newfd
         }
         None => {
-            let tbl = &mut t.procs[cur].lx_fds;
+            let tbl = &mut t.procs[own].lx_fds;
             while tbl.len() <= min {
                 tbl.push(None);
             }
@@ -373,6 +394,7 @@ fn lx_dup_fd(
 /// Раньше их не существовало вовсе: 0/1/2 разбирались условиями по номеру. Пока так, `dup2` не
 /// имел чего присваивать, а без него у чужого `sh` нет ни перенаправления, ни конвейера.
 fn lx_init_stdio(t: &mut Table, pid: usize) {
+    let own = fd_own(t, pid);
     let mk = || {
         Some(LxFd {
             meta: crate::lxfs::Meta {
@@ -390,7 +412,7 @@ fn lx_init_stdio(t: &mut Table, pid: usize) {
             cloexec: false,
         })
     };
-    let tbl = &mut t.procs[pid].lx_fds;
+    let tbl = &mut t.procs[own].lx_fds;
     tbl.clear();
     for _ in 0..3 {
         tbl.push(mk());
@@ -399,9 +421,10 @@ fn lx_init_stdio(t: &mut Table, pid: usize) {
 
 /// Открыть найденный узел: занять слот в таблице дескрипторов процесса, вернуть номер fd.
 fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>) -> usize {
+    let own = fd_own(t, cur);
     let fd =
         LxFd { meta, off: 0, path, dpos: 0, wfile: None, pipe: None, console: false, cloexec: false };
-    let tbl = &mut t.procs[cur].lx_fds;
+    let tbl = &mut t.procs[own].lx_fds;
     let i = match tbl.iter().position(|s| s.is_none()) {
         Some(i) => {
             tbl[i] = Some(fd);
@@ -428,6 +451,157 @@ const LX_FD_BASE: usize = 0;
 /// `PROT_NONE` мы отображаем как «читаемо»: ld.so резервирует им дыры между сегментами и потом
 /// перекрывает их FIXED-отображениями. Настоящая защита от чтения потребовала бы отдельного
 /// состояния «страница есть, но недоступна», а пользы для запуска бинаря не даёт.
+/// Веха 223.6 — ГОТОВНОСТЬ ДЕСКРИПТОРА для `poll`.
+///
+/// Биты те же, что у Linux. `POLLNVAL`, `POLLERR` и `POLLHUP` возвращаются НЕЗАВИСИМО от того,
+/// о чём спрашивали, — так велит стандарт, и именно на этом стоит проверка Rust-`std`: она
+/// спрашивает `events = 0` и смотрит, не ответили ли ей «дескриптора нет».
+fn poll_revents(t: &mut Table, cur: usize, fd: usize, events: u16) -> u16 {
+    const POLLIN: u16 = 0x001;
+    const POLLOUT: u16 = 0x004;
+    const POLLHUP: u16 = 0x010;
+    const POLLNVAL: u16 = 0x020;
+    match fd_kind(t, cur, fd) {
+        FdKind::None => POLLNVAL,
+        // Обычный файл в Linux готов ВСЕГДА — и на чтение, и на запись; ждать на нём нечего.
+        FdKind::File => (POLLIN | POLLOUT) & events,
+        // Консоль: писать можно всегда. Про чтение честно сказать нечего — узнать, лежит ли
+        // байт, нам пока нечем, и соврать «готово» значило бы превратить опрос в холостой цикл,
+        // а соврать «не готово» — подвесить. Отвечаем «готово»: лишнее пробуждение программа
+        // переживёт (она перечитает), а зависание — нет.
+        FdKind::Console => (POLLIN | POLLOUT) & events,
+        FdKind::Pipe(idx, write_end) => {
+            let (data, readers, writers) = match t.lx_pipes.get(idx).and_then(|p| p.as_ref()) {
+                Some(p) => (!p.buf.is_empty(), p.readers, p.writers),
+                None => return POLLNVAL,
+            };
+            let mut r = 0;
+            if write_end {
+                if readers > 0 {
+                    r |= POLLOUT & events;
+                } else {
+                    r |= POLLHUP; // читателей не осталось — писать некому
+                }
+            } else {
+                if data {
+                    r |= POLLIN & events;
+                } else if writers == 0 {
+                    r |= POLLHUP; // писателей нет и данных нет — это конец файла
+                }
+            }
+            r
+        }
+    }
+}
+
+/// Веха 223.6 — ДЕЙСТВИЕ ПО УМОЛЧАНИЮ у сигнала: правда — «убить».
+///
+/// Перечислены те, что по стандарту НЕ убивают; всё прочее убивает. Список короткий нарочно:
+/// ошибиться в сторону «убить» хуже, чем в сторону «пропустить», поэтому знать мы обязаны
+/// именно безобидные.
+fn signal_kills(sig: usize) -> bool {
+    const SIGCHLD: usize = 17;
+    const SIGURG: usize = 23;
+    const SIGCONT: usize = 18;
+    const SIGWINCH: usize = 28;
+    !matches!(sig, 0 | SIGCHLD | SIGURG | SIGCONT | SIGWINCH)
+}
+
+/// Веха 223.6 — доставить сигнал `sig` процессу/нити `target`. `true` — цель легла.
+///
+/// Обработчиков мы НЕ ЗОВЁМ: для этого нужен кадр на стеке пользователя и `rt_sigreturn`, и это
+/// отдельная работа. Поэтому поведение честное, но неполное: игнорируемый сигнал пропускаем,
+/// пойманный — пропускаем и говорим об этом в журнал (программа ждёт обработчика и не получит
+/// его), а сигнал в умолчании делает ровно то, что обязан, — кладёт цель.
+///
+/// Этого хватает, чтобы `abort()` работал: musl сперва поднимает сигнал (вдруг поймают), затем
+/// СБРАСЫВАЕТ его в умолчание и поднимает снова — вот второй раз и убивает.
+fn deliver_signal(t: &mut Table, target: usize, sig: usize, whole_group: bool) -> bool {
+    if sig == 0 {
+        return false; // `kill(pid, 0)` — только проверка, что цель есть
+    }
+    let bit = 1u64 << (sig.min(63) as u64);
+    if t.procs[target].sig_ign & bit != 0 {
+        return false;
+    }
+    if t.procs[target].sig_catch & bit != 0 {
+        vprintln!("  [linux] P{} сигнал {} пойман обработчиком — а звать его нечем", target, sig);
+        return false;
+    }
+    if !signal_kills(sig) {
+        return false;
+    }
+    let leader = t.procs[target].group;
+    for i in 0..t.procs.len() {
+        let hit = if whole_group { t.procs[i].group == leader } else { i == target };
+        if hit && t.procs[i].state != State::Finished {
+            lx_close_all(t, i);
+            t.procs[i].state = State::Finished;
+        }
+    }
+    if whole_group {
+        crate::net::ext_detach(leader);
+        wake_exec_waiters(t, leader, 128 + sig); // как в оболочках: «убит сигналом N»
+    }
+    println!("  [linux] P{} убит сигналом {}", target, sig);
+    true
+}
+
+/// Веха 223.6 (РАЗВЕДКА) — КОЛЬЦО ПОСЛЕДНИХ LINUX-ВЫЗОВОВ.
+///
+/// Зачем. Когда чужая программа падает, в журнале видна ровно одна строка: «неожиданный trap из
+/// U». Она называет МЕСТО, но не говорит, что процесс делал перед этим, — а у чужого софта
+/// именно это и есть вопрос. Подробная трасса (`vprintln!`) в обычной загрузке выключена, да и
+/// печатать сотни строк на serial ради последних трёх незачем.
+///
+/// Поэтому: пишем номер и результат КАЖДОГО вызова в кольцо, а выливаем его один раз — когда
+/// процесс умирает не по своей воле ([`dump_lx_trace`]). Стоимость в обычной жизни — две записи
+/// в массив.
+const TRACE_LEN: usize = 48;
+static mut LX_TRACE: [(u16, isize); TRACE_LEN] = [(0, 0); TRACE_LEN];
+static mut LX_TRACE_AT: usize = 0;
+
+fn trace_lx(nr: usize, ret: isize) {
+    unsafe {
+        let at = LX_TRACE_AT % TRACE_LEN;
+        LX_TRACE[at] = (nr as u16, ret);
+        LX_TRACE_AT = LX_TRACE_AT.wrapping_add(1);
+    }
+}
+
+/// Вылить кольцо: последние вызовы в порядке совершения. Зовётся с пути «процесс умер не сам».
+pub(super) fn dump_lx_trace() {
+    let at = unsafe { LX_TRACE_AT };
+    if at == 0 {
+        return;
+    }
+    let n = at.min(TRACE_LEN);
+    crate::println!("  [linux] последние {} вызовов перед падением (номер → результат):", n);
+    for k in 0..n {
+        let (nr, ret) = unsafe { LX_TRACE[(at - n + k) % TRACE_LEN] };
+        match crate::linux::decode(nr as usize) {
+            Some(lx) => crate::println!("    #{:<4} {:?} → {}", nr, lx, ret),
+            // Неизвестный номер — самое интересное: это он отвечал ENOSYS.
+            None => crate::println!("    #{:<4} (НЕРЕАЛИЗОВАН) → {}", nr, ret),
+        }
+    }
+}
+
+/// Веха 223.5 — прочитать `struct timespec` (сек + нсек, по 8 байт) и свести в наносекунды.
+///
+/// `None` — указателя нет (`0`): для futex'а это «ждать бессрочно», и отличать его от «ждать
+/// ноль наносекунд» обязательно. Нуль-указатель здесь штатный случай, а не ошибка:
+/// `pthread_cond_wait` без срока приходит именно так.
+fn read_timespec(t: &mut Table, cur: usize, va: usize) -> Option<u64> {
+    if va == 0 {
+        return None;
+    }
+    let b = lx_get(t, cur, va, 16)?;
+    let secs = u64::from_ne_bytes(b[0..8].try_into().ok()?);
+    let nsecs = u64::from_ne_bytes(b[8..16].try_into().ok()?);
+    Some(secs.saturating_mul(1_000_000_000).saturating_add(nsecs))
+}
+
 fn lx_page_flags(prot: usize) -> usize {
     let mut f = arch::MAP_U | arch::MAP_R;
     if prot & 2 != 0 {
@@ -498,6 +672,8 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
     use crate::linux::{self, Lx};
     let nr = t.procs[cur].frame.syscall_num();
     let a = |t: &Table, i: usize| t.procs[cur].frame.arg(i);
+    // Веха 223.5 — чей стол дескрипторов: у нити он лидера группы (см. [`fd_own`]).
+    let own = fd_own(t, cur);
     let (a0, a1, a2) = (a(t, 0), a(t, 1), a(t, 2));
 
     let decoded = linux::decode(nr);
@@ -583,7 +759,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                         // одним объектом (или кусками, если вырос).
                         ret = match fd
                             .checked_sub(LX_FD_BASE)
-                            .and_then(|i| t.procs[cur].lx_fds.get_mut(i).and_then(|s| s.as_mut()))
+                            .and_then(|i| t.procs[own].lx_fds.get_mut(i).and_then(|s| s.as_mut()))
                         {
                             Some(sl) => match sl.wfile {
                                 Some(wi) => {
@@ -650,14 +826,14 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             } else if kind == FdKind::File {
                 // Файл из store (Веха 108.3). Чтение короткое: за раз отдаём не больше остатка
                 // текущего куска блоба — так же ведёт себя `read` на трубе, и musl дочитает.
-                let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
+                let slot = t.procs[own].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
                 ret = match slot {
                     None => linux::err(linux::EBADF),
                     Some(f) => {
                         let mut tmp = alloc::vec![0u8; len.min(64 * 1024)];
                         let n = crate::lxfs::read_at(&f.meta, f.off, &mut tmp);
                         if lx_put(t, cur, buf, &tmp[..n]) {
-                            if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                            if let Some(Some(sl)) = t.procs[own].lx_fds.get_mut(fd - LX_FD_BASE) {
                                 sl.off += n as u64;
                             }
                             n
@@ -668,7 +844,9 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                 };
             } else if kind != FdKind::Console {
                 ret = linux::err(linux::EBADF);
-            } else if !ensure_heap_range(t, cur, buf, len) {
+            } else if !ensure_heap_range(t, cur, buf, len) || !user_range_ok(t, cur, buf, len) {
+                // Веха 223.6 — ВТОРАЯ проверка обязательна: ниже ядро пишет байты ПРЯМО по
+                // этому адресу, и `read(0, NULL, 1)` валил машину целиком.
                 ret = linux::err(linux::EFAULT);
             } else {
                 let mut n = 0usize;
@@ -694,7 +872,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             let (fd, buf, len, off) = (a0, a1, a2, a(t, 3));
             let slot = fd
                 .checked_sub(LX_FD_BASE)
-                .and_then(|i| t.procs[cur].lx_fds.get(i).cloned())
+                .and_then(|i| t.procs[own].lx_fds.get(i).cloned())
                 .flatten();
             ret = match slot {
                 None => linux::err(linux::EBADF),
@@ -806,7 +984,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                         .try_into()
                         .ok()
                         .and_then(|f: usize| f.checked_sub(LX_FD_BASE))
-                        .and_then(|i| t.procs[cur].lx_fds.get(i).cloned())
+                        .and_then(|i| t.procs[own].lx_fds.get(i).cloned())
                         .flatten();
                     match slot {
                         None => ret = linux::err(linux::EBADF),
@@ -877,21 +1055,50 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             // для таймаутов, которых мы пока не различаем.
             const FUTEX_WAIT: usize = 0;
             const FUTEX_WAKE: usize = 1;
+            const FUTEX_REQUEUE: usize = 3;
+            const FUTEX_CMP_REQUEUE: usize = 4;
+            const FUTEX_WAIT_BITSET: usize = 9;
+            const FUTEX_WAKE_BITSET: usize = 10;
             let (uaddr, op, val) = (a0, a1 & 0x7f, a2);
             match op {
-                FUTEX_WAIT => {
-                    let read = if ensure_heap_range(t, cur, uaddr, 4) {
+                // Веха 223.5 — `WAIT_BITSET` обслуживается тем же кодом. Разница по букве
+                // стандарта в двух вещах: маска (нам безразлична — мы будим всех, кто спит на
+                // слове) и АБСОЛЮТНОЕ время вместо относительного. Второе важно, и ниже учтено.
+                FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                    let read = if ensure_heap_range(t, cur, uaddr, 4) && user_range_ok(t, cur, uaddr, 4)
+                    {
                         Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
                     } else {
                         None
                     };
                     match read {
                         Some(v) if v == val as u32 => {
-                            // Ждём бессрочно: единственная нить linux-процесса разбудить себя не
-                            // может, но и попасть сюда при своей же незанятой блокировке — тоже.
+                            // Веха 223.5 — СРОК ТЕПЕРЬ ЧИТАЕТСЯ. Прежде здесь стояло «ждём
+                            // бессрочно» с доводом «единственная нить разбудить себя не может»;
+                            // с нитями довод умер, а `pthread_cond_timedwait` только сроком и
+                            // живёт. `a3` — указатель на `timespec` (сек, нсек) либо 0.
+                            const FUTEX_CLOCK_REALTIME: usize = 256;
+                            let ts = a(t, 3);
+                            let deadline = read_timespec(t, cur, ts).map(|ns| {
+                                // `WAIT` считает срок ОТНОСИТЕЛЬНЫМ, `WAIT_BITSET` —
+                                // АБСОЛЮТНЫМ, и часы у него монотонные, если не попросили
+                                // иначе флагом. Перепутать эти две вещи — значит уснуть на
+                                // полвека (абсолютное время, принятое за относительное).
+                                let rel = if op == FUTEX_WAIT_BITSET {
+                                    let now = if a1 & FUTEX_CLOCK_REALTIME != 0 {
+                                        crate::clock::realtime_ns()
+                                    } else {
+                                        crate::clock::uptime_ns()
+                                    };
+                                    ns.saturating_sub(now)
+                                } else {
+                                    ns
+                                };
+                                arch::now_ticks().wrapping_add(crate::clock::ns_to_ticks(rel))
+                            });
                             t.procs[cur].state = State::FutexWait;
                             t.procs[cur].futex_addr = uaddr;
-                            t.procs[cur].futex_deadline = None;
+                            t.procs[cur].futex_deadline = deadline;
                             if let Some(n) = t.next_runnable(cur) {
                                 t.set_cur(n);
                             }
@@ -901,21 +1108,154 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                         _ => ret = linux::err(11),
                     }
                 }
-                FUTEX_WAKE => {
+                FUTEX_WAKE | FUTEX_WAKE_BITSET => {
                     let space = t.procs[cur].space;
                     ret = wake_futex(t, space, uaddr, val);
+                }
+                // Веха 223.5 — ПЕРЕСТАНОВКА ОЧЕРЕДИ СДЕЛАНА ГРУБО, И ЭТО НАРОЧНО.
+                //
+                // `requeue` просит разбудить `val` спящих на `uaddr`, а остальных ПЕРЕВЕСИТЬ на
+                // второе слово. Мы вместо этого будим ВСЕХ на первом. Это законно: ждущий
+                // futex'а обязан перепроверять своё условие в цикле — лишнее пробуждение он
+                // переживёт, пропущенное не пережил бы никто. Цена — толчея на broadcast'е
+                // условной переменной; выигрыш — отсутствие второй очереди в ядре.
+                //
+                // Честная перестановка появится, если толчея окажется видна в замере. Пока
+                // наблюдать её не на чем, а догадку в ядро класть незачем.
+                FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+                    let space = t.procs[cur].space;
+                    ret = wake_futex(t, space, uaddr, usize::MAX);
                 }
                 _ => ret = linux::err(linux::ENOSYS),
             }
         }
-        Some(Lx::SetTidAddress) => ret = cur + 1, // «tid» = индекс процесса + 1
+        // Веха 223.5 — `set_tid_address(ptr)` ЗАПОМИНАЕТ АДРЕС, а не просто отвечает номером.
+        // Это второй вход в то же обещание, что `CLONE_CHILD_CLEARTID`: libc ставит его
+        // главной нити, чтобы её смерть тоже была видна ждущим. Возврат — свой tid.
+        Some(Lx::SetTidAddress) => {
+            t.procs[cur].clear_child_tid = a0;
+            ret = cur + 1;
+        }
         Some(Lx::SetRobustList) => ret = 0,
         Some(Lx::RtSigprocmask) => ret = 0,
-        Some(Lx::RtSigaction) => ret = 0, // обработчики сигналов игнорируем (однопоточный CLI)
+        // Веха 223.6 — ЗАПОМИНАЕМ РАСПОЛОЖЕНИЕ, а не киваем.
+        //
+        // Звать обработчик нам пока нечем (нужен кадр на стеке пользователя и `rt_sigreturn`),
+        // но разницу между «игнорировать», «ловить» и «как по умолчанию» помнить обязаны: на
+        // ней стоит `abort()`, который сбрасывает сигнал в умолчание, чтобы тот наконец убил.
+        Some(Lx::RtSigaction) => {
+            const SIG_DFL: usize = 0;
+            const SIG_IGN: usize = 1;
+            let (sig, act) = (a0, a1);
+            if sig >= 1 && sig < 64 {
+                let bit = 1u64 << sig;
+                // `struct k_sigaction` начинается указателем на обработчик — его и читаем.
+                let h = if act == 0 {
+                    None
+                } else {
+                    lx_get(t, cur, act, 8).map(|b| usize::from_ne_bytes(b[0..8].try_into().unwrap()))
+                };
+                match h {
+                    Some(SIG_DFL) => {
+                        t.procs[cur].sig_ign &= !bit;
+                        t.procs[cur].sig_catch &= !bit;
+                    }
+                    Some(SIG_IGN) => {
+                        t.procs[cur].sig_ign |= bit;
+                        t.procs[cur].sig_catch &= !bit;
+                    }
+                    Some(_) => {
+                        t.procs[cur].sig_catch |= bit;
+                        t.procs[cur].sig_ign &= !bit;
+                    }
+                    None => {} // `act == 0` — только спросили старое, менять нечего
+                }
+            }
+            ret = 0;
+        }
+        // Веха 223.6 — ПОСЛАТЬ СИГНАЛ. `kill` — всей группе, `tkill`/`tgkill` — одной нити.
+        // Без этого `abort()` в musl не может убить сам себя: он зовёт `raise`, то есть
+        // `tkill` себе, получает `ENOSYS`, возвращается — и упирается в `hlt` (#GP).
+        Some(Lx::Kill) | Some(Lx::Tkill) | Some(Lx::Tgkill) => {
+            let group = decoded == Some(Lx::Kill);
+            // `tgkill(tgid, tid, sig)` — номер нити ВТОРЫМ аргументом, у остальных первым.
+            let (who, sig) = if decoded == Some(Lx::Tgkill) { (a1, a2) } else { (a0, a1) };
+            // Номера у нас «индекс + 1» (см. `gettid`), ноль и отрицательные группы не поддержаны.
+            match who.checked_sub(1).filter(|&i| i < t.procs.len() && t.procs[i].state != State::Finished) {
+                None => ret = linux::err(3), // ESRCH — нет такой цели
+                Some(target) => {
+                    let died = deliver_signal(t, target, sig, group);
+                    if died && t.procs[cur].state == State::Finished {
+                        // Убили самих себя (это и есть `abort`) — возвращаться некуда.
+                        if let Some(n) = t.next_runnable(cur) {
+                            t.set_cur(n);
+                        }
+                        done = false;
+                    } else {
+                        ret = 0;
+                    }
+                }
+            }
+        }
+        // Веха 223.6 — ОПРОС ДЕСКРИПТОРОВ. Разбор — у [`poll_revents`]; здесь ожидание.
+        //
+        // Срок отсчитывает ЯДРО (`poll_deadline`), потому что вызов повторяется: поспали
+        // ломтик — осмотрели заново. Ломтик, а не весь срок, затем, что готовность может
+        // наступить раньше, а будить нас по ней пока нечем — честная цена: задержка в ломтик.
+        Some(Lx::Poll) => {
+            /// Насколько засыпаем между осмотрами.
+            const SLICE_MS: u64 = 20;
+            let (ufds, nfds, timeout) = (a0, a1.min(64), a2 as isize);
+            let mut ready = 0usize;
+            for k in 0..nfds {
+                let at = ufds + k * 8;
+                let Some(b) = lx_get(t, cur, at, 8) else {
+                    ret = linux::err(14); // EFAULT — массив недоступен
+                    break;
+                };
+                let fd = i32::from_ne_bytes(b[0..4].try_into().unwrap());
+                let events = u16::from_ne_bytes(b[4..6].try_into().unwrap());
+                // Отрицательный номер Linux пропускает молча, обнуляя `revents`.
+                let rev = if fd < 0 { 0 } else { poll_revents(t, cur, fd as usize, events) };
+                if rev != 0 {
+                    ready += 1;
+                }
+                lx_put(t, cur, at + 6, &rev.to_ne_bytes());
+            }
+            if ready > 0 || timeout == 0 {
+                t.procs[cur].poll_deadline = None;
+                ret = ready;
+            } else {
+                // Срок ставим ОДИН раз, на первом заходе; дальше только сверяемся с ним.
+                let now = arch::now_ticks();
+                if t.procs[cur].poll_deadline.is_none() && timeout > 0 {
+                    let ns = (timeout as u64).saturating_mul(1_000_000);
+                    t.procs[cur].poll_deadline = Some(now.wrapping_add(crate::clock::ns_to_ticks(ns)));
+                }
+                match t.procs[cur].poll_deadline {
+                    Some(d) if now >= d => {
+                        t.procs[cur].poll_deadline = None;
+                        ret = 0; // срок вышел, готовых нет — это не ошибка
+                    }
+                    _ => {
+                        let slice = crate::clock::ns_to_ticks(SLICE_MS * 1_000_000);
+                        t.procs[cur].state = State::PollWait;
+                        t.procs[cur].futex_deadline = Some(now.wrapping_add(slice));
+                        if let Some(n) = t.next_runnable(cur) {
+                            t.set_cur(n);
+                        }
+                        done = false; // кадр не трогаем — `syscall` повторится и осмотрит снова
+                    }
+                }
+            }
+        }
         Some(Lx::Rseq) => ret = linux::err(linux::ENOSYS),
         Some(Lx::Prlimit64) => ret = linux::err(linux::ENOSYS),
         // ── информация ──────────────────────────────────────────────────────────
-        Some(Lx::Getpid) | Some(Lx::Gettid) => ret = cur + 1,
+        // Веха 223.5 — РАЗВЕДЕНЫ. `getpid` — номер ПРОЦЕССА (лидера группы), `gettid` — номер
+        // НИТИ. До нитей это было одно число, и libc их сравнивает: равны — «я главная нить».
+        Some(Lx::Getpid) => ret = t.procs[cur].group + 1,
+        Some(Lx::Gettid) => ret = cur + 1,
         Some(Lx::Getppid) => ret = 1,
         Some(Lx::Getuid) | Some(Lx::Geteuid) | Some(Lx::Getgid) | Some(Lx::Getegid) => ret = 0,
         // Мы «root» (uid/gid 0) — сброс привилегий busybox'а на старте no-op (успех).
@@ -1030,17 +1370,17 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             const F_DUPFD_CLOEXEC: usize = 1030;
             const FD_CLOEXEC: usize = 1;
             let (fd, cmd, arg) = (a0, a1, a2);
-            let known = t.procs[cur].lx_fds.get(fd).map(|s| s.is_some()).unwrap_or(false);
+            let known = t.procs[own].lx_fds.get(fd).map(|s| s.is_some()).unwrap_or(false);
             ret = match cmd {
                 F_DUPFD => lx_dup_fd(t, cur, fd, None, arg, false),
                 F_DUPFD_CLOEXEC => lx_dup_fd(t, cur, fd, None, arg, true),
                 _ if !known => linux::err(linux::EBADF),
                 F_GETFD => {
-                    let set = t.procs[cur].lx_fds[fd].as_ref().map(|f| f.cloexec).unwrap_or(false);
+                    let set = t.procs[own].lx_fds[fd].as_ref().map(|f| f.cloexec).unwrap_or(false);
                     if set { FD_CLOEXEC } else { 0 }
                 }
                 F_SETFD => {
-                    if let Some(Some(f)) = t.procs[cur].lx_fds.get_mut(fd) {
+                    if let Some(Some(f)) = t.procs[own].lx_fds.get_mut(fd) {
                         f.cloexec = arg & FD_CLOEXEC != 0;
                     }
                     0
@@ -1048,7 +1388,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                 // Режим открытия мы не храним: файл на запись узнаётся по буферу, всё
                 // остальное читается. Отвечаем тем, что есть, а не выдуманным набором флагов.
                 F_GETFL => {
-                    let w = t.procs[cur].lx_fds[fd].as_ref().map(|f| f.wfile.is_some());
+                    let w = t.procs[own].lx_fds[fd].as_ref().map(|f| f.wfile.is_some());
                     if w == Some(true) { 0o1 } else { 0 }
                 }
                 _ => 0,
@@ -1063,7 +1403,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             // причине.
             ret = 0;
             if a0 >= LX_FD_BASE {
-                let taken = t.procs[cur].lx_fds.get_mut(a0 - LX_FD_BASE).and_then(|s| s.take());
+                let taken = t.procs[own].lx_fds.get_mut(a0 - LX_FD_BASE).and_then(|s| s.take());
                 if let Some(sl) = taken {
                     if !lx_release_fd(t, cur, sl) {
                         ret = linux::err(linux::ENOSPC);
@@ -1074,14 +1414,60 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
         Some(Lx::Fork) => {
             // fork / vfork / clone(flags, stack, …).
             //
-            // Нить (CLONE_VM — общее адресное пространство) мы НЕ делаем: у VOID для нитей есть
-            // свой механизм, и подменять его линуксовым значило бы завести вторую модель
-            // многопоточности в одной системе. Честный отказ лучше: `pthread_create` увидит
-            // ENOSYS и скажет об этом, а не сломается посреди работы.
-            const CLONE_VM: usize = 0x100;
-            let flags = if decoded == Some(Lx::Fork) && (nr == 56 || nr == 220) { a0 } else { 0 };
+            // Веха 223.5 — НИТЬ (`CLONE_VM`) КЛАДЁТСЯ НА НАШ СОБСТВЕННЫЙ МЕХАНИЗМ (Веха 35).
+            //
+            // До этой вехи здесь стоял `ENOSYS` с доводом «не заводить вторую модель
+            // многопоточности в одной системе». Довод верен — но он про РЕАЛИЗАЦИЮ линуксовых
+            // нитей отдельным механизмом, а не про ОТОБРАЖЕНИЕ на свой. Отображение второй
+            // модели не создаёт, и доказательство лежало рядом всё это время: `futex` уже
+            // положен на нити Вехи 35 (см. `Lx::Futex` ниже), и второй моделью это никто не
+            // счёл. Нить linux-процесса — та же запись таблицы с тем же `group`, что у нитей
+            // наших программ: общие `space`, `domain` и куча, свои кадр, стек и TLS.
+            const CLONE_VM: usize = 0x0000_0100;
+            const CLONE_SETTLS: usize = 0x0008_0000;
+            const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+            const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+            const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+            let is_clone = decoded == Some(Lx::Fork) && (nr == 56 || nr == 220);
+            let flags = if is_clone { a0 } else { 0 };
             if flags & CLONE_VM != 0 {
-                ret = linux::err(linux::ENOSYS);
+                // ПОРЯДОК АРГУМЕНТОВ У АРХИТЕКТУР РАЗНЫЙ, и перепутать его — значит отдать
+                // ребёнку чужой указатель. x86-64: clone(flags, stack, ptid, ctid, tls).
+                // RISC-V — вариант `CLONE_BACKWARDS`: clone(flags, stack, ptid, tls, ctid).
+                let (child_stack, ptid) = (a1, a2);
+                let (a3, a4) = (a(t, 3), a(t, 4));
+                let (tls, ctid) = if nr == 56 { (a4, a3) } else { (a3, a4) };
+
+                let leader = t.procs[cur].group;
+                // Заводим нить штатным путём; вход и стек перепишем следом — у `clone`
+                // ребёнок не ПРЫГАЕТ на функцию, а продолжает с того же места.
+                let tid = create_thread_locked(t, leader, 0, 0, child_stack);
+                let mut frame = t.procs[cur].frame;
+                frame.set_sp(child_stack);
+                frame.set_ret(0); // ребёнку — ноль, им он и отличает себя от родителя
+                frame.skip_syscall_insn(); // шагнуть за сам `syscall`/`ecall`
+                if flags & CLONE_SETTLS != 0 {
+                    frame.set_thread_ptr(tls);
+                }
+                t.procs[tid].frame = frame;
+                // Обещание join'у: положим нить — обнулим слово и разбудим спящих на нём.
+                if flags & CLONE_CHILD_CLEARTID != 0 {
+                    t.procs[tid].clear_child_tid = ctid;
+                }
+                // Номер нити, как его видит Linux (наш индекс + 1 — та же нумерация, что у
+                // `gettid`). Пишем ОБОИМ, если просили: родителю по `ptid`, ребёнку по `ctid`.
+                let lx_tid = tid + 1;
+                if flags & CLONE_PARENT_SETTID != 0 {
+                    lx_put(t, cur, ptid, &(lx_tid as u32).to_ne_bytes());
+                }
+                if flags & CLONE_CHILD_SETTID != 0 {
+                    lx_put(t, cur, ctid, &(lx_tid as u32).to_ne_bytes());
+                }
+                vprintln!(
+                    "  [linux] P{} clone(CLONE_VM) → нить P{} (стек {:#x}, tls {:#x})",
+                    cur, tid, child_stack, tls,
+                );
+                ret = lx_tid; // родителю — номер нити
             } else {
                 let src = arch::space_root(t.procs[cur].space);
                 match unsafe { arch::copy_user_space(src) } {
@@ -1114,7 +1500,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                         // потомки. У трубы от этого прибавляется держателей, и счётчик обязан об
                         // этом узнать — иначе закрытие одного конца объявило бы конец файла
                         // всем остальным.
-                        t.procs[child].lx_fds = t.procs[cur].lx_fds.clone();
+                        t.procs[child].lx_fds = t.procs[own].lx_fds.clone();
                         let inherited: Vec<(Option<(usize, bool)>, Option<usize>)> = t.procs
                             [child]
                             .lx_fds
@@ -1238,7 +1624,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                     console: false,
                     cloexec: flags & O_CLOEXEC != 0,
                 };
-                let tbl = &mut t.procs[cur].lx_fds;
+                let tbl = &mut t.procs[own].lx_fds;
                 match tbl.iter().position(|s| s.is_none()) {
                     Some(i) => {
                         tbl[i] = Some(fd);
@@ -1432,12 +1818,12 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                             t.lx_wfiles.len() - 1
                         }
                     };
-                    if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                    if let Some(Some(sl)) = t.procs[own].lx_fds.get_mut(fd - LX_FD_BASE) {
                         sl.wfile = Some(wi);
                         sl.off = off;
                     }
                     if flags & O_CLOEXEC != 0 {
-                        if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                        if let Some(Some(sl)) = t.procs[own].lx_fds.get_mut(fd - LX_FD_BASE) {
                             sl.cloexec = true;
                         }
                     }
@@ -1448,7 +1834,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                     Some(meta) => {
                         let fd = lx_fd_alloc(t, cur, meta, path);
                         if flags & O_CLOEXEC != 0 {
-                            if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                            if let Some(Some(sl)) = t.procs[own].lx_fds.get_mut(fd - LX_FD_BASE) {
                                 sl.cloexec = true;
                             }
                         }
@@ -1494,7 +1880,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
         Some(Lx::Getdents64) => {
             // Записи каталога в linux-формате: d_ino(8) d_off(8) d_reclen(2) d_type(1) имя+NUL.
             let (fd, buf, len) = (a0, a1, a2);
-            let slot = fd.checked_sub(LX_FD_BASE).and_then(|i| t.procs[cur].lx_fds.get(i).cloned());
+            let slot = fd.checked_sub(LX_FD_BASE).and_then(|i| t.procs[own].lx_fds.get(i).cloned());
             match slot.flatten() {
                 None => ret = linux::err(linux::EBADF),
                 Some(f) => {
@@ -1526,7 +1912,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                         }
                         pos += 1;
                     }
-                    if let Some(Some(sl)) = t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE) {
+                    if let Some(Some(sl)) = t.procs[own].lx_fds.get_mut(fd - LX_FD_BASE) {
                         sl.dpos = pos;
                     }
                     ret = if lx_put(t, cur, buf, &out) {
@@ -1543,7 +1929,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                 // Ни консоль, ни труба не позиционируются — это поток, а не файл.
                 ret = linux::err(linux::ESPIPE);
             } else {
-                match t.procs[cur].lx_fds.get_mut(fd - LX_FD_BASE).and_then(|s| s.as_mut()) {
+                match t.procs[own].lx_fds.get_mut(fd - LX_FD_BASE).and_then(|s| s.as_mut()) {
                     None => ret = linux::err(linux::EBADF),
                     Some(f) => {
                         let base = match whence {
@@ -1591,7 +1977,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
         Some(Lx::Fstat) if fd_kind(t, cur, a0) == FdKind::File => {
             // fstat файла из store: тип и размер знает узел дерева.
             let (fd, buf) = (a0, a1);
-            let slot = t.procs[cur].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
+            let slot = t.procs[own].lx_fds.get(fd - LX_FD_BASE).cloned().flatten();
             ret = match slot {
                 None => linux::err(linux::EBADF),
                 Some(f) => {
@@ -1645,7 +2031,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
                 ret = if lx_put(t, cur, buf, &st) { 0 } else { linux::err(linux::EFAULT) };
             } else if empty_path && dirfd >= LX_FD_BASE as isize {
                 // AT_EMPTY_PATH на открытом файле = fstat.
-                let slot = t.procs[cur].lx_fds.get(dirfd as usize - LX_FD_BASE).cloned().flatten();
+                let slot = t.procs[own].lx_fds.get(dirfd as usize - LX_FD_BASE).cloned().flatten();
                 ret = match slot {
                     None => linux::err(linux::EBADF),
                     Some(f) => {
@@ -1671,6 +2057,25 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             }
         }
         // ── завершение ────────────────────────────────────────────────────────────
+        // Веха 223.5 — `exit` КЛАДЁТ ТОЛЬКО СЕБЯ, если это нить.
+        //
+        // До нитей `exit` и `exit_group` были одним и тем же, и это было верно: нить в
+        // linux-процессе была одна. Теперь разница существенна — `pthread_exit` зовёт именно
+        // `exit`, и положить на нём всю группу значило бы убивать процесс при выходе любой
+        // нити. Лидер по-прежнему кладёт группу: из `main` возвращаются один раз, и у libc
+        // это конец процесса (сам он зовёт `exit_group`, но полагаться на это не станем).
+        Some(Lx::Exit) if t.procs[cur].group != cur => {
+            let code = a0 & 0xff;
+            vprintln!("  [linux] P{} exit({}) — НИТЬ легла, группа жива", cur, code);
+            // ДЕСКРИПТОРЫ НЕ ТРОГАЕМ: они принадлежат группе, а не нити (`CLONE_FILES`).
+            // Закрыть их здесь значило бы оборвать файлы и трубы живому процессу из-за того,
+            // что одна его нить доработала.
+            finish_thread(t, cur, code);
+            if let Some(n) = t.next_runnable(cur) {
+                t.set_cur(n);
+            }
+            done = false; // нить завершена — кадр и PC не трогаем
+        }
         Some(Lx::Exit) | Some(Lx::ExitGroup) => {
             let code = a0 & 0xff;
             let leader = t.procs[cur].group;
@@ -1695,6 +2100,7 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
     }
 
     if done {
+        trace_lx(nr, ret as isize);
         let f = &mut t.procs[cur].frame;
         f.set_ret(ret);
         f.skip_syscall_insn(); // riscv: sepc+4; x86: rip+2 (пройти `syscall`)

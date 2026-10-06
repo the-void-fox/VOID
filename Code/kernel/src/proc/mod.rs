@@ -184,6 +184,12 @@ enum State {
     /// `FutexWait` с выдуманным адресом: спящий по времени НЕ должен просыпаться от чужого
     /// `FUTEX_WAKE`, случайно назвавшего тот же адрес.
     Sleeping,
+    /// Веха 223.6: заблокирован в linux-`poll` до срока в `futex_deadline`. Отдельно от
+    /// [`State::Sleeping`] по одной причине: проснувшись, он обязан ПОВТОРИТЬ свой вызов и
+    /// заново осмотреть дескрипторы, а не вернуть результат. Поэтому будильник ему кадра НЕ
+    /// трогает — иначе в `rax` лёг бы результат, а у инструкции `syscall` `rax` это номер
+    /// вызова (та же мина, что разведена в [`finish_futex`]).
+    PollWait,
     Finished,
 }
 
@@ -279,6 +285,35 @@ struct Proc {
     /// Веха 35 — дедлайн futex-ожидания в тиках [`arch`]-счётчика (`None` — бессрочно).
     /// Истёкший дедлайн будит нить с «таймаутом» (проверяется в [`resume`]).
     futex_deadline: Option<u64>,
+    /// Веха 223.7 — ПРОСИЛИ ПРЕРВАТЬСЯ (`SYS_INTERRUPT`). Один бит, и больше ничего.
+    ///
+    /// Сигналов в VOID нет и не будет: система живёт без юниксовых пользователей и root, и
+    /// тащить в неё юниксовую модель сигналов значило бы копировать ровно то, от чего ушли —
+    /// обработчики, маски, кадр на стеке пользователя, `sigreturn`. Вместо всего этого флажок:
+    /// кто считает в цикле — спрашивает его сам (`SYS_INTERRUPTED`), кто ждёт ввода — узнаёт
+    /// из ответа хоста stdio. Не спросил никто — второй Ctrl+C кладёт насмерть.
+    interrupted: bool,
+    /// Веха 223.6 — КОГДА ИСТЕКАЕТ нынешний linux-`poll` (тики). `None` — опроса нет.
+    ///
+    /// Держать срок приходится ядру, потому что вызов ПОВТОРЯЕТСЯ: поспали ломтик — осмотрели
+    /// дескрипторы — снова поспали. Считать остаток из аргумента нельзя: он в регистре, а
+    /// регистры аргументов по ABI обязаны пережить syscall нетронутыми.
+    poll_deadline: Option<u64>,
+    /// Веха 223.6 — какие сигналы процесс просил ИГНОРИРОВАТЬ и какие ЛОВИТЬ (бит на номер).
+    ///
+    /// Обработчиков мы пока не зовём (для этого нужен кадр на стеке пользователя и
+    /// `rt_sigreturn`), но помнить разницу обязаны: `abort()` в musl сперва поднимает сигнал с
+    /// обработчиком, а потом СБРАСЫВАЕТ его в умолчание и поднимает снова — и вот второй раз
+    /// обязан убить. Без этой памяти умирать было бы нечем.
+    sig_ign: u64,
+    sig_catch: u64,
+    /// Веха 223.5 — адрес слова, которое надо ОБНУЛИТЬ И РАЗБУДИТЬ, когда нить завершится
+    /// (`CLONE_CHILD_CLEARTID` у `clone`, он же `set_tid_address`). `0` — не просили.
+    ///
+    /// На этом стоит `pthread_join`, и больше ни на чём: присоединяющийся спит на futex'е по
+    /// этому адресу, а ядро, кладя нить, пишет туда ноль и будит ждущих. Без него `join`
+    /// висел бы вечно — реализовать нити и не сделать этого значит не сделать нити.
+    clear_child_tid: usize,
     /// Веха 38 — личность linux-abi: процесс — неизменённый static-PIE musl-бинарь из nixpkgs,
     /// его `ecall`/`syscall` уходит в трансля́тор [`crate::linux`], а не в ABI VOID. Ставится
     /// при exec'е ET_DYN-образа ([`spawn_linux_locked`]); нити наследуют (у linux их пока нет).
@@ -598,11 +633,7 @@ fn wake_netdev_owner(t: &mut Table) -> Option<usize> {
             State::IrqWait => {
                 // Кадр уже продвинут при блокировке — вернётся 0, как от настоящего прерывания.
             }
-            State::Sleeping => {
-                let f = &mut t.procs[i].frame;
-                f.set_ret(0);
-                f.advance();
-            }
+            State::Sleeping => finish_blocked(&mut t.procs[i], 0),
             _ => continue,
         }
         t.procs[i].state = State::Runnable;
@@ -696,6 +727,11 @@ fn create_process_locked(
         retval: 0,
         futex_addr: 0,
         futex_deadline: None,
+        clear_child_tid: 0,
+        interrupted: false,
+        poll_deadline: None,
+        sig_ign: 0,
+        sig_catch: 0,
         linux: false, // по умолчанию — родная личность VOID; spawn_linux_locked поставит true
         // Веха 98: обычный процесс никем не ожидается — слот освободится сразу. `SYS_SPAWN`
         // пометит своего ребёнка зомби и проставит родителя.
@@ -754,7 +790,12 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         retval: 0,
         futex_addr: 0,
         futex_deadline: None,
-        linux: t.procs[leader].linux, // нить наследует личность лидера (у linux нитей пока нет)
+        clear_child_tid: 0,
+        interrupted: false,
+        poll_deadline: None,
+        sig_ign: 0,
+        sig_catch: 0,
+        linux: t.procs[leader].linux, // нить наследует личность лидера (с Вехи 223.5 и у linux)
         zombie: false, // ждут НИТЬ через THREAD_JOIN, а не через SYS_WAIT — зомби не нужен
         parent: usize::MAX,
         exit_code: None,
@@ -1109,6 +1150,64 @@ fn wake_join_waiters(t: &mut Table, thread: usize, retval: usize) {
     }
 }
 
+/// Веха 223.5 — ПОЛОЖИТЬ НИТЬ и выполнить обещание `CLONE_CHILD_CLEARTID`.
+///
+/// Ядро обязано, кладя нить, обнулить слово по её `clear_child_tid` и разбудить спящих на нём
+/// futex'ом. На этом — и больше ни на чём — стоит `pthread_join`: присоединяющийся ничего не
+/// опрашивает, он спит на этом адресе и просыпается от нас. Реализовать нити и не сделать
+/// этого значит не сделать нити: `join` висел бы вечно.
+///
+/// Звать ТОЛЬКО когда адресное пространство нити — текущее (нить кладёт себя сама, либо её
+/// кладёт соседка по группе): запись идёт прямо по пользовательскому адресу, а он имеет смысл
+/// лишь в загруженной таблице страниц.
+fn finish_thread(t: &mut Table, idx: usize, retval: usize) {
+    t.procs[idx].state = State::Finished;
+    t.procs[idx].retval = retval;
+    let (addr, space) = (t.procs[idx].clear_child_tid, t.procs[idx].space);
+    t.procs[idx].clear_child_tid = 0; // обещание одноразовое
+    if addr != 0 && ensure_heap_range(t, idx, addr, 4) && user_range_ok(t, idx, addr, 4) {
+        unsafe { core::ptr::write_volatile(addr as *mut u32, 0) };
+        // Будим ВСЕХ: ждущих join'а может быть сколько угодно, и каждый обязан увидеть ноль.
+        wake_futex(t, space, addr, usize::MAX);
+    }
+    wake_join_waiters(t, idx, retval);
+}
+
+/// Веха 223.5 — ЗАВЕРШИТЬ заблокированный futex-вызов, чем бы он ни кончился.
+///
+/// Соглашения у двух личностей РАЗНЫЕ, и перепутать их нельзя:
+///
+/// * у VOID `SYS_FUTEX` возвращает `0` (разбудили) либо `1` (вышел срок), а инструкцию вызова
+///   кадр уже перешагнул: `int 0x80` на x86 оставляет rip ЗА ней (на riscv досылает `advance`);
+/// * у Linux `futex` возвращает `0` либо `-ETIMEDOUT`, а инструкция `syscall` ловится у нас как
+///   #UD (EFER.SCE=0), и rip стоит НА ней — перешагнуть обязаны мы.
+///
+/// Пока это не различалось, пробуждение linux-нити клало результат в `rax` и повторяло ту же
+/// инструкцию — а `rax` у `syscall` и есть НОМЕР вызова. Срок futex'а превращался в
+/// `write(uaddr, …)` и возвращал `EFAULT`; обычное пробуждение — в `read(…)`, и сходило с рук
+/// только потому, что ждущие futex'а обязаны крутиться в цикле и перепроверять условие.
+/// Поймано пробником `lx-threads`.
+fn finish_blocked(p: &mut Proc, ret: usize) {
+    p.frame.set_ret(ret);
+    if p.linux {
+        p.frame.skip_syscall_insn();
+    } else {
+        p.frame.advance();
+    }
+}
+
+/// Веха 223.5 — частный случай для futex: соглашение о РЕЗУЛЬТАТЕ у личностей тоже своё.
+/// VOID отвечает 0/1 («разбудили»/«вышел срок»), Linux — 0/`-ETIMEDOUT`.
+fn finish_futex(p: &mut Proc, timed_out: bool) {
+    const ETIMEDOUT: isize = -110;
+    let ret = match (p.linux, timed_out) {
+        (true, true) => ETIMEDOUT as usize,
+        (true, false) => 0,
+        (false, t) => t as usize,
+    };
+    finish_blocked(p, ret);
+}
+
 /// Веха 35 — разбудить до `count` нитей, спящих в FUTEX_WAIT на слове `uaddr` в
 /// пространстве `space`. Пробуждённой нити syscall вернёт 0 (обычное пробуждение).
 /// Возвращает число разбуженных (результат FUTEX_WAKE).
@@ -1122,9 +1221,7 @@ fn wake_futex(t: &mut Table, space: usize, uaddr: usize, count: usize) -> usize 
             && t.procs[i].futex_addr == uaddr
             && t.procs[i].space == space
         {
-            let f = &mut t.procs[i].frame;
-            f.set_ret(0); // 0 — разбужены (не таймаут)
-            f.advance();
+            finish_futex(&mut t.procs[i], false);
             t.procs[i].state = State::Runnable;
             t.procs[i].ready_at = arch::now_ticks();
             t.procs[i].futex_deadline = None;
@@ -1177,7 +1274,10 @@ fn drain_net_irq(t: &mut Table) -> bool {
 /// следующим `SYS_RECV` оно ещё старое. Пока он `Runnable`, будить его сроком незачем — он и
 /// так на очереди; а вот считать этот срок поводом не спать было прямой ошибкой.
 fn sleeps_by_deadline(p: &Proc) -> bool {
-    matches!(p.state, State::FutexWait | State::RecvWait | State::Sleeping | State::IrqWait)
+    matches!(
+        p.state,
+        State::FutexWait | State::RecvWait | State::Sleeping | State::IrqWait | State::PollWait
+    )
 }
 
 fn wake_futex_timeouts(t: &mut Table) {
@@ -1191,11 +1291,10 @@ fn wake_futex_timeouts(t: &mut Table) {
             continue;
         }
         match t.procs[i].state {
-            State::FutexWait => {
-                let f = &mut t.procs[i].frame;
-                f.set_ret(1); // 1 — истёк таймаут (futex_wait вернёт «не разбужен»)
-                f.advance();
-            }
+            State::FutexWait => finish_futex(&mut t.procs[i], true),
+            // Веха 223.6 — просто делаем бегущим: кадр не трогаем, `syscall` повторится сам и
+            // осмотрит дескрипторы заново (срок он проверит по `poll_deadline`).
+            State::PollWait => {}
             // Веха 91: `SYS_RECV` с дедлайном — время вышло, запроса не было.
             State::RecvWait => {
                 let f = &mut t.procs[i].frame;
@@ -1204,11 +1303,7 @@ fn wake_futex_timeouts(t: &mut Table) {
                 f.advance();
             }
             // Веха 114: `SYS_SLEEP` — срок вышел, это и есть успех.
-            State::Sleeping => {
-                let f = &mut t.procs[i].frame;
-                f.set_ret(0);
-                f.advance();
-            }
+            State::Sleeping => finish_blocked(&mut t.procs[i], 0),
             // Веха 195: `SYS_IRQ_WAIT` со сроком — прерывания не было, но ждать больше нельзя
             // (у драйвера свои таймеры). Кадр продвинут при блокировке, возвращать нечего.
             State::IrqWait => {}
@@ -1296,6 +1391,11 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                         code,
                         t.procs[cur].frame.user_pc()
                     );
+                    // Веха 223.6 — у чужой программы «место» ничего не объясняет: нужен путь,
+                    // которым она сюда пришла.
+                    if t.procs[cur].linux {
+                        lxabi::dump_lx_trace();
+                    }
                     t.procs[cur].state = State::Finished;
                     lx_close_all(&mut t, cur);
                     crate::net::ext_detach(t.procs[cur].group); // Веха 195: карта ушла с процессом

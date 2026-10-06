@@ -90,6 +90,8 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                             State::Finished => 9,
                             State::PipeWait(_) => 10,
                             State::ChildWait(_) => 11,
+                            // Веха 223.6 — linux-`poll`: спит ломтиками и осматривает заново.
+                            State::PollWait => 12,
                         };
                         // Имя = argv[0] до NUL, обрезанное до 24 байт.
                         let name: &[u8] = p.args.split(|&b| b == 0).next().unwrap_or(&[]);
@@ -236,6 +238,49 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     }
                 }
                 _ => usize::MAX, // нет права Sysview WRITE или неверный pid
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
+        // SYS_PROC_GRANT(sysview_cap, pid, my_slot) -> 0 | MAX (Веха 223.8): ОТДАТЬ процессу
+        // `pid` копию СВОЕГО права из слота `my_slot` — под правом Sysview WRITE.
+        //
+        // Зеркало отзыва, но НЕ симметричное ему, и это главное, что надо понимать. Отзыв только
+        // УБАВЛЯЕТ полномочия: худшее, чего добьётся злоумышленник, — сломает работу. Выдача
+        // ДОБАВЛЯЕТ, то есть может ПОВЫСИТЬ полномочия. Поэтому границ четыре, и все нарочно:
+        //
+        //   1. источник — СВОЙ слот. В системе без root право не берётся из воздуха, его
+        //      передают; иначе `sysview` стал бы суперправом, то есть тем самым root;
+        //   2. исходное право обязано нести `GRANT` (`g` в строке конфига) — решает ДЕКЛАРАЦИЯ,
+        //      а не диспетчер: владелец заранее сказал, что это можно передавать дальше;
+        //   3. с копии `GRANT` снимается — отдали право, а не право раздавать (нет цепочек);
+        //   4. гейт — Sysview WRITE, как у отзыва.
+        //
+        // Пятая граница живёт НЕ ЗДЕСЬ, а у диспетчера: он записывает выданное в `/etc/granted/`
+        // готовыми строками конфига. Выданное на ходу не переживает перезагрузку — постоянным
+        // оно становится только через декларацию, и конфиг остаётся полным описанием системы.
+        69 => {
+            let (scap, pid, slot) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::sysview(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
+                Ok(()) if pid < t.procs.len() && t.procs[pid].state != State::Finished => {
+                    let tdom = t.procs[pid].domain;
+                    // Себе же отдавать нечего: право и так наше, а новый слот — только мусор.
+                    if tdom != dom && cap::grant_slot(dom, slot, tdom) {
+                        println!(
+                            "  [proc] P{} ОТДАЛ P{} своё право из слота {}",
+                            cur, pid, slot
+                        );
+                        0
+                    } else {
+                        usize::MAX
+                    }
+                }
+                _ => usize::MAX,
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(result);
