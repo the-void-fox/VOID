@@ -6,9 +6,14 @@
 # версии rustc, от новой зависимости, от чужого окружения — и узнаёт об этом тот, кто клонировал
 # репозиторий, а не тот, кто сломал.
 #
-# Чего здесь НЕТ и почему. Прогонов в QEMU (`run.sh --script`, `redteam.py`) — они требуют
-# эмулятора, снимков экрана и сроков ожидания, то есть отдельной работы и отдельного времени.
-# Это следующий шаг, а не этот: сперва пусть перестанет молча ломаться сборка.
+# Веха 223.12 — ПРОГОН В QEMU появился (задание `smoke`). Сборка не ловит худший класс
+# регрессий: сломанное ядро собирается прекрасно, оно просто не грузится. Дымовой прогон
+# поднимает машину и ждёт в serial отметку «сеанс поднят» (`tools/smoke.py`).
+#
+# Чего здесь по-прежнему НЕТ и почему. Сравнения СНИМКОВ ЭКРАНА и чисел `fps`. Снимок надо
+# сверять с эталоном, эталон стареет от каждой правки оформления, и расхождение в один пиксель
+# выглядит как поломка; а числа скорости на runner'е без KVM не значат ничего. Красный CI,
+# которому не верят, хуже отсутствующего — это уже проверено на себе (30.09–06.10).
 
 name: CI
 
@@ -67,6 +72,55 @@ jobs:
       - name: собрать
         working-directory: Code
         run: cargo build --release -p void-kernel --target ${{ matrix.target }}
+
+      # Ядро x86_64 уезжает дымовому прогону: собирать его там заново значило бы делать ту же
+      # минуту работы дважды и однажды прогнать не то ядро, которое проверили здесь.
+      - name: отдать ядро дымовому прогону
+        if: matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-x86_64
+          path: Code/target/x86_64-unknown-none/release/void-kernel
+          retention-days: 1
+
+  smoke:
+    name: дымовой прогон в QEMU
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-x86_64
+          path: Code/target/x86_64-unknown-none/release
+
+      # grub-pc-bin кладёт i386-pc-модули туда, где их ищет `mkdisk.sh` (/usr/lib/grub/i386-pc);
+      # mtools пишет в FAT-раздел без root; sfdisk уже стоит (util-linux).
+      - name: qemu, grub и mtools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 grub-pc-bin grub-common mtools
+
+      # Графика VOID живёт только при загрузке через GRUB с ОБРАЗА ДИСКА: multiboot2 отдаёт тег
+      # фреймбуфера, а путь `-kernel`/PVH его не даёт вовсе. Поэтому образ, а не ядро напрямую.
+      - name: собрать образ диска
+        run: |
+          chmod +x Code/target/x86_64-unknown-none/release/void-kernel
+          Code/boot/mkdisk.sh Code/target/x86_64-unknown-none/release/void-kernel void.img 700
+
+      - name: загрузиться и дождаться сеанса
+        run: Code/tools/smoke.py void.img out
+
+      # Журнал — артефактом, и только при провале: разбираться, ПОЧЕМУ не поднялось, по одной
+      # строке «упало» нельзя, а на зелёном прогоне он никому не нужен.
+      - name: журнал при провале
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-serial
+          path: out/
+          retention-days: 7
 
   test:
     name: хост-тесты и ссылки
