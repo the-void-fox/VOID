@@ -31,6 +31,9 @@ const DEV_NET_TRANSITIONAL: u16 = 0x1000;
 
 /// virtio-rng: источник энтропии. Modern id = 0x1040 + 4, legacy — 0x1005.
 const DEV_RNG_MODERN: u16 = 0x1044;
+/// virtio-gpu (device id 16). Переходного (`transitional`) идентификатора у неё нет вовсе:
+/// устройство появилось уже после разделения, и легаси-режима у него не было никогда.
+const DEV_GPU_MODERN: u16 = 0x1050;
 const DEV_RNG_TRANSITIONAL: u16 = 0x1005;
 
 const VENDOR_INTEL: u16 = 0x8086;
@@ -451,6 +454,13 @@ pub fn probe_virtio_net() -> Option<NetDevice> {
 /// драйвер ждёт завершения в used-кольце.
 pub fn probe_virtio_rng() -> Option<BlkTransport> {
     setup_transport(find_id(BUS0, VENDOR_VIRTIO, &[DEV_RNG_MODERN, DEV_RNG_TRANSITIONAL])?)
+}
+
+/// Найти virtio-gpu на PCI (Веха 224). Прерывания не заводим по тому же доводу, что у
+/// virtio-rng: команд за кадр единицы и каждую мы тут же ждём в used-кольце, а прерывание на
+/// такой длине дороже опроса.
+pub fn probe_virtio_gpu() -> Option<BlkTransport> {
+    setup_transport(find_id(BUS0, VENDOR_VIRTIO, &[DEV_GPU_MODERN])?)
 }
 
 /// Пройти vendor-capabilities virtio, отобразить BAR-окна структур, вернуть транспорт.

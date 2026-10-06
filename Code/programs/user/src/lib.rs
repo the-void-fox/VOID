@@ -121,6 +121,7 @@ const SYS_RANDOM: usize = 37;
 const SYS_OBJ_PUT_NODE: usize = 38;
 const SYS_OBJ_CHILDREN: usize = 39;
 const SYS_VIDEO_INFO: usize = 40;
+const SYS_VIDEO_FLUSH: usize = 71;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1428,6 +1429,20 @@ pub struct VideoInfo {
     /// По каналам R, G, B: (позиция младшего бита, ширина маски). Раскладку задаёт прошивка,
     /// зашивать `0x00RRGGBB` нельзя — бывают и 16-битные режимы.
     pub rgb: [(u8, u8); 3],
+}
+
+/// `SYS_VIDEO_FLUSH(mmio_cap, x, y, w|h)` (Веха 224): ПОКАЗАТЬ прямоугольник кадра.
+///
+/// У экрана от загрузчика записи попадают на развёртку сами — это видеопамять. У virtio-gpu
+/// кадр лежит в обычной памяти, и показ там отдельная команда устройству: без неё нарисованное
+/// не появится. Вызов НЕ спрашивает, какой экран под ним, и ничего не делает там, где показ не
+/// нужен, — поэтому звать его надо ВСЕГДА, в конце кадра, а не по условию.
+///
+/// Ширина и высота едут одним словом: аргументов у вызова шесть, а два из них на то, что
+/// всегда влезает в одно, — расточительство.
+pub fn video_flush(mmio_cap: usize, x: u32, y: u32, w: u32, h: u32) {
+    let wh = w as usize | ((h as usize) << 32);
+    abi::syscall(SYS_VIDEO_FLUSH, mmio_cap, x as usize, y as usize, wh, 0, 0, 0);
 }
 
 /// `SYS_VIDEO_INFO(mmio_cap, out)` (Веха 97): геометрия и раскладка цвета экрана. Право то же,

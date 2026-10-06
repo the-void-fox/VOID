@@ -1067,6 +1067,7 @@ fn main_loop() -> ! {
 
     let mut wm = Wm {
         info,
+        fb_cap,
         rgb,
         rgb8,
         work: At::new(0, 0, info.width as i32, info.height as i32),
@@ -1846,6 +1847,8 @@ struct Wm {
     rgb: [(u32, u32); 3],
     /// Все три канала по восемь бит — тогда разбор пикселя это сдвиг, а не деление.
     rgb8: bool,
+    /// Право на экран — нужно, чтобы ПОКАЗАТЬ собранный кадр (Веха 224, `sys::video_flush`).
+    fb_cap: usize,
     super_held: bool,
     /// Веха 144 — номер поверхности ПОД КУРСОРОМ. Нужен только для того, чтобы сказать прежней,
     /// что курсор ушёл: без этого подсветка виджетов под курсором залипала бы навсегда.
@@ -2600,6 +2603,9 @@ impl Wm {
         let pitch = self.info.width as usize;
         let sh = core::mem::take(&mut self.shadow);
         let mut px = 0u32;
+        // Запоминаем ДО сброса: показ кадра ниже спрашивает ту же ветку, а флажок к тому
+        // времени уже погашен.
+        let whole = self.present_all;
         if self.present_all {
             self.present_all = false;
             for yy in 0..self.info.height as i32 {
@@ -2619,6 +2625,21 @@ impl Wm {
         }
         self.shadow = sh;
         fence();
+        // Веха 224 — ПОКАЗАТЬ выведенное. У экрана от загрузчика записи уходят на развёртку
+        // сами, и вызов ничего не делает; у virtio-gpu кадр лежит в обычной памяти, и без этой
+        // команды нарисованное не появится вовсе. Зовём ВСЕГДА и не спрашиваем, какой экран
+        // под нами: откуда взялся кадр — не дело композитора.
+        //
+        // По областям, а не одним охватывающим: у устройства цена и в пикселях тоже, а
+        // охватывающий для разбросанных кусков — это весь экран.
+        if whole {
+            sys::video_flush(self.fb_cap, 0, 0, self.info.width as u32, self.info.height as u32);
+        } else {
+            for r in &rects {
+                let r = r.rect();
+                sys::video_flush(self.fb_cap, r.x as u32, r.y as u32, r.w as u32, r.h as u32);
+            }
+        }
         self.frames.put(t0, mid, sys::monotonic_ns(), px, self.anim_busy);
     }
 

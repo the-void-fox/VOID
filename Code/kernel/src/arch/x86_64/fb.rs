@@ -46,6 +46,13 @@ const FOUR_GIB: usize = 4 * 1024 * 1024 * 1024;
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
 static BASE: AtomicUsize = AtomicUsize::new(0);
+/// ФИЗИЧЕСКИЙ адрес кадра — отдельно от [`BASE`] с Вехи 224.
+///
+/// У буфера от загрузчика они совпадают: это MMIO-окно, отображённое тождественно. У кадра
+/// virtio-gpu — нет: он живёт в обычной памяти ядра, а она с Вехи 87 лежит в higher-half.
+/// Рисовать надо по VA, а отдавать процессу под capability — физику, и до этой вехи одно
+/// число работало за оба только потому, что других источников кадра не было.
+static PHYS: AtomicUsize = AtomicUsize::new(0);
 static PITCH: AtomicUsize = AtomicUsize::new(0);
 static PIX_W: AtomicUsize = AtomicUsize::new(0);
 static PIX_H: AtomicUsize = AtomicUsize::new(0);
@@ -115,6 +122,7 @@ pub fn init(base: usize, pitch: usize, width: usize, height: usize, bpp: u8, rgb
         return false;
     }
     BASE.store(base, Ordering::Relaxed);
+    PHYS.store(base, Ordering::Relaxed); // буфер загрузчика: окно тождественное, VA = PA
     PITCH.store(pitch, Ordering::Relaxed);
     PIX_W.store(width, Ordering::Relaxed);
     PIX_H.store(height, Ordering::Relaxed);
@@ -124,6 +132,38 @@ pub fn init(base: usize, pitch: usize, width: usize, height: usize, bpp: u8, rgb
     for (i, (pos, size)) in [rgb.red, rgb.green, rgb.blue].iter().enumerate() {
         RGB_POS[i].store(*pos as usize, Ordering::Relaxed);
         RGB_SIZE[i].store((*size).clamp(1, 8) as usize, Ordering::Relaxed);
+    }
+    PRESENT.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Веха 224 — ПРИНЯТЬ КАДР ИЗ ОБЫЧНОЙ ПАМЯТИ (virtio-gpu), а не окно MMIO от загрузчика.
+///
+/// Отличий от [`init`] ровно два, и оба — следствие того, что кадр теперь живёт в RAM:
+///
+/// 1. **Адреса разные.** Рисуем по `va` (higher-half, Веха 87), отдаём наружу `pa`.
+/// 2. **Потолка в 4 ГиБ нет.** Он стоял в [`init`] потому, что буфер загрузчика используется до
+///    `mm_enable`, на таблицах трамплина. Сюда мы попадаем после опроса шины, когда таблицы ядра
+///    давно свои, и ограничивать RAM нечем.
+///
+/// Раскладка пикселя не спрашивается: ресурс создан в `B8G8R8X8`, то есть `0x00RRGGBB`.
+/// Зовётся ПОЗДНО — консоль к этому моменту уже что-то напечатала в текстовый режим или в
+/// serial, и это нормально: с этого вызова она просто продолжит пикселями.
+pub fn adopt(va: usize, pa: usize, pitch: usize, width: usize, height: usize) -> bool {
+    if va == 0 || pa == 0 || width < CELL_W || height < CELL_H || pitch < width * 4 {
+        return false;
+    }
+    BASE.store(va, Ordering::Relaxed);
+    PHYS.store(pa, Ordering::Relaxed);
+    PITCH.store(pitch, Ordering::Relaxed);
+    PIX_W.store(width, Ordering::Relaxed);
+    PIX_H.store(height, Ordering::Relaxed);
+    BYTES_PP.store(4, Ordering::Relaxed);
+    COLS.store((width / CELL_W).min(MAX_COLS), Ordering::Relaxed);
+    ROWS.store((height / CELL_H).min(MAX_ROWS), Ordering::Relaxed);
+    for (i, (pos, size)) in [(16u8, 8u8), (8, 8), (0, 8)].iter().enumerate() {
+        RGB_POS[i].store(*pos as usize, Ordering::Relaxed);
+        RGB_SIZE[i].store(*size as usize, Ordering::Relaxed);
     }
     PRESENT.store(true, Ordering::Relaxed);
     true
@@ -217,7 +257,7 @@ pub fn rows() -> usize {
 pub fn window() -> Option<(usize, usize)> {
     present().then(|| {
         (
-            BASE.load(Ordering::Relaxed),
+            PHYS.load(Ordering::Relaxed),
             PITCH.load(Ordering::Relaxed) * PIX_H.load(Ordering::Relaxed),
         )
     })

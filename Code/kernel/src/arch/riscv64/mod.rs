@@ -65,6 +65,28 @@ pub fn video_window() -> Option<(usize, usize)> {
     None
 }
 
+/// Веха 224 — virtio-gpu на riscv ищется (устройство на шине есть), но пиксельной консоли
+/// здесь пока нет: `fb` лежит в x86-части и завязана на её обвязку консоли. Чтобы экран
+/// появился и тут, `fb` надо вынести в общую часть — это следующий шаг той же вехи, а не
+/// забытая заглушка.
+pub fn video_adopt(_va: usize, _pa: usize, _pitch: usize, _w: usize, _h: usize) -> bool {
+    false
+}
+
+/// Веха 224 — найти virtio-gpu (device id **16**) среди слотов virtio-mmio.
+pub fn probe_virtio_gpu() -> Option<crate::arch::BlkTransport> {
+    const MMIO_BASE: usize = 0x1000_1000;
+    const MMIO_STRIDE: usize = 0x1000;
+    for slot in 0..8 {
+        let base = MMIO_BASE + slot * MMIO_STRIDE;
+        let r = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+        if r(0x000) == 0x7472_6976 && r(0x004) == 2 && r(0x008) == 16 {
+            return Some(crate::arch::BlkTransport::Mmio { base });
+        }
+    }
+    None
+}
+
 // ── мышь (Веха 115) ─────────────────────────────────────────────────────────
 //
 // На riscv (QEMU virt) нет ни PS/2-контроллера, ни экрана, куда двигать курсор. Заглушки

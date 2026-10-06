@@ -36,7 +36,7 @@ core::arch::global_asm!(include_str!("ap.s"));
 
 pub use pci::{
     e1000_irq_setup, probe_ahci_ports, probe_e1000, probe_virtio_blk, probe_virtio_net,
-    probe_virtio_rng, probe_xhci, MAX_DISKS,
+    probe_virtio_gpu, probe_virtio_rng, probe_xhci, MAX_DISKS,
 };
 /// Веха 130 — опись шины PCI в журнал ядра: что вообще стоит в этой машине.
 pub use pci::dump as pci_dump;
@@ -362,6 +362,11 @@ pub fn video_mode() -> Option<(usize, usize, usize)> {
 /// (`mmio:fb` в конфиге init). `None` — пиксельного режима нет.
 pub fn video_window() -> Option<(usize, usize)> {
     fb::window()
+}
+
+/// Веха 224 — принять кадр virtio-gpu как экран системы (см. [`fb::adopt`]).
+pub fn video_adopt(va: usize, pa: usize, pitch: usize, w: usize, h: usize) -> bool {
+    fb::adopt(va, pa, pitch, w, h)
 }
 
 /// Веха 97 — полное описание режима для `SYS_VIDEO_INFO`.
@@ -714,6 +719,15 @@ pub fn console_begin_write(reads_input: bool) {
 }
 pub fn console_end_write(reads_input: bool) {
     vga::end_write(reads_input);
+    // Веха 224 — у кадра virtio-gpu записи в память сами на экран не попадают: показ это
+    // отдельная команда. Консоль ядра показывает себя ЦЕЛИКОМ и только пока экран её: как
+    // только его забрал процесс, показывать кадр — его дело, а наш вывод уходит в serial.
+    //
+    // Целиком, а не по строке: у устройства цена команды, а не пикселя, и считать область ради
+    // одной строки текста значит усложнить путь, которым печатают панику.
+    if crate::virtio_gpu::present() && !fb::owned_by_user() {
+        crate::virtio_gpu::flush_all();
+    }
 }
 
 pub fn console_size() -> (usize, usize) {
