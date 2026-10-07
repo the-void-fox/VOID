@@ -158,17 +158,24 @@ dependencies = [
 [[package]]
 name = "void-conf"
 version = "0.2.0-pre1"
+dependencies = [
+ "void-fuzz",
+]
 
 [[package]]
 name = "void-drv"
 version = "0.0.1"
 dependencies = [
  "sha2",
+ "void-fuzz",
 ]
 
 [[package]]
 name = "void-fs"
 version = "0.0.1"
+dependencies = [
+ "void-fuzz",
+]
 
 [[package]]
 name = "void-fuzz"
@@ -198,6 +205,7 @@ name = "void-nix"
 version = "0.0.1"
 dependencies = [
  "void-drv",
+ "void-fuzz",
 ]
 
 [[package]]
@@ -214,3 +222,6 @@ version = "0.2.0-pre1"
 [[package]]
 name = "void-tree"
 version = "0.0.1"
+dependencies = [
+ "void-fuzz",
+]

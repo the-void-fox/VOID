@@ -15,3 +15,6 @@ authors = ["voidfox"]
 description = "Формат иерархии файлов VOID в объектном store: имена корней, индекс каталога, времена записей."
 
 [dependencies]
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }

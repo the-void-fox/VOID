@@ -16,3 +16,6 @@ description = "Язык nix: разбор и ленивое вычисление
 [dependencies]
 # Веха 189 — формат `.drv` и арифметика адресов store: `derivation` кончается ими.
 void-drv = { path = "../void-drv" }
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }

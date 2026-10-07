@@ -8,3 +8,6 @@ name = "void-md"
 version = "0.0.1"
 edition = "2021"
 authors = ["voidfox"]
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }

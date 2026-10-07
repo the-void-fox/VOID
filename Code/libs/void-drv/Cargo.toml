@@ -18,3 +18,6 @@ description = "Деривация nix в формате ATerm: разбор .drv
 # Веха 189 — sha256 для арифметики адресов store. Тот же крейт, что у `pkg` (NarHash и
 # подписи кэша): двух реализаций одного хэша в системе быть не должно.
 sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }

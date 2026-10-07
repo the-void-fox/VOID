@@ -12,3 +12,6 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Грамматика и словарь конфига поколения VOID: запись <вид> <ключ> <хвост>, виды записей и их форма."
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }

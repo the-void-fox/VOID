@@ -11,3 +11,6 @@ version = "0.0.1"
 edition = "2021"
 authors = ["voidfox"]
 description = "Формат дерева распакованного пакета в объектном store VOID: индекс каталога, типы записей, обход."
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }
