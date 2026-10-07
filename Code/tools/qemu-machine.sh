@@ -152,6 +152,38 @@ void_qemu_machine() {
         -device virtio-rng-pci,disable-legacy=on
 }
 
+# ── riscv: МАШИНА ВТОРОЙ АРХИТЕКТУРЫ (Веха 224.1) ─────────────────────────────────────────────
+#
+# Отдельной функцией, а не ключом к `void_qemu_machine`: у `virt` нет ни q35, ни AHCI, ни PCI в
+# том виде, в каком их знает x86-ветка — всё virtio-mmio. Общего у них ровно столько, сколько у
+# двух разных машин, то есть ничего, кроме имени понятия.
+#
+#   qemu-machine.sh machine-riscv <диск> [память]
+#
+# `VOID_QEMU_GPU=1` добавляет virtio-gpu. Опционально, а не всегда, и это важно: с экраном ядро
+# по умолчанию поднимает ОКОННОЕ поколение, и привычный текстовый прогон riscv (`run.sh --riscv`)
+# показывал бы журнал без шелла.
+void_qemu_machine_riscv() {
+    local disk="${1:-}" mem="${2:-1024M}"
+    [ -n "$disk" ] || {
+        echo "стенд: не сказан диск (qemu-machine.sh machine-riscv <диск> [память])" >&2
+        return 2
+    }
+    local gpu=()
+    [ -n "${VOID_QEMU_GPU:-}" ] && gpu=(-device virtio-gpu-device)
+    printf '%s\n' \
+        -machine virt \
+        -bios default \
+        -m "$mem" \
+        -global virtio-mmio.force-legacy=false \
+        -drive "file=$disk,if=none,format=raw,id=hd0" \
+        -device virtio-blk-device,drive=hd0 \
+        -netdev user,id=net0 \
+        -device virtio-net-device,netdev=net0 \
+        -device virtio-rng-device \
+        "${gpu[@]}"
+}
+
 # ── USB (Веха 196) ────────────────────────────────────────────────────────────────────────────
 #
 # До этой вехи USB на стенде не было ВОВСЕ: драйвер xHCI (Веха 50) проверяли разовой командой
@@ -337,11 +369,12 @@ void_qemu_net() {
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     case "${1:-}" in
         machine) shift; void_qemu_machine "$@" ;;
+        machine-riscv) shift; void_qemu_machine_riscv "$@" ;;
         net)     shift; void_qemu_net "$@" ;;
         usb)     shift; void_qemu_usb "$@" ;;
         snd)     shift; void_qemu_snd "$@" ;;
         *)
-            echo "qemu-machine.sh machine <образ> [память] | net [сеть] [карта] [mac] [pcap] [мкс] | usb | snd" >&2
+            echo "qemu-machine.sh machine <образ> [память] | machine-riscv <диск> [память] | net … | usb | snd" >&2
             exit 2
             ;;
     esac

@@ -11,9 +11,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) mod fb;
 mod acpi;
-mod font;
 mod gdt;
 mod ioapic;
 mod lapic;
@@ -346,7 +344,7 @@ pub fn console_init(magic: usize, info: usize) {
         // Веха 87: ebx от загрузчика — физический адрес; ядро уже в верхней половине.
         discover_framebuffer(phys_to_virt(info));
     }
-    if !fb::present() {
+    if !crate::fb::present() {
         vga::load_font();
     }
     vga::clear();
@@ -355,39 +353,39 @@ pub fn console_init(magic: usize, info: usize) {
 /// Веха 96 — режим пиксельной консоли `(ширина, высота, бит на пиксель)`; `None` — текстовый
 /// VGA (GRUB режим не дал либо мы грузились через PVH). Только для отчёта на загрузке.
 pub fn video_mode() -> Option<(usize, usize, usize)> {
-    fb::present().then(fb::geometry)
+    crate::fb::present().then(crate::fb::geometry)
 }
 
 /// Веха 97 — окно фреймбуфера `(физ. база, длина)` для выдачи процессу под capability
 /// (`mmio:fb` в конфиге init). `None` — пиксельного режима нет.
 pub fn video_window() -> Option<(usize, usize)> {
-    fb::window()
+    crate::fb::window()
 }
 
-/// Веха 224 — принять кадр virtio-gpu как экран системы (см. [`fb::adopt`]).
+/// Веха 224 — принять кадр virtio-gpu как экран системы (см. [`crate::fb::adopt`]).
 pub fn video_adopt(va: usize, pa: usize, pitch: usize, w: usize, h: usize) -> bool {
-    fb::adopt(va, pa, pitch, w, h)
+    crate::fb::adopt(va, pa, pitch, w, h)
 }
 
 /// Веха 97 — полное описание режима для `SYS_VIDEO_INFO`.
 pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
-    fb::info()
+    crate::fb::info()
 }
 
 /// Веха 97 — экран отдан процессу / забрать обратно (паника).
 pub fn video_give_to_user(pid: usize) {
-    fb::give_to_user(pid);
+    crate::fb::give_to_user(pid);
 }
 
 /// Кто сейчас владеет экраном (`None` — ядро).
 pub fn video_owner() -> Option<usize> {
-    fb::owner()
+    crate::fb::owner()
 }
 pub fn video_take_back() {
-    fb::take_back();
+    crate::fb::take_back();
 }
 
-/// Веха 96 — найти в инфо-тегах multiboot2 тег 8 (framebuffer) и отдать его [`fb::init`].
+/// Веха 96 — найти в инфо-тегах multiboot2 тег 8 (framebuffer) и отдать его [`crate::fb::init`].
 /// Раскладка тега: `addr@+8` (u64), `pitch@+16`, `width@+20`, `height@+24`, `bpp@+28` (u8),
 /// `type@+29` (u8), **`reserved@+30` — u16, а не байт** (общая часть тега ровно 32 байта),
 /// дальше для типа 1 (прямой RGB) — позиции и ширины полей R/G/B с `+32`.
@@ -410,13 +408,13 @@ fn discover_framebuffer(info: usize) {
             return;
         }
         if ty == 8 && size >= 38 && rd8(p + 29) == 1 {
-            fb::init(
+            crate::fb::init(
                 rd64(p + 8) as usize,
                 rd(p + 16) as usize,
                 rd(p + 20) as usize,
                 rd(p + 24) as usize,
                 rd8(p + 28),
-                fb::RgbFields {
+                crate::fb::RgbFields {
                     red: (rd8(p + 32), rd8(p + 33)),
                     green: (rd8(p + 34), rd8(p + 35)),
                     blue: (rd8(p + 36), rd8(p + 37)),
@@ -725,13 +723,22 @@ pub fn console_end_write(reads_input: bool) {
     //
     // Целиком, а не по строке: у устройства цена команды, а не пикселя, и считать область ради
     // одной строки текста значит усложнить путь, которым печатают панику.
-    if crate::virtio_gpu::present() && !fb::owned_by_user() {
+    if crate::virtio_gpu::present() && !crate::fb::owned_by_user() {
         crate::virtio_gpu::flush_all();
     }
 }
 
 pub fn console_size() -> (usize, usize) {
     vga::size()
+}
+
+/// Веха 224.1 — очистить консоль ЯДРА и увести её курсор в начало.
+///
+/// Крючок понадобился, когда `fb` стала общей: чистить экран, забирая его у процесса, умеет
+/// только движок консоли, а он у каждой архитектуры свой. На x86 это текстовый VGA (он же
+/// держит курсор и для пиксельного режима), на riscv — UART, которому чистить нечего.
+pub fn console_clear() {
+    vga::clear();
 }
 
 /// Забрать и обнулить счётчик потерянного ввода.

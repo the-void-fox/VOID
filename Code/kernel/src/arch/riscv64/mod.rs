@@ -52,25 +52,38 @@ pub fn console_size() -> (usize, usize) {
 /// Веха 214.1 — разнимать писателей консоли здесь не надо и нечем: консоль — UART, экрана у
 /// ядра нет, а что делает с потоком терминал на другом конце провода, мы не решаем.
 pub fn console_begin_write(_reads_input: bool) {}
-pub fn console_end_write(_reads_input: bool) {}
 
-/// Веха 96 — пиксельной консоли на riscv нет (в QEMU `virt` дисплея нет вовсе; понадобится
-/// virtio-gpu или ramfb). Заглушка арх-контракта, парная x86-версии.
+pub fn console_end_write(_reads_input: bool) {
+    // Веха 224 — кадр virtio-gpu сам на экран не попадает: показ это отдельная команда. Пока
+    // экран у ядра, показывать его некому, кроме нас. Консоль ядра здесь UART и в кадр ничего
+    // не пишет, но экран мог быть очищен при отъёме у процесса — и эту очистку надо показать.
+    if crate::virtio_gpu::present() && !crate::fb::owned_by_user() {
+        crate::virtio_gpu::flush_all();
+    }
+}
+
+/// Веха 224.1 — чистить на riscv нечего: консоль ядра это UART, своего экрана у неё нет.
+/// Парная x86-версия стирает текстовый VGA и уводит курсор в начало.
+pub fn console_clear() {}
+
+/// Веха 224.1 — ЭКРАН НА RISCV ЕСТЬ. Его даёт virtio-gpu, а описывает общая [`crate::fb`] —
+/// та же, что и на x86. Пока источником кадра был только загрузчик, модуль жил в x86-части, и
+/// здесь на его месте стояла заглушка «дисплея нет вовсе».
+///
+/// Текстовой консоли по этому кадру тут по-прежнему нет, и это не недоделка: консоль ядра на
+/// riscv — UART, а экран нужен сеансу. Движок текста остался на x86 вместе с VGA, под который
+/// он и написан.
 pub fn video_mode() -> Option<(usize, usize, usize)> {
-    None
+    crate::fb::present().then(crate::fb::geometry)
 }
 
-/// Веха 97 — фреймбуфера нет, отдавать процессу нечего.
 pub fn video_window() -> Option<(usize, usize)> {
-    None
+    crate::fb::window()
 }
 
-/// Веха 224 — virtio-gpu на riscv ищется (устройство на шине есть), но пиксельной консоли
-/// здесь пока нет: `fb` лежит в x86-части и завязана на её обвязку консоли. Чтобы экран
-/// появился и тут, `fb` надо вынести в общую часть — это следующий шаг той же вехи, а не
-/// забытая заглушка.
-pub fn video_adopt(_va: usize, _pa: usize, _pitch: usize, _w: usize, _h: usize) -> bool {
-    false
+/// Веха 224 — принять кадр virtio-gpu как экран системы.
+pub fn video_adopt(va: usize, pa: usize, pitch: usize, w: usize, h: usize) -> bool {
+    crate::fb::adopt(va, pa, pitch, w, h)
 }
 
 /// Веха 224 — найти virtio-gpu (device id **16**) среди слотов virtio-mmio.
@@ -147,13 +160,17 @@ pub fn key_pending() -> bool {
     false
 }
 pub fn video_info() -> (usize, usize, usize, usize, [(u8, u8); 3]) {
-    (0, 0, 0, 0, [(0, 0); 3])
+    crate::fb::info()
 }
-pub fn video_give_to_user(_pid: usize) {}
+pub fn video_give_to_user(pid: usize) {
+    crate::fb::give_to_user(pid);
+}
 pub fn video_owner() -> Option<usize> {
-    None
+    crate::fb::owner()
 }
-pub fn video_take_back() {}
+pub fn video_take_back() {
+    crate::fb::take_back();
+}
 
 // ─── прерывания ─────────────────────────────────────────────────────────────
 

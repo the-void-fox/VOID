@@ -31,13 +31,13 @@ const H: usize = 25;
 /// Ширина консоли в знакоместах.
 #[inline]
 fn w() -> usize {
-    if super::fb::present() { super::fb::cols() } else { W }
+    if crate::fb::present() { crate::fb::cols() } else { W }
 }
 
 /// Высота консоли в знакоместах.
 #[inline]
 fn h() -> usize {
-    if super::fb::present() { super::fb::rows() } else { H }
+    if crate::fb::present() { crate::fb::rows() } else { H }
 }
 
 /// Размер консоли в знакоместах — наружу (Веха 120, `SYS_CONSIZE`). Программе, рисующей во весь
@@ -56,10 +56,10 @@ static mut ATTR: u8 = ATTR_DEFAULT;
 
 #[inline]
 unsafe fn put_cell(row: usize, col: usize, ch: u8) {
-    if super::fb::present() {
+    if crate::fb::present() {
         // Веха 97: экран мог уйти процессу — тогда ядро молчит (вывод остаётся в serial).
-        if !super::fb::owned_by_user() {
-            super::fb::put_cell(row, col, ch, ATTR);
+        if !crate::fb::owned_by_user() {
+            crate::fb::put_cell(row, col, ch, ATTR);
         }
         return;
     }
@@ -207,9 +207,9 @@ unsafe fn newline() {
 
 /// Сдвинуть все строки на одну вверх, очистить последнюю (кольцевого буфера нет — экран мал).
 unsafe fn scroll() {
-    if super::fb::present() {
-        if !super::fb::owned_by_user() {
-            super::fb::scroll(ATTR);
+    if crate::fb::present() {
+        if !crate::fb::owned_by_user() {
+            crate::fb::scroll(ATTR);
         }
         return;
     }
@@ -456,9 +456,9 @@ pub fn put_char(c: char) {
 /// Очистить экран текущим цветом и увести курсор в начало (для `clear` из vsh — Веха 43).
 pub fn clear() {
     unsafe {
-        if super::fb::present() {
-            if !super::fb::owned_by_user() {
-                super::fb::clear(ATTR);
+        if crate::fb::present() {
+            if !crate::fb::owned_by_user() {
+                crate::fb::clear(ATTR);
             }
         } else {
             let blank = ((ATTR as u16) << 8) | b' ' as u16;
@@ -476,9 +476,9 @@ pub fn clear() {
 pub fn sync_cursor() {
     unsafe {
         // Веха 96: в пиксельном режиме аппаратного курсора нет — рисуем свой (подчёркивание).
-        if super::fb::present() {
-            if !super::fb::owned_by_user() {
-                super::fb::cursor(ROW, COL);
+        if crate::fb::present() {
+            if !crate::fb::owned_by_user() {
+                crate::fb::cursor(ROW, COL);
             }
             return;
         }
@@ -502,7 +502,7 @@ unsafe fn outb(port: u16, v: u8) {
 /// на трамплинных таблицах (0xA0000 отображён идентично). На QEMU безвредно, на металле —
 /// именно это делает русскую консоль читаемой.
 pub fn load_font() {
-    let font = &super::font::CP866_8X16;
+    let font = &crate::font::CP866_8X16;
     unsafe {
         // ── дать доступ к плоскости 2 (шрифт) по 0xA0000 ──
         outb(0x3C4, 0x00); outb(0x3C5, 0x01); // Seq: синхронный сброс

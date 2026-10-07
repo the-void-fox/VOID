@@ -3,7 +3,7 @@
 #
 #   Code/tools/run.sh                  собрать и запустить (x86_64, окно + serial здесь)
 #   Code/tools/run.sh --fresh          пересобрать образ с нуля (store СТИРАЕТСЯ)
-#   Code/tools/run.sh --riscv          вторая архитектура (текстовая консоль, без графики)
+#   Code/tools/run.sh --riscv          вторая архитектура (текстовая консоль; экран — rvscreen.py)
 #   Code/tools/run.sh --headless       без окна QEMU — только консоль ядра в терминале
 #   Code/tools/run.sh --net none       без сетевой карты вовсе
 #   Code/tools/run.sh --script с.txt в/  СЦЕНАРНЫЙ прогон: клавиши, мышь, снимки (screenrun.py)
@@ -134,11 +134,15 @@ command -v cargo >/dev/null 2>&1 || { echo "нет cargo на PATH (rustup ст�
 flags=()
 [ "$profile" = release ] && flags=(--release)
 
-# ── riscv: там нет ни экрана, ни GRUB — только `cargo run` и консоль ─────────────────────────
+# ── riscv: GRUB'а нет, консоль — UART ────────────────────────────────────────────────────────
 #
-# Отдельной веткой, а не «тем же кодом с другим таргетом»: на riscv (QEMU virt) дисплея нет
-# вовсе, значит нет ни образа с GRUB, ни фреймбуфера, ни композитора. Диск при этом нужен —
-# store живёт в нём, — и раннер из `.cargo/config.toml` ждёт его рядом с исходниками.
+# Отдельной веткой, а не «тем же кодом с другим таргетом»: на riscv (QEMU virt) нет ни образа с
+# GRUB, ни BIOS-загрузки — ядро грузит сам QEMU (`-kernel`). Диск при этом нужен: store живёт в
+# нём, и раннер из `.cargo/config.toml` ждёт его рядом с исходниками.
+#
+# Веха 224.1 — ЭКРАН НА RISCV ТЕПЕРЬ ЕСТЬ (virtio-gpu), но этот прогон остаётся текстовым, и
+# намеренно: с экраном ядро по умолчанию поднимает ОКОННОЕ поколение, и привычный здесь шелл в
+# UART сменился бы журналом без приглашения. Посмотреть графику на riscv — `tools/rvscreen.py`.
 if [ "$arch" = riscv ]; then
     disk="$code/void-disk.img"
     [ "$fresh" = 1 ] && rm -f "$disk"
@@ -149,7 +153,7 @@ if [ "$arch" = riscv ]; then
         truncate -s 512M "$disk"
         say "создан пустой диск $disk (512 МиБ, разрежённый)"
     fi
-    say "riscv64: текстовая консоль, графики на этой архитектуре нет. Выход: Ctrl-A, затем X"
+    say "riscv64: текстовая консоль. Графика есть, но отдельно: tools/rvscreen.py. Выход: Ctrl-A, затем X"
     cd "$code"
     exec cargo run "${flags[@]}" --target riscv64gc-unknown-none-elf
 fi

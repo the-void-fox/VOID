@@ -177,7 +177,7 @@ pub fn init() -> usize {
         //    строки первый же println после `mm_enable` ушёл бы в неотображённую память. До сих
         //    пор консоль жила на таблицах трамплина (первые 4 ГиБ тождественно) — потому и
         //    печаталась; здесь отображение становится постоянным.
-        if let Some((base, len)) = super::fb::window() {
+        if let Some((base, len)) = crate::fb::window() {
             map_range(root, base, base + len, PTE_W | PTE_NX);
         }
     }
