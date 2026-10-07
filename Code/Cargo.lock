@@ -150,14 +150,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "void-abi"
-version = "0.1.0"
+version = "0.2.0-pre1"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "void-conf"
-version = "0.1.0"
+version = "0.2.0-pre1"
 
 [[package]]
 name = "void-drv"
@@ -172,7 +172,7 @@ version = "0.0.1"
 
 [[package]]
 name = "void-kernel"
-version = "0.1.0"
+version = "0.2.0-pre1"
 dependencies = [
  "void-abi",
  "void-conf",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "void-nar"
-version = "0.1.0"
+version = "0.2.0-pre1"
 
 [[package]]
 name = "void-nix"
@@ -195,14 +195,14 @@ dependencies = [
 
 [[package]]
 name = "void-store"
-version = "0.1.0"
+version = "0.2.0-pre1"
 dependencies = [
  "void-abi",
 ]
 
 [[package]]
 name = "void-touch"
-version = "0.1.0"
+version = "0.2.0-pre1"
 
 [[package]]
 name = "void-tree"
