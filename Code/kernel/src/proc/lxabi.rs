@@ -356,6 +356,7 @@ fn lx_dup_fd(
         }
     }
     match to {
+        Some(newfd) if newfd >= LX_FD_LIMIT => crate::linux::err(crate::linux::EBADF),
         Some(newfd) => {
             // Занятый номер сперва ЗАКРЫВАЕТСЯ — так велит POSIX, и на этом стоит
             // перенаправление: `dup2(труба, 1)` обязан убрать прежний stdout, иначе тот остался
@@ -370,6 +371,9 @@ fn lx_dup_fd(
             tbl[newfd] = Some(copy);
             newfd
         }
+        // `min` приходит из `fcntl(F_DUPFD)` и тоже назван ПРОГРАММОЙ — тот же потолок и по
+        // тому же доводу: иначе стол растёт до названного числа.
+        None if min >= LX_FD_LIMIT => crate::linux::err(crate::linux::EBADF),
         None => {
             let tbl = &mut t.procs[own].lx_fds;
             while tbl.len() <= min {
@@ -445,6 +449,17 @@ fn lx_fd_alloc(t: &mut Table, cur: usize, meta: crate::lxfs::Meta, path: Vec<u8>
 /// константой, а не убран, ровно затем, чтобы арифметика в двух десятках мест осталась той же и
 /// правка не превратилась в переписывание всей личности.
 const LX_FD_BASE: usize = 0;
+
+/// Веха 225.3 — ПОТОЛОК НОМЕРА ДЕСКРИПТОРА. Без него `dup3` убивал машину одной строкой.
+///
+/// Стол дескрипторов растили ДО НОМЕРА, НАЗВАННОГО ПРОГРАММОЙ (`while tbl.len() <= newfd`), а
+/// номер приходит вторым аргументом `dup2`/`dup3`. `dup3(0, usize::MAX, 0)` — и куча ядра (16
+/// МиБ) кончается на очередном удвоении вектора: паника распределителя, то есть смерть машины.
+/// Прав для этого не нужно никаких. Нашёл `lx-fuzz`, случай 8778.
+///
+/// Тысяча — с запасом: у Linux тот же потолок задаёт `RLIMIT_NOFILE`, и типичное мягкое
+/// значение там 1024. Выход за него — `EBADF`, ровно как у Linux, когда `newfd` вне диапазона.
+const LX_FD_LIMIT: usize = 1024;
 
 /// Права страницы из `prot` линуксового `mmap`/`mprotect` (PROT_READ=1, WRITE=2, EXEC=4).
 ///
@@ -615,11 +630,45 @@ fn lx_page_flags(prot: usize) -> usize {
 
 /// Материализовать диапазон страниц процесса с правами на ЗАПИСЬ (в них ещё предстоит копировать).
 /// `false` — не хватило памяти или квоты.
+/// Веха 225.3 — ДИАПАЗОН ПРИНАДЛЕЖИТ ПРОЦЕССУ? `None` — нет, трогать нельзя.
+///
+/// ## Чем это стоило ядра
+///
+/// `mprotect` отдавал адрес и длину из U-mode прямо в [`lx_protect_range`], а та шла по ним
+/// страница за страницей и ПЕРЕСТАВЛЯЛА ПРАВА всему, что находила в таблицах. Таблицы у нас
+/// общие: ядро живёт в тех же, higher-half, а MMIO-окна отображены тождественно — и локальный
+/// APIC лежит по `0xFEE0_0000`, то есть НИЖЕ терабайта.
+///
+/// Отсюда `mprotect(0, 1 << 40, 0)` из любой Linux-программы: обход от нуля до терабайта
+/// натыкается на страницу APIC и снимает с неё права ядра. Следующее же прерывание таймера
+/// пишет EOI — страница недоступна — ядро умирает (`cr2 = 0xFEE000B0`). Нашёл `lx-fuzz`,
+/// случай 223.
+///
+/// ## Почему проверка ЗДЕСЬ, а не в `mprotect`
+///
+/// Потому что в `mprotect` её забыли, а в `mmap` — нет (`end > limit || start < …`). Чинить
+/// там, где поймали, значит оставить класс живым: ровно это уже случилось с проверкой
+/// диапазонов в Вехе 223.6, и стоило второй смерти ядра (Веха 225). Поэтому граница стоит
+/// внутри обеих функций, которые ходят по страницам, и обойти её вызывающий не может.
+fn user_range(start: usize, size: usize) -> Option<(usize, usize)> {
+    if size == 0 {
+        return None;
+    }
+    let end = start.checked_add(size)?; // переполнение — заведомо не диапазон процесса
+    if start < USER_REGION_START || end > USER_STACK_TOP_VA {
+        return None;
+    }
+    Some((start, end))
+}
+
 fn lx_map_range(t: &mut Table, cur: usize, start: usize, size: usize, _prot: usize) -> bool {
+    let Some((start, end)) = user_range(start, size) else {
+        return false;
+    };
     let leader = t.procs[cur].group;
     let root = arch::space_root(t.procs[cur].space);
     let mut va = start;
-    while va < start + size {
+    while va < end {
         // Страница могла остаться от ПРЕДЫДУЩЕГО отображения этого же диапазона (ld.so сперва
         // резервирует весь файл, потом кладёт в него сегменты) — и остаться без права записи.
         // Копировать в такую нечем, поэтому права возвращаем на запись независимо от того,
@@ -649,11 +698,14 @@ fn lx_map_range(t: &mut Table, cur: usize, start: usize, size: usize, _prot: usi
 }
 
 /// Поставить диапазону страниц права `prot` (уже отображённым — не трогая их содержимого).
-fn lx_protect_range(t: &mut Table, cur: usize, start: usize, size: usize, prot: usize) {
+fn lx_protect_range(t: &mut Table, cur: usize, start: usize, size: usize, prot: usize) -> bool {
+    let Some((start, end)) = user_range(start, size) else {
+        return false;
+    };
     let root = arch::space_root(t.procs[cur].space);
     let flags = lx_page_flags(prot);
     let mut va = start;
-    while va < start + size {
+    while va < end {
         if let Some(pa) = arch::translate(root, va) {
             let _ = unsafe { arch::map(root, va, pa & !(PAGE - 1), flags) };
         }
@@ -662,6 +714,7 @@ fn lx_protect_range(t: &mut Table, cur: usize, start: usize, size: usize, prot: 
     // Веха 170 — права УРЕЗАНЫ (mprotect снимает запись с уже отданных страниц): сосед со
     // старой трансляцией продолжал бы туда писать.
     flush_space(t, t.procs[cur].space);
+    true
 }
 
 /// Веха 38 — трансля́тор Linux-syscall'ов для процессов личности `linux` ([`crate::linux`]).
@@ -1028,8 +1081,14 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             // Веха 108.4 — теперь по-настоящему: ld.so переводит RELRO в read-only и ставит
             // права сегментам, а страницы у нас появляются с правами из mmap.
             let (addr, len, prot) = (a0, a1, a2);
-            lx_protect_range(t, cur, addr & !(PAGE - 1), (len + PAGE - 1) & !(PAGE - 1), prot);
-            ret = 0;
+            // Длину округляем БЕЗ переполнения: `len = usize::MAX` давало ноль, и диапазон
+            // молча становился пустым вместо отказа.
+            let size = len.saturating_add(PAGE - 1) & !(PAGE - 1);
+            ret = if lx_protect_range(t, cur, addr & !(PAGE - 1), size, prot) {
+                0
+            } else {
+                linux::err(linux::ENOMEM)
+            };
         }
         Some(Lx::Madvise) => ret = 0,
         Some(Lx::Mremap) => ret = linux::err(linux::ENOSYS),
@@ -1273,9 +1332,19 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
             // Веха 86: был линейный конгруэнтный генератор от счётчика — теперь общий источник
             // ядра (аппаратный ГСЧ + пул событий, [`crate::random`]), тот же, что у SYS_RANDOM.
             let (buf, len) = (a0, a1);
-            let mut tmp = alloc::vec![0u8; len];
+            // Веха 225.3 — ПОТОЛОК, и он не перестраховка. Здесь стояло `vec![0u8; len]` с
+            // длиной прямо от программы: `getrandom(buf, 1 << 40)` — это попытка выделить
+            // терабайт в куче ядра (16 МиБ), то есть паника, то есть смерть машины. Прав для
+            // такого не нужно никаких.
+            //
+            // Короткий ответ здесь ЗАКОННЫЙ, а не уловка: `getrandom` по своему описанию вправе
+            // отдать меньше запрошенного, и вызывающий обязан это уметь. Отдаём сколько влезло
+            // и говорим сколько.
+            const RND_MAX: usize = 64 * 1024;
+            let n = len.min(RND_MAX);
+            let mut tmp = alloc::vec![0u8; n];
             crate::random::fill(&mut tmp);
-            ret = if lx_put(t, cur, buf, &tmp) { len } else { linux::err(linux::EFAULT) };
+            ret = if lx_put(t, cur, buf, &tmp) { n } else { linux::err(linux::EFAULT) };
         }
         Some(Lx::Getcwd) => {
             // Корневой каталог: "/". Linux getcwd возвращает длину включая NUL.
