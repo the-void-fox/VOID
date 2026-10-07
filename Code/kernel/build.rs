@@ -11,7 +11,7 @@ const PROGRAMS: &[&str] = &[
     "hello", "vsh", "posixfs", "mini-sh", "blk-srv", "blk-cli", "obj-srv", "obj-cli", "cap-srv",
     "cap-cli", "busy", "heap", "crash", "bench", "net-srv", "threads", "freeze", "e1000d",
     "lx_e1000", "vvsh", "httpsc", "spawn-demo", "stdio-demo", "pkg", "klog", "ved",
-    "hostile", "run", "probe", "ps",
+    "hostile", "run", "probe", "sysfuzz", "ps",
     // Веха 187 (ADR 0019, шаг 4) — песочница сборки: выполняет деривацию на самом устройстве.
     "nixb",
     // Веха 188 (ADR 0019, шаг 5) — вычислитель языка nix.
