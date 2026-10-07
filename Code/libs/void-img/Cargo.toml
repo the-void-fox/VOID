@@ -24,6 +24,7 @@ miniz_oxide = { version = "0.8", default-features = false, features = ["with-all
 zune-jpeg = { version = "0.5", default-features = false }
 
 [dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }
 # ЭТАЛОНЫ для host-тестов, в VOID не попадают. Смысл именно в независимости: наш PNG сверяется
 # с png от image-rs, наш JPEG (zune) — с jpeg-decoder от image-rs. Совпасть по ошибке два разных
 # декодера не могут.

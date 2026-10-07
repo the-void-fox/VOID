@@ -171,6 +171,10 @@ name = "void-fs"
 version = "0.0.1"
 
 [[package]]
+name = "void-fuzz"
+version = "0.2.0-pre1"
+
+[[package]]
 name = "void-kernel"
 version = "0.2.0-pre1"
 dependencies = [
@@ -185,6 +189,9 @@ dependencies = [
 [[package]]
 name = "void-nar"
 version = "0.2.0-pre1"
+dependencies = [
+ "void-fuzz",
+]
 
 [[package]]
 name = "void-nix"

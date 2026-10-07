@@ -1,0 +1,10 @@
+[package]
+name = "void-fuzz"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# Крейт ХОСТОВЫЙ и только для тестов: на VOID ему делать нечего, в ядро он не едет.
+# Зависимостей нет намеренно — мутатор должен быть воспроизводим до байта, а чужой ГСЧ
+# меняет поток между версиями.
+[dependencies]

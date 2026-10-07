@@ -129,6 +129,43 @@ jobs:
           path: out/
           retention-days: 7
 
+  fuzz:
+    name: фаззинг разборщиков
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: тулчейн
+        run: rustup toolchain install stable --profile minimal
+
+      - name: кэш cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Code/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('Code/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-fuzz-
+
+      # RELEASE, а не debug, и это замер, а не вкус: двадцать тысяч кругов по декодеру картинок
+      # занимают 333 с в отладке и 29 с в оптимизированной сборке. Глубина выбирается сама
+      # (`void_fuzz::rounds`): мелко в debug — чтобы `cargo test` разработчика оставался быстрым,
+      # глубоко в release — здесь.
+      #
+      # Находка печатает зерно и круг; `void_fuzz::replay` по ним достаёт точный вход, и его
+      # можно положить обычным тестом рядом.
+      - name: разборщики чужих байтов
+        working-directory: Code
+        run: cargo test --release -p void-nar --test fuzz --target x86_64-unknown-linux-gnu
+
+      - name: разборщики в обособленных крейтах
+        run: |
+          for c in libs/void-img libs/void-wpa; do
+            echo "── $c"
+            ( cd "Code/$c" && cargo test --release --test fuzz )
+          done
+
   test:
     name: хост-тесты и ссылки
     runs-on: ubuntu-latest

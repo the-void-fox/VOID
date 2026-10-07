@@ -19,3 +19,6 @@ aes = { version = "0.8", default-features = false }
 default = ["alloc"]
 # Сборка кадров требует кучи; разбор и крипта — нет.
 alloc = []
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }

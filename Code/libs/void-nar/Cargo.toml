@@ -6,3 +6,6 @@ name = "void-nar"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+
+[dev-dependencies]
+void-fuzz = { path = "../void-fuzz" }
