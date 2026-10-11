@@ -129,6 +129,59 @@ jobs:
           path: out/
           retention-days: 7
 
+  uefi:
+    name: загрузка по UEFI
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-x86_64
+          path: Code/target/x86_64-unknown-none/release
+
+      # Отдельное задание, а не шаг в `smoke`: UEFI — ДРУГОЙ путь загрузки, и ломается он
+      # отдельно от BIOS. Проверено на себе (Веха 226): ядро, которое прекрасно поднималось под
+      # BIOS, под UEFI не находило ACPI, а найдя — умирало на `#GP`. Один прогон этого не видел.
+      #
+      # grub-efi-amd64-bin кладёт платформу x86_64-efi, ovmf — саму прошивку;
+      # dosfstools нужен `mkesp.sh` (mkfs.vfat/fsck.vfat).
+      - name: qemu, grub (BIOS и EFI), ovmf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 grub-pc-bin grub-efi-amd64-bin \
+                                      grub-common xorriso mtools dosfstools ovmf
+
+      - name: собрать гибридный образ
+        env:
+          VOID_GRUB_EFI: /usr
+        run: |
+          chmod +x Code/target/x86_64-unknown-none/release/void-kernel
+          Code/boot/mkboot.sh Code/target/x86_64-unknown-none/release/void-kernel
+
+      # ЧЕТЫРЕ ядра нарочно: на одном ядре отвалившийся SMP выглядел бы правильным ответом —
+      # именно так Веха 226 и начала мерить, пока не сравнила с BIOS на том же числе ядер.
+      - name: загрузиться по UEFI и дождаться сеанса
+        env:
+          VOID_OVMF: /usr/share/OVMF/OVMF_CODE.fd
+          VOID_OVMF_VARS: /usr/share/OVMF/OVMF_VARS.fd
+          # На runner'е нет KVM — всё идёт через TCG, и прошивка UEFI поднимается заметно дольше
+          # SeaBIOS. Поэтому срок вдвое больше, чем у дымового прогона, а подъём ОКОННОГО сеанса
+          # не требуется вовсе (`--без-сеанса`): под эмуляцией он не укладывается в разумное
+          # время — ровно та причина, по которой дымовой прогон здесь текстовый. Всё, что ломается
+          # именно от UEFI, случается раньше композитора.
+          VOID_UEFI_DEADLINE: "600"
+        run: Code/tools/uefirun.py Code/boot/void.iso out-uefi --без-сеанса -- -smp 4
+
+      - name: журнал при провале
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uefi-serial
+          path: out-uefi/
+          retention-days: 7
+
   fuzz:
     name: фаззинг разборщиков
     runs-on: ubuntu-latest

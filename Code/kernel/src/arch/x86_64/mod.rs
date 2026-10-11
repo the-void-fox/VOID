@@ -205,6 +205,7 @@ fn discover_multiboot(info: usize) -> usize {
     let rd = |off: usize| unsafe { core::ptr::read_volatile((info + off) as *const u32) };
     let rd64 = |off: usize| unsafe { core::ptr::read_unaligned((info + off) as *const u64) };
     let mut basic = 0usize; // ёмкость по тегу 4 — запасной ответ, если карты (тег 6) не дали
+    let mut acpi_new = false; // видели ли тег 15 (RSDP v2) — он сильнее тега 14
     let mut total = 0usize; // сумма пригодных записей карты
     let mut p = 8usize; // теги начинаются после total_size(u32)+reserved(u32)
     loop {
@@ -248,6 +249,27 @@ fn discover_multiboot(info: usize) -> usize {
                         e += esize;
                     }
                 }
+            }
+            // Веха 226 — АДРЕС ТАБЛИЦ ACPI (теги 14 и 15). На UEFI это единственный способ их
+            // найти: прошивка сообщает адрес через свою системную таблицу, а `RSD PTR ` в
+            // области BIOS не кладёт — там этой области может не быть вовсе. Тег 14 — копия
+            // RSDP версии 1 (20 байт), тег 15 — версии 2 (36 байт); сама копия лежит ТЕЛОМ
+            // тега, поэтому адрес = `info + p + 8`.
+            //
+            // Тег 15 сильнее: у него есть XSDT, то есть 64-битные адреса таблиц. Поэтому 14
+            // ставится только если 15 ещё не видели, а 15 — всегда.
+            //
+            // `virt_to_phys` здесь ОБЯЗАТЕЛЕН: `info` переведён в виртуальный адрес ещё в
+            // `platform_init` (строка с `phys_to_virt`), а ACPI говорит физическими — вся
+            // `acpi.rs` читает через `phys()`. Первая редакция сохранила виртуальный адрес как
+            // физический, и `phys_to_virt` от него дал НЕКАНОНИЧЕСКИЙ адрес: `#GP`, vector 13,
+            // err 0 — ровно то, чем отвечает процессор на такое обращение, и ни слова про
+            // адреса в самом сообщении. Правило проекта «физика ≠ VA» стоило здесь одного
+            // прогона.
+            14 if !acpi_new => acpi::set_rsdp_from_boot(virt_to_phys(info + p + 8)),
+            15 => {
+                acpi_new = true;
+                acpi::set_rsdp_from_boot(virt_to_phys(info + p + 8));
             }
             3 => {
                 let (start, end) = (rd(p + 8) as usize, rd(p + 12) as usize);
@@ -1172,6 +1194,14 @@ pub fn now_cycles() -> Option<u64> {
 
 /// MSR базы сегмента `%fs` — Веха 35 несёт в нём TLS-указатель нити (Variant II).
 const IA32_FS_BASE: u32 = 0xC000_0100;
+
+/// Прочитать модельно-специфичный регистр (ring0). `ecx = msr`, ответ в `edx:eax`.
+#[inline]
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nostack, nomem));
+    ((hi as u64) << 32) | lo as u64
+}
 
 /// Записать модельно-специфичный регистр (ring0). `edx:eax = value`, `ecx = msr`.
 #[inline]
