@@ -51,6 +51,51 @@ STAGES = [
 ]
 BAD = ("[PANIC]", "FATAL TRAP", "ПРОЦЕСС УБИТ")
 
+# Где прошивку кладут дистрибутивы. Списком, а не выражением внутри функции, — чтобы его можно
+# было подменить в проверке: на NixOS ни одного из этих каталогов нет, и убедиться, что разбор
+# имён верный, иначе нечем.
+CANDIDATE_DIRS = (
+    "/usr/share/OVMF",       # Debian/Ubuntu: OVMF_CODE_4M.fd + OVMF_VARS_4M.fd
+    "/usr/share/ovmf",
+    "/usr/share/ovmf/x64",   # Arch
+    "/usr/share/edk2/ovmf",  # Fedora
+    "/usr/share/edk2/x64",
+    "/usr/share/qemu",
+)
+
+
+def firmware():
+    """Найти прошивку: сперва то, что назвали, потом — где её кладут дистрибутивы.
+
+    Зашивать путь нельзя: в nix-сторе он с хэшем, у Ubuntu это `OVMF_CODE_4M.fd`, у Fedora —
+    `/usr/share/edk2/ovmf/`. Первая редакция требовала `VOID_OVMF` и упала в CI ровно на этом:
+    пакет стоял, прошивка лежала, а стенд сказал «войди в nix-shell».
+
+    Код и переменные берутся ПАРОЙ из одного каталога: `OVMF_CODE_4M.fd` и `OVMF_VARS.fd` имеют
+    разный размер pflash, и смешать их — получить прошивку, которая не стартует.
+    """
+    named = os.environ.get("VOID_OVMF")
+    if named and os.path.exists(named):
+        v = os.environ.get("VOID_OVMF_VARS") or named.replace("_CODE", "_VARS")
+        if os.path.exists(v):
+            return named, v
+    tried = []
+    for d in CANDIDATE_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for c in sorted(os.listdir(d)):
+            if not (c.startswith("OVMF_CODE") and c.endswith(".fd")):
+                continue
+            v = os.path.join(d, c.replace("_CODE", "_VARS"))
+            tried.append(os.path.join(d, c))
+            if os.path.exists(v):
+                return os.path.join(d, c), v
+    sys.exit(
+        "прошивки UEFI не нашлось. Назови её в VOID_OVMF (+ VOID_OVMF_VARS) или поставь пакет:\n"
+        "  NixOS: уже в shell.nix (OVMF)   ·   Debian/Ubuntu: apt install ovmf\n"
+        + (f"  нашлось без пары переменных: {', '.join(tried)}\n" if tried else "")
+    )
+
 
 def main():
     if len(sys.argv) < 3:
@@ -64,10 +109,8 @@ def main():
     extra = args[args.index("--") + 1:] if "--" in args else []
     os.makedirs(out, exist_ok=True)
 
-    code = os.environ.get("VOID_OVMF")
-    varsrc = os.environ.get("VOID_OVMF_VARS")
-    if not code or not os.path.exists(code):
-        sys.exit("нет VOID_OVMF — войди в nix-shell (прошивка ставится из пакета OVMF)")
+    code, varsrc = firmware()
+    print(f"прошивка: {code}")
     nvram = os.path.join(out, "OVMF_VARS.fd")
     shutil.copyfile(varsrc, nvram)
     os.chmod(nvram, 0o644)
