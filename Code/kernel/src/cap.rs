@@ -157,6 +157,10 @@ struct Domain {
     /// Веха 156 — c-space ВТОРОГО живого тёзки: не личность программы, а временная таблица.
     /// Не персистится и умирает вместе с процессом (домен становится тумбой).
     transient: bool,
+    /// Веха 225.5 — про исчерпание слотов УЖЕ сказано. Один раз на домен, а не на попытку:
+    /// жадный процесс просит их в цикле, и зонд `greed` залил журнал шестьюдесятью тысячами
+    /// одинаковых строк. Забитая консоль — это тоже отказ в обслуживании, только оператору.
+    warned_full: bool,
 }
 
 /// Все домены системы. Отдельная таблица прав на домен — суть модели.
@@ -179,6 +183,13 @@ pub enum CapError {
     WrongKind,
     /// Цель — значение/корень, которого нет в store.
     Dangling,
+    /// Веха 225.5 — у домена кончились слоты: больше власти ему не вместить.
+    ///
+    /// Не «не хватило памяти», а именно потолок: без него любой процесс выедал кучу ядра
+    /// вызовом `SYS_CAP_DERIVE` в цикле (зонд `greed` взял восемь тысяч слотов и не
+    /// останавливался), а каждый слот ещё и писался на диск — в журнале двести восемьдесят
+    /// коммитов store подряд.
+    Exhausted,
 }
 
 // ─── домены и минт ─────────────────────────────────────────────────────────
@@ -199,7 +210,7 @@ pub fn create_domain(name: &'static str) -> DomainId {
 
 /// Завести домен в свободной тумбе (или в конце таблицы) и вернуть его id.
 fn push_domain(cs: &mut CSpace, name: &'static str, live: bool, transient: bool) -> DomainId {
-    let d = Domain { name, slots: Vec::new(), live, transient };
+    let d = Domain { name, slots: Vec::new(), live, transient, warned_full: false };
     match cs.domains.iter().position(|x| x.name.is_empty()) {
         Some(i) => {
             cs.domains[i] = d;
@@ -305,14 +316,26 @@ pub fn domain_name(dom: DomainId) -> &'static str {
 /// загрузки при этом остаётся действительным — ровно то, что обещает персистентный c-space
 /// (Веха 21.3). Совпадение требуется ТОЧНОЕ: другие права — другое полномочие, и подменять им
 /// старый слот нельзя (иначе `store:rw` тихо стал бы `store:rwx` прошлой загрузки наоборот).
-fn alloc_slot(dom: &mut Domain, entry: Entry) -> Cap {
+/// Веха 225.5 — ПОТОЛОК СЛОТОВ ДОМЕНА.
+///
+/// Модель угроз (ADR 0023) писала про это прямо: «слотов c-space процесс может съесть столько,
+/// сколько машина даст», а живость ядра объявлена АКТИВОМ. Зонд `greed` превратил запись в
+/// число: восемь тысяч слотов за полторы минуты и конца не видно, причём c-space персистентный —
+/// значит каждый слот ещё и уезжает на диск.
+///
+/// Тысяча — с огромным запасом: у самого богатого процесса в конфиге прав меньше десятка, а
+/// перечисляют слоты `probe` и диспетчер задач, которым столько и подавно не нужно.
+const SLOTS_MAX: usize = 1024;
+
+/// `None` — слоты кончились (см. [`SLOTS_MAX`]).
+fn alloc_slot(dom: &mut Domain, entry: Entry) -> Option<Cap> {
     for (i, s) in dom.slots.iter_mut().enumerate() {
         let same = s.persisted
             && matches!(&s.entry, Some(e) if e.rights == entry.rights && target_eq(&e.target, &entry.target));
         if same {
             s.persisted = false; // усыновлён живым наделением этой загрузки
             s.noinherit = false;
-            return Cap::new(i as u32, s.generation);
+            return Some(Cap::new(i as u32, s.generation));
         }
     }
     for (i, s) in dom.slots.iter_mut().enumerate() {
@@ -320,18 +343,53 @@ fn alloc_slot(dom: &mut Domain, entry: Entry) -> Cap {
             s.entry = Some(entry);
             s.persisted = false; // свежий минт — не наследство прошлой загрузки
             s.noinherit = false; // Веха 154 — переиспользованный слот наследуется, пока не помечен
-            return Cap::new(i as u32, s.generation);
+            return Some(Cap::new(i as u32, s.generation));
         }
     }
+    if dom.slots.len() >= SLOTS_MAX {
+        return None;
+    }
     dom.slots.push(Slot { generation: 1, entry: Some(entry), persisted: false, noinherit: false });
-    Cap::new((dom.slots.len() - 1) as u32, 1)
+    Some(Cap::new((dom.slots.len() - 1) as u32, 1))
 }
 
 /// Сминтить capability — привилегированное создание при владении объектом.
 /// (В настоящей системе минт происходит при создании объекта; здесь его делает ядро.)
+///
+/// Веха 225.5 — если слоты кончились ([`SLOTS_MAX`]), отдаём МЁРТВЫЙ дескриптор и ГОВОРИМ об
+/// этом. Подпись не меняем нарочно: минт зовут три десятка мест подъёма системы, и переписывать
+/// их все ради случая, которого при здоровой системе не бывает, значит размазать починку.
+///
+/// Мёртвый — это слот `u32::MAX`: его нет в таблице, и [`resolve`] ответит `Invalid` на первом
+/// же обращении. То есть власть не выдаётся, а не «выдаётся неизвестно какая». Молчать здесь
+/// нельзя: домен, которому не хватило слотов на подъёме, — это поломка конфигурации, и человек
+/// обязан её увидеть.
 pub fn mint(dom: DomainId, target: Target, rights: Rights) -> Cap {
+    mint_opt(dom, target, rights).unwrap_or_else(|| Cap::new(u32::MAX, 0))
+}
+
+/// Тот же минт, но ЧЕСТНЫЙ: `None` — слоты кончились.
+///
+/// Нужен там, где отказ надо передать процессу, а не отдать ему мёртвый дескриптор. Так
+/// случилось с `SYS_SHM_NEW`: он возвращал биты мёртвого cap-а, и жадный процесс считал, что
+/// область создана, — то есть отказ выглядел успехом. Области при этом заводились по-настоящему
+/// и никем не освобождались.
+pub fn mint_opt(dom: DomainId, target: Target, rights: Rights) -> Option<Cap> {
     let mut cs = CSPACE.lock();
-    alloc_slot(&mut cs.domains[dom], Entry { target, rights })
+    let d = &mut cs.domains[dom];
+    match alloc_slot(d, Entry { target, rights }) {
+        Some(c) => Some(c),
+        None => {
+            if !d.warned_full {
+                d.warned_full = true;
+                crate::println!(
+                    "  [cap] домен {} ИСЧЕРПАЛ слоты ({}) — дальше минт отказывает молча",
+                    dom, SLOTS_MAX
+                );
+            }
+            None
+        }
+    }
 }
 
 // ─── проверка и доступ ───────────────────────────────────────────────────────
@@ -622,7 +680,7 @@ pub fn grant(from: DomainId, cap: Cap, to: DomainId, mask: Rights) -> Result<Cap
         }
         (e.target.clone(), e.rights.intersect(mask))
     };
-    Ok(alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights }))
+    alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights }).ok_or(CapError::Exhausted)
 }
 
 /// Наделить потомка (Веха 30): скопировать capability из домена `from` в домен `to` —
@@ -637,7 +695,7 @@ pub fn endow(from: DomainId, cap: Cap, to: DomainId) -> Result<Cap, CapError> {
         let e = resolve(&cs, from, cap)?;
         (e.target.clone(), e.rights)
     };
-    Ok(alloc_slot(&mut cs.domains[to], Entry { target, rights }))
+    alloc_slot(&mut cs.domains[to], Entry { target, rights }).ok_or(CapError::Exhausted)
 }
 
 /// Отозвать capability: освободить слот и бумкнуть его поколение. Все ранее выданные
@@ -741,7 +799,7 @@ pub fn derive(dom: DomainId, cap: Cap, mask: Rights) -> Result<Cap, CapError> {
         let e = resolve(&cs, dom, cap)?;
         (e.target.clone(), e.rights.intersect(mask))
     };
-    Ok(alloc_slot(&mut cs.domains[dom], Entry { target, rights }))
+    alloc_slot(&mut cs.domains[dom], Entry { target, rights }).ok_or(CapError::Exhausted)
 }
 
 /// Та же цель ли (по СОДЕРЖИМОМУ, не по слоту): нужна [`clamp_persisted`], чтобы сверять
@@ -984,7 +1042,7 @@ pub fn load() -> usize {
         }
         // Веха 156 — поднятый домен никем не занят: живым его сделает первый же процесс с этим
         // именем (`claim_domain`), и он же тогда получит права прошлой загрузки.
-        cs.domains.push(Domain { name, slots, live: false, transient: false });
+        cs.domains.push(Domain { name, slots, live: false, transient: false, warned_full: false });
     }
     cs.domains.len()
 }

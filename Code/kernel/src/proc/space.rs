@@ -325,8 +325,23 @@ pub(super) fn shm_map_new(t: &mut Table, cur: usize, len: usize, va: usize) -> u
     //
     // Урезает права уже сам создатель (`CAP_DERIVE`) перед отправкой: композитору уезжает
     // READ|GRANT без WRITE, и в кадр он писать не может.
-    cap::mint(dom, cap::Target::Shm(id), Rights::READ.union(Rights::WRITE).union(Rights::GRANT))
-        .bits() as usize
+    // Веха 225.5 — минт ЧЕСТНЫЙ: не вышло — область освобождаем и отказываем.
+    //
+    // Здесь стоял `cap::mint(...).bits()`, и при исчерпанных слотах процесс получал биты
+    // МЁРТВОГО дескриптора, то есть отказ, выглядящий успехом. Область при этом оставалась
+    // созданной и никем не освобождённой: жадный процесс выедал память, думая, что всё идёт
+    // хорошо. Поймано зондом `greed` сразу после того, как у слотов появился потолок.
+    match cap::mint_opt(
+        dom,
+        cap::Target::Shm(id),
+        Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+    ) {
+        Some(c) => c.bits() as usize,
+        None => {
+            shm_unmap(t, cur, id, va);
+            usize::MAX
+        }
+    }
 }
 
 /// Отобразить УЖЕ существующую область (право проверено вызывающим).
