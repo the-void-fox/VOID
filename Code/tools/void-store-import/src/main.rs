@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! void-store-import <disk.img> ls                       # корни, поколение, объекты
+//! void-store-import <disk.img> verify                   # ЦЕЛОСТНОСТЬ: хэши и достижимость
 //! void-store-import <disk.img> cat <корень>             # содержимое объекта корня → stdout
 //! void-store-import <disk.img> put <файл> <корень>      # файл → объект + корень
 //! void-store-import <disk.img> nar <архив.nar> <префикс># NAR → объект и корень на каждый файл
@@ -457,9 +458,76 @@ fn run() -> Result<(), String> {
         ("put", Some(file), Some(root)) => cmd_put(&mut store, &mut io, file, root),
         ("nar", Some(archive), Some(prefix)) => cmd_nar(&mut store, &mut io, archive, prefix),
         ("del", Some(root), None) => cmd_del(&mut store, &mut io, root),
+        ("verify", None, None) => cmd_verify(&mut store, &mut io),
         ("gc", None, None) => cmd_gc(&mut store, &mut io, false),
         ("gc", Some(flag), None) if flag == "--compact" => cmd_gc(&mut store, &mut io, true),
         _ => Err(format!("неверные аргументы\n\n{USAGE}")),
+    }
+}
+
+/// ПРОВЕРКА ЦЕЛОСТНОСТИ STORE — признак 4 модели угроз машиной (Веха 225.6).
+///
+/// ADR 0023 называет порчей store три вещи: «объект, не сошедшийся со своим content-id; корень,
+/// указывающий в никуда; кадр, затёртый мимо области объектов». Первые две проверяются здесь;
+/// третья видна через ту же первую — затёртый кадр не сойдётся с хэшем.
+///
+/// ## Половина проверки уже была, и это важно знать
+///
+/// Store сверяет content-id на КАЖДОМ чтении (`ContentId::hash(&frame) == *id`) и считает
+/// расхождения ([`Store::corrupt_reads`]). То есть машина уже умела отличать порчу — просто
+/// никто не ходил по всем объектам и не спрашивал её об итоге. Здесь не новая проверка, а
+/// ВЕРДИКТ: обойти всё достижимое и сказать числом.
+///
+/// Обход рекурсивный: с Вехи 176 большой файл лежит кусками — узел несёт манифест, а куски
+/// висят детьми. Пройти только корни значило бы не прочитать как раз то, где порча вероятнее
+/// всего (мегабайты против двадцати пяти байт манифеста).
+fn cmd_verify(store: &mut Store, io: &mut FileIo) -> Result<(), String> {
+    let roots: Vec<(String, ContentId)> =
+        store.roots().map(|(n, id)| (n.to_owned(), *id)).collect();
+    let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+    let mut read_ok = 0usize;
+    let mut dangling: Vec<String> = Vec::new();
+
+    for (name, id) in &roots {
+        // Обход в глубину своим стеком, а не рекурсией: дерево пакета бывает глубоким, а
+        // переполнение стека на проверке целостности — издевательство.
+        let mut stack = vec![*id];
+        let mut root_ok = true;
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue; // объект содержательно адресуем: один и тот же встречается многажды
+            }
+            match store.with(io, &cur, |p| p.map(|b| b.len())) {
+                Some(_) => {
+                    read_ok += 1;
+                    for ch in store.children(io, &cur) {
+                        stack.push(ch);
+                    }
+                }
+                None => root_ok = false,
+            }
+        }
+        if !root_ok {
+            dangling.push(name.clone());
+        }
+    }
+
+    let corrupt = store.corrupt_reads();
+    println!("поколение {} · объектов в индексе {}", store.generation(), store.len());
+    println!("  корней: {}", roots.len());
+    println!("  объектов прочитано и сошлось: {read_ok}");
+    println!("  кадров НЕ сошлось с content-id: {corrupt}");
+    if !dangling.is_empty() {
+        println!("  корней в никуда: {}", dangling.len());
+        for n in dangling.iter().take(20) {
+            println!("    {n}");
+        }
+    }
+    if corrupt == 0 && dangling.is_empty() {
+        println!("ПРОВЕРКА: store цел");
+        Ok(())
+    } else {
+        Err("ПРОВЕРКА: store ПОВРЕЖДЁН (см. выше)".to_string())
     }
 }
 
