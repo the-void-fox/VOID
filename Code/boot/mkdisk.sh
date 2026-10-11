@@ -42,17 +42,26 @@ DISK_MB="${3:-$(( 1 + P1_MB + 8 ))}" # 1 МиБ зазор + p1 + минимум
 rm -f "$out"
 dd if=/dev/zero of="$out" bs=1M count="$DISK_MB" status=none
 
-# 2) таблица разделов MBR: p1 FAT16 (bootable), p2 VOID store (тип 0x9f, остаток)
+# 2) таблица разделов MBR: p1 FAT (bootable), p2 VOID store (тип 0x9f, остаток)
+#
+# Веха 226.7 — тип p1 стал `ef` (системный раздел EFI) вместо `c` (FAT32 LBA). Это и есть весь
+# фокус: прошивка UEFI ищет загрузчик в разделе ТАКОГО типа, а BIOS на тип не смотрит вовсе —
+# ему важен только `core.img` в зазоре и флаг загрузочного раздела. Один раздел, две прошивки.
+#
+# Почему не GPT. На GPT загрузка по BIOS требует отдельного раздела под `core.img` (зазора там
+# нет), то есть третьего раздела и второй раскладки. А целевая машина владельца — BIOS-только,
+# и терять её ради современного вида таблицы незачем. GPT ядро уже ЧИТАЕТ (Веха 226.6), и
+# размечать так тоже сможем — когда понадобится машина, где прошивка MBR не принимает.
 sfdisk --quiet "$out" <<EOF
 label: dos
-${P1_START},${P1_SIZE},c,*
+${P1_START},${P1_SIZE},ef,*
 ${P2_START},,9f
 EOF
 
 # 3) p1 = FAT16, положить ядро + grub.cfg (mtools по смещению @@offset — без монтирования)
 off=$((P1_START * 512))
 # -T: ФС РОВНО на размер p1 (см. преамбулу к P1_SIZE) — иначе она залезет на p2.
-mformat -i "$out@@${off}" -T "$P1_SIZE" -F ::
+mformat -i "$out@@${off}" -T "$P1_SIZE" ::
 mmd -i "$out@@${off}" ::/boot ::/boot/grub
 mcopy -i "$out@@${off}" "$kernel" ::/boot/void-kernel
 # Проверка, а не надежда: mtools при нехватке места молчит не всегда, но полагаться на это нельзя.
@@ -82,6 +91,29 @@ menuentry "VOID" {
 CFG
 mcopy -i "$out@@${off}" "$cfg" ::/boot/grub/grub.cfg
 rm -f "$cfg"
+
+# 3a) Веха 226.7 — ЗАГРУЗЧИК ДЛЯ UEFI в тот же раздел. Прошивка ищет `/EFI/BOOT/BOOTX64.EFI`, и
+# этого ей достаточно: дальше вшитый переходник найдёт том по `/boot/void-kernel` — тот самый,
+# что лежит здесь же, — и прочтёт этот же `grub.cfg`.
+#
+# Собирается он `mkesp.sh --дерево`, а не здесь: иначе `BOOTX64.EFI` существовал бы в двух
+# экземплярах кода (для ISO и для диска) и однажды разошёлся бы молча.
+#
+# Если EFI-сборки GRUB нет, диск остаётся BIOS-только и скрипт говорит об этом ВСЛУХ. Молча
+# выдать половину — худший из исходов: образ выглядит готовым, а на UEFI-машине не грузится.
+if [ -n "${VOID_GRUB_EFI:-}" ]; then
+    efitree="$(mktemp -d)"
+    "$here/mkesp.sh" --дерево "$efitree" >/dev/null
+    mmd -i "$out@@${off}" ::/EFI ::/EFI/BOOT
+    for f in "$efitree"/EFI/BOOT/*; do
+        mcopy -i "$out@@${off}" "$f" "::/EFI/BOOT/$(basename "$f")"
+    done
+    rm -rf "$efitree"
+    mdir -i "$out@@${off}" ::/EFI/BOOT 2>/dev/null | grep -qi BOOTX64 || {
+        echo "BOOTX64.EFI не лёг в p1 — образ грузился бы только по BIOS"; exit 1; }
+else
+    echo "  ВНИМАНИЕ: VOID_GRUB_EFI не задан — образ будет грузиться ТОЛЬКО по BIOS"
+fi
 
 # 4) GRUB core.img: модули для чтения FAT-раздела + multiboot2; префикс — на /boot/grub p1
 tmpd="$(mktemp -d)"

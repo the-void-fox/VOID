@@ -190,6 +190,18 @@ jobs:
         # Store на этом диске пуст, и ядро сеет его сам — то есть проверяется заодно ЗАПИСЬ в
         # раздел, найденный через GPT.
 
+      # Веха 226.7 — ТРЕТИЙ путь, и он важнее двух первых: это ровно тот образ, который
+      # `install` переносит на диск сектор в сектор. MBR с разделом типа `ef`: BIOS грузится по
+      # `core.img` в зазоре, UEFI — по `/EFI/BOOT/BOOTX64.EFI` в том же разделе. Один раздел,
+      # две прошивки; если он сломается, установленная система перестанет грузиться по UEFI, а
+      # первые два прогона этого не заметят.
+      - name: собрать образ диска с ESP и загрузиться по UEFI
+        env:
+          VOID_GRUB_EFI: /usr
+        run: |
+          Code/boot/mkdisk.sh Code/target/x86_64-unknown-none/release/void-kernel dual.img 700
+          Code/tools/uefirun.py dual.img out-dual --без-сеанса
+
       - name: журнал при провале
         if: failure()
         uses: actions/upload-artifact@v4
@@ -198,6 +210,7 @@ jobs:
           path: |
             out-uefi/
             out-gpt/
+            out-dual/
           retention-days: 7
 
   fuzz:
