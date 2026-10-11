@@ -51,10 +51,9 @@ const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_IDENTIFY: u8 = 0xec;
 
-/// Тип MBR-раздела под store VOID (Веха 48). Произвольный незанятый байт — по нему AHCI
-/// узнаёт «свой» раздел на разбитом диске (загрузчик+ядро в p1, store в p2). Если MBR/раздела
-/// нет — store лежит с сектора 0 на весь диск (как `void-disk.img` в QEMU, обратная совместимость).
-pub const VOID_STORE_TYPE: u8 = 0x9f;
+/// Тип MBR-раздела под store VOID (Веха 48). Живёт в [`void_part`] вместе с остальным разбором
+/// таблиц; здесь оставлено имя, которым его зовёт установщик.
+pub const VOID_STORE_TYPE: u8 = void_part::VOID_STORE_MBR;
 
 /// Смещения структур внутри фрейма A.
 const OFF_FIS: usize = 0x400; // принятый FIS
@@ -191,30 +190,23 @@ fn open(abar: usize, port_num: u32) -> Option<Ahci> {
     // устройство зарегистрировано, полная ёмкость известна, и разметить диск по просьбе он
     // может. Обратная совместимость сырого образа «store с сектора 0» осталась там, где ей и
     // место, — у virtio-blk (образ riscv `void-disk.img`); у AHCI её никогда не требовалось.
-    let mut ours = false;
-    if dev.command(ATA_READ_DMA_EXT, 0, false) {
-        unsafe {
-            let m = crate::frame::ptr(buf) as *const u8;
-            if m.add(510).read_volatile() == 0x55 && m.add(511).read_volatile() == 0xaa {
-                for i in 0..4 {
-                    let e = m.add(446 + i * 16);
-                    if e.add(4).read_volatile() == VOID_STORE_TYPE {
-                        let rd_le = |o: usize| {
-                            e.add(o).read_volatile() as u64
-                                | (e.add(o + 1).read_volatile() as u64) << 8
-                                | (e.add(o + 2).read_volatile() as u64) << 16
-                                | (e.add(o + 3).read_volatile() as u64) << 24
-                        };
-                        dev.base = rd_le(8); // LBA начала раздела
-                        dev.capacity = rd_le(12); // число секторов раздела
-                        ours = true;
-                        break;
-                    }
-                }
-            }
+    // Веха 226.6 — таблицу разбирает общая `void_part`: MBR и GPT. Копий этого цикла было
+    // четыре (здесь, в `nvme`, в `xhci` и в `ramdisk`), и GPT сделал бы из них восемь.
+    let part = void_part::find_store(|lba, out| {
+        if !dev.command(ATA_READ_DMA_EXT, lba, false) {
+            return false;
         }
+        // SAFETY: буфер DMA — наш фрейм, команда завершилась, читаем ровно сектор.
+        unsafe {
+            core::ptr::copy_nonoverlapping(crate::frame::ptr(buf), out.as_mut_ptr(), out.len());
+        }
+        true
+    });
+    let ours = part.is_some();
+    if let Some(p) = part {
+        dev.base = p.start;
+        dev.capacity = p.sectors;
     }
-
     dev.void = ours;
     if !ours {
         dev.capacity = 0; // не носитель: ни одного сектора store на этом диске нет

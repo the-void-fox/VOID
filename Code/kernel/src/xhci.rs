@@ -1212,7 +1212,6 @@ pub fn has_pointer() -> bool {
 
 /// Тот же тип MBR-раздела, что ищут AHCI и NVMe: след явного согласия человека отдать носитель
 /// под VOID. Флешку без него не трогаем — на ней чужие файлы.
-const VOID_STORE_TYPE: u8 = crate::ahci::VOID_STORE_TYPE;
 
 /// Есть ли накопитель и сколько у него блоков ВСЕГО (0 — накопителя нет). Для установщика.
 pub fn disk_sectors() -> u64 {
@@ -1222,29 +1221,17 @@ pub fn disk_sectors() -> u64 {
 /// Искать на флешке раздел VOID и сделать её носителем store. `false` — флешки нет либо
 /// раздела VOID на ней нет (тогда её не трогаем вовсе).
 pub fn store_init() -> bool {
-    let mut sec = [0u8; SECTOR];
-    if !read_abs(0, &mut sec) {
+    // Веха 226.6 — таблицу разбирает общая `void_part`: MBR и GPT, один разбор на все четыре
+    // транспорта. Своя копия цикла по четырём записям жила здесь, в `ahci`, в `nvme` и в
+    // `ramdisk`; GPT превратил бы четыре копии в восемь.
+    let Some(part) = void_part::find_store(|lba, buf| read_abs(lba, buf)) else {
         return false;
-    }
-    if sec[510] != 0x55 || sec[511] != 0xaa {
-        return false;
-    }
-    for i in 0..4 {
-        let e = &sec[446 + i * 16..446 + (i + 1) * 16];
-        if e[4] != VOID_STORE_TYPE {
-            continue;
-        }
-        let base = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
-        let cap = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
-        if base == 0 || cap == 0 {
-            continue;
-        }
-        let mut g = XHCI.lock_irq();
-        if let Some(m) = g.as_mut().and_then(|x| x.msc.as_mut()) {
-            m.base = base;
-            m.capacity = cap;
-            return true;
-        }
+    };
+    let mut g = XHCI.lock_irq();
+    if let Some(m) = g.as_mut().and_then(|x| x.msc.as_mut()) {
+        m.base = part.start;
+        m.capacity = part.sectors;
+        return true;
     }
     false
 }

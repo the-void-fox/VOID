@@ -36,9 +36,6 @@ use crate::frame;
 use crate::sync::SpinLock;
 
 const SECTOR: usize = 512;
-/// Тот же тип MBR-раздела, что ищет AHCI: след явного согласия человека отдать диск под VOID.
-const VOID_STORE_TYPE: u8 = crate::ahci::VOID_STORE_TYPE;
-
 /// Регистры контроллера (смещения от BAR0).
 const CAP: usize = 0x00;
 const CC: usize = 0x14;
@@ -292,25 +289,21 @@ pub fn init() -> bool {
     // Где на этом диске store. Правило то же, что у AHCI (Веха 174): носителем становится ТОЛЬКО
     // диск с разделом VOID — он и есть след явного согласия человека, а «нет таблицы разделов,
     // значит весь диск наш» на чужой машине означало бы затереть чужие данные.
-    if d.submit(false, &cmd(IO_READ, 1, buf as u64, 0, 0, 0)) != 0 {
-        crate::println!("  [nvme] первый сектор не читается");
-        return false;
-    }
-    let mut found = false;
-    unsafe {
-        let p = frame::ptr(buf);
-        let sig = core::ptr::read_unaligned(p.add(510) as *const u16);
-        if sig == 0xaa55 {
-            for i in 0..4 {
-                let e = p.add(446 + i * 16);
-                if core::ptr::read_volatile(e.add(4)) == VOID_STORE_TYPE {
-                    d.base = core::ptr::read_unaligned(e.add(8) as *const u32) as u64;
-                    d.capacity = core::ptr::read_unaligned(e.add(12) as *const u32) as u64;
-                    found = true;
-                    break;
-                }
-            }
+    // Веха 226.6 — разбор общий (`void_part`): MBR и GPT, одна копия на четыре транспорта.
+    let part = void_part::find_store(|lba, out| {
+        if d.submit(false, &cmd(IO_READ, 1, buf as u64, lba as u32, (lba >> 32) as u32, 0)) != 0 {
+            return false;
         }
+        // SAFETY: буфер DMA наш, команда завершилась, читаем ровно сектор.
+        unsafe {
+            core::ptr::copy_nonoverlapping(frame::ptr(buf), out.as_mut_ptr(), out.len());
+        }
+        true
+    });
+    let found = part.is_some();
+    if let Some(p) = part {
+        d.base = p.start;
+        d.capacity = p.sectors;
     }
     if !found {
         crate::println!(

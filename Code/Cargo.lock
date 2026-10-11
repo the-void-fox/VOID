@@ -188,6 +188,7 @@ dependencies = [
  "void-abi",
  "void-conf",
  "void-fs",
+ "void-part",
  "void-store",
  "void-touch",
  "void-tree",
@@ -207,6 +208,10 @@ dependencies = [
  "void-drv",
  "void-fuzz",
 ]
+
+[[package]]
+name = "void-part"
+version = "0.0.1"
 
 [[package]]
 name = "void-store"

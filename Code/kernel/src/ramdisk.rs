@@ -33,7 +33,6 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use void_store::SECTOR;
 
 /// Тип MBR-раздела под store VOID — тот же байт, по которому свой раздел ищет AHCI.
-use crate::ahci::VOID_STORE_TYPE;
 
 /// Физический адрес первого сектора store внутри образа (0 — носителя нет).
 static BASE: AtomicUsize = AtomicUsize::new(0);
@@ -43,9 +42,9 @@ static SECTORS: AtomicU64 = AtomicU64::new(0);
 /// Подключить образ, привезённый загрузчиком, как носитель store. `false` — модуля нет или он
 /// не похож на диск VOID.
 ///
-/// Ищем раздел так же, как [`crate::ahci`]: подпись `0x55AA`, затем запись таблицы с типом
-/// [`VOID_STORE_TYPE`]. Без MBR носитель не принимаем вовсе — на живом носителе «весь образ с
-/// нулевого сектора» означало бы, что store пишет поверх собственного загрузчика и ядра.
+/// Раздел ищется общим разбором ([`void_part`]) — так же, как на настоящем диске. Без таблицы
+/// разделов носитель не принимаем вовсе: на живом носителе «весь образ с нулевого сектора»
+/// означало бы, что store пишет поверх собственного загрузчика и ядра.
 pub fn init() -> bool {
     let Some((mbase, mlen)) = crate::arch::boot_module() else {
         return false;
@@ -55,22 +54,22 @@ pub fn init() -> bool {
     }
     // Веха 87: загрузчик сообщает ФИЗИЧЕСКИЙ адрес — читаем через прямую карту.
     let img = unsafe { core::slice::from_raw_parts(crate::frame::ptr(mbase), mlen) };
-    if img[510] != 0x55 || img[511] != 0xaa {
-        return false;
-    }
-    let le32 = |o: usize| {
-        img[o] as u64
-            | (img[o + 1] as u64) << 8
-            | (img[o + 2] as u64) << 16
-            | (img[o + 3] as u64) << 24
-    };
-    for i in 0..4 {
-        let e = 446 + i * 16;
-        if img[e + 4] != VOID_STORE_TYPE {
-            continue;
+    // Веха 226.6 — разбор общий (`void_part`), MBR и GPT. Живой носитель сегодня всегда MBR
+    // (его делает `mkdisk.sh`), но читать его своей копией цикла незачем: копий было четыре.
+    let Some(part) = void_part::find_store(|lba, buf| {
+        let at = lba as usize * SECTOR;
+        match img.get(at..at + SECTOR) {
+            Some(s) => {
+                buf.copy_from_slice(s);
+                true
+            }
+            None => false,
         }
-        let start = le32(e + 8) as usize;
-        let count = le32(e + 12);
+    }) else {
+        return false;
+    };
+    {
+        let (start, count) = (part.start as usize, part.sectors);
         // Раздел обязан целиком лежать внутри привезённого образа: `module2` мог привезти
         // усечённый файл, и обнаружить это на первой же записи в хвост — значит обнаружить
         // порчей чужой памяти.
@@ -80,9 +79,8 @@ pub fn init() -> bool {
         }
         BASE.store(mbase + start * SECTOR, Ordering::Relaxed);
         SECTORS.store(count, Ordering::Relaxed);
-        return true;
+        true
     }
-    false
 }
 
 /// Ёмкость носителя в секторах (0 — носителя нет).

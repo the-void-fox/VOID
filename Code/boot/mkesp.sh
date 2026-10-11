@@ -38,6 +38,10 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/esp.img}"
+# Второй аргумент — каталог, содержимое которого едет в ESP рядом с `EFI/BOOT`. Нужен диску с
+# установленной системой: там на этом же разделе лежат ядро и `grub.cfg`, потому что больше им
+# лежать негде — store VOID читает только само ядро, а GRUB его формата не знает.
+extra="${2:-}"
 
 : "${VOID_GRUB_EFI:?нет VOID_GRUB_EFI — войди в nix-shell (там он ставится из grub2_efi)}"
 plat="$VOID_GRUB_EFI/lib/grub/x86_64-efi"
@@ -74,7 +78,7 @@ modules=(
 # Теперь умолчание ставится ПЕРВЫМ и без устройства — то есть «то, с чего нас загрузили», и для
 # живого носителя это сразу верно. `search` только УЛУЧШАЕТ результат, когда ему есть что
 # сказать: это понадобится установленному диску, где ядро лежит не там, где `BOOTX64.EFI`.
-early="$tmp/early.cfg"
+early="$tmp/early.cfg" # удаляется перед копированием: нужен сборке, не диску
 cat > "$early" <<'CFG'
 set prefix=/boot/grub
 search --set=root --file /boot/void-kernel
@@ -86,6 +90,7 @@ CFG
 grub-mkimage --directory="$plat" -O x86_64-efi -p /boot/grub -c "$early" \
     -o "$tmp/EFI/BOOT/BOOTX64.EFI" "${modules[@]}"
 cp "$VOID_GRUB_EFI/share/grub/unicode.pf2" "$tmp/EFI/BOOT/"
+[ -z "$extra" ] || cp -r "$extra"/. "$tmp/"
 
 # Размер — по содержимому плюс запас на служебные структуры FAT, и дальше вверх до мегабайта:
 # раздел меньше мегабайта некоторые прошивки не любят, а точный размер здесь ничего не стоит.
@@ -95,10 +100,11 @@ rm -f "$out"
 truncate --size="${size_kb}K" "$out"
 mkfs.vfat -n VOIDESP "$out" >/dev/null
 
-( cd "$tmp" && for d in $(find EFI -type d | sort); do mmd -i "$out" "::/$d"; done
-  for f in $(find EFI -type f | sort); do mcopy -i "$out" "$f" "::/$f"; done )
+( cd "$tmp" && rm -f early.cfg
+  for d in $(find . -mindepth 1 -type d | sed 's|^\./||' | sort); do mmd -i "$out" "::/$d"; done
+  for f in $(find . -type f | sed 's|^\./||' | sort); do mcopy -i "$out" "$f" "::/$f"; done )
 
 # Проверяем СВОЙ результат, а не надеемся на него: молчаливо битый ESP выглядит как «прошивка не
 # видит носитель», и искать это потом будут в прошивке.
 fsck.vfat -n "$out" >/dev/null || { echo "ESP собрался БИТЫМ — это ошибка сборки, а не прошивки"; exit 1; }
-echo "готово: $out ($((size_kb / 1024)) МиБ, BOOTX64.EFI + переходник)"
+echo "готово: $out ($((size_kb / 1024)) МиБ, BOOTX64.EFI + переходник${extra:+ + содержимое $extra})"
