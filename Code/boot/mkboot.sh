@@ -81,9 +81,23 @@ kernel_mb=$(( ( $(stat -c%s "$kernel") + 1048575 ) / 1048576 ))
 esp="$staging/../esp-$$.img"
 "$here/mkesp.sh" "$esp" >/dev/null
 
+# `-d` на платформу BIOS — чтобы UEFI-вход был РОВНО ОДИН, наш.
+#
+# Где платформы лежат РЯДОМ (так на Ubuntu: `/usr/lib/grub/{i386-pc,x86_64-efi}`), mkrescue
+# делает UEFI-вход сам, и в образе их становится три: его ESP и наш. Firmware возьмёт первый
+# попавшийся, то есть загрузка пойдёт по пути, которого мы не собирали и не проверяли, — а это
+# ровно «две меры расходятся молча». В CI это и поймалось: проверка входов сказала «3, а должно
+# быть 2».
+#
+# `-d <каталог платформы>` ограничивает mkrescue одной платформой (проверено: с ним в образе
+# только BIOS-вход). Так сборка одинакова и на NixOS, где платформы в разных пакетах, и там, где
+# они вместе.
+bios_plat="$(dirname "$(command -v grub-mkimage)")/../lib/grub/i386-pc"
+[ -f "$bios_plat/modinfo.sh" ] || { echo "нет платформы GRUB i386-pc в $bios_plat"; exit 1; }
+
 # Ошибки НЕ глушим. Раньше здесь стоял `2>/dev/null`, и это ровно та молчаливая поломка, которую
 # в этом проекте ловят месяцами: образ собирался «успешно» с потерянным входом загрузки.
-grub-mkrescue -o "$here/void.iso" "$staging" \
+grub-mkrescue -d "$bios_plat" -o "$here/void.iso" "$staging" \
     -append_partition 2 0xef "$esp" \
     -eltorito-alt-boot -e --interval:appended_partition_2:all:: -no-emul-boot
 rm -f "$esp"
