@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::arch;
 
 /// Запасная таймбаза, если платформа не назвала свою: прежние умолчания (riscv 10 МГц QEMU virt,
-/// x86 «TSC ≈ 1 ГГц»). Это не «правильное значение», а честно приблизительное — и [`calibrated`]
+/// x86 «TSC ≈ 1 ГГц»). Это не «правильное значение», а честно приблизительное — и источник
 /// позволяет это увидеть.
 #[cfg(target_arch = "riscv64")]
 const FALLBACK_HZ: u64 = 10_000_000;
@@ -42,8 +42,10 @@ const FALLBACK_HZ: u64 = 1_000_000_000;
 static TICK_HZ: AtomicU64 = AtomicU64::new(FALLBACK_HZ);
 static NS_PER_TICK_Q32: AtomicU64 = AtomicU64::new(ns_per_tick_q32(FALLBACK_HZ));
 static TICKS_PER_NS_Q32: AtomicU64 = AtomicU64::new(ticks_per_ns_q32(FALLBACK_HZ));
-/// Измерена ли таймбаза платформой (иначе стоит [`FALLBACK_HZ`] и время приблизительное).
-static CALIBRATED: AtomicBool = AtomicBool::new(false);
+// Признака «измерена/не измерена» здесь больше нет (Веха 226.4): его заменил ИСТОЧНИК
+// таймбазы словами — `arch::timer_hz_name`. Два состояния различали меньше, чем нужно: на riscv
+// «измерена» было верно всегда, хотя частота могла остаться умолчанием QEMU, а на x86 появился
+// третий случай — «со слов CPUID, PIT'а нет».
 
 /// Unix-время (нс), соответствующее нулю монотонного счётчика. 0 — часов нет.
 static WALL_BASE_NS: AtomicU64 = AtomicU64::new(0);
@@ -65,12 +67,6 @@ pub fn tick_hz() -> u64 {
     TICK_HZ.load(Ordering::Relaxed)
 }
 
-/// Измерена ли таймбаза (иначе взято умолчание и время приблизительное). Печатается на загрузке:
-/// «время идёт неизвестно как» обязано быть видно, а не подразумеваться.
-pub fn calibrated() -> bool {
-    CALIBRATED.load(Ordering::Relaxed)
-}
-
 /// Прочитать часы платформы и запомнить базу. Зовётся один раз на загрузке, ПОСЛЕ `mm_init`
 /// (на riscv страница RTC отображается там же) и до старта процессов.
 pub fn init() {
@@ -80,7 +76,6 @@ pub fn init() {
         TICK_HZ.store(hz, Ordering::Relaxed);
         NS_PER_TICK_Q32.store(ns_per_tick_q32(hz), Ordering::Relaxed);
         TICKS_PER_NS_Q32.store(ticks_per_ns_q32(hz), Ordering::Relaxed);
-        CALIBRATED.store(true, Ordering::Relaxed);
     }
     if let Some(ns) = arch::wall_clock_unix_ns() {
         // База = «сколько было на часах, когда счётчик был нулём».

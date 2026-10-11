@@ -21,7 +21,9 @@ mod ps2;
 mod rtc;
 mod smp;
 mod trap;
-mod vga;
+/// Задник текстовой консоли: VGA-память и знакогенератор. Публичен ради [`crate::textcon`],
+/// который им рисует, когда пиксельного кадра нет.
+pub mod vga;
 
 // Точка входа: PVH-нота + трамплин 32→64 (см. entry.s).
 core::arch::global_asm!(include_str!("entry.s"));
@@ -337,10 +339,10 @@ impl fmt::Write for Console {
                 outb(COM1, b);
             }
             // Веха 41: VGA-текст — на реальной машине (без COM-порта) виден ОН.
-            vga::put_char(c);
+            crate::textcon::put_char(c);
         }
         // Веха 43: подвинуть аппаратный курсор VGA туда, где мы остановились (иначе висит).
-        vga::sync_cursor();
+        crate::textcon::sync_cursor();
         Ok(())
     }
 }
@@ -369,7 +371,7 @@ pub fn console_init(magic: usize, info: usize) {
     if !crate::fb::present() {
         vga::load_font();
     }
-    vga::clear();
+    crate::textcon::clear();
 }
 
 /// Веха 96 — режим пиксельной консоли `(ширина, высота, бит на пиксель)`; `None` — текстовый
@@ -735,10 +737,10 @@ pub(super) fn phys_low_top() -> usize {
 /// вынесены две точки, которые зовёт [`crate::_print`]. `reads_input` — читает ли пишущий ввод
 /// с этой консоли, то есть его ли это набранная строка.
 pub fn console_begin_write(reads_input: bool) {
-    vga::begin_write(reads_input);
+    crate::textcon::begin_write(reads_input);
 }
 pub fn console_end_write(reads_input: bool) {
-    vga::end_write(reads_input);
+    crate::textcon::end_write(reads_input);
     // Веха 224 — у кадра virtio-gpu записи в память сами на экран не попадают: показ это
     // отдельная команда. Консоль ядра показывает себя ЦЕЛИКОМ и только пока экран её: как
     // только его забрал процесс, показывать кадр — его дело, а наш вывод уходит в serial.
@@ -751,7 +753,7 @@ pub fn console_end_write(reads_input: bool) {
 }
 
 pub fn console_size() -> (usize, usize) {
-    vga::size()
+    crate::textcon::size()
 }
 
 /// Веха 224.1 — очистить консоль ЯДРА и увести её курсор в начало.
@@ -760,7 +762,7 @@ pub fn console_size() -> (usize, usize) {
 /// только движок консоли, а он у каждой архитектуры свой. На x86 это текстовый VGA (он же
 /// держит курсор и для пиксельного режима), на riscv — UART, которому чистить нечего.
 pub fn console_clear() {
-    vga::clear();
+    crate::textcon::clear();
 }
 
 /// Забрать и обнулить счётчик потерянного ввода.

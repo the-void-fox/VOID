@@ -135,6 +135,11 @@ pub use imp::{
 /// ни ACPI).
 #[cfg(target_arch = "x86_64")]
 pub use imp::{enable_power_button, touchpad_tune};
+
+// Задник текстовой консоли (Веха 226.5). Наружу из `arch` — потому что рисует им общий
+// `crate::textcon`, а не сама архитектура: слой текста один на обе, железо под ним разное.
+#[cfg(target_arch = "x86_64")]
+pub use imp::vga;
 /// Веха 199 — EHCI: поиск контроллера и доступ к его конфигурации PCI.
 #[cfg(target_arch = "x86_64")]
 pub use imp::{pci_bdf_by_bar, pci_cfg_read32, pci_cfg_write32, probe_ehci};

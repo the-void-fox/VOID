@@ -125,6 +125,8 @@ mod cpu;
 mod elf;
 mod executor;
 mod fb;
+/// Текстовая консоль ядра — общая для обеих архитектур (Веха 226.5).
+mod textcon;
 mod font;
 mod frame;
 mod heap;

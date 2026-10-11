@@ -63,11 +63,21 @@ impl Uart {
 
 impl Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // В UART — байтами (там на другом конце терминал, и он сам знает UTF-8), а в ЭКРАН —
+        // символами через общий текстовый слой (Веха 226.5). Раньше второго не было вовсе:
+        // кадр на riscv появился Вехой 224.1, а слой текста жил в x86-части вместе с VGA, под
+        // который был написан. Экран есть — консоли на нём не было.
         for b in s.bytes() {
             if b == b'\n' {
                 Uart::putc(b'\r'); // CRLF для последовательного терминала
             }
             Uart::putc(b);
+        }
+        if crate::fb::present() {
+            for c in s.chars() {
+                crate::textcon::put_char(c);
+            }
+            crate::textcon::sync_cursor();
         }
         Ok(())
     }
