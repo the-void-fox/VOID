@@ -24,7 +24,7 @@ const CAP_RTSOFF: usize = 0x18; // u32: смещение runtime-регистр�
 
 // ─── операционные регистры (от op_base = BAR0 + CAPLENGTH) ───────────────────
 const OP_USBCMD: usize = 0x00; // RS бит0, HCRST бит1
-const OP_USBSTS: usize = 0x04; // HCH бит0, CNR бит11
+const OP_USBSTS: usize = 0x04; // HCH бит0, HCE бит12, CNR бит11
 const OP_CRCR: usize = 0x18; // u64: кольцо команд + RCS бит0
 const OP_DCBAAP: usize = 0x30; // u64: массив базовых адресов контекстов устройств
 const OP_CONFIG: usize = 0x38; // MaxSlotsEn[7:0]
@@ -32,6 +32,7 @@ const OP_PORTS: usize = 0x400; // PORTSC[port] = OP_PORTS + (port-1)*0x10
 
 const CMD_RS: u32 = 1 << 0;
 const CMD_HCRST: u32 = 1 << 1;
+const STS_HCE: u32 = 1 << 12; // Host Controller Error — контроллер встал насмерть
 const STS_HCH: u32 = 1 << 0;
 const STS_CNR: u32 = 1 << 11;
 
@@ -125,6 +126,7 @@ pub struct Xhci {
     // перечисления мы к портам не возвращаемся — горячего подключения у нас нет, устройство
     // опознаётся один раз при загрузке. Заводить поля «на будущее» значит держать в структуре
     // то, чего никто не читает.
+    op: usize, // база операционных регистров (нужна, чтобы читать USBSTS — см. `poll`)
     db: usize, // база массива дверных звонков
     rt: usize, // база runtime-регистров
     ctx64: bool, // размер контекста 64 Б (иначе 32)
@@ -276,7 +278,7 @@ pub fn init() -> bool {
         }
 
         let mut x = Xhci {
-            db, rt, ctx64,
+            op, db, rt, ctx64,
             cmd_ring, cmd_enq: 0, cmd_cycle: 1,
             event_ring, event_deq: 0, event_cycle: 1,
             dcbaa,
@@ -1183,8 +1185,29 @@ impl Xhci {
     }
 }
 
+/// Сказано ли уже про смерть контроллера. Один раз на загрузку: `poll` зовётся тиком таймера,
+/// и повторять это сто раз в секунду значило бы утопить журнал.
+static DIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn poll() {
     if let Some(x) = XHCI.lock_irq().as_mut() {
+        // Веха 226.9 — СПРОСИТЬ КОНТРОЛЛЕР, ЖИВ ЛИ ОН.
+        //
+        // Бит `HCE` (Host Controller Error) означает, что контроллер встал насмерть: дальше он
+        // не выполнит ни одного переноса. Ставится он от ошибок, в которых виноват ДРАЙВЕР, —
+        // например указатель чтения кольца событий, выехавший за его границы.
+        //
+        // До этой вехи драйвер такого не замечал вовсе: USB просто переставал отвечать, и
+        // снаружи это выглядело как «клавиатура иногда не работает». Молчаливая смерть
+        // устройства — худший вид отказа: искать её будут где угодно, только не здесь.
+        let sts = unsafe { rd(x.op + OP_USBSTS) };
+        if sts & STS_HCE != 0 && !DIED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::println!(
+                "  [usb]  xHCI ВСТАЛ НАСМЕРТЬ: USBSTS {:#010x} (бит HCE). Контроллер больше не \
+                 обслужит ни одного переноса — это ошибка драйвера, а не устройства.",
+                sts
+            );
+        }
         if x.hids.iter().any(|h| h.is_some()) {
             unsafe { x.poll_hid() }
         }
