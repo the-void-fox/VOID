@@ -12,7 +12,7 @@ mod sbi;
 mod trap;
 mod uart;
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // Ассемблерная точка входа `_start`: OpenSBI прыгает на 0x8020_0000 в S-mode → стек → kmain.
 core::arch::global_asm!(include_str!("entry.s"));
@@ -350,10 +350,24 @@ pub fn probe_virtio_rng() -> Option<crate::arch::BlkTransport> {
 /// значение приезжает из DTB в [`platform_init`] (Веха 136).
 static TIMEBASE_HZ: AtomicU64 = AtomicU64::new(10_000_000);
 
+/// Назвала ли таймбазу плата (иначе в [`TIMEBASE_HZ`] лежит умолчание QEMU).
+static TIMEBASE_FROM_DTB: AtomicBool = AtomicBool::new(false);
+
 /// Частота монотонного счётчика. `Some` всегда: у riscv она объявлена платой, а не измеряется —
 /// но если DTB не дал её, это по-прежнему умолчание QEMU, и звать его точным нельзя.
 pub fn timer_hz() -> Option<u64> {
     Some(TIMEBASE_HZ.load(Ordering::Relaxed))
+}
+
+/// Чем получена таймбаза — словами, для печати на загрузке. На riscv вариантов два: её назвала
+/// плата в DTB либо осталось умолчание QEMU. Своего измерения тут нет и не нужно: таймбаза здесь
+/// СВОЙСТВО платы, а не то, что приходится выяснять опытом, как на x86.
+pub fn timer_hz_name() -> &'static str {
+    if TIMEBASE_FROM_DTB.load(Ordering::Relaxed) {
+        "из DTB"
+    } else {
+        "умолчание QEMU — время приблизительное"
+    }
 }
 
 /// Квант вытеснения — 20 мс, СЧИТАННЫЕ от настоящей таймбазы (Веха 136). Раньше здесь стояло
@@ -582,6 +596,7 @@ pub fn platform_init(_hartid: usize, dtb: usize) {
     if let Some(hz) = dtb_find_u32(dtb, b"timebase-frequency") {
         if hz > 0 {
             TIMEBASE_HZ.store(hz as u64, Ordering::Relaxed);
+            TIMEBASE_FROM_DTB.store(true, Ordering::Relaxed);
         }
     }
     // Веха 170 — СКОЛЬКО ХАРТОВ у платы. Пока мы работаем на одном, но сказать, сколько их

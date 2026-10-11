@@ -527,7 +527,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         "  [time] таймбаза {}.{:03} МГц ({})",
         clock::tick_hz() / 1_000_000,
         clock::tick_hz() % 1_000_000 / 1000,
-        if clock::calibrated() { "измерена" } else { "умолчание — время приблизительное" },
+        arch::timer_hz_name(),
     );
     println!();
 
