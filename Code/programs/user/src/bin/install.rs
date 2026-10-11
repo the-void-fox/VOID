@@ -93,8 +93,9 @@ fn read_disks(store: usize) -> Vec<Disk> {
 enum Stage {
     /// Выбираем диск.
     Pick,
-    /// Кадр «ставлю» уже нарисован — установка идёт следующим шагом ([`ui::Client::after`]).
-    Working,
+    /// Кадр «работаю» уже нарисован — дело идёт следующим шагом ([`ui::Client::after`]).
+    /// `true` — ОБНОВЛЕНИЕ (данные остаются), `false` — установка со стиранием.
+    Working(bool),
     /// Кончилось: текст итога и удалось ли.
     Done(String, bool),
 }
@@ -112,6 +113,12 @@ impl App {
     /// Можно ли ставить на выбранный диск.
     fn target_ok(&self) -> bool {
         self.disks.get(self.sel).is_some_and(|d| !d.live)
+    }
+
+    /// Можно ли ОБНОВИТЬ выбранный диск (Веха 226.8). Условие то же, что у ядра: VOID на нём
+    /// уже стоит, и это не тот диск, с которого система работает сейчас.
+    fn can_update(&self) -> bool {
+        self.disks.get(self.sel).is_some_and(|d| d.void && !d.live)
     }
 
     fn move_sel(&mut self, by: i32) -> bool {
@@ -166,8 +173,9 @@ impl ui::Client for App {
         u.label(title, ui::t("Куда поставить систему"), tx, Align::Center);
 
         match &self.stage {
-            Stage::Working => {
-                u.label(r, ui::t("ставлю…"), mu, Align::Center);
+            Stage::Working(обновление) => {
+                let слово = if *обновление { ui::t("обновляю…") } else { ui::t("ставлю…") };
+                u.label(r, слово, mu, Align::Center);
                 return ui::Scope::No;
             }
             Stage::Done(text, ok) => {
@@ -219,8 +227,22 @@ impl ui::Client for App {
             self.sel = i;
         }
 
-        // ── предупреждение и кнопка ────────────────────────────────────────
+        // ── предупреждение и кнопки ────────────────────────────────────────
+        //
+        // Веха 226.8 — кнопок стало ДВЕ, когда на диске уже есть VOID. Обновление в ядре было с
+        // Вехи 222 (`install update <номер>`), но дотянуться до него можно было только командой:
+        // человек, поставивший систему мышью, обновить её мышью не мог и о команде ниоткуда не
+        // узнавал. Правка нарочно минимальная — вид установщика будет переделан отдельно,
+        // вместе с макетом; сейчас закрывается именно недостающее ДЕЙСТВИЕ.
         let btn = r.cut_bottom(line * 2);
+        // Кнопка обновления — НАД опасной, и это не вкусовщина: читают сверху вниз, а
+        // безопасное действие должно встретиться раньше разрушительного.
+        let upd = if self.can_update() {
+            r.cut_bottom(u.th.gap);
+            Some(r.cut_bottom(line * 2))
+        } else {
+            None
+        };
         let warn = r.cut_bottom(line * 3);
         if self.target_ok() {
             wrap(
@@ -228,15 +250,30 @@ impl ui::Client for App {
                 warn.x,
                 warn.y,
                 warn.w,
-                ui::t(
-                    "Диск будет стёрт целиком: таблица разделов, все разделы, все файлы. \
-                     Отменить это нельзя.",
-                ),
+                if self.can_update() {
+                    ui::t(
+                        "На этом диске уже есть VOID. Обновить — ядро и загрузчик станут \
+                         новыми, файлы, поколения и пакеты останутся. Стереть и поставить — \
+                         диск будет очищен целиком, отменить это нельзя.",
+                    )
+                } else {
+                    ui::t(
+                        "Диск будет стёрт целиком: таблица разделов, все разделы, все файлы. \
+                         Отменить это нельзя.",
+                    )
+                },
                 u.th.danger,
             );
+            if let Some(ub) = upd {
+                let hot = if u.hot(ub) { 256 } else { 0 };
+                if u.action(ub, ui::t("Обновить — данные останутся"), hot) {
+                    self.stage = Stage::Working(true);
+                    return ui::Scope::All;
+                }
+            }
             let hot = if u.hot(btn) { 256 } else { 0 };
             if u.danger(btn, ui::t("Стереть и поставить"), hot) {
-                self.stage = Stage::Working;
+                self.stage = Stage::Working(false);
                 return ui::Scope::All; // кадр «ставлю…» — ДО самой установки
             }
         } else {
@@ -255,26 +292,36 @@ impl ui::Client for App {
     /// После кадра — сама установка. Отдельно от рисования намеренно: она занимает секунды, и
     /// делать её внутри кадра значило бы показать человеку замерший экран без единого слова.
     fn after(&mut self, _surf: &Window) -> ui::Scope {
-        if !matches!(self.stage, Stage::Working) {
+        let Stage::Working(обновление) = self.stage else {
             return ui::Scope::No;
-        }
+        };
         let slot = self.disks.get(self.sel).map(|d| d.slot).unwrap_or(usize::MAX);
-        self.stage = match sys::install(self.store, slot) {
-            Some(_) => Stage::Done(
-                String::from(ui::t(
+        let вышло = if обновление {
+            sys::update(self.store, slot).is_some()
+        } else {
+            sys::install(self.store, slot).is_some()
+        };
+        self.stage = Stage::Done(
+            String::from(match (обновление, вышло) {
+                (true, true) => ui::t(
+                    "VOID обновлён. Файлы, поколения и пакеты остались на месте. \
+                     Выключи машину, вынь носитель и включи снова.",
+                ),
+                (false, true) => ui::t(
                     "VOID установлен. Выключи машину, вынь носитель и включи снова — \
                      система поднимется с диска. Первая загрузка сама посеет конфиг.",
-                )),
-                true,
-            ),
-            None => Stage::Done(
-                String::from(ui::t(
+                ),
+                (true, false) => ui::t(
+                    "Обновить не вышло. Причину ядро сказало в журнал: `klog`. \
+                     Данные на диске при этом не тронуты.",
+                ),
+                (false, false) => ui::t(
                     "Установка не состоялась. Причину ядро сказало в журнал: `klog`. \
                      Чаще всего это отсутствие образа установки — то есть загрузка не с носителя.",
-                )),
-                false,
-            ),
-        };
+                ),
+            }),
+            вышло,
+        );
         ui::Scope::All
     }
 }
