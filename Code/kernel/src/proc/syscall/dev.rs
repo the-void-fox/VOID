@@ -376,6 +376,16 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             {
                 usize::MAX
             } else {
+                // Веха 228 — о потерянных нажатиях говорим ВСЛУХ и здесь же: это обычный
+                // контекст, а кольцо наполняется из прерывания, откуда печать может не доехать.
+                let lost = arch::key_take_lost();
+                if lost != 0 {
+                    crate::println!(
+                        "  [kbd] кольцо событий переполнено: {} нажатий потеряно — их никто не \
+                         вычерпывал (занят композитор?)",
+                        lost
+                    );
+                }
                 let mut off = 0usize;
                 while off + 6 <= len {
                     let Some(e) = arch::key_pop() else { break };

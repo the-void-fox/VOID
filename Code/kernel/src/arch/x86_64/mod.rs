@@ -607,6 +607,13 @@ static KEY_TAIL: AtomicUsize = AtomicUsize::new(0);
 const SYM_F1: u16 = 0x120;
 const MOD_CTRL_ALT: u8 = 2 | 4;
 
+/// Веха 228 — сколько СОБЫТИЙ клавиатуры потеряно переполнением кольца.
+///
+/// Кольцо байт считает свои потери с Вехи 101 («человек, увидевший испорченную строку, должен
+/// знать, что виноват не он»), а кольцо событий теряло молча — то есть в оконном сеансе, где
+/// читают именно его, потеря нажатия была невидима вовсе. Забирает и обнуляет [`key_take_lost`].
+static KEY_LOST: AtomicUsize = AtomicUsize::new(0);
+
 pub(super) fn key_push(sym: u16, mods: u8, down: bool, ch: u16) {
     if down && sym == SYM_F1 && mods & MOD_CTRL_ALT == MOD_CTRL_ALT {
         crate::proc::request_rescue();
@@ -615,7 +622,15 @@ pub(super) fn key_push(sym: u16, mods: u8, down: bool, ch: u16) {
     if head.wrapping_sub(KEY_TAIL.load(Ordering::Relaxed)) < KEY_CAP {
         unsafe { KEY_BUF[head % KEY_CAP] = KeyEvent { sym, mods, down, ch } };
         KEY_HEAD.store(head.wrapping_add(1), Ordering::Relaxed);
+    } else {
+        KEY_LOST.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Забрать счёт потерянных нажатий и обнулить его. Спрашивается из ОБЫЧНОГО контекста (разбор
+/// системного вызова), а не из обработчика прерывания: печать из обработчика может не доехать.
+pub fn key_take_lost() -> usize {
+    KEY_LOST.swap(0, Ordering::Relaxed)
 }
 
 pub fn key_pop() -> Option<KeyEvent> {

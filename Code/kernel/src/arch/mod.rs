@@ -73,7 +73,7 @@ pub use imp::{
     // раскладка клавиатуры (Веха 143): таблицы у драйвера, переключение — системным вызовом
     keymap, keymap_set, keymaps,
     // клавиатура событиями (Веха 119): код клавиши + маска модификаторов + готовый ASCII
-    key_pending, key_pop,
+    key_pending, key_pop, key_take_lost,
     // прерывания
     enable_interrupts, init_device_interrupts, irq_mask_preempt, irq_mask_read, irq_mask_stdin,
     irq_mask_idle, irq_mask_write, irq_restore, irq_save_disable, mark_in_kernel,

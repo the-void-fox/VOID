@@ -166,6 +166,10 @@ pub struct KeyEvent {
 pub fn key_pop() -> Option<KeyEvent> {
     None
 }
+/// Веха 228 — парная заглушка к x86: кольца событий здесь нет, терять нечего.
+pub fn key_take_lost() -> usize {
+    0
+}
 pub fn key_pending() -> bool {
     false
 }
