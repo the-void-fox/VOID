@@ -102,7 +102,7 @@ static void *lx_arena_alloc(size_t size)
 		uintptr_t pa = vsys_dma_alloc_n(lx_dma_cap, va, LX_DMA_ARENA_PAGES);
 		if (pa == VOID_NO_CAP) {
 			lx_arena_failed = 1;
-			printk("lx_net: арена DMA не завелась — приём работать не будет\n");
+			printk("[lx_net] арена DMA не завелась — приём работать не будет\n");
 		} else {
 			lx_dma_va_next += (uintptr_t)LX_DMA_ARENA_PAGES * 4096;
 			lx_arena_va = va;
@@ -113,7 +113,7 @@ static void *lx_arena_alloc(size_t size)
 			 * прочитав его же обратно. Карты семейства atl1c объявляют 32-битный DMA — если
 			 * арена окажется выше 4 ГиБ, старшая половина адреса просто не доедет, и приём
 			 * умрёт молча. Строка стоит одной; догадка о ней стоила бы перезагрузки. */
-			printk("lx_net: арена DMA %u КиБ: VA %lx → физ %lx\n",
+			printk("[lx_net] арена DMA %u КиБ: VA %lx → физ %lx\n",
 			       (unsigned)(lx_arena_size / 1024),
 			       (unsigned long)lx_arena_va, (unsigned long)lx_arena_pa);
 		}
@@ -133,7 +133,7 @@ static void *lx_arena_alloc(size_t size)
 		return p;
 	}
 	if (lx_arena_va) {
-		printk("lx_net: арена DMA кончилась (%u из %u байт, в возврате %u блоков)\n",
+		printk("[lx_net] арена DMA кончилась (%u из %u байт, в возврате %u блоков)\n",
 		       (unsigned)lx_arena_used, (unsigned)lx_arena_size, lx_arena_free_n);
 	}
 #else
@@ -152,7 +152,7 @@ static void lx_arena_free_block(void *p, size_t size)
 		lx_arena_free_n++;
 		return;
 	}
-	printk("lx_net: табличка возврата арены полна — блок %u байт потерян\n", (unsigned)size);
+	printk("[lx_net] табличка возврата арены полна — блок %u байт потерян\n", (unsigned)size);
 }
 
 /* Лежит ли указатель в арене — то есть можно ли назвать карте его адрес. */
@@ -203,7 +203,7 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 	 * вендорный код печатает только об ошибках, а «дошёл сюда» в нём нет. Трогать его нельзя —
 	 * значит говорить обязаны наши шимы, через которые он и ходит. Дёшево (несколько строк на
 	 * подъём) и отвечает на главный вопрос: докуда добрался. */
-	printk("lx_net: dma_alloc_coherent(%u байт)\n", (unsigned)size);
+	printk("[lx_net] dma_alloc_coherent(%u байт)\n", (unsigned)size);
 #ifdef LX_HAVE_SYSCALL
 	/* Реальный DMA: `pages` ПОДРЯД идущих страниц по DMA-cap; физ-адрес начала — device-адрес.
 	 *
@@ -230,7 +230,7 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 				lx_coh[i] = lx_coh[--lx_coh_n];
 				memset((void *)va, 0, size);
 				*handle = (dma_addr_t)pa;
-				printk("lx_net:   кольца легли по физ %lx (область переиспользована)\n",
+				printk("[lx_net]   кольца легли по физ %lx (область переиспользована)\n",
 				       (unsigned long)pa);
 				return (void *)va;
 			}
@@ -241,7 +241,7 @@ void *dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle, gf
 		lx_dma_va_next += pages * 4096;
 		memset((void *)va, 0, size);
 		*handle = (dma_addr_t)pa;
-		printk("lx_net:   кольца легли по физ %lx\n", (unsigned long)pa);
+		printk("[lx_net]   кольца легли по физ %lx\n", (unsigned long)pa);
 		return (void *)va;
 	}
 #endif
@@ -265,7 +265,7 @@ void dma_free_coherent(struct device *dev, size_t size, void *vaddr, dma_addr_t 
 			lx_coh[lx_coh_n].pages = (size + 4095) / 4096;
 			lx_coh_n++;
 		} else {
-			printk("lx_net: некуда отложить область DMA (%u байт) — потеряна\n", (unsigned)size);
+			printk("[lx_net] некуда отложить область DMA (%u байт) — потеряна\n", (unsigned)size);
 		}
 		return;
 	}
@@ -281,7 +281,7 @@ dma_addr_t dma_map_single(struct device *dev, void *ptr, size_t size, int dir)
 {
 	(void)dev; (void)size; (void)dir;
 	if (!lx_in_arena(ptr)) {
-		printk("lx_net: dma_map_single вне арены DMA — адрес карте не назвать\n");
+		printk("[lx_net] dma_map_single вне арены DMA — адрес карте не назвать\n");
 		return 0;
 	}
 	return (dma_addr_t)(lx_arena_pa + ((uintptr_t)ptr - lx_arena_va));
@@ -309,7 +309,7 @@ struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int txqs)
 	 * регистров, а будил бы одну очередь: пакеты уходили бы в три молчащих кольца, и выглядело
 	 * бы это как «иногда теряются пакеты» — худший вид ошибки. Веха 131. */
 	if (txqs != 1) {
-		printk("lx_net: alloc_etherdev_mq(%u очередей) — умеем только одну\n", txqs);
+		printk("[lx_net] alloc_etherdev_mq(%u очередей) — умеем только одну\n", txqs);
 		return NULL;
 	}
 
@@ -388,7 +388,7 @@ int register_netdev(struct net_device *dev)
 	} else if (!dev->name[0]) {
 		snprintf(dev->name, sizeof(dev->name), "eth%d", next_index++);
 	}
-	printk("lx_net: register_netdev('%s')\n", dev->name);
+	printk("[lx_net] register_netdev('%s')\n", dev->name);
 	return 0;
 }
 void unregister_netdev(struct net_device *dev) { (void)dev; }
@@ -442,7 +442,7 @@ int netif_threaded_enable(struct net_device *dev) { (void)dev; return 0; }
 
 /* ─ netif_* очереди/несущая (оживут при open/link на след. вехе) ─ */
 void netif_start_queue(struct net_device *dev)
-{ (void)dev; printk("lx_net: netif_start_queue — очередь передачи открыта\n"); }
+{ (void)dev; printk("[lx_net] netif_start_queue — очередь передачи открыта\n"); }
 void netif_stop_queue(struct net_device *dev) { (void)dev; }
 void netif_wake_queue(struct net_device *dev) { (void)dev; }
 void netif_tx_disable(struct net_device *dev) { (void)dev; }
@@ -453,12 +453,12 @@ bool netif_running(const struct net_device *dev) { return dev->flags & IFF_UP; }
 void netif_carrier_on(struct net_device *dev)
 {
 	dev->lx_state |= 1UL << LX_STATE_CARRIER;
-	printk("lx_net: netif_carrier_on — несущая есть\n");
+	printk("[lx_net] netif_carrier_on — несущая есть\n");
 }
 void netif_carrier_off(struct net_device *dev)
 {
 	dev->lx_state &= ~(1UL << LX_STATE_CARRIER);
-	printk("lx_net: netif_carrier_off\n");
+	printk("[lx_net] netif_carrier_off\n");
 }
 /* Веха 134.3 — состояние несущей ВЕДЁТСЯ, а не выдумывается. Здесь стояло `return true`, и
  * харнесс бодро печатал «несущая ЕСТЬ» в прогоне, где `netif_carrier_on` не звался ни разу.
@@ -515,7 +515,7 @@ void netif_napi_set_irq(struct napi_struct *napi, int irq) { (void)napi; (void)i
 void netif_queue_set_napi(struct net_device *dev, unsigned int q, int type, struct napi_struct *napi)
 { (void)dev; (void)q; (void)type; (void)napi; }
 void napi_enable(struct napi_struct *napi)
-{ napi->state = 1; printk("lx_net: napi_enable\n"); }
+{ napi->state = 1; printk("[lx_net] napi_enable\n"); }
 void napi_disable(struct napi_struct *napi)
 {
 	napi->state = 0;
@@ -536,7 +536,7 @@ void __napi_schedule(struct napi_struct *napi)
 			lx_napi_pending[i] = napi;
 			return;
 		}
-	printk("lx_net: очередь NAPI полна — опрос потерян\n");
+	printk("[lx_net] очередь NAPI полна — опрос потерян\n");
 }
 
 /* Разрешено ли планировать. Выключенный NAPI (до `ndo_open`, после `ndo_stop`) отвечает «нет»,
@@ -638,7 +638,7 @@ int lx_netdev_open(struct net_device *dev)
 int lx_netdev_attach(struct net_device *dev)
 {
 	if (lx_netdev_cap == VOID_NO_CAP) {
-		printk("lx_net: нет права быть картой — кадры в стек не пойдут\n");
+		printk("[lx_net] нет права быть картой — кадры в стек не пойдут\n");
 		return 0;
 	}
 	lx_netdev_dev = dev;
@@ -646,11 +646,11 @@ int lx_netdev_attach(struct net_device *dev)
 		/* Картой работает другой драйвер. Наше дело — замолчать: кадры этой карты стеку не
 		 * нужны, и носить их туда значит жечь процессор за двоих. */
 		lx_netdev_ours = 0;
-		printk("lx_net: картой системы работает другой драйвер — наши кадры в стек не идут\n");
+		printk("[lx_net] картой системы работает другой драйвер — наши кадры в стек не идут\n");
 		return 0;
 	}
 	lx_netdev_ours = 1;
-	printk("lx_net: мы — сетевая карта системы, кадры идут в стек\n");
+	printk("[lx_net] мы — сетевая карта системы, кадры идут в стек\n");
 	return 1;
 }
 
@@ -666,7 +666,7 @@ static void lx_netdev_rx(struct sk_buff *skb)
 	 * печатать каждый — утопить журнал на первой же закачке: тысяча кадров это меньше секунды
 	 * на сотне мегабит. */
 	if ((lx_rx_frames & 1023) == 1)
-		printk("lx_net: принято кадров %lu (потеряно %lu)\n", lx_rx_frames, lx_rx_lost);
+		printk("[lx_net] принято кадров %lu (потеряно %lu)\n", lx_rx_frames, lx_rx_lost);
 }
 
 /* Насос передачи: забрать у ядра кадры, которые стек просил отправить, и отдать их драйверу
@@ -701,8 +701,7 @@ static void lx_netdev_rx(struct sk_buff *skb)
  */
 void lx_net_pulse(unsigned long now_jiffies)
 {
-	static unsigned long next, slice, seen_rx, seen_tx;
-	static int said_once;
+	static unsigned long next, seen_rx, seen_tx;
 	int talking, deaf;
 
 	if (!lx_netdev_active())
@@ -726,19 +725,22 @@ void lx_net_pulse(unsigned long now_jiffies)
 	seen_tx = lx_tx_frames;
 	seen_rx = lx_rx_frames;
 
-	/* Веха 199.9 — РЕДКИЙ СРЕЗ, даже когда всё выглядит хорошо.
+	/* Веха 228 — РЕДКОГО СРЕЗА БОЛЬШЕ НЕТ, и уходит он по условию, записанному здесь же.
 	 *
-	 * Условия «отправляли и не приняли» мало: в живой домашней сети широковещание идёт само
-	 * собой (ARP соседей), приём растёт — и пульс промолчит, хотя `ping` не отвечает. Раз в
-	 * полминуты говорим безусловно: три строки за тридцать секунд журнал переживёт, а
-	 * отладка на машине, куда можно смотреть только через фотографию экрана, без них встаёт.
-	 * Когда сеть на железе перестанет быть расследованием, этот срез уйдёт. */
-	if (said_once && !(talking && deaf) && (long)(now_jiffies - slice) < 0)
+	 * Он печатался раз в полминуты безусловно — «пока сеть на железе остаётся расследованием».
+	 * Сеть на железе работает с сентября (провод 17.09, Wi-Fi 30.09), расследование кончилось,
+	 * а срез остался и стал ровно тем, от чего его заводили защищать: пять строк каждые
+	 * тридцать секунд, в которых тонет то, ради чего журнал и читают. Владелец это и сказал.
+	 *
+	 * Остаётся правило Вехи 199.8, и оно верное: пульс говорит РОВНО ТОГДА, когда мы шлём, а
+	 * нам не отвечают. В тишине и при живом приёме — молчит.
+	 *
+	 * Вернуть срез, если сеть снова станет расследованием: `#define LX_NET_SLICE_HZ (30 * HZ)`
+	 * и условие ниже. Специально оставлено одной строкой, а не выкинуто совсем. */
+	if (!(talking && deaf))
 		return;
-	slice = now_jiffies + 30 * HZ;
-	said_once = 1;
 
-	printk("lx_net: пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, взято %lu,"
+	printk("[lx_net] пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, взято %lu,"
 	       " отправлено %lu (отказов %lu)\n",
 	       lx_isr_calls, lx_isr_handled, lx_napi_polls, lx_rx_frames,
 	       lx_tx_taken, lx_tx_frames, lx_tx_busy);
@@ -781,7 +783,7 @@ static int lx_xmit_one(const unsigned char *frame, size_t n)
 	 * того, что очереди живут в ядре (см. `kernel/src/net.rs`). */
 	skb = __netdev_alloc_skb(lx_netdev_dev, n, 0);
 	if (!skb) {
-		printk("lx_net: нет буфера под исходящий кадр — откладываю\n");
+		printk("[lx_net] нет буфера под исходящий кадр — откладываю\n");
 		return 0;
 	}
 	memcpy(skb_put(skb, n), frame, n);
@@ -789,13 +791,13 @@ static int lx_xmit_one(const unsigned char *frame, size_t n)
 	if (ops->ndo_start_xmit(skb, lx_netdev_dev) == NETDEV_TX_OK) {
 		lx_tx_frames++;
 		if ((lx_tx_frames & 1023) == 1)
-			printk("lx_net: отправлено кадров %lu\n", lx_tx_frames);
+			printk("[lx_net] отправлено кадров %lu\n", lx_tx_frames);
 		return 1;
 	}
 	/* Драйвер не взял. Раньше об этом не знал никто, и кадр исчезал бесследно. */
 	lx_tx_busy++;
 	if (lx_tx_busy == 1 || (lx_tx_busy % 64) == 0)
-		printk("lx_net: карта не взяла кадр (занята) — отказов %lu\n", lx_tx_busy);
+		printk("[lx_net] карта не взяла кадр (занята) — отказов %lu\n", lx_tx_busy);
 	dev_kfree_skb(skb);
 	return 0;
 }
@@ -974,7 +976,7 @@ static struct sk_buff *lx_skb_alloc(unsigned int len)
 	{
 		static unsigned n;
 		if ((n++ & 127) == 0)
-			printk("lx_net: буфер приёма №%u (%u байт)\n", n - 1, room);
+			printk("[lx_net] буфер приёма №%u (%u байт)\n", n - 1, room);
 	}
 	skb->head = lx_arena_alloc(room);
 	if (!skb->head) {
@@ -1041,7 +1043,7 @@ void tcp_v6_gso_csum_prep(struct sk_buff *skb) { (void)skb; }
 int  request_irq(unsigned int irq, irq_handler_t h, unsigned long flags, const char *name, void *dev)
 {
 	(void)flags;
-	printk("lx_net: request_irq('%s', линия %u)\n", name ? name : "?", irq);
+	printk("[lx_net] request_irq('%s', линия %u)\n", name ? name : "?", irq);
 #ifdef LX_HAVE_SYSCALL
 	/* Веха 199.6 — обработчик заводим ДАЖЕ БЕЗ ПРАВА НА ПРЕРЫВАНИЕ.
 	 *
@@ -1053,7 +1055,7 @@ int  request_irq(unsigned int irq, irq_handler_t h, unsigned long flags, const c
 	 * зато работает. Право на прерывание становится оптимизацией, а не условием жизни. */
 	lx_irq_register((int)irq, lx_irq_cap, (lx_irq_handler_t)h, dev);
 	if (lx_irq_cap == VOID_NO_CAP)
-		printk("lx_net: права на прерывание нет — карту буду опрашивать\n");
+		printk("[lx_net] права на прерывание нет — карту буду опрашивать\n");
 	return 0;
 #endif
 	(void)irq; (void)h; (void)dev;

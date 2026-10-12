@@ -215,12 +215,12 @@ pub fn init() {
         if was_x2 { " (прошивка оставила x2APIC — переключили)" } else { "" }
     );
     if deadline {
-        crate::println!("  таймер: TSC-deadline — пробуждение по сроку, без пересчёта");
+        crate::println!("  [time] TSC-deadline — пробуждение по сроку, без пересчёта");
     } else if ratio != 0 {
         let hz = (ratio * crate::clock::ns_to_ticks(1_000_000_000)) >> 16;
-        crate::println!("  таймер: one-shot, шина {} МГц (измерена по TSC)", hz / 1_000_000);
+        crate::println!("  [time] one-shot, шина {} МГц (измерена по TSC)", hz / 1_000_000);
     } else {
-        crate::println!("  таймер: one-shot, шину измерить НЕ вышло — кванты приблизительные");
+        crate::println!("  [time] one-shot, шину измерить НЕ вышло — кванты приблизительные");
     }
 
     // Взвести здесь, а не полагаться на `timer::init` — он зовёт `arm()` ДО нас, а калибровка

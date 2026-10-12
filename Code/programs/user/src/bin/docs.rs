@@ -596,12 +596,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         вес(&a.имя).cmp(&вес(&b.имя)).then_with(|| a.имя.cmp(&b.имя))
     });
     if разделы.is_empty() {
-        say("docs: разделов руководства нет (права на store?)\n");
+        say("[docs] разделов руководства нет (права на store?)\n");
     }
 
     let (w, h) = (960u16, 680u16);
     let Some(mut surf) = Window::create(w, h, ui::t("руководство")) else {
-        say("docs: композитора нет (WM в окружении)\n");
+        say("[docs] композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
 

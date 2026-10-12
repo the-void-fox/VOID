@@ -84,7 +84,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                             if is_screen {
                                 arch::video_give_to_user(cur);
                                 println!(
-                                    "  [видео] экран отдан процессу P{} (WC) — вывод ядра уходит в serial",
+                                    "  [video] экран отдан процессу P{} (WC) — вывод ядра уходит в serial",
                                     cur
                                 );
                             }

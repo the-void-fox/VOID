@@ -353,7 +353,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                 }
                 let lost = arch::mouse_take_lost();
                 if lost > 0 {
-                    println!("  [мышь] потеряно событий: {} (владелец не успевает читать)", lost);
+                    println!("  [mouse] потеряно событий: {} (владелец не успевает читать)", lost);
                 }
                 off
             };
@@ -554,7 +554,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     0
                 }
                 Err(e) => {
-                    vprintln!("  [видео] P{} VIDEO_FLUSH отклонён: {:?}", cur, e);
+                    vprintln!("  [video] P{} VIDEO_FLUSH отклонён: {:?}", cur, e);
                     usize::MAX
                 }
             };
@@ -592,7 +592,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                 }
                 Ok(_) => usize::MAX,
                 Err(e) => {
-                    vprintln!("  [видео] P{} VIDEO_INFO отклонён: {:?}", cur, e);
+                    vprintln!("  [video] P{} VIDEO_INFO отклонён: {:?}", cur, e);
                     usize::MAX
                 }
             };

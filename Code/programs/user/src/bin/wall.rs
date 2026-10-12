@@ -77,7 +77,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // не должно — программа, которая может писать во фреймбуфер напрямую, никакому композитору
     // не подчиняется.
     let Some((sw, sh)) = win::screen() else {
-        say("wall: композитора нет (WM в окружении) — обоям не на чем лежать\n");
+        say("[wall] композитора нет (WM в окружении) — обоям не на чем лежать\n");
         sys::exit(1);
     };
 
@@ -87,20 +87,20 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         Art::Backdrop
     } else {
         let Some(store) = sys::cap_named("STORE") else {
-            say("wall: нет права на store (STORE в окружении)\n");
+            say("[wall] нет права на store (STORE в окружении)\n");
             sys::exit(1);
         };
         match obj::read(store, spec) {
             Ok(b) => Art::File(b),
             Err(e) => {
-                say(&alloc::format!("wall: {e}\n"));
+                say(&alloc::format!("[wall] {e}\n"));
                 sys::exit(1);
             }
         }
     };
 
     let Some(mut surf) = Window::layer(win::Layer::WALLPAPER, sw, sh, sys::i18n::t("обои")) else {
-        say("wall: композитор не дал поверхность слоя\n");
+        say("[wall] композитор не дал поверхность слоя\n");
         sys::exit(1);
     };
     if !paint(&art, &mut surf, sw, sh) {
@@ -154,7 +154,7 @@ fn paint(art: &Art, surf: &mut Window, w: u16, h: u16) -> bool {
             let t0 = sys::now() as u64;
             backdrop::wallpaper(surf.pixels(), w as u32, h as u32, &backdrop::Palette::VOID);
             let ms = sys::ticks_to_ns(sys::now() as u64 - t0) / 1_000_000;
-            say(&alloc::format!("wall: стол {w}×{h}, {ms} мс\n"));
+            say(&alloc::format!("[wall] стол {w}×{h}, {ms} мс\n"));
         }
     }
     surf.damage(0, 0, w, h);
@@ -167,7 +167,7 @@ fn render(bytes: &[u8], w: u16, h: u16) -> Option<void_img::Image> {
     let img = match void_img::decode(bytes, MAX_PIXELS) {
         Ok(i) => i,
         Err(e) => {
-            say(&alloc::format!("wall: {e}\n"));
+            say(&alloc::format!("[wall] {e}\n"));
             return None;
         }
     };
@@ -175,12 +175,12 @@ fn render(bytes: &[u8], w: u16, h: u16) -> Option<void_img::Image> {
     let out = match img.cover(w as u32, h as u32) {
         Ok(c) => c,
         Err(e) => {
-            say(&alloc::format!("wall: {e}\n"));
+            say(&alloc::format!("[wall] {e}\n"));
             return None;
         }
     };
     let ms = sys::ticks_to_ns(sys::now() as u64 - t0) / 1_000_000;
-    say(&alloc::format!("wall: {iw}×{ih} → {w}×{h} с обрезкой, {ms} мс\n"));
+    say(&alloc::format!("[wall] {iw}×{ih} → {w}×{h} с обрезкой, {ms} мс\n"));
     Some(out)
 }
 

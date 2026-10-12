@@ -554,8 +554,8 @@ impl App {
             },
         };
         if self.net_ep == sys::NO_CAP {
-            say("taskmgr: канала к серверу сети нет — выключателя не будет\n");
-            say("taskmgr: выдаётся строкой `desktop net taskmgr` в конфиге поколения\n");
+            say("[taskmgr] канала к серверу сети нет — выключателя не будет\n");
+            say("[taskmgr] выдаётся строкой `desktop net taskmgr` в конфиге поколения\n");
         }
     }
 
@@ -1596,13 +1596,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     let (sysview, can_write) = find_sysview();
     if sysview == sys::NO_CAP {
-        say("taskmgr: нет права обзора (sysview) — ни в старте, ни от композитора\n");
-        say("taskmgr: выдаётся строкой `desktop sysview taskmgr` в конфиге поколения\n");
+        say("[taskmgr] нет права обзора (sysview) — ни в старте, ни от композитора\n");
+        say("[taskmgr] выдаётся строкой `desktop sysview taskmgr` в конфиге поколения\n");
     }
 
     let (w, h) = (820u16, 620u16);
     let Some(mut surf) = Window::create(w, h, ui::t("Диспетчер задач")) else {
-        say("taskmgr: композитора нет (WM в окружении)\n");
+        say("[taskmgr] композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
 

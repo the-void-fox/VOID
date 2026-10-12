@@ -468,7 +468,7 @@ impl ui::Client for App {
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let Some((sw, sh)) = win::screen() else {
-        say("launcher: композитора нет (WM в окружении)\n");
+        say("[launcher] композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
     let (generation, th, mut font) = ui::app::boot();
@@ -517,7 +517,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     if items.is_empty() {
         // Не молча: пустой список без объяснения человек читает как «система сломалась», а это
         // всего лишь отказ по правам на store.
-        say("launcher: корни store не читаются — списка не будет, но набрать имя можно\n");
+        say("[launcher] корни store не читаются — списка не будет, но набрать имя можно\n");
     }
 
     let mut app = App {
@@ -542,7 +542,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     app.mo.set(A_OPEN, 0);
 
     let Some(mut surf) = Window::layer(win::Layer::POPUP, sw, sh, ui::t("строка запуска")) else {
-        say("launcher: композитор не дал поверхность слоя\n");
+        say("[launcher] композитор не дал поверхность слоя\n");
         sys::exit(1);
     };
 
@@ -563,7 +563,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 fn launch(store: Option<usize>, wm: usize, name: &str, args: &[u8]) {
     let _ = wm;
     let Some(store) = store else {
-        say("launcher: нет права на store — запускать нечем\n");
+        say("[launcher] нет права на store — запускать нечем\n");
         return;
     };
     // argv сторожа: имя программы, дальше её собственные аргументы — как в командной строке.
@@ -574,6 +574,6 @@ fn launch(store: Option<usize>, wm: usize, name: &str, args: &[u8]) {
     if sys::spawn(store, b"run", &a).is_none() {
         // Говорим вслух: молчащая строка запуска неотличима от сломанной. Плитки в этом случае
         // не будет ничьей — сторож, которого не запустили, о себе не расскажет.
-        say(&alloc::format!("launcher: сторож запуска не завёлся, программа {} не пущена\n", name));
+        say(&alloc::format!("[launcher] сторож запуска не завёлся, программа {} не пущена\n", name));
     }
 }

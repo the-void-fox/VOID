@@ -844,7 +844,7 @@ int lx_pci_register_device(struct pci_dev *pdev)
 	pci_read_config_word(pdev, PCI_DEVICE_ID, &did);
 	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
 	if (vid != 0xffff && vid != 0)
-		printk("lx_pci: шина отвечает %04x:%04x, команда %04x%s\n", vid, did, cmd,
+		printk("[lx_pci] шина отвечает %04x:%04x, команда %04x%s\n", vid, did, cmd,
 		       (vid == pdev->vendor && did == pdev->device) ? "" : " — НЕ ТО УСТРОЙСТВО");
 
 	pdev->dev.bus = &pci_bus_type;
@@ -1326,7 +1326,7 @@ void lx_sched_run(void)
 						 * завершался, ядро возвращало его DMA-страницы в общий котёл — а
 						 * карта продолжала в них писать (см. `atl1c_keepalive`). И всё это
 						 * молча. Переходим на опрос и говорим вслух. */
-						printk("lx_net: ожидание прерывания отказало — перехожу на опрос\n");
+						printk("[lx_net] ожидание прерывания отказало — перехожу на опрос\n");
 						lx_the_irq.cap = VOID_NO_CAP;
 						continue;
 					}
@@ -1446,7 +1446,7 @@ void get_random_bytes(void *buf, size_t len)
 	static int warned;
 	if (!warned) {
 		warned = 1;
-		printk("lx_kit: СЛУЧАЙНОСТИ НЕТ (сборка без syscall'ов) — байты фиктивные\n");
+		printk("[lx_kit] СЛУЧАЙНОСТИ НЕТ (сборка без syscall'ов) — байты фиктивные\n");
 	}
 	memset(buf, 0xa5, len);
 #endif

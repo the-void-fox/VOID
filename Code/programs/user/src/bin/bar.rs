@@ -101,7 +101,7 @@ fn build_short() -> &'static str {
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let Some((sw, sh)) = win::screen() else {
-        say("bar: композитора нет (WM в окружении) — панели не на чем висеть\n");
+        say("[bar] композитора нет (WM в окружении) — панели не на чем висеть\n");
         sys::exit(1);
     };
 
@@ -118,7 +118,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let anim_ms = ui::anim::duration_from_config(&generation);
     let mut bar = Bar::new(&th, font.line_h(), sw as i32, sh as i32, anim_ms, &generation);
     say(&alloc::format!(
-        "bar: шрифт {} {} px, масштаб {}%, высота {} px, движение {} мс\n",
+        "[bar] шрифт {} {} px, масштаб {}%, высота {} px, движение {} мс\n",
         if font.ttf() { "из пакета" } else { "встроенный 8×16" },
         th.font_px,
         th.scale,
@@ -128,14 +128,14 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Кто эта машина — вслух, по той же причине, что и шрифт: «почему в меню написано VOID, а не
     // моё имя» — вопрос, ответ на который панель знает, а человек нет.
     say(&alloc::format!(
-        "bar: раскладка {} — слева: {} · середина: {} · справа: {}\n",
+        "[bar] раскладка {} — слева: {} · середина: {} · справа: {}\n",
         if bar.from_conf { "из bar.vv" } else { "по умолчанию (в конфиге нет строк bar)" },
         slot_names(&bar.left),
         slot_names(&bar.center),
         slot_names(&bar.right),
     ));
     say(&alloc::format!(
-        "bar: устройство «{}», аватар {}\n",
+        "[bar] устройство «{}», аватар {}\n",
         bar.device,
         bar.avatar_root.as_deref().unwrap_or("не задан (знак системы в кружке)"),
     ));
@@ -158,11 +158,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // его нельзя ещё и потому, что «панель» у терминала значит другое (pane), а ключ перевода
     // здесь — сама строка: один ключ не может дать два разных слова.
     let Some(mut surf) = Window::layer(spec, sw, bar.h as u16, "панель") else {
-        say("bar: композитор не дал поверхность слоя\n");
+        say("[bar] композитор не дал поверхность слоя\n");
         sys::exit(1);
     };
     if !surf.watch() {
-        say("bar: композитор не принял подписку на состояние — столы показаны не будут\n");
+        say("[bar] композитор не принял подписку на состояние — столы показаны не будут\n");
     }
 
     bar.fetch(&surf);
@@ -170,7 +170,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // выдал нам слой, отвечать на неё ему нечем.
     bar.take_sysview();
     if year_now() < 2000 {
-        say("bar: часов у машины нет — время идёт с загрузки (см. SYS_TIME)\n");
+        say("[bar] часов у машины нет — время идёт с загрузки (см. SYS_TIME)\n");
     }
 
     ui::app::run(&mut surf, &th, &mut font, &mut bar);
@@ -818,7 +818,7 @@ impl Bar {
         }
         let h = if want { self.sh } else { self.h };
         if !surf.resize_buf(self.sw as u16, h as u16) {
-            say("bar: композитор не дал буфер под меню — меню не открыть\n");
+            say("[bar] композитор не дал буфер под меню — меню не открыть\n");
             self.open = Menu::None;
             return;
         }
@@ -848,7 +848,7 @@ impl Bar {
             surf.switch_layout();
         }
         if core::mem::take(&mut self.power) {
-            say("bar: выключение по кнопке меню\n");
+            say("[bar] выключение по кнопке меню\n");
             // Веха 204.3 — ПРОСИМ КОМПОЗИТОР, а не гасим сами. Он перед выключением сохранит
             // сеанс: спросит окна «сохранись и назовись», дождётся ответов и обновит снимки.
             // Пока панель гасила машину своим правом, всё это пропускалось — и стол возвращался
@@ -857,7 +857,7 @@ impl Bar {
             // сохранилось».
             if surf.poweroff() {
                 // Вернулись — значит композитор ещё пишет сеанс; питание он снимет сам.
-                say("bar: композитор сохраняет сеанс и выключит машину\n");
+                say("[bar] композитор сохраняет сеанс и выключит машину\n");
             } else {
                 // Композитор отказал (конфиг не называет нас) либо он старого поколения и такой
                 // просьбы не знает. Тогда прежний путь: погасить своим правом, если оно есть.
@@ -866,11 +866,11 @@ impl Bar {
                 // наследуется», иначе его имело бы каждое окно).
                 let pc = sys::win::cap_or_grant(10);
                 if pc == sys::NO_CAP {
-                    say("bar: права `power` нет — нужна строка `desktop power bar` в конфиге\n");
+                    say("[bar] права `power` нет — нужна строка `desktop power bar` в конфиге\n");
                 } else {
                     sys::power_off(pc);
                     // Вернулись — значит права не хватило: сказать вслух, а не молчать кнопкой.
-                    say("bar: выключить не вышло — право есть, но машина продолжает работу\n");
+                    say("[bar] выключить не вышло — право есть, но машина продолжает работу\n");
                 }
             }
         }
@@ -1487,7 +1487,7 @@ impl Bar {
     fn take_sysview(&mut self) {
         let c = sys::win::cap_or_grant(13);
         if c == sys::NO_CAP {
-            say("bar: права обзора нет — метрик не будет (строка `desktop sysview bar` в конфиге)\n");
+            say("[bar] права обзора нет — метрик не будет (строка `desktop sysview bar` в конфиге)\n");
             return;
         }
         self.sysview = c;
@@ -1560,19 +1560,19 @@ impl Bar {
             match ui::font::read_path(&root) {
                 Some(b) => b,
                 None => {
-                    say(&alloc::format!("bar: аватар «{root}»: файла нет\n"));
+                    say(&alloc::format!("[bar] аватар «{root}»: файла нет\n"));
                     return;
                 }
             }
         } else {
             let Some(store) = ui::conf::store_cap() else {
-                say("bar: аватар не прочитать — нет права на store\n");
+                say("[bar] аватар не прочитать — нет права на store\n");
                 return;
             };
             match obj::read(store, root.as_bytes()) {
                 Ok(b) => b,
                 Err(e) => {
-                    say(&alloc::format!("bar: аватар «{root}»: {e}\n"));
+                    say(&alloc::format!("[bar] аватар «{root}»: {e}\n"));
                     return;
                 }
             }
@@ -1580,7 +1580,7 @@ impl Bar {
         let img = match void_img::decode(&bytes, MAX_PIXELS) {
             Ok(i) => i,
             Err(e) => {
-                say(&alloc::format!("bar: аватар «{root}»: {e}\n"));
+                say(&alloc::format!("[bar] аватар «{root}»: {e}\n"));
                 return;
             }
         };
@@ -1589,10 +1589,10 @@ impl Bar {
         // значит оставить поля внутри кружка.
         match img.cover(self.av_px, self.av_px) {
             Ok(a) => {
-                say(&alloc::format!("bar: аватар {iw}×{ih} → {0}×{0}\n", self.av_px));
+                say(&alloc::format!("[bar] аватар {iw}×{ih} → {0}×{0}\n", self.av_px));
                 self.avatar = Some(a);
             }
-            Err(e) => say(&alloc::format!("bar: аватар «{root}»: {e}\n")),
+            Err(e) => say(&alloc::format!("[bar] аватар «{root}»: {e}\n")),
         }
     }
 

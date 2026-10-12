@@ -730,11 +730,11 @@ fn load_font(conf: &Conf) -> TermFont {
         match ui::font::find(name) {
             Some(bytes) => match TtfFont::from_vec(bytes, conf.font_px) {
                 Ok(f) => return TermFont::Ttf(f),
-                Err(_) => log_line(&alloc::format!("term: {} — не разбирается как шрифт", name)),
+                Err(_) => log_line(&alloc::format!("[term] {} — не разбирается как шрифт", name)),
             },
             None => {
                 log_line(&alloc::format!(
-                    "term: шрифт {} не найден (ни путь, ни пакет профиля)",
+                    "[term] шрифт {} не найден (ни путь, ни пакет профиля)",
                     name
                 ));
                 // «Не найден» — половина ответа. Вторая половина: а что там ЕСТЬ. Без неё
@@ -747,12 +747,18 @@ fn load_font(conf: &Conf) -> TermFont {
     // Кегль у растрового шрифта кратен 16, и просьбу «18» он выполнить не может. Говорим, что
     // получилось на самом деле: молча нарисовать не то — худший исход из возможных.
     let f = BitmapFont::new(conf.font_px);
-    log_line(&alloc::format!(
-        "term: рисую встроенным шрифтом 8×16 (кегль {} вместо {}); настоящий задаётся так: \
+    // Веха 228 — ОДИН раз на запуск, а не на каждую панель. Шрифт берётся при создании каждого
+    // вида, и в сеансе с парой терминалов одна и та же строка про кегль печаталась по шесть раз.
+    // Сказать нужно ровно однажды: сообщение про машину, а не про панель.
+    static СКАЗАНО: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !СКАЗАНО.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        log_line(&alloc::format!(
+        "[term] рисую встроенным шрифтом 8×16 (кегль {} вместо {}); настоящий задаётся так: \
          packages(\"…\") + terminal(\"font\", \"имя.ttf\")",
         f.effective_px(),
         conf.font_px
     ));
+    }
     TermFont::Bitmap(f)
 }
 
@@ -810,7 +816,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // здесь и больше нигде: дальше по коду разница видна только в том, куда лёг кадр.
     let (mut out, mut info) = match sys::win::Window::create(WIN_W, WIN_H, sys::i18n::t("терминал")) {
         Some(win) => {
-            log_line("term: работаю окном композитора");
+            log_line("[term] работаю окном композитора");
             // Кадр окна — RGBA по строкам без выравнивания; описываем его теми же полями, что
             // ядро отдаёт для экрана, чтобы весь рисующий код остался общим.
             let info = sys::VideoInfo {
@@ -840,7 +846,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             let (mbs32, mbs64) = measure_fb(&info);
             let frame = (info.width * info.height * (info.bpp / 8)) as u64;
             log_line(&alloc::format!(
-                "term: экран {}×{}, {} бит — заливка {} МБ/с по 4 байта, {} МБ/с по 8 (полный кадр {} мс)",
+                "[term] экран {}×{}, {} бит — заливка {} МБ/с по 4 байта, {} МБ/с по 8 (полный кадр {} мс)",
                 info.width, info.height, info.bpp, mbs32, mbs64,
                 frame / mbs64.max(1) / 1000,
             ));
@@ -895,7 +901,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             _ => alloc::format!("app/term/{}", win.id()),
         });
         log_line(&alloc::format!(
-            "term: состояние — {}",
+            "[term] состояние — {}",
             state.as_deref().unwrap_or("не сохраняем")
         ));
         // Вернуть прошлый вывод — просто напечатать его в панель: она уже умеет принимать байты.
@@ -1104,7 +1110,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             // остаться прежним.
             if let Out::Window { win } = &mut out {
                 if !win.resize_buf(w as u16, h as u16) {
-                    log_line("term: новый буфер кадра не вышел — остаюсь в прежнем размере");
+                    log_line("[term] новый буфер кадра не вышел — остаюсь в прежнем размере");
                     info.width = win.width as usize;
                     info.height = win.height as usize;
                     info.pitch = win.width as usize * 4;
@@ -1130,7 +1136,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 my = (my as i32 + e.dy as i32).clamp(0, info.height as i32 - 1) as usize;
                 if e.buttons != mbtn {
                     log_line(&alloc::format!(
-                        "term: кнопки {:#04b} в {}×{}",
+                        "[term] кнопки {:#04b} в {}×{}",
                         e.buttons, mx, my
                     ));
                     mbtn = e.buttons;
@@ -1912,12 +1918,12 @@ fn paste_named(
     // Право на store берём тем же способом, что и конфиг: по имени, а не вышло — перебором
     // ([`store_cap`]). Иначе вставка работала бы у одних поколений и молча не работала у других.
     let Some(cap) = store_cap() else {
-        log_line("term: вставка не вышла — права на store нет");
+        log_line("[term] вставка не вышла — права на store нет");
         return 0;
     };
     let mut buf = [0u8; PASTE_MAX];
     let Some((_, got, full)) = read(cap, &mut buf) else {
-        log_line(&alloc::format!("term: вставлять нечего ({})", empty));
+        log_line(&alloc::format!("[term] вставлять нечего ({})", empty));
         return 0;
     };
     for &b in &buf[..got] {
@@ -1925,7 +1931,7 @@ fn paste_named(
     }
     if full > got {
         log_line(&alloc::format!(
-            "term: вставлено {} из {} байт — буфер вставки {} байт",
+            "[term] вставлено {} из {} байт — буфер вставки {} байт",
             got, full, PASTE_MAX
         ));
     }

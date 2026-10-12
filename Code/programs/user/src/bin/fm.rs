@@ -2127,11 +2127,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Файловый сервер: по имени из окружения, а нет имени — стартовым правом 0, как у шелла.
     let ep = sys::cap_named("POSIXFS").unwrap_or_else(|| sys::start_cap(0));
     if ep == sys::NO_CAP {
-        say("fm: нет эндпоинта файлового сервера — показывать нечего\n");
+        say("[fm] нет эндпоинта файлового сервера — показывать нечего\n");
     }
     let (w, h) = (760u16, 620u16);
     let Some(mut surf) = Window::create(w, h, ui::t("Файлы")) else {
-        say("fm: композитора нет (WM в окружении)\n");
+        say("[fm] композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
 

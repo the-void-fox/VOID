@@ -544,13 +544,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         }
     }
     if items.is_empty() {
-        say("roots: корни store не читаются — права на store нет\n");
+        say("[roots] корни store не читаются — права на store нет\n");
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
 
     let (w, h) = (900u16, 620u16);
     let Some(mut surf) = Window::create(w, h, ui::t("корни store")) else {
-        say("roots: композитора нет (WM в окружении)\n");
+        say("[roots] композитора нет (WM в окружении)\n");
         sys::exit(1);
     };
 

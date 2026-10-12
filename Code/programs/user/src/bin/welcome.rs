@@ -364,7 +364,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // `Resize` с настоящим. Крупные кегли поэтому и считаются в первом кадре, а не здесь.
     let (w, h) = (640u16, 760u16);
     let Some(mut surf) = Window::create(w, h, ui::t("Добро пожаловать")) else {
-        ui::app::say("welcome: композитора нет (WM в окружении)");
+        ui::app::say("[welcome] композитора нет (WM в окружении)");
         sys::exit(1);
     };
 
