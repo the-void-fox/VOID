@@ -924,6 +924,14 @@ fn seed_programs() {
     for (name, bytes) in PROGRAMS.iter().chain(PROGRAMS_SCREEN).chain(PROGRAMS_X86).chain(drivers.iter()) {
         if *name == "install" && !install_media {
             object::del_root(&prog_root(name)); // не носитель — install отсутствует
+            // Веха 227.3 — и СКАЗАТЬ об этом. Раньше установщик исчезал молча, и отличить «эта
+            // система установлена» от «флешка записана неправильно» было нечем: экран, окна и
+            // команды те же самые. Жалоба владельца звучала ровно так — «в записанном образе нет
+            // программы инсталлятора», — а образ был в порядке.
+            println!(
+                "  [seed] 'install' НЕ посеян: загрузочного модуля нет, то есть это не живой \
+                 носитель, а установленная система"
+            );
             continue;
         }
         let root_name = prog_root(name);

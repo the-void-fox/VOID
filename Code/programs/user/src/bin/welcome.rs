@@ -26,12 +26,16 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use void_user as sys;
 use void_user::win::{sym, Event, Window};
 
 #[path = "../ui/mod.rs"]
 mod ui;
+// Список корней store — тем же кодом, что у `vvsh`: вопрос «есть ли корень» в системе один.
+#[path = "../roots.rs"]
+mod roots;
 
 use ui::{Align, Rect, Rgba, Ui};
 
@@ -58,6 +62,28 @@ enum Line {
 }
 
 use Line::{Code, Gap, Item, Pair, Text, Title};
+
+/// Веха 227.3 — экран ЖИВОГО НОСИТЕЛЯ. Вставляется вторым (сразу за знаком системы) и только
+/// там, где система работает с флешки.
+///
+/// Появился из жалобы владельца: «в записанном образе нет программы инсталлятора». Установщик был
+/// на месте — не было НИ ОДНОГО СЛОВА о том, что это живой носитель и чем он отличается от
+/// установленной системы. Экран у них один и тот же, окна те же, и отличить одно от другого можно
+/// было только журналом ядра, которого в оконном сеансе никто не видит.
+const LIVE: &[Line] = &[
+    Title("Это живой носитель"),
+    Gap(3),
+    Text(
+        "Система работает из памяти: всё, что ты изменишь, исчезнет при перезагрузке. Диски \
+         машины при этом не тронуты — ни один сектор.",
+    ),
+    Gap(2),
+    Text("Поставить VOID на диск — одно слово в терминале (Super+Return):"),
+    Gap(1),
+    Code("install"),
+    Gap(1),
+    Text("То же самое есть в строке запуска (Super+D) под именем «Установка VOID»."),
+];
 
 /// Экраны. Порядок — порядок прокрутки; первый особенный: вместо строк на нём знак системы.
 const SCREENS: &[&[Line]] = &[
@@ -108,12 +134,14 @@ struct App {
     fitted: i32,
     /// Куда попадает щелчок по шеврону. Считается при рисовании — как и всё в immediate-mode.
     chevron: Rect,
+    /// Экраны ЭТОГО запуска: на живом носителе их на один больше ([`LIVE`]).
+    screens: Vec<&'static [Line]>,
 }
 
 impl App {
     /// Перейти на экран `n`, если он есть. `true` — что-то изменилось.
     fn go(&mut self, n: i32) -> bool {
-        let n = n.clamp(0, SCREENS.len() as i32 - 1) as usize;
+        let n = n.clamp(0, self.screens.len() as i32 - 1) as usize;
         let moved = n != self.at;
         self.at = n;
         moved
@@ -165,14 +193,14 @@ impl App {
         let width = self.w - pad * 2;
         // Колонка значений отбивается от самой длинной подписи, а не на глаз: иначе «Обзор
         // столов» и «Терминал» разъехались бы при другом кегле или шрифте.
-        let key_w = SCREENS[screen]
+        let key_w = self.screens[screen]
             .iter()
             .filter_map(|i| if let Pair(k, _) = i { Some(ui::t(k)) } else { None })
             .map(|k| u.text_w(k))
             .max()
             .unwrap_or(0);
         let mut y = top + self.h / 4;
-        for item in SCREENS[screen] {
+        for item in self.screens[screen] {
             match item {
                 Title(s) => {
                     let col = u.th.muted;
@@ -243,6 +271,20 @@ fn wrap(u: &mut Ui, x: i32, y: i32, w: i32, s: &str, col: Rgba) -> i32 {
     y
 }
 
+/// Живой ли это носитель. Вопрос решается ровно тем же признаком, которым его решает ЯДРО:
+/// установщик сеется в store **только** на установочном носителе (`main.rs`, `seed_programs`), и
+/// значит «корень программы `install` есть» и «мы на живом носителе» — это одно и то же.
+///
+/// Не спрашиваем ядро отдельным вызовом намеренно: второй источник правды про одно и то же
+/// однажды разошёлся бы с первым, и окно говорило бы «ставь командой install» там, где её нет.
+fn живой_носитель() -> bool {
+    let Some(scap) = ui::conf::store_cap() else { return false };
+    let Some(list) = roots::text(scap) else { return false };
+    roots::suffixes(&list, b"bin/")
+        .iter()
+        .any(|s| s.ends_with(b"/install") || *s == b"install")
+}
+
 impl ui::Client for App {
     fn event(&mut self, e: Event, _input: &ui::Input) -> ui::Scope {
         let moved = match e {
@@ -250,7 +292,7 @@ impl ui::Client for App {
                 sym::DOWN | sym::PAGE_DOWN | sym::RETURN => self.go(self.at as i32 + 1),
                 sym::UP | sym::PAGE_UP => self.go(self.at as i32 - 1),
                 sym::HOME => self.go(0),
-                sym::END => self.go(SCREENS.len() as i32 - 1),
+                sym::END => self.go(self.screens.len() as i32 - 1),
                 _ if ch == b' ' as u16 => self.go(self.at as i32 + 1),
                 _ => false,
             },
@@ -287,7 +329,7 @@ impl ui::Client for App {
         // Прокрутка едет сама (Веха 168.2): цель — верх нужного экрана, а значение этого кадра
         // считает тулкит и сам просит следующий кадр, пока не доедет.
         let off = u.anim(ANIM_SCROLL, self.at as i32 * self.h);
-        for n in 0..SCREENS.len() {
+        for n in 0..self.screens.len() {
             let top = n as i32 * self.h - off;
             if top >= self.h || top + self.h <= 0 {
                 continue; // экран целиком за краем окна — рисовать нечего
@@ -297,7 +339,7 @@ impl ui::Client for App {
             } else {
                 self.draw_screen(u, n, top);
             }
-            if n + 1 < SCREENS.len() {
+            if n + 1 < self.screens.len() {
                 self.draw_chevron(u, top);
             }
         }
@@ -338,6 +380,13 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         font_name: name,
         fitted: 0,
         chevron: Rect::ZERO,
+        screens: {
+            let mut v: Vec<&'static [Line]> = SCREENS.to_vec();
+            if живой_носитель() {
+                v.insert(1, LIVE);
+            }
+            v
+        },
     };
     ui::app::run(&mut surf, &th, &mut font, &mut app);
     sys::exit(0);
