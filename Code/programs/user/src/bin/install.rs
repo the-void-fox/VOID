@@ -144,6 +144,20 @@ const MODES: [(&str, &str, &str); 3] = [
     ("Шелл", "vsh", "Текстовый шелл в консоли ядра. Работает где угодно."),
 ];
 
+/// Веха 227.7 — можно ли этот знак в ИМЕНИ МАШИНЫ.
+///
+/// Запрет не косметический: имя уезжает в конфиг двумя путями сразу — токеном `arg:name=…`
+/// (строку конфига разбирают по пробелам) и строкой `device("name", "…")` в `.vv` (её
+/// ограничивают кавычки). Пробел ломает первый, кавычка — вторую, и выясняется это уже
+/// УСТАНОВКОЙ: ядро отказывается брать такое имя, а человек к тому моменту успел дойти до
+/// последнего шага.
+///
+/// Поэтому непозволенный знак просто не набирается — как не набирается буква в поле для числа.
+/// Буквы любые, в том числе русские: имя показывает меню оболочки, а не сетевой стек.
+fn имя_ок(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
 struct App {
     w: i32,
     h: i32,
@@ -209,7 +223,10 @@ impl App {
         let mut s = String::new();
         s.push_str(&alloc::format!("mode {}\n", MODES[self.mode].1));
         s.push_str(&alloc::format!("language {}\n", LANGS[self.lang].1));
-        let name = self.name.text.trim();
+        // Второй рубеж: поле уже не даёт набрать лишнего, но имя может приехать и не с
+        // клавиатуры (вставка, восстановленный сеанс), а цена пропущенного пробела — отказ
+        // установки на последнем шаге.
+        let name: String = self.name.text.trim().chars().filter(|c| имя_ок(*c)).collect();
         if !name.is_empty() {
             s.push_str(&alloc::format!("name {}\n", name));
         }
@@ -228,6 +245,12 @@ impl ui::Client for App {
                 (Step::Disk, sym::UP) => self.move_sel(-1),
                 // Имя машины набирают клавиатурой, и все прочие клавиши на этом шаге — его.
                 (Step::System, _) => {
+                    // Знак, которому в имени не место, до правки не доходит. Управляющие
+                    // (Backspace, стрелки, Enter) пропускаем: они не знаки, а движения.
+                    let печатный = char::from_u32(ch as u32).filter(|c| !c.is_control());
+                    if печатный.is_some_and(|c| !имя_ок(c)) {
+                        return ui::Scope::No;
+                    }
                     self.name.key(code, ch, mods);
                     true
                 }
@@ -324,6 +347,10 @@ impl ui::Client for App {
             None
         };
         let back_r = right.cut_right(w);
+        // Всё, что осталось левее кнопок: сюда пишется причина, по которой дальше нельзя.
+        // Первая редакция писала её в объединение прямоугольников кнопок — и накрывала «Назад».
+        right.cut_right(u.th.gap);
+        let why_r = right;
         if self.step > 0 {
             let hot = if u.hot(back_r) { 256 } else { 0 };
             if u.button(back_r, ui::t("Назад"), hot) {
@@ -337,7 +364,7 @@ impl ui::Client for App {
                 // Кнопки нет вовсе, а на её месте — причина. Серая кнопка, которая не
                 // нажимается, объясняет ровно ничего, и человек жмёт её до тех пор, пока не
                 // решит, что сломано.
-                u.label(next_r.union(back_r), why, u.th.danger, Align::Right);
+                u.label(why_r, why, u.th.danger, Align::Right);
             }
             None if last => {
                 // Веха 227.6 — на диске с VOID кнопки ДВЕ, и это не удобство, а выход из тупика.
@@ -456,7 +483,7 @@ impl ui::Client for App {
                 u.label(body.cut_top(line * 2), ui::t("Как зовут эту машину"), tx, Align::Center);
                 let w = (body.w / 2).min(320);
                 let f = Rect::new(body.x + (body.w - w) / 2, body.y, w, line * 2);
-                let (click, drag) = u.edit_field(f, &self.name, ui::t("без пробелов, можно пусто"));
+                let (click, drag) = u.edit_field(f, &self.name, ui::t("буквы, цифры, дефис; можно пусто"));
                 if let Some(a) = click {
                     self.name.put_caret(a);
                     again = true;

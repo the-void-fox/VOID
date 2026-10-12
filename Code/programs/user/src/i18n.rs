@@ -271,7 +271,7 @@ fn en(s: &'static str) -> &'static str {
         "Текстовый шелл в консоли ядра. Работает где угодно."
             => "A text shell in the kernel console. Works anywhere.",
         "Как зовут эту машину" => "What this machine is called",
-        "без пробелов, можно пусто" => "no spaces, may be empty",
+        "буквы, цифры, дефис; можно пусто" => "letters, digits, hyphen; may be empty",
         "Пользователей в VOID нет — ни root, ни учётных записей. На вопрос «чьё это» отвечает \
          имя машины."
             => "VOID has no users — no root, no accounts. The question «whose is this» is \

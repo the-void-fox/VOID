@@ -113,6 +113,20 @@ pub const fn panel_fillet(strip: i32) -> i32 {
     strip / 2
 }
 
+/// Веха 227.7 — **РАДИУС БЕГУНКА** ползунка, и он публичный не для красоты.
+///
+/// Его знает не только [`Ui::slider`], но и тот, кто отводит ползунку место: дорожку надо
+/// отступить от краёв карточки ровно на бегунок, иначе на нуле и на сотне он наполовину вылезает
+/// и срезается краем. До этой вехи чисел было ДВА — `KNOB` в тулките и `th.px(4)` в панели, — и
+/// пока оба равнялись четырём, расхождения было не видно. Просьба владельца «увеличить круг
+/// вдвое» показала бы его сразу: бегунок стал бы больше, а отступ под него — нет.
+///
+/// Масштабируется темой, как и всё остальное: на крупном `scale` бегунок обязан расти вместе с
+/// кеглем, иначе попасть в него станет труднее именно там, где масштаб и включают.
+pub fn slider_knob(th: &Theme) -> i32 {
+    th.px(8).max(4)
+}
+
 /// Кадр интерфейса: холст, тема, шрифт и ввод этого кадра.
 pub struct Ui<'a> {
     pub c: Canvas<'a>,
@@ -1007,7 +1021,9 @@ impl<'a> Ui<'a> {
     /// заниматься не обязан (то же правило и по той же причине, что у полосы прокрутки).
     pub fn slider(&mut self, r: Rect, value: u8, press: Option<(i32, i32)>) -> Option<u8> {
         const TRACK: i32 = 4;
-        const KNOB: i32 = 4;
+        // Веха 227.7 — бегунок ВДВОЕ крупнее прежнего (просьба владельца): в четыре точки
+        // попадать мышью работа, а не управление. Мера общая — [`slider_knob`].
+        let knob = slider_knob(self.th);
         if r.w <= TRACK {
             return None;
         }
@@ -1035,11 +1051,14 @@ impl<'a> Ui<'a> {
         }
         // Бегунок: квадрат со скруглением в половину — он же круг, другого круга у холста нет.
         let cx = r.x + done;
-        let ring = Rect::new(cx - KNOB, mid - KNOB, KNOB * 2, KNOB * 2);
-        self.c.rrect(ring, KNOB, self.tint(self.th.text));
-        let hole = Rect::new(ring.x + 1, ring.y + 1, ring.w - 2, ring.h - 2);
-        self.c.rrect(hole, KNOB - 1, self.tint(self.th.bg.with_a(0xff)));
-        self.mark(Rect::new(r.x - KNOB, r.y, r.w + KNOB * 2, r.h));
+        let ring = Rect::new(cx - knob, mid - knob, knob * 2, knob * 2);
+        self.c.rrect(ring, knob, self.tint(self.th.text));
+        // Толщина кольца — доля радиуса, а не точка: на крупном бегунке однопиксельная обводка
+        // читалась бы как тонкий контур, а не как кольцо с макета.
+        let t = (knob / 4).max(1);
+        let hole = Rect::new(ring.x + t, ring.y + t, ring.w - 2 * t, ring.h - 2 * t);
+        self.c.rrect(hole, knob - t, self.tint(self.th.bg.with_a(0xff)));
+        self.mark(Rect::new(r.x - knob, r.y, r.w + knob * 2, r.h));
         grab.map(|_| value)
     }
 
