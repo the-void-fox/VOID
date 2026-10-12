@@ -506,11 +506,28 @@ impl Cfg {
                 }
                 _ => false,
             };
-            if !ok {
+            if !ok && tok != b"verbose" {
                 warn_arg(tok);
+            }
+            if tok == b"verbose" {
+                ПОДРОБНО.store(true, core::sync::atomic::Ordering::Relaxed);
             }
         }
         cfg
+    }
+}
+
+/// Веха 227.5 — **ПОДРОБНЫЙ ли вывод**, тем же ключом, что у драйвера карты (`arg:verbose`).
+///
+/// Сервер и так немногословен, но две его строки — диагностические: самопинг шлюза при подъёме
+/// и счёт кадров на каждый `ping`. На машине, где журнал читают, чтобы найти чужой отказ, они
+/// лишние, а при разборе сети — незаменимы.
+static ПОДРОБНО: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Печать ПОДРОБНОСТИ: при `arg:verbose` — как обычно, иначе ни байта.
+fn шум(b: &[u8]) {
+    if ПОДРОБНО.load(core::sync::atomic::Ordering::Relaxed) {
+        sys::write(b);
     }
 }
 
@@ -708,19 +725,31 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     }
 
     // Самопроверка на каждой загрузке: пингуем шлюз (в QEMU это SLIRP — не выходя за его пределы).
+    //
+    // Веха 227.5 — удачный самопинг печатается только при `arg:verbose`: «сеть работает» и так
+    // видно по адресу строкой выше, а неудачный остаётся всегда — это уже не отчёт, а отказ.
     if let Some(gw) = default_gateway(&mut iface) {
-        sys::write("[net-srv] самопинг шлюза ".as_bytes());
-        write_ipv4(gw);
-        sys::write(": ".as_bytes());
+        шум("[net-srv] самопинг шлюза ".as_bytes());
         match ping(&mut iface, &mut device, &mut sockets, &mut pings, gw) {
             Ok(rtt) => {
-                sys::write("ответ за ".as_bytes());
-                write_dec(rtt);
-                sys::write(" мкс\n".as_bytes());
+                if ПОДРОБНО.load(core::sync::atomic::Ordering::Relaxed) {
+                    write_ipv4(gw);
+                    sys::write(": ответ за ".as_bytes());
+                    write_dec(rtt);
+                    sys::write(" мкс\n".as_bytes());
+                }
             }
-            Err(PING_NO_REPLY) => sys::write("нет ICMP-ответа\n".as_bytes()),
-            Err(PING_EXHAUSTED) => sys::write("сокеты пинга кончились\n".as_bytes()),
-            Err(_) => sys::write("адрес не разрешился\n".as_bytes()),
+            Err(e) => {
+                // Отказ называет СЕБЯ целиком, не полагаясь на начало строки выше: его могло не
+                // быть вовсе.
+                sys::write("[net-srv] самопинг шлюза ".as_bytes());
+                write_ipv4(gw);
+                sys::write(match e {
+                    PING_NO_REPLY => ": нет ICMP-ответа\n".as_bytes(),
+                    PING_EXHAUSTED => ": сокеты пинга кончились\n".as_bytes(),
+                    _ => ": адрес не разрешился\n".as_bytes(),
+                });
+            }
         }
     } else {
         sys::write("[net-srv] шлюза нет — доступна только локальная сеть\n".as_bytes());

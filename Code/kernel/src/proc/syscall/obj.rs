@@ -284,9 +284,9 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         //
         // ДИСК СТИРАЕТСЯ ЦЕЛИКОМ. Ставить на диск, с которого работает система, ядро отказывает.
         30 => {
-            let (scap, op, slot, ptr, len) = {
+            let (scap, op, slot, ptr, len, eptr, elen) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4), f.arg(5), f.arg(6))
             };
             let dom = t.procs[cur].domain;
             let result = match cap::store(dom, Cap::from_bits(scap as u64), Rights::WRITE) {
@@ -342,6 +342,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     }
                     Err(e) => {
                         crate::println!("  [install] обновление отклонено: {}", e);
+                        сказать_причину(t, cur, eptr, elen, e);
                         usize::MAX
                     }
                 },
@@ -351,6 +352,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                 Ok(()) => match читать_пожелание(t, cur, ptr, len) {
                     None => {
                         crate::println!("  [install] отказ: пожелание установки не читается");
+                        сказать_причину(t, cur, eptr, elen, "пожелание установки не читается");
                         usize::MAX
                     }
                     Some(setup) => match crate::install::run(slot, &setup) {
@@ -360,6 +362,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         }
                         Err(e) => {
                             crate::println!("  [install] отказ: {}", e);
+                            сказать_причину(t, cur, eptr, elen, e);
                             usize::MAX
                         }
                     },
@@ -562,4 +565,35 @@ fn читать_пожелание(t: &Table, cur: usize, ptr: usize, len: usize
     // SAFETY: диапазон проверен выше — он же дотянул ленивые страницы кучи.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
     core::str::from_utf8(bytes).ok().map(alloc::string::String::from)
+}
+
+/// Веха 227.4 — отдать ПРИЧИНУ ОТКАЗА установки вызывающему, а не только в журнал.
+///
+/// Окно установщика говорило «Не вышло. Причину ядро сказало в журнал: `klog`», и это было
+/// верно ровно до первой машины с настоящим железом: на ноутбуке владельца журнал забит
+/// драйверами сети, и одна строка отказа в нём не находится. Причина у ядра есть точная
+/// («раскладка диска не совпадает с образом»), и ей место там, где человек нажал кнопку.
+///
+/// Буфер — аргументы 5 и 6 того же вызова (раньше не использовались), текст кладётся с нулём на
+/// конце. Нет буфера или он не читается — молча пропускаем: отказ УЖЕ произошёл, и ронять его
+/// ещё и об это незачем.
+fn сказать_причину(t: &Table, cur: usize, ptr: usize, len: usize, why: &str) {
+    if ptr == 0 || len < 2 || !ensure_heap_range(t, cur, ptr, len) {
+        return;
+    }
+    let bytes = why.as_bytes();
+    // Обрезаем по ГРАНИЦЕ СИМВОЛА: причины написаны по-русски, и половина буквы в конце строки
+    // превратила бы сообщение в мусор ещё до того, как его прочитают.
+    //
+    // Условие `n < bytes.len()` здесь не лишнее, и стоило оно паники ядра: когда причина влезает
+    // целиком, `n` равно длине, и `bytes[n]` читает байт ЗА строкой. Ловится это только на
+    // причине короче буфера — то есть на самом обычном случае.
+    let mut n = bytes.len().min(len - 1);
+    while n > 0 && n < bytes.len() && (bytes[n] & 0xc0) == 0x80 {
+        n -= 1;
+    }
+    // SAFETY: диапазон проверен выше — он же дотянул ленивые страницы кучи.
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+    dst[..n].copy_from_slice(&bytes[..n]);
+    dst[n] = 0;
 }

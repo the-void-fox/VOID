@@ -1108,10 +1108,30 @@ pub fn start_cap(i: usize) -> usize {
 /// Веха 227.1 — `setup` едет вместе с номером диска: это ПОЖЕЛАНИЕ установщика будущей системе
 /// (`mode`, `language`, `name` — строками `ключ значение`). Ядро кладёт его в store цели, а
 /// первая загрузка оттуда сеет себе исходник конфига. Пусто — ставим ровно то, что в образе.
-pub fn install(store_cap: usize, slot: usize, setup: &str) -> Option<u64> {
+pub fn install(store_cap: usize, slot: usize, setup: &str, err: &mut [u8]) -> Option<u64> {
     let b = setup.as_bytes();
-    let r = abi::syscall(SYS_INSTALL, store_cap, 1, slot, b.as_ptr() as usize, b.len(), 0, 0).0;
+    let (ep, el) = err_buf(err);
+    let r = abi::syscall(SYS_INSTALL, store_cap, 1, slot, b.as_ptr() as usize, b.len(), ep, el).0;
     (r != NO_CAP).then_some(r as u64)
+}
+
+/// Веха 227.4 — буфер под ПРИЧИНУ ОТКАЗА (аргументы 5 и 6 вызова). Пустой — ядру писать некуда,
+/// и оно молчит; так зовут те, кому причина не нужна.
+///
+/// Обнуляем ПЕРВЫЙ байт здесь, а не надеемся на вызывающего: иначе на успешном вызове в буфере
+/// осталась бы причина от прошлого отказа — и окно показало бы её поверх слова «Готово».
+fn err_buf(err: &mut [u8]) -> (usize, usize) {
+    if err.is_empty() {
+        return (0, 0);
+    }
+    err[0] = 0;
+    (err.as_mut_ptr() as usize, err.len())
+}
+
+/// Прочитать причину из буфера: байты до нуля. Пусто — ядро причины не назвало.
+pub fn err_text(err: &[u8]) -> &str {
+    let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+    core::str::from_utf8(&err[..n]).unwrap_or("")
 }
 
 /// Веха 222 — ОБНОВИТЬ установленную систему, не трогая данные.
@@ -1119,8 +1139,9 @@ pub fn install(store_cap: usize, slot: usize, setup: &str) -> Option<u64> {
 /// Отличается от [`install`] ровно тем, чего НЕ делает: не переписывает таблицу разделов и не
 /// касается store. Новое ядро, загрузившись, само сверит программы системы с теми, что лежат в
 /// store, и перепишет разошедшиеся — файлы, поколения, пакеты и секреты при этом ни при чём.
-pub fn update(store_cap: usize, slot: usize) -> Option<u64> {
-    let r = abi::syscall(SYS_INSTALL, store_cap, 2, slot, 0, 0, 0, 0).0;
+pub fn update(store_cap: usize, slot: usize, err: &mut [u8]) -> Option<u64> {
+    let (ep, el) = err_buf(err);
+    let r = abi::syscall(SYS_INSTALL, store_cap, 2, slot, 0, 0, ep, el).0;
     (r != NO_CAP).then_some(r as u64)
 }
 

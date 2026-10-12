@@ -844,7 +844,7 @@ fn serve(
                             for b in &f[..16] {
                                 д += &alloc::format!(" {:02x}", b);
                             }
-                            sys::write((д + "\n").as_bytes());
+                            шум((д + "\n").as_bytes());
                         }
                     }
                 }
@@ -891,7 +891,7 @@ fn serve(
         if сейчас - сказано >= срок {
             сказано = сейчас;
             срок = 60_000_000_000;
-            sys::write(
+            шум(
                 alloc::format!(
                     "[wifi] кадров из эфира {} (нам {}, нам но не поняты {}), отправлено {}, \
 потеряно {}, не расшифровано {}; карта: без подтверждения {:#010x}, ушло {:#010x}\n",
@@ -951,7 +951,7 @@ fn rekey(tx: &mut Tx, addr: &[u8; 6], bssid: &[u8; 6], кадр: &[u8], keys: &m
             k16.copy_from_slice(&ключ[..16]);
             rt2800::install_group_key(номер, &k16);
             keys.gtk = Some((номер, k16));
-            sys::write(alloc::format!("[wifi] групповой ключ сменился на {}\n", номер).as_bytes());
+            шум(alloc::format!("[wifi] групповой ключ сменился на {}\n", номер).as_bytes());
         }
     }
     внутри.fill(0);
@@ -998,6 +998,37 @@ fn arg<'a>(args: &'a [u8], имя: &[u8]) -> Option<&'a [u8]> {
 
 fn w(s: &str) {
     sys::write(s.as_bytes());
+}
+
+/// Веха 227.5 — **ПОДРОБНЫЙ ли вывод**. Ставится первой строкой `_start` из `arg:verbose`.
+///
+/// Драйвер писался по регистрам и про регистры рассказывал: дампы EFUSE, таблицы BBP и радио,
+/// настройка канала, кольцо приёма — всё это печаталось на каждой загрузке. На стенде это было
+/// единственным способом понять, что происходит; на живой машине владельца оно забило журнал
+/// так, что в нём потерялась ОДНА строка отказа установщика — ровно та, которую он искал.
+///
+/// Поэтому по умолчанию драйвер молчит обо всём, кроме отказов и смены состояния, а подробности
+/// возвращаются строкой в конфиге:
+///
+/// ```text
+/// service("wifi", "mmio:wifi", "dma", "store:r", "netdev", "arg:verbose")
+/// ```
+static ПОДРОБНО: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn подробно() -> bool {
+    ПОДРОБНО.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Печать ПОДРОБНОСТИ: при `arg:verbose` — как обычно, иначе ни байта.
+fn шум(b: &[u8]) {
+    if подробно() {
+        sys::write(b);
+    }
+}
+
+/// То же для строковых литералов — пара к [`w`].
+fn шумs(s: &str) {
+    шум(s.as_bytes());
 }
 
 /// Ждать, пока бит `mask` в регистре `off` примет значение `want`. `false` — не дождались.
@@ -1106,6 +1137,16 @@ fn disable_wpdma() {
 
 #[no_mangle]
 pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
+    // Веха 227.5 — ПОДРОБНОСТЬ вывода решается здесь, до первой печати: дальше о ней помнят
+    // `шум`/`шумs`. Аргументы читаются дважды (второй раз — за `ssid=` ниже), и это дешевле,
+    // чем тащить разбор через полтораста строк подъёма карты.
+    {
+        let mut buf = [0u8; 256];
+        let n = sys::args(&mut buf);
+        let подробно = buf[..n].split(|&b| b == 0).any(|a| a == b"verbose");
+        ПОДРОБНО.store(подробно, core::sync::atomic::Ordering::Relaxed);
+    }
+
     // Веха 220.3 — ПРАВА БЕРЁМ ПО ИМЕНИ, а не по месту в строке сервиса.
     //
     // Позиция — плохой договор, и это уже стоило системы однажды (Веха 99.1: в конфиге поменяли
@@ -1141,7 +1182,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         for i in 0..8 {
             line += &alloc::format!(" {:08x}", unsafe { rd32(base + i * 4) });
         }
-        sys::write((line + "\n").as_bytes());
+        шум((line + "\n").as_bytes());
     }
     // Первое же число отвечает на главный вопрос. `ffffffff` значит «на шине никто не ответил»
     // (так читается отключённое или несуществующее устройство), ноль — «окно есть, карта молчит».
@@ -1164,7 +1205,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     let mac = [a0 as u8, (a0 >> 8) as u8, (a0 >> 16) as u8, (a0 >> 24) as u8, a1 as u8, (a1 >> 8) as u8];
     let efuse = unsafe { rd32(EFUSE_CTRL) };
 
-    sys::write(
+    шум(
         alloc::format!(
             "[wifi] ASIC {:04x} ревизия {:04x} (MAC_CSR0 {:#010x})\n\
              [wifi] MAC_SYS_CTRL {:#010x} — приём {}, передача {}\n\
@@ -1191,14 +1232,14 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // настроить приём: RF-тип выбирает таблицы инициализации, а поправка частоты — то, попадём
     // ли мы вообще в канал.
     if efuse & EFUSE_PRESENT == 0 {
-        w("[wifi] EFUSE нет — калибровки во внешней EEPROM, её чтение ещё не написано\n");
+        шумs("[wifi] EFUSE нет — калибровки во внешней EEPROM, её чтение ещё не написано\n");
         sys::exit(0);
     }
     let mut ee = [0u16; EE_WORDS];
     for blk in 0..EE_WORDS / 8 {
         let mut part = [0u16; 8];
         if efuse_block(blk * 8, &mut part).is_none() {
-            sys::write(
+            шум(
                 alloc::format!("[wifi] EFUSE молчит на блоке {} — дальше читать нечего\n", blk)
                     .as_bytes(),
             );
@@ -1223,7 +1264,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     } else {
         (conf0 >> 8) & 0xf
     };
-    sys::write(
+    шум(
         alloc::format!(
             "[wifi] EFUSE: chip-id {:04x} версия {:04x}\n\
              [wifi] адрес в EFUSE {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n\
@@ -1240,7 +1281,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         for i in 0..8 {
             line += &alloc::format!(" {:04x}", ee[row * 8 + i]);
         }
-        sys::write((line + "\n").as_bytes());
+        шум((line + "\n").as_bytes());
     }
     // ── прошивка (Веха 207) ──────────────────────────────────────────────────────────────
     //
@@ -1264,13 +1305,13 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         sys::exit(1);
     }
     fw.truncate(got);
-    sys::write(
+    шум(
         alloc::format!("[wifi] прошивка: {} Б (в объекте {} Б), гружу\n", got, full).as_bytes(),
     );
     match load_firmware(&fw) {
         Ok(()) => {
             let (pbf, mac_ctrl) = unsafe { (rd32(PBF_SYS_CTRL), rd32(MAC_SYS_CTRL)) };
-            sys::write(
+            шум(
                 alloc::format!(
                     "[wifi] прошивка записана: PBF_SYS_CTRL {:#010x}, MAC_SYS_CTRL {:#010x}\n",
                     pbf, mac_ctrl
@@ -1281,7 +1322,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
             // карте кто-то работает» по регистрам не видна никак; видно только по тому, забрали
             // ли письмо из ящика.
             if mcu_command(MCU_WAKEUP, 0, 2) {
-                w("[wifi] ПРОШИВКА ОТВЕЧАЕТ: письмо забрано, процессор карты жив\n");
+                шумs("[wifi] ПРОШИВКА ОТВЕЧАЕТ: письмо забрано, процессор карты жив\n");
             } else {
                 sys::write(
                     alloc::format!(
@@ -1324,7 +1365,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     sys::sleep_ns(1_000_000);
     match rt2800::bbp_read(0) {
         Some(v) if v != 0 && v != 0xff => {
-            sys::write(alloc::format!("[wifi] BBP отвечает: версия {:#04x}\n", v).as_bytes());
+            шум(alloc::format!("[wifi] BBP отвечает: версия {:#04x}\n", v).as_bytes());
         }
         other => {
             sys::write(
@@ -1341,7 +1382,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // назвала типом RF. Два независимых источника об одном чипе — лучшая из доступных проверок.
     match rt2800::rfcsr_read(0) {
         Some(v) => {
-            sys::write(alloc::format!("[wifi] RFCSR[0] = {:#04x}\n", v).as_bytes());
+            шум(alloc::format!("[wifi] RFCSR[0] = {:#04x}\n", v).as_bytes());
         }
         None => w("[wifi] радио не отвечает на чтение\n"),
     }
@@ -1353,7 +1394,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     let (bbp_n, rf_n) = rt2800::table_sizes(rev);
     let mut diff = [(0u8, 0u8, 0u8); 12];
     let (bbp_ok, rf_ok, n_diff) = rt2800::load_tables(rev, &mut diff);
-    sys::write(
+    шум(
         alloc::format!(
             "[wifi] таблицы: BBP {} из {}, радио {} из {}\n",
             bbp_ok, bbp_n, rf_ok, rf_n
@@ -1365,7 +1406,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // живут биты состояния: их значение по чтению и не обязано совпадать с записанным.
     for &(reg, want, got) in diff.iter().take(n_diff.min(diff.len())) {
         let (kind, num) = if reg & 0x80 != 0 { ("радио", reg & 0x7f) } else { ("BBP", reg) };
-        sys::write(
+        шум(
             alloc::format!(
                 "[wifi]   {} {}: писали {:#04x}, читается {:#04x}\n",
                 kind, num, want, got
@@ -1376,9 +1417,9 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // Нормальный режим: одноантенной карте второй тракт не нужен — он тратит питание и добавляет
     // шум, а сигнала по нему нет. Числа антенн берём из EFUSE, а не из предположений.
     rt2800::normal_mode_5xxx(rx_path, tx_path);
-    w("[wifi] радио в нормальном режиме: лишние тракты выключены, калибровка сделана\n");
+    шумs("[wifi] радио в нормальном режиме: лишние тракты выключены, калибровка сделана\n");
     if n_diff > diff.len() {
-        sys::write(alloc::format!("[wifi]   …и ещё {}\n", n_diff - diff.len()).as_bytes());
+        шум(alloc::format!("[wifi]   …и ещё {}\n", n_diff - diff.len()).as_bytes());
     }
     // ── канал и приём (Веха 210) ─────────────────────────────────────────────────────────
     //
@@ -1402,7 +1443,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         rt2800::rd32(rt2800::RX_FILTER_CFG),
         rt2800::rd32(rt2800::TX_PIN_CFG),
     );
-    sys::write(
+    шум(
         alloc::format!(
             "[wifi] канал {} (поправка {:#04x}, усиление {:#04x}): радио {:#04x}, \
 MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n",
@@ -1414,7 +1455,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // то, что коэффициенты синтезатора читаются такими же, какими их записали, и что приёмный
     // тракт включён. Первый заход судил по передатчику и объявил бы неудачей работающий приём.
     if rt2800::channel_ok(ch) {
-        sys::write(
+        шум(
             alloc::format!(
                 "[wifi] КАНАЛ {} НАСТРОЕН: синтезатор принял коэффициенты, приёмник включён \
 (радио {:#04x})\n",
@@ -1461,7 +1502,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     rt2800::tx_rings_idle();
     rt2800::rx_ring_init(DESC_VA, dma_pa, buf_pa);
     rt2800::wpdma_rx_on();
-    sys::write(
+    шум(
         alloc::format!(
             "[wifi] кольцо приёма: {} буферов по {} Б, физ {:#x}, движок {:#010x}; слушаю эфир\n",
             rt2800::RX_RING,
@@ -1544,8 +1585,17 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     sys::write(
         alloc::format!("[wifi] ЭФИР: сетей {}, маяков {}\n", nets.len(), beacons).as_bytes(),
     );
+    // Список сетей — это ОТВЕТ на обзор эфира, и при обзоре он печатается всегда. А когда сеть
+    // названа строкой `arg:ssid=…`, человек уже знает, куда подключается, и перечень соседей
+    // каждую загрузку — чистый шум.
+    let обзор = {
+        let mut buf = [0u8; 256];
+        let n = sys::args(&mut buf);
+        arg(&buf[..n], b"ssid=").is_none()
+    };
     for n in &nets {
-        sys::write(
+        let печать = if обзор { sys::write } else { шум };
+        печать(
             alloc::format!(
                 "[wifi]   {:<24} к{:<3} {:>4} дБм  {}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} маяков)\n",
                 n.ssid,
@@ -1558,7 +1608,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
             .as_bytes(),
         );
     }
-    sys::write(
+    шум(
         alloc::format!(
             "[wifi] кольцо: индекс карты {}, наш {}\n",
             rt2800::rd32(rt2800::RX_DRX_IDX),
