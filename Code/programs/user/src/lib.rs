@@ -1104,8 +1104,13 @@ pub fn start_cap(i: usize) -> usize {
 /// `SYS_INSTALL(store_cap)` (Веха 48): установить VOID на AHCI-диск из загрузочного модуля
 /// (образ с USB). Нужен store-cap с правом WRITE. **ДИСК СТИРАЕТСЯ.** `Some(p2_start)` — успех
 /// (store заморожен, нужен ребут без USB); `None` — отказ (нет диска/образа/прав), система цела.
-pub fn install(store_cap: usize, slot: usize) -> Option<u64> {
-    let r = abi::syscall(SYS_INSTALL, store_cap, 1, slot, 0, 0, 0, 0).0;
+///
+/// Веха 227.1 — `setup` едет вместе с номером диска: это ПОЖЕЛАНИЕ установщика будущей системе
+/// (`mode`, `language`, `name` — строками `ключ значение`). Ядро кладёт его в store цели, а
+/// первая загрузка оттуда сеет себе исходник конфига. Пусто — ставим ровно то, что в образе.
+pub fn install(store_cap: usize, slot: usize, setup: &str) -> Option<u64> {
+    let b = setup.as_bytes();
+    let r = abi::syscall(SYS_INSTALL, store_cap, 1, slot, b.as_ptr() as usize, b.len(), 0, 0).0;
     (r != NO_CAP).then_some(r as u64)
 }
 

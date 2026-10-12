@@ -344,8 +344,38 @@ fn cmd_eval(path: &[u8]) -> ! {
 fn cmd_init_config() -> ! {
     let argv = sys::argv::Argv::take();
     let force = argv.rest().any(|w| w == b"--force");
-    run_init_config(force);
+    // Веха 227.1 — ВЫБОР УСТАНОВЩИКА: `init-config mode=term language=en name=voidbook`.
+    //
+    // Шлёт их ядро первой загрузкой установленной системы (`init::Пожелание::seed_line`), и
+    // приходят они сюда же, куда человек пишет `--force`: исходник конфига один, и писать его
+    // полагается одной команде, а не двум.
+    let mut wish = Wish::default();
+    for w in argv.rest() {
+        let Some((key, val)) = split_eq(w) else { continue };
+        let val = core::str::from_utf8(val).unwrap_or("");
+        match key {
+            b"mode" => wish.mode = val.into(),
+            b"language" => wish.language = val.into(),
+            b"name" => wish.name = val.into(),
+            _ => {}
+        }
+    }
+    run_init_config(force, &wish);
     sys::exit(0);
+}
+
+/// Выбор, сделанный в установщике: что подставить в шаблон `terminal.vv`.
+#[derive(Default)]
+struct Wish {
+    mode: String,
+    language: String,
+    name: String,
+}
+
+/// Разделить `ключ=значение`. `None` — знака равенства нет (`--force` и прочие слова).
+fn split_eq(w: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = w.iter().position(|&c| c == b'=')?;
+    Some((&w[..i], &w[i + 1..]))
 }
 
 /// Шаблон модуля конфига: куда пишем, что пишем и под каким корнем помним ПОСЕЯННОЕ.
@@ -363,6 +393,10 @@ struct Tpl {
     seed: &'static str,
 }
 
+/// Путь, в который едет выбор установщика. Назван отдельно, чтобы подстановка метила в ФАЙЛ,
+/// а не в порядковый номер шаблона: таблица ниже растёт, и номер однажды уехал бы молча.
+const TERMINAL_PATH: &[u8] = b"/etc/system/terminal.vv";
+
 /// Посеять модульный конфиг в `/etc/system/` (posixfs, start-cap 0). Идемпотентно. Печатает итог.
 const TPLS: [Tpl; 10] = [
     Tpl { path: b"/etc/system/net.vv", text: NET_VV, seed: "system/seed/net.vv" },
@@ -372,7 +406,7 @@ const TPLS: [Tpl; 10] = [
         text: NETWORKING_VV,
         seed: "system/seed/networking.vv",
     },
-    Tpl { path: b"/etc/system/terminal.vv", text: TERMINAL_VV, seed: "system/seed/terminal.vv" },
+    Tpl { path: TERMINAL_PATH, text: TERMINAL_VV, seed: "system/seed/terminal.vv" },
     Tpl { path: b"/etc/system/bar.vv", text: BAR_VV, seed: "system/seed/bar.vv" },
     Tpl { path: b"/etc/system/packages.vv", text: PACKAGES_VV, seed: "system/seed/packages.vv" },
     Tpl { path: b"/etc/system/apps.vv", text: APPS_VV, seed: "system/seed/apps.vv" },
@@ -397,7 +431,7 @@ const TPLS: [Tpl; 10] = [
 ///
 /// `--force` возвращает прежнее поведение: перезаписать всё. Оно осталось, но теперь его надо
 /// попросить вслух.
-fn run_init_config(force: bool) {
+fn run_init_config(force: bool, wish: &Wish) {
     let ep = cap_fs();
     let store = cap_store();
     px::mkdir(ep, b"/etc"); // идемпотентно: если есть — MAX, игнорируем
@@ -408,14 +442,32 @@ fn run_init_config(force: bool) {
     let mut news: Vec<(&[u8], Vec<String>)> = Vec::new();
 
     for t in &TPLS {
+        // Веха 227.1 — в `terminal.vv` подставляется ВЫБОР УСТАНОВЩИКА (режим, язык, имя
+        // машины). Подстановка делается ДО всего остального, потому что дальше текст участвует
+        // и в сравнении с посеянным, и в записи: подставь его позже — и система решила бы, что
+        // файл кто-то правил руками.
+        let text = if t.path == TERMINAL_PATH {
+            let (text, bad) = vvsh_core::templates::with_wish(
+                t.text, &wish.mode, &wish.language, &wish.name,
+            );
+            for key in bad {
+                sys::write(b"vvsh: init-config: ");
+                sys::write(key.as_bytes());
+                sys::write(" — некуда подставить: шаблон terminal.vv уехал из-под установщика\n".as_bytes());
+            }
+            text
+        } else {
+            String::from(t.text)
+        };
+        let text = text.as_str();
         let cur = read_file(ep, t.path);
         // Файл УЖЕ такой же, как шаблон, — писать нечего. Отдельный случай, а не «обновлён»:
         // сказать «обновлено 9» там, где не изменилось ничего, значит приучить не читать отчёт.
-        let tpl_id = content_id(store, t.text.as_bytes());
+        let tpl_id = content_id(store, text.as_bytes());
         if let Some(c) = &cur {
             if tpl_id.is_some() && content_id(store, c) == tpl_id {
                 if seed_id(store, t.seed) != tpl_id {
-                    remember_seed(store, t.seed, t.text.as_bytes());
+                    remember_seed(store, t.seed, text.as_bytes());
                 }
                 same += 1;
                 continue;
@@ -429,14 +481,14 @@ fn run_init_config(force: bool) {
         if force || untouched {
             // Веха 101 — КАЖДАЯ запись проверяется. Сев `terminal.vv` однажды доехал наполовину
             // и оборвался посреди буквы, а сообщение об успехе печаталось как ни в чём не бывало.
-            if !px::echo_to(ep, t.path, t.text.as_bytes()) {
+            if !px::echo_to(ep, t.path, text.as_bytes()) {
                 sys::write(sys::i18n::t("vvsh: НЕ УДАЛОСЬ записать ").as_bytes());
                 sys::write(t.path);
                 sys::write(b"\n");
                 bad = true;
                 continue;
             }
-            remember_seed(store, t.seed, t.text.as_bytes());
+            remember_seed(store, t.seed, text.as_bytes());
             if cur.is_none() {
                 written += 1;
             } else {
@@ -446,8 +498,8 @@ fn run_init_config(force: bool) {
         }
         // Правленый файл: не трогаем, но говорим, чего в нём нет.
         kept += 1;
-        let text = cur.unwrap_or_default();
-        let missing = missing_keys(t.text, &text);
+        let cur_text = cur.unwrap_or_default();
+        let missing = missing_keys(text, &cur_text);
         if !missing.is_empty() {
             news.push((t.path, missing));
         }
@@ -3238,7 +3290,9 @@ fn sh_gens(_args: &[Value]) -> Result<Value, EvalError> {
 /// издевательством. Произнесённое вслух намерение — это и есть набранное слово.
 fn sh_init_config(args: &[Value]) -> Result<Value, EvalError> {
     let force = args.iter().any(|a| matches!(a, Value::Str(s) if &**s == "--force"));
-    run_init_config(force);
+    // Пустое пожелание: выбор установщика бывает только на ПЕРВОЙ загрузке системы, а здесь
+    // команду набирает человек, у которого конфиг уже есть, — подставлять ему нечего.
+    run_init_config(force, &Wish::default());
     Ok(Value::nil())
 }
 

@@ -345,15 +345,24 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         usize::MAX
                     }
                 },
-                Ok(()) => match crate::install::run(slot) {
-                    Ok(p2) => {
-                        crate::println!("  [install] VOID установлен на диск {} (store с сектора {}) — перезагрузись без носителя", slot, p2);
-                        p2 as usize
-                    }
-                    Err(e) => {
-                        crate::println!("  [install] отказ: {}", e);
+                // Веха 227.1 — вместе с номером диска едет ПОЖЕЛАНИЕ установщика (`buf`/`len`):
+                // режим сеанса, язык, имя машины. Те же два аргумента, что перечисляют диски при
+                // `op = 0`, — новых у вызова не появилось.
+                Ok(()) => match читать_пожелание(t, cur, ptr, len) {
+                    None => {
+                        crate::println!("  [install] отказ: пожелание установки не читается");
                         usize::MAX
                     }
+                    Some(setup) => match crate::install::run(slot, &setup) {
+                        Ok(p2) => {
+                            crate::println!("  [install] VOID установлен на диск {} (store с сектора {}) — перезагрузись без носителя", slot, p2);
+                            p2 as usize
+                        }
+                        Err(e) => {
+                            crate::println!("  [install] отказ: {}", e);
+                            usize::MAX
+                        }
+                    },
                 },
             };
             let f = &mut t.procs[cur].frame;
@@ -532,4 +541,25 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Веха 227.1 — прочитать ПОЖЕЛАНИЕ УСТАНОВКИ из памяти вызывающего.
+///
+/// `None` — память не читается или текст не UTF-8; пустая строка — пожелания нет (так ставит
+/// `install` из командной строки, и это законный случай: «поставь ровно то, что в образе»).
+///
+/// Потолок намеренно мал: пожелание — три-четыре строки вида `mode wm`. Всё, что длиннее,
+/// означает ошибку вызывающего, а не настройку, и отказать здесь дешевле, чем выяснять потом,
+/// почему свежая система не поднялась.
+fn читать_пожелание(t: &Table, cur: usize, ptr: usize, len: usize) -> Option<alloc::string::String> {
+    const ПОТОЛОК: usize = 512;
+    if len == 0 {
+        return Some(alloc::string::String::new());
+    }
+    if len > ПОТОЛОК || !ensure_heap_range(t, cur, ptr, len) {
+        return None;
+    }
+    // SAFETY: диапазон проверен выше — он же дотянул ленивые страницы кучи.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    core::str::from_utf8(bytes).ok().map(alloc::string::String::from)
 }

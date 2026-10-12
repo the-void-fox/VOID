@@ -57,7 +57,17 @@ static LANG: AtomicU8 = AtomicU8::new(RU);
 /// `rebuild` (там же, где остальные ключи `ui`).
 pub fn set_from_config(text: &str) {
     let lang = void_conf::get(text, "ui", "language").unwrap_or("ru");
-    LANG.store(if lang.starts_with("en") { EN } else { RU }, Ordering::Relaxed);
+    set(lang.starts_with("en"));
+}
+
+/// Веха 227.1 — переключить язык НА ХОДУ. Зовёт ровно одна программа — установщик.
+///
+/// Всем остальным язык приезжает из конфига поколения и за время работы не меняется: сменить его
+/// — это `rebuild`, то есть новое поколение и новый запуск. Установщик же спрашивает про язык
+/// раньше, чем система вообще существует, и обязан перейти на выбранный немедленно: человек,
+/// выбравший English, дальше читает про стирание диска — и читать это он должен на своём языке.
+pub fn set(en: bool) {
+    LANG.store(if en { EN } else { RU }, Ordering::Relaxed);
 }
 
 /// Английский ли сейчас интерфейс. Нужно там, где переводом дело не ограничивается: формат даты,
@@ -238,6 +248,56 @@ fn en(s: &'static str) -> &'static str {
             => "The installation did not happen. The kernel said why in the log: `klog`. Most \
                 often the install image is missing — that is, this is not a boot from the medium.",
         "Установка VOID" => "Install VOID",
+
+        // Веха 227.1 — мастер установки: шаги, выбор сеанса, сводка.
+        "Язык" => "Language",
+        "Диск" => "Disk",
+        "Система" => "System",
+        "Установка" => "Installation",
+        "Назад" => "Back",
+        "Дальше" => "Next",
+        "Обновить" => "Update",
+        "Язык установки и системы" => "Language of the installer and the system",
+        "Дисков не найдено — ставить некуда." => "No disks found — nowhere to install.",
+        "С этого диска работает система прямо сейчас."
+            => "The running system boots from this disk right now.",
+        "Чем система встречает" => "How the system greets you",
+        "Окна" => "Windows",
+        "Шелл" => "Shell",
+        "Композитор, окна и мышь. Обычный рабочий стол."
+            => "Compositor, windows and a mouse. An ordinary desktop.",
+        "Терминал во весь экран, без окон. Нужен пиксельный экран."
+            => "A full-screen terminal, no windows. Needs a pixel screen.",
+        "Текстовый шелл в консоли ядра. Работает где угодно."
+            => "A text shell in the kernel console. Works anywhere.",
+        "Как зовут эту машину" => "What this machine is called",
+        "без пробелов, можно пусто" => "no spaces, may be empty",
+        "Пользователей в VOID нет — ни root, ни учётных записей. На вопрос «чьё это» отвечает \
+         имя машины."
+            => "VOID has no users — no root, no accounts. The question «whose is this» is \
+                answered by the machine name.",
+        "Проверь и подтверди" => "Check and confirm",
+        "Сеанс" => "Session",
+        "Имя машины" => "Machine name",
+        "не задано" => "not set",
+        "обновляю…" => "updating…",
+        "На этом диске уже есть VOID. Обновятся ядро и загрузчик; файлы, поколения и пакеты \
+         останутся на месте."
+            => "This disk already has VOID. The kernel and the bootloader will be updated; \
+                files, generations and packages stay where they are.",
+        "VOID обновлён. Файлы, поколения и пакеты остались на месте. Выключи машину, вынь \
+         носитель и включи снова."
+            => "VOID is updated. Files, generations and packages stayed where they were. Power \
+                the machine off, remove the medium and switch it on again.",
+        "Обновить не вышло. Причину ядро сказало в журнал: `klog`. Данные на диске при этом не \
+         тронуты."
+            => "The update did not happen. The kernel said why in the log: `klog`. The data on \
+                the disk is untouched.",
+        "VOID установлен. Выключи машину, вынь носитель и включи снова — система поднимется с \
+         диска. Первая загрузка сама посеет конфиг с тем, что здесь выбрано."
+            => "VOID is installed. Power the machine off, remove the medium and switch it on \
+                again — the system will come up from the disk. The first boot seeds the config \
+                with what was chosen here.",
 
         // ── просмотрщик корней store ───────────────────────────────────────────────────────
         "поиск по имени корня" => "search by root name",

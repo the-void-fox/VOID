@@ -47,7 +47,101 @@ const CURRENT_ROOT: &str = "system/current";
 /// Обычная строка конфига, только приписанная к нему на один запуск. `service`, потому что это
 /// программа, которая делает своё дело и уходит; права те же, что у шелла и в том же порядке
 /// (Веха 99.1: `vvsh` ждёт файловый сервер первым, store вторым).
-const FIRST_BOOT_SEED: &str = "service vvsh endpoint:posixfs store:rwx arg:init-config\n";
+const FIRST_BOOT_SEED: &str = "service vvsh endpoint:posixfs store:rwx arg:init-config";
+
+/// Веха 227.1 — **ПОЖЕЛАНИЕ УСТАНОВЩИКА**: что человек выбрал, пока система ставилась.
+///
+/// Лежит в store корнем [`crate::install::SETUP_ROOT`] — его кладёт туда установщик ДО первой
+/// загрузки цели ([`crate::install::run`]). Текст в той же грамматике, что и конфиг поколения:
+/// `ключ значение` на строку.
+///
+/// ## Почему выбор едет сюда, а не в `system/current`
+///
+/// Потому что `current` называет ПОКОЛЕНИЕ, то есть уже вычисленный результат, а исходник лежит
+/// отдельно (`/etc/system/*.vv`). Поставь установщик `current = gen3` — человек получил бы
+/// полноэкранный терминал ровно до первого `rebuild`: пересборка честно пересчитала бы конфиг из
+/// исходника, где написано `mode = "wm"`, и выбор пропал бы молча, без единого сообщения.
+/// Поэтому установщик не выбирает поколение, а говорит, КАКОЙ ПОСЕЯТЬ ИСХОДНИК.
+#[derive(Default)]
+struct Пожелание {
+    /// `wm` | `term` | `vsh` — чем система встречает. Пусто — как в образе.
+    mode: String,
+    /// `ru` | `en` — язык интерфейса (журнал ядра остаётся русским).
+    language: String,
+    /// Как зовут машину. Без пробелов: уезжает токеном `arg:` в конфиг этой загрузки.
+    name: String,
+}
+
+impl Пожелание {
+    /// Прочитать и разобрать. `None` — пожелания нет (система поставлена без установщика либо
+    /// обновлена), и тогда всё идёт ровно так, как шло до этой вехи.
+    fn read() -> Option<Пожелание> {
+        let text = read_text(crate::install::SETUP_ROOT)?;
+        let mut w = Пожелание::default();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some((key, val)) = line.split_once(' ') else { continue };
+            let val = val.trim();
+            match key {
+                "mode" if matches!(val, "wm" | "term" | "vsh") => w.mode = val.into(),
+                "language" if matches!(val, "ru" | "en") => w.language = val.into(),
+                // Имя с пробелом сломало бы разбор токенов конфига, а молча обрезать чужое имя
+                // хуже, чем не взять его вовсе: систему зовут так, как сказал человек, либо
+                // никак. Установщик о том же предупреждает полем ввода.
+                "name" if !val.is_empty() && !val.contains(' ') => w.name = val.into(),
+                _ => println!("  [init] пожелание установки: строка не понята — {:?}", line),
+            }
+        }
+        Some(w)
+    }
+
+    /// Какое поколение поднять на первой загрузке. `windowed` — машина умеет в пиксели.
+    fn generation(&self, windowed: bool) -> &'static str {
+        match self.mode.as_str() {
+            "wm" if windowed => "gen4",
+            "term" if windowed => "gen3",
+            "vsh" => "gen1",
+            // Выбран графический режим, а экрана нет: честнее сесть в текстовый шелл, чем
+            // поднимать поколение, которое не покажет ничего. Установщик такого не пошлёт —
+            // но образ переносной, и диск из машины с экраном попадает в машину без него.
+            _ if windowed => "gen4",
+            _ => "gen1",
+        }
+    }
+
+    /// Строки, которые выбор добавляет к САМОМУ ПОКОЛЕНИЮ — язык и имя машины.
+    ///
+    /// Нужны потому, что поколение на первой загрузке берётся готовое (`gen3`/`gen4` вложены в
+    /// образ), а в готовом этих строк нет и взяться им неоткуда. Без них человек, выбравший
+    /// English, увидел бы первую загрузку по-русски: исходник конфига уже правильный, но читают
+    /// программы не исходник, а ПОКОЛЕНИЕ.
+    ///
+    /// Режима среди них нет и быть не может: режим — это то, КАКОЕ поколение взять
+    /// ([`Пожелание::generation`]), а не строка внутри него.
+    fn config_lines(&self) -> String {
+        let mut s = String::new();
+        if !self.language.is_empty() {
+            s.push_str(&alloc::format!("ui language {}\n", self.language));
+        }
+        if !self.name.is_empty() {
+            s.push_str(&alloc::format!("device name {}\n", self.name));
+        }
+        s
+    }
+
+    /// Строка конфига первой загрузки: посеять исходник, подставив в него выбранное.
+    fn seed_line(&self) -> String {
+        let mut s = String::from(FIRST_BOOT_SEED);
+        for (key, val) in [("mode", &self.mode), ("language", &self.language), ("name", &self.name)]
+        {
+            if !val.is_empty() {
+                s.push_str(&alloc::format!(" arg:{}={}", key, val));
+            }
+        }
+        s.push('\n');
+        s
+    }
+}
 
 /// Конфиг по умолчанию (поколение `gen1`) — полный: файлы, сеть, интерактивный shell.
 /// Совпадает с тем, что до Вехи 40 было зашито в `shell_session`.
@@ -171,6 +265,17 @@ autostart welcome
 fn read_text(root: &str) -> Option<String> {
     let id = object::root(root)?;
     object::with(&id, |b| b.and_then(|x| core::str::from_utf8(x).ok()).map(String::from))
+}
+
+/// Текст ГОТОВОГО поколения из образа ядра по его имени. Нужен там, где поколение берут не из
+/// store, а собирают: читать `system/gen3` в этот момент нельзя — его ещё не записали.
+fn default_gen(name: &str) -> &'static str {
+    match name {
+        "gen4" => DEFAULT_GEN4,
+        "gen3" => DEFAULT_GEN3,
+        "gen2" => DEFAULT_GEN2,
+        _ => DEFAULT_GEN1,
+    }
 }
 
 /// Записать текст объектом и привязать к корню (сев конфига/поколения).
@@ -601,14 +706,51 @@ pub fn boot() {
     // оконное поколение там не поднимется вовсе, и предложить его значило бы предложить пустоту.
     let windowed = arch::video_mode().is_some();
     let clean = object::root("system/gen1").is_none();
+    // Веха 227.1 — записка от установщика. Читается ровно один раз, на первой загрузке цели.
+    let wish = if clean { Пожелание::read() } else { None };
     if clean {
         write_text("system/gen1", DEFAULT_GEN1);
         write_text("system/gen2", DEFAULT_GEN2);
-        write_text(CURRENT_ROOT, if windowed { "gen4" } else { "gen1" });
+        let gen = match &wish {
+            Some(w) => w.generation(windowed),
+            None => {
+                if windowed {
+                    "gen4"
+                } else {
+                    "gen1"
+                }
+            }
+        };
+        // Язык и имя машины дописываются к взятому поколению, и поэтому оно СВОЁ, а не готовое:
+        // `gen3`/`gen4` системные и переписываются из образа на каждой загрузке — дописанное в
+        // них пропало бы на второй же. Номер свободен наверняка: на чистом диске есть ровно
+        // gen1…gen4, а `rebuild` нумерует от максимума плюс один и возьмёт следующий.
+        let lines = wish.as_ref().map(|w| w.config_lines()).unwrap_or_default();
+        let gen = if lines.is_empty() {
+            String::from(gen)
+        } else {
+            write_text("system/gen5", &alloc::format!("{}{}", default_gen(gen), lines));
+            println!("  [init] поколение 'gen5' — {} плюс выбранное установщиком", gen);
+            String::from("gen5")
+        };
+        write_text(CURRENT_ROOT, &gen);
         println!("  [init] чистый диск — посеяны поколения gen1 (полное) и gen2 (без сети)");
-        if windowed {
-            println!("  [init] есть фреймбуфер — по умолчанию беру gen4 (оконный режим)");
+        match &wish {
+            Some(w) => println!(
+                "  [init] пожелание установщика: режим '{}', язык '{}' — беру {}",
+                if w.mode.is_empty() { "как в образе" } else { &w.mode },
+                if w.language.is_empty() { "ru" } else { &w.language },
+                gen
+            ),
+            None if windowed => {
+                println!("  [init] есть фреймбуфер — по умолчанию беру gen4 (оконный режим)")
+            }
+            None => {}
         }
+        // Записка прочитана — снимаем корень. Она описывает МОМЕНТ установки, а не систему:
+        // человек завтра сменит режим в конфиге, и оставленное пожелание начнёт врать о том,
+        // как эта машина настроена. Истина про настройку живёт в `/etc/system/*.vv`.
+        object::del_root(crate::install::SETUP_ROOT);
     }
 
     // Веха 99.1 — `gen3` СИСТЕМНОЕ и переписывается на каждой загрузке, в отличие от gen1/gen2
@@ -652,8 +794,15 @@ pub fn boot() {
     // вместе с языком, которым написаны, и вторая их копия здесь разошлась бы с первой — вопрос
     // только когда. Строка добавляется к конфигу ЭТОЙ загрузки и в store не попадает: это
     // действие первого запуска, а не часть поколения.
+    //
+    // Веха 227.1 — вместе с командой сеять едет и ВЫБОР человека (`arg:mode=…`): исходник
+    // пишется сразу таким, каким его просил установщик, а не правится следом.
     let config = if clean {
-        alloc::format!("{}{}", config, FIRST_BOOT_SEED)
+        let seed = wish.as_ref().map_or_else(
+            || alloc::format!("{}\n", FIRST_BOOT_SEED),
+            |w| w.seed_line(),
+        );
+        alloc::format!("{}{}", config, seed)
     } else {
         config
     };
