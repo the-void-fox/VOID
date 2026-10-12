@@ -73,9 +73,13 @@ mkdir -p "$staging/boot/grub"
 cp "$kernel" "$staging/boot/void-kernel"
 cp "$here/grub.cfg" "$staging/boot/grub/grub.cfg"
 
-kernel_mb=$(( ( $(stat -c%s "$kernel") + 1048575 ) / 1048576 ))
+# Веха 227.6 — размер p1 берём у общей функции, а не считаем ВТОРОЙ копией формулы. Своя копия
+# здесь была и не знала про загрузчик UEFI: store живого носителя оказывался меньше обещанного
+# ровно на его размер, и заметить это было нечем.
+. "$here/layout.sh"
+p1_mb=$(void_p1_mb "$kernel")
 "$here/mkdisk.sh" "$kernel" "$staging/boot/void-disk-boot.img" \
-    $(( 1 + kernel_mb + 3 + LIVE_MB )) >/dev/null
+    $(( 1 + p1_mb + LIVE_MB )) >/dev/null
 
 # ESP — отдельным скриптом, потому что он нужен ещё и установке (см. mkesp.sh).
 esp="$staging/../esp-$$.img"

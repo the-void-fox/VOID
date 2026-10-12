@@ -289,10 +289,8 @@ fn en(s: &'static str) -> &'static str {
          носитель и включи снова."
             => "VOID is updated. Files, generations and packages stayed where they were. Power \
                 the machine off, remove the medium and switch it on again.",
-        "Обновить не вышло. Причину ядро сказало в журнал: `klog`. Данные на диске при этом не \
-         тронуты."
-            => "The update did not happen. The kernel said why in the log: `klog`. The data on \
-                the disk is untouched.",
+        "Обновить не вышло. Данные на диске при этом не тронуты."
+            => "The update did not happen. The data on the disk is untouched.",
         "VOID установлен. Выключи машину, вынь носитель и включи снова — система поднимется с \
          диска. Первая загрузка сама посеет конфиг с тем, что здесь выбрано."
             => "VOID is installed. Power the machine off, remove the medium and switch it on \
