@@ -353,6 +353,18 @@ impl<'a> Ui<'a> {
         c.with_a((c.a as u32 * self.fade / 256) as u8)
     }
 
+    /// Веха 227 — **ВИДИМАЯ РАМКА** для того, у чего есть край: полей ввода, кнопок в рамке,
+    /// головы выбора.
+    ///
+    /// Не `th.border`. Тема монохромная, и `border` в ней равен фону карточки (`0x313131`) —
+    /// намеренно: у карточки края быть не должно. Но поле ввода без края это не поле, а строка
+    /// текста, повисшая в воздухе: на снимке стенда пароль выглядел подписью, ровно как кнопка
+    /// «Обновить» до [`Ui::action`]. Одна функция на всех затем, чтобы третий такой случай не
+    /// потребовал третьего раза ловить это глазом.
+    fn frame(&self) -> Rgba {
+        self.th.text.with_a(0x66)
+    }
+
     /// Курсор внутри?
     pub fn hot(&self, r: Rect) -> bool {
         self.ptr.is_some_and(|(x, y)| r.contains(x, y))
@@ -615,10 +627,9 @@ impl<'a> Ui<'a> {
     pub fn action(&mut self, r: Rect, s: &str, hot: u32) -> bool {
         let rad = self.th.radius.min(r.h / 2);
         let bg = self.th.text.with_a((0x22 * hot.min(256) / 256) as u8);
-        // Рамка — СВОИМ цветом с прозрачностью, как у опасной кнопки, а не `th.border`. Тема
-        // монохромная, и `border` в ней почти чёрный (`0x313131`): на тёмной подложке карточки
-        // такая рамка не видна вовсе — проверено снимком, кнопка по-прежнему читалась подписью.
-        let (bg, br) = (self.tint(bg), self.tint(self.th.text.with_a(0x66)));
+        // Рамка — видимая ([`Ui::frame`]), а не `th.border`: на подложке карточки та не видна
+        // вовсе — проверено снимком, кнопка по-прежнему читалась подписью.
+        let (bg, br) = (self.tint(bg), self.tint(self.frame()));
         self.c.rrect_bordered(r, rad, self.th.line, bg, br);
         self.label(r, s, self.th.text, Align::Center);
         self.mark(r);
@@ -698,7 +709,7 @@ impl<'a> Ui<'a> {
     /// где печатает. Обрезать по началу значило бы прятать от него последнюю букву.
     pub fn field(&mut self, r: Rect, s: &str, hint: &str, caret: bool) {
         let rad = self.th.radius.min(r.h / 2);
-        let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.th.border));
+        let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.frame()));
         self.c.rrect_bordered(r, rad, self.th.line, bg, br);
         // Колонка под курсор отводится ВСЕГДА, даже когда его не рисуют: иначе текст съезжал бы
         // вбок на два пикселя в тот момент, когда курсор появляется.
@@ -748,12 +759,52 @@ impl<'a> Ui<'a> {
     pub fn edit_field(
         &mut self, r: Rect, e: &edit::Edit, hint: &str,
     ) -> (Option<usize>, Option<usize>) {
+        self.text_field(r, &e.text, e.caret(), e.selection(), hint)
+    }
+
+    /// Веха 227 — **ПОЛЕ ПАРОЛЯ**: то же правимое поле, но вместо букв точки.
+    ///
+    /// `shown` — человек попросил посмотреть, что набрал (глазок рядом с полем). Показ обязателен:
+    /// пароль шифрования диска набирают дважды и помнить его придётся до конца жизни машины —
+    /// запретить себе проверить набранное значило бы повышать цену опечатки до потери данных.
+    ///
+    /// Маска не трогает [`edit::Edit`]: правка по-прежнему хранит настоящий текст, а точки живут
+    /// ровно один кадр. Поэтому индексы, которые поле отдаёт наружу (щелчок и протяжка), считаются
+    /// по маске и возвращаются переведёнными В ТЕКСТ — иначе курсор, поставленный щелчком, уехал
+    /// бы втрое дальше на первой же русской букве (точка шире байта).
+    pub fn secret_field(
+        &mut self, r: Rect, e: &edit::Edit, hint: &str, shown: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        if shown {
+            return self.edit_field(r, e, hint);
+        }
+        // Запасной шрифт 8×16 (CP866) точки не знает и нарисовал бы «?» — ровно тот же выбор по
+        // набору, что у многоточия в `draw_clip`.
+        let dot = if self.font.ttf() { "•" } else { "*" };
+        let mask = dot.repeat(e.text.chars().count());
+        let chars = |at: usize| e.text[..at.min(e.text.len())].chars().count();
+        let caret = chars(e.caret()) * dot.len();
+        let sel = e.selection().map(|(a, b)| (chars(a) * dot.len(), chars(b) * dot.len()));
+        let (click, drag) = self.text_field(r, &mask, caret, sel, hint);
+        let back = |m: usize| {
+            let k = m / dot.len();
+            e.text.char_indices().nth(k).map_or(e.text.len(), |(i, _)| i)
+        };
+        (click.map(back), drag.map(back))
+    }
+
+    /// Общее тело правимого поля: текст, курсор и выделение приезжают по отдельности.
+    ///
+    /// Разделено затем, чтобы поле пароля не стало ВТОРОЙ копией этого кода: две меры расходятся
+    /// молча, и разошлись бы они здесь на сдвиге по курсору — самом неочевидном месте поля.
+    fn text_field(
+        &mut self, r: Rect, s: &str, caret: usize, sel: Option<(usize, usize)>, hint: &str,
+    ) -> (Option<usize>, Option<usize>) {
         let rad = self.th.radius.min(r.h / 2);
-        let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.th.border));
+        let (bg, br) = (self.tint(self.th.bg.with_a(0xff)), self.tint(self.frame()));
         self.c.rrect_bordered(r, rad, self.th.line, bg, br);
         let caret_w = self.th.line.max(1);
         let inner = r.inset_xy(self.th.pad, 0);
-        let s = &e.text;
         if s.is_empty() {
             self.label(inner, hint, self.th.muted, Align::Left);
         }
@@ -761,14 +812,14 @@ impl<'a> Ui<'a> {
         // не по концу строки, — иначе, уйдя стрелками в начало длинного пути, он смотрел бы на
         // его хвост и правил вслепую.
         let tw = self.font.width(s);
-        let cx = self.font.width(&s[..e.caret().min(s.len())]);
+        let cx = self.font.width(&s[..caret.min(s.len())]);
         let over = (tw - inner.w).max(0).min((cx - inner.w / 2).max(0));
         let base = inner.y + (inner.h - self.font.line_h()) / 2 + self.font.ascent();
         let keep = self.c.clip();
         self.c.set_clip(inner.intersect(keep));
         // Выделение — подложкой под текстом, а не инверсией: инверсия требует второго прохода по
         // глифам, а подложка это один прямоугольник.
-        if let Some((a, b)) = e.selection() {
+        if let Some((a, b)) = sel {
             let (xa, xb) = (self.font.width(&s[..a]), self.font.width(&s[..b]));
             let sel = Rect::new(inner.x - over + xa, r.y + self.th.px(3), xb - xa, r.h - 2 * self.th.px(3));
             let c = self.tint(self.th.accent.with_a(0x66));
@@ -1016,9 +1067,162 @@ impl<'a> Ui<'a> {
         self.mark(box_r);
     }
 
+    /// Веха 227 — **ПОЛОСА ХОДА**: сколько из обещанного уже сделано. `frac` в долях 256.
+    ///
+    /// Не [`Ui::slider`] и не [`Ui::indicator`]: ползунок обещает, что его можно ТЯНУТЬ (а ход
+    /// установки руками не сдвинуть), точка же говорит «идёт» и не говорит «сколько». Дорожка
+    /// намеренно та же, что у ползунка, — две разные полосы в одной системе человек принял бы
+    /// за разные вещи.
+    ///
+    /// Долей, а не «сделано из всего», ровно затем, чтобы полосу можно было ВЕСТИ: `u.anim(id,
+    /// цель)` доводит её до новой отметки движением, а не прыжком. Шаги установки крупные
+    /// (разметка, посев store, загрузчик), и без движения полоса стояла бы и прыгала.
+    pub fn progress(&mut self, r: Rect, frac: u32) {
+        let h = self.th.px(4).max(2);
+        let track = Rect::new(r.x, r.y + (r.h - h) / 2, r.w, h);
+        self.c.rrect(track, h / 2, self.tint(self.th.muted));
+        let done = r.w * frac.min(256) as i32 / 256;
+        if done > 0 {
+            // Огрызок короче высоты не рисуем короче высоты: `rrect` с радиусом больше половины
+            // длины даёт кружок, и «только началось» читалось бы как помарка на дорожке.
+            let fill = Rect::new(track.x, track.y, done.max(h), h);
+            self.c.rrect(fill, h / 2, self.tint(self.th.text));
+        }
+        self.mark(track);
+    }
+
+    /// Веха 227 — **КАРТА ШАГОВ**: где человек сейчас и сколько ещё осталось.
+    ///
+    /// Макет владельца — ряд «стрелочкоподобных» блоков понизу установщика. Форма не украшение:
+    /// остриё показывает НАПРАВЛЕНИЕ, то есть что шаги идут по порядку и назад дороги нет (а где
+    /// есть — там стоит отдельная кнопка «назад», и это разные обещания). Саму форму считает
+    /// холст ([`Canvas::chevron`]).
+    ///
+    /// Три состояния, и все три нужны: пройденное приглушено, текущее залито акцентом, будущее —
+    /// цвета полосы. Без «пройденного» карта не отличалась бы от простого перечисления шагов.
+    pub fn steps(&mut self, r: Rect, names: &[&str], at: usize) {
+        let n = names.len() as i32;
+        if n == 0 || r.is_empty() {
+            return;
+        }
+        let tip = (r.h / 2).min(self.th.px(12));
+        // Блоки налезают друг на друга на вылет остриё, поэтому в ширину каждого этот вылет
+        // возвращается — иначе ряд из пяти шагов оказался бы короче отведённого места.
+        let w = (r.w + tip * (n - 1)) / n;
+        for (k, name) in names.iter().enumerate() {
+            let k = k as i32;
+            let x = r.x + k * (w - tip);
+            // Последнему — весь остаток: деление с остатком иначе оставляло бы справа полоску
+            // стола в пару точек, и ряд выглядел бы недорисованным.
+            let bw = if k == n - 1 { r.right() - x } else { w };
+            let (first, last) = (k == 0, k == n - 1);
+            let (bg, fg) = if k < at as i32 {
+                (self.th.band_on, self.th.text)
+            } else if k == at as i32 {
+                (self.th.accent, self.th.on_accent)
+            } else {
+                (self.th.band, self.th.muted)
+            };
+            let b = Rect::new(x, r.y, bw, r.h);
+            self.c.chevron(b, tip, self.tint(bg), !first, !last);
+            // Подпись считается от ТЕЛА блока, а не от его прямоугольника: выемка и остриё — не
+            // место для текста, и центрируй подпись по всему блоку, ряд выглядел бы пляшущим.
+            let (lp, rp) = (if first { 0 } else { tip }, if last { 0 } else { tip });
+            self.label(Rect::new(b.x + lp, b.y, bw - lp - rp, b.h), name, fg, Align::Center);
+        }
+        self.mark(r);
+    }
+
+    /// Веха 227 — **ВЫБОР ИЗ СПИСКА**: голова с выбранным и выпадающий список под ней.
+    ///
+    /// Имя `select`, а не `dropdown`: «выпадающим» в этом тулките с Вехи 145 зовётся ФОРМА
+    /// ПОЛОТНА (`Canvas` рисует её панели), и второе значение у того же слова стоило бы ровно
+    /// одной путаницы на ровном месте.
+    ///
+    /// Виджет без памяти, как и всё здесь: открыт ли список и что в нём выбрано — знает
+    /// программа. Поэтому `select` обязан стоять ПОСЛЕДНИМ в кадре: список кладётся поверх уже
+    /// нарисованного, а порядок рисования в immediate-mode — это и есть порядок вызовов.
+    ///
+    /// Прокрутки нет намеренно. Выбор, который не влезает на экран целиком, — это уже не выбор, а
+    /// поиск: для него есть [`list::List`] с полем отбора (так сделаны часовые пояса), и подмена
+    /// одного другим дала бы человеку крутить сотню строк мышью вместо того, чтобы набрать три
+    /// буквы.
+    pub fn select(&mut self, r: Rect, items: &[&str], sel: usize, open: bool) -> Pick {
+        let rad = self.th.radius.min(r.h / 2);
+        let hot = self.hot(r);
+        // Под курсором и в открытом виде рамка ярче обычной ([`Ui::frame`]): голова выбора —
+        // единственное здесь, что отвечает на наведение формой, а не только цветом текста.
+        let bg = self.tint(self.th.bg.with_a(0xff));
+        let br = if hot || open { self.th.text.with_a(0x99) } else { self.frame() };
+        let br = self.tint(br);
+        self.c.rrect_bordered(r, rad, self.th.line, bg, br);
+        let mut inner = r.inset_xy(self.th.pad, 0);
+        // Знак говорит, КУДА поедет список, и переворачивается, когда он открыт: иначе открытый
+        // список и закрытый отличались бы только тем, что один виден, — а он может уехать за край.
+        let d = inner.h.min(self.font.line_h());
+        let arrow = inner.cut_right(d);
+        let art = if open { icon::UP } else { icon::DOWN };
+        let ink = self.th.muted.mix(self.th.text, if hot { 256 } else { 0 });
+        self.icon(Rect::new(arrow.x, arrow.y + (arrow.h - d) / 2, d, d), art, ink);
+        self.label(inner, items.get(sel).copied().unwrap_or(""), self.th.text, Align::Left);
+        self.mark(r);
+        let mut out = if self.clicked(r) { Pick::Toggle } else { Pick::None };
+        if !open {
+            return out;
+        }
+        let row = (self.font.line_h() + self.th.px(8)).max(self.th.px(18));
+        let pad = self.th.px(4);
+        let h = row * items.len() as i32 + 2 * pad;
+        // Вниз, а если внизу не помещается — ВВЕРХ. Головой выбора кончается не одна форма, и
+        // список, уехавший за нижний край окна, выглядел бы не ошибкой раскладки, а пустотой:
+        // человек видел бы, что выбор открылся, и не видел бы чем.
+        let gap = self.th.px(2);
+        let below = r.bottom() + gap;
+        let y = if below + h > self.c.h { (r.y - gap - h).max(0) } else { below };
+        let pane = self.popup(Rect::new(r.x, y, r.w, h));
+        for (i, it) in items.iter().enumerate() {
+            let line = Rect::new(pane.x, pane.y + pad + row * i as i32, pane.w, row);
+            let on = if i == sel { 256 } else { 0 };
+            let lit = if self.hot(line) { 256 } else { 0 };
+            // Подсветка строки ЗАМЕТНЕЕ, чем у плитки (0x14): плитка лежит на фоне окна, а список
+            // — на `band_on`, самой светлой подложке темы, и та же доля текста даёт по ней вдвое
+            // меньший шаг. Выбирают здесь мышью, и строка под курсором обязана читаться сразу.
+            let back = self.th.text.with_a((0x2a * lit / 256) as u8).mix(self.th.accent, on);
+            if back.a != 0 {
+                let c = self.tint(back);
+                self.c.rrect(line, self.th.radius.min(row / 2), c);
+            }
+            let fg = self.th.text.mix(self.th.on_accent, on);
+            self.label(line.inset_xy(self.th.pad, 0), it, fg, Align::Left);
+            if self.clicked(line) {
+                out = Pick::Take(i);
+            }
+        }
+        // Щелчок мимо головы и мимо списка ЗАКРЫВАЕТ. Решает это виджет, а не программа, потому
+        // что оба прямоугольника знает он один; оставь это вызывающему — и однажды открытый
+        // список остался бы висеть поверх следующего шага установки.
+        if matches!(out, Pick::None) && self.click.is_some() {
+            out = Pick::Away;
+        }
+        out
+    }
+
     /// Ширина строки — раскладке ряда её надо знать заранее.
     pub fn text_w(&mut self, s: &str) -> i32 {
         self.font.width(s)
     }
+}
+
+/// Что человек сделал с [`Ui::select`] на этом кадре.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pick {
+    /// Ничего.
+    None,
+    /// Щёлкнули по голове — список открыть или закрыть.
+    Toggle,
+    /// Выбрали строку с этим номером.
+    Take(usize),
+    /// Щёлкнули мимо открытого списка — закрыть, выбор не менять.
+    Away,
 }
 
