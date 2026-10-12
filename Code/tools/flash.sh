@@ -34,7 +34,23 @@
 #   Code/tools/flash.sh --yes /dev/sdX            без вопроса (для своих скриптов)
 #   Code/tools/flash.sh --force /dev/sdX          разрешить НЕсъёмный диск (осторожно!)
 #
-# Запускать под root (запись в блочное устройство): sudo Code/tools/flash.sh /dev/sdX
+# ── Где брать права и где брать окружение (Веха 227.2) ──────────────────────────────────────
+#
+# Это ДВЕ РАЗНЫЕ вещи, и раньше они конфликтовали. Запись в блочное устройство требует root;
+# сборка образа требует `nix-shell` (grub2_efi в `VOID_GRUB_EFI`, xorriso, mtools). А `sudo`
+# окружение сбрасывает — и `sudo flash.sh /dev/sdX` падал уже под root'ом, на сборке:
+#
+#     mkesp.sh: нет VOID_GRUB_EFI — войди в nix-shell
+#
+# Совет при этом был верный и бесполезный: владелец В НЁМ И БЫЛ, окружение отнял sudo.
+#
+# Теперь скрипт root'а не требует вовсе: проверки читает из `/sys` (там права не нужны), образ
+# собирает ОТ ТЕБЯ в `nix-shell`, а под root уходят ровно три команды записи — через `sudo`.
+# Привычное `sudo flash.sh` тоже работает: сборка в этом случае зовётся обратно от имени
+# хозяина сеанса (`$SUDO_USER`), потому что собирать образ под root и не надо, и нечем.
+#
+#   Code/tools/flash.sh /dev/sdX            ← так правильно (пароль спросится перед записью)
+#   sudo Code/tools/flash.sh /dev/sdX       ← тоже работает
 set -euo pipefail
 
 # Недостроенный образ не должен оставаться лежать: он большой, а место, как выяснилось, кончается.
@@ -68,7 +84,12 @@ case "$dev" in
                 echo "$dev — это РАЗДЕЛ, а нужен диск целиком (например /dev/sdb, не /dev/sdb1)"; exit 1
             fi ;;
 esac
-[ "$(id -u)" = "0" ] || { echo "нужен root: sudo $0 $*"; exit 1; }
+# Под root уходят только команды записи. Пусто — мы уже root (запустили через sudo).
+SUDO=""
+if [ "$(id -u)" != "0" ]; then
+    command -v sudo >/dev/null || { echo "нужен root для записи в $dev, а sudo не найден"; exit 1; }
+    SUDO="sudo"
+fi
 
 name="$(basename "$dev")"
 removable="$(cat "/sys/block/$name/removable" 2>/dev/null || echo 0)"
@@ -83,7 +104,10 @@ if grep -q "^$dev" /proc/mounts; then
     exit 1
 fi
 
-size_b=$(blockdev --getsize64 "$dev")
+# Размер берём из `/sys` (там он в секторах по 512 Б), а не `blockdev --getsize64`: последний
+# открывает устройство, то есть требует прав, — а все проверки до записи обязаны проходить без
+# них. Иначе «не тот диск» выяснялось бы уже после ввода пароля.
+size_b=$(( $(cat "/sys/block/$name/size") * 512 ))
 model="$(cat "/sys/block/$name/device/model" 2>/dev/null || echo '?')"
 echo "устройство: $dev  ($model, $((size_b / 1024 / 1024)) МиБ, съёмный=$removable)"
 
@@ -93,6 +117,22 @@ if [ -z "$img" ]; then
     kernel="$repo/Code/target/x86_64-unknown-none/release/void-kernel"
     [ -f "$kernel" ] || { echo "нет ядра: $kernel
 собери: Code/tools/run.sh --build-only"; exit 1; }
+    # Собрать образ ТЕМ, У КОГО ЕСТЬ ОКРУЖЕНИЕ. Три случая, и все три кончаются одинаково:
+    #   уже в nix-shell          → зовём напрямую;
+    #   root через sudo          → обратно к хозяину сеанса, он войдёт в nix-shell сам;
+    #   просто снаружи nix-shell → входим в него.
+    собрать() {
+        if [ -n "${VOID_GRUB_EFI:-}" ]; then
+            "$@" >/dev/null
+        elif [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+            echo "  (собираю от имени $SUDO_USER: под sudo окружение nix-shell потеряно)"
+            sudo -u "$SUDO_USER" -H nix-shell "$repo/shell.nix" \
+                 --run "$(printf '%q ' "$@")" >/dev/null
+        else
+            echo "  (вхожу в nix-shell: снаружи его нет ни grub2_efi, ни xorriso)"
+            nix-shell "$repo/shell.nix" --run "$(printf '%q ' "$@")" >/dev/null
+        fi
+    }
     if [ "$raw_disk" = 1 ]; then
         # Образ собираем РЯДОМ СО СБОРКОЙ, а не в /tmp: на NixOS `/tmp` — это tmpfs, то есть
         # оперативная память, и семисотмегабайтный образ туда просто не влезает («на устройстве
@@ -107,10 +147,10 @@ if [ -z "$img" ]; then
         tmp="$tmpdir/void-flash-$$.img"
         img="$tmp"
         echo "собираю ОБРАЗ ДИСКА из $(basename "$kernel") …"
-        "$here/../boot/mkdisk.sh" "$kernel" "$img" 700 >/dev/null
+        собрать "$here/../boot/mkdisk.sh" "$kernel" "$img" 700
     else
         echo "собираю живой ISO из $(basename "$kernel") …"
-        "$here/../boot/mkboot.sh" "$kernel" >/dev/null
+        собрать "$here/../boot/mkboot.sh" "$kernel" 
         img="$repo/Code/boot/void.iso"
     fi
 fi
@@ -128,16 +168,16 @@ fi
 
 # ── стирание ─────────────────────────────────────────────────────────────────
 echo "стираю подписи и таблицы разделов …"
-wipefs -a "$dev" >/dev/null
+$SUDO wipefs -a "$dev" >/dev/null
 # Начало: MBR, загрузочный зазор, начало p1. Конец: резервная таблица GPT — она переживает
 # перезапись начала и потом всплывает как «диск уже размечен».
-dd if=/dev/zero of="$dev" bs=1M count=16 conv=fsync status=none
+$SUDO dd if=/dev/zero of="$dev" bs=1M count=16 conv=fsync status=none
 tail_mb=4
 seek_mb=$(( size_b / 1024 / 1024 - tail_mb ))
-[ "$seek_mb" -gt 16 ] && dd if=/dev/zero of="$dev" bs=1M count="$tail_mb" seek="$seek_mb" conv=fsync status=none
+[ "$seek_mb" -gt 16 ] && $SUDO dd if=/dev/zero of="$dev" bs=1M count="$tail_mb" seek="$seek_mb" conv=fsync status=none
 
 echo "пишу образ ($((img_b / 1024 / 1024)) МиБ) …"
-dd if="$img" of="$dev" bs=4M conv=fsync status=progress
+$SUDO dd if="$img" of="$dev" bs=4M conv=fsync status=progress
 
 if [ "$grow" = "1" ] && [ "$raw_disk" != "1" ]; then
     echo "--grow пропущен: у живого ISO store лежит в памяти, растягивать на носителе нечего."
@@ -146,12 +186,12 @@ elif [ "$grow" = "1" ]; then
     # store это просто исправить длину второго раздела. Область за образом уже обнулена, так
     # что store увидит пустое место, а не мусор.
     echo "растягиваю store на весь носитель …"
-    start=$(sfdisk -d "$dev" | awk '/type=9f/ {gsub(",","",$4); print $4}')
+    start=$($SUDO sfdisk -d "$dev" | awk '/type=9f/ {gsub(",","",$4); print $4}')
     [ -n "$start" ] || { echo "не нашёл раздел store (тип 9f) — оставляю как есть"; start=""; }
     if [ -n "$start" ]; then
         sectors=$(( size_b / 512 ))
         printf 'start=%s, size=%s, type=9f\n' "$start" "$(( sectors - start ))" \
-            | sfdisk --no-reread -N 2 "$dev" >/dev/null
+            | $SUDO sfdisk --no-reread -N 2 "$dev" >/dev/null
     fi
 fi
 

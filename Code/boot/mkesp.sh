@@ -56,7 +56,7 @@ out="${1:-$here/esp.img}"
 # лежать негде — store VOID читает только само ядро, а GRUB его формата не знает.
 extra="${2:-}"
 
-: "${VOID_GRUB_EFI:?нет VOID_GRUB_EFI — войди в nix-shell (там он ставится из grub2_efi)}"
+: "${VOID_GRUB_EFI:?нет VOID_GRUB_EFI — собирать надо из nix-shell (там grub2_efi); если звал через sudo — окружение сбросил он, зови flash.sh БЕЗ sudo}"
 plat="$VOID_GRUB_EFI/lib/grub/x86_64-efi"
 [ -d "$plat" ] || { echo "в $VOID_GRUB_EFI нет платформы x86_64-efi"; exit 1; }
 
