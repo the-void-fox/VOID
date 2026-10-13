@@ -343,7 +343,7 @@ struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int txqs)
 	 * То есть карте говорилось: «кадры длиннее ДВАДЦАТИ ДВУХ байт не принимай». Самый короткий
 	 * Ethernet-кадр — шестьдесят. Карта честно выбрасывала ВСЁ, что приходило с провода, и столь
 	 * же честно молчала об этом: отброшенный по длине кадр не поднимает прерывания и не пишет
-	 * дескриптор. Снаружи это выглядело как «линк есть, кадр уходит, в ответ тишина» — и увело
+	 * дескриптор. Снаружи это выглядело как «link есть, кадр уходит, в ответ тишина» — и увело
 	 * поиск в прерывания, маршрутизацию линий и DMA, где всё было исправно.
 	 *
 	 * Почему не всплыло в QEMU: ни rtl8139, ни e1000 не программируют картe предел длины из
@@ -411,7 +411,7 @@ void eth_hw_addr_random(struct net_device *dev) { eth_random_addr(dev->dev_addr)
  * структур (link_ksettings, drvinfo, regs, wolinfo…), к работе карты отношения не имеющих.
  * Драйвер зовёт это в probe безусловно, поэтому пустое тело обязано быть: netdev остаётся без
  * ethtool_ops, как устройство, которое ethtool не поддерживает. Понадобится показывать состояние
- * линка в сетевом TUI — шим вырастет тогда, под настоящего потребителя. */
+ * linkа в сетевом TUI — шим вырастет тогда, под настоящего потребителя. */
 void atl1c_set_ethtool_ops(struct net_device *netdev) { (void)netdev; }
 
 struct netdev_queue *netdev_get_tx_queue(struct net_device *dev, unsigned int index)
@@ -449,7 +449,7 @@ void netif_tx_disable(struct net_device *dev) { (void)dev; }
 bool netif_queue_stopped(const struct net_device *dev) { (void)dev; return false; }
 bool netif_running(const struct net_device *dev) { return dev->flags & IFF_UP; }
 /* Веха 133.3 — след подъёма: несущая переключается в начале `atl1c_up` и по результату
- * согласования, то есть по этим двум строкам видно, дошёл ли драйвер до работы с линком. */
+ * согласования, то есть по этим двум строкам видно, дошёл ли драйвер до работы с linkом. */
 void netif_carrier_on(struct net_device *dev)
 {
 	dev->lx_state |= 1UL << LX_STATE_CARRIER;
@@ -524,7 +524,7 @@ void napi_disable(struct napi_struct *napi)
 			lx_napi_pending[i] = NULL;
 }
 
-/* Поставить опрос в очередь. Дубликат не добавляем: `poll` не обязан быть повторно входимым,
+/* Поставить опрос в очередь. Дубликат не добавляем: `poll` не обязан быть repeat_atно входимым,
  * и в Linux это гарантирует тот же самый бит «уже запланирован». */
 void __napi_schedule(struct napi_struct *napi)
 {
@@ -701,7 +701,8 @@ static void lx_netdev_rx(struct sk_buff *skb)
  */
 void lx_net_pulse(unsigned long now_jiffies)
 {
-	static unsigned long next, seen_rx, seen_tx;
+	static unsigned long next, seen_rx, seen_tx, repeat_at;
+	static int complained;
 	int talking, deaf;
 
 	if (!lx_netdev_active())
@@ -737,8 +738,42 @@ void lx_net_pulse(unsigned long now_jiffies)
 	 *
 	 * Вернуть срез, если сеть снова станет расследованием: `#define LX_NET_SLICE_HZ (30 * HZ)`
 	 * и условие ниже. Специально оставлено одной строкой, а не выкинуто совсем. */
-	if (!(talking && deaf))
+	/* Веха 228.1 — НЕТ НЕСУЩЕЙ — НЕЧЕГО РАССЛЕДОВАТЬ.
+	 *
+	 * «Мы шлём, нам не отвечают» при невоткнутом проводе не поломка, а описание провода. У
+	 * владельца это и вышло: срез убрали, а пульс остался печататься каждые две секунды —
+	 * потому что условие было ВЕРНЫМ. Состояние несущей шим ведёт честно (`netif_carrier_ok`,
+	 * Веха 134.3), так что спросить есть у кого.
+	 *
+	 * Говорим о проводе ОДИН раз на смену состояния: воткнули — скажем, выдернули — скажем. */
+	{
+		static int was_link = -1;
+		int link = netif_carrier_ok(lx_netdev_dev) ? 1 : 0;
+
+		if (link != was_link) {
+			was_link = link;
+			printk(link ? "[lx_net] несущая есть\n"
+				    : "[lx_net] несущей нет — провод не воткнут\n");
+		}
+		if (!link)
+			return;
+	}
+
+	/* Беда начинается и кончается, и сказать надо про ОБА конца. Молчащий пульс после жалобы
+	 * неотличим от продолжающейся беды — человек так и останется думать, что сеть лежит. */
+	if (!(talking && deaf)) {
+		if (complained) {
+			complained = 0;
+			printk("[lx_net] ответы пошли — приём ожил\n");
+		}
 		return;
+	}
+	/* Повторяться раз в две секунды незачем: complained одна, а строк в журнале тридцать за минуту.
+	 * Первый раз — сразу (человек смотрит журнал сразу после `ping`), дальше раз в полминуты. */
+	if (complained && (long)(now_jiffies - repeat_at) < 0)
+		return;
+	complained = 1;
+	repeat_at = now_jiffies + 30 * HZ;
 
 	printk("[lx_net] пульс — ISR %lu (моё %lu), NAPI %lu, принято %lu, взято %lu,"
 	       " отправлено %lu (отказов %lu)\n",
@@ -760,7 +795,7 @@ int lx_netdev_active(void)
 	return lx_netdev_cap != VOID_NO_CAP && lx_netdev_dev != 0;
 }
 
-/* Веха 199.12 — ОТЛОЖЕННЫЙ КАДР. `NETDEV_TX_BUSY` в Linux означает «повтори позже», и повторять
+/* Веха 199.12 — ОТЛОЖЕННЫЙ КАДР. `NETDEV_TX_BUSY` в Linux означает «repeat_atи позже», и repeat_atять
  * обязан тот, кто отдаёт. Раньше отказ драйвера здесь терялся дважды: кадр молча пропадал, а его
  * буфер не возвращался в арену вовсе. Держим один кадр и пробуем его на следующем обороте — так
  * же, как это делает очередь qdisc.
@@ -770,7 +805,7 @@ int lx_netdev_active(void)
 static unsigned char lx_tx_hold[1600];
 static size_t lx_tx_hold_len;
 
-/* Отдать кадр драйверу. 1 — взял, 0 — занят (надо повторить позже). */
+/* Отдать кадр драйверу. 1 — взял, 0 — занят (надо repeat_atить позже). */
 static int lx_xmit_one(const unsigned char *frame, size_t n)
 {
 	const struct net_device_ops *ops = lx_netdev_dev->netdev_ops;
@@ -856,12 +891,12 @@ struct sk_buff *napi_get_frags(struct napi_struct *napi) { (void)napi; return NU
 void napi_free_frags(struct napi_struct *napi) { (void)napi; }
 int  napi_gro_frags(struct napi_struct *napi) { (void)napi; return 0; }
 
-/* ─ MII: опрос линка (Веха 193) ─
+/* ─ MII: опрос linkа (Веха 193) ─
  *
  * `mii_check_media` в Linux читает BMSR, сравнивает с прошлым состоянием и объявляет
- * `netif_carrier_on/off`. Бит BMSR_LSTATUS ЗАЛИПАЮЩИЙ: он помнит, что линк пропадал, поэтому
+ * `netif_carrier_on/off`. Бит BMSR_LSTATUS ЗАЛИПАЮЩИЙ: он помнит, что link пропадал, поэтому
  * читать его надо дважды — первое чтение сбрасывает память, второе говорит правду. Урок этот
- * уже оплачен на atl1c (Веха 133), и повторять его здесь не будем.
+ * уже оплачен на atl1c (Веха 133), и repeat_atять его здесь не будем.
  */
 int mii_link_ok(struct mii_if_info *mii)
 {
@@ -916,7 +951,7 @@ int mii_nway_restart(struct mii_if_info *mii)
 	return 0;
 }
 
-/* Описание линка для ethtool. Читателя у этих чисел пока нет — утилиты `ethtool` в VOID не
+/* Описание linkа для ethtool. Читателя у этих чисел пока нет — утилиты `ethtool` в VOID не
  * существует, — но заполняем честно: молча оставить нули значило бы соврать первому же, кто
  * сюда посмотрит. */
 int mii_ethtool_get_link_ksettings(struct mii_if_info *mii,
@@ -958,7 +993,7 @@ unsigned int mii_check_media(struct mii_if_info *mii, unsigned int ok_to_print,
 	else
 		netif_carrier_off(mii->dev);
 	if (ok_to_print)
-		printk("[mii] линк %s\n", ok ? "есть" : "пропал");
+		printk("[mii] link %s\n", ok ? "есть" : "пропал");
 	return ok ? 1 : 0;
 }
 

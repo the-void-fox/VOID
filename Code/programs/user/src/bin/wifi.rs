@@ -196,7 +196,12 @@ fn efuse_block(word: usize, out: &mut [u16]) -> Option<()> {
     }
     // Слова приезжают с конца блока: DATA3 — первые четыре байта, DATA0 — последние.
     for i in 0..4 {
-        let v = unsafe { rd32(EFUSE_DATA3 - i * 4) };
+        // С КОНЦА К НАЧАЛУ: `DATA3` — первые байты блока, `DATA0` — последние (см. выше).
+        // Нижняя граница названа явно, а не подразумевается вычитанием: так видно, что четыре
+        // слова — это ровно диапазон регистров, а не произвольное число итераций.
+        let reg = EFUSE_DATA3 - i * 4;
+        debug_assert!(reg >= EFUSE_DATA0);
+        let v = unsafe { rd32(reg) };
         let at = i * 2;
         if at + 1 < out.len() {
             out[at] = v as u16;

@@ -89,7 +89,6 @@ impl Tab {
 /// Один процесс (снимок для одного кадра).
 struct Proc {
     pid: u16,
-    ppid: u16,
     system: bool,
     linux: bool,
     has_hash: bool,
@@ -221,7 +220,6 @@ impl App {
             hash.copy_from_slice(&r[8..40]);
             out.push(Proc {
                 pid: u16::from_le_bytes([r[0], r[1]]),
-                ppid: u16::from_le_bytes([r[2], r[3]]),
                 system: flags & 0x01 != 0,
                 linux: flags & 0x02 != 0,
                 has_hash: flags & 0x04 != 0,
@@ -369,7 +367,7 @@ impl App {
         lay.foot_msg = foot;
         all.cut_bottom(th.gap);
         // Таблица сверху, права под ней — как в макете (там таблица занимает верхние две пятых).
-        let mut table = all.cut_top((all.h * 2 / 5).max(row_h * 3 + th.pad * 2));
+        let table = all.cut_top((all.h * 2 / 5).max(row_h * 3 + th.pad * 2));
         all.cut_top(th.gap);
         let inner = table.inset(th.pad);
         lay.head = Rect::new(inner.x, inner.y, inner.w, row_h);
@@ -379,7 +377,6 @@ impl App {
         lay.list = lay.bar.cut_left(lay.bar.w - th.px(6));
         // Веха 223.4 — полоса СРАЗУ такая, какой рисуется: по ней же считается попадание.
         lay.bar = lay.bar.inset_xy(th.px(1), th.px(2));
-        table.h = 0; // сам прямоугольник карточки восстановим при рисовании
         lay.rows = (lay.list.h / row_h).max(1) as usize;
         // Права: список слева, пояснение справа (в макете — ровно так). Пополам, а не 5/9:
         // пояснение — это ТЕКСТ, и узкая колонка режет его многоточием на первом же слове.

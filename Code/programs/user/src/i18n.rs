@@ -379,7 +379,6 @@ fn en(s: &'static str) -> &'static str {
         "видео" => "video",
         "датчики" => "sensors",
         "счётчиков нет" => "no counters",
-        "нет драйверов" => "no drivers",
         // что значит право
         "объекты системы:" => "system objects:",
         "класть и читать по" => "put and read by",
@@ -656,7 +655,6 @@ fn en(s: &'static str) -> &'static str {
         "ждёт IRQ" => "waits for IRQ",
         "спит" => "sleeps",
         "ждёт трубы" => "waits on a pipe",
-        "ждёт ребёнка" => "waits for a child",
         "неизвестно" => "unknown",
         "чтение" => "read",
         "запись" => "write",

@@ -1672,14 +1672,6 @@ fn device_checksum(
     device.capabilities().checksum
 }
 
-/// Карты нет: обслуживаем IPC, честно отвечая status=3 (система от этого не встаёт).
-fn serve_no_device() -> ! {
-    let mut req = [0u8; 256];
-    loop {
-        let m = sys::recv(&mut req);
-        sys::reply(m.reply_cap, &[ST_NODEV, 0, 0, 0, 0]);
-    }
-}
 
 
 /// «A.B.C.D» в адрес smoltcp. Сам разбор общий с остальными программами

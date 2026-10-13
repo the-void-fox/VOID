@@ -750,8 +750,8 @@ fn load_font(conf: &Conf) -> TermFont {
     // Веха 228 — ОДИН раз на запуск, а не на каждую панель. Шрифт берётся при создании каждого
     // вида, и в сеансе с парой терминалов одна и та же строка про кегль печаталась по шесть раз.
     // Сказать нужно ровно однажды: сообщение про машину, а не про панель.
-    static СКАЗАНО: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if !СКАЗАНО.swap(true, core::sync::atomic::Ordering::Relaxed) {
+    static SAID_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !SAID_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
         log_line(&alloc::format!(
         "[term] рисую встроенным шрифтом 8×16 (кегль {} вместо {}); настоящий задаётся так: \
          packages(\"…\") + terminal(\"font\", \"имя.ttf\")",

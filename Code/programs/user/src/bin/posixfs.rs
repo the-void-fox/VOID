@@ -727,7 +727,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 let path = &pbuf[..pl];
                 let mut sz = usize::MAX;
                 let mut is_dir = false;
-                let mut ty = 0u8;
+                let ty;
                 // У дерева пакета времени нет и быть не может: пакет неизменяем, а его узлы —
                 // чужой формат, в котором места под время не отведено.
                 rep[7..15].copy_from_slice(&0u64.to_le_bytes());

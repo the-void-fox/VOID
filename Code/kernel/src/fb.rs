@@ -51,6 +51,9 @@ const MAX_CELLS: usize = MAX_COLS * MAX_ROWS;
 
 /// Фреймбуфер выше этой границы не поддерживаем: до `mm_enable` мы живём на таблицах трамплина,
 /// а те покрывают ровно первые 4 ГиБ (см. `entry.s`).
+/// Только для [`init`], а он — путь multiboot2, то есть x86. На riscv кадр приходит иначе
+/// (`adopt` от virtio-gpu), и предел в 4 ГиБ там ни при чём.
+#[cfg(target_arch = "x86_64")]
 const FOUR_GIB: usize = 4 * 1024 * 1024 * 1024;
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
@@ -104,6 +107,7 @@ const PALETTE: [(u8, u8, u8); 16] = [
 ];
 
 /// Раскладка цвета одного канала: (позиция младшего бита, ширина маски).
+#[cfg(target_arch = "x86_64")]
 pub struct RgbFields {
     pub red: (u8, u8),
     pub green: (u8, u8),
@@ -115,6 +119,11 @@ pub struct RgbFields {
 ///
 /// Зовётся ДО первого вывода (из `console_init` архитектуры) и до `mm_init`, поэтому опирается
 /// только на таблицы трамплина.
+///
+/// **Только x86.** Кадр от загрузчика описан тегом multiboot2 (тег 8), и тега этого на riscv
+/// не бывает: там экран приходит от virtio-gpu через [`adopt`]. Помечено `cfg`, а не
+/// `allow(dead_code)`, чтобы причина была видна, а не заглушена.
+#[cfg(target_arch = "x86_64")]
 pub fn init(base: usize, pitch: usize, width: usize, height: usize, bpp: u8, rgb: RgbFields) -> bool {
     let bytes_pp = match bpp {
         32 => 4,

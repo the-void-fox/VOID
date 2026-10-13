@@ -280,11 +280,6 @@ pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
 
-/// Окно кадра `(физический адрес, байт)` — для выдачи процессу под capability.
-pub fn window() -> Option<(usize, usize)> {
-    present().then(|| (FB_PA.load(Ordering::Relaxed), FB_BYTES.load(Ordering::Relaxed)))
-}
-
 /// ПОКАЗАТЬ прямоугольник: перенести его в ресурс устройства и обновить им экран.
 ///
 /// Две команды, а не одна, и это не лишняя работа: `TRANSFER` говорит «возьми из моей памяти»,
