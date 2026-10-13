@@ -1251,16 +1251,13 @@ fn run_stage(
     нужен_текст: bool,
 ) -> Result<Option<String>, String> {
     let head = core::str::from_utf8(звено[0]).unwrap_or("");
-    // Программа: запускаем, собрав её вывод. Текста на вход ей передать пока нечем — у
-    // перехваченной программы ввода нет (см. [`run_captured`]), и это честнее, чем сделать вид.
+    // Программа: запускаем, собрав её вывод, и отдаём ей вход конвейера её же `stdin`
+    // (Веха 228.2). До этого шелл здесь отказывал, и конвейер работал только между своими
+    // формами — то есть ровно до первой настоящей программы.
     if !env.lookup(head).is_some_and(|v| is_callable(&v)) {
-        if вход.is_some() {
-            return Err(alloc::format!(
-                "vvsh: `{head}` — программа, а программе вход конвейера передать нечем\n"
-            ));
-        }
         let args: alloc::vec::Vec<&[u8]> = звено[1..].to_vec();
-        let out = run_captured(звено[0], &args).ok_or_else(|| {
+        let вход_байт = вход.map(|s| s.as_bytes()).unwrap_or(&[]);
+        let out = run_captured(звено[0], &args, вход_байт).ok_or_else(|| {
             alloc::format!(
                 "{}{}\n",
                 sys::i18n::t("vvsh: команда не найдена: "),
@@ -1314,7 +1311,17 @@ fn run_stage(
 /// на свой эндпоинт и объявляет `STDIO` (Веха 98). Здесь он нужен дважды — конвейеру (`>>`,
 /// `>`) и языку: `\(fps 4)` тоже обязан получить вывод значением, иначе форма языка умеет
 /// меньше, чем строка над ней.
-fn run_captured(name: &[u8], args: &[&[u8]]) -> Option<alloc::string::String> {
+/// Запустить программу, перехватив её вывод, и отдать ей `вход` как stdin.
+///
+/// Веха 228.2 — ВХОД КОНВЕЙЕРА. Раньше здесь стояло «ввода у перехваченной программы нет», и
+/// шелл честно отказывал: `klog |> grep` работало (обе стороны — свои формы), а `klog |> wc`
+/// нет, потому что `wc` программа. Чинить оказалось нечего: хозяином stdio перехваченной
+/// программы шелл уже был — он отвечал на её `OP_STDIN`, просто пустотой.
+///
+/// Отдаём КУСКАМИ по запросу (`want` в теле запроса), как это делает терминал: ответ больше
+/// буфера ядро обрежет, а мы бы уже посчитали байты отданными (та же ловушка Вехи 101).
+/// Вход кончился — пустой ответ, и программа читает его как конец, а не как «ещё подожди».
+fn run_captured(name: &[u8], args: &[&[u8]], вход: &[u8]) -> Option<alloc::string::String> {
     let mut blob = alloc::vec::Vec::new();
     for w in args {
         blob.extend_from_slice(w);
@@ -1327,6 +1334,7 @@ fn run_captured(name: &[u8], args: &[&[u8]]) -> Option<alloc::string::String> {
     });
     let pid = pid?;
     let mut out = alloc::string::String::new();
+    let mut отдано = 0usize; // сколько байт входа программа уже забрала
     let mut msg = [0u8; sys::stdio::CHUNK + 64];
     loop {
         // Спим коротко: пока ребёнок пишет — просыпаемся на его сообщения, пока молчит — на
@@ -1340,11 +1348,26 @@ fn run_captured(name: &[u8], args: &[&[u8]]) -> Option<alloc::string::String> {
                     // Ответ пустой, но обязательный: он же и регулировка потока.
                     sys::reply(m.reply_cap, &[]);
                 }
-                // Ввода у перехваченной программы нет: клавиатура принадлежит шеллу, а не ей.
-                // Пустой ответ — это конец ввода, и он честнее молчания: на молчании программа
-                // повисла бы навсегда.
+                // Вход конвейера — кусками по запросу. Клавиатуры у перехваченной программы
+                // по-прежнему нет (она принадлежит шеллу), и когда вход иссяк, отвечаем пусто:
+                // это конец ввода, и он честнее молчания — на молчании программа повисла бы.
                 sys::stdio::OP_STDIN => {
-                    sys::reply(m.reply_cap, &[]);
+                    let want = if m.len >= 4 {
+                        u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize
+                    } else {
+                        sys::stdio::CHUNK
+                    };
+                    let want = want.clamp(1, sys::stdio::CHUNK - 1);
+                    let n = (вход.len() - отдано).min(want);
+                    if n == 0 {
+                        sys::reply(m.reply_cap, &[]);
+                    } else {
+                        let mut rep = alloc::vec::Vec::with_capacity(n + 1);
+                        rep.push(sys::stdio::IN_BYTES);
+                        rep.extend_from_slice(&вход[отдано..отдано + n]);
+                        отдано += n;
+                        sys::reply(m.reply_cap, &rep);
+                    }
                 }
                 sys::stdio::OP_WINSIZE => {
                     sys::reply(m.reply_cap, &[80, 0, 25, 0]);
@@ -1377,7 +1400,8 @@ impl vvsh_core::Runner for Programs {
         let owned: alloc::vec::Vec<alloc::string::String> =
             args.iter().map(arg_string).collect();
         let refs: alloc::vec::Vec<&[u8]> = owned.iter().map(|s| s.as_bytes()).collect();
-        run_captured(name.as_bytes(), &refs).map(|out| Ok(Value::str(&out)))
+        // Форма `(имя арг…)` входа не имеет: он бывает только у звена конвейера.
+        run_captured(name.as_bytes(), &refs, &[]).map(|out| Ok(Value::str(&out)))
     }
 }
 
@@ -1514,10 +1538,10 @@ fn render_atom(v: &Value) {
 // vvsh-core остаётся ЧИСТЫМ (конфиг использует `root_env`, эти команды — только в REPL). Caps
 // приходят из `start_cap` (ambient процессу), вывод — `sys::write`; Host-trait не нужен.
 
-/// Окружение шелл-сессии: чистые builtins vvsh-core + команды-эффекты (`ls`/`cat`/`echo`/`run`).
-fn shell_env() -> Env {
-    let env = vvsh_core::root_env();
-    let cmds: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
+/// Команды-эффекты шелла: имя → реализация. Константой, а не локальным списком, затем, что имена
+/// нужны ДВОИМ — окружению сессии ([`shell_env`]) и дописыванию по `Tab` ([`complete`]). Два
+/// списка одних и тех же имён разошлись бы молча, и `Tab` перестал бы знать половину команд.
+const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         ("ls", sh_ls),
         ("cat", sh_cat),
         ("echo", sh_echo),
@@ -1574,7 +1598,12 @@ fn shell_env() -> Env {
         ("root", sh_root),
         ("root-del", sh_root_del),
         ("secret", sh_secret),
-    ];
+];
+
+/// Окружение шелл-сессии: чистые builtins vvsh-core + команды-эффекты (`ls`/`cat`/`echo`/`run`).
+fn shell_env() -> Env {
+    let env = vvsh_core::root_env();
+    let cmds = CMDS;
     for (name, f) in cmds {
         env.define(alloc::rc::Rc::from(*name), Value::Builtin(name, *f));
     }
@@ -3458,6 +3487,40 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                             redraw(prompt, line, llen, pos);
                         }
                     }
+                    // Веха 228.4 — ДОПИСЫВАНИЕ ПО `Tab`.
+                    //
+                    // Дописываем ПОСЛЕДНЕЕ СЛОВО строки, и чем именно — решает его место:
+                    // первое слово это команда (свои формы языка плюс программы store и
+                    // профиля), всё прочее — путь. Так же делит мир и сам шелл, когда строку
+                    // исполняет, и вторая, своя, классификация здесь разошлась бы с ней.
+                    //
+                    // Единственное совпадение дописывается целиком; несколько — дописывается
+                    // их общее начало, а список показывается. Ноль — молчим: звонок на каждое
+                    // «не знаю» раздражает ровно тех, кто жмёт `Tab` вслепую.
+                    b'\t' => {
+                        let (начало, кандидаты) = complete(&line[..pos], pos);
+                        if !кандидаты.is_empty() {
+                            let общее = common_prefix(&кандидаты);
+                            let хвост = &общее[начало.min(общее.len())..];
+                            if !хвост.is_empty() && llen + хвост.len() <= line.len() {
+                                line.copy_within(pos..llen, pos + хвост.len());
+                                line[pos..pos + хвост.len()].copy_from_slice(хвост.as_bytes());
+                                llen += хвост.len();
+                                pos += хвост.len();
+                            } else if кандидаты.len() > 1 {
+                                // Дописывать нечего, а вариантов несколько — показать их.
+                                sys::write(b"\r\n");
+                                for (i, k) in кандидаты.iter().enumerate() {
+                                    if i != 0 {
+                                        sys::write(b"  ");
+                                    }
+                                    sys::write(k.as_bytes());
+                                }
+                                sys::write(b"\r\n");
+                            }
+                            redraw(prompt, line, llen, pos);
+                        }
+                    }
                     0x04 => {
                         if llen == 0 {
                             return None; // Ctrl-D на пустой строке — EOF
@@ -3539,6 +3602,83 @@ fn utf8_len(b: u8) -> usize {
 /// нарисовать кадр МЕЖДУ ними: на экране мелькало промежуточное состояние, где возврат каретки
 /// уже сделан, а строка ещё не напечатана. Со стороны это «при стирании курсор прыгает в начало
 /// строки и возвращается» — давняя жалоба владельца, и причина оказалась не в терминале.
+/// Веха 228.4 — что дописать по `Tab`. Возвращает «сколько уже набрано» и список кандидатов
+/// ЦЕЛИКОМ (не хвостами): вызывающему остаётся взять их общее начало и дописать недостающее.
+///
+/// Делим мир ровно так же, как делит его сам шелл при исполнении строки: ПЕРВОЕ слово — команда,
+/// остальные — пути. Своя, вторая классификация здесь разошлась бы с настоящей, и `Tab` обещал
+/// бы то, чего шелл не исполнит.
+fn complete(строка: &[u8], _pos: usize) -> (usize, Vec<String>) {
+    let ws = строка.iter().rposition(|&b| b == b' ').map_or(0, |i| i + 1);
+    let слово = &строка[ws..];
+    let mut out: Vec<String> = Vec::new();
+    if ws == 0 {
+        // ── команда ──
+        for (имя, _) in CMDS {
+            if имя.as_bytes().starts_with(слово) {
+                out.push(String::from(*имя));
+            }
+        }
+        // Программы store: те же имена, которыми их зовёт `spawn_program` (`bin/<арх>/<имя>`).
+        if let Some(list) = roots::text(cap_store()) {
+            for суф in roots::suffixes(&list, b"bin/") {
+                let имя = match суф.iter().rposition(|&b| b == b'/') {
+                    Some(i) => &суф[i + 1..],
+                    None => суф,
+                };
+                if имя.starts_with(слово) {
+                    if let Ok(s) = core::str::from_utf8(имя) {
+                        if !out.iter().any(|k| k == s) {
+                            out.push(String::from(s));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // ── путь ──
+        let (dir, base) = match слово.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&слово[..i + 1], &слово[i + 1..]),
+            None => (&b""[..], слово),
+        };
+        let мест = resolve(dir);
+        let mut buf = alloc::vec![0u8; 16 * 1024];
+        let n = px::readdir(cap_fs(), &мест, &mut buf);
+        for запись in buf[..n].split(|&b| b == b'\n').filter(|e| !e.is_empty()) {
+            // Формат строки каталога — «имя» либо «имя/» у каталогов; нам годится как есть.
+            let имя = запись;
+            if имя.starts_with(base) {
+                if let (Ok(s), Ok(d)) = (core::str::from_utf8(имя), core::str::from_utf8(dir)) {
+                    out.push(alloc::format!("{d}{s}"));
+                }
+            }
+        }
+    }
+    out.sort();
+    (слово.len(), out)
+}
+
+/// Общее начало кандидатов. Один кандидат — он сам; пусто — пустая строка.
+fn common_prefix(кандидаты: &[String]) -> String {
+    let Some(первый) = кандидаты.first() else { return String::new() };
+    let mut n = первый.len();
+    for k in &кандидаты[1..] {
+        n = n.min(
+            первый
+                .as_bytes()
+                .iter()
+                .zip(k.as_bytes())
+                .take_while(|(a, b)| a == b)
+                .count(),
+        );
+    }
+    // По границе символа: дописать пол-буквы значит испортить строку.
+    while n > 0 && !первый.is_char_boundary(n) {
+        n -= 1;
+    }
+    String::from(&первый[..n])
+}
+
 fn redraw(prompt: &[u8], line: &[u8], llen: usize, pos: usize) {
     // Приглашение (320) + строка (LINE_CAP) + управляющие последовательности. Больше `CHUNK`
     // stdio всё равно поедет двумя сообщениями, но это уже длина строки, а не наша щедрость.
