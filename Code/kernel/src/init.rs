@@ -173,7 +173,7 @@ const DEFAULT_GEN3: &str = "\
 # VOID — поколение с графическим терминалом (Веха 97)
 service posixfs store:rw
 service net-srv dev:net:rw
-service hda mmio:hda dma
+service hda mmio:hda dma endpoint:posixfs:/etc/apps/hda
 shell term endpoint:posixfs store:rwx mmio:fb power endpoint:hda env
 ";
 
@@ -213,7 +213,7 @@ service posixfs store:rw
 service net-srv dev:net:rw
 # Веха 202 — ЗВУК: драйвер Intel HDA обычным сервисом, под правом на окно регистров и DMA.
 # Машина без звуковой карты просто не поднимет его — строка при этом остаётся верной.
-service hda mmio:hda dma
+service hda mmio:hda dma endpoint:posixfs:/etc/apps/hda
 # Веха 206 — РАЗВЕДКА беспроводной карты (ADR 0021, шаг 1): не драйвер, а чтение нескольких
 # регистров и отчёт в журнал. Машина без карты просто не поднимет её — строка остаётся верной.
 service wifi mmio:wifi dma store:r
@@ -429,15 +429,30 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
             }
         }
     } else if let Some(rest) = token.strip_prefix("endpoint:") {
-        // endpoint:ИМЯ  или  endpoint:ИМЯ:права (по умолчанию SEND).
-        let (svc, rights) = match rest.split_once(':') {
-            Some((s, r)) => (s, parse_rights(r)),
-            None => (rest, Rights::SEND),
+        // endpoint:ИМЯ · endpoint:ИМЯ:права · endpoint:ИМЯ:/префикс (Веха 229).
+        //
+        // Третья часть читается как ПУТЬ, если начинается с косой черты, и как буквы прав
+        // иначе. Спутать их нельзя: в правах косой черты не бывает, в абсолютном пути она
+        // первая по определению.
+        let (svc, rights, root) = match rest.split_once(':') {
+            Some((s, r)) if r.starts_with('/') => (s, Rights::SEND, Some(r)),
+            Some((s, r)) => (s, parse_rights(r), None),
+            None => (rest, Rights::SEND, None),
         };
         match services.iter().find(|(n, _)| n == svc) {
-            Some((_, spid)) => {
-                Some(cap::mint(dom, cap::Target::Endpoint(*spid), rights).bits() as usize)
-            }
+            Some((_, spid)) => Some(match root {
+                // Веха 229 ([[0022-app-state-directory]]) — право на файлы, СУЖЕННОЕ путём.
+                //
+                // Строку приходится «подвесить» (`leak`): право живёт до конца загрузки, а
+                // конфиг, из которого она взята, — временный текст. Утечки здесь нет по сути:
+                // минт идёт один раз на строку конфига при подъёме системы.
+                Some(r) => {
+                    let r: &'static str = alloc::boxed::Box::leak(String::from(r).into_boxed_str());
+                    println!("  [init] endpoint:{} сужен до {}", svc, r);
+                    cap::mint_rooted(dom, cap::Target::Endpoint(*spid), rights, r).bits() as usize
+                }
+                None => cap::mint(dom, cap::Target::Endpoint(*spid), rights).bits() as usize,
+            }),
             None => {
                 println!("  [init] endpoint:{} — нет такого сервера (пропуск)", svc);
                 None
@@ -654,6 +669,17 @@ fn hardware_entry(kind: &str, entry: &void_conf::Entry<'_>) {
 /// `store:rwx` → `STORE`, `mmio:fb` → `FB`, `dev:net:rw` → `NET`. Пустая строка — имени нет
 /// (право останется только позиционным).
 fn cap_name(token: &str) -> alloc::string::String {
+    // Веха 229 — СУЖЕННЫЙ эндпоинт файлов зовётся `STATE`, а не именем сервера.
+    //
+    // Иначе он столкнулся бы в окружении с широким правом на тот же сервер (`CAP_POSIXFS`), и
+    // одно затёрло бы другое. А программе нужны ОБА: широкое — смотреть файлы, узкое — хранить
+    // своё. Имя говорит не «куда» (путь программа знать не обязана), а ЗАЧЕМ: «вот твоё
+    // состояние». Такой у программы один, и это ровно модель ADR 0022: каталог на программу.
+    if let Some(r) = token.strip_prefix("endpoint:") {
+        if r.split_once(':').is_some_and(|(_, p)| p.starts_with('/')) {
+            return alloc::string::String::from("STATE");
+        }
+    }
     let base = if let Some(r) = token.strip_prefix("endpoint:") {
         r.split(':').next().unwrap_or(r)
     } else if token.starts_with("store:") {

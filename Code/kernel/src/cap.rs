@@ -126,6 +126,17 @@ pub enum Target {
 struct Entry {
     target: Target,
     rights: Rights,
+    /// Веха 229 ([[0022-app-state-directory]]) — **СУЖЕНИЕ права путём**: для эндпоинта файлов
+    /// это префикс, за который держателю не выйти.
+    ///
+    /// Право на файлы было «да/нет» и означало всё дерево целиком. Состояние программы
+    /// (`/etc/apps/<имя>/`) требует другого: пусть пишет, но только себе. Префикс живёт ЗДЕСЬ, у
+    /// права, а не у сервера, и это главное в решении — иначе сервер верил бы просителю на слово
+    /// о том, кто он такой, а подделать имя дешевле, чем подделать власть.
+    ///
+    /// `&'static str`, как у [`Target::Root`]: строка минтится один раз на загрузку из конфига и
+    /// живёт столько же, сколько само право.
+    root: Option<&'static str>,
 }
 
 /// Слот таблицы прав. `generation` растёт при каждом освобождении → отзыв.
@@ -368,6 +379,27 @@ pub fn mint(dom: DomainId, target: Target, rights: Rights) -> Cap {
     mint_opt(dom, target, rights).unwrap_or_else(|| Cap::new(u32::MAX, 0))
 }
 
+/// Веха 229 — минт эндпоинта, СУЖЕННОГО путём: держатель не выйдет за `root`.
+///
+/// Отдельной функцией, а не параметром у [`mint`]: сужение бывает ровно у одного вида права, и
+/// добавлять `None` ко всем сорока вызовам ради одного случая значило бы сделать вид, что оно
+/// бывает у всех.
+pub fn mint_rooted(dom: DomainId, target: Target, rights: Rights, root: &'static str) -> Cap {
+    let mut cs = CSPACE.lock();
+    let d = &mut cs.domains[dom];
+    alloc_slot(d, Entry { target, rights, root: Some(root) }).unwrap_or_else(|| Cap::new(u32::MAX, 0))
+}
+
+/// Корень, которым сужено право, — `None` у обычных прав.
+pub fn root_of(dom: DomainId, cap: Cap) -> Option<&'static str> {
+    let cs = CSPACE.lock();
+    let s = cs.domains[dom].slots.get(cap.slot() as usize)?;
+    if s.generation != cap.generation() {
+        return None;
+    }
+    s.entry.as_ref()?.root
+}
+
 /// Тот же минт, но ЧЕСТНЫЙ: `None` — слоты кончились.
 ///
 /// Нужен там, где отказ надо передать процессу, а не отдать ему мёртвый дескриптор. Так
@@ -375,9 +407,10 @@ pub fn mint(dom: DomainId, target: Target, rights: Rights) -> Cap {
 /// область создана, — то есть отказ выглядел успехом. Области при этом заводились по-настоящему
 /// и никем не освобождались.
 pub fn mint_opt(dom: DomainId, target: Target, rights: Rights) -> Option<Cap> {
+    let root = None;
     let mut cs = CSPACE.lock();
     let d = &mut cs.domains[dom];
-    match alloc_slot(d, Entry { target, rights }) {
+    match alloc_slot(d, Entry { target, rights, root }) {
         Some(c) => Some(c),
         None => {
             if !d.warned_full {
@@ -680,7 +713,7 @@ pub fn grant(from: DomainId, cap: Cap, to: DomainId, mask: Rights) -> Result<Cap
         }
         (e.target.clone(), e.rights.intersect(mask))
     };
-    alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights }).ok_or(CapError::Exhausted)
+    alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights, root: None }).ok_or(CapError::Exhausted)
 }
 
 /// Наделить потомка (Веха 30): скопировать capability из домена `from` в домен `to` —
@@ -695,7 +728,7 @@ pub fn endow(from: DomainId, cap: Cap, to: DomainId) -> Result<Cap, CapError> {
         let e = resolve(&cs, from, cap)?;
         (e.target.clone(), e.rights)
     };
-    alloc_slot(&mut cs.domains[to], Entry { target, rights }).ok_or(CapError::Exhausted)
+    alloc_slot(&mut cs.domains[to], Entry { target, rights, root: None }).ok_or(CapError::Exhausted)
 }
 
 /// Отозвать capability: освободить слот и бумкнуть его поколение. Все ранее выданные
@@ -746,7 +779,7 @@ pub fn grant_slot(from: DomainId, slot: usize, to: DomainId) -> bool {
     if cs.domains.get(to).is_none() {
         return false;
     }
-    alloc_slot(&mut cs.domains[to], Entry { target, rights });
+    alloc_slot(&mut cs.domains[to], Entry { target, rights, root: None });
     true
 }
 
@@ -799,7 +832,7 @@ pub fn derive(dom: DomainId, cap: Cap, mask: Rights) -> Result<Cap, CapError> {
         let e = resolve(&cs, dom, cap)?;
         (e.target.clone(), e.rights.intersect(mask))
     };
-    alloc_slot(&mut cs.domains[dom], Entry { target, rights }).ok_or(CapError::Exhausted)
+    alloc_slot(&mut cs.domains[dom], Entry { target, rights, root: None }).ok_or(CapError::Exhausted)
 }
 
 /// Та же цель ли (по СОДЕРЖИМОМУ, не по слоту): нужна [`clamp_persisted`], чтобы сверять
@@ -1030,7 +1063,7 @@ pub fn load() -> usize {
                         Target::Root(str_at(&b, &mut off, l))
                     }
                 };
-                Some(Entry { target, rights })
+                Some(Entry { target, rights, root: None })
             };
             // Веха 152.3 — долговечное право прошлой загрузки: помечаем персистентным, пока
             // живой процесс не подтвердит его своим наделением ([`clamp_persisted`]). Пустой

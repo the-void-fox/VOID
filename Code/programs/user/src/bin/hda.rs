@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use void_user as sys;
+use void_user::posix as px;
 use void_user::snd_cli as snd;
 
 /// Куча нужна только печати (`format!`): числа этого драйвера человек читает часто.
@@ -674,6 +675,53 @@ impl Voice {
 /// должен быть самым громким, который она умеет.
 const VOL_DEFAULT: u8 = 70;
 
+/// Веха 229 ([[0022-app-state-directory]]) — ГДЕ ЖИВЁТ ГРОМКОСТЬ.
+///
+/// Путь КОРОТКИЙ, потому что он в своём мире: право на файлы у сервера сужено строкой конфига
+/// (`endpoint:posixfs:/etc/apps/hda`), и всё, что он называет, туда и приклеивается. Настоящее
+/// место — `/etc/apps/hda/volume`, но знать об этом серверу не надо и не положено: куда его
+/// пустили, решает конфиг, а не он сам.
+const VOL_FILE: &[u8] = b"/volume";
+
+/// Прочитать сохранённую громкость. `None` — своего каталога нет (право не сужено) либо файла
+/// ещё не было: оба случая значат «бери умолчание», и различать их незачем.
+fn load_volume() -> Option<u8> {
+    let ep = sys::cap_named("STATE")?;
+    let mut buf = [0u8; 8];
+    let fd = px::open(ep, VOL_FILE, 0);
+    if fd == usize::MAX {
+        return None;
+    }
+    let n = px::read(ep, fd, &mut buf);
+    px::close(ep, fd);
+    core::str::from_utf8(&buf[..n.min(buf.len())])
+        .ok()?
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .map(|v| v.min(100))
+}
+
+/// Записать громкость. Молчим, если писать некуда: отсутствие своего каталога — это не отказ
+/// системы, а решение конфига, и говорить о нём на каждый поворот ползунка нечего.
+fn save_volume(vol: u8) {
+    let Some(ep) = sys::cap_named("STATE") else { return };
+    let fd = px::open(ep, VOL_FILE, px::O_TRUNC);
+    if fd == usize::MAX {
+        return;
+    }
+    let mut buf = [0u8; 4];
+    let mut n = 0;
+    for d in [vol / 100 % 10, vol / 10 % 10, vol % 10] {
+        if n != 0 || d != 0 || vol < 10 {
+            buf[n] = b'0' + d;
+            n += 1;
+        }
+    }
+    px::write(ep, fd, &buf[..n.max(1)]);
+    px::close(ep, fd);
+}
+
 /// Заполнить ПОЛОВИНУ кольца СУММОЙ голосов. Возвращает `true`, если хоть одному голосу ещё
 /// есть что играть, — а не «были ли ненулевые отсчёты»: тишина перед тоном тоже работа, и
 /// гасить поток на ней значило бы гасить его ровно перед сигналом.
@@ -1035,7 +1083,8 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
     // Частота вывода ВСЕГДА 48 кГц: кодек умеет перестраиваться под дорожку, но ровно под одну,
     // а голосов теперь много. Чужие частоты пересчитывает `Ring::next_frame`.
     let mut voices: Vec<Voice> = Vec::new();
-    let mut master: u8 = VOL_DEFAULT;
+    // Веха 229 — громкость переживает перезагрузку, если есть куда её класть.
+    let mut master: u8 = load_volume().unwrap_or(VOL_DEFAULT);
     // Номер следующего голоса. Растёт всегда: номер, выданный повторно, означал бы, что
     // ползунок в меню однажды подвинет громкость не тому, кто под ним написан.
     let mut next_id: u16 = 1;
@@ -1191,6 +1240,7 @@ pub extern "C" fn _start(mmio_cap: usize, dma_cap: usize) -> ! {
                     let vol = req[2].min(100);
                     if id == 0 {
                         master = vol;
+                        save_volume(vol);
                         snd::ST_OK
                     } else if let Some(v) = voices.iter_mut().find(|v| v.id == id) {
                         v.vol = vol;

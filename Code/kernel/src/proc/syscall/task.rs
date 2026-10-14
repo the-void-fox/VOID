@@ -604,6 +604,40 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         // Понадобилось диспетчеру задач: чтобы отдать СВОЁ право, надо сперва перечислить свои
         // права, а перечень просится по номеру процесса (`SYS_PROC_CAPS`). Заодно он отмечает
         // себя в таблице — человеку полезно видеть, какая строка про смотрящего.
+        // SYS_PEER_ROOT(sender, buf, len) -> длина | MAX (Веха 229, [[0022-app-state-directory]]):
+        // ЧЕМ СУЖЕНО право, которым `sender` сделал вызов, который мы сейчас разбираем.
+        //
+        // Сервер файлов спрашивает это у ЯДРА, а не у просителя, и в этом вся суть сужения:
+        // программа не может назваться чужим корнем, потому что корень — свойство ВЛАСТИ, а не
+        // слово в запросе. Тот же порядок, что у раздачи `sysview` (Веха 155).
+        //
+        // Отдаём ТОЛЬКО тому, кого этот клиент прямо сейчас зовёт: иначе любой процесс мог бы
+        // подсматривать, куда ходят соседи, — мелочь, но ровно та, из которых складывается
+        // «право видно всем».
+        72 => {
+            let (sender, buf, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let мой = sender < t.procs.len()
+                && t.procs[sender].state == State::ReplyWait
+                && t.procs[sender].call_dest == cur;
+            let result = match (мой, t.procs.get(sender).and_then(|p| p.call_root)) {
+                (true, Some(root)) if len != 0 && ensure_heap_range(t, cur, buf, len) => {
+                    let b = root.as_bytes();
+                    let n = b.len().min(len);
+                    // SAFETY: диапазон проверен выше — он же дотянул ленивые страницы кучи.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
+                    dst.copy_from_slice(&b[..n]);
+                    n
+                }
+                (true, None) => 0, // право не сужено — ходить можно везде
+                _ => usize::MAX,
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         70 => {
             let f = &mut t.procs[cur].frame;
             f.set_ret(cur);

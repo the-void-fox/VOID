@@ -477,8 +477,86 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
         fs::mt_find(t, n, name).unwrap_or(0)
     };
 
+/// Веха 229 ([[0022-app-state-directory]]) — путь из запроса В НАСТОЯЩИЙ путь.
+///
+/// Пустой `root` — право не сужено, и это ровно прежнее поведение. Иначе клиент живёт в мире,
+/// у которого корнем служит `root`: его `/marks` — это наш `/etc/apps/fm/marks`, и назвать
+/// что-либо вне своего корня он не может, потому что ВСЁ, что он называет, туда и приклеивается.
+///
+/// Про `..`: в этом сервере путь — КЛЮЧ объекта в store («каталоги = имена корней»), а не
+/// дорожка, по которой кто-то идёт. Поэтому `..` не поднимает на уровень выше, а просто входит
+/// в имя, которого ни у кого нет. Выйти им из своего корня нельзя — но на всякий случай это
+/// сказано здесь, а не подразумевается.
+fn norm(req: &[u8], root: &[u8], out: &mut [u8; fs::PATH_MAX]) -> usize {
+    let n = fs::normalize(req, out);
+    if root.is_empty() {
+        return n;
+    }
+    let mut tmp = [0u8; fs::PATH_MAX];
+    let mut k = 0usize;
+    for &b in root.iter().take(fs::PATH_MAX) {
+        tmp[k] = b;
+        k += 1;
+    }
+    // `/` у клиента — это сам корень, без лишней косой черты на хвосте.
+    if !(n == 1 && out[0] == b'/') {
+        for &b in out[..n].iter() {
+            if k < fs::PATH_MAX {
+                tmp[k] = b;
+                k += 1;
+            }
+        }
+    }
+    out[..k].copy_from_slice(&tmp[..k]);
+    k
+}
+
+    // Веха 229 — последний корень, под который уже созданы каталоги (см. ниже).
+    let mut ensured = [0u8; 128];
+    let mut ensured_len = 0usize;
     loop {
         let m = sys::recv(&mut req);
+        // Веха 229 — чем сужено право звонящего. Спрашиваем ЯДРО на каждом запросе: право у
+        // клиента может быть не одно, и какое из них он пустил в дело — знает только ядро.
+        let mut rootb = [0u8; 128];
+        let rootn = sys::peer_root(m.sender, &mut rootb).unwrap_or(0);
+        let root = &rootb[..rootn];
+        // Веха 229 — КАТАЛОГ ПОД СУЖЕНИЕ СОЗДАЁМ САМИ, и это не удобство, а следствие.
+        //
+        // Держатель сужённого права физически не может создать свой корень: всё, что он
+        // называет, уже внутри корня, то есть сам корень для него недостижим. Значит сделать
+        // это может только тот, кто корень знает, — сервер. Правило простое: есть право —
+        // есть каталог.
+        //
+        // Раз на корень за загрузку: помним последний, а их у нас по одному на программу.
+        if rootn != 0 && root != &ensured[..ensured_len] {
+            // `mkdir -p` по компонентам: `/etc`, `/etc/apps`, `/etc/apps/hda`. Логика та же,
+            // что у `OP_MKDIR` ниже; существующий каталог просто пропускается.
+            let mut at = 0usize;
+            while at < rootn {
+                at += 1;
+                while at < rootn && root[at] != b'/' {
+                    at += 1;
+                }
+                let p = &root[..at];
+                if read_index(store_cap, p, &mut dir, &mut idb).is_some() {
+                    continue;
+                }
+                let par = fs::parent(p);
+                if par != b"/" && read_index(store_cap, par, &mut dir, &mut idb).is_none() {
+                    break; // родителя нет — дальше идти незачем
+                }
+                dir[0] = 0;
+                dir[1] = 0;
+                write_index(store_cap, p, &dir[..2], &mut idb);
+                let plen = read_index(store_cap, par, &mut dir, &mut idb).unwrap_or(2);
+                let nlen = fs::idx_add(&mut dir, plen, fs::leaf(p), true);
+                write_index(store_cap, par, &dir[..nlen], &mut idb);
+                touch(store_cap, par, fs::leaf(p), sys::time_ns(), &mut tim, &mut idb);
+            }
+            ensured[..rootn].copy_from_slice(root);
+            ensured_len = rootn;
+        }
         let opcode = m.op & 0xff;
         let fd = (m.op >> 8) & 0xff;
         let mode = (m.op >> 16) & 0xff;
@@ -488,7 +566,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
         match opcode {
             OP_MKDIR => {
                 // Создать каталог: пустой индекс `d<path>` + запись в родителе. rep[0]: 0 ок / 1 ошибка.
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
                 // Пакет неизменяем (Веха 108.2). Веха 187 — но лишь ГОТОВЫЙ: собираемый путь
@@ -519,7 +597,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             }
             OP_OPEN => {
                 // req — путь; открыть/создать файл, вернуть [fd] (0xff — ошибка).
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let path = &pbuf[..pl];
                 // Файл ПАКЕТА (Веха 108.2): в слот кладётся узел дерева, а не содержимое —
                 // копировать libc.so.6 в буфер на 128 КиБ и незачем, и некуда.
@@ -723,7 +801,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 // исполняемый бит; хвостовые восемь (Веха 177) — наносекунды Unix последнего
                 // изменения, 0 — неизвестно. Старые клиенты читают первые шесть-семь байт и
                 // ничего не замечают: ответ растёт с конца.
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let path = &pbuf[..pl];
                 let mut sz = usize::MAX;
                 let mut is_dir = false;
@@ -806,7 +884,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 //
                 // Каталогом, а не файлом: список рисуют целиком, и `stat` на каждое имя — это
                 // круговой рейс на запись. У каталога в сотню имён их стало бы сто вместо одного.
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let n = read_times(store_cap, &pbuf[..pl], &mut tim, &mut idb);
                 reply_len = n.min(rep.len());
                 rep[..reply_len].copy_from_slice(&tim[..reply_len]);
@@ -819,7 +897,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 // режимом, а не отдельной операцией: спрашивают то же самое («убери вот это»),
                 // разница только в согласии человека на потерю содержимого. И спрашивать его
                 // обязан тот, кто разговаривает с человеком, — файловый менеджер или шелл.
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let path = &pbuf[..pl];
                 rep[0] = 1;
                 if ready_object(store_cap, path, &mut idb) {
@@ -942,8 +1020,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 if ol != usize::MAX && 1 + ol < len {
                     let mut oldp = [0u8; PATH_MAX];
                     let mut newp = [0u8; PATH_MAX];
-                    let onl = fs::normalize(&req[1..1 + ol], &mut oldp);
-                    let mut nnl = fs::normalize(&req[1 + ol..len], &mut newp);
+                    let onl = norm(&req[1..1 + ol], root, &mut oldp);
+                    let mut nnl = norm(&req[1 + ol..len], root, &mut newp);
                     if ready_object(store_cap, &oldp[..onl], &mut idb)
                         || ready_object(store_cap, &newp[..nnl], &mut idb)
                     {
@@ -1115,8 +1193,8 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
                 if ol != usize::MAX && 1 + ol < len {
                     let mut oldp = [0u8; PATH_MAX];
                     let mut newp = [0u8; PATH_MAX];
-                    let onl = fs::normalize(&req[1..1 + ol], &mut oldp);
-                    let mut nnl = fs::normalize(&req[1 + ol..len], &mut newp);
+                    let onl = norm(&req[1..1 + ol], root, &mut oldp);
+                    let mut nnl = norm(&req[1 + ol..len], root, &mut newp);
                     // Из дерева пакета копировать нечего: там узлы чужого формата, а не корни
                     // `f<путь>`. Такой файл копируется содержимым, и это дело вызывающего.
                     if ready_object(store_cap, &oldp[..onl], &mut idb)
@@ -1215,7 +1293,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             OP_READLINK => {
                 // req — путь. Ответ: цель ссылки (пусто — не ссылка либо нет такой).
                 // Симлинки есть только в дереве пакета: своих в персоналии по-прежнему нет.
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let path = &pbuf[..pl];
                 if let Some(rel) = under_mount(path) {
                     if let Some(node) = tree_find(store_cap, rel, ibuf, kids) {
@@ -1228,7 +1306,7 @@ pub extern "C" fn _start(store_cap: usize, _a1: usize) -> ! {
             OP_READDIR => {
                 // req — путь каталога (пусто/`.`/`/` → корень). Ответ: имена через '\n',
                 // у каталогов — с хвостовым '/'.
-                let pl = fs::normalize(&req[..len], &mut pbuf);
+                let pl = norm(&req[..len], root, &mut pbuf);
                 let path = &pbuf[..pl];
                 // Дерево пакетов (Веха 108.2). Сам `/nix/store` — не индекс, а СПИСОК КОРНЕЙ
                 // `pkg/tree/*`: пакет виден ровно тогда, когда он в сторе, и отдельного каталога

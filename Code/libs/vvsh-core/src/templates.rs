@@ -25,6 +25,11 @@ pub const NET_VV: &str = "# net.vv — сеть: true (вкл) или false (в�
 
 pub const SERVICES_VV: &str = "# services.vv — базовые сервисы\n\
 #\n\
+# Веха 229 — у `hda` есть ещё и СВОЙ КАТАЛОГ: `endpoint:posixfs:/etc/apps/hda` это право\n\
+# на файлы, СУЖЕННОЕ путём. Сервер звука хранит там громкость и не видит ничего, кроме\n\
+# своего: всё, что он назовёт, приклеится к этому корню. Так же получит своё место любая\n\
+# программа, которой есть что помнить между запусками ([[0022-app-state-directory]]).\n\
+#\n\
 # posixfs — файлы (личность Linux в store). hda — ЗВУК: драйвер Intel HDA под правом на окно\n\
 # регистров и DMA. Машина без звуковой карты просто не поднимет его, и строка при этом остаётся\n\
 # верной: сервер живёт и честно отвечает «звука в этой машине нет».\n\
@@ -46,7 +51,7 @@ pub const SERVICES_VV: &str = "# services.vv — базовые сервисы\n
 # Без `arg:ssid` карта только осматривает эфир и печатает список сетей.\n\
 [\n\
 \x20 service(\"posixfs\", \"store:rw\"),\n\
-\x20 service(\"hda\", \"mmio:hda\", \"dma\"),\n\
+\x20 service(\"hda\", \"mmio:hda\", \"dma\", \"endpoint:posixfs:/etc/apps/hda\"),\n\
 \x20 service(\"wifi\", \"mmio:wifi\", \"dma\", \"store:r\", \"netdev\"),\n\
 ]\n";
 

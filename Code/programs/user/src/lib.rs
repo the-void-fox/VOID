@@ -122,6 +122,7 @@ const SYS_OBJ_PUT_NODE: usize = 38;
 const SYS_OBJ_CHILDREN: usize = 39;
 const SYS_VIDEO_INFO: usize = 40;
 const SYS_VIDEO_FLUSH: usize = 71;
+const SYS_PEER_ROOT: usize = 72;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1093,6 +1094,21 @@ pub fn set_env(blob: &[u8]) -> bool {
 /// capability-модель. Поэтому шелл СООБЩАЕТ его детям, а путь собирает [`posix::resolve`].
 pub fn cwd(out: &mut [u8]) -> usize {
     argv::env_raw(b"CWD", out).unwrap_or(0)
+}
+
+/// Веха 229 ([[0022-app-state-directory]]) — **ЧЕМ СУЖЕНО ПРАВО ЗВОНЯЩЕГО**: корень, за который
+/// ему не выйти. Спрашивает СЕРВЕР, пока разбирает запрос; `sender` — номер из `SYS_RECV`.
+///
+/// `None` — вопрос не наш: либо этот процесс нас сейчас не зовёт, либо номер не тот. Пустой
+/// ответ (`Some(0)`) значит «право НЕ сужено» — ходить можно везде, как и раньше.
+///
+/// Спрашивают у ЯДРА, а не у просителя, и в этом вся суть: корень — свойство власти, а не слово
+/// в запросе, и назваться чужим корнем нельзя.
+pub fn peer_root(sender: usize, buf: &mut [u8]) -> Option<usize> {
+    let n = abi::syscall(
+        SYS_PEER_ROOT, sender, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0,
+    ).0;
+    (n != usize::MAX).then_some(n)
 }
 
 /// `SYS_STARTCAP(i)`: i-й стартовый capability процесса (преоткрытые права — как preopen'ы

@@ -380,6 +380,14 @@ pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
             return Err("`endpoint:` без имени сервера");
         }
         return match права {
+            // Веха 229 ([[0022-app-state-directory]]) — третья часть может быть ПУТЁМ, а не
+            // буквами прав: `endpoint:posixfs:/etc/apps/hda` — право на файлы, сужённое этим
+            // корнем. Спутать нельзя: в правах косой черты не бывает, в абсолютном пути она
+            // первая по определению.
+            Some(r) if r.starts_with('/') => match r.len() > 1 && !r.ends_with('/') {
+                true => Ok(()),
+                false => Err("корень сужения должен быть путём вида `/что-то` без косой на конце"),
+            },
             Some(r) => check_rights(r),
             None => Ok(()),
         };

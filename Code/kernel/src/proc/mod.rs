@@ -218,6 +218,16 @@ struct Proc {
     /// `usize::MAX` — нет). Проверяется (`GRANT`) при отправке, копируется в домен получателя
     /// при доставке — как `send_buf`, только для прав.
     send_cap: usize,
+    /// Веха 229 — ЧЕМ СУЖЕНО право, которым этот процесс сделал текущий вызов (`None` — ничем).
+    ///
+    /// Живёт у КЛИЕНТА, а не у сервера, и это не мелочь: клиент на время вызова заблокирован,
+    /// поэтому значение гарантированно принадлежит тому самому запросу, который сервер сейчас
+    /// разбирает. Сервер читает его через `SYS_PEER_ROOT`, и ядро отдаёт корень только тому,
+    /// кого этот клиент в данный момент зовёт.
+    pub(crate) call_root: Option<&'static str>,
+    /// Веха 229 — КОГО зовёт этот процесс сейчас (`usize::MAX` — никого). Нужно вместе с
+    /// [`Proc::call_root`]: корень отдаётся только тому, кого клиент в этот момент и зовёт.
+    pub(crate) call_dest: usize,
     /// Веха 91 — процесс спит в `SYS_RECV` и просил будить его ещё и ПРИХОДОМ КАДРА
     /// (режим 3): так сетевой сервер просыпается от карты, а не от таймера.
     wake_on_net: bool,
@@ -706,6 +716,8 @@ fn create_process_locked(
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        call_root: None,
+        call_dest: usize::MAX,
         wake_on_net: false,
         wake_on_key: false,
         reads_console: false,
@@ -774,6 +786,8 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         send_buf: 0,
         send_len: 0,
         send_cap: usize::MAX,
+        call_root: None,
+        call_dest: usize::MAX,
         wake_on_net: false,
         wake_on_key: false,
         reads_console: false,
