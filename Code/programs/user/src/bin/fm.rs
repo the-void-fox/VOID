@@ -963,24 +963,43 @@ impl App {
         }
     }
 
-    /// Веха 167 — закладки ЖИВУТ ФАЙЛОМ (`/etc/fm.marks`, по пути на строку).
+    /// Веха 167 — закладки ЖИВУТ ФАЙЛОМ (по пути на строку).
     ///
     /// Не в конфиге поколения, хотя соблазн был: закладка — не свойство системы, а привычка
     /// человека, и требовать ради неё `rebuild` со сменой поколения значило бы приравнять
     /// «добавил папку в боковую колонку» к «переставил службу». Файлом же её видно и правит
     /// любой редактор.
-    const MARKS_FILE: &'static str = "/etc/fm.marks";
+    ///
+    /// Веха 229.2 — файл переехал в СВОЁ МЕСТО программы (`/etc/apps/fm/marks`, см.
+    /// [`sys::state`]). Имя внутри места короткое: каталог и так зовётся именем программы, и
+    /// писать в нём второй раз `fm` значит повторяться.
+    const MARKS_FILE: &'static [u8] = b"/marks";
+
+    /// Где закладки лежали до Вехи 229.2. Читаем, если в новом месте ничего нет, и сразу
+    /// переносим: человек не должен узнавать о переезде по пропавшей боковой колонке.
+    const MARKS_WAS: &'static str = "/etc/fm.marks";
 
     /// Прочитать закладки; строки, которых на диске уже нет, отбрасываются молча.
     fn load_marks(&mut self) {
         let mut out: Vec<(String, String)> = Vec::new();
-        if let Some(text) = ui::font::read_path(Self::MARKS_FILE) {
+        let mut buf = alloc::vec![0u8; 4096];
+        let мой = sys::state::load(Self::MARKS_FILE, &mut buf).map(|n| buf[..n].to_vec());
+        let переезд = мой.is_none();
+        let text = мой.or_else(|| ui::font::read_path(Self::MARKS_WAS));
+        if let Some(text) = text {
             for line in String::from_utf8_lossy(&text).lines() {
                 let p = line.trim();
                 if p.starts_with('/') && px::stat(self.ep, p.as_bytes()).is_some_and(|(d, _)| d) {
                     out.push((String::from(p), Self::leaf_name(p)));
                 }
             }
+        }
+        if !out.is_empty() && переезд {
+            // Прочитали со старого места — переписываем на новое. Старый файл убираем своим
+            // широким правом: держать две копии значит ждать, когда они разойдутся.
+            self.marks = out.clone();
+            self.save_marks();
+            px::unlink(self.ep, Self::MARKS_WAS.as_bytes());
         }
         if out.is_empty() {
             // Пусто (или файла нет) — умолчание из мест, которые в системе есть всегда.
@@ -1002,13 +1021,11 @@ impl App {
             text.push_str(p);
             text.push('\n');
         }
-        let fd = px::open(self.ep, Self::MARKS_FILE.as_bytes(), px::O_TRUNC);
-        if fd == usize::MAX {
+        // Своё место даёт тот, кто запустил; нет его — говорим человеку прямо, а не теряем
+        // закладки молча (правило строгости: ошибка должна называть себя).
+        if !sys::state::save(Self::MARKS_FILE, text.as_bytes()) {
             self.flash = Some(String::from(ui::t("закладки не записать")));
-            return;
         }
-        px::write(self.ep, fd, text.as_bytes());
-        px::close(self.ep, fd);
     }
 
     /// Имя последнего звена пути (для подписи закладки). У корня имени нет — так и назовём.

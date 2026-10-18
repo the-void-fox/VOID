@@ -123,6 +123,7 @@ const SYS_OBJ_CHILDREN: usize = 39;
 const SYS_VIDEO_INFO: usize = 40;
 const SYS_VIDEO_FLUSH: usize = 71;
 const SYS_PEER_ROOT: usize = 72;
+const SYS_CAP_NARROW: usize = 73;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1109,6 +1110,20 @@ pub fn peer_root(sender: usize, buf: &mut [u8]) -> Option<usize> {
         SYS_PEER_ROOT, sender, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0,
     ).0;
     (n != usize::MAX).then_some(n)
+}
+
+/// Веха 229.2 — **СУЗИТЬ СВОЁ ПРАВО НА ФАЙЛЫ ПУТЁМ**: копия `cap`, за корень которой не выйти.
+///
+/// `None` — сузить не вышло: право не на файловый сервер, путь негоден либо он ведёт НАРУЖУ
+/// уже имеющегося корня (сужение расширением быть не может).
+///
+/// Так власть раздаётся сверху вниз: держатель широкого права отдаёт обрезок тому, кого
+/// запускает, — и не может отдать больше, чем имеет сам.
+pub fn cap_narrow(cap: usize, path: &[u8]) -> Option<usize> {
+    let r = abi::syscall(
+        SYS_CAP_NARROW, cap, path.as_ptr() as usize, path.len(), 0, 0, 0, 0,
+    ).0;
+    (r != NO_CAP).then_some(r)
 }
 
 /// `SYS_STARTCAP(i)`: i-й стартовый capability процесса (преоткрытые права — как preopen'ы
@@ -2144,5 +2159,52 @@ pub mod posix {
         let n = write(ep, fd, msg);
         close(ep, fd);
         n == msg.len()
+    }
+}
+
+/// Веха 229.2 ([[0022-app-state-directory]]) — **СВОЁ МЕСТО**: два вызова, чтобы программа
+/// помнила себя между запусками.
+///
+/// Каталог у программы один и ищется сам (см. [`win::state_cap`]); здесь — только имя файла
+/// внутри него. Сохранить закладки, последний открытый путь, историю команд — всё, что до сих
+/// пор терялось с закрытием окна, потому что складывать было некуда.
+///
+/// Обе функции МОЛЧА ничего не делают, если места нет. Это рабочее состояние, а не поломка:
+/// программу могли запустить без композитора и без строки конфига, и тогда она просто не помнит
+/// — ровно как раньше. Говорить человеку «не удалось сохранить» на каждое движение ползунка
+/// значило бы ругать его за нашу же необязательную услужливость.
+pub mod state {
+    use super::{posix as px, win, NO_CAP};
+
+    /// Прочитать свой файл целиком. `None` — места нет, файла нет или он пуст.
+    ///
+    /// Пустой файл равен отсутствию нарочно: персоналия создаёт файл при открытии даже на чтение
+    /// (см. known-gaps), поэтому «открылось» ещё не значит «что-то было».
+    pub fn load(name: &[u8], buf: &mut [u8]) -> Option<usize> {
+        let ep = cap()?;
+        let fd = px::open(ep, name, 0);
+        if fd == usize::MAX {
+            return None;
+        }
+        let n = px::read(ep, fd, buf);
+        px::close(ep, fd);
+        (n != 0).then_some(n)
+    }
+
+    /// Записать свой файл целиком, затерев прежнее. `false` — места нет или записалось не всё.
+    pub fn save(name: &[u8], bytes: &[u8]) -> bool {
+        let Some(ep) = cap() else { return false };
+        px::echo_to(ep, name, bytes)
+    }
+
+    /// Убрать свой файл. Нужна, чтобы «забыть» было так же дёшево, как запомнить.
+    pub fn forget(name: &[u8]) -> bool {
+        let Some(ep) = cap() else { return false };
+        px::unlink(ep, name) != usize::MAX
+    }
+
+    fn cap() -> Option<usize> {
+        let c = win::state_cap();
+        (c != NO_CAP).then_some(c)
     }
 }

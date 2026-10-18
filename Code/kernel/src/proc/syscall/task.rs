@@ -604,6 +604,38 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         // Понадобилось диспетчеру задач: чтобы отдать СВОЁ право, надо сперва перечислить свои
         // права, а перечень просится по номеру процесса (`SYS_PROC_CAPS`). Заодно он отмечает
         // себя в таблице — человеку полезно видеть, какая строка про смотрящего.
+        // SYS_CAP_NARROW(cap, path, len) -> новое право | MAX (Веха 229.2):
+        // копия своего права на файлы, СУЖЕННАЯ путём.
+        //
+        // Власть здесь не выдаётся сверху, а сужается тем, у кого она есть: композитор, запуская
+        // программу, отдаёт ей не своё право на файлы, а обрезок — `/etc/apps/<имя программы>`.
+        // Сузить можно только ВНУТРЬ уже имеющегося корня; наружу — отказ.
+        73 => {
+            let (cap, ptr, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let result = if len == 0 || len > 128 || !ensure_heap_range(t, cur, ptr, len) {
+                usize::MAX
+            } else {
+                // SAFETY: диапазон проверен выше — он же дотянул ленивые страницы кучи.
+                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                match core::str::from_utf8(bytes) {
+                    Ok(path) => match cap::narrow(dom, Cap::from_bits(cap as u64), path) {
+                        Ok(c) => c.bits() as usize,
+                        Err(e) => {
+                            vprintln!("  [cap] P{} сужение до '{}' отклонено: {:?}", cur, path, e);
+                            usize::MAX
+                        }
+                    },
+                    Err(_) => usize::MAX,
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_PEER_ROOT(sender, buf, len) -> длина | MAX (Веха 229, [[0022-app-state-directory]]):
         // ЧЕМ СУЖЕНО право, которым `sender` сделал вызов, который мы сейчас разбираем.
         //

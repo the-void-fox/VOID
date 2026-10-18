@@ -1026,6 +1026,7 @@ fn cmd_repl() -> ! {
     let env = shell_env(); // ПЕРСИСТЕНТНОЕ окружение сессии (чистые builtins + команды-эффекты)
     let mut line = [0u8; LINE_CAP];
     let mut hist = History::new();
+    hist.load();
     loop {
         let mut pbuf = [0u8; 320];
         let plen = build_prompt(&mut pbuf);
@@ -1041,6 +1042,7 @@ fn cmd_repl() -> ! {
             continue;
         }
         hist.push(src);
+        hist.save();
         if src == b"exit" || src == b"quit" {
             break;
         }
@@ -3337,6 +3339,9 @@ const HISTN: usize = 8;
 /// = 8 КиБ на стеке при 256 КиБ у процесса — запас есть.
 const LINE_CAP: usize = 1024;
 
+/// Имя файла истории в своём месте программы (`/etc/apps/vvsh/history`).
+const HIST_FILE: &[u8] = b"/history";
+
 struct History {
     buf: [[u8; LINE_CAP]; HISTN],
     len: [usize; HISTN],
@@ -3366,6 +3371,41 @@ impl History {
             self.count += 1;
         }
     }
+    /// Веха 229.2 — история ПЕРЕЖИВАЕТ окно: своё место программы, файл `history`.
+    ///
+    /// Раньше она жила на стеке и умирала с закрытием терминала, а набирают в шелле одно и то же:
+    /// `rebuild`, `switch`, тот же `echo … > файл` с длинным путём. Ради этого ↑ и заводили.
+    ///
+    /// Места может не быть (шелл запущен не из окна) — тогда история прежняя, на один сеанс.
+    fn load(&mut self) {
+        let mut buf = [0u8; HISTN * 128];
+        let Some(n) = sys::state::load(HIST_FILE, &mut buf) else { return };
+        for line in buf[..n].split(|b| *b == b'\n') {
+            self.push(trim(line));
+        }
+    }
+
+    /// Записать историю: старые строки первыми, чтобы прочитаться в том же порядке.
+    ///
+    /// Длинные строки НЕ сохраняем: файл конфига, вписанный одной командой, — это килобайт на
+    /// запись, и восемь таких превратили бы историю в хранилище текстов. ↑ за ним всё равно не
+    /// гоняют: такую строку правят в редакторе, а не вспоминают.
+    fn save(&self) {
+        let mut out = [0u8; HISTN * 128];
+        let mut n = 0;
+        for back in (1..=self.count).rev() {
+            let Some(l) = self.get(back) else { continue };
+            if l.len() > 120 || n + l.len() + 1 > out.len() {
+                continue;
+            }
+            out[n..n + l.len()].copy_from_slice(l);
+            n += l.len();
+            out[n] = b'\n';
+            n += 1;
+        }
+        sys::state::save(HIST_FILE, &out[..n]);
+    }
+
     fn get(&self, back: usize) -> Option<&[u8]> {
         if back == 0 || back > self.count {
             return None;

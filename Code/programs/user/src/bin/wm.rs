@@ -854,6 +854,47 @@ fn grant_policy(text: &str) -> Vec<(u8, String)> {
     out
 }
 
+/// Веха 229.2 ([[0022-app-state-directory]]) — **ПЕРЕНАЗНАЧЕНИЕ МЕСТА**: строки
+/// `desktop state <имя> <путь>`.
+///
+/// По умолчанию каталог состояния зовётся именем программы (`/etc/apps/fm`) и человека не
+/// касается вовсе — ровно так и должно быть. Но место — его дело: захочется держать закладки
+/// файлового менеджера рядом с остальным своим, а не в `/etc/apps`, — пусть держит. Это путь 3
+/// из ADR 0022: «всё работает само, но если хотите переназначить — милости просим».
+///
+/// Путь должен быть АБСОЛЮТНЫМ и без `..`: сузить право можно только внутрь, и строка вида
+/// `../..` просто не прошла бы проверку ядра. Отказываем здесь, чтобы сказать человеку, что не
+/// так, вместо молчаливого «право не выдалось».
+fn state_policy(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for e in void_conf::of(text, "desktop") {
+        if e.key() != "state" {
+            continue;
+        }
+        let tail = e.tail().trim();
+        let (who, path) = match tail.split_once(' ') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => {
+                sys::write_console(
+                    alloc::format!("[wm] state «{tail}»: нужны ИМЯ и ПУТЬ\n").as_bytes(),
+                );
+                continue;
+            }
+        };
+        if who.is_empty() || !path.starts_with('/') || path.contains("..") {
+            sys::write_console(
+                alloc::format!(
+                    "[wm] state {who} «{path}»: путь должен начинаться с / и не содержать ..\n"
+                )
+                .as_bytes(),
+            );
+            continue;
+        }
+        out.push((String::from(who), String::from(path.trim_end_matches('/'))));
+    }
+    out
+}
+
 /// Веха 140 — просит ли конфиг поколения ПАНЕЛЬ: строка `desktop bar on`.
 ///
 /// Выключателем, а не высотой: высота панели следует за шрифтом (8×16 плюс поля), и вынести её в
@@ -1098,6 +1139,7 @@ fn main_loop() -> ! {
         // уведомления просто беззвучны, и это рабочее состояние, а не поломка.
         sndcap: sys::snd_cli::find_cap().unwrap_or(sys::NO_CAP),
         grants: grant_policy(&generation),
+        app_state: state_policy(&generation),
         liveness_at: 0,
         kmods: 0,
         notes: Vec::new(),
@@ -1971,6 +2013,9 @@ struct Wm {
     sndcap: usize,
     /// Веха 155/157 — что кому отдавать: `(вид права, имя программы)` из `desktop`-строк.
     grants: Vec<(u8, String)>,
+    /// Веха 229.2 — куда кому класть состояние: `(имя программы, путь)` из строк
+    /// `desktop state`. Пусто — каждому своё `/etc/apps/<имя>`, и это нормальный случай.
+    app_state: Vec<(String, String)>,
     /// Веха 166.1 — когда последний раз сверяли живость ЧУЖИХ хозяев окон по списку процессов.
     liveness_at: u64,
     /// Веха 168 — накопленные УВЕДОМЛЕНИЯ, свежие первыми, и номер для следующего.
@@ -5778,6 +5823,52 @@ impl Wm {
         sys::NO_CAP
     }
 
+    /// Веха 229.2 — право на файлы для состояния программы `pid`. `NO_CAP` — не вышло.
+    ///
+    /// Путь по умолчанию — `/etc/apps/<имя>`; конфиг может назначить другой строкой
+    /// `desktop state <имя> <путь>` (путь 3 из ADR 0022: «всё работает само, но если хотите
+    /// переназначить — милости просим»).
+    fn state_for(&self, pid: usize) -> usize {
+        let Some(files) = sys::cap_named("POSIXFS") else { return sys::NO_CAP };
+        // Имя спрашиваем у ЯДРА — для этого нужен обзор процессов.
+        if self.sysview == sys::NO_CAP {
+            return sys::NO_CAP;
+        }
+        let rec = sys::PROC_REC;
+        let Some(buf) = proc_snapshot(self.sysview) else { return sys::NO_CAP };
+        for k in 0..buf.len() / rec {
+            let r = &buf[k * rec..k * rec + rec];
+            if u16::from_le_bytes([r[0], r[1]]) as usize != pid {
+                continue;
+            }
+            let nlen = (r[7] as usize).min(24);
+            let name = core::str::from_utf8(&r[40..40 + nlen]).unwrap_or("");
+            // Имя программы в store бывает с путём (`bin/vvsh`) — берём последнее звено:
+            // каталог состояния зовётся именем программы, а не её местом в store.
+            let leaf = name.rsplit('/').next().unwrap_or(name);
+            if leaf.is_empty() || leaf.contains("..") {
+                return sys::NO_CAP;
+            }
+            let path = match self.app_state.iter().find(|(n, _)| n == leaf) {
+                Some((_, p)) => p.clone(),
+                None => alloc::format!("/etc/apps/{leaf}"),
+            };
+            let cap = sys::cap_narrow(files, path.as_bytes()).unwrap_or(sys::NO_CAP);
+            sys::write_console(
+                alloc::format!(
+                    "[wm] место P{} «{}» → {}{}\n",
+                    pid,
+                    leaf,
+                    path,
+                    if cap == sys::NO_CAP { " — СУЗИТЬ НЕ ВЫШЛО" } else { "" },
+                )
+                .as_bytes(),
+            );
+            return cap;
+        }
+        sys::NO_CAP
+    }
+
     fn request(&mut self, m: &sys::Message, buf: &[u8]) {
         let op = m.op & 0xff;
         let len = m.len.min(buf.len());
@@ -6520,6 +6611,32 @@ impl Wm {
                     }
                 }
                 sys::reply(m.reply_cap, &[self.dnd as u8]);
+            }
+            // Веха 229.2 — ВЫДАТЬ ПРОГРАММЕ ЕЁ МЕСТО: своё право на файлы, сужённое до
+            // `/etc/apps/<имя программы>`.
+            //
+            // Власть не выдаётся сверху — она СУЖАЕТСЯ тем, у кого есть. Композитор отдаёт не
+            // своё право на файлы, а его обрезок, и отдать больше, чем имеет сам, не может по
+            // устройству вызова (`cap_narrow` сужает только внутрь).
+            //
+            // Имя просителя — У ЯДРА, как и в `OP_GRANT`: назваться чужим именем значило бы
+            // забрать чужое состояние, а имя процесса равно имени программы в store.
+            win::OP_STATE => {
+                let cap = self.state_for(m.sender);
+                // Эндпоинту нужна одна буква — отправка. Раздавать дальше (`GRANT`) не даём:
+                // своё место на то и своё.
+                //
+                // Отказ ядра в ПЕРЕДАЧЕ права — не повод оставить просителя висеть: ответ без
+                // права он разберёт («места нет») и пойдёт работать без памяти, а молчание
+                // держало бы его в ожидании вечно. Первый прогон вехи именно так и завис.
+                if cap == sys::NO_CAP
+                    || sys::reply_granting(m.reply_cap, &[], cap, 0x08) == usize::MAX
+                {
+                    if cap != sys::NO_CAP {
+                        sys::write_console("[wm] место: ядро не дало передать право\n".as_bytes());
+                    }
+                    sys::reply(m.reply_cap, &[]);
+                }
             }
             win::OP_GRANT => {
                 let kind = body!(m, win::wire::Rd::new(req).u8());

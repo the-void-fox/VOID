@@ -379,6 +379,84 @@ pub fn mint(dom: DomainId, target: Target, rights: Rights) -> Cap {
     mint_opt(dom, target, rights).unwrap_or_else(|| Cap::new(u32::MAX, 0))
 }
 
+/// Веха 229.2 — СТОЛ КОРНЕЙ: строки сужения живут здесь и ровно по одному экземпляру.
+///
+/// Корень обязан быть `&'static str` (он переживает всё, кроме перезагрузки), а приходит он из
+/// памяти программы. Класть каждый запрос в кучу навсегда нельзя: программа, зовущая сужение в
+/// цикле, съела бы память ядра — медленно и молча, то есть худшим из возможных способов.
+///
+/// Поэтому строки ИНТЕРНИРУЮТСЯ: одинаковые дают один экземпляр, а всего их не больше
+/// [`MAX_ROOTS`]. Потолок — не экономия, а граница: корней в системе столько, сколько программ,
+/// и число это измеряется десятками.
+const MAX_ROOTS: usize = 64;
+static ROOTS: SpinLock<Vec<&'static str>> = SpinLock::new(Vec::new());
+
+/// Взять постоянную копию строки. `None` — стол полон (и это отказ, а не молчаливое «ладно»).
+fn intern_root(path: &str) -> Option<&'static str> {
+    let mut t = ROOTS.lock();
+    if let Some(found) = t.iter().find(|r| **r == path) {
+        return Some(found);
+    }
+    if t.len() >= MAX_ROOTS {
+        crate::println!("  [cap] стол корней полон ({}) — сужение отклонено", MAX_ROOTS);
+        return None;
+    }
+    let s: &'static str = alloc::boxed::Box::leak(String::from(path).into_boxed_str());
+    t.push(s);
+    Some(s)
+}
+
+/// Веха 229.2 — **СУЗИТЬ СВОЁ ПРАВО ПУТ�ём**: получить копию `cap`, за корень которой не выйти.
+///
+/// Это и есть capability-дисциплина в чистом виде: власть не выдаётся сверху, а **сужается тем,
+/// у кого она есть**. Композитор, запуская программу, отдаёт ей не своё право на файлы, а его
+/// обрезок — `/etc/apps/<имя программы>`.
+///
+/// Сузить можно только ВНУТРЬ: у права с корнем `/etc/apps` новый корень обязан начинаться с
+/// него. Иначе сужение стало бы расширением, то есть обходом.
+pub fn narrow(dom: DomainId, cap: Cap, path: &str) -> Result<Cap, CapError> {
+    if !path.starts_with('/') || path.len() < 2 || path.ends_with('/') {
+        return Err(CapError::WrongKind);
+    }
+    let (target, rights, old) = {
+        let cs = CSPACE.lock();
+        let s = cs.domains[dom].slots.get(cap.slot() as usize).ok_or(CapError::Invalid)?;
+        if s.generation != cap.generation() {
+            return Err(CapError::Stale);
+        }
+        let e = s.entry.as_ref().ok_or(CapError::Invalid)?;
+        // Сужают ПУТЁМ только право на файловый сервер — у прочих путей не бывает.
+        let Target::Endpoint(pid) = e.target else {
+            return Err(CapError::WrongKind);
+        };
+        (Target::Endpoint(pid), e.rights, e.root)
+    };
+    // Только внутрь: `/etc/apps` → `/etc/apps/fm` можно, `/etc/apps` → `/etc` нельзя.
+    if let Some(r) = old {
+        let внутри = path.len() > r.len()
+            && path.starts_with(r)
+            && path.as_bytes()[r.len()] == b'/';
+        if !внутри {
+            return Err(CapError::WrongKind);
+        }
+    }
+    let root = intern_root(path).ok_or(CapError::Exhausted)?;
+    // Сужённое право РОЖДАЕТСЯ РАЗДАВАЕМЫМ (`GRANT`), даже если исходное таким не было.
+    //
+    // Сужают не для себя: обрезок делают тому, кого запускают, а передача права по IPC требует
+    // `GRANT` у передающего — без него ядро отклоняет сам ответ, и проситель остаётся висеть в
+    // ожидании навсегда (так и вышло на первом прогоне Вехи 229.2).
+    //
+    // Новой власти это не даёт. Отдать СВОЁ право и так может всякий, кто умеет спавнить:
+    // ребёнку достаётся вся таблица родителя целиком. Запрет на раздачу бережёт от случайной
+    // утечки равному, а здесь передача — весь смысл вызова. Сам обрезок при этом уже, чем
+    // исходное право: власть по дороге только убывает.
+    let rights = Rights(rights.0 | Rights::GRANT.0);
+    let mut cs = CSPACE.lock();
+    alloc_slot(&mut cs.domains[dom], Entry { target, rights, root: Some(root) })
+        .ok_or(CapError::Exhausted)
+}
+
 /// Веха 229 — минт эндпоинта, СУЖЕННОГО путём: держатель не выйдет за `root`.
 ///
 /// Отдельной функцией, а не параметром у [`mint`]: сужение бывает ровно у одного вида права, и
@@ -700,20 +778,32 @@ pub fn list_caps(dom: DomainId) -> Vec<(u16, u8, u32, u16)> {
 }
 
 // ─── передача и отзыв ──────────────────────────────────────────────────────
+//
+// ВО ВСЕХ ЧЕТЫРЁХ копиях права ([`grant`], [`endow`], [`grant_slot`], [`derive`]) корень сужения
+// (`Entry::root`) переезжает вместе с правом. Это не удобство, а условие безопасности: копия без
+// корня — это право на ВЕСЬ файловый сервер вместо каталога, то есть расширение власти копией.
+//
+// Первая редакция Вехи 229 корень не копировала, и дыра открывалась самым обычным путём: шелл
+// получал своё место (`/etc/apps/vvsh`), а дальше `endow` отдавал его ребёнку уже БЕЗ корня, и
+// ребёнок ходил по всей системе. Нашлось замером: файл истории лёг в `f/history`, в корень store,
+// вместо `f/etc/apps/vvsh/history`.
+//
+// Персистентность (см. [`persist`]) здесь ни при чём: сужать можно только эндпоинты, а эндпоинты
+// переживать перезагрузку не умеют по устройству — после загрузки их минтит `init` заново.
 
 /// Передать capability из домена `from` в домен `to`, сузив права маской `mask`
 /// (требует `GRANT` у исходного). Итоговые права = исходные ∩ mask — **аттенуация**:
 /// расширить права передачей нельзя. Возвращает новый дескриптор, валидный в `to`.
 pub fn grant(from: DomainId, cap: Cap, to: DomainId, mask: Rights) -> Result<Cap, CapError> {
     let mut cs = CSPACE.lock();
-    let (target, new_rights) = {
+    let (target, new_rights, root) = {
         let e = resolve(&cs, from, cap)?;
         if !e.rights.contains(Rights::GRANT) {
             return Err(CapError::Denied);
         }
-        (e.target.clone(), e.rights.intersect(mask))
+        (e.target.clone(), e.rights.intersect(mask), e.root)
     };
-    alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights, root: None }).ok_or(CapError::Exhausted)
+    alloc_slot(&mut cs.domains[to], Entry { target, rights: new_rights, root }).ok_or(CapError::Exhausted)
 }
 
 /// Наделить потомка (Веха 30): скопировать capability из домена `from` в домен `to` —
@@ -724,11 +814,11 @@ pub fn grant(from: DomainId, cap: Cap, to: DomainId, mask: Rights) -> Result<Cap
 /// syscall'а с такой силой нет.
 pub fn endow(from: DomainId, cap: Cap, to: DomainId) -> Result<Cap, CapError> {
     let mut cs = CSPACE.lock();
-    let (target, rights) = {
+    let (target, rights, root) = {
         let e = resolve(&cs, from, cap)?;
-        (e.target.clone(), e.rights)
+        (e.target.clone(), e.rights, e.root)
     };
-    alloc_slot(&mut cs.domains[to], Entry { target, rights, root: None }).ok_or(CapError::Exhausted)
+    alloc_slot(&mut cs.domains[to], Entry { target, rights, root }).ok_or(CapError::Exhausted)
 }
 
 /// Отозвать capability: освободить слот и бумкнуть его поколение. Все ранее выданные
@@ -775,11 +865,11 @@ pub fn grant_slot(from: DomainId, slot: usize, to: DomainId) -> bool {
     if !e.rights.contains(Rights::GRANT) {
         return false;
     }
-    let (target, rights) = (e.target.clone(), Rights(e.rights.0 & !Rights::GRANT.0));
+    let (target, rights, root) = (e.target.clone(), Rights(e.rights.0 & !Rights::GRANT.0), e.root);
     if cs.domains.get(to).is_none() {
         return false;
     }
-    alloc_slot(&mut cs.domains[to], Entry { target, rights, root: None });
+    alloc_slot(&mut cs.domains[to], Entry { target, rights, root });
     true
 }
 
@@ -828,11 +918,11 @@ pub fn inheritable(dom: DomainId, cap: Cap) -> bool {
 /// «сервер-раздатчик»: derive урезает, grant-в-сообщении передаёт ([[ipc-cap-transfer]]).
 pub fn derive(dom: DomainId, cap: Cap, mask: Rights) -> Result<Cap, CapError> {
     let mut cs = CSPACE.lock();
-    let (target, rights) = {
+    let (target, rights, root) = {
         let e = resolve(&cs, dom, cap)?;
-        (e.target.clone(), e.rights.intersect(mask))
+        (e.target.clone(), e.rights.intersect(mask), e.root)
     };
-    alloc_slot(&mut cs.domains[dom], Entry { target, rights, root: None }).ok_or(CapError::Exhausted)
+    alloc_slot(&mut cs.domains[dom], Entry { target, rights, root }).ok_or(CapError::Exhausted)
 }
 
 /// Та же цель ли (по СОДЕРЖИМОМУ, не по слоту): нужна [`clamp_persisted`], чтобы сверять
@@ -1063,6 +1153,8 @@ pub fn load() -> usize {
                         Target::Root(str_at(&b, &mut off, l))
                     }
                 };
+                // Корня нет и быть не может: сужаются только эндпоинты, а они эфемерны (kind 0
+                // выше) — до этой строки доезжают лишь store, диск, значение и корень store.
                 Some(Entry { target, rights, root: None })
             };
             // Веха 152.3 — долговечное право прошлой загрузки: помечаем персистентным, пока
