@@ -1028,6 +1028,9 @@ fn cmd_repl() -> ! {
     let mut hist = History::new();
     hist.load();
     loop {
+        // Веха 230.4 — сказать о фоновых работах, которые кончились, ПЕРЕД приглашением:
+        // посреди набранной строки такое сообщение сбило бы ввод.
+        jobs_reap();
         let mut pbuf = [0u8; 320];
         let plen = build_prompt(&mut pbuf);
         let len = match read_line(&pbuf[..plen], &mut line, &hist) {
@@ -1106,9 +1109,18 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
             return;
         }
     };
-    let words: alloc::vec::Vec<&[u8]> = owned.iter().map(|w| w.as_bytes()).collect();
+    let mut words: alloc::vec::Vec<&[u8]> = owned.iter().map(|w| w.as_bytes()).collect();
     if words.is_empty() {
         return;
+    }
+    // Веха 230.4 — `&` ПОСЛЕДНИМ СЛОВОМ значит «не жди». Отдельным словом, а не приклеенным к
+    // команде (`sleep&`): так его видно в строке, и разбирать нечего — слова уже нарезаны.
+    let фоном = words.last() == Some(&b"&".as_slice());
+    if фоном {
+        words.pop();
+        if words.is_empty() {
+            return sys::write(sys::i18n::t("vvsh: `&` без команды\n").as_bytes());
+        }
     }
     // Веха 221 — КОНВЕЙЕР ЦЕПОЧКОЙ, а не одним звеном.
     //
@@ -1122,6 +1134,21 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
         Ok(s) => s,
         Err(_) => return sys::write(sys::i18n::t("vvsh: имя команды не UTF-8\n").as_bytes()),
     };
+    if фоном {
+        // В фон уходят только ПРОГРАММЫ: встроенная команда исполняется внутри процесса шелла,
+        // и отправить её в фон нечем. Сказать об этом прямо честнее, чем выполнить её молча
+        // не так, как просили.
+        return match env.lookup(head) {
+            Some(_) => {
+                sys::write(sys::i18n::t("vvsh: в фон уходят программы, а не встроенные команды: ").as_bytes());
+                sys::write(words[0]);
+                sys::write(b"\n");
+            }
+            None => {
+                spawn_background(words[0], &words[1..]);
+            }
+        };
+    }
     match env.lookup(head) {
         Some(v) if is_callable(&v) => match build_command_form(&words, env) {
             Ok(form) => match interp.eval(&form, env) {
@@ -1467,6 +1494,154 @@ fn spawn_program(name: &[u8], arg_words: &[&[u8]]) {
     }
 }
 
+// ── ФОНОВЫЕ РАБОТЫ (Веха 230.4) ─────────────────────────────────────────────────────────────
+//
+// Просьба владельца от 14.10: «фоновые программы: `&` и `jobs`». Повод названный им же — часы,
+// идущие, пока ты работаешь в шелле; повод настоящий — всё, что дольше секунды: сборка
+// поколения, скачивание пакета, пинг в цикле. До этой вехи шелл ЖДАЛ любую программу до конца
+// (`SYS_EXEC` — запустить и дождаться), и единственным способом не ждать было открыть второе
+// окно.
+//
+// В фон уходят ТОЛЬКО программы. Встроенная команда исполняется внутри процесса шелла, и
+// отправить её в фон без нитей нечем — а делать вид, что получилось, хуже, чем отказать
+// (у нас и нити есть, но шелл однопоточный намеренно: своё состояние он правит без замков).
+//
+// Ребёнок наследует наш stdio, то есть пишет в ТОТ ЖЕ терминал. Вывод при этом перемешается с
+// приглашением — это честное поведение шелла, а не недоделка: своего места на экране у фоновой
+// программы нет, и завести его может только терминал, а не мы.
+
+/// Одна фоновая работа.
+struct Job {
+    /// Номер, по которому её зовут (`stop 1`). Номера не переиспользуются в рамках сеанса:
+    /// «работа 1» должна означать одно и то же от начала до конца.
+    n: usize,
+    pid: usize,
+    cmd: String,
+    /// Код выхода, если уже закончилась и об этом ЕЩЁ НЕ СКАЗАНО человеку.
+    done: Option<usize>,
+}
+
+static mut JOBS: Option<alloc::vec::Vec<Job>> = None;
+static mut JOB_NEXT: usize = 1;
+
+fn jobs() -> &'static mut alloc::vec::Vec<Job> {
+    // Шелл однопоточный: гонок за эту таблицу нет, и замка она не просит.
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(JOBS);
+        slot.get_or_insert_with(alloc::vec::Vec::new)
+    }
+}
+
+/// Запустить программу В ФОНЕ. `false` — не нашлась (сообщение уже напечатано).
+fn spawn_background(name: &[u8], arg_words: &[&[u8]]) -> bool {
+    let mut blob = alloc::vec::Vec::new();
+    for w in arg_words {
+        blob.extend_from_slice(w);
+        blob.push(0);
+    }
+    let mut pid = sys::spawn(cap_store(), name, &blob);
+    if pid.is_none() {
+        for path in path_candidates(name) {
+            pid = sys::spawn(cap_store(), path.as_bytes(), &blob);
+            if pid.is_some() {
+                break;
+            }
+        }
+    }
+    let Some(pid) = pid else {
+        sys::write(sys::i18n::t("vvsh: команда не найдена: ").as_bytes());
+        sys::write(name);
+        sys::write(b"\n");
+        return false;
+    };
+    let mut cmd = String::from_utf8_lossy(name).into_owned();
+    for w in arg_words {
+        cmd.push(' ');
+        cmd.push_str(&String::from_utf8_lossy(w));
+    }
+    let n = unsafe {
+        let next = &mut *core::ptr::addr_of_mut!(JOB_NEXT);
+        let n = *next;
+        *next += 1;
+        n
+    };
+    jobs().push(Job { n, pid, cmd, done: None });
+    sys::write(alloc::format!("[{n}] {pid}\n").as_bytes());
+    true
+}
+
+/// Опросить фоновые работы и сказать о тех, что закончились.
+///
+/// Зовётся ПЕРЕД приглашением, как в любом шелле: сообщение «работа кончилась» посреди набранной
+/// строки сбило бы ввод, а человек всё равно смотрит на экран между командами.
+fn jobs_reap() {
+    let list = jobs();
+    let mut i = 0;
+    while i < list.len() {
+        if list[i].done.is_none() {
+            if let sys::Wait::Exited(code) = sys::wait(list[i].pid, true) {
+                list[i].done = Some(code);
+            }
+        }
+        match list[i].done {
+            Some(code) => {
+                let j = list.remove(i);
+                let итог = if code == 0 {
+                    String::from(sys::i18n::t("готово"))
+                } else {
+                    alloc::format!("{} {}", sys::i18n::t("код"), code)
+                };
+                sys::write(alloc::format!("[{}] {}: {}\n", j.n, итог, j.cmd).as_bytes());
+            }
+            None => i += 1,
+        }
+    }
+}
+
+/// `jobs` — что крутится в фоне.
+fn sh_jobs(_args: &[Value]) -> Result<Value, EvalError> {
+    let list = jobs();
+    if list.is_empty() {
+        sys::write(sys::i18n::t("фоновых работ нет\n").as_bytes());
+        return Ok(Value::nil());
+    }
+    for j in list.iter() {
+        let состояние = match sys::wait(j.pid, true) {
+            sys::Wait::Running => String::from(sys::i18n::t("работает")),
+            sys::Wait::Exited(code) => alloc::format!("{} {}", sys::i18n::t("кончилась, код"), code),
+            sys::Wait::NoChild => String::from(sys::i18n::t("пропала")),
+        };
+        sys::write(alloc::format!("[{}] {} {} — {}\n", j.n, j.pid, состояние, j.cmd).as_bytes());
+    }
+    Ok(Value::nil())
+}
+
+/// `stop N` — остановить фоновую работу.
+///
+/// Отдельной командой, а не `kill PID`: номер работы человек видел своими глазами, а номер
+/// процесса ему знать неоткуда. Да и убить по номеру процесса можно ЧУЖОГО — своих детей ядро
+/// различает, а шеллу незачем предлагать промахнуться.
+fn sh_stop(args: &[Value]) -> Result<Value, EvalError> {
+    let n = match args.first() {
+        Some(Value::Int(n)) => *n as usize,
+        Some(Value::Str(s)) => s.trim().parse::<usize>().map_err(|_| {
+            EvalError::new("stop: номер работы — число (его показывает `jobs`)")
+        })?,
+        _ => return Err(EvalError::new("stop: (stop НОМЕР) — номер показывает `jobs`")),
+    };
+    let list = jobs();
+    let Some(k) = list.iter().position(|j| j.n == n) else {
+        return Err(EvalError::new(alloc::format!("stop: работы [{n}] нет")));
+    };
+    let pid = list[k].pid;
+    if !sys::kill(pid) {
+        return Err(EvalError::new(alloc::format!("stop: [{n}] не останавливается")));
+    }
+    let j = list.remove(k);
+    sys::write(alloc::format!("[{}] {}: {}\n", j.n, sys::i18n::t("остановлена"), j.cmd).as_bytes());
+    Ok(Value::nil())
+}
+
 /// Где в профиле может лежать программа `name`: `/nix/store/<пакет>/bin/<имя>` (Веха 109 — PATH).
 ///
 /// Ищем только среди пакетов ВЕРХНЕГО УРОВНЯ: зависимости человек не устанавливал, и их `bin/` —
@@ -1563,6 +1738,10 @@ const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         // Веха 229.3 (ADR 0022) — СВОЁ МЕСТО ПРОГРАММЫ: забыть настроенное и заморозить его.
         ("forget", sh_forget),
         ("freeze", sh_freeze),
+        // Веха 230.4 — фоновые работы: запускает их `&` в конце строки, а смотрят и
+        // останавливают этими двумя.
+        ("jobs", sh_jobs),
+        ("stop", sh_stop),
         ("mkdir", sh_mkdir),
         ("stat", sh_stat), // Веха 177 — вид, размер и время
         ("readlink", sh_readlink), // Веха 108.2 — симлинки есть только в дереве пакета
@@ -1910,6 +2089,9 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row("root-del ИМЯ".as_bytes(), "снять корень");
     help_row("secret ИМЯ".as_bytes(), "задать корень, не показывая значения (пароли)");
     help_row("doc [раздел]".as_bytes(), "руководство системы (без имени — список разделов)");
+    help_row("КОМАНДА &".as_bytes(), "запустить программу в фоне (не ждать её)");
+    help_row(b"jobs", "что крутится в фоне");
+    help_row("stop НОМЕР".as_bytes(), "остановить фоновую работу (номер — из `jobs`)");
     help_row("forget ПРОГРАММА".as_bytes(), "забыть настроенное программой (вернётся объявленное)");
     help_row("freeze ПРОГРАММА".as_bytes(), "напечатать настроенное записями для apps.vv");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
