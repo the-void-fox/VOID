@@ -1,8 +1,19 @@
+# Форки чужих деревьев, от которых зависит сборка std-программ и uutils (Веха 230.2).
+#
+# URL ведёт на НАШИ форки, а не на upstream, и это не предпочтение, а условие работоспособности:
+# закреплены здесь коммиты с нашими правками (порт `std` на VOID, порт uutils), и в upstream их
+# нет. Пока URL указывал туда, `git submodule update --init` падал у всякого, кто не я, — то
+# есть собрать систему целиком мог ровно один человек на одной машине.
+#
+# Форки сделаны на стороне GitHub (`gh repo fork`), ветка `void`; апстрим у них на месте, так что
+# обновляться с него можно обычным `git fetch upstream`.
 [submodule "vendor/rust"]
 	path = vendor/rust
-	url = https://github.com/rust-lang/rust.git
+	url = https://github.com/the-void-fox/void-rust.git
+	branch = void
 	shallow = true
 [submodule "vendor/coreutils"]
 	path = vendor/coreutils
-	url = https://github.com/uutils/coreutils
+	url = https://github.com/the-void-fox/void-coreutils.git
+	branch = void
 	shallow = true

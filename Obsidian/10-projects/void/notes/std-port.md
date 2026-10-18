@@ -12,6 +12,14 @@ status: done
 куча, argv/env, HashMap (со случайными сидами), Instant/Duration, коды выхода.
 Обе архитектуры, 0 паник. Форк: ветка `void` в `vendor/rust`, коммит `0d7db89a`.
 
+> **Где лежит форк (с 18.10.2026).** Подмодуль указывает на
+> [the-void-fox/void-rust](https://github.com/the-void-fox/void-rust), ветка `void` — семь наших
+> коммитов поверх апстрима (45 файлов, ~2000 строк). До этого URL вёл на `rust-lang/rust`, где
+> этих коммитов нет: `git submodule update --init` падал у всех, кроме автора, и пересобрать
+> `std` можно было ровно на одной машине. Форк сделан на стороне GitHub, поэтому апстрим на
+> месте и обновляется обычным `git fetch`. То же — у `vendor/coreutils`
+> ([void-coreutils](https://github.com/the-void-fox/void-coreutils)).
+
 ## Витрина (vsh, riscv64 и x86_64 с одного диска)
 
 ```

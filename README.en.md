@@ -256,9 +256,9 @@ The full plans, with the reasoning and the rejected options, live in `Obsidian/1
 ## Building from source
 
 You need `nix-shell` (QEMU, GRUB, mtools) and the rustup toolchain from
-`Code/rust-toolchain.toml`. Clone **without** `--recursive`: the `vendor/` submodules are only
-needed by the `std` port and uutils; the system, the ISO and everything visible in the
-screenshots build without them (see "Third-party code" below).
+`Code/rust-toolchain.toml`. The `vendor/` submodules are only needed by the `std` port and
+uutils — the system, the ISO and everything visible in the screenshots build without them — so
+cloning without `--recurse-submodules` is fine and fast (see "Third-party code" below).
 
 ```sh
 Code/tools/run.sh                    # build and run x86_64 with graphics (one command)
@@ -310,9 +310,17 @@ Third-party code: `vendor/rust` and `vendor/coreutils` are submodules tracking u
 their own licenses, `Reference/` is not part of the repository, and the vendored crates are
 listed in `Code/programs/user/Cargo.toml` with a note on why each was taken.
 
-**A caveat about the submodules.** They are FORKS (branch `void`), and their changes — the `std`
-port to VOID and the uutils port — currently live only locally: the public repository holds
-pointers into upstream, where those commits do not exist. So `git submodule update --init` will
-fail, and that is expected. It does not affect the system: the kernel, the shell, every program
-in the screenshots and the ISO all build without the submodules — they are only needed to
-rebuild the std programs and uutils.
+**About the submodules.** They are FORKS (branch `void`): the `std` port to VOID and the uutils
+port. Since 2026-10-18 they live on GitHub — [void-rust](https://github.com/the-void-fox/void-rust)
+and [void-coreutils](https://github.com/the-void-fox/void-coreutils) — so anyone can build
+everything:
+
+```sh
+git clone --recurse-submodules https://github.com/the-void-fox/VOID.git
+# already cloned?  git submodule update --init --recursive
+```
+
+Before that the submodule URLs pointed at upstream, where our commits do not exist, so
+`git submodule update` failed for everyone but the author — the `std` programs and uutils could
+be rebuilt on exactly one machine. The system itself is unaffected either way: the kernel, the
+shell, every program in the screenshots and the ISO build **without** the submodules.
