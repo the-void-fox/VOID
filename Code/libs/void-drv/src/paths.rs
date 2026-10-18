@@ -186,7 +186,6 @@ mod tests {
     use super::*;
     use crate::Output;
     use alloc::string::ToString;
-    use alloc::vec;
 
     /// Собрать задание так, как его собрал бы вычислитель из выражения nix.
     fn drv(name: &str, args: &[&str], extra: &[(&str, &str)], outs: &[&str]) -> Drv {

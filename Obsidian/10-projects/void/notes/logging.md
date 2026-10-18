@@ -122,4 +122,4 @@ install: обновляю диск 0 — файлы, поколения и па�
 
 ## Связано
 
-[[known-gaps]] · [[notes-conventions]] · [[void-strictness|строгость]] · `lx-net` · `wifi`
+[[known-gaps]] · [[notes-conventions]] · [[i18n]] · `lx-net` · `wifi`
