@@ -27,6 +27,17 @@
 //! `^S` — сохранить, `^Q` — выйти (при несохранённых правках спрашивает второй раз), `^K` —
 //! удалить строку, `^L` — перерисовать и перемерить экран.
 //!
+//! ## Веха 230.3 — рисует ТУЛКИТОМ (`tui/`), а не escape-кодами
+//!
+//! Раньше редактор складывал кадр сам: перевод курсора, стирание строки, явные цвета строки
+//! состояния — и всё это с оглядкой на то, что консоль ядра знает не все коды. Теперь он рисует
+//! в БУФЕР ЯЧЕЕК, а на экран уезжает разница между кадрами ([[void-ui]] — тот же порядок, что в
+//! оконном тулките, только ячейки вместо пикселей).
+//!
+//! Видно это сразу тремя вещами: редактор въезжает на ЗАПАСНОЙ экран (лента шелла после выхода
+//! остаётся цела), перерисовка перестала зависеть от того, догадался ли он, что строки
+//! сдвинулись, а строка состояния взяла обратный цвет вместо подобранного синего.
+//!
 //! ## Границы, названные вслух
 //!
 //! Файл целиком лежит в памяти и пишется целиком же — файловая персоналия и так держит файл
@@ -43,7 +54,12 @@ use alloc::vec::Vec;
 use alloc::{format, string::ToString};
 
 use void_user as sys;
-use void_user::{posix as px, stdio};
+use void_user::posix as px;
+
+#[path = "../tui/mod.rs"]
+mod tui;
+
+use tui::{Key, Style};
 
 #[global_allocator]
 static ALLOC: sys::heap::Heap<{ 4 * 1024 * 1024 }> = sys::heap::Heap::new();
@@ -55,10 +71,6 @@ const FILE_MAX: usize = 128 * 1024;
 /// Tab вставляет пробелы: конфиги поколения набраны пробелами, а показ настоящих табуляций
 /// требовал бы отдельной арифметики колонок ради символа, которого мы сами не пишем.
 const TAB_WIDTH: usize = 2;
-
-/// Размер экрана, когда его не назвал никто — ни хост, ни ядро (консоль в serial). 80×25 есть у
-/// любого терминала: это не догадка, а безопасное подмножество.
-const FALLBACK: (u16, u16) = (80, 25);
 
 /// «1 строка», «2 строки», «5 строк» — правило русского счёта. Мелочь, но строка состояния
 /// висит перед глазами постоянно, и «2 строк» в ней мозолит глаз.
@@ -72,146 +84,6 @@ fn lines_word(n: usize) -> &'static str {
         "строк"
     }
 }
-
-// ── ввод ────────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq)]
-enum Key {
-    Ch(char),
-    Enter,
-    Back,
-    Del,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PgUp,
-    PgDn,
-    Save,
-    Quit,
-    CutLine,
-    Refresh,
-}
-
-/// Разбор потока байт в клавиши: CSI-последовательности терминала плюс сборка многобайтных
-/// символов UTF-8.
-#[derive(Default)]
-struct Input {
-    /// 0 — обычный текст, 1 — видели ESC, 2 — внутри `ESC [ …`.
-    esc: u8,
-    /// Первый числовой параметр CSI (`ESC[3~` — Delete).
-    param: usize,
-    /// Видели `;` — дальше идут модификаторы xterm (`ESC[1;5C`), и на клавишу они не влияют:
-    /// параметр после точки с запятой не должен затирать первый.
-    tail: bool,
-    utf: [u8; 4],
-    ulen: usize,
-    uneed: usize,
-}
-
-impl Input {
-    fn feed(&mut self, b: u8) -> Option<Key> {
-        // Хвост многобайтного символа. Он может приехать РАЗОРВАННЫМ между двумя чтениями —
-        // хост отдаёт столько байт, сколько накопилось, и на границу символа не смотрит.
-        if self.uneed > 0 {
-            if b & 0xc0 == 0x80 && self.ulen < 4 {
-                self.utf[self.ulen] = b;
-                self.ulen += 1;
-                if self.ulen == self.uneed {
-                    let ch = core::str::from_utf8(&self.utf[..self.ulen])
-                        .ok()
-                        .and_then(|s| s.chars().next());
-                    self.uneed = 0;
-                    self.ulen = 0;
-                    return ch.map(Key::Ch);
-                }
-                return None;
-            }
-            // Рваная последовательность: бросаем накопленное и разбираем этот байт заново.
-            self.uneed = 0;
-            self.ulen = 0;
-        }
-        match self.esc {
-            1 => {
-                if b == b'[' {
-                    self.param = 0;
-                    self.tail = false;
-                    self.esc = 2;
-                } else {
-                    self.esc = 0;
-                }
-                None
-            }
-            2 => {
-                if b == b';' {
-                    self.tail = true;
-                    return None;
-                }
-                if b.is_ascii_digit() {
-                    if !self.tail {
-                        self.param = self.param * 10 + (b - b'0') as usize;
-                    }
-                    return None;
-                }
-                self.esc = 0;
-                match b {
-                    b'A' => Some(Key::Up),
-                    b'B' => Some(Key::Down),
-                    b'C' => Some(Key::Right),
-                    b'D' => Some(Key::Left),
-                    b'H' => Some(Key::Home),
-                    b'F' => Some(Key::End),
-                    b'~' => match self.param {
-                        1 | 7 => Some(Key::Home),
-                        3 => Some(Key::Del),
-                        4 | 8 => Some(Key::End),
-                        5 => Some(Key::PgUp),
-                        6 => Some(Key::PgDn),
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            }
-            _ => match b {
-                0x1b => {
-                    self.esc = 1;
-                    None
-                }
-                b'\r' | b'\n' => Some(Key::Enter),
-                0x7f | 0x08 => Some(Key::Back),
-                0x01 => Some(Key::Home),    // ^A
-                0x02 => Some(Key::Left),    // ^B
-                0x05 => Some(Key::End),     // ^E
-                0x06 => Some(Key::Right),   // ^F
-                0x0b => Some(Key::CutLine), // ^K
-                0x0c => Some(Key::Refresh), // ^L
-                0x0e => Some(Key::Down),    // ^N
-                0x10 => Some(Key::Up),      // ^P
-                0x11 => Some(Key::Quit),    // ^Q
-                0x13 => Some(Key::Save),    // ^S
-                b'\t' => Some(Key::Ch('\t')),
-                c if (0x20..0x7f).contains(&c) => Some(Key::Ch(c as char)),
-                c if c >= 0xc0 => {
-                    self.uneed = if c >= 0xf0 {
-                        4
-                    } else if c >= 0xe0 {
-                        3
-                    } else {
-                        2
-                    };
-                    self.utf[0] = c;
-                    self.ulen = 1;
-                    None
-                }
-                _ => None,
-            },
-        }
-    }
-}
-
-// ── файл ────────────────────────────────────────────────────────────────────
 
 /// Прочитать файл целиком. `None` — открыть не удалось: файла нет, и это законно — редактор
 /// откроет пустой буфер и создаст его при сохранении.
@@ -269,8 +141,8 @@ struct Ed {
     msg: String,
     /// `^Q` при несохранённых правках только предупреждает; выходит второй подряд.
     quit_armed: bool,
-    /// Перерисовать весь экран: строки сдвинулись, одной строкой не обойтись.
-    full: bool,
+    /// Человек попросил показать заново (`^L`): в тот же терминал мог написать кто-то ещё.
+    redraw: bool,
     done: bool,
 }
 
@@ -294,15 +166,6 @@ impl Ed {
         line.char_indices().nth(ci).map_or(line.len(), |(b, _)| b)
     }
 
-    fn measure(&mut self) {
-        // Порядок опроса — это порядок осведомлённости: свой хост знает размер ОКНА (панель
-        // терминала), ядро — размер своей консоли (спасательный шелл), и только если молчат оба,
-        // берём умолчание.
-        let (c, r) = stdio::win_size().or_else(sys::console_size).unwrap_or(FALLBACK);
-        self.cols = (c as usize).clamp(20, 400);
-        self.rows = (r as usize).clamp(4, 200);
-    }
-
     // ── правки ──
 
     fn insert(&mut self, ch: char) {
@@ -319,7 +182,6 @@ impl Ed {
         self.cy += 1;
         self.cx = 0;
         self.changed = true;
-        self.full = true;
     }
 
     fn backspace(&mut self) {
@@ -334,7 +196,6 @@ impl Ed {
             self.cx = self.line_len(self.cy);
             self.lines[self.cy].push_str(&cur);
             self.changed = true;
-            self.full = true;
         }
     }
 
@@ -347,7 +208,6 @@ impl Ed {
             let next = self.lines.remove(self.cy + 1);
             self.lines[self.cy].push_str(&next);
             self.changed = true;
-            self.full = true;
         }
     }
 
@@ -359,7 +219,6 @@ impl Ed {
         self.cy = self.cy.min(self.lines.len() - 1);
         self.cx = 0;
         self.changed = true;
-        self.full = true;
     }
 
     /// Записать файл. Пишем ЦЕЛИКОМ (`echo_to` = open+O_TRUNC, write, close): у персоналии файл
@@ -388,7 +247,6 @@ impl Ed {
             // тот случай, ради которого она отвечает.
             self.msg = "ОШИБКА ЗАПИСИ — файл на диске неполон!".to_string();
         }
-        self.full = true;
     }
 
     // ── движение ──
@@ -419,67 +277,101 @@ impl Ed {
         self.cx = self.cx.min(self.line_len(self.cy));
     }
 
+    /// Клавиша тулкита — в правку.
+    ///
+    /// Аккорды Ctrl приходят сюда КАК ЕСТЬ (`Ctrl('s')`), а не разобранными в «сохранить»:
+    /// разборщик клавиш один на систему, а что значит `^S`, решает каждая программа сама.
     fn key(&mut self, k: Key) {
-        if k != Key::Quit {
+        if k != Key::Ctrl('q') {
             self.quit_armed = false;
         }
         match k {
-            Key::Ch('\t') => {
+            // Tab вставляет пробелы: конфиги набраны пробелами, а показ настоящих табуляций
+            // требовал бы арифметики колонок ради знака, которого мы сами не пишем.
+            Key::Tab => {
                 for _ in 0..TAB_WIDTH {
                     self.insert(' ');
                 }
             }
-            Key::Ch(c) => self.insert(c),
+            Key::Char(c) => self.insert(c),
             Key::Enter => self.newline(),
             Key::Back => self.backspace(),
             Key::Del => self.delete(),
-            Key::CutLine => self.cut_line(),
-            Key::Left => self.left_key(),
-            Key::Right => self.right_key(),
-            Key::Up => self.vertical(-1),
-            Key::Down => self.vertical(1),
+            Key::Left | Key::Ctrl('b') => self.left_key(),
+            Key::Right | Key::Ctrl('f') => self.right_key(),
+            Key::Up | Key::Ctrl('p') => self.vertical(-1),
+            Key::Down | Key::Ctrl('n') => self.vertical(1),
             Key::PgUp => self.vertical(-(self.text_rows() as isize)),
             Key::PgDn => self.vertical(self.text_rows() as isize),
-            Key::Home => self.cx = 0,
-            Key::End => self.cx = self.line_len(self.cy),
-            Key::Save => self.save(),
-            Key::Refresh => {
-                self.measure();
-                self.full = true;
-            }
-            Key::Quit => {
-                if self.changed && !self.quit_armed {
-                    self.quit_armed = true;
-                    self.msg = "есть несохранённое: ^S сохранить, ^Q ещё раз — выйти без него"
-                        .to_string();
-                    self.full = true;
-                } else {
-                    self.done = true;
-                }
-            }
+            Key::Home | Key::Ctrl('a') => self.cx = 0,
+            Key::End | Key::Ctrl('e') => self.cx = self.line_len(self.cy),
+            Key::Ctrl('k') => self.cut_line(),
+            Key::Ctrl('s') => self.save(),
+            Key::Ctrl('q') => self.quit(),
+            // `^L` — «покажи заново»: кадр считается с нуля. Нужен там, где в тот же терминал
+            // написал кто-то ещё (ядро своим журналом, например).
+            Key::Ctrl('l') => self.redraw = true,
+            _ => {}
+        }
+    }
+
+    /// Выход: при несохранённом сперва предупреждаем, вторым `^Q` выходим.
+    fn quit(&mut self) {
+        if self.changed && !self.quit_armed {
+            self.quit_armed = true;
+            self.msg =
+                "есть несохранённое: ^S сохранить, ^Q ещё раз — выйти без него".to_string();
+        } else {
+            self.done = true;
         }
     }
 
     // ── вывод ──
 
-    fn row_into(&self, out: &mut String, r: usize) {
-        let _ = core::fmt::Write::write_fmt(out, format_args!("\x1b[{};1H", r + 1));
-        match self.lines.get(self.top + r) {
-            Some(line) => {
-                for ch in line.chars().skip(self.left).take(self.width()) {
-                    // Чужие табуляции показываем пробелом: свои мы не пишем (TAB_WIDTH), а
-                    // ширина чужой зависит от колонки — арифметика ради символа, которого нет.
-                    out.push(if ch == '\t' { ' ' } else { ch });
-                }
-            }
-            // За последней строкой файла — тусклая тильда: пустая строка файла и место, где
-            // файла уже нет, должны выглядеть по-разному.
-            None => out.push_str("\x1b[90m~\x1b[0m"),
+    /// Нарисовать кадр в буфер ячеек. Что изменилось с прошлого раза, считает тулкит.
+    ///
+    /// Прокрутка правится ЗДЕСЬ, перед рисованием: курсор мог уехать за край любой правкой, и
+    /// ловить это в каждой из них — двадцать мест вместо одного.
+    fn draw(&mut self, buf: &mut tui::Buffer, area: tui::Rect) -> Option<(u16, u16)> {
+        self.cols = area.w as usize;
+        self.rows = area.h as usize;
+        let rows = self.text_rows();
+        let w = self.width();
+        if self.cy < self.top {
+            self.top = self.cy;
         }
-        out.push_str("\x1b[K");
-    }
+        if self.cy >= self.top + rows {
+            self.top = self.cy + 1 - rows;
+        }
+        if self.cx < self.left {
+            self.left = self.cx;
+        }
+        if self.cx >= self.left + w {
+            self.left = self.cx + 1 - w;
+        }
 
-    fn status_into(&self, out: &mut String) {
+        // `cut_bottom` отдаёт ОТРЕЗАННОЕ первым — строку состояния, а остаток вторым.
+        let (bar, body) = area.cut_bottom(1);
+        for r in 0..body.h {
+            let y = body.y + r;
+            match self.lines.get(self.top + r as usize) {
+                Some(line) => {
+                    // Чужие табуляции показываем пробелом: свои мы не пишем (TAB_WIDTH), а
+                    // ширина чужой зависит от колонки — арифметика ради знака, которого нет.
+                    let shown: String = line
+                        .chars()
+                        .skip(self.left)
+                        .take(w)
+                        .map(|c| if c == '\t' { ' ' } else { c })
+                        .collect();
+                    buf.put(body.x, y, &shown, body.w, Style::PLAIN);
+                }
+                // За последней строкой файла — тусклая тильда: пустая строка файла и место, где
+                // файла уже нет, должны выглядеть по-разному.
+                None => buf.set(body.x, y, '~', Style::MUTED),
+            }
+        }
+
         let name = self.path.rsplit('/').next().unwrap_or(&self.path);
         let left = format!(
             " {}{}  {}:{}  {} {} ",
@@ -491,64 +383,19 @@ impl Ed {
             lines_word(self.lines.len())
         );
         let right = if self.msg.is_empty() {
-            " ^S сохранить  ^Q выход  ^K удалить строку ".to_string()
+            String::from(" ^S сохранить  ^Q выход  ^K удалить строку ")
         } else {
             format!(" {} ", self.msg)
         };
-        let w = self.width();
-        let mut bar: String = left.chars().take(w).collect();
-        let used = bar.chars().count();
-        let tail: String = right.chars().rev().take(w.saturating_sub(used)).collect();
-        let tail: String = tail.chars().rev().collect();
-        for _ in 0..w.saturating_sub(used + tail.chars().count()) {
-            bar.push(' ');
-        }
-        bar.push_str(&tail);
-        // Инверсии (`SGR 7`) консоль ядра не знает — берём явные цвета: синий фон, белый текст.
-        // Они одинаково видны и на VGA, и в гриде терминала.
-        let _ = core::fmt::Write::write_fmt(
-            out,
-            format_args!("\x1b[{};1H\x1b[44;97m{}\x1b[0m\x1b[K", self.rows, bar),
-        );
-    }
-
-    fn draw(&mut self) {
-        let (old_top, old_left) = (self.top, self.left);
-        let rows = self.text_rows();
-        if self.cy < self.top {
-            self.top = self.cy;
-        }
-        if self.cy >= self.top + rows {
-            self.top = self.cy + 1 - rows;
-        }
-        let w = self.width();
-        if self.cx < self.left {
-            self.left = self.cx;
-        }
-        if self.cx >= self.left + w {
-            self.left = self.cx + 1 - w;
-        }
-        // Прокрутка сдвигает ВЕСЬ текст; без неё меняется только строка под курсором — остальные
-        // перерисовывать незачем. Терминал и так шлёт на экран лишь изменившиеся строки, но
-        // кадр 80×25 — это ещё и четыре IPC-сообщения на каждую букву.
-        let full = self.full || self.top != old_top || self.left != old_left;
-
-        let mut out = String::new();
-        if full {
-            for r in 0..rows {
-                self.row_into(&mut out, r);
-            }
-        } else {
-            self.row_into(&mut out, self.cy - self.top);
-        }
-        self.status_into(&mut out);
-        let _ = core::fmt::Write::write_fmt(
-            &mut out,
-            format_args!("\x1b[{};{}H", self.cy - self.top + 1, self.cx - self.left + 1),
-        );
-        sys::write(out.as_bytes());
-        self.full = false;
+        // Обратный цвет вместо подобранного синего: он берёт цвета самого терминала, значит
+        // читается на любой теме. Консоль ядра его понимает с Вехи 230.3.
+        tui::status(buf, bar, &left, &right, Style::SELECTED);
         self.msg.clear();
+
+        Some((
+            body.x + (self.cx - self.left) as u16,
+            body.y + (self.cy - self.top) as u16,
+        ))
     }
 }
 
@@ -594,11 +441,10 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         changed: false,
         msg: String::new(),
         quit_armed: false,
-        full: true,
+        redraw: false,
         done: false,
         path,
     };
-    ed.measure();
 
     match read_file(ep, ed.path.as_bytes()) {
         Some(bytes) => {
@@ -620,47 +466,36 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         None => ed.msg = format!("новый файл: {}", ed.path),
     }
 
-    sys::write(b"\x1b[2J");
-    let mut input = Input::default();
-    let mut buf = [0u8; 64];
+    let mut app = tui::App::open();
     while !ed.done {
-        ed.draw();
-        // Веха 223.7 — спрашиваем ВИД ответа. До этого редактор узнавал размер окна ОДИН раз,
-        // на старте: растянул человек терминал — и `ved` остался рисовать в прежних границах,
-        // потому что сказать ему было нечем (`SIGWINCH` у нас нет и не будет).
-        let n = match stdio::read_ex(&mut buf) {
-            stdio::In::Bytes(k) => k,
-            stdio::In::Eof => break, // ввод кончился (хост ушёл) — выходим, а не крутимся впустую
-            // Окно стало другим: перемерить и перерисовать ЦЕЛИКОМ — рамки, строка состояния и
-            // перенос строк считаются от размера.
-            stdio::In::Resized => {
-                ed.measure();
-                ed.full = true;
-                continue;
-            }
+        let area = app.screen().area();
+        let cursor = {
+            let buf = app.screen().frame();
+            ed.draw(buf, area)
+        };
+        // Курсор ставим туда, где человек печатает: в редакторе это единственное, что говорит,
+        // куда поедет следующий знак.
+        app.screen().cursor(cursor);
+        app.screen().flush();
+        if ed.redraw {
+            ed.redraw = false;
+            app.screen().repaint();
+            continue;
+        }
+        match app.next() {
+            tui::Event::Key(k) => ed.key(k),
+            // Окно стало другим: кадр считается заново — переносы, строка состояния и прокрутка
+            // все считаются от размера. Экран тулкит уже перемерил.
+            tui::Event::Resized => {}
             // Прервали. У редактора это не «умереть»: несохранённое дороже. Ведём себя как с
             // обычным выходом — предупредим, если есть что терять.
-            stdio::In::Interrupted => {
-                ed.key(Key::Quit);
-                continue;
-            }
-            // Хоста stdio нет (спасательный шелл) — читаем ядром по-старому.
-            stdio::In::NoHost => sys::read_stdin(&mut buf),
-        };
-        if n == 0 {
-            break;
-        }
-        for &b in &buf[..n.min(buf.len())] {
-            if let Some(k) = input.feed(b) {
-                ed.key(k);
-                if ed.done {
-                    break;
-                }
-            }
+            tui::Event::Interrupted => ed.quit(),
+            // Ввод кончился (хост ушёл) — выходим, а не крутимся впустую.
+            tui::Event::Eof => break,
         }
     }
 
-    // Экран за собой убираем: следующим здесь печатает приглашение шелл.
-    sys::write(b"\x1b[0m\x1b[2J\x1b[H");
+    // Экран за собой убираем и возвращаем ленту шелла — запасной экран для того и нужен.
+    app.close();
     sys::exit(0);
 }

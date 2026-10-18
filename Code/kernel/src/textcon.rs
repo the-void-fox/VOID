@@ -314,13 +314,21 @@ static mut PLEN: usize = 0;
 static mut FG: u8 = 7; // цвет символа (VGA-палитра)
 static mut BG: u8 = 0; // цвет фона
 static mut BOLD: bool = false; // яркость символа (VGA-бит 3)
+/// Веха 230.3 — ОБРАТНЫЙ (`SGR 7`): меняет местами цвет текста и фона.
+///
+/// Нужен тулкиту терминала: им рисуются строка состояния, выделенная строка списка и подписи
+/// клавиш. До этой вехи консоль ядра его не знала, и `ved` ради этого брал явные цвета (синий
+/// фон, белый текст) — то есть программа подбирала цвета под чужую тему, потому что сказать
+/// «обратный» было нечем. На VGA обратного бита нет, зато смена местами — ровно то же самое.
+static mut REVERSE: bool = false;
 
 /// ANSI-цвет (0..7) → VGA-цвет: у VGA другой порядок (красный=4, синий=1…).
 const ANSI2VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
 /// Собрать текущий атрибут из fg/bg/bold.
 unsafe fn recompose() {
-    ATTR = (BG << 4) | (if BOLD { 0x08 } else { 0 }) | FG;
+    let (fg, bg) = if REVERSE { (BG, FG) } else { (FG, BG) };
+    ATTR = (bg << 4) | (if BOLD { 0x08 } else { 0 }) | fg;
 }
 
 /// Применить накопленный SGR (`ESC[ … m`): цвета/яркость/сброс.
@@ -353,9 +361,12 @@ unsafe fn apply_sgr() {
                 FG = 7;
                 BG = 0;
                 BOLD = false;
+                REVERSE = false;
             }
             1 => BOLD = true,
+            7 => REVERSE = true,
             22 => BOLD = false,
+            27 => REVERSE = false,
             30..=37 => FG = ANSI2VGA[(n - 30) as usize],
             39 => FG = 7,
             40..=47 => BG = ANSI2VGA[(n - 40) as usize],

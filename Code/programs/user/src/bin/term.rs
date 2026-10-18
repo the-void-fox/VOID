@@ -1473,7 +1473,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 if let Some((dy, start, run)) =
                     detect_scroll(&prev_cells, &cells, view.cols, view.rows)
                 {
-                    let ch = view.cell_h();
+                        let ch = view.cell_h();
                     out.scroll_up(&info, start * ch, (start + dy) * ch, run * ch);
                     // Тот же сдвиг в своей памяти прошлого кадра — тогда `dirty_rows` ниже
                     // увидит ровно то, что ДЕЙСТВИТЕЛЬНО новое.
@@ -2097,6 +2097,27 @@ fn compose(
 ///
 /// Поэтому полоса засчитывается, только если в ней есть хоть одна строка со знаками. Пустота,
 /// уехавшая вверх, — не прокрутка, а совпадение.
+///
+/// ## Веха 230.3 — и строки в полосе обязаны быть РАЗНЫМИ
+///
+/// Запрет пустоты закрыл половину дыры. Вторая открылась, как только в терминале появилась
+/// полноэкранная программа ([[void-ui]], тулкит `tui/`): редактор рисует за концом файла
+/// столбец одинаковых тильд, и ПОЛОСА ОДИНАКОВЫХ СТРОК совпадает со своей сдвинутой копией
+/// точно так же, как пустая, — только она не пустая и прежнюю проверку проходит.
+///
+/// Выглядело это так: первый кадр редактора вставал на место, а со второго экран уезжал на
+/// строку — строка состояния оставалась нарисованной дважды, в старом месте и в новом. Искали
+/// в тулките (думали: пишем в правый нижний угол и прокручиваем терминал), а виновата была
+/// оптимизация здесь.
+///
+/// Правило теперь общее и короткое: **сдвиг виден только там, где строки различимы**. Полоса из
+/// одинаковых строк не доказывает ничего — ни пустая, ни полная.
+fn band_is_uniform(now: &[Cell], cols: usize, start: usize, run: usize) -> bool {
+    let first = &now[start * cols..(start + 1) * cols];
+    !(start + 1..start + run).any(|y| now[y * cols..(y + 1) * cols] != *first)
+}
+
+/// Уехала ли полоса строк вверх (продолжение).
 fn detect_scroll(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> Option<(usize, usize, usize)> {
     const MIN_BAND: usize = 8;
     if prev.len() != now.len() || rows < MIN_BAND + 2 {
@@ -2129,7 +2150,8 @@ fn detect_scroll(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> Optio
             }
         }
         let real = filled[start..start + run].iter().any(|&f| f);
-        if run >= MIN_BAND && real && best.map_or(true, |(_, _, b)| run > b) {
+        let различимы = run > 0 && !band_is_uniform(now, cols, start, run);
+        if run >= MIN_BAND && real && различимы && best.map_or(true, |(_, _, b)| run > b) {
             best = Some((dy, start, run));
         }
     }
