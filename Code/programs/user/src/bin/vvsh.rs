@@ -1560,6 +1560,9 @@ const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         ("random", sh_random), // Веха 86 — случайные байты от ядра
         // Веха 84 — перенос команд vsh в vvsh: файлы/каталоги, store, сеть, поколения.
         ("roots", sh_roots),
+        // Веха 229.3 (ADR 0022) — СВОЁ МЕСТО ПРОГРАММЫ: забыть настроенное и заморозить его.
+        ("forget", sh_forget),
+        ("freeze", sh_freeze),
         ("mkdir", sh_mkdir),
         ("stat", sh_stat), // Веха 177 — вид, размер и время
         ("readlink", sh_readlink), // Веха 108.2 — симлинки есть только в дереве пакета
@@ -1895,6 +1898,8 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row("root-del ИМЯ".as_bytes(), "снять корень");
     help_row("secret ИМЯ".as_bytes(), "задать корень, не показывая значения (пароли)");
     help_row("doc [раздел]".as_bytes(), "руководство системы (без имени — список разделов)");
+    help_row("forget ПРОГРАММА".as_bytes(), "забыть настроенное программой (вернётся объявленное)");
+    help_row("freeze ПРОГРАММА".as_bytes(), "напечатать настроенное записями для apps.vv");
     help_row(b"rebuild", "собрать поколение из /etc/system/*.vv");
     help_row(b"gens", "показать поколения системы (активно — *)");
     help_row(b"switch GEN", "выбрать поколение (после ребута)");
@@ -2075,6 +2080,114 @@ fn arg_path(args: &[Value], usage: &str) -> Result<Vec<u8>, EvalError> {
 }
 
 /// `(roots)` — сырые корни store (короткий id + имя на строку). Store — start-cap 1.
+// ── своё место программы: забыть и заморозить (Веха 229.3, ADR 0022) ───────────────────────
+//
+// Состояние программы живёт файлами в `/etc/apps/<имя>` и правится ею самой. Декларация задаёт
+// только то, С ЧЕМ она приезжает (`app` в конфиге), и настроенное не трогает — иначе каждый вход
+// затирал бы работу человека. Отсюда две команды, замыкающие круг:
+//
+//   forget <программа>  — убрать настроенное; объявленное вернётся само;
+//   freeze <программа>  — напечатать настроенное готовыми записями для конфига.
+//
+// `freeze` печатает, а не правит конфиг: текст `*.vv` принадлежит человеку (его комментарии, его
+// порядок), и машинная правка там запрещена — тем же решением, что и у записок диспетчера задач
+// в `/etc/granted`.
+
+/// Где лежит состояние программы: объявленное место (`desktop state`) либо `/etc/apps/<имя>`.
+fn app_place(who: &str) -> String {
+    if let Some(text) = read_generation_text() {
+        for e in void_conf::of(&text, "desktop") {
+            if e.key() != "state" {
+                continue;
+            }
+            let tail = e.tail().trim();
+            if let Some((name, path)) = tail.split_once(' ') {
+                if name.trim() == who {
+                    return String::from(path.trim().trim_end_matches('/'));
+                }
+            }
+        }
+    }
+    alloc::format!("/etc/apps/{who}")
+}
+
+/// Имя программы аргументом команды. Чужих путей не принимаем: `forget ../..` должен быть
+/// опечаткой, а не правом.
+fn app_arg(args: &[Value], cmd: &str) -> Result<String, EvalError> {
+    let Some(Value::Str(who)) = args.first() else {
+        return Err(EvalError::new(alloc::format!("{cmd}: ({cmd} \"программа\")")));
+    };
+    let who = who.trim();
+    if who.is_empty() || who.contains('/') || who.contains("..") {
+        return Err(EvalError::new(alloc::format!("{cmd}: имя программы — одно слово без косых")));
+    }
+    Ok(String::from(who))
+}
+
+/// `(forget "fm")` — убрать СВОЁ место программы целиком.
+///
+/// Объявленное вернётся при следующем открытии программы (его раскладывает композитор), а
+/// настроенное пропадёт — на то и команда. Спрашивать подтверждение здесь некому: это шелл,
+/// команда названа словом «забыть», и вводит её человек.
+fn sh_forget(args: &[Value]) -> Result<Value, EvalError> {
+    let who = app_arg(args, "forget")?;
+    let place = app_place(&who);
+    let ep = cap_fs();
+    if px::stat(ep, place.as_bytes()).is_none() {
+        sys::write(tf("{}: нечего забывать ({})\n", &[&who, &place]).as_bytes());
+        return Ok(Value::nil());
+    }
+    if px::unlink_all(ep, place.as_bytes()) != 0 {
+        return Err(EvalError::new("forget: не вышло убрать место"));
+    }
+    sys::write(tf("{}: забыто ({})\n", &[&who, &place]).as_bytes());
+    Ok(Value::nil())
+}
+
+/// `(freeze "fm")` — напечатать настроенное программой готовыми записями конфига.
+///
+/// Это и есть «смесь `.config` и Nix» из ADR 0022: человек настраивает руками, а потом решает,
+/// что из настроенного станет ОБЪЯВЛЕННЫМ и уедет на другую машину вместе с поколением.
+fn sh_freeze(args: &[Value]) -> Result<Value, EvalError> {
+    let who = app_arg(args, "freeze")?;
+    let place = app_place(&who);
+    let ep = cap_fs();
+    let mut names = alloc::vec![0u8; 4096];
+    let n = px::readdir(ep, place.as_bytes(), &mut names);
+    if n == 0 {
+        sys::write(tf("{}: ничего не настроено ({})\n", &[&who, &place]).as_bytes());
+        return Ok(Value::nil());
+    }
+    let list = String::from_utf8_lossy(&names[..n]).into_owned();
+    let mut сказано = false;
+    for name in list.lines() {
+        let name = name.trim();
+        // Подкаталогов в своём месте не предусмотрено, и замораживать их нечем.
+        if name.is_empty() || name.ends_with('/') {
+            continue;
+        }
+        let path = alloc::format!("{place}/{name}");
+        let Some(data) = read_file(ep, path.as_bytes()) else { continue };
+        for line in String::from_utf8_lossy(&data).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            sys::write(alloc::format!("app(\"{who}\", \"{name}\", \"{line}\"),\n").as_bytes());
+            сказано = true;
+        }
+    }
+    if сказано {
+        sys::write(
+            sys::i18n::t("↑ вставьте в список `state` файла /etc/system/apps.vv, затем `rebuild`\n")
+                .as_bytes(),
+        );
+    } else {
+        sys::write(tf("{}: ничего не настроено ({})\n", &[&who, &place]).as_bytes());
+    }
+    Ok(Value::nil())
+}
+
 fn sh_roots(_args: &[Value]) -> Result<Value, EvalError> {
     // Список читается ЦЕЛИКОМ (Веха 107): с пакетами корней стало много — по два на каждый путь
     // замыкания, — и фиксированный буфер молча резал вывод посреди строки.

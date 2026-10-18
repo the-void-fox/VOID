@@ -490,6 +490,7 @@ const BUILTINS: &[(&str, BuiltinFn)] = &[
     ("ui", b_ui),
     ("bar", b_bar),
     ("default", b_default),
+    ("app", b_app),
     ("device", b_device),
     ("packages", b_packages),
     ("autostart", b_autostart),
@@ -765,6 +766,17 @@ fn b_ui(args: &[Value]) -> Result<Value, EvalError> {
     build_entry("ui", args)
 }
 
+/// Веха 229.3 — `(app программа файл строка)`: С ЧЕМ ПРОГРАММА ПРИЕЗЖАЕТ.
+///
+/// Умолчание для её состояния ([[0022-app-state-directory]]): закладки менеджера на новой
+/// машине, громкость по вкусу владельца. Пока своего файла у программы нет, он составляется из
+/// этих строк — а дальше программа правит его сама, и декларация в это больше не вмешивается.
+///
+/// Отдельный вид, а не `default`: тот отвечает «чем открывать», этот — «что программа помнит».
+fn b_app(args: &[Value]) -> Result<Value, EvalError> {
+    build_entry("app", args)
+}
+
 /// Веха 198.1 — `(touchpad ключ значение)`: чувствительность тачпада. Читает ЯДРО, потому что
 /// тачпад держит оно; оболочке эти числа не нужны и знать их незачем.
 ///
@@ -881,6 +893,6 @@ fn is_entry(items: &[Value]) -> bool {
     matches!(items.first(), Some(Value::Sym(s))
         if matches!(&**s,
             "service" | "shell" | "terminal" | "desktop" | "ui" | "device" | "bind"
-                | "gesture" | "packages" | "autostart" | "channel" | "bar" | "default"
+                | "gesture" | "packages" | "autostart" | "channel" | "bar" | "default" | "app"
                 | "touchpad" | "acpi"))
 }

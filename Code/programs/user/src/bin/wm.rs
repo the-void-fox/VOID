@@ -895,6 +895,41 @@ fn state_policy(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Веха 229.3 ([[0022-app-state-directory]]) — **С ЧЕМ ПРОГРАММА ПРИЕЗЖАЕТ**: записи
+/// `app <программа> <файл> <строка>`.
+///
+/// Умолчание для состояния: пока своего файла у программы нет, он складывается из этих строк по
+/// порядку. Так новая машина поднимается с закладками владельца, а не пустой — ради этого ADR
+/// 0022 и затевался («они не декларируемые, то есть не переживают переустановку»).
+///
+/// Имя файла — одно слово без косых: своё место у программы плоское, подкаталогов в нём не
+/// предусмотрено, а `..` в имени означал бы выход из него (ядро такое и так не пропустит, но
+/// сказать об этом лучше здесь, где видно строку конфига).
+fn seed_policy(text: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for e in void_conf::of(text, "app") {
+        let (Some(prog), Some(file)) = (e.word(0), e.word(1)) else {
+            sys::write_console(
+                alloc::format!("[wm] app «{}»: нужны ПРОГРАММА, ФАЙЛ и строка\n", e.rest)
+                    .as_bytes(),
+            );
+            continue;
+        };
+        // Значение — всё после двух слов, как есть: пробел в нём законен.
+        let tail = e.rest.trim_start_matches(prog).trim_start();
+        let line = tail.trim_start_matches(file).trim_start();
+        if line.is_empty() || file.contains('/') || file.contains("..") {
+            sys::write_console(
+                alloc::format!("[wm] app {prog} «{file}»: имя файла — одно слово, строка непустая\n")
+                    .as_bytes(),
+            );
+            continue;
+        }
+        out.push((String::from(prog), String::from(file), String::from(line)));
+    }
+    out
+}
+
 /// Веха 140 — просит ли конфиг поколения ПАНЕЛЬ: строка `desktop bar on`.
 ///
 /// Выключателем, а не высотой: высота панели следует за шрифтом (8×16 плюс поля), и вынести её в
@@ -1140,6 +1175,8 @@ fn main_loop() -> ! {
         sndcap: sys::snd_cli::find_cap().unwrap_or(sys::NO_CAP),
         grants: grant_policy(&generation),
         app_state: state_policy(&generation),
+        app_seed: seed_policy(&generation),
+        places: Vec::new(),
         liveness_at: 0,
         kmods: 0,
         notes: Vec::new(),
@@ -1236,6 +1273,26 @@ fn main_loop() -> ! {
     // порядка: сеанс говорит, КАК ЛЕЖАЛО, а конфиг — ЧТО ВООБЩЕ должно быть на столе. Позванное
     // сеансом конфиг вторым разом не зовёт; чего в сеансе не было — запустится как обычно.
     let restored = wm.restore_session(store, me);
+
+    // Веха 229.3 — РАЗЛОЖИТЬ ОБЪЯВЛЕННОЕ до того, как кто-нибудь откроется. Окна своё место
+    // спросят сами, а СЕРВИСЫ (звук, сеть) берут его стартовым правом и читают при подъёме —
+    // спрашивать композитора им нечем и незачем. Поэтому проходим по всем объявленным именам,
+    // а не только по тем, кого запускаем сами.
+    //
+    // Для сервисов это значит «со следующей загрузки»: они поднялись раньше композитора и своё
+    // прочитать уже успели. Честная цена одного прохода вместо участия ядра в раскладке файлов.
+    let мест: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        for (prog, _, _) in wm.app_seed.iter() {
+            if !v.iter().any(|p| p == prog) {
+                v.push(prog.clone());
+            }
+        }
+        v
+    };
+    for prog in мест {
+        wm.seed_state(&prog);
+    }
 
     let argv = sys::argv::Argv::take();
     let list = autostart(&generation);
@@ -2016,6 +2073,12 @@ struct Wm {
     /// Веха 229.2 — куда кому класть состояние: `(имя программы, путь)` из строк
     /// `desktop state`. Пусто — каждому своё `/etc/apps/<имя>`, и это нормальный случай.
     app_state: Vec<(String, String)>,
+    /// Веха 229.3 — с чем программа ПРИЕЗЖАЕТ: `(имя, файл, строка)` из записей `app`. По записи
+    /// на строку файла, порядок конфига сохраняется.
+    app_seed: Vec<(String, String, String)>,
+    /// Веха 229.3 — уже сужённые права по местам: `(путь, cap)`. Сужение занимает слот в таблице
+    /// прав, а места спрашивают часто — поэтому на место их ровно по одному.
+    places: Vec<(String, usize)>,
     /// Веха 166.1 — когда последний раз сверяли живость ЧУЖИХ хозяев окон по списку процессов.
     liveness_at: u64,
     /// Веха 168 — накопленные УВЕДОМЛЕНИЯ, свежие первыми, и номер для следующего.
@@ -5828,14 +5891,36 @@ impl Wm {
     /// Путь по умолчанию — `/etc/apps/<имя>`; конфиг может назначить другой строкой
     /// `desktop state <имя> <путь>` (путь 3 из ADR 0022: «всё работает само, но если хотите
     /// переназначить — милости просим»).
-    fn state_for(&self, pid: usize) -> usize {
-        let Some(files) = sys::cap_named("POSIXFS") else { return sys::NO_CAP };
-        // Имя спрашиваем у ЯДРА — для этого нужен обзор процессов.
+    fn state_for(&mut self, pid: usize) -> usize {
+        let Some(leaf) = self.proc_leaf(pid) else { return sys::NO_CAP };
+        let path = self.state_path(&leaf);
+        // Умолчания из декларации — ПЕРЕД выдачей права: программа должна открыть своё место и
+        // увидеть в нём объявленное, а не пустоту, которую потом кто-то дозаполнит.
+        self.seed_state(&leaf);
+        let cap = self.place_cap(&path);
+        sys::write_console(
+            alloc::format!(
+                "[wm] место P{} «{}» → {}{}\n",
+                pid,
+                leaf,
+                path,
+                if cap == sys::NO_CAP { " — СУЗИТЬ НЕ ВЫШЛО" } else { "" },
+            )
+            .as_bytes(),
+        );
+        cap
+    }
+
+    /// Имя программы процесса `pid` ПО ВЕРСИИ ЯДРА, последним звеном (`bin/vvsh` → `vvsh`).
+    ///
+    /// Последним звеном потому, что каталог состояния зовётся именем программы, а не её местом в
+    /// store. `None` — обзора процессов нет, такого процесса нет или имя негодное.
+    fn proc_leaf(&self, pid: usize) -> Option<String> {
         if self.sysview == sys::NO_CAP {
-            return sys::NO_CAP;
+            return None;
         }
         let rec = sys::PROC_REC;
-        let Some(buf) = proc_snapshot(self.sysview) else { return sys::NO_CAP };
+        let buf = proc_snapshot(self.sysview)?;
         for k in 0..buf.len() / rec {
             let r = &buf[k * rec..k * rec + rec];
             if u16::from_le_bytes([r[0], r[1]]) as usize != pid {
@@ -5843,30 +5928,88 @@ impl Wm {
             }
             let nlen = (r[7] as usize).min(24);
             let name = core::str::from_utf8(&r[40..40 + nlen]).unwrap_or("");
-            // Имя программы в store бывает с путём (`bin/vvsh`) — берём последнее звено:
-            // каталог состояния зовётся именем программы, а не её местом в store.
             let leaf = name.rsplit('/').next().unwrap_or(name);
             if leaf.is_empty() || leaf.contains("..") {
-                return sys::NO_CAP;
+                return None;
             }
-            let path = match self.app_state.iter().find(|(n, _)| n == leaf) {
-                Some((_, p)) => p.clone(),
-                None => alloc::format!("/etc/apps/{leaf}"),
-            };
-            let cap = sys::cap_narrow(files, path.as_bytes()).unwrap_or(sys::NO_CAP);
+            return Some(String::from(leaf));
+        }
+        None
+    }
+
+    /// Где место программы `who`: объявленное конфигом либо `/etc/apps/<имя>`.
+    fn state_path(&self, who: &str) -> String {
+        match self.app_state.iter().find(|(n, _)| n == who) {
+            Some((_, p)) => p.clone(),
+            None => alloc::format!("/etc/apps/{who}"),
+        }
+    }
+
+    /// Право на файлы, сужённое до `path`. Сужается ОДИН РАЗ на место и запоминается.
+    ///
+    /// Запоминается не ради скорости: каждое сужение занимает слот в таблице прав композитора, а
+    /// места спрашивают при каждом открытии окна. Без памяти слоты утекали бы — медленно и
+    /// молча, то есть худшим из возможных способов (так уже было с правами окон, Веха 156.1).
+    fn place_cap(&mut self, path: &str) -> usize {
+        if let Some((_, c)) = self.places.iter().find(|(p, _)| p == path) {
+            return *c;
+        }
+        let Some(files) = sys::cap_named("POSIXFS") else { return sys::NO_CAP };
+        let Some(cap) = sys::cap_narrow(files, path.as_bytes()) else { return sys::NO_CAP };
+        self.places.push((String::from(path), cap));
+        cap
+    }
+
+    /// Веха 229.3 — **УМОЛЧАНИЯ ИЗ ДЕКЛАРАЦИИ**: разложить по месту программы `who` то, что
+    /// объявлено строками `app <имя> <файл> <строка>`.
+    ///
+    /// Пишется только то, чего ЕЩЁ НЕТ: объявление — это «с чем программа приезжает», а не «что
+    /// у неё всегда». Иначе декларация затирала бы настроенное человеком при каждом входе, то
+    /// есть ровно тот спор двух правд, ради избегания которого состояние и отделено от конфига
+    /// (ADR 0022).
+    ///
+    /// Пишем сужённым правом, а не своим широким, по двум причинам: сервер сам заводит корень
+    /// под таким правом (широкому пришлось бы создавать каталоги руками) и мимо места не
+    /// промахнёшься — выйти за корень нечем.
+    fn seed_state(&mut self, who: &str) {
+        if !self.app_seed.iter().any(|(p, _, _)| p == who) {
+            return;
+        }
+        let path = self.state_path(who);
+        let cap = self.place_cap(&path);
+        if cap == sys::NO_CAP {
+            return;
+        }
+        // Собираем по файлам, сохраняя порядок строк конфига.
+        let mut файлы: Vec<(&String, String)> = Vec::new();
+        for (prog, file, line) in self.app_seed.iter() {
+            if prog != who {
+                continue;
+            }
+            match файлы.iter_mut().find(|(f, _)| *f == file) {
+                Some((_, text)) => {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                None => файлы.push((file, alloc::format!("{line}\n"))),
+            }
+        }
+        for (file, text) in файлы {
+            let имя = alloc::format!("/{file}");
+            if sys::posix::stat(cap, имя.as_bytes()).is_some() {
+                continue; // своё уже есть — декларация молчит
+            }
+            let ok = sys::posix::echo_to(cap, имя.as_bytes(), text.as_bytes());
             sys::write_console(
                 alloc::format!(
-                    "[wm] место P{} «{}» → {}{}\n",
-                    pid,
-                    leaf,
+                    "[wm] объявленное {}{}{}\n",
                     path,
-                    if cap == sys::NO_CAP { " — СУЗИТЬ НЕ ВЫШЛО" } else { "" },
+                    имя,
+                    if ok { " разложено" } else { " — ЗАПИСАТЬ НЕ ВЫШЛО" },
                 )
                 .as_bytes(),
             );
-            return cap;
         }
-        sys::NO_CAP
     }
 
     fn request(&mut self, m: &sys::Message, buf: &[u8]) {
