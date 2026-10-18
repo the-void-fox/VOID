@@ -1754,11 +1754,21 @@ fn sh_notify(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
-/// `(date)` — текущее время системы: `ГГГГ-ММ-ДД ЧЧ:ММ:СС UTC` (Веха 86, часы от прошивки).
+/// `(date)` — текущее время системы: `ГГГГ-ММ-ДД ЧЧ:ММ:СС UTC+03:00` (Веха 86 — часы от
+/// прошивки или от NTP; Веха 230 — МЕСТНОЕ время, если конфиг назвал пояс).
+///
+/// Подпись пояса стоит всегда и не для красоты: без неё «11:10» и «14:10» — две одинаково
+/// правдоподобные строки, и понять, которая из них врёт, нельзя ничем.
 /// Возвращает строку — значит годится и в конвейер, и как значение выражения.
 fn sh_date(_args: &[Value]) -> Result<Value, EvalError> {
+    // Пояс живёт в поколении; читаем один раз за жизнь шелла.
+    if !sys::tz::known() {
+        if let Some(text) = read_generation_text() {
+            sys::tz::set_from_config(&text);
+        }
+    }
     let secs = sys::time_ns() / 1_000_000_000;
-    let (y, mo, d, h, mi, s) = sys::civil_from_unix(secs);
+    let (y, mo, d, h, mi, s) = sys::tz::civil_local(secs);
     let mut buf = [0u8; 32];
     let mut n = 0;
     let mut put = |v: i64, width: usize, sep: u8| {
@@ -1794,7 +1804,9 @@ fn sh_date(_args: &[Value]) -> Result<Value, EvalError> {
     put(s as i64, 2, 0);
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("?");
     let mut out = alloc::string::String::from(text);
-    out.push_str(" UTC");
+    out.push(' ');
+    let mut tzb = [0u8; 10];
+    out.push_str(sys::tz::label(&mut tzb));
     Ok(Value::str(&out))
 }
 
@@ -1905,7 +1917,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"switch GEN", "выбрать поколение (после ребута)");
     help_row(b"sysdef GEN F", "задать поколение из файла-конфига");
     help_row(b"notify T [TXT]", "сказать человеку: всплывашка и колокольчик в панели");
-    help_row(b"date", "текущее время системы (UTC)");
+    help_row(b"date", "текущее время системы (местное, с подписью пояса)");
     help_row(b"random [N]", "N случайных байт от ядра (hex)");
     help_row(b"log on|off", "подробный трейс ядра ([ipc]/[obj]/…)");
     help_row(b"clear", "очистить экран");

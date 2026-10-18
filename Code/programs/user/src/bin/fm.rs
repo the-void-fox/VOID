@@ -1779,7 +1779,7 @@ fn date_text(ns: u64) -> String {
     if ns == 0 {
         return String::from("—");
     }
-    let (y, mo, d, h, mi, _) = sys::civil_from_unix(ns / 1_000_000_000);
+    let (y, mo, d, h, mi, _) = sys::tz::civil_local(ns / 1_000_000_000);
     alloc::format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
 }
 

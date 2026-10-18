@@ -110,6 +110,8 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let generation = ui::conf::generation().unwrap_or_default();
     // Веха 178 — язык из того же поколения, что и тема: он такая же часть вида системы.
     ui::i18n::set_from_config(&generation);
+    // Веха 230 — часовой пояс: панель показывает время чаще всех в системе.
+    sys::tz::set_from_config(&generation);
     let th = Theme::from_config(&generation);
     let mut font = Font::load(th.font.as_deref(), th.font_px);
 
@@ -2415,9 +2417,9 @@ fn sig_str(s: &str) -> u64 {
     h
 }
 
-/// Часы «ЧЧ:ММ» по UTC.
+/// Часы «ЧЧ:ММ» по МЕСТНОМУ времени (Веха 230: `device timezone` в конфиге; без строки — UTC).
 fn clock_text() -> String {
-    let (_, _, _, hh, mm, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
+    let (_, _, _, hh, mm, _) = sys::tz::civil_local(sys::time_ns() / 1_000_000_000);
     alloc::format!("{hh:02}:{mm:02}")
 }
 
@@ -2428,7 +2430,7 @@ fn clock_text() -> String {
 /// в одном мире и как 9 августа в другом. Поэтому здесь язык меняет не текст, а форму числа —
 /// единственное такое место в панели.
 fn date_text() -> String {
-    let (_, mo, d, _, _, _) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
+    let (_, mo, d, _, _, _) = sys::tz::civil_local(sys::time_ns() / 1_000_000_000);
     if ui::i18n::is_en() {
         alloc::format!("{mo:02}-{d:02}")
     } else {

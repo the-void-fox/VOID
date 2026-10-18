@@ -45,12 +45,12 @@ use void_user as sys;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
-use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::storage::PacketMetadata;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
-    DnsQueryType, EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr,
+    DnsQueryType, EthernetAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
+    Ipv4Address, Ipv4Cidr,
 };
 
 use sys::net_cli::{
@@ -69,6 +69,19 @@ const PING_IDENT: u16 = 0x1D0;
 /// такой обязан лежать в нашей же подсети: до всего остального ARP делается к шлюзу, и отвечает
 /// шлюз. То есть сжечь пул можно лишь восемью разными несуществующими соседями подряд.
 const PING_SOCKETS: usize = 8;
+
+/// Сколько ждать ответа SNTP. Полсекунды мало (сервер может быть за океаном), десять — это уже
+/// задержка загрузки, которую человек заметит глазами.
+const NTP_MS: u64 = 2_000;
+
+/// Как часто сверять часы заново. Шесть часов — достаточно редко, чтобы не быть заметной
+/// нагрузкой ни на нас, ни на чужой сервер (правила NTP-пулов просят не чаще раза в час), и
+/// достаточно часто, чтобы дрейф кварца не успел накопиться во что-то видимое.
+const NTP_EVERY_NS: u64 = 6 * 60 * 60 * 1_000_000_000;
+
+/// Секунд между эпохой NTP (1900-01-01) и эпохой Unix (1970-01-01). Число известное и
+/// постоянное: 70 лет плюс 17 високосных дней.
+const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 /// Коды отказа пинга (уходят клиенту первым байтом ответа).
 const PING_UNRESOLVED: u8 = 1;
@@ -361,6 +374,9 @@ struct Cfg {
     /// Корень store (или content-id) со списком блокировки (`arg:block=…`).
     block: [u8; 96],
     block_len: usize,
+    /// Веха 230 — у кого спрашивать ВРЕМЯ (`arg:ntp=имя|адрес`, `ntp=off` — ни у кого).
+    ntp: [u8; NAME_MAX],
+    ntp_len: usize,
 }
 
 impl Cfg {
@@ -378,6 +394,10 @@ impl Cfg {
             nhosts: 0,
             block: [0; 96],
             block_len: 0,
+            // Пусто по умолчанию: ходить в сеть за временем система обязана лишь тогда, когда ей
+            // это объявили. Шаблон конфига объявляет `pool.ntp.org` — строкой, которую видно.
+            ntp: [0; NAME_MAX],
+            ntp_len: 0,
         }
     }
 
@@ -493,6 +513,16 @@ impl Cfg {
                     }
                     _ => false,
                 },
+                // Веха 230 — КТО СКАЖЕТ ВРЕМЯ: имя или адрес сервера NTP. `off` — никто.
+                b"ntp" if matches!(val, b"off") => {
+                    cfg.ntp_len = 0;
+                    true
+                }
+                b"ntp" if !val.is_empty() && val.len() <= cfg.ntp.len() => {
+                    cfg.ntp[..val.len()].copy_from_slice(val);
+                    cfg.ntp_len = val.len();
+                    true
+                }
                 // Веха 136 — список блокировки: корень store или content-id. Сам список читается
                 // позже, когда известно, дали ли нам право на store.
                 b"block" if val.len() <= cfg.block.len() => {
@@ -536,7 +566,7 @@ fn warn_arg(tok: &[u8]) {
     sys::write(tok);
     sys::write(
         "' (жду dhcp=off|on, ip=A.B.C.D/NN, gw=A.B.C.D, dns=A.B.C.D[,A.B.C.D], \
-         host=имя=A.B.C.D, block=корень)\n"
+         host=имя=A.B.C.D, block=корень, ntp=имя|адрес|off)\n"
             .as_bytes(),
     );
 }
@@ -639,7 +669,14 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     let mut tcp_rx = [[0u8; TCP_RX]; MAX_CONN];
     let mut tcp_tx = [[0u8; TCP_TX]; MAX_CONN];
 
-    let mut storage = [SocketStorage::EMPTY; 2 + PING_SOCKETS + MAX_CONN];
+    // Веха 230 — UDP под SNTP. Один сокет и крошечные буферы: пакет NTP — ровно 48 байт, и
+    // больше одного обмена за раз нам не нужно.
+    let mut ntp_rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut ntp_rx_data = [0u8; 256];
+    let mut ntp_tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut ntp_tx_data = [0u8; 256];
+
+    let mut storage = [SocketStorage::EMPTY; 3 + PING_SOCKETS + MAX_CONN];
     let mut sockets = SocketSet::new(&mut storage[..]);
     let mut icmp_bufs = icmp_rx_meta
         .iter_mut()
@@ -658,6 +695,10 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     // не «человек передумал», а новая жизнь, и начинать её выключенным было бы ловушкой.
     let mut link_on = true;
     let dns_handle = sockets.add(dns_socket);
+    let ntp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(&mut ntp_rx_meta[..], &mut ntp_rx_data[..]),
+        udp::PacketBuffer::new(&mut ntp_tx_meta[..], &mut ntp_tx_data[..]),
+    ));
     let dhcp_handle = cfg.dhcp.then(|| sockets.add(dhcp_socket));
     let mut bufs = tcp_rx.iter_mut().zip(tcp_tx.iter_mut());
     let tcp_handles: [SocketHandle; MAX_CONN] = core::array::from_fn(|_| {
@@ -755,6 +796,19 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         sys::write("[net-srv] шлюза нет — доступна только локальная сеть\n".as_bytes());
     }
 
+    // Веха 230 — ПОДВЕСТИ ЧАСЫ ПО СЕТИ при подъёме, а дальше изредка повторять.
+    //
+    // Здесь, а не в отдельной службе: время спрашивают по UDP, а UDP наружу мы не отдаём вовсе
+    // (клиентам доступны ping, DNS и TCP). Заводить ради одного пакета второй сервер с сырым
+    // доступом к проводу — худший размен, чем сорок строк тут.
+    let mut ntp_at = 0u64; // когда звать в следующий раз (монотонные нс; 0 — прямо сейчас)
+    if cfg.ntp_len > 0 {
+        sync_clock(
+            &mut iface, &mut device, &mut sockets, dns_handle, ntp_handle, &cfg, blocklist, true,
+        );
+        ntp_at = sys::monotonic_ns() + NTP_EVERY_NS;
+    }
+
     // Серверный цикл (Веха 90 — РЕАКТОР): стек прокачивается постоянно, а IPC разбирается между
     // тиками неблокирующим приёмом. До этого сервер стоял в блокирующем `recv`, и стек тикал
     // только внутри `ping` — для ICMP сходило, для TCP (Веха 93) не сойдёт: ретрансмиссии и
@@ -772,6 +826,20 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         // Веха 93: раздать ответы тем, чьи сокеты дошли до нужного состояния, и прибрать
         // доигравшие закрытия. Это делается ДО сна — иначе клиент ждал бы лишний круг.
         complete_pending(&mut sockets, &tcp_handles, &mut conns, &mut hold);
+        // Веха 230 — ПОВТОРНАЯ СВЕРКА ЧАСОВ. Кварц машины уходит на секунды в сутки, а VOID
+        // рассчитан на то, чтобы не выключаться; один раз при загрузке — это «верно на момент
+        // включения», а не «верные часы». Срок считаем по МОНОТОННОМУ времени: настенное мы сами
+        // же и двигаем, и считать по нему срок следующей сверки значило бы считать по линейке,
+        // которую сам же и растягиваешь.
+        if cfg.ntp_len > 0 && sys::monotonic_ns() >= ntp_at {
+            // Обмен блокирует цикл на время ответа (до NTP_MS, плюс DNS при первом разе) —
+            // раз в шесть часов это честная цена за часы, которые не уезжают.
+            sync_clock(
+                &mut iface, &mut device, &mut sockets, dns_handle, ntp_handle, &cfg, blocklist,
+                false,
+            );
+            ntp_at = sys::monotonic_ns() + NTP_EVERY_NS;
+        }
         // Веха 91 — СОН ВМЕСТО ОПРОСА. Спим в самом `SYS_RECV` (режим с дедлайном): пока никто
         // не зовёт и стеку нечего делать, процесс не занимает процессор вовсе — он заблокирован
         // ядром, а не крутит цикл. Момент пробуждения называет САМ стек: `poll_at` — это время
@@ -1479,6 +1547,123 @@ fn resolve(
     }
     sockets.get_mut::<dns::Socket>(handle).cancel_query(query);
     Err(2)
+}
+
+/// Веха 230 — **СПРОСИТЬ ВРЕМЯ У СЕТИ (SNTP) И ПОДВЕСТИ ЧАСЫ**.
+///
+/// Зачем это вообще: RTC ноутбука врёт, а на машине без батарейки часов нет вовсе — система
+/// поднимается в 1970 году. От даты зависят сроки сертификатов TLS, то есть «сеть сломалась без
+/// причины» — на самом деле «часы отстали на годы». Разобраться в таком, не зная про часы,
+/// нельзя ни одним замером.
+///
+/// Протокол взят самый простой — SNTP (RFC 4330, упрощённый NTP): один пакет туда, один обратно.
+/// Полного NTP с фильтрацией, выбором источника и плавным подводом нет и не планируется: это
+/// служба целиком, а задача здесь — чтобы дата была ВЕРНОЙ, а не точной до миллисекунды.
+///
+/// Права на подвод часов (`clock`) может и не быть: тогда время спрашивается, печатается и
+/// выбрасывается. Так видно, что сеть и сервер в порядке, а запрещает именно конфиг.
+fn sync_clock(
+    iface: &mut Interface,
+    device: &mut sys::net_phy::VoidDevice,
+    sockets: &mut SocketSet,
+    dns_handle: SocketHandle,
+    ntp_handle: SocketHandle,
+    cfg: &Cfg,
+    bl: &Blocklist,
+    первый: bool,
+) {
+    // Адрес сервера: либо прямо числами, либо через DNS — ровно как это делает `ping`.
+    let spec = &cfg.ntp[..cfg.ntp_len];
+    let addr = match parse_ipv4(spec) {
+        Some(a) => a,
+        None => {
+            let Ok(name) = core::str::from_utf8(spec) else {
+                sys::write("[net-srv] NTP: имя сервера не UTF-8\n".as_bytes());
+                return;
+            };
+            match resolve(iface, device, sockets, dns_handle, cfg, bl, name) {
+                Ok(a) => a,
+                Err(_) => {
+                    sys::write("[net-srv] NTP: имя ".as_bytes());
+                    sys::write(spec);
+                    sys::write(" не разрешилось — часы остались как были\n".as_bytes());
+                    return;
+                }
+            }
+        }
+    };
+
+    // Порт источника — эфемерный и СВОЙ на каждую загрузку: фиксированный был бы приметой
+    // машины в чужой сети, а нам он не нужен ничем.
+    let port = EPHEMERAL_BASE.wrapping_add((sys::now() as u16) & 0x0fff);
+    {
+        let s = sockets.get_mut::<udp::Socket>(ntp_handle);
+        if s.bind(port).is_err() {
+            sys::write("[net-srv] NTP: не открыть UDP-сокет\n".as_bytes());
+            return;
+        }
+        // Запрос: 48 байт, из которых значащий ровно первый. 0x1B = LI 0 (без секунды
+        // координации), версия 3, режим 3 (клиент). Остальное сервер не читает.
+        let mut req = [0u8; 48];
+        req[0] = 0x1B;
+        if s.send_slice(&req, IpEndpoint::new(IpAddress::Ipv4(addr), 123)).is_err() {
+            sys::write("[net-srv] NTP: запрос не отправился\n".as_bytes());
+            s.close();
+            return;
+        }
+    }
+
+    let since = sys::net_phy::now();
+    let deadline = since + Duration::from_millis(NTP_MS);
+    let mut unix: Option<u64> = None;
+    while sys::net_phy::now() < deadline && unix.is_none() {
+        iface.poll(sys::net_phy::now(), device, sockets);
+        let s = sockets.get_mut::<udp::Socket>(ntp_handle);
+        if let Ok((data, _)) = s.recv() {
+            // Ответ SNTP: нам нужен transmit timestamp — секунды с 1900 года, байты 40..44.
+            // Дробную часть (44..48) сознательно выбрасываем: сдвиг на доли секунды не стоит
+            // ни строки кода там, где часы до этого врали на годы.
+            if data.len() >= 48 {
+                let secs1900 = u32::from_be_bytes([data[40], data[41], data[42], data[43]]) as u64;
+                // Ноль значит «сервер не знает времени» (kiss-o'-death и прочее) — не верим.
+                if secs1900 > NTP_EPOCH_OFFSET {
+                    unix = Some(secs1900 - NTP_EPOCH_OFFSET);
+                }
+            }
+            if unix.is_none() {
+                sys::write("[net-srv] NTP: ответ негодный\n".as_bytes());
+                break;
+            }
+        }
+        wait_step(iface, sockets, since);
+    }
+    sockets.get_mut::<udp::Socket>(ntp_handle).close();
+
+    let Some(unix) = unix else {
+        sys::write("[net-srv] NTP: ".as_bytes());
+        sys::write(spec);
+        sys::write(" не ответил — часы остались как были\n".as_bytes());
+        return;
+    };
+
+    // Подводим — если конфиг дал право. Оно названо строкой (`clock`), и отсутствие его здесь
+    // не ошибка, а решение владельца: машина без права на часы просто живёт на своём RTC.
+    match sys::cap_named("CLOCK") {
+        Some(cap) if sys::clock_set(cap, unix * 1_000_000_000) => {
+            // О первой сверке говорим — это часть рассказа о подъёме системы; о повторных
+            // молчим: ядро само скажет, если часы сдвинулись заметно.
+            if первый {
+                sys::write("[net-srv] часы подведены по NTP (".as_bytes());
+                sys::write(spec);
+                sys::write(")\n".as_bytes());
+            }
+        }
+        Some(_) => sys::write("[net-srv] NTP: ядро отклонило подвод часов\n".as_bytes()),
+        None => sys::write(
+            "[net-srv] NTP: время получено, но права на часы нет (нужен токен `clock`)\n"
+                .as_bytes(),
+        ),
+    }
 }
 
 /// Один echo-запрос с замером RTT. Возвращает микросекунды либо код ошибки

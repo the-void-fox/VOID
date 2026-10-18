@@ -11,7 +11,7 @@
 //! ```text
 //! # комментарий
 //! service posixfs store:rw          # сервер + права a0
-//! service net-srv dev:net:rw
+//! service net-srv dev:net:rw clock arg:ntp=pool.ntp.org
 //! shell   vsh endpoint:posixfs store:rwx endpoint:net-srv env
 //! ```
 //! Токены прав: `store:RWX`, `dev:net:RW`, `dev:block:RW`, `endpoint:ИМЯ[:S]` (по умолчанию SEND),
@@ -148,7 +148,7 @@ impl Пожелание {
 const DEFAULT_GEN1: &str = "\
 # VOID — поколение по умолчанию (полное: файлы + сеть)
 service posixfs store:rw
-service net-srv dev:net:rw
+service net-srv dev:net:rw clock arg:ntp=pool.ntp.org
 shell vsh endpoint:posixfs store:rwx endpoint:net-srv power env
 ";
 
@@ -172,7 +172,7 @@ shell vsh endpoint:posixfs store:rwx power env
 const DEFAULT_GEN3: &str = "\
 # VOID — поколение с графическим терминалом (Веха 97)
 service posixfs store:rw
-service net-srv dev:net:rw
+service net-srv dev:net:rw clock arg:ntp=pool.ntp.org
 service hda mmio:hda dma endpoint:posixfs:/etc/apps/hda
 shell term endpoint:posixfs store:rwx mmio:fb power endpoint:hda env
 ";
@@ -210,7 +210,7 @@ const DEFAULT_GEN4: &str = "\
 # нечем. Композитор сам в сеть не ходит: право у него, чтобы отдать названному (диспетчеру —
 # под выключатель сети). `!` — чтобы канал не достался каждому окну наследством.
 service posixfs store:rw
-service net-srv dev:net:rw
+service net-srv dev:net:rw clock arg:ntp=pool.ntp.org
 # Веха 202 — ЗВУК: драйвер Intel HDA обычным сервисом, под правом на окно регистров и DMA.
 # Машина без звуковой карты просто не поднимет его — строка при этом остаётся верной.
 service hda mmio:hda dma endpoint:posixfs:/etc/apps/hda
@@ -342,6 +342,10 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
         // раздатчику: композитор гасит машину сам, а панели и шеллу отдаёт это право по просьбе
         // (`desktop power <имя>`), потому что с Вехи 154 наследством оно им уже не достаётся.
         Some(cap::mint(dom, cap::Target::Power, parse_rights(r)).bits() as usize)
+    } else if token == "clock" || token == "clock:w" {
+        // Веха 230 — право ПОДВЕСТИ ЧАСЫ по сети. Стоит у сервера сети: он один знает, когда
+        // поднялась связь, и он же ходит к NTP. Убрали токен — система живёт на RTC и дрейфе.
+        Some(cap::mint(dom, cap::Target::Clock, Rights::WRITE).bits() as usize)
     } else if token == "sysview" {
         // Веха 153 — право ОБЗОРА процессов (только READ): видеть, что запущено и что оно может.
         // По умолчанию нет ни у кого; обычно стоит у диспетчера задач ([[task-manager]]).
@@ -692,6 +696,8 @@ fn cap_name(token: &str) -> alloc::string::String {
         "dma"
     } else if token == "netdev" {
         "netdev"
+    } else if token == "clock" || token.starts_with("clock:") {
+        "clock"
     } else if token == "power" || token.starts_with("power:") {
         // Веха 157 — имя одно и то же, сколько бы прав ни назвал токен: `power` и `power:wg` —
         // одно и то же полномочие, просто второе можно ещё и передать.

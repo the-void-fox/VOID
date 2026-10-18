@@ -1139,6 +1139,8 @@ fn main_loop() -> ! {
     let generation = read_generation(store).unwrap_or_default();
     // Веха 178 — язык из того же поколения, что и тема.
     ui::i18n::set_from_config(&generation);
+    // Веха 230 — и часовой пояс: композитор подписывает им снимки экрана.
+    sys::tz::set_from_config(&generation);
     let theme = Theme::from_config(&generation);
 
     let mut wm = Wm {
@@ -4407,7 +4409,9 @@ impl Wm {
             sys::write_console("[wm] снимок: кадр не сходится с размером экрана\n".as_bytes());
             return;
         };
-        let (y, mo, d, hh, mm, ss) = sys::civil_from_unix(sys::time_ns() / 1_000_000_000);
+        // Имя снимка — по МЕСТНОМУ времени (Веха 230): человек ищет его глазами среди своих
+        // файлов, и «в котором часу я это снял» он помнит по своим часам, а не по UTC.
+        let (y, mo, d, hh, mm, ss) = sys::tz::civil_local(sys::time_ns() / 1_000_000_000);
         let name = alloc::format!("/снимок-{y:04}-{mo:02}-{d:02}-{hh:02}{mm:02}{ss:02}.png");
         // Канал к файловому серверу спрашиваем ПО ИМЕНИ: позиция прав меняется от поколения к
         // поколению, и взятое по номеру однажды окажется чужим эндпоинтом (Веха 199.14).

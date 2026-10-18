@@ -406,7 +406,9 @@ pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
             None => Ok(()),
         };
     }
-    for одиночный in ["power", "sysview", "hwprobe"] {
+    // Веха 230 — `clock` (подвести часы по сети) стоит в одном ряду с `power` и `sysview`:
+    // общесистемное действие, названное строкой конфига.
+    for одиночный in ["power", "sysview", "hwprobe", "clock"] {
         if tok == одиночный {
             return Ok(());
         }
@@ -417,12 +419,86 @@ pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
     Err("такого права нет")
 }
 
+/// Веха 230 — **ЧАСОВОЙ ПОЯС СМЕЩЕНИЕМ**: разобрать значение `device timezone`.
+///
+/// Понимает `+03:00`, `-0530`, `+5`, `05:45`, `UTC`, `Z`, `0`. Возвращает МИНУТЫ со знаком;
+/// `None` — не похоже на смещение, и тогда звавший остаётся при UTC.
+///
+/// Форм несколько потому, что человек пишет ту, которую помнит, а ошибка в поясе тихая: время
+/// просто показывается не то, и винить некого. Разбор живёт здесь, а не у того, кто показывает
+/// часы, по той же причине, что и весь этот файл: читателей у одной строки несколько (панель,
+/// шелл, менеджер файлов), и три копии разбора разошлись бы молча.
+///
+/// Имён зон (`Europe/Moscow`) здесь нет и не будет без tzdata: имя без базы правил перехода на
+/// летнее время — это обещание, которого мы не держим.
+pub fn tz_offset_min(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("utc") || s.eq_ignore_ascii_case("z") || s == "0" {
+        return Some(0);
+    }
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => (1, s),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let (hh, mm) = match rest.split_once(':') {
+        Some((h, m)) => (h, m),
+        // `+0530` — четыре цифры без двоеточия; `+5` и `+05` — только часы.
+        None if rest.len() == 4 => (&rest[..2], &rest[2..]),
+        None => (rest, "0"),
+    };
+    if !hh.bytes().all(|b| b.is_ascii_digit()) || !mm.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let h: i32 = hh.parse().ok()?;
+    let m: i32 = mm.parse().ok()?;
+    // 16 часов — запас над настоящим краем (+14:00, Кирибати): опечатка вроде `+25` должна быть
+    // отказом, а не временем из другого дня.
+    if !(0..=16).contains(&h) || !(0..60).contains(&m) {
+        return None;
+    }
+    Some(sign * (h * 60 + m))
+}
+
 /// Объявляет ли запись ПРОГРАММУ с правами: только `service` и `shell`.
 ///
 /// Прочие виды (`desktop`, `ui`, `bind`, …) несут свои значения, и проверять их как права значило
 /// бы ругаться на верный конфиг.
 pub fn spawns_program(kind: &str) -> bool {
     kind == "service" || kind == "shell"
+}
+
+#[cfg(test)]
+mod tz_tests {
+    use super::tz_offset_min as p;
+
+    #[test]
+    fn пояс_разбирается_во_всех_написаниях() {
+        assert_eq!(p("+03:00"), Some(180));
+        assert_eq!(p("-05:30"), Some(-330));
+        assert_eq!(p("+0530"), Some(330));
+        assert_eq!(p("+5"), Some(300));
+        assert_eq!(p("05:45"), Some(345)); // Непал — без знака и не целый час
+        assert_eq!(p(" +03:00 "), Some(180));
+        assert_eq!(p("UTC"), Some(0));
+        assert_eq!(p("Z"), Some(0));
+        assert_eq!(p("0"), Some(0));
+    }
+
+    /// Опечатка обязана быть ОТКАЗОМ, а не временем из другого дня: ошибка в поясе тихая, и
+    /// «часы врут на пару часов» ищут потом неделями.
+    #[test]
+    fn негодное_смещение_отвергается() {
+        assert_eq!(p("+25"), None);
+        assert_eq!(p("+03:70"), None);
+        assert_eq!(p("Europe/Moscow"), None);
+        assert_eq!(p("три часа"), None);
+        assert_eq!(p("+"), None);
+        assert_eq!(p(""), None);
+    }
 }
 
 #[cfg(test)]

@@ -124,6 +124,8 @@ const SYS_VIDEO_INFO: usize = 40;
 const SYS_VIDEO_FLUSH: usize = 71;
 const SYS_PEER_ROOT: usize = 72;
 const SYS_CAP_NARROW: usize = 73;
+/// Веха 230 — подвести настенные часы системы (нужно право `clock:w`).
+const SYS_CLOCK_SET: usize = 74;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -535,6 +537,104 @@ pub fn reply_granting(reply_cap: usize, buf: &[u8], cap: usize, mask: u32) -> us
 /// `SYS_REPLY` без права — обычный ответ сервера.
 pub fn reply(reply_cap: usize, buf: &[u8]) -> usize {
     reply_full(reply_cap, buf, NO_CAP)
+}
+
+/// Веха 230 — **ЧАСОВОЙ ПОЯС**: смещение местного времени от UTC.
+///
+/// ## Почему смещением, а не именем зоны
+///
+/// Настоящие часовые пояса (`Europe/Moscow`) — это база данных tzdata: правила перехода на
+/// летнее время, их история с 1970-х и ежегодные правки, потому что политики двигают стрелки.
+/// Таскать её ради одной строки в панели значит взять на себя обязательство обновлять её вместе
+/// с системой — а не обновлённая tzdata врёт хуже, чем честное смещение.
+///
+/// Поэтому в конфиге пишут СМЕЩЕНИЕ: `device timezone +03:00`. Оно не знает про летнее время, и
+/// там, где его переводят, стрелки придётся подвинуть руками дважды в год — зато система не
+/// врёт о том, чего не знает. Имена зон вернутся вместе с tzdata, если она понадобится.
+///
+/// Ядро про пояс не знает вовсе: его журнал и `SYS_TIME` — всегда UTC. Местное время считают
+/// те, кто показывает его ЧЕЛОВЕКУ, и только они.
+pub mod tz {
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    /// Смещение в минутах. `i32::MIN` — «ещё не читали»; дальше это обычное число со знаком.
+    static OFFSET: AtomicI32 = AtomicI32::new(i32::MIN);
+
+    /// Текущее смещение, минуты. `0` — UTC (и это же умолчание, пока конфиг не прочитан).
+    pub fn offset_min() -> i32 {
+        match OFFSET.load(Ordering::Relaxed) {
+            i32::MIN => 0,
+            v => v,
+        }
+    }
+
+    /// Назвали ли пояс вообще. Нужно тем, кто подписывает время: «UTC» у них честное, а не
+    /// «мы не знаем».
+    pub fn known() -> bool {
+        OFFSET.load(Ordering::Relaxed) != i32::MIN
+    }
+
+    /// Запомнить смещение (минуты). Зовётся один раз при подъёме программы.
+    pub fn set(min: i32) {
+        OFFSET.store(min.clamp(-16 * 60, 16 * 60), Ordering::Relaxed);
+    }
+
+    /// Прочитать пояс из текста поколения (`device timezone +03:00`) и запомнить.
+    /// `false` — строки нет или она негодная; тогда остаётся UTC.
+    pub fn set_from_config(text: &str) -> bool {
+        match void_conf::get(text, "device", "timezone").and_then(void_conf::tz_offset_min) {
+            Some(min) => {
+                set(min);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Разобрать `+03:00`, `-0530`, `+5`, `UTC`, `Z`. `None` — не похоже на смещение.
+    ///
+    /// Сам разбор живёт в словаре конфига ([`void_conf::tz_offset_min`]) — там же, где он
+    /// проверяется тестами, и там же, где его видят остальные читатели строки.
+    pub fn parse(s: &str) -> Option<i32> {
+        void_conf::tz_offset_min(s)
+    }
+
+    /// Местное время теми же шестью числами, что [`super::civil_from_unix`], но со смещением.
+    ///
+    /// Смещение прибавляется к СЕКУНДАМ, а не к часам: пояса бывают получасовые (Индия +05:30) и
+    /// даже сорокапятиминутные (Непал +05:45), и «прибавить часы» их бы потеряло.
+    pub fn civil_local(unix_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+        let shifted = (unix_secs as i64 + offset_min() as i64 * 60).max(0) as u64;
+        super::civil_from_unix(shifted)
+    }
+
+    /// Подпись времени: `UTC`, `UTC+03:00`, `UTC-05:30`. В буфер — чтобы годилось и там, где
+    /// кучи нет.
+    pub fn label(buf: &mut [u8; 10]) -> &str {
+        let min = offset_min();
+        buf[..3].copy_from_slice(b"UTC");
+        if min == 0 {
+            return core::str::from_utf8(&buf[..3]).unwrap_or("UTC");
+        }
+        let (sign, a) = if min < 0 { (b'-', -min) } else { (b'+', min) };
+        let (h, m) = ((a / 60) as u8, (a % 60) as u8);
+        buf[3] = sign;
+        buf[4] = b'0' + h / 10;
+        buf[5] = b'0' + h % 10;
+        buf[6] = b':';
+        buf[7] = b'0' + m / 10;
+        buf[8] = b'0' + m % 10;
+        core::str::from_utf8(&buf[..9]).unwrap_or("UTC")
+    }
+}
+
+/// Веха 230 — **ПОДВЕСТИ ЧАСЫ**: сказать ядру, сколько сейчас на самом деле (Unix, нс).
+/// `false` — права нет (`Target::Clock` + WRITE) либо дескриптор негодный.
+///
+/// Читать время правом не закрыто ([`time_ns`]) — время не секрет; закрыто только ДВИГАТЬ
+/// его: сдвиг часов двигает сроки сертификатов и времена файлов во всей системе.
+pub fn clock_set(cap: usize, unix_ns: u64) -> bool {
+    abi::syscall(SYS_CLOCK_SET, cap, unix_ns as usize, 0, 0, 0, 0, 0).0 == 0
 }
 
 /// `SYS_BLK_READ`: прочитать сектор диска (нужен cap на устройство с `READ`).

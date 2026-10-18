@@ -369,6 +369,42 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret(v as usize);
             f.advance();
         }
+        // SYS_CLOCK_SET(cap, ns) -> 0 | MAX (Веха 230): подвести настенные часы системы.
+        //
+        // Право отдельное (`Target::Clock` + WRITE), потому что действие общесистемное: сдвиг
+        // часов двигает сроки сертификатов, времена файлов и всё, что меряется датой. Читать
+        // время по-прежнему может кто угодно и без права — время не секрет.
+        //
+        // Двигается только БАЗА настенного времени; монотонный счётчик не трогается (см.
+        // `clock::set_realtime_ns`), иначе подвод часов будил бы спящих.
+        74 => {
+            let (cap, ns) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1) as u64)
+            };
+            let dom = t.procs[cur].domain;
+            let ok = cap::may_set_clock(dom, Cap::from_bits(cap as u64));
+            if ok {
+                let сдвиг = crate::clock::set_realtime_ns(ns);
+                let (y, mo, d, h, mi, sec) = crate::clock::civil_from_unix(ns / 1_000_000_000);
+                // Говорим, только если часы ДЕЙСТВИТЕЛЬНО сдвинулись хотя бы на секунду.
+                // Сверка повторяется раз в несколько часов, и «подведены на 0 с» — это не
+                // событие, а шум: по умолчанию система молчит.
+                if сдвиг.abs() >= 1_000_000_000 {
+                    crate::println!(
+                        "  [clock] часы подведены: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC (сдвиг {} с)",
+                        y, mo, d, h, mi, sec, сдвиг / 1_000_000_000,
+                    );
+                } else {
+                    vprintln!("  [clock] сверка часов: сдвиг {} нс", сдвиг);
+                }
+            } else {
+                crate::println!("  [clock] P{} подвод часов ОТКЛОНЁН: нет права clock:w", cur);
+            }
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(if ok { 0 } else { usize::MAX });
+            f.advance();
+        }
         // SYS_RANDOM(buf, len) -> len | MAX (Веха 86): заполнить буфер процесса случайными
         // байтами (аппаратный ГСЧ + пул событий, см. [`crate::random`]). Буфер может лежать в
         // ленивой куче — доотображаем, как в SYS_WRITE.

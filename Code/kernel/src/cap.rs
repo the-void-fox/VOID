@@ -120,6 +120,16 @@ pub enum Target {
     /// отменяло бы изоляцию целиком. Регистры устройств в RAM не живут, так что запрет ничего не
     /// отнимает у настоящей задачи.
     HwProbe,
+    /// Веха 230 — **ПОДВЕСТИ ЧАСЫ СИСТЕМЫ** (`SYS_CLOCK_SET`). `WRITE` — поставить настенное
+    /// время; читать время может кто угодно и без права (время не секрет).
+    ///
+    /// Отдельным правом, а не «может всякий, у кого есть сеть»: часы — вещь общесистемная, и
+    /// подвинуть их значит подвинуть сроки сертификатов, времена файлов и всё, что меряется
+    /// датой. Держит его сервер сети (он же ходит к NTP), и названо оно в конфиге строкой —
+    /// убрал токен `clock`, и система перестала подводить часы по сети.
+    ///
+    /// Эфемерно: минтится на каждой загрузке из конфига, как `power` и `sysview`.
+    Clock,
 }
 
 /// Запись в c-space: цель + права на неё.
@@ -304,6 +314,15 @@ pub fn may_power_off(dom: DomainId, cap: Cap) -> bool {
     let cs = CSPACE.lock();
     match resolve(&cs, dom, cap) {
         Ok(e) => matches!(e.target, Target::Power) && e.rights.contains(Rights::WRITE),
+        Err(_) => false,
+    }
+}
+
+/// Веха 230 — есть ли право ПОДВЕСТИ ЧАСЫ по этому дескриптору (`Clock` + WRITE).
+pub fn may_set_clock(dom: DomainId, cap: Cap) -> bool {
+    let cs = CSPACE.lock();
+    match resolve(&cs, dom, cap) {
+        Ok(e) => matches!(e.target, Target::Clock) && e.rights.contains(Rights::WRITE),
         Err(_) => false,
     }
 }
@@ -562,6 +581,7 @@ pub fn info_kind(t: &Target) -> u8 {
         Target::Irq { .. } => 12,
         Target::Sysview => 13,
         Target::HwProbe => 15,
+        Target::Clock => 16,
     }
 }
 
@@ -584,7 +604,8 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power
-        | Target::Shm(_) | Target::Sysview | Target::HwProbe => return Err(CapError::WrongKind),
+        | Target::Shm(_) | Target::Sysview | Target::HwProbe
+        | Target::Clock => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -605,7 +626,8 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
             Target::Root(name) => name,
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
             | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
-            | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe => return Err(CapError::WrongKind),
+            | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
+            | Target::Clock => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -752,7 +774,7 @@ pub fn hwprobe(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
         return Err(CapError::Denied);
     }
     match e.target {
-        Target::HwProbe => Ok(()),
+        Target::HwProbe | Target::Clock => Ok(()),
         _ => Err(CapError::WrongKind),
     }
 }
@@ -944,6 +966,7 @@ fn target_eq(a: &Target, b: &Target) -> bool {
         (Target::Irq { vector: v1 }, Target::Irq { vector: v2 }) => v1 == v2,
         (Target::Sysview, Target::Sysview) => true,
         (Target::HwProbe, Target::HwProbe) => true,
+        (Target::Clock, Target::Clock) => true,
         _ => false,
     }
 }
@@ -1071,6 +1094,7 @@ pub fn persist() {
                         Target::Endpoint(_) | Target::Reply(_)
                         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
                         | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
+                        | Target::Clock
                         | Target::Device(Device::NetDrv) => 0,
                     },
                     None => 0,
