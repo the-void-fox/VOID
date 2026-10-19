@@ -69,6 +69,8 @@ use ereb_core::{Cell, Color, Grid, NamedColor};
 use ereb_input::{Action, Bindings, KeyEvent, Keysym, ModMask, Mode};
 use ereb_mux::{neighbor, Area, Direction, PaneId, PaneRect, SplitDirection, SplitTree};
 use ereb_render::{GlyphCache, GridRenderer, Palette, Surface, TtfFont};
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use void_user as sys;
 use void_user::{stdio, win, Wait};
 
@@ -692,6 +694,14 @@ struct View {
     rows: usize,
 }
 
+/// Размер знакоместа в пикселях — для разбора картинок (Веха 230.5).
+static CELL_W: AtomicU32 = AtomicU32::new(8);
+static CELL_H: AtomicU32 = AtomicU32::new(16);
+
+/// Сколько памяти отдаём картинкам одной панели. Терминал не альбом: когда предел пройден,
+/// самые старые забываются вместе с их показами.
+const PICS_MAX: usize = 8 * 1024 * 1024;
+
 impl View {
     fn build(conf: &Conf, info: &sys::VideoInfo) -> Option<View> {
         let font = load_font(conf);
@@ -704,6 +714,11 @@ impl View {
         let rows = (info.height / metrics.height.max(1) as usize).max(4);
         let (w, h) = renderer.pixel_size(cols, rows);
         let surface = Surface::new(w, h, palette.background);
+        // Веха 230.5 — размер знакоместа нужен разбору картинок, а он живёт в обработчике
+        // запросов, куда вид не передаётся. Статиком, потому что величина на терминал одна:
+        // шрифт выбирается при подъёме и дальше не меняется.
+        CELL_W.store(metrics.width.max(1) as u32, Ordering::Relaxed);
+        CELL_H.store(metrics.height.max(1) as u32, Ordering::Relaxed);
         Some(View { cache, renderer, surface, cols, rows })
     }
 
@@ -802,6 +817,50 @@ struct Pane {
     /// Сырые байты снимают оба: в них escape-последовательности цвета как были, а чужого в них
     /// нет по построению — это ровно то, что ребёнок написал ПОСЛЕ восстановления.
     out_log: Vec<u8>,
+    /// Веха 230.5 — КАРТИНКИ (протокол Kitty): то, что принято от ребёнка и что показано.
+    ///
+    /// Картинка хранится ОТДЕЛЬНО от размещения, потому что одна и та же может быть показана
+    /// дважды (протокол это умеет, и это дешевле, чем переслать её второй раз).
+    pics: Vec<Pic>,
+    places: Vec<Place>,
+    /// Копится APC-последовательность, пока не пришёл её конец (`ESC \`): ребёнок шлёт
+    /// картинку кусками, а кусок может оборваться где угодно.
+    apc: Option<Vec<u8>>,
+    /// Где расщепитель остановился на границе кусков (см. [`split_apc`]).
+    apc_st: ApcSt,
+    /// Хвост многокускового запроса (`m=1`): управляющая часть первого куска и его данные.
+    pic_ctrl: Option<Vec<u8>>,
+    pic_data: Vec<u8>,
+    /// Картинки изменились — строки под ними перерисовать.
+    pics_dirty: bool,
+}
+
+/// Принятая картинка: пиксели RGBA и размер.
+struct Pic {
+    id: u32,
+    w: u32,
+    h: u32,
+    px: Vec<u8>,
+}
+
+/// Где картинка показана: левый верхний угол в ЗНАКОМЕСТАХ и сколько их занято.
+///
+/// В знакоместах, а не в пикселях, потому что в них живёт всё остальное в терминале: прокрутка
+/// двигает строки, а не пиксели, и картинка обязана ехать вместе с текстом, рядом с которым её
+/// показали.
+struct Place {
+    pic: u32,
+    col: usize,
+    row: usize,
+    /// Высота в знакоместах — по ней считаются грязные строки. Ширину в них хранить незачем:
+    /// в пикселях она уже есть ([`Place::pw`]), а второй мерой одного и того же мы не держим.
+    rows: usize,
+    /// Пиксели, уже подогнанные под знакоместа (RGBA). Масштабируем ОДИН РАЗ, при показе:
+    /// кадров у терминала много, а показ один, и пересчитывать картинку на каждый кадр значило
+    /// бы класть на экран ту же работу шестьдесят раз в секунду.
+    px: Vec<u8>,
+    pw: u32,
+    ph: u32,
 }
 
 #[no_mangle]
@@ -1531,6 +1590,44 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 sel_rows_prev = if sel.is_some() { (a0, a1) } else { (usize::MAX, 0) };
                 dirty.sort_unstable();
             }
+            // Веха 230.5 — строки под КАРТИНКАМИ. Текста в них могло и не смениться (картинка
+            // приехала или уехала, а знаки под ней те же), и без этой добавки показ не попал бы
+            // на экран вовсе — грязные строки считаются по знакам.
+            {
+                let mut добавить: Vec<usize> = Vec::new();
+                for pane in panes.iter_mut() {
+                    if !pane.pics_dirty {
+                        continue;
+                    }
+                    pane.pics_dirty = false;
+                    let Some(обл) = rects.iter().find(|r| r.id == pane.id).map(|r| r.area) else {
+                        continue;
+                    };
+                    for pl in pane.places.iter() {
+                        for k in 0..pl.rows {
+                            let y = обл.row as usize + pl.row + k;
+                            if y < view.rows {
+                                добавить.push(y);
+                            }
+                        }
+                    }
+                    // Убранная картинка оставляет за собой чужие пиксели: строки, где она была,
+                    // надо перерисовать знаками. Проще всего — пометить всю панель.
+                    if pane.places.is_empty() {
+                        for y in обл.row as usize..(обл.row as usize + обл.rows as usize).min(view.rows) {
+                            добавить.push(y);
+                        }
+                    }
+                }
+                if !добавить.is_empty() {
+                    for y in добавить {
+                        if !dirty.contains(&y) {
+                            dirty.push(y);
+                        }
+                    }
+                    dirty.sort_unstable();
+                }
+            }
             // Кадр, по которому выделение вычитывается при отпускании кнопки, — ЭТОТ. Копия
             // только ПОКА ВЫДЕЛЯЮТ: без выделения это шестьдесят килобайт на каждый кадр
             // вывода, то есть плата за то, чем никто не пользуется.
@@ -1565,6 +1662,38 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                                 ereb_render::BlendMode::Invert,
                             );
                         }
+                    }
+                }
+                // Веха 230.5 — КАРТИНКИ поверх знаков. Поверх, а не вместо: ячейки под
+                // картинкой остаются обычными ячейками грида (курсор по ним ходит, текст в них
+                // пишется), и спорить с ними незачем — кто нарисован последним, тот и виден.
+                for pane in panes.iter() {
+                    if pane.places.is_empty() {
+                        continue;
+                    }
+                    let Some(обл) = rects.iter().find(|r| r.id == pane.id).map(|r| r.area) else {
+                        continue;
+                    };
+                    let cw = view.renderer.metrics().width.max(1) as usize;
+                    for pl in pane.places.iter() {
+                        let y0 = обл.row as usize + pl.row;
+                        // Рисуем, только если хоть одна строка картинки перерисовывалась:
+                        // иначе она и так цела на поверхности.
+                        if !(y0..y0 + pl.rows).any(|y| dirty.contains(&y)) {
+                            continue;
+                        }
+                        view.surface.blit_rgba(
+                            ereb_render::Rect {
+                                x: ((обл.col as usize + pl.col) * cw) as i32,
+                                y: (y0 * ch) as i32,
+                                w: pl.pw,
+                                h: pl.ph,
+                            },
+                            &pl.px,
+                            // Прозрачность картинки уважаем: PNG с альфой ложится на фон
+                            // терминала, а не на чёрный квадрат.
+                            ereb_render::BlendMode::AlphaBlend,
+                        );
                     }
                 }
                 for &y in &dirty {
@@ -1650,18 +1779,39 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
             // Первая редакция писала сюда только `&buf[from..len]` — то есть хвост после
             // последнего перевода строки, а всё, что выше, молча пропадало. Поймано не глазом,
             // а чтением самого объекта в store: в записи не было приветствия шелла.
-            let mut from = 0usize;
-            for at in 0..len {
-                if buf[at] == b'\n' && (at == 0 || buf[at - 1] != b'\r') {
-                    pane.parser.advance(&mut pane.grid, &buf[from..at]);
-                    pane.parser.advance(&mut pane.grid, b"\r\n");
-                    pane.out_log.extend_from_slice(&buf[from..at]);
-                    pane.out_log.extend_from_slice(b"\r\n");
-                    from = at + 1;
+            // Веха 230.5 — КАРТИНКИ приезжают APC-последовательностью (`ESC _ G … ESC \`), а
+            // наш разборщик VT её ГЛОТАЕТ: `vte` доводит состояние `SosPmApcString` до конца и
+            // не отдаёт наружу ни байта. Поэтому поток делится ЗДЕСЬ, до разборщика: куски APC
+            // уходят в `kitty_apc`, всё остальное — прежним путём.
+            //
+            // Делить до `vte`, а не чинить `vte`, — решение осознанное: он чужой и вендоренный
+            // ради воспроизводимой сборки, а форк чужого крейта стоит дороже сорока строк
+            // расщепителя.
+            for (кусок, это_apc) in split_apc(pane, &buf[..len]) {
+                if это_apc {
+                    kitty_apc(pane, &кусок);
+                    continue;
+                }
+                let mut from = 0usize;
+                for at in 0..кусок.len() {
+                    if кусок[at] == b'\n' && (at == 0 || кусок[at - 1] != b'\r') {
+                        pane.parser.advance(&mut pane.grid, &кусок[from..at]);
+                        pane.parser.advance(&mut pane.grid, b"\r\n");
+                        pane.out_log.extend_from_slice(&кусок[from..at]);
+                        pane.out_log.extend_from_slice(b"\r\n");
+                        from = at + 1;
+                    }
+                }
+                pane.parser.advance(&mut pane.grid, &кусок[from..]);
+                pane.out_log.extend_from_slice(&кусок[from..]);
+                // Экран стёрли — картинкам на нём делать нечего. Ловим последовательность в
+                // потоке, а не спрашиваем грид: знать, что `ESC[2J` случилось, кроме нас
+                // некому, а картинка, пережившая `clear`, — это мусор поверх чистого экрана.
+                if содержит_очистку(&кусок) {
+                    pane.places.clear();
+                    pane.pics_dirty = true;
                 }
             }
-            pane.parser.advance(&mut pane.grid, &buf[from..len]);
-            pane.out_log.extend_from_slice(&buf[from..len]);
             if pane.out_log.len() > HIST_MAX {
                 let лишнее = pane.out_log.len() - HIST_MAX;
                 let срез = pane.out_log[лишнее..]
@@ -1670,9 +1820,26 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
                     .map_or(pane.out_log.len(), |k| лишнее + k + 1);
                 pane.out_log.drain(..срез);
             }
+            let grown = pane.grid.scrollback_len().saturating_sub(before);
             if pane.scroll > 0 {
-                let grown = pane.grid.scrollback_len().saturating_sub(before);
                 pane.scroll = (pane.scroll + grown).min(pane.grid.scrollback_len());
+            }
+            // Текст уехал вверх — картинки едут с ним. Уехавшие за верх забываем: в истории
+            // мы их не храним (грид хранит знаки, а не пиксели), и делать вид, что прокрутка
+            // назад их вернёт, было бы обманом.
+            if grown > 0 && !pane.places.is_empty() {
+                // Уехавшую за верх ЗАБЫВАЕМ целиком, а не прижимаем к нулевой строке.
+                //
+                // Прижимали — и картинка оставалась висеть в первых строках поверх бегущего
+                // текста (видно было на `help`: вывод уехал вверх, а клетчатая проба осталась
+                // на месте). Половину картинки показать нечем: в истории у нас знаки, пиксели
+                // в неё не кладутся, и честнее убрать, чем врать обрезком.
+                pane.places.retain(|p| p.row >= grown);
+                for p in pane.places.iter_mut() {
+                    p.row -= grown;
+                }
+                pane.places.retain(|p| p.row < pane.grid.rows());
+                pane.pics_dirty = true;
             }
             sys::reply(m.reply_cap, &[]);
             true
@@ -1706,6 +1873,280 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
             sys::reply(m.reply_cap, &[]);
             false
         }
+    }
+}
+
+// ── КАРТИНКИ В ТЕРМИНАЛЕ: протокол Kitty (Веха 230.5) ───────────────────────────────────────
+//
+// Просьба владельца от 14.10: «отображение изображений… китиграфикпротокол нам нужен». Протокол
+// выбран им же и не случайно: это тот, который понимают chafa, timg, kitten icat и прочее
+// готовое, — то есть картинка в нашем терминале будет работать и у чужих программ, если они
+// однажды приедут.
+//
+// Поддержано ровно то, чем картинку ПОКАЗЫВАЮТ, и ни байтом больше:
+//
+//   a=T       — принять и сразу показать (других действий не делаем);
+//   a=d       — убрать показанное;
+//   f=24|32   — пиксели как есть, RGB или RGBA;
+//   s=,v=     — размер в пикселях (для сырых пикселей обязателен);
+//   c=,r=     — во сколько знакомест вписать (масштаб ближайшим соседом);
+//   m=0|1     — продолжение следует: картинка едет кусками по нескольку килобайт;
+//   i=        — номер картинки, чтобы показать принятую ещё раз.
+//
+// Чего НЕТ и почему: `f=100` (PNG внутри протокола) — декодер есть у программы-отправителя
+// (`icat` берёт его из `void-img`), и тащить его в терминал значило бы держать две копии
+// решения «чем разжимать картинки». `t=f` (картинка файлом) — терминалу пришлось бы читать
+// чужие файлы своим правом, то есть обходить сужение прав ровно там, где оно и заведено.
+
+/// Где расщепитель APC остановился. Состояние живёт в панели, потому что кусок вывода может
+/// оборваться где угодно — хост отдаёт столько байт, сколько накопилось, и на границы
+/// последовательностей не смотрит.
+///
+/// Первая редакция держала только накопитель и искала `ESC \` ПАРОЙ БАЙТ внутри одного куска.
+/// Этого хватало ровно до первой настоящей картинки: данные едут кусками по 4 КиБ, стык
+/// приходится куда попало, и разорванный пополам конец не находился НИКОГДА. Снаружи это
+/// выглядело как зависший терминал на ста процентах процессора.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApcSt {
+    /// Обычный поток.
+    Idle,
+    /// Видели `ESC` в обычном потоке — ждём, окажется ли он началом APC.
+    SawEsc,
+    /// Внутри APC, копим тело.
+    In,
+    /// Внутри APC видели `ESC` — ждём `\` (конец) или продолжения тела.
+    InEsc,
+}
+
+/// Разложить поток ребёнка на куски: обычные байты и тела APC-последовательностей.
+fn split_apc(pane: &mut Pane, buf: &[u8]) -> Vec<(Vec<u8>, bool)> {
+    let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut обычное: Vec<u8> = Vec::new();
+    for &b in buf {
+        match pane.apc_st {
+            ApcSt::Idle => {
+                if b == 0x1b {
+                    pane.apc_st = ApcSt::SawEsc;
+                } else {
+                    обычное.push(b);
+                }
+            }
+            ApcSt::SawEsc => {
+                if b == b'_' {
+                    // Началась APC: всё обычное до неё отдаём разборщику VT как есть.
+                    if !обычное.is_empty() {
+                        out.push((core::mem::take(&mut обычное), false));
+                    }
+                    pane.apc = Some(Vec::new());
+                    pane.apc_st = ApcSt::In;
+                } else {
+                    // Не APC — значит обычная escape-последовательность: `ESC` возвращаем на
+                    // место, иначе разборщик VT получит обрубок и покажет мусор.
+                    обычное.push(0x1b);
+                    if b == 0x1b {
+                        pane.apc_st = ApcSt::SawEsc; // два ESC подряд: второй ещё в игре
+                    } else {
+                        обычное.push(b);
+                        pane.apc_st = ApcSt::Idle;
+                    }
+                }
+            }
+            ApcSt::In => {
+                if b == 0x1b {
+                    pane.apc_st = ApcSt::InEsc;
+                } else if let Some(acc) = pane.apc.as_mut() {
+                    acc.push(b);
+                }
+            }
+            ApcSt::InEsc => {
+                if b == b'\\' {
+                    out.push((pane.apc.take().unwrap_or_default(), true));
+                    pane.apc_st = ApcSt::Idle;
+                } else if let Some(acc) = pane.apc.as_mut() {
+                    // `ESC` внутри тела — часть тела (так бывает у чужих APC); возвращаем его.
+                    acc.push(0x1b);
+                    if b == 0x1b {
+                        pane.apc_st = ApcSt::InEsc;
+                    } else {
+                        acc.push(b);
+                        pane.apc_st = ApcSt::In;
+                    }
+                }
+            }
+        }
+    }
+    if !обычное.is_empty() {
+        out.push((обычное, false));
+    }
+    out
+}
+
+/// Есть ли в куске очистка экрана (`ESC[2J` / `ESC[3J`, в том числе с параметрами перед ней).
+fn содержит_очистку(кусок: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < кусок.len() {
+        if кусок[i] == 0x1b && кусок[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < кусок.len() && (кусок[j].is_ascii_digit() || кусок[j] == b';') {
+                j += 1;
+            }
+            if j < кусок.len() && кусок[j] == b'J' {
+                let п = &кусок[i + 2..j];
+                if п == b"2" || п == b"3" {
+                    return true;
+                }
+            }
+            i = j.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Разобрать тело APC. Нас интересует только то, что начинается с `G` — графика Kitty.
+fn kitty_apc(pane: &mut Pane, тело: &[u8]) {
+    let Some(тело) = тело.strip_prefix(b"G") else { return };
+    // Тело: `ключ=значение,…;данные`. Точка с запятой может и отсутствовать (команда без данных).
+    let (ctrl, данные) = match тело.iter().position(|&b| b == b';') {
+        Some(k) => (&тело[..k], &тело[k + 1..]),
+        None => (тело, &[][..]),
+    };
+    // Продолжение многокускового запроса: управляющая часть была у первого куска.
+    let первый = pane.pic_ctrl.is_none();
+    if первый {
+        pane.pic_ctrl = Some(ctrl.to_vec());
+        pane.pic_data.clear();
+    }
+    pane.pic_data.extend_from_slice(данные);
+    let ещё = ключ(ctrl, b'm').unwrap_or(0) == 1;
+    if ещё {
+        return; // ждём остальные куски
+    }
+    let ctrl = pane.pic_ctrl.take().unwrap_or_default();
+    let данные = core::mem::take(&mut pane.pic_data);
+    kitty_command(pane, &ctrl, &данные);
+}
+
+/// Числовое значение ключа управляющей части (`s=640` → 640).
+fn ключ(ctrl: &[u8], имя: u8) -> Option<u32> {
+    for поле in ctrl.split(|&b| b == b',') {
+        if поле.len() >= 2 && поле[0] == имя && поле[1] == b'=' {
+            return core::str::from_utf8(&поле[2..]).ok()?.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Буквенное значение ключа (`a=T` → `T`).
+fn буква(ctrl: &[u8], имя: u8) -> Option<u8> {
+    for поле in ctrl.split(|&b| b == b',') {
+        if поле.len() == 3 && поле[0] == имя && поле[1] == b'=' {
+            return Some(поле[2]);
+        }
+    }
+    None
+}
+
+/// Исполнить собранную команду графики.
+fn kitty_command(pane: &mut Pane, ctrl: &[u8], данные: &[u8]) {
+    match буква(ctrl, b'a').unwrap_or(b'T') {
+        b'd' => {
+            pane.places.clear();
+            pane.pics_dirty = true;
+            return;
+        }
+        b'T' | b'p' => {}
+        other => {
+            log_line(&alloc::format!("[term] картинка: действие '{}' не поддержано", other as char));
+            return;
+        }
+    }
+    let id = ключ(ctrl, b'i').unwrap_or(0);
+    // Показать принятую раньше (`a=p,i=N`) — данных при этом нет.
+    if данные.is_empty() && pane.pics.iter().any(|p| p.id == id) {
+        return place_pic(pane, id, ключ(ctrl, b'c'), ключ(ctrl, b'r'));
+    }
+    let (Some(w), Some(h)) = (ключ(ctrl, b's'), ключ(ctrl, b'v')) else {
+        log_line("[term] картинка: нет размера (нужны s= и v=)");
+        return;
+    };
+    let формат = ключ(ctrl, b'f').unwrap_or(32);
+    if формат != 24 && формат != 32 {
+        log_line(&alloc::format!(
+            "[term] картинка: формат {формат} не поддержан — шлите сырые пиксели (f=24 или f=32)"
+        ));
+        return;
+    }
+    use base64ct::Encoding;
+    let Ok(сырьё) = base64ct::Base64::decode_vec(core::str::from_utf8(данные).unwrap_or("")) else {
+        log_line("[term] картинка: данные не base64");
+        return;
+    };
+    let шаг = if формат == 24 { 3 } else { 4 };
+    let нужно = w as usize * h as usize * шаг;
+    if сырьё.len() < нужно {
+        log_line(&alloc::format!(
+            "[term] картинка: данных {} из {нужно} — показывать нечего",
+            сырьё.len()
+        ));
+        return;
+    }
+    // Внутри держим RGBA: `blit_rgba` ждёт именно его, а перекладывать на каждом кадре дороже,
+    // чем один раз при приёме.
+    let px = if формат == 32 {
+        сырьё
+    } else {
+        let mut v = Vec::with_capacity(w as usize * h as usize * 4);
+        for p in сырьё.chunks_exact(3) {
+            v.extend_from_slice(&[p[0], p[1], p[2], 255]);
+        }
+        v
+    };
+    pane.pics.retain(|p| p.id != id);
+    // Потолок на память картинок: терминал не альбом, а в памяти у нас куча процесса.
+    while pane.pics.iter().map(|p| p.px.len()).sum::<usize>() + px.len() > PICS_MAX {
+        if pane.pics.is_empty() {
+            break;
+        }
+        let ушла = pane.pics.remove(0).id;
+        pane.places.retain(|p| p.pic != ушла);
+    }
+    pane.pics.push(Pic { id, w, h, px });
+    place_pic(pane, id, ключ(ctrl, b'c'), ключ(ctrl, b'r'));
+}
+
+/// Показать картинку в текущем знакоместе курсора.
+fn place_pic(pane: &mut Pane, id: u32, cols: Option<u32>, rows: Option<u32>) {
+    let Some(pic) = pane.pics.iter().find(|p| p.id == id) else { return };
+    // Размер в знакоместах: сказанный отправителем либо посчитанный от пикселей. Клетку знаем
+    // мы, а не он, — поэтому считать её долю правильно здесь.
+    let (cw, ch) = (CELL_W.load(Ordering::Relaxed), CELL_H.load(Ordering::Relaxed));
+    let cols = cols.unwrap_or_else(|| pic.w.div_ceil(cw)).max(1) as usize;
+    let rows = rows.unwrap_or_else(|| pic.h.div_ceil(ch)).max(1) as usize;
+    let (col, row) = (pane.grid.cursor().col, pane.grid.cursor().row);
+    let cols = cols.min(pane.grid.cols().saturating_sub(col)).max(1);
+    let rows = rows.min(pane.grid.rows().saturating_sub(row)).max(1);
+    // Подгоняем ближайшим соседом: картинка в терминале — это иллюстрация в тексте, и
+    // билинейная гладкость ей не нужна, а лишний код и время — нужны ещё меньше.
+    let (pw, ph) = (cols as u32 * cw, rows as u32 * ch);
+    let mut px = alloc::vec![0u8; pw as usize * ph as usize * 4];
+    for y in 0..ph as usize {
+        let sy = (y as u64 * pic.h as u64 / ph as u64).min(pic.h as u64 - 1) as usize;
+        for x in 0..pw as usize {
+            let sx = (x as u64 * pic.w as u64 / pw as u64).min(pic.w as u64 - 1) as usize;
+            let si = (sy * pic.w as usize + sx) * 4;
+            let di = (y * pw as usize + x) * 4;
+            px[di..di + 4].copy_from_slice(&pic.px[si..si + 4]);
+        }
+    }
+    pane.places.retain(|p| !(p.col == col && p.row == row));
+    pane.places.push(Place { pic: id, col, row, rows, px, pw, ph });
+    pane.pics_dirty = true;
+    // Курсор уводим ПОД картинку: иначе следующая строка вывода ляжет поверх неё, и человек
+    // решит, что терминал сломался. Так же ведут себя kitty и chafa.
+    for _ in 0..rows {
+        pane.parser.advance(&mut pane.grid, b"\r\n");
     }
 }
 
@@ -1746,6 +2187,13 @@ fn new_pane(id: PaneId, rects: &[PaneRect], exec_cap: &mut usize, me: usize, con
         intr_count: 0,
         inbox: Vec::new(),
         scroll: 0,
+        pics: Vec::new(),
+        places: Vec::new(),
+        apc: None,
+        apc_st: ApcSt::Idle,
+        pic_ctrl: None,
+        pic_data: Vec::new(),
+        pics_dirty: false,
     };
     if child.is_none() {
         let msg = sys::i18n::t("[не удалось запустить шелл]");
