@@ -142,4 +142,5 @@ Capability-система — это **механизм, а не результ�
 ## Связано
 
 [[redteam]] · [[capabilities]] · [[0002-persistent-content-addressed-capability-core]] ·
-[[stuck-watchdog]] · [[known-gaps]] · [[internal-debt]] · [[target-system]]
+[[stuck-watchdog]] · [[known-gaps]] · [[internal-debt]] · [[target-system]] ·
+[[openbsd-lessons]] (образец подхода, выбранный владельцем 20.10.2026: чем закрывать раздел 5)
