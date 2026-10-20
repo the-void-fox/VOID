@@ -71,4 +71,4 @@ Bring-up будет наполнять эти функции, не трогая 
 ## Связано
 - [[0005-multiarch-arch-boundary]] — решение и альтернативы
 - [[elf-userspace]] (Веха 23 — пререквизит) · [[user-mode]] · [[sv39-paging]] · [[processes]]
-- [[0004-void-pkg]] — Фаза 4 · [[todo]]
+- [[0004-void-pkg]] — Фаза 4 · [[todo_G]]

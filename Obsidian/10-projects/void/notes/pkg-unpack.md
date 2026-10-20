@@ -128,4 +128,4 @@ lzma-rs, и каталог переименован в `vendor-compress`. При
 
 ## Связано
 - [[0009-ondevice-packages]] · [[store-bridge]] · [[persistent-store]] · [[posix-personality]] ·
-  [[folders]] · [[vvsh-shell]] · [[known-gaps]] · [[todo]]
+  [[folders]] · [[vvsh-shell]] · [[known-gaps]] · [[todo_G]]

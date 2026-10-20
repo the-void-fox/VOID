@@ -102,4 +102,4 @@ userspace-сервере `net-srv`. Но самих протоколов там 
 0.103 из самого rustls — но при обновлении это надо перепроверить, а не открыть заново.
 
 ## Связано
-- [[virtio-net]] · [[e1000]] · [[known-gaps]] · [[0009-ondevice-packages]] · [[todo]]
+- [[virtio-net]] · [[e1000]] · [[known-gaps]] · [[0009-ondevice-packages]] · [[todo_G]]

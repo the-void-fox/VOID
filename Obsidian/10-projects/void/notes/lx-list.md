@@ -78,4 +78,4 @@ linux-src/list_sort.c`; `lx_kit.c` не нужен — список без ал�
 ## Связано
 - [[lx-kit]] (Веха 56, аллокатор) · [[lx-linux]] (Веха 55, sort.c — старт конвейера) ·
   [[lx-emul-c]] (C-каркас: ioremap/DMA/IRQ — свести с Lx_kit) · [[store-bridge]] (доставка) ·
-  [[known-gaps]] · [[todo]]
+  [[known-gaps]] · [[todo_G]]

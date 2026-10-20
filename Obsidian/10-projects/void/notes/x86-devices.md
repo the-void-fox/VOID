@@ -92,4 +92,4 @@ std-порт Rust → uutils → host-мост. Перед реальным же
 ## Связано
 - [[x86-userspace]] (Веха 26) · [[x86-bringup]] (Веха 25) · [[arch-boundary]] · [[0005-multiarch-arch-boundary|ADR 0005]]
 - [[virtio-blk]] (Веха 7.1 — mmio-корни драйвера) · [[async-executor]] · [[persistent-store]]
-- [[todo]]
+- [[todo_G]]

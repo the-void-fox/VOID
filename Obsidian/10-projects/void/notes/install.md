@@ -98,7 +98,7 @@ Store занимал диск **с сектора 0** (там суперблок
 - `Code/boot/mkdisk.sh` (образ диска), `mkboot.sh` (+модуль), `grub.cfg` (+`module2`).
 
 ## Связано
-- [[ahci]] (SATA-диск) · [[platform]] (реальный x86, GRUB) · [[declarative-init]] (что грузится) · [[known-gaps]] · [[todo]]
+- [[ahci]] (SATA-диск) · [[platform]] (реальный x86, GRUB) · [[declarative-init]] (что грузится) · [[known-gaps]] · [[todo_G]]
 
 ## Веха 222 — ОБНОВЛЕНИЕ: новое ядро, старые данные
 

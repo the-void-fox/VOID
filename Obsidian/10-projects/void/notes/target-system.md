@@ -44,4 +44,4 @@ status: active
 
 ## Связано
 - [[0002-persistent-content-addressed-capability-core]] · [[0006-vvsh-lisp-config-shell]] ·
-  [[0007-graphics-native-compositor]] · [[lx-linux]] · [[known-gaps]] · [[todo]]
+  [[0007-graphics-native-compositor]] · [[lx-linux]] · [[known-gaps]] · [[todo_G]]

@@ -58,5 +58,5 @@ jiffies≈3–5` (задержка ~3 jiffies); Демо 3 — `cancel верн�
 
 ## Связано
 - [[lx-sched]] (Веха 62) · [[lx-timer]] (Веха 63, таймеры — под delayed_work) · [[lx-wait]] (Веха 64,
-  wait_event — под flush) · [[lx-kit]] (аллокатор) · [[known-gaps]] · [[todo]]
+  wait_event — под flush) · [[lx-kit]] (аллокатор) · [[known-gaps]] · [[todo_G]]
 - Референс: reference/dde-linux/[[10-lx-kit-runtime]] · [[20-linker-driven-workflow]] · [[30-e1000-porting-map]]

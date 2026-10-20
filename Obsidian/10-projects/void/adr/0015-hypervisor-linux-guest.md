@@ -151,4 +151,4 @@ Passthrough единственного GPU означает, что во вре�
 - [[0011-foreign-software-personalities]] · [[0007-graphics-native-compositor]] ·
   [[0005-multiarch-arch-boundary]] · [[linux-abi]] · [[lx-emul]] · [[userspace-drivers]] ·
   [[capabilities]] · [[known-gaps]] · [[threads]] · [[declarative-init]] · [[net-stack]] ·
-  [[block-driver]] · [[todo]]
+  [[block-driver]] · [[todo_G]]

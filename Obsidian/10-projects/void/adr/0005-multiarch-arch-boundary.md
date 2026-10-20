@@ -70,4 +70,4 @@ Bring-up x86_64 (Вехи 25+: Limine → GDT/IDT → PML4 → LAPIC → syscall
 
 ## Связано
 - [[arch-boundary]] — заметка Вехи 24 (как переезжали, грабли)
-- [[0004-void-pkg]] · [[0001-rust-riscv-microkernel]] · [[todo]]
+- [[0004-void-pkg]] · [[0001-rust-riscv-microkernel]] · [[todo_G]]

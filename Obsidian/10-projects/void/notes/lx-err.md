@@ -34,4 +34,4 @@ IS_ERR_OR_NULL=1` → «идиома «ошибка в указателе» ве
 `-Wall -Wextra` чисто; ядро не менялось.
 
 ## Связано
-- [[lx-io]] (Веха 60, MMIO) · [[lx-delay]] (Веха 61, паузы) · [[lx-bits]] (Веха 58) · [[known-gaps]] · [[todo]]
+- [[lx-io]] (Веха 60, MMIO) · [[lx-delay]] (Веха 61, паузы) · [[lx-bits]] (Веха 58) · [[known-gaps]] · [[todo_G]]

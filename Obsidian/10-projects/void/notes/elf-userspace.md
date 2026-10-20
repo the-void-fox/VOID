@@ -83,4 +83,4 @@ content-id с корнем `bin/<имя>` →
 ## Связано
 - [[0004-void-pkg]] — Фаза 4 открыта этой вехой (лестница самодостаточности, ступень 1)
 - [[exec-from-store]] · [[process-heap]] · [[user-mode]] (историческая) · [[posix-personality]]
-- [[interactive-shell]] · [[ipc-cap-transfer]] · [[todo]]
+- [[interactive-shell]] · [[ipc-cap-transfer]] · [[todo_G]]

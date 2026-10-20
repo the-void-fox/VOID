@@ -293,4 +293,4 @@ cap-модель ([[capabilities]]) — из строки конфига пер�
 ## Связано
 - [[0008-network-stack]] · [[virtio-net]] · [[e1000]] · [[irq]] · [[threads]] ·
   [[declarative-init]] · [[vvsh-config-layout]] · [[vvsh-shell]] · [[capabilities]] ·
-  [[known-gaps]] · [[todo]]
+  [[known-gaps]] · [[todo_G]]

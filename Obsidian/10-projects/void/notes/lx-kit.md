@@ -86,4 +86,4 @@ linux-src/argv_split.c lx_kit.c`). ELF на диске (`void-disk.img` в .giti
 ## Связано
 - [[lx-linux]] (Веха 55, sort.c — старт конвейера) · [[lx-emul-c]] (C-каркас: ioremap/DMA/IRQ/
   completion — предстоит свести с Lx_kit) · [[lx-emul]] (Rust-каркас) · [[nixpkgs-cross]] (C-мир) ·
-  [[store-bridge]] (доставка) · [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo]]
+  [[store-bridge]] (доставка) · [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo_G]]

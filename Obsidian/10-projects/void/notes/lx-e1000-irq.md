@@ -74,5 +74,5 @@ x86, QEMU q35 `-device e1000,mac=52:54:00:12:34:99` (+ virtio-net ядру):
 ## Связано
 - [[lx-e1000-rx]] (Веха 71, RX опросом) · [[lx-e1000-tx]] (70) · [[lx-e1000-hw]] (69) · [[lx-e1000-port]] (68) ·
   [[lx-pci]] · [[lx-sched]] · [[lx-wait]] (completion) · [[irq]] · [[userspace-drivers]] · [[virtio-net]] ·
-  [[e1000]] · [[known-gaps]] · [[todo]]
+  [[e1000]] · [[known-gaps]] · [[todo_G]]
 - Референс: reference/dde-linux/[[10-lx-kit-runtime]] · [[30-e1000-porting-map]]

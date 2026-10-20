@@ -113,4 +113,4 @@ BAR'ы PCI) рядом с LAPIC/IOAPIC. До `mm_enable` печать работ
 
 ## Связано
 - [[0014-terminal-ereb]] · [[0007-graphics-native-compositor]] · [[platform]] · [[tty]] ·
-  [[known-gaps]] · [[install]] · [[todo]]
+  [[known-gaps]] · [[install]] · [[todo_G]]

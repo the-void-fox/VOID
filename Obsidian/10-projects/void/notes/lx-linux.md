@@ -66,4 +66,4 @@ Linux-драйверов по природе смешивает лицензии
 
 ## Связано
 - [[lx-emul]] (Rust-каркас) · [[lx-emul-c]] (C-каркас, тот же тулчейн) · [[nixpkgs-cross]]
-  (C-мир) · [[store-bridge]] (доставка) · [[known-gaps]] · [[todo]]
+  (C-мир) · [[store-bridge]] (доставка) · [[known-gaps]] · [[todo_G]]

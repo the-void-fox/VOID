@@ -88,4 +88,4 @@ lib
 
 ## Связано
 - [[pkg-tree]] · [[pkg-closure]] · [[folders]] · [[posix-personality]] · [[linux-abi]] ·
-  [[known-gaps]] · [[todo]]
+  [[known-gaps]] · [[todo_G]]

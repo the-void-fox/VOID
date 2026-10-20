@@ -74,4 +74,4 @@ level)`: `ktbl` — параллельная таблица ЯДРА того ж
 - `kernel/src/main.rs` — `mem_report` показывает живо/переиспользуемо.
 
 ## Связано
-- [[known-gaps]] (техдолг #3, закрыт) · [[platform]] (клон PML4/PDPT на x86) · [[process-heap]] · [[todo]]
+- [[known-gaps]] (техдолг #3, закрыт) · [[platform]] (клон PML4/PDPT на x86) · [[process-heap]] · [[todo_G]]

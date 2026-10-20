@@ -36,4 +36,4 @@ VOID», код 0. `-Wall -Wextra` чисто; ядро не менялось.
 
 ## Связано
 - [[lx-err]] (Веха 59) · [[lx-delay]] (Веха 61) · [[lx-emul-c]] (ioremap по MMIO-cap — сведём) ·
-  [[userspace-drivers]] · [[known-gaps]] · [[todo]]
+  [[userspace-drivers]] · [[known-gaps]] · [[todo_G]]

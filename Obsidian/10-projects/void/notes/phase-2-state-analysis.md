@@ -106,4 +106,4 @@ x86 — после самостоятельности, иначе будем п�
 - [[0003-phase-3-exec-by-hash]]
 - [[0002-persistent-content-addressed-capability-core]]
 - [[0001-rust-riscv-microkernel]]
-- [[todo]]
+- [[todo_G]]

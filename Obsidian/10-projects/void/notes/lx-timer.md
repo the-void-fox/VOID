@@ -65,5 +65,5 @@ status: done
 
 ## Связано
 - [[lx-sched]] (Веха 62, планировщик — основа) · [[lx-delay]] (Веха 61, буси-паузы; `msleep` теперь
-  уступает) · [[lx-kit]] (аллокатор) · [[known-gaps]] · [[todo]]
+  уступает) · [[lx-kit]] (аллокатор) · [[known-gaps]] · [[todo_G]]
 - Референс: reference/dde-linux/[[10-lx-kit-runtime]] · [[30-e1000-porting-map]]

@@ -91,4 +91,4 @@ READY, READ CAPACITY(10), READ(10)/WRITE(10). Устройств теперь п
 - `kernel/src/main.rs` — `xhci::init()` (модуль cfg-gated на x86; riscv — заглушка).
 
 ## Связано
-- [[ahci]] · [[e1000]] (тот же приём: реальный драйвер опросом, DMA-фреймы) · [[platform]] (PS/2, VGA) · [[known-gaps]] · [[todo]]
+- [[ahci]] · [[e1000]] (тот же приём: реальный драйвер опросом, DMA-фреймы) · [[platform]] (PS/2, VGA) · [[known-gaps]] · [[todo_G]]

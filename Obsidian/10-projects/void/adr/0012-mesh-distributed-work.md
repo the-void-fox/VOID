@@ -107,4 +107,4 @@ Kerrighed). Чинить там нечего — правило простое: 
 ## Связано
 - [[0009-ondevice-packages]] · [[0008-network-stack]] · [[0002-persistent-content-addressed-capability-core]] ·
   [[0011-foreign-software-personalities]] · [[persistent-store]] · [[object-model]] · [[void-pkg]] ·
-  [[checkpoint]] · [[threads]] · [[target-system]] · [[todo]]
+  [[checkpoint]] · [[threads]] · [[target-system]] · [[todo_G]]

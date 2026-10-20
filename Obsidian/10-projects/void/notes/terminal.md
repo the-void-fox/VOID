@@ -151,7 +151,7 @@ shell term mmio:fb endpoint:posixfs store:rwx env
 
 ## Связано
 - [[0014-terminal-ereb]] · [[framebuffer]] · [[userspace-drivers]] · [[capabilities]] ·
-  [[declarative-init]] · [[known-gaps]] · [[todo]]
+  [[declarative-init]] · [[known-gaps]] · [[todo_G]]
 
 ## Колесо крутит историю (Веха 148.1)
 

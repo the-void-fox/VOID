@@ -9,7 +9,7 @@ status: active
 
 Собран из потока мыслей владельца (вид бара, меню, индикатор запуска, список программ) и того,
 что уже записано в [[0016-void-ui-toolkit]], [[0017-settings-from-config]], [[task-manager]] и
-приоритетах «на ощущение живой системы» в [[todo]].
+приоритетах «на ощущение живой системы» в [[_external/VOID/30-todo/todo]].
 
 ## Где мы сейчас
 
@@ -335,4 +335,4 @@ store**. Прав НА ОБЪЕКТ в модели нет, поэтому ко�
 
 ## Связано
 - [[0016-void-ui-toolkit]] · [[0017-settings-from-config]] · [[0007-graphics-native-compositor]] ·
-  [[task-manager]] · [[bar]] · [[layers]] · [[logo]] · [[known-gaps]] · [[todo]]
+  [[task-manager]] · [[bar]] · [[layers]] · [[logo]] · [[known-gaps]] · [[_external/VOID/30-todo/todo]]

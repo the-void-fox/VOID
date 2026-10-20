@@ -42,4 +42,4 @@ err/io/delay готовы: kit имеет три столпа (аллокато�
 
 ## Связано
 - [[lx-err]] (Веха 59) · [[lx-io]] (Веха 60) · [[lx-emul-c]] (буси-udelay уже был там по тикам) ·
-  [[lx-kit]] (Lx_kit-рантайм) · [[known-gaps]] · [[todo]]
+  [[lx-kit]] (Lx_kit-рантайм) · [[known-gaps]] · [[todo_G]]

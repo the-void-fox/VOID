@@ -93,4 +93,4 @@ TSS + сегменты ring3 + `enter_user` (iretq) и syscall-путь (`syscal
 ## Связано
 - [[arch-boundary]] (Веха 24 — пререквизит) · [[0005-multiarch-arch-boundary|ADR 0005]]
 - [[elf-userspace]] · [[sv39-paging]] (riscv-аналог памяти) · [[scheduling]]
-- [[0004-void-pkg]] — Фаза 4 · [[todo]]
+- [[0004-void-pkg]] — Фаза 4 · [[todo_G]]

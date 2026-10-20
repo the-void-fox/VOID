@@ -51,5 +51,5 @@ TX+RX опросом есть. Дальше:
 
 ## Связано
 - [[lx-e1000-tx]] (Веха 70, TX) · [[lx-e1000-hw]] (Веха 69, MMIO) · [[lx-e1000-port]] (Веха 68) · [[lx-pci]] ·
-  [[lx-emul-c]] · [[userspace-drivers]] · [[irq]] · [[virtio-net]] · [[e1000]] · [[known-gaps]] · [[todo]]
+  [[lx-emul-c]] · [[userspace-drivers]] · [[irq]] · [[virtio-net]] · [[e1000]] · [[known-gaps]] · [[todo_G]]
 - Референс: reference/dde-linux/[[20-linker-driven-workflow]] · [[30-e1000-porting-map]]

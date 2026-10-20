@@ -74,4 +74,4 @@ status: done
 - `programs/user/src/lib.rs` — `irq_wait`; `bin/e1000d.rs` — IRQ-демо поверх polled-TX.
 
 ## Связано
-- [[userspace-drivers]] (слой 1: MMIO+DMA) · [[e1000]] (та же карта в ядре) · [[known-gaps]] · [[todo]]
+- [[userspace-drivers]] (слой 1: MMIO+DMA) · [[e1000]] (та же карта в ядре) · [[known-gaps]] · [[todo_G]]

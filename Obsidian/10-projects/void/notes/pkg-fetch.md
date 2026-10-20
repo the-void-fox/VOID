@@ -88,4 +88,4 @@ content-id именно затем, чтобы такого не было.
 
 ## Связано
 - [[0009-ondevice-packages]] · [[pkg-unpack]] · [[net-stack]] · [[capabilities]] ·
-  [[persistent-store]] · [[known-gaps]] · [[todo]]
+  [[persistent-store]] · [[known-gaps]] · [[todo_G]]

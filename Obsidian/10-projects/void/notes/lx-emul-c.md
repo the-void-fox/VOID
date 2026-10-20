@@ -84,4 +84,4 @@ timer — Linux-драйвер ждёт вытесняющий контекст)
 
 ## Связано
 - [[lx-emul]] (Rust-каркас, Веха 53) · [[nixpkgs-cross]] (C-мир, тот же тулчейн) · [[store-bridge]]
-  (доставка) · [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo]]
+  (доставка) · [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo_G]]
