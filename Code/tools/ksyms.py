@@ -111,9 +111,13 @@ def main():
 
     text = " ".join(args) if args else sys.stdin.read()
     addrs = [int(a, 16) for a in re.findall(r"0x[0-9a-fA-F]{6,16}", text)]
-    addrs = [a for a in addrs if a >= 0xFFFFFFFF80000000]
+    # Фильтр по базе ядра — только когда образ взят по умолчанию. Веха 231: выборка `trace`
+    # печатает адреса ПРОГРАММ, они лежат низко, и отбрасывать их значило бы отвечать «адресов
+    # нет» на верный вопрос. Назвали ELF явно — значит знают, чьи адреса принесли.
+    if kernel == DEFAULT_KERNEL:
+        addrs = [a for a in addrs if a >= 0xFFFFFFFF80000000]
     if not addrs:
-        sys.exit("адресов ядра во входных данных нет")
+        sys.exit("адресов во входных данных нет (для программ укажите их ELF первым аргументом)")
 
     syms = read_symbols(kernel)
     print(f"# {kernel}  ({len(syms)} символов)\n")

@@ -35,6 +35,23 @@ pub(super) fn syscall(t: &mut Table, cur: usize) {
     // всей системе» (этого хватает аварийному дампу: авария одна). Зависание — другой вопрос:
     // там важно, чем занято КАЖДОЕ ядро, потому что тупик — это всегда двое.
     cpu::note_syscall(num);
+    // Веха 231 — трассировка. Мерим ровно РАБОТУ ЯДРА по вызову, а не ожидание клиента: у
+    // блокирующих вызовов (`SYS_CALL`, `SYS_RECV`, чтение ввода) ядро отвечает быстро и
+    // переводит процесс в сон, а ответ приедет много позже. Назвать это «временем вызова»
+    // значило бы повторить ошибку `bench`, который мерил отказы вместо работы.
+    if crate::trace::on(crate::trace::TAG_SYSCALL) {
+        let t0 = crate::clock::uptime_ns();
+        dispatch_all(t, cur, num);
+        let dt = crate::clock::uptime_ns().saturating_sub(t0);
+        crate::trace::rec(crate::trace::TAG_SYSCALL, cur as u16, num as u64, dt);
+    } else {
+        dispatch_all(t, cur, num);
+    }
+}
+
+/// Сам разбор номера — вынесен из [`syscall`] затем, чтобы у вызова было ОДНО место выхода:
+/// иначе замер времени пришлось бы ставить перед каждым из шести `return`'ов.
+fn dispatch_all(t: &mut Table, cur: usize, num: usize) {
     if ipc::dispatch(t, cur, num) {
         return;
     }

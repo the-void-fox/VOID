@@ -2170,6 +2170,9 @@ pub(super) fn linux_syscall(t: &mut Table, cur: usize) {
 
     if done {
         trace_lx(nr, ret as isize);
+        // Веха 231 — то же событие наружу, в общую трассу: у хостируемых программ вопрос «что
+        // она делает» ровно такой же, а своё кольцо выше выливается только на падении.
+        crate::trace::rec(crate::trace::TAG_LINUX, cur as u16, nr as u64, ret as u64);
         let f = &mut t.procs[cur].frame;
         f.set_ret(ret);
         f.skip_syscall_insn(); // riscv: sepc+4; x86: rip+2 (пройти `syscall`)

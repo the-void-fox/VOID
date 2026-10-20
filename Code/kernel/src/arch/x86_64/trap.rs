@@ -469,6 +469,11 @@ extern "C" fn x86_trap_handler(frame: &mut TrapFrame) {
     }
     match frame.vector as u8 {
         VEC_TIMER => {
+            // Веха 231 — отсчёт выборки В ЯДРЕ. Сюда тик приходит только из кольца 0 (трап из
+            // кольца 3 ушёл в `handle_user_trap` выше и не вернулся), поэтому адрес ядерный и с
+            // пользовательскими отсчётами не смешивается. Адрес арх-зависим — отсюда две
+            // одинаковые строки в двух `trap.rs`, а не одна в `timer`.
+            crate::trace::rec(crate::trace::TAG_SAMPLE_K, 0, frame.pc() as u64, 0);
             crate::timer::on_tick();
             lapic::eoi();
         }

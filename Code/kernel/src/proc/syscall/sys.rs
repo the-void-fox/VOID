@@ -405,6 +405,59 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret(if ok { 0 } else { usize::MAX });
             f.advance();
         }
+        // SYS_TRACE(sysview_cap, op, ptr, len) (Веха 231) — трассировка под правом ОБЗОРА.
+        //
+        //   op=0  включить теги маской `ptr` (бит = номер тега); 0 — выключить. Нужен Sysview
+        //         WRITE: трассировка влияет на всю систему, это не чтение.
+        //   op=1  вычерпать новые записи в буфер (`ptr`, `len`), по 32 Б; возвращает байты.
+        //   op=2  числа о самой трассе в буфер: маска, сделано записей, ПОТЕРЯНО (3 × u64).
+        //
+        // Потери отдаются отдельным вопросом, а не вторым результатом `op=1`: второго
+        // результата у нашего syscall-соглашения нет, а заводить его ради отладочного
+        // инструмента — менять ABI не по делу.
+        //
+        // Почему под правом, и тем же самым, что список процессов: трасса показывает, что делают
+        // ЧУЖИЕ процессы, вплоть до адресов их кода. Свободный доступ к ней был бы дырой в
+        // конфайнменте — ровно той, которую модель угроз называет первым признаком нарушения.
+        75 => {
+            let (scap, op, ptr, len) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            let dom = t.procs[cur].domain;
+            let need = if op == 0 { Rights::WRITE } else { Rights::READ };
+            let ret = match cap::sysview(dom, Cap::from_bits(scap as u64), need) {
+                Err(_) => usize::MAX,
+                Ok(()) => match op {
+                    0 => {
+                        let m = crate::trace::set_mask(ptr as u64);
+                        if m != 0 {
+                            crate::println!("  [trace] трассировка включена, маска {:#x}", m);
+                        } else {
+                            crate::println!("  [trace] трассировка выключена");
+                        }
+                        0
+                    }
+                    1 if len >= crate::trace::REC && ensure_heap_range(t, cur, ptr, len) => {
+                        let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+                        let (n, _) = crate::trace::read_into(buf);
+                        n
+                    }
+                    2 if len >= 24 && ensure_heap_range(t, cur, ptr, len) => {
+                        let (mask, written, dropped) = crate::trace::stats();
+                        let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, 24) };
+                        buf[0..8].copy_from_slice(&mask.to_le_bytes());
+                        buf[8..16].copy_from_slice(&written.to_le_bytes());
+                        buf[16..24].copy_from_slice(&dropped.to_le_bytes());
+                        0
+                    }
+                    _ => usize::MAX,
+                },
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(ret);
+            f.advance();
+        }
         // SYS_RANDOM(buf, len) -> len | MAX (Веха 86): заполнить буфер процесса случайными
         // байтами (аппаратный ГСЧ + пул событий, см. [`crate::random`]). Буфер может лежать в
         // ленивой куче — доотображаем, как в SYS_WRITE.

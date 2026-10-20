@@ -1364,6 +1364,16 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
             // Веха 22.2: page fault из U-mode — ленивая страница кучи или гибель процесса.
             UserTrap::PageFault { va, kind } => handle_user_fault(&mut t, cur, va, kind),
             UserTrap::TimerTick => {
+                // Веха 231 — ОТСЧЁТ ВЫБОРКИ. Единственное место, где известно, по какому адресу
+                // своего кода застали процесс: тик, пришедший в U-mode, попадает именно сюда.
+                // Адрес берём из сохранённого кадра, а не из `frame`, — в кадре он уже разобран
+                // арх-частью, и это тот же путь, которым его видит аварийный дамп.
+                crate::trace::rec(
+                    crate::trace::TAG_SAMPLE_U,
+                    cur as u16,
+                    t.procs[cur].frame.user_pc() as u64,
+                    0,
+                );
                 // Вытеснение по таймеру: перевзвести и уступить следующему готовому. Текущий
                 // остаётся Runnable, его кадр сохранён; PC НЕ двигаем — продолжит с прерванного.
                 timer::preempt_tick();

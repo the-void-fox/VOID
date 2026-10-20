@@ -200,7 +200,12 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
 
     if is_interrupt {
         match code {
-            csr::IRQ_S_TIMER => timer::on_tick(),
+            csr::IRQ_S_TIMER => {
+                // Веха 231 — отсчёт выборки В ЯДРЕ (пара к x86: трап из U-mode обслужен выше и
+                // сюда не доходит, значит адрес ядерный).
+                crate::trace::rec(crate::trace::TAG_SAMPLE_K, 0, frame.pc() as u64, 0);
+                timer::on_tick()
+            }
             csr::IRQ_S_EXTERNAL => plic::handle_external(), // устройства (диск)
             other => println!("  [trap] неизвестное прерывание, код={}", other),
         }

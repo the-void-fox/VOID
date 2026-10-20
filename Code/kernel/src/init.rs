@@ -227,6 +227,10 @@ service wifi mmio:wifi dma store:r
 shell wm endpoint:posixfs store:rwx endpoint:net-srv:sg! mmio:fb! power:wg! sysview:rwg! hwprobe:rwg! endpoint:hda env
 desktop sysview taskmgr
 desktop sysview bar
+# Веха 231 — трассировка тем же порядком: `trace` показывает, что делают ЧУЖИЕ процессы, вплоть
+# до адресов их кода, и это ровно то же наблюдение за системой, что список процессов. Без этой
+# строки инструмент честно скажет, что права нет, и не запустится.
+desktop sysview trace
 desktop power bar
 desktop power bin/vvsh
 desktop net taskmgr

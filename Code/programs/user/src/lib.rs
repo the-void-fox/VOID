@@ -126,6 +126,8 @@ const SYS_PEER_ROOT: usize = 72;
 const SYS_CAP_NARROW: usize = 73;
 /// Веха 230 — подвести настенные часы системы (нужно право `clock:w`).
 const SYS_CLOCK_SET: usize = 74;
+/// Веха 231 — трассировка: включить, вычерпать, спросить числа (право обзора).
+const SYS_TRACE: usize = 75;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1057,6 +1059,89 @@ pub fn random(buf: &mut [u8]) -> usize {
 /// здесь нельзя, и TLS обязан отказаться, а не «сделать как-нибудь».
 pub fn random_is_strong() -> bool {
     abi::syscall(SYS_RANDOM, 0, 0, 1, 0, 0, 0, 0).0 == 1
+}
+
+/// Веха 231 — трассировка ядра. Всё под правом ОБЗОРА (`sysview`), тем же, которым живут список
+/// процессов и числа о машине: трасса показывает, что делают чужие процессы.
+pub mod trace {
+    use super::{abi, SYS_TRACE};
+
+    /// Размер одной записи — тот же в ядре (`trace::REC`).
+    pub const REC: usize = 32;
+
+    /// Теги; номер тега есть номер бита в маске включения.
+    pub const TAG_SYSCALL: u16 = 1;
+    pub const TAG_LINUX: u16 = 2;
+    pub const TAG_SAMPLE_U: u16 = 3;
+    pub const TAG_SAMPLE_K: u16 = 4;
+
+    /// Одна разобранная запись.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Event {
+        /// Время с загрузки, нс.
+        pub t_ns: u64,
+        pub tag: u16,
+        /// Номер процесса (у ядерных отсчётов — 0).
+        pub pid: u16,
+        pub cpu: u8,
+        /// Смысл зависит от тега: номер вызова, адрес кода.
+        pub a: u64,
+        /// Длительность работы ядра по вызову (нс) либо признак.
+        pub b: u64,
+    }
+
+    /// Включить теги маской. `0` — выключить. Нужно право обзора с WRITE.
+    pub fn enable(sysview_cap: usize, mask: u64) -> bool {
+        abi::syscall(SYS_TRACE, sysview_cap, 0, mask as usize, 0, 0, 0, 0).0 == 0
+    }
+
+    /// Собрать маску из списка тегов — чтобы звать `enable(cap, mask_of(&[TAG_SYSCALL]))`.
+    pub fn mask_of(tags: &[u16]) -> u64 {
+        tags.iter().fold(0u64, |m, &t| m | (1 << t))
+    }
+
+    /// Вычерпать новые записи. Возвращает, сколько разобрано в `out`.
+    ///
+    /// Вычерпывать надо РЕГУЛЯРНО: кольцо ядра конечно, и отставший читатель теряет самые старые
+    /// записи. Сколько потеряно — отвечает [`stats`], и спрашивать это обязательно: трасса с
+    /// молчаливой дырой хуже отсутствия трассы.
+    pub fn read(sysview_cap: usize, raw: &mut [u8], out: &mut [Event]) -> usize {
+        let cap = out.len() * REC;
+        let len = raw.len().min(cap);
+        if len < REC {
+            return 0;
+        }
+        let n = abi::syscall(SYS_TRACE, sysview_cap, 1, raw.as_mut_ptr() as usize, len, 0, 0, 0).0;
+        if n == usize::MAX {
+            return 0;
+        }
+        let k = n / REC;
+        for i in 0..k {
+            let r = &raw[i * REC..i * REC + REC];
+            out[i] = Event {
+                t_ns: u64::from_le_bytes(r[0..8].try_into().unwrap()),
+                tag: u16::from_le_bytes(r[8..10].try_into().unwrap()),
+                pid: u16::from_le_bytes(r[10..12].try_into().unwrap()),
+                cpu: r[12],
+                a: u64::from_le_bytes(r[16..24].try_into().unwrap()),
+                b: u64::from_le_bytes(r[24..32].try_into().unwrap()),
+            };
+        }
+        k
+    }
+
+    /// Числа о самой трассе: (маска, сделано записей, ПОТЕРЯНО записей).
+    pub fn stats(sysview_cap: usize) -> Option<(u64, u64, u64)> {
+        let mut buf = [0u8; 24];
+        let r = abi::syscall(SYS_TRACE, sysview_cap, 2, buf.as_mut_ptr() as usize, 24, 0, 0, 0).0;
+        (r != usize::MAX).then(|| {
+            (
+                u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+                u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+                u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            )
+        })
+    }
 }
 
 /// Разложить Unix-секунды в (год, месяц, день, час, минута, секунда) UTC — зеркало
