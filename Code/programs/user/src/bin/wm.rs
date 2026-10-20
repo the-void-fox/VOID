@@ -1148,6 +1148,8 @@ fn main_loop() -> ! {
         fb_cap,
         rgb,
         rgb8,
+        rgb_std: rgb8 && rgb[0].0 == 16 && rgb[1].0 == 8 && rgb[2].0 == 0,
+        slide_now: (0, 0, 0),
         work: At::new(0, 0, info.width as i32, info.height as i32),
         // Веха 150 — буфер обмена ПЕРЕЖИВАЕТ ПЕРЕЗАГРУЗКУ: он лежит корнем в store, и здесь мы
         // его просто поднимаем. Вид после загрузки считаем текстом: других видов сегодня нет, а
@@ -1948,6 +1950,11 @@ struct Wm {
     rgb: [(u32, u32); 3],
     /// Все три канала по восемь бит — тогда разбор пикселя это сдвиг, а не деление.
     rgb8: bool,
+    /// Веха 230.6 — раскладка кадра ОБЫЧНАЯ: `0x00RRGGBB` (R на 16, G на 8, B на 0, по восемь
+    /// бит). При ней перевод пикселя клиента в пиксель кадра — перестановка двух байт в слове.
+    rgb_std: bool,
+    /// Веха 230.6 — смещения переезда столов на ЭТОТ кадр: `(приходящая, уходящая, прокрутка)`.
+    slide_now: (i32, i32, i32),
     /// Право на экран — нужно, чтобы ПОКАЗАТЬ собранный кадр (Веха 224, `sys::video_flush`).
     fb_cap: usize,
     super_held: bool,
@@ -2704,6 +2711,8 @@ impl Wm {
         // Веха 168.3 — два чтения часов на кадр: одно здесь, одно на границе сборки и вывода.
         // Ими и меряется «подлагивает» ([`Frames`]).
         let t0 = sys::monotonic_ns();
+        // Веха 230.6 — смещения переезда на весь кадр считаются здесь, один раз.
+        self.slide_tick();
         let rects = core::mem::take(&mut self.damage);
         for r in &rects {
             self.repaint(*r);
@@ -2790,14 +2799,6 @@ impl Wm {
         // Веха 145.1 — приходящая едет ОТ `sl.from` К НУЛЮ, а уходящая жёстко привязана к ней
         // ровно на экран: пара не может разъехаться, и переключение посреди движения продолжает
         // картинку с того места, где она есть, а не прыгает на экран в сторону.
-        let (dy_in, dy_out, sl_scroll) = match &self.slide {
-            Some(sl) => {
-                let dy = sl.offset(sys::monotonic_ns());
-                (dy, dy - sl.dir * self.info.height as i32, sl.scroll)
-            }
-            None => (0, 0, 0),
-        };
-
         for win in &self.wins {
             if !win.visible || !win.tiled() {
                 continue;
@@ -2806,14 +2807,40 @@ impl Wm {
             // (Веха 125). Отсюда следствие: содержимое приходится масштабировать — во время
             // переезда и сжатия окно на экране не совпадает со своим буфером.
             let active = self.focus == Some(win.id);
-            let leaving = self.slide.as_ref().is_some_and(|s| s.ids.contains(&win.id));
-            let (sc, dy) = if leaving { (sl_scroll, dy_out) } else { (self.scroll_x, dy_in) };
-            let rect = win.shown.rect().to_screen(sc).offset(0, dy);
+            let rect = self.win_on_screen(win);
             self.draw_win_row(out, yy, x0, x1, rect, win, active, win.shown.a);
         }
 
         self.draw_layers(out, yy, x0, x1, true);
         self.draw_cursor_row(out, yy, x0, x1);
+    }
+
+    /// Веха 230.6 — пересчитать смещения переезда столов ОДИН РАЗ ЗА КАДР.
+    ///
+    /// Внутри сидит чтение часов, а это системный вызов. Считать их там, где спрашивают (на
+    /// каждую строку и каждое окно), значит платить две тысячи вызовов за кадр — одиннадцать
+    /// миллисекунд на пустом месте. Эта ошибка в файле уже описана дважды в других местах;
+    /// теперь она закрыта и здесь.
+    fn slide_tick(&mut self) {
+        self.slide_now = match &self.slide {
+            Some(sl) => {
+                let dy = sl.offset(sys::monotonic_ns());
+                (dy, dy - sl.dir * self.info.height as i32, sl.scroll)
+            }
+            None => (0, 0, 0),
+        };
+    }
+
+    /// Веха 230.6 — ГДЕ ОКНО НА ЭКРАНЕ СЕЙЧАС: прокрутка ленты плюс смещение переезда столов.
+    ///
+    /// Формула была записана ДВАЖДЫ — в сборке строки и в расчёте закрывающих отрезков, — и
+    /// вторая копия во время переезда просто сдавалась («проще честно нарисовать всё»). Цена
+    /// сдачи измерена: кадр переезда заливал стол и обои под окнами, которые их закрывают.
+    fn win_on_screen(&self, win: &Win) -> At<Screen> {
+        let (dy_in, dy_out, sl_scroll) = self.slide_now;
+        let leaving = self.slide.as_ref().is_some_and(|s| s.ids.contains(&win.id));
+        let (sc, dy) = if leaving { (sl_scroll, dy_out) } else { (self.scroll_x, dy_in) };
+        win.shown.rect().to_screen(sc).offset(0, dy)
     }
 
     /// Стол и слои ПОД окнами — но только там, где их видно (Веха 223.10).
@@ -2842,7 +2869,8 @@ impl Wm {
                 if !win.visible || !win.tiled() || win.shown.a < 256 || n == cover.len() {
                     continue;
                 }
-                let r = win.shown.rect().to_screen(self.scroll_x).rect();
+                // Веха 230.6 — прямоугольник ТОТ ЖЕ, по которому окно и рисуется.
+                let r = self.win_on_screen(win).rect();
                 let (_, rad) = win.deco();
                 // Строка у скруглённого угла закрывает не всю свою ширину — пусть её рисуют.
                 if yy < r.y + rad || yy >= r.bottom() - rad {
@@ -2854,11 +2882,6 @@ impl Wm {
                     n += 1;
                 }
             }
-        }
-        // Переезд столов двигает ленту по вертикали, и тогда закрытое окнами место уже не то,
-        // которое посчитано выше: проще честно нарисовать всё.
-        if self.slide.is_some() {
-            n = 0;
         }
         if n == 0 {
             out.fill(desktop);
@@ -3010,8 +3033,27 @@ impl Wm {
                     let b1 = b0 + (ce - cs) as usize * 4;
                     if b1 <= px.len() {
                         let dst = &mut out[(cs - x0) as usize..(ce - x0) as usize];
-                        for (d, s) in dst.iter_mut().zip(px[b0..b1].chunks_exact(4)) {
-                            *d = self.pack((s[0], s[1], s[2]));
+                        // Веха 230.6 — СЛОВАМИ, А НЕ БАЙТАМИ.
+                        //
+                        // Замер показал то, во что трудно поверить, пока не увидишь: кадр
+                        // 1280×800 собирался пятьдесят миллисекунд, и это была не память, не
+                        // планировщик и не чужая работа, а СОБСТВЕННЫЙ цикл — полсотни
+                        // наносекунд на точку. На каждый пиксель приходилось три отдельных
+                        // чтения байта (каждое с проверкой границ), шесть сдвигов и две склейки.
+                        //
+                        // У клиента пиксель лежит как `[r,g,b,a]`, то есть словом это
+                        // `0xAABBGGRR`; кадру при обычной раскладке нужен `0x00RRGGBB`. Значит
+                        // вся работа — переставить два байта, если читать слово целиком.
+                        let src = &px[b0..b1];
+                        let (pre, src32, _) = unsafe { src.align_to::<u32>() };
+                        if self.rgb_std && pre.is_empty() && src32.len() >= dst.len() {
+                            for (d, &v) in dst.iter_mut().zip(src32) {
+                                *d = (v & 0x0000_ff00) | ((v & 0xff) << 16) | ((v >> 16) & 0xff);
+                            }
+                        } else {
+                            for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                                *d = self.pack((s[0], s[1], s[2]));
+                            }
                         }
                     }
                 } else if ce > cs && off >= 0 {
