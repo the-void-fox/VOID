@@ -72,4 +72,4 @@ host-мост (первая точка самодостаточности) → N
 ## Связано
 - [[void-pkg]] — развёрнутый план и лестница самодостаточности
 - [[0002-persistent-content-addressed-capability-core]] · [[0003-phase-3-exec-by-hash]]
-- [[exec-from-store]] · [[posix-personality]] · [[process-heap]] · [[todo_G]]
+- [[exec-from-store]] · [[posix-personality]] · [[process-heap]] · [[todo]]

@@ -58,5 +58,5 @@ TX есть. Дальше:
 
 ## Связано
 - [[lx-e1000-hw]] (Веха 69, MMIO) · [[lx-e1000-port]] (Веха 68) · [[lx-pci]] · [[lx-emul-c]] (Веха 54 — тот же DMA-cap) ·
-  [[userspace-drivers]] · [[irq]] · [[virtio-net]] · [[known-gaps]] · [[todo_G]]
+  [[userspace-drivers]] · [[irq]] · [[virtio-net]] · [[known-gaps]] · [[todo]]
 - Референс: reference/dde-linux/[[20-linker-driven-workflow]] · [[30-e1000-porting-map]]

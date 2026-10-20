@@ -96,4 +96,4 @@ IOAPIC (консоль IRQ4 по прерыванию, линии устройс
 ## Связано
 - [[x86-bringup]] (Веха 25) · [[arch-boundary]] (Веха 24) · [[0005-multiarch-arch-boundary|ADR 0005]]
 - [[elf-userspace]] (Веха 23) · [[user-mode]] · [[interactive-shell]] · [[commit-policy]]
-- [[todo_G]]
+- [[todo]]

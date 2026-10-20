@@ -61,4 +61,4 @@ MMIO+DMA из userspace РАБОТАЮТ`. e1000d чисто вышел (vsh п�
 - `programs/user/src/lib.rs` — `mmio_map`/`dma_alloc`; `bin/e1000d.rs` — e1000 в userspace.
 
 ## Связано
-- [[e1000]] (тот же драйвер, но в ядре) · [[frame-freeing]] (is_ram при сносе) · [[known-gaps]] · [[todo_G]]
+- [[e1000]] (тот же драйвер, но в ядре) · [[frame-freeing]] (is_ram при сносе) · [[known-gaps]] · [[todo]]

@@ -63,5 +63,5 @@ Genode dde_linux (`lx_kit/{task,scheduler}.cc`): весь портируемый
 
 ## Связано
 - [[lx-kit]] (Веха 56, аллокатор) · [[lx-delay]] (Веха 61, буси-паузы) · [[irq]] (SYS_IRQ_WAIT —
-  стык реального прерывания) · [[threads]] (нити/futex VOID — вне Lx_kit) · [[known-gaps]] · [[todo_G]]
+  стык реального прерывания) · [[threads]] (нити/futex VOID — вне Lx_kit) · [[known-gaps]] · [[todo]]
 - Референс: reference/dde-linux/[[00-overview]] · [[10-lx-kit-runtime]] · [[20-linker-driven-workflow]] · [[30-e1000-porting-map]]

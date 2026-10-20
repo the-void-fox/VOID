@@ -101,4 +101,4 @@ status: accepted
 ## Связано
 - [[posix-personality]] · [[linux-abi]] · [[lx-emul]] · [[userspace-drivers]] · [[capabilities]] ·
   [[threads]] · [[wasi]] · [[0002-persistent-content-addressed-capability-core]] ·
-  [[0007-graphics-native-compositor]] · [[0012-mesh-distributed-work]] · [[todo_G]]
+  [[0007-graphics-native-compositor]] · [[0012-mesh-distributed-work]] · [[todo]]

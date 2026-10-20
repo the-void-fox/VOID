@@ -117,4 +117,4 @@ store был меньше кучи ядра (16 МиБ), это не прояв�
 
 ## Связано
 - [[pkg-unpack]] · [[pkg-fetch]] · [[pkg-closure]] · [[persistent-store]] · [[linux-abi]] ·
-  [[known-gaps]] · [[todo_G]]
+  [[known-gaps]] · [[todo]]

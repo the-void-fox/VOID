@@ -79,4 +79,4 @@ virtio-скан смотрит только функцию 0. Ищем клас�
 - `kernel/src/main.rs` — выбор носителя на загрузке (AHCI → иначе virtio-blk).
 
 ## Связано
-- [[known-gaps]] (драйверы железа) · [[platform]] (реальный x86) · [[x86-devices]] (virtio/PCI/MSI-X) · [[frame-freeing]] (DMA-фреймы) · [[todo_G]]
+- [[known-gaps]] (драйверы железа) · [[platform]] (реальный x86) · [[x86-devices]] (virtio/PCI/MSI-X) · [[frame-freeing]] (DMA-фреймы) · [[todo]]

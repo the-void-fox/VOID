@@ -103,4 +103,4 @@ DTB на riscv) и стелить direct-map huge-страницами. Но п�
 
 ## Связано
 - [[platform]] · [[memory-regions]] · [[sv39-paging]] · [[x86-bringup]] · [[frame-freeing]] ·
-  [[nixpkgs-cross]] · [[std-port]] · [[known-gaps]] · [[todo_G]]
+  [[nixpkgs-cross]] · [[std-port]] · [[known-gaps]] · [[todo]]

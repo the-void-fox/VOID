@@ -56,5 +56,5 @@ driver_register → probe: 'fakedev0' ← 'fakedrv'`; `probe=1, связан с 
 
 ## Связано
 - [[lx-work]] (Веха 65) · [[lx-kit]] (аллокатор) · [[lx-emul-c]] (Rust/C-каркас драйвер-модели — свести) ·
-  [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo_G]]
+  [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo]]
 - Референс: reference/dde-linux/[[20-linker-driven-workflow]] · [[30-e1000-porting-map]]

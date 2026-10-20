@@ -171,4 +171,4 @@ ereb на Linux читает свой KDL-файл. Здесь принято и
   въехали настройки терминала.
 - [[0002-persistent-content-addressed-capability-core]] · [[0005-multiarch-arch-boundary]] ·
   [[0008-network-stack]] (тот же принцип про чужой код) · [[platform]] · [[tty]] ·
-  [[known-gaps]] · [[todo_G]]
+  [[known-gaps]] · [[todo]]

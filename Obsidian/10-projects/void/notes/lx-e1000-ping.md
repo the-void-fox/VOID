@@ -58,5 +58,5 @@ DMA-RX → IRQ → **ping**). Дальше — **по требованию** ([[
 ## Связано
 - [[lx-e1000-irq]] (72, IRQ) · [[lx-e1000-rx]] (71) · [[lx-e1000-tx]] (70) · [[lx-e1000-hw]] (69) ·
   [[lx-e1000-port]] (68) · [[lx-pci]] · [[lx-sched]] · [[userspace-drivers]] · [[irq]] · [[virtio-net]] ·
-  [[e1000]] · [[known-gaps]] · [[todo_G]] · [[target-system]] (зачем: host-agnostic boot)
+  [[e1000]] · [[known-gaps]] · [[todo]] · [[target-system]] (зачем: host-agnostic boot)
 - Референс: reference/dde-linux/[[30-e1000-porting-map]]

@@ -79,4 +79,4 @@ vsh поднялся). riscv — `lx_e1000` компилируется и сее
 
 ## Связано
 - [[userspace-drivers]] (MMIO+DMA, Веха 51) · [[irq]] (IRQ, Веха 52) · [[e1000]] (та же карта в ядре)
-  · [[known-gaps]] · [[todo_G]]
+  · [[known-gaps]] · [[todo]]

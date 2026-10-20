@@ -58,5 +58,5 @@ waiter получает completion @ jiffies≈5–6; Демо 3 — `wait_event
 
 ## Связано
 - [[lx-sched]] (Веха 62, планировщик) · [[lx-timer]] (Веха 63, таймеры — под таймаут-ожидания) ·
-  [[lx-kit]] (аллокатор) · [[known-gaps]] · [[todo_G]]
+  [[lx-kit]] (аллокатор) · [[known-gaps]] · [[todo]]
 - Референс: reference/dde-linux/[[10-lx-kit-runtime]] · [[30-e1000-porting-map]]

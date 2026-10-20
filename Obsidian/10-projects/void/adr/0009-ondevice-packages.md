@@ -90,4 +90,4 @@ cargo под `*-unknown-void`) и **положить мостом** `void-store-
 
 ## Связано
 - [[0004-void-pkg]] · [[void-pkg]] · [[0008-network-stack]] · [[store-bridge]] · [[linux-abi]] ·
-  [[declarative-init]] · [[known-gaps]] · [[todo_G]]
+  [[declarative-init]] · [[known-gaps]] · [[todo]]

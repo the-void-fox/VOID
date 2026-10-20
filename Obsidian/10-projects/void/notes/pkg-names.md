@@ -209,4 +209,4 @@ vvsh/> pkg update
 
 ## Связано
 - [[pkg-fetch]] · [[pkg-closure]] · [[pkg-tree]] · [[pkg-life]] · [[store-compact]] ·
-  [[0009-ondevice-packages]] · [[known-gaps]] · [[todo_G]]
+  [[0009-ondevice-packages]] · [[known-gaps]] · [[todo]]

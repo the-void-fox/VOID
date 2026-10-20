@@ -58,4 +58,4 @@ x86-порт, SASOS, сеть или «самостоятельность» си
 - [[phase-2-state-analysis]]
 - [[0001-rust-riscv-microkernel]]
 - [[0002-persistent-content-addressed-capability-core]]
-- [[todo_G]]
+- [[todo]]

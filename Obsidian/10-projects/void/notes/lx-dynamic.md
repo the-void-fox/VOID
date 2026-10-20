@@ -97,4 +97,4 @@ unexpected error code») легли на уже существующие мех�
 
 ## Связано
 - [[lx-files]] · [[linux-abi]] · [[pkg-tree]] · [[store-mount]] · [[pkg-closure]] ·
-  [[exec-from-store]] · [[known-gaps]] · [[todo_G]]
+  [[exec-from-store]] · [[known-gaps]] · [[todo]]

@@ -93,4 +93,4 @@ vvsh/> pkg gc all
 
 ## Связано
 - [[pkg-fetch]] · [[pkg-closure]] · [[pkg-tree]] · [[store-mount]] · [[lx-files]] ·
-  [[lx-dynamic]] · [[0009-ondevice-packages]] · [[known-gaps]] · [[todo_G]]
+  [[lx-dynamic]] · [[0009-ondevice-packages]] · [[known-gaps]] · [[todo]]

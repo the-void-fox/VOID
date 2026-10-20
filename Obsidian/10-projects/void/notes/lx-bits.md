@@ -72,4 +72,4 @@ linux-src/hweight.c lx_kit.c`; `lx_kit.c` — ради `printk`). ELF на ди�
 
 ## Связано
 - [[lx-list]] (Веха 57, список) · [[lx-kit]] (Веха 56, аллокатор) · [[lx-linux]] (Веха 55, старт) ·
-  [[lx-emul-c]] (C-каркас: IRQ-поток — под атомики позже) · [[store-bridge]] · [[known-gaps]] · [[todo_G]]
+  [[lx-emul-c]] (C-каркас: IRQ-поток — под атомики позже) · [[store-bridge]] · [[known-gaps]] · [[todo]]

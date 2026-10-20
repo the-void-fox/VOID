@@ -65,5 +65,5 @@ Vendored-файлы собираются с ядровыми флагами (`-W
 
 ## Связано
 - [[lx-pci]] (Веха 67) · [[lx-driver]] (Веха 66) · [[lx-kit]] · [[lx-emul-c]] · [[e1000]] (родной драйвер, Веха 49) ·
-  [[userspace-drivers]] · [[irq]] · [[virtio-net]] · [[known-gaps]] · [[todo_G]]
+  [[userspace-drivers]] · [[irq]] · [[virtio-net]] · [[known-gaps]] · [[todo]]
 - Референс: reference/dde-linux/[[20-linker-driven-workflow]] · [[30-e1000-porting-map]]

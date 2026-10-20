@@ -48,4 +48,4 @@ status: done
 
 ## Связано
 - [[commit-policy]] · [[persistent-store]] · [[group-commit]] · [[pkg-tree]] · [[pkg-life]] ·
-  [[known-gaps]] · [[todo_G]]
+  [[known-gaps]] · [[todo]]

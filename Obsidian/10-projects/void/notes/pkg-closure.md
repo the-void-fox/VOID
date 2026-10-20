@@ -141,4 +141,4 @@ vvsh/> pkg gens
 
 ## Связано
 - [[0009-ondevice-packages]] · [[pkg-fetch]] · [[pkg-unpack]] · [[persistent-store]] ·
-  [[declarative-init]] · [[capabilities]] · [[known-gaps]] · [[todo_G]]
+  [[declarative-init]] · [[capabilities]] · [[known-gaps]] · [[todo]]

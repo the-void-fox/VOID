@@ -81,4 +81,4 @@ musl на x86-64 предпочитает **легаси-номера без `di
   читаются, но в том виде, в каком легли в store последним `close`.
 
 ## Связано
-- [[linux-abi]] · [[pkg-tree]] · [[store-mount]] · [[object-model]] · [[known-gaps]] · [[todo_G]]
+- [[linux-abi]] · [[pkg-tree]] · [[store-mount]] · [[object-model]] · [[known-gaps]] · [[todo]]

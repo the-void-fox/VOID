@@ -183,4 +183,4 @@ ADR. Мерить объём и решать — когда владелец в�
 
 ## Связано
 - [[0006-vvsh-lisp-config-shell]] · [[vvsh-lang]] · [[vvsh-config-layout]] · [[vvsh-shell]] ·
-  [[declarative-init]] · [[0008-network-stack]] · [[todo_G]]
+  [[declarative-init]] · [[0008-network-stack]] · [[todo]]

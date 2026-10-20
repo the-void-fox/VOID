@@ -66,5 +66,5 @@ device=100e reg=0xe1000ba5 OK`. `-Wall -Wextra -Wclobbered -Wcomment` чисто
 
 ## Связано
 - [[lx-driver]] (Веха 66, driver-model — PCI стоит на ней) · [[lx-kit]] · [[lx-emul-c]] ·
-  [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo_G]]
+  [[userspace-drivers]] · [[irq]] · [[known-gaps]] · [[todo]]
 - Референс: reference/dde-linux/[[20-linker-driven-workflow]] · [[30-e1000-porting-map]]
