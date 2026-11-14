@@ -56,6 +56,15 @@ mod reg {
     /// Отдельная плоскость — поэтому курсор и не стоит кадра: двигает его развёртка, а не мы.
     /// Счётчик кадров конвейера A: растёт на каждом обратном ходе луча.
     pub const FRMCOUNT: usize = 0x70040;
+    /// Размер источника конвейера: `(ширина-1) << 16 | (высота-1)`. Это то, сколько точек
+    /// конвейер БЕРЁТ ИЗ ПАМЯТИ, — а сколько показывает панель, говорит её развёртка.
+    pub const PIPEASRC: usize = 0x6001c;
+    /// Временная развёртка: активных точек и всего. Активная часть — это размер ПАНЕЛИ.
+    pub const HTOTAL_A: usize = 0x60000;
+    pub const VTOTAL_A: usize = 0x6000c;
+    /// Масштабатор панели: он растягивает картинку конвейера, когда она меньше панели.
+    pub const PF_CTL_A: usize = 0x68080;
+    pub const PF_WIN_SZ_A: usize = 0x68074;
     /// Подсветка панели. У шестого и седьмого поколения её две половины: ПЕРИОД ШИМ живёт в
     /// микросхеме PCH, а УРОВЕНЬ — в регистре процессора. Путать их нельзя: запись уровня в
     /// PCH не меняет ничего (проверено на живой машине владельца).
@@ -76,6 +85,15 @@ static BAR0: AtomicUsize = AtomicUsize::new(0);
 static GTT_OFF: AtomicUsize = AtomicUsize::new(0);
 /// Шаг между буферами в байтах (он же смещение второго).
 static STEP: AtomicUsize = AtomicUsize::new(0);
+/// Новый размер экрана, если мы перешли на родной размер панели. Ноль в ширине — не переходили.
+/// Применяет его не этот модуль, а тот, кто владеет геометрией экрана (`fb`): здесь мы знаем
+/// железо, но не знаем, кто на него смотрит.
+static NEW_W: AtomicUsize = AtomicUsize::new(0);
+static NEW_H: AtomicUsize = AtomicUsize::new(0);
+static NEW_PITCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Сколько украденной памяти у графики (байт).
+static STOLEN: AtomicUsize = AtomicUsize::new(0);
 /// Смещение картинки курсора в GTT (0 — курсора нет).
 static CURSOR_OFF: AtomicUsize = AtomicUsize::new(0);
 /// Апертура (BAR2): через неё пишется картинка курсора — тем же путём, которым композитор
@@ -101,6 +119,12 @@ static ACCEPTED: AtomicBool = AtomicBool::new(false);
 /// анимации: обратный ход луча за это время случается наверняка (экран идёт на шестидесяти
 /// герцах), а человек не успевает долго смотреть на застывший кадр, если мы ошиблись.
 const TRIES: usize = 30;
+
+/// Новый размер экрана, если мы перешли на родной размер панели. `None` — геометрия прежняя.
+pub fn new_mode() -> Option<(usize, usize, usize)> {
+    let w = NEW_W.load(Ordering::Relaxed);
+    (w != 0).then(|| (w, NEW_H.load(Ordering::Relaxed), NEW_PITCH.load(Ordering::Relaxed)))
+}
 
 /// Готова ли двойная буферизация.
 pub fn present() -> bool {
@@ -188,13 +212,13 @@ fn bar(bdf: u16, off: u8) -> usize {
 
 /// Подготовить двойную буферизацию. Зовётся один раз на загрузке, ПОСЛЕ того как принят кадр.
 ///
-/// `fb_phys` — физический адрес кадра, каким его отдал загрузчик; `pitch` и `height` — его
-/// геометрия. Возвращает `true`, если всё сошлось и переключать страницу теперь есть чем.
+/// `fb_phys` — физический адрес кадра, каким его отдал загрузчик; `pitch`, `width` и `height` —
+/// его геометрия. Возвращает `true`, если всё сошлось и переключать страницу теперь есть чем.
 ///
 /// Проверок много, и ни одна не лишняя: каждая отвечает за своё предположение, и провал любого
 /// означает, что мы понимаем железо хуже, чем думаем. В этом случае система работает как
 /// работала — одним буфером, — а в журнале стоит строка с причиной.
-pub fn init(fb_phys: usize, pitch: usize, height: usize) -> bool {
+pub fn init(fb_phys: usize, pitch: usize, width: usize, height: usize) -> bool {
     let Some(bdf) = find() else { return false };
     // ПОКОЛЕНИЕ — прежде всего остального: по нему решается, верны ли вообще смещения, по
     // которым мы собираемся читать и писать.
@@ -240,16 +264,7 @@ pub fn init(fb_phys: usize, pitch: usize, height: usize) -> bool {
     BAR0.store(bar0, Ordering::Relaxed);
     GTT_OFF.store(gtt_off, Ordering::Relaxed);
 
-    let frame = pitch * height;
-    let step = (frame + 0xfff) & !0xfff;
-    if stolen < step * 2 {
-        crate::println!(
-            "  [intel] украденной памяти {} МиБ — на два кадра по {} КиБ не хватает",
-            stolen / (1024 * 1024),
-            step / 1024,
-        );
-        return false;
-    }
+    STOLEN.store(stolen, Ordering::Relaxed);
 
     // Развёртка обязана быть включена и настроена так, как мы собираемся ей подсовывать кадр.
     let conf = rd(reg::PIPEACONF);
@@ -269,6 +284,34 @@ pub fn init(fb_phys: usize, pitch: usize, height: usize) -> bool {
             stride,
             pitch,
             surf,
+        );
+        return false;
+    }
+
+    // Плоскость проверена — ТЕПЕРЬ можно её менять. Порядок именно такой: убедиться, что
+    // железо настроено так, как мы думаем, и только потом трогать. Обратный порядок означал бы
+    // проверку собственных же записей.
+    let (width, height, pitch) = match try_native_mode(width, height) {
+        Some((w, h, p)) => {
+            crate::println!(
+                "  [intel] родной размер панели: {}×{} (было {}×{}, масштабатор выключен)",
+                w, h, width, height,
+            );
+            NEW_W.store(w, Ordering::Relaxed);
+            NEW_H.store(h, Ordering::Relaxed);
+            NEW_PITCH.store(p, Ordering::Relaxed);
+            (w, h, p)
+        }
+        None => (width, height, pitch),
+    };
+    let _ = width; // дальше считается по шагу строки: он и есть ширина в байтах
+    let frame = pitch * height;
+    let step = (frame + 0xfff) & !0xfff;
+    if stolen < step * 2 {
+        crate::println!(
+            "  [intel] украденной памяти {} МиБ — на два кадра по {} КиБ не хватает",
+            stolen / (1024 * 1024),
+            step / 1024,
         );
         return false;
     }
@@ -446,6 +489,77 @@ pub fn cursor_show(on: bool) -> bool {
         arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::CURABASE, off as u32);
     }
     true
+}
+
+/// Попробовать перейти на РОДНОЙ размер панели, если прошивка оставила нас растянутыми.
+///
+/// ## Что тут происходит
+///
+/// У панели ноутбука размер один и навсегда — тот, что в её развёртке. Прошивка же может
+/// отдать конвейеру картинку поменьше и включить МАСШТАБАТОР, который растянет её на панель:
+/// картинка при этом мыльная, и человек видит это как «нечёткий шрифт». Ровно так и вышло у
+/// владельца: панель 1366×768, конвейер 1024×768, масштабатор включён.
+///
+/// Переход при этом не требует программирования частот — самой опасной части установки режима.
+/// Развёртка УЖЕ идёт по панели: меняются только размер источника, шаг строки плоскости и
+/// выключается масштабатор.
+///
+/// ## Почему это не «подгонка под одну машину»
+///
+/// Ни одного числа отсюда: размер берётся из развёртки и окна масштабатора, то есть у самого
+/// железа. На машине, где прошивка уже дала родной режим, условия не сойдутся и мы ничего не
+/// тронем. Трогаем, только если ВСЁ сошлось: масштабатор включён, его окно больше источника и
+/// совпадает с активной развёрткой, а украденной памяти хватает на два новых кадра.
+///
+/// Возвращает новые `(ширина, высота, шаг строки)` — или `None`, если ничего не меняли.
+fn try_native_mode(width: usize, height: usize) -> Option<(usize, usize, usize)> {
+    let active = |v: u32| (((v & 0xffff) + 1) as usize, ((v >> 16) + 1) as usize);
+    let (panel_w, _) = active(rd(reg::HTOTAL_A));
+    let (panel_h, _) = active(rd(reg::VTOTAL_A));
+    let pf_ctl = rd(reg::PF_CTL_A);
+    let win = rd(reg::PF_WIN_SZ_A);
+    let (win_w, win_h) = ((win >> 16) as usize, (win & 0xffff) as usize);
+    // Масштабатор выключен — значит нас не растягивают, и делать нечего.
+    if pf_ctl & (1 << 31) == 0 {
+        return None;
+    }
+    // Окно масштабатора обязано совпасть с активной развёрткой: это и есть проверка «мы верно
+    // поняли, какого размера панель». Не совпало — мы чего-то не понимаем, и трогать нельзя.
+    if win_w != panel_w || win_h != panel_h || panel_w <= width || panel_h < height {
+        return None;
+    }
+    // Шаг строки плоскости кратен 64 байтам — требование железа, а не наше удобство.
+    let pitch = (panel_w * 4).div_ceil(64) * 64;
+    let frame = pitch * panel_h;
+    let step = (frame + 0xfff) & !0xfff;
+    if STOLEN.load(Ordering::Relaxed) < step * 2 + CURSOR_SIDE * CURSOR_SIDE * 4 {
+        return None;
+    }
+    // Порядок важен: сперва убрать растяжение, потом сказать конвейеру новый размер, и только
+    // после этого показать плоскости кадр с новым шагом. Обратный порядок на один кадр показал
+    // бы мусор, растянутый мусор или и то и другое.
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::PF_CTL_A, 0);
+    arch::hw_write32(
+        BAR0.load(Ordering::Relaxed) + reg::PIPEASRC,
+        (((panel_w - 1) as u32) << 16) | (panel_h - 1) as u32,
+    );
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASTRIDE, pitch as u32);
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, 0);
+    // Сверяем ЧТЕНИЕМ: регистры могли не принять записанное, и тогда честнее вернуть всё, как
+    // было, чем работать с кадром, которого на экране нет.
+    let ok = rd(reg::DSPASTRIDE) as usize == pitch
+        && active(rd(reg::PIPEASRC)) == (panel_w, panel_h);
+    if !ok {
+        arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::PF_CTL_A, pf_ctl);
+        arch::hw_write32(
+            BAR0.load(Ordering::Relaxed) + reg::PIPEASRC,
+            (((width - 1) as u32) << 16) | (height - 1) as u32,
+        );
+        arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASTRIDE, (width * 4) as u32);
+        crate::println!("  [intel] родной размер панели не принят железом — остаёмся как были");
+        return None;
+    }
+    Some((panel_w, panel_h, pitch))
 }
 
 /// Яркость панели в процентах: `(сколько сейчас, можно ли ставить)`.

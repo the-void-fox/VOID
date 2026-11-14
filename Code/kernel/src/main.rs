@@ -537,9 +537,18 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // перезагрузка: в QEMU ветка не исполнялась вовсе (графики Intel там нет), и проверка
     // «собралось и загрузилось» её не касалась.
     #[cfg(target_arch = "x86_64")]
-    if let (Some((base, _)), Some((_, h, _))) = (arch::video_window(), arch::video_mode()) {
+    if let (Some((base, _)), Some((w, h, _))) = (arch::video_window(), arch::video_mode()) {
         let (_, _, pitch, _, _) = fb::info();
-        if intel_fb::init(base, pitch, h) {
+        if intel_fb::init(base, pitch, w, h) {
+            // Перешли на родной размер панели — объявить новую геометрию ТУТ ЖЕ: консоль ядра
+            // считает строки по ней, и до объявления она рисует по старому шагу (то есть
+            // наискось). Чистим экран следом: в кадре осталась картинка прошлого режима.
+            if let Some((nw, nh, npitch)) = intel_fb::new_mode() {
+                if fb::adopt(base, base, npitch, nw, nh) {
+                    arch::console_clear();
+                    println!("  [video] экран стал {}×{}, шаг {} Б", nw, nh, npitch);
+                }
+            }
             fb::set_extra_buffers(intel_fb::step());
         }
     }
