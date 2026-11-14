@@ -130,6 +130,10 @@ pub use imp::{power_off, reboot};
 pub use imp::{
     intx_irq_setup, pci_dump, probe_bar, probe_bar0, probe_class_bar0, probe_xhci, touchpad,
     usb_key, usb_key_event, usb_mouse_event,
+    // Веха 233.4 — раскладка клавиатуры ОДНА на все клавиатуры машины: PS/2 считает символ в
+    // своём разборе, USB переводит сюда свои коды. Две таблицы на одну раскладку расходятся
+    // молча — так и вышло: указатель языка менялся, а печаталась всегда латиница.
+    keyboard_char, keyboard_caps_toggle,
 };
 /// Веха 198.1 — настройки железа из конфига поколения (только x86: на riscv нет ни тачпада,
 /// ни ACPI).

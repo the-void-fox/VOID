@@ -58,37 +58,42 @@ fn hid_to_sym(k: u8) -> u16 {
     }
 }
 
-/// HID Usage (boot keyboard) → ASCII. Достаточно для vsh: буквы, цифры, пробел, Enter, Backspace,
-/// Tab, базовая пунктуация; Shift даёт верхний регистр/символы. Неизвестное — `None`.
-fn hid_to_ascii(k: u8, shift: bool) -> Option<u8> {
-    let b = match k {
-        0x04..=0x1d => {
-            let c = b'a' + (k - 0x04);
-            return Some(if shift { c - 32 } else { c });
-        }
-        0x1e..=0x26 => {
-            let d = b'1' + (k - 0x1e);
-            let sym = [b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'('];
-            return Some(if shift { sym[(k - 0x1e) as usize] } else { d });
-        }
-        0x27 => if shift { b')' } else { b'0' },
-        0x28 => b'\r', // Enter
-        0x2a => 0x08,  // Backspace
-        0x2b => b'\t', // Tab
-        0x2c => b' ',  // Space
-        0x2d => if shift { b'_' } else { b'-' },
-        0x2e => if shift { b'+' } else { b'=' },
-        0x2f => if shift { b'{' } else { b'[' },
-        0x30 => if shift { b'}' } else { b']' },
-        0x31 => if shift { b'|' } else { b'\\' },
-        0x33 => if shift { b':' } else { b';' },
-        0x34 => if shift { b'"' } else { b'\'' },
-        0x36 => if shift { b'<' } else { b',' },
-        0x37 => if shift { b'>' } else { b'.' },
-        0x38 => if shift { b'?' } else { b'/' },
-        _ => return None,
-    };
-    Some(b)
+/// HID Usage (boot keyboard) → СКАН-КОД набора 1 (тот, что приходит от PS/2). 0 — нет такого.
+///
+/// Нужен затем, чтобы раскладка жила в одном месте. Своя таблица HID→символ у этого драйвера
+/// уже была, и именно из-за неё переключение раскладки меняло указатель на панели, а
+/// печаталась всегда латиница: таблица знала только US. Теперь USB переводит свои коды в
+/// скан-коды, а букву по ним считает общая [`crate::arch::keyboard_char`].
+///
+/// Порядок HID букв — алфавитный (`a`=0x04), у скан-кодов — по рядам клавиатуры; поэтому
+/// таблица явная, а не формула.
+fn hid_to_scancode(k: u8) -> u8 {
+    const LETTERS: [u8; 26] = [
+        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, // a..m
+        0x31, 0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c, // n..z
+    ];
+    const DIGITS: [u8; 10] = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b]; // 1..9,0
+    match k {
+        0x04..=0x1d => LETTERS[(k - 0x04) as usize],
+        0x1e..=0x27 => DIGITS[(k - 0x1e) as usize],
+        0x28 => 0x1c, // Enter
+        0x29 => 0x01, // Esc
+        0x2a => 0x0e, // Backspace
+        0x2b => 0x0f, // Tab
+        0x2c => 0x39, // Space
+        0x2d => 0x0c, // - _
+        0x2e => 0x0d, // = +
+        0x2f => 0x1a, // [ {
+        0x30 => 0x1b, // ] }
+        0x31 => 0x2b, // \ |
+        0x33 => 0x27, // ; :
+        0x34 => 0x28, // ' "
+        0x35 => 0x29, // ` ~
+        0x36 => 0x33, // , <
+        0x37 => 0x34, // . >
+        0x38 => 0x35, // / ?
+        _ => 0,
+    }
 }
 
 /// Опрос USB-клавиатуры — зовётся из `console_drain` (тик/IRQ) наравне с PS/2 и COM1.
@@ -179,13 +184,30 @@ pub fn report(prev: &mut [u8; 6], r: &[u8]) {
     for &k in &r[2..8] {
         // Новое нажатие: код есть в этом репорте, но не было в прошлом.
         if k != 0 && !prev.contains(&k) {
-            if let Some(b) = hid_to_ascii(k, shift) {
-                crate::arch::usb_key(b); // байт в консольное кольцо (спасательный шелл)
+            // Веха 233.4 — CapsLock это замок сеанса, а не символ: он общий для всех
+            // клавиатур машины, и нажатый на USB обязан влиять на то, что печатает PS/2.
+            if k == 0x39 {
+                crate::arch::keyboard_caps_toggle();
+            }
+            // Символ считает ОБЩАЯ раскладка по скан-коду — своей таблицы здесь больше нет
+            // (она знала только латиницу, и переключение языка её не касалось).
+            let ctrl = hid_mods & 0x11 != 0;
+            let ch = match hid_to_scancode(k) {
+                0 => 0,
+                sc => crate::arch::keyboard_char(sc, shift, ctrl),
+            };
+            if ch != 0 {
+                // В консольное кольцо — UTF-8: кириллица едет двумя байтами, как и у PS/2.
+                let mut buf = [0u8; 4];
+                if let Some(c) = char::from_u32(ch as u32) {
+                    for &b in c.encode_utf8(&mut buf).as_bytes() {
+                        crate::arch::usb_key(b);
+                    }
+                }
             }
             // Веха 196 — и СОБЫТИЕ клавиатуры: его читает композитор, а через него —
             // окна. Оба пути нужны: консоль живёт без графики, окна — без консоли.
             let sym = hid_to_sym(k);
-            let ch = hid_to_ascii(k, shift).map_or(0, |b| b as u16);
             if sym != 0 {
                 crate::arch::usb_key_event(sym, mods, true, ch);
             }
