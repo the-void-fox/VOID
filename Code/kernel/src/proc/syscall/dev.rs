@@ -629,6 +629,41 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_VIDEO_SYNC(mmio_cap, op) -> значение | MAX (Веха 233.9) — РИТМ ЭКРАНА.
+        //
+        //   op=0  защёлкнулось ли последнее переключение страницы (1 — да, 0 — ещё нет);
+        //   op=1  счётчик кадров развёртки.
+        //
+        // `MAX` — переключать нечего (экран без двойного буфера); тогда спрашивать незачем, и
+        // рисующий работает как работал.
+        77 => {
+            let (mcap, op) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::READ) {
+                #[cfg(target_arch = "x86_64")]
+                Ok(_) if crate::intel_fb::present() => match op {
+                    0 => usize::from(crate::intel_fb::latched()),
+                    1 => crate::intel_fb::vblank_count() as usize,
+                    _ => usize::MAX,
+                },
+                Ok(_) => {
+                    // На riscv (и на x86 без двойного буфера) спрашивать нечего: ритм задаёт
+                    // не развёртка, а наш собственный бюджет кадра.
+                    let _ = op;
+                    usize::MAX
+                }
+                Err(e) => {
+                    vprintln!("  [video] P{} VIDEO_SYNC отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_VIDEO_INFO(mmio_cap, out) -> 0 | MAX (Веха 97): описание видеорежима в буфер
         // процесса — 10 × u32: ширина, высота, шаг строки, бит/пиксель и по паре
         // (позиция, ширина маски) на R, G, B.

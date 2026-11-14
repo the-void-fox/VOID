@@ -130,6 +130,8 @@ const SYS_CLOCK_SET: usize = 74;
 const SYS_TRACE: usize = 75;
 /// Веха 233.7 — аппаратный курсор экрана: картинка, положение, показать/спрятать.
 const SYS_VIDEO_CURSOR: usize = 76;
+/// Веха 233.9 — ритм экрана: защёлкнулось ли переключение, счётчик кадров развёртки.
+const SYS_VIDEO_SYNC: usize = 77;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1739,6 +1741,23 @@ pub fn video_cursor_move(mmio_cap: usize, x: i32, y: i32) -> bool {
 /// Веха 233.7 — показать или спрятать аппаратный курсор.
 pub fn video_cursor_show(mmio_cap: usize, on: bool) -> bool {
     abi::syscall(SYS_VIDEO_CURSOR, mmio_cap, 2, usize::from(on), 0, 0, 0, 0).0 == 0
+}
+
+/// Веха 233.9 — **защёлкнулось ли последнее переключение страницы.**
+///
+/// Запись в регистр поверхности — просьба показать, а не показ: железо исполнит её на ближайшем
+/// обратном ходе луча. До тех пор буфер, который нам «вернули под рисование», ЕЩЁ НА ЭКРАНЕ, и
+/// писать в него значит вернуть разрыв кадра. `None` — экран без двойного буфера, спрашивать
+/// нечего.
+pub fn video_latched(mmio_cap: usize) -> Option<bool> {
+    let r = abi::syscall(SYS_VIDEO_SYNC, mmio_cap, 0, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then(|| r != 0)
+}
+
+/// Веха 233.9 — счётчик кадров развёртки: им меряется настоящий ритм экрана.
+pub fn video_frame_count(mmio_cap: usize) -> Option<u32> {
+    let r = abi::syscall(SYS_VIDEO_SYNC, mmio_cap, 1, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r as u32)
 }
 
 /// `SYS_VIDEO_INFO(mmio_cap, out)` (Веха 97): геометрия и раскладка цвета экрана. Право то же,
