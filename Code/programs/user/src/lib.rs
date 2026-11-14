@@ -132,6 +132,8 @@ const SYS_TRACE: usize = 75;
 const SYS_VIDEO_CURSOR: usize = 76;
 /// Веха 233.9 — ритм экрана: защёлкнулось ли переключение, счётчик кадров развёртки.
 const SYS_VIDEO_SYNC: usize = 77;
+/// Веха 233.10 — яркость панели: спросить и поставить.
+const SYS_VIDEO_BACKLIGHT: usize = 78;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1757,6 +1759,19 @@ pub fn video_latched(mmio_cap: usize) -> Option<bool> {
 /// Веха 233.9 — счётчик кадров развёртки: им меряется настоящий ритм экрана.
 pub fn video_frame_count(mmio_cap: usize) -> Option<u32> {
     let r = abi::syscall(SYS_VIDEO_SYNC, mmio_cap, 1, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r as u32)
+}
+
+/// Веха 233.10 — ЯРКОСТЬ ПАНЕЛИ в процентах. `None` — машина не та, где мы знаем, чем её
+/// ставить (знание поколения живёт в ядре, см. `intel_fb`).
+pub fn backlight(mmio_cap: usize) -> Option<u32> {
+    let r = abi::syscall(SYS_VIDEO_BACKLIGHT, mmio_cap, 0, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r as u32)
+}
+
+/// Веха 233.10 — поставить яркость. Возвращает, сколько получилось ПО ЧТЕНИЮ регистра.
+pub fn backlight_set(mmio_cap: usize, percent: u32) -> Option<u32> {
+    let r = abi::syscall(SYS_VIDEO_BACKLIGHT, mmio_cap, 1, percent as usize, 0, 0, 0, 0).0;
     (r != usize::MAX).then_some(r as u32)
 }
 

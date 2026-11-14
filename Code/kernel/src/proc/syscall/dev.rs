@@ -664,6 +664,50 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_VIDEO_BACKLIGHT(mmio_cap, op, percent) -> проценты | MAX (Веха 233.10) — ЯРКОСТЬ.
+        //
+        //   op=0  спросить, op=1 — поставить `percent`.
+        //
+        // Почему в ядре, а не в шелле, где она была. Яркость ставится записью в регистр
+        // дисплейной части, то есть требует ЗНАНИЯ ПОКОЛЕНИЯ: у Intel эти регистры переезжали,
+        // и запись по чужим смещениям — это запись наугад в чужую видеокарту. Знание поколения
+        // живёт в одном месте (`intel_fb`), и всё, что пишет в дисплейные регистры, обязано
+        // ходить через него. Шелл остаётся лицом: он спрашивает и показывает.
+        //
+        // Право — ЗАГЛЯНУТЬ В ЖЕЛЕЗО (`hwprobe`), то же, которым живут `mmio` и `pci`. Не право
+        // на кадр: подсветка не рисует и кадра не касается, а выдавать ради неё власть над всем
+        // экраном значило бы раздать больше, чем нужно. Спросить — чтение, поставить — запись.
+        78 => {
+            let (hcap, op, percent) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2))
+            };
+            let dom = t.procs[cur].domain;
+            let need = if op == 0 { Rights::READ } else { Rights::WRITE };
+            let result = match cap::hwprobe(dom, Cap::from_bits(hcap as u64), need) {
+                #[cfg(target_arch = "x86_64")]
+                Ok(_) => {
+                    let r = match op {
+                        0 => crate::intel_fb::backlight(),
+                        1 => crate::intel_fb::backlight_set(percent as u32),
+                        _ => None,
+                    };
+                    r.map_or(usize::MAX, |v| v as usize)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                Ok(_) => {
+                    let _ = (op, percent);
+                    usize::MAX
+                }
+                Err(e) => {
+                    vprintln!("  [video] P{} VIDEO_BACKLIGHT отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_VIDEO_INFO(mmio_cap, out) -> 0 | MAX (Веха 97): описание видеорежима в буфер
         // процесса — 10 × u32: ширина, высота, шаг строки, бит/пиксель и по паре
         // (позиция, ширина маски) на R, G, B.
