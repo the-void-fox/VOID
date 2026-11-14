@@ -1685,6 +1685,12 @@ pub struct VideoInfo {
     /// По каналам R, G, B: (позиция младшего бита, ширина маски). Раскладку задаёт прошивка,
     /// зашивать `0x00RRGGBB` нельзя — бывают и 16-битные режимы.
     pub rgb: [(u8, u8); 3],
+    /// Веха 233 — сколько буферов у экрана: 1 (рисуем прямо в видимый) или 2 (есть куда
+    /// рисовать, пока показывается прошлый кадр).
+    pub buffers: usize,
+    /// Шаг между буферами в байтах. Второй буфер начинается через столько байт от начала окна;
+    /// окно, выданное под `mmio:fb`, уже включает оба.
+    pub buffer_step: usize,
 }
 
 /// `SYS_VIDEO_FLUSH(mmio_cap, x, y, w|h)` (Веха 224): ПОКАЗАТЬ прямоугольник кадра.
@@ -1696,15 +1702,22 @@ pub struct VideoInfo {
 ///
 /// Ширина и высота едут одним словом: аргументов у вызова шесть, а два из них на то, что
 /// всегда влезает в одно, — расточительство.
-pub fn video_flush(mmio_cap: usize, x: u32, y: u32, w: u32, h: u32) {
+///
+/// **Веха 233 — возвращает СМЕЩЕНИЕ, по которому рисовать следующий кадр.** На экране с двумя
+/// буферами (настоящая графика Intel) показ — это переключение страницы, и после него рисовать
+/// надо уже в другой буфер; ноль значит «буфер один, рисуй туда же». Звать по-прежнему надо
+/// всегда: решает ядро, а не рисующий.
+pub fn video_flush(mmio_cap: usize, x: u32, y: u32, w: u32, h: u32) -> usize {
     let wh = w as usize | ((h as usize) << 32);
-    abi::syscall(SYS_VIDEO_FLUSH, mmio_cap, x as usize, y as usize, wh, 0, 0, 0);
+    let r = abi::syscall(SYS_VIDEO_FLUSH, mmio_cap, x as usize, y as usize, wh, 0, 0, 0).0;
+    // Отказ (нет права) — это не смещение: рисовать по нему было бы хуже, чем не рисовать.
+    if r == usize::MAX { 0 } else { r }
 }
 
 /// `SYS_VIDEO_INFO(mmio_cap, out)` (Веха 97): геометрия и раскладка цвета экрана. Право то же,
 /// что на окно фреймбуфера, — числа неотделимы от права рисовать. `None` — нет права или экрана.
 pub fn video_info(mmio_cap: usize) -> Option<VideoInfo> {
-    let mut raw = [0u32; 10];
+    let mut raw = [0u32; 12];
     let r = abi::syscall(SYS_VIDEO_INFO, mmio_cap, raw.as_mut_ptr() as usize, 0, 0, 0, 0, 0).0;
     if r != 0 || raw[0] == 0 || raw[1] == 0 {
         return None;
@@ -1714,6 +1727,8 @@ pub fn video_info(mmio_cap: usize) -> Option<VideoInfo> {
         height: raw[1] as usize,
         pitch: raw[2] as usize,
         bpp: raw[3] as usize,
+        buffers: raw[10].max(1) as usize,
+        buffer_step: raw[11] as usize,
         rgb: [
             (raw[4] as u8, raw[5] as u8),
             (raw[6] as u8, raw[7] as u8),

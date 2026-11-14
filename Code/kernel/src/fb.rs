@@ -205,6 +205,18 @@ pub fn present() -> bool {
 /// оставила бы экран навсегда занятым — ядро молчало бы в мёртвый терминал.
 static USER_OWNED: AtomicUsize = AtomicUsize::new(0);
 
+/// Веха 233 — сколько БАЙТ добавочных буферов лежит сразу за кадром. Ноль — буфер один.
+///
+/// Нужно одному месту: окну, которое выдаётся процессу под `mmio:fb`. Композитор должен
+/// отобразить оба буфера разом, иначе рисовать во второй ему нечем; само переключение он не
+/// делает и о железе не знает ([[intel-display]]).
+static EXTRA: AtomicUsize = AtomicUsize::new(0);
+
+/// Объявить, что за кадром есть ещё столько же байт под второй буфер.
+pub fn set_extra_buffers(bytes: usize) {
+    EXTRA.store(bytes, Ordering::Relaxed);
+}
+
 /// Экран у процесса?
 #[inline]
 pub fn owned_by_user() -> bool {
@@ -238,6 +250,11 @@ pub fn give_to_user(pid: usize) {
 /// и мог стереть дамп аварии, ради которого всё и затевалось.
 pub fn take_back() {
     if present() && USER_OWNED.swap(0, Ordering::Relaxed) != 0 {
+        // Веха 233 — сперва вернуть развёртку на первый буфер: консоль ядра рисует по началу
+        // окна, и оставить железо на втором значило бы показывать кадр, в который больше никто
+        // не пишет. Пока экран не был двойным, возвращать было нечего.
+        #[cfg(target_arch = "x86_64")]
+        crate::intel_fb::to_front();
         crate::arch::console_clear();
     }
 }
@@ -277,7 +294,8 @@ pub fn window() -> Option<(usize, usize)> {
     present().then(|| {
         (
             PHYS.load(Ordering::Relaxed),
-            PITCH.load(Ordering::Relaxed) * PIX_H.load(Ordering::Relaxed),
+            PITCH.load(Ordering::Relaxed) * PIX_H.load(Ordering::Relaxed)
+                + EXTRA.load(Ordering::Relaxed),
         )
     })
 }

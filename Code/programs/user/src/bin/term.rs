@@ -895,6 +895,9 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 pitch: WIN_W as usize * 4,
                 bpp: 32,
                 rgb: [(0, 8), (8, 8), (16, 8)],
+                // Буфер окна один: переключение страницы — дело экрана, а не окна в нём.
+                buffers: 1,
+                buffer_step: 0,
             };
             (Out::Window { win }, info)
         }

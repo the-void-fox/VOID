@@ -550,6 +550,17 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             let dom = t.procs[cur].domain;
             let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::WRITE) {
                 Ok(_) => {
+                    // Веха 233 — на графике Intel «показать» означает ПЕРЕКЛЮЧИТЬ СТРАНИЦУ, и
+                    // ответом уезжает смещение, по которому рисовать следующий кадр. Областей
+                    // при этом нет: переключается кадр целиком, а не его часть.
+                    #[cfg(target_arch = "x86_64")]
+                    if crate::intel_fb::present() {
+                        let off = crate::intel_fb::flip();
+                        let f = &mut t.procs[cur].frame;
+                        f.set_ret(off);
+                        f.advance();
+                        return true;
+                    }
                     crate::virtio_gpu::flush(x as u32, y as u32, (wh & 0xffff_ffff) as u32, (wh >> 32) as u32);
                     0
                 }
@@ -575,15 +586,24 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                 (f.arg(0), f.arg(1))
             };
             let dom = t.procs[cur].domain;
-            const N: usize = 10;
+            // Веха 233 — слов двенадцать, а не десять: к режиму добавились СКОЛЬКО БУФЕРОВ у
+            // экрана и ШАГ между ними в байтах. Это часть описания режима, а не отдельная
+            // справка: рисовать во второй буфер, не зная его смещения, нельзя, а знать о нём
+            // из другого источника значило бы развести две меры.
+            const N: usize = 12;
             let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::READ) {
                 Ok(_) if ensure_heap_range(t, cur, out, N * 4) => {
                     let (w, h, pitch, bpp, rgb) = arch::video_info();
+                    #[cfg(target_arch = "x86_64")]
+                    let (buffers, step) = (crate::intel_fb::buffers(), crate::intel_fb::step());
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let (buffers, step) = (1usize, 0usize);
                     let vals: [u32; N] = [
                         w as u32, h as u32, pitch as u32, bpp as u32,
                         rgb[0].0 as u32, rgb[0].1 as u32,
                         rgb[1].0 as u32, rgb[1].1 as u32,
                         rgb[2].0 as u32, rgb[2].1 as u32,
+                        buffers as u32, step as u32,
                     ];
                     for (i, v) in vals.iter().enumerate() {
                         unsafe { core::ptr::write_unaligned((out + i * 4) as *mut u32, *v) };

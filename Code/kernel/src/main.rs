@@ -145,6 +145,8 @@ mod sched;
 mod sync;
 mod timer;
 mod trace;
+#[cfg(target_arch = "x86_64")]
+mod intel_fb;
 mod virtio;
 mod virtio_blk;
 mod virtio_gpu;
@@ -501,6 +503,16 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                 "  [video] фреймбуфер {}×{}, {} бит/пиксель, кадр по {:#x} ({} КиБ)",
                 w, h, bpp, base, len / 1024,
             );
+            // Веха 233 — на настоящей графике Intel у кадра может быть ВТОРАЯ страница: кадр
+            // от прошивки лежит в апертуре, а украденной памяти хватает на два. Проверки все
+            // внутри; не сошлось — работаем как работали, одним буфером.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (_, _, pitch, _, _) = fb::info();
+                if intel_fb::init(base, pitch, h) {
+                    fb::set_extra_buffers(intel_fb::step());
+                }
+            }
         }
         None => println!("  [video] текстовый режим (пиксельного фреймбуфера нет)"),
     }

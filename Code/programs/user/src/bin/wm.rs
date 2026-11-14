@@ -1206,6 +1206,8 @@ fn main_loop() -> ! {
         damage: Vec::new(),
             shadow: vec![0u32; info.width * info.height],
         present_all: false,
+        draw_off: 0,
+        prev_damage: None,
         // Веха 137 — стол ровно один, пустой. Дальше их число ведёт `tidy_spaces`.
         ov_bands: Vec::new(),
         spaces: vec![Space::default()],
@@ -1929,6 +1931,12 @@ struct Wm {
     /// Что перерисовать в конце оборота (Веха 120.2). Раньше каждое событие рисовало САМО, и
     /// перетаскивание превращалось в тридцать перерисовок на один оборот цикла.
     damage: Vec<At<Screen>>,
+    /// Веха 233 — смещение буфера, в который рисуем сейчас (0, пока буфер один).
+    draw_off: usize,
+    /// Области, нарисованные в ПРОШЛЫЙ кадр. При двух буферах их надо повторить: буфер, в
+    /// который мы пишем, показывал кадр ПОЗАПРОШЛЫЙ, и всё, что менялось с тех пор, в нём
+    /// устарело. `None` значит «буфер целиком устарел» — тогда перерисовывается весь экран.
+    prev_damage: Option<Vec<At<Screen>>>,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
     /// ТЕНЕВОЙ КАДР (Веха 126): весь экран в обычной памяти. Кадр собирается здесь, а на экран
     /// уходит блитом. Затевалось ради разрывов, а понадобилось ради СТОИМОСТИ: прокрутка ленты
@@ -2229,13 +2237,24 @@ impl Wm {
         self.pack((mix(src.0, d.0), mix(src.1, d.1), mix(src.2, d.2)))
     }
 
+    /// Начало буфера, в который рисуем ПРЯМО СЕЙЧАС.
+    ///
+    /// Веха 233 — на экране с двумя буферами это не всегда начало окна: пока развёртка
+    /// показывает один кадр, мы пишем в другой, и ядро после каждого показа говорит, в какой
+    /// ([`sys::video_flush`]). Три места ниже обязаны спрашивать адрес здесь, а не складывать
+    /// его сами: разойдись они — половина кадра уедет не в тот буфер.
+    #[inline]
+    fn fb_base(&self) -> usize {
+        FB_VA + self.draw_off
+    }
+
     #[inline]
     fn put(&self, x: i32, y: i32, px: u32) {
         if x < 0 || y < 0 || x >= self.info.width as i32 || y >= self.info.height as i32 {
             return;
         }
         let bpp = self.info.bpp / 8;
-        let dst = FB_VA + y as usize * self.info.pitch + x as usize * bpp;
+        let dst = self.fb_base() + y as usize * self.info.pitch + x as usize * bpp;
         unsafe {
             match bpp {
                 4 => core::ptr::write_volatile(dst as *mut u32, px),
@@ -2265,7 +2284,7 @@ impl Wm {
             }
             return;
         }
-        let mut dst = FB_VA + y as usize * self.info.pitch + x as usize * bpp;
+        let mut dst = self.fb_base() + y as usize * self.info.pitch + x as usize * bpp;
         let two = (px as u64) | ((px as u64) << 32);
         let mut i = 0usize;
         unsafe {
@@ -2292,7 +2311,7 @@ impl Wm {
             }
             return;
         }
-        let mut dst = FB_VA + y as usize * self.info.pitch + x as usize * bpp;
+        let mut dst = self.fb_base() + y as usize * self.info.pitch + x as usize * bpp;
         let mut i = 0usize;
         unsafe {
             while i + 1 < src.len() {
@@ -2724,8 +2743,13 @@ impl Wm {
         let mut px = 0u32;
         // Запоминаем ДО сброса: показ кадра ниже спрашивает ту же ветку, а флажок к тому
         // времени уже погашен.
-        let whole = self.present_all;
-        if self.present_all {
+        //
+        // Веха 233 — при ДВУХ буферах «весь кадр» нужен ещё и тогда, когда буфер, в который мы
+        // сейчас пишем, устарел целиком: в нём лежит позапрошлый кадр, а что менялось с тех
+        // пор, мы знаем только за один прошлый шаг.
+        let double_buffered = self.info.buffers > 1;
+        let whole = self.present_all || (double_buffered && self.prev_damage.is_none());
+        if whole {
             self.present_all = false;
             for yy in 0..self.info.height as i32 {
                 let off = yy as usize * pitch;
@@ -2733,7 +2757,10 @@ impl Wm {
             }
             px = (self.info.width * self.info.height) as u32;
         } else {
-            for r in &rects {
+            // Свои области — и области ПРОШЛОГО кадра: в буфере, куда мы пишем, они показывают
+            // позапрошлое. Без этого на экране остаются следы — курсор из прошлого кадра,
+            // половина уехавшего окна. Цена — повтор одной перерисовки, а не целого экрана.
+            for r in rects.iter().chain(self.prev_damage.iter().flatten()) {
                 let r = r.rect();
                 for yy in r.y..r.bottom() {
                     let off = yy as usize * pitch + r.x as usize;
@@ -2741,6 +2768,12 @@ impl Wm {
                 }
                 px += (r.w * r.h).max(0) as u32;
             }
+        }
+        // Что рисовали сейчас — станет «прошлым» для следующего кадра. Целый кадр обнуляет
+        // память об областях: после него обе половины экрана свежи, кроме той, которую
+        // перерисует следующий заход.
+        if double_buffered {
+            self.prev_damage = if whole { Some(Vec::new()) } else { Some(rects.clone()) };
         }
         self.shadow = sh;
         fence();
@@ -2751,7 +2784,12 @@ impl Wm {
         //
         // По областям, а не одним охватывающим: у устройства цена и в пикселях тоже, а
         // охватывающий для разбросанных кусков — это весь экран.
-        if whole {
+        if double_buffered {
+            // Экран с двумя буферами показывает кадр ЦЕЛИКОМ и один раз: переключается
+            // страница, а не её части. Ответ — смещение, по которому рисовать дальше.
+            self.draw_off =
+                sys::video_flush(self.fb_cap, 0, 0, self.info.width as u32, self.info.height as u32);
+        } else if whole {
             sys::video_flush(self.fb_cap, 0, 0, self.info.width as u32, self.info.height as u32);
         } else {
             for r in &rects {
