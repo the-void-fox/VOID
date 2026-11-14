@@ -368,6 +368,74 @@ unsafe fn blit(row: usize, col: usize, ch: u8, attr: u8) {
     }
 }
 
+/// Залить прямоугольник точек цветом — для полей, куда знакоместо не влезло.
+///
+/// # Safety
+/// Прямоугольник внутри окна фреймбуфера.
+unsafe fn fill_px(x: usize, y: usize, w: usize, h: usize, color: u32) {
+    let bytes_pp = BYTES_PP.load(Ordering::Relaxed);
+    let pitch = PITCH.load(Ordering::Relaxed);
+    let mut line = y * pitch + x * bytes_pp;
+    for _ in 0..h {
+        let mut off = line;
+        for _ in 0..w {
+            put_pixel(off, color);
+            off += bytes_pp;
+        }
+        line += pitch;
+    }
+}
+
+/// Фон знакоместа по его атрибуту.
+fn attr_bg(attr: u8) -> u32 {
+    encode(((attr >> 4) & 0x07) as usize)
+}
+
+/// Веха 233.19 — ПРАВОЕ ПОЛЕ строки: точки, куда целое знакоместо не поместилось.
+///
+/// Ширина экрана на ширину знакоместа делится не всегда: у панели 1366 точек знакомест
+/// помещается 170, то есть 1360 точек, а шесть правых не трогает никто. Владелец увидел это как
+/// полосу мусора справа в текстовой консоли — и мусор был настоящий: там лежало то, что оставил
+/// в кадре композитор, потому что консоль в эти точки не писала НИКОГДА.
+///
+/// Цвет берём не чёрный, а фон СОСЕДНЕГО знакоместа — последнего в строке. Чёрное было бы такой
+/// же выдумкой, как мусор: у строки есть свой фон, и поле — её продолжение, а не чужая земля.
+///
+/// # Safety
+/// Как [`put_cell`].
+unsafe fn blit_right_margin(row: usize) {
+    let used = cols() * CELL_W;
+    let width = PIX_W.load(Ordering::Relaxed);
+    if width <= used || row >= rows() {
+        return;
+    }
+    let bg = attr_bg(SH_AT[row * cols() + cols() - 1]);
+    fill_px(used, row * CELL_H, width - used, CELL_H, bg);
+}
+
+/// Веха 233.19 — НИЖНЕЕ ПОЛЕ: строка точек, куда целая строка знакомест не поместилась.
+///
+/// То же самое по второй оси (у панели владельца 768 = 48×16 сошлось, у другой не сойдётся).
+/// Каждый столбец продолжает фон знакоместа над собой, правый угол — фон последнего.
+///
+/// # Safety
+/// Как [`put_cell`].
+unsafe fn blit_bottom_margin() {
+    let used = rows() * CELL_H;
+    let (width, height) = (PIX_W.load(Ordering::Relaxed), PIX_H.load(Ordering::Relaxed));
+    if height <= used {
+        return;
+    }
+    let last = (rows() - 1) * cols();
+    for col in 0..cols() {
+        fill_px(col * CELL_W, used, CELL_W, height - used, attr_bg(SH_AT[last + col]));
+    }
+    let right = cols() * CELL_W;
+    if width > right {
+        fill_px(right, used, width - right, height - used, attr_bg(SH_AT[last + cols() - 1]));
+    }
+}
+
 /// Положить символ в знакоместо: обновить тень и нарисовать.
 ///
 /// # Safety
@@ -382,6 +450,13 @@ pub unsafe fn put_cell(row: usize, col: usize, ch: u8, attr: u8) {
     SH_CH[i] = ch;
     SH_AT[i] = attr;
     blit(row, col, ch, attr);
+    // Поля идут за своим соседом: сменился фон крайнего знакоместа — сменился и фон поля.
+    if col + 1 == cols() {
+        blit_right_margin(row);
+    }
+    if row + 1 == rows() {
+        blit_bottom_margin();
+    }
 }
 
 /// Очистить экран атрибутом `attr` (фон берётся из него же).
@@ -428,7 +503,9 @@ unsafe fn repaint() {
             let i = row * cols() + col;
             blit(row, col, SH_CH[i], SH_AT[i]);
         }
+        blit_right_margin(row);
     }
+    blit_bottom_margin();
 }
 
 /// Поставить курсор в `(row, col)`: подчёркивание в две пиксельные строки цветом символа.
