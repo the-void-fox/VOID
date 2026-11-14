@@ -3432,6 +3432,9 @@ mod intel_reg {
     /// защёлкивается на следующем обратном ходе луча.
     pub const DSPSURF: [usize; 2] = [0x7019c, 0x7119c];
     pub const DSPTILEOFF: [usize; 2] = [0x701a4, 0x711a4];
+    /// Что развёртка читает ПРЯМО СЕЙЧАС (в отличие от `DSPSURF`, где ожидающее значение).
+    /// По паре «ожидающее / живое», снятой дважды, видно, идут ли переключения страниц.
+    pub const DSPSURFLIVE: [usize; 2] = [0x701ac, 0x711ac];
     /// Временная развёртка конвейера A: сколько точек активно и сколько всего. По ней виден
     /// НАСТОЯЩИЙ режим — тот, который выставила прошивка, а не тот, что попросил GRUB.
     pub const HTOTAL_A: usize = 0x60000;
@@ -3562,9 +3565,11 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
             if cntr & (1 << 10) != 0 { "ДА" } else { "нет" },
             cntr,
         ));
+        let live = sys::hw_read(hw, bar0 + intel_reg::DSPSURFLIVE[i]).unwrap_or(0);
         out.push_str(&alloc::format!(
-            "  поверхность {:#010x}  смещение строки {:#x}  смещение плитки {:#010x}\n",
+            "  поверхность {:#010x} (живая {:#010x})  смещение строки {:#x}  смещение плитки {:#010x}\n",
             surf,
+            live,
             linoff,
             tileoff,
         ));
@@ -3572,6 +3577,14 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
         let f1 = sys::hw_read(hw, bar0 + intel_reg::FRMCOUNT[i]).unwrap_or(0);
         sys::sleep_ns(100_000_000);
         let f2 = sys::hw_read(hw, bar0 + intel_reg::FRMCOUNT[i]).unwrap_or(0);
+        // Вторая пара «ожидающее / живое»: если за сто миллисекунд они не сдвинулись, значит
+        // переключений страниц не происходит — а это и есть вопрос, ради которого всё.
+        let surf2 = sys::hw_read(hw, bar0 + intel_reg::DSPSURF[i]).unwrap_or(0);
+        let live2 = sys::hw_read(hw, bar0 + intel_reg::DSPSURFLIVE[i]).unwrap_or(0);
+        out.push_str(&alloc::format!(
+            "  через 100 мс: поверхность {:#010x} (живая {:#010x})\n",
+            surf2, live2,
+        ));
         out.push_str(&alloc::format!(
             "  кадров за 100 мс: {} ({} → {}) — развёртка {}\n",
             f2.wrapping_sub(f1),

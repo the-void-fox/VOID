@@ -1245,6 +1245,17 @@ fn main_loop() -> ! {
     wm.fill_rect(0, 0, info.width as i32, info.height as i32, tri(wm.th.desktop));
     // Веха 233.7 — курсор пробуем отдать ЖЕЛЕЗУ. Спрашиваем один раз: ответ не меняется, а
     // движение мыши не место для проверок. Не вышло — рисуем сами, как рисовали всегда.
+    // Веха 233.14 — что композитор думает про буферы. Одной строкой и один раз: по ней видно,
+    // согласен ли он с ядром (их двое, и расходиться им нельзя).
+    if info.buffers > 1 {
+        sys::write_console(
+            alloc::format!(
+                "[wm] экран {}×{}, шаг строки {} Б; буферов {}, шаг буфера {} Б\n",
+                info.width, info.height, info.pitch, info.buffers, info.buffer_step,
+            )
+            .as_bytes(),
+        );
+    }
     wm.hw_cursor = wm.push_hw_cursor();
     if wm.hw_cursor {
         sys::video_cursor_move(wm.fb_cap, wm.cursor.x, wm.cursor.y);
@@ -2794,6 +2805,9 @@ impl Wm {
             self.info.buffers = 1;
             self.draw_off = 0;
             self.draw_slot = 0;
+            // В оставшемся буфере лежит то, что успели нарисовать ДО отказа, — то есть не
+            // нынешний кадр. Пометить весь экран: иначе человек останется с полукадром.
+            self.damage(self.screen());
         }
         self.wait_since = 0;
         // Веха 168.3 — два чтения часов на кадр: одно здесь, одно на границе сборки и вывода.
@@ -2801,6 +2815,20 @@ impl Wm {
         let t0 = sys::monotonic_ns();
         // Веха 230.6 — смещения переезда на весь кадр считаются здесь, один раз.
         self.slide_tick();
+        // Веха 233.14 — буфер, который мы ещё не рисовали, нужно СОБРАТЬ, а не «вылить в него
+        // теневой кадр». Разница решающая: теневой кадр собирается по damage, и то, что в него
+        // ни разу не попало, в нём ЧЁРНОЕ. При старте он чёрный почти весь — рабочий стол
+        // закрашивается прямо во фреймбуфер, мимо него. Прошлая редакция считала «весь кадр» и
+        // выливала этот чёрный теневой поверх экрана, а всё настоящее уезжало во второй буфер,
+        // который на экран не попадал. Владелец это и увидел: «сначала чёрный, потом цвета
+        // обоев, и больше ничего».
+        //
+        // Теперь «буфер устарел» означает «пометить весь экран», то есть собрать его заново, —
+        // и дальше обычный путь: собрали в теневой, вылили помеченное.
+        if self.info.buffers > 1 && self.needs_full[self.draw_slot] {
+            self.needs_full[self.draw_slot] = false;
+            self.damage(self.screen());
+        }
         let rects = core::mem::take(&mut self.damage);
         for r in &rects {
             self.repaint(*r);
@@ -2817,7 +2845,9 @@ impl Wm {
         // сейчас пишем, устарел целиком: в нём лежит позапрошлый кадр, а что менялось с тех
         // пор, мы знаем только за один прошлый шаг.
         let double_buffered = self.info.buffers > 1;
-        let whole = self.present_all || (double_buffered && self.needs_full[self.draw_slot]);
+        // «Весь кадр» теперь значит ровно одно: теневой кадр УЖЕ верен целиком, и его надо
+        // вылить без разбора областей (так бывает после сдвига памяти).
+        let whole = self.present_all;
         if whole {
             self.present_all = false;
             for yy in 0..self.info.height as i32 {
@@ -2842,7 +2872,6 @@ impl Wm {
         // его следующим, показывал позапрошлое.
         if double_buffered {
             if whole {
-                self.needs_full[self.draw_slot] = false;
                 self.prev_damage.clear();
             } else {
                 self.prev_damage.clone_from(&rects);
