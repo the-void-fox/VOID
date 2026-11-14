@@ -1550,6 +1550,10 @@ const SHM_WORDS: usize = SHM_GRAINS.div_ceil(64);
 /// Одно окно.
 struct Win {
     id: u32,
+    /// Веха 233.16 — сказали ли уже про укороченный буфер этого окна. Ячейка, а не поле: о
+    /// нехватке узнаёт РИСУЮЩИЙ код, а он работает по `&self` — иначе пришлось бы тащить
+    /// изменяемость через всю сборку кадра ради одной строки в журнале.
+    short_noted: core::cell::Cell<bool>,
     owner: usize,
     /// Левый верхний угол РАМКИ на экране.
     x: i32,
@@ -3172,7 +3176,21 @@ impl Wm {
                 if ce > cs && off >= 0 && win.bw == cw {
                     let b0 = (src_row * win.bw) as usize * 4 + off as usize * 4;
                     let b1 = b0 + (ce - cs) as usize * 4;
-                    if b1 <= px.len() {
+                    // Веха 233.16 — буфер клиента КОРОЧЕ объявленного им размера. Так бывает:
+                    // окно уже получило новый размер, а свежий кадр ещё не прислало. Здесь
+                    // стояла молчаливая пропажа — «не влезает, значит не рисуем», — и пиксели
+                    // оставались такими, какими были в теневом кадре, то есть ЧЁРНЫМИ. А стол
+                    // под ними уже не нарисован: закрывающий отрезок считает место занятым
+                    // окном. Так и получается чёрная дыра на экране (найдена владельцем,
+                    // доказана чтением пикселей через апертуру).
+                    //
+                    // Правило: **кто закрывает, тот и рисует.** Нет содержимого — пусть будет
+                    // фон окна, но пустым место не останется.
+                    if b1 > px.len() {
+                        let bg = self.pack(tri(self.th.bg));
+                        out[(cs - x0) as usize..(ce - x0) as usize].fill(bg);
+                        self.note_short_buffer(win, px.len());
+                    } else {
                         let dst = &mut out[(cs - x0) as usize..(ce - x0) as usize];
                         // Веха 230.6 — СЛОВАМИ, А НЕ БАЙТАМИ.
                         //
@@ -3216,12 +3234,16 @@ impl Wm {
                     let mut col = n0 / cwx;
                     let mut err = n0 % cwx;
                     let row = (src_row * win.bw) as usize * 4;
+                    let bg = self.pack(tri(self.th.bg));
                     for xx in cs..ce {
                         let p = row + col.max(0) as usize * 4;
-                        if col >= 0 && col < win.bw && p + 2 < px.len() {
-                            out[(xx - x0) as usize] =
-                                self.pack((px[p], px[p + 1], px[p + 2]));
-                        }
+                        // Та же мысль, что выше: нет источника — рисуем фон, а не оставляем
+                        // пиксель каким был. Пропуск здесь — это чёрная точка в середине окна.
+                        out[(xx - x0) as usize] = if col >= 0 && col < win.bw && p + 2 < px.len() {
+                            self.pack((px[p], px[p + 1], px[p + 2]))
+                        } else {
+                            bg
+                        };
                         err += win.bw;
                         while err >= cwx {
                             err -= cwx;
@@ -4188,6 +4210,29 @@ impl Wm {
 
     // ── курсор (тот же приём, что в `term`: он не часть кадра) ────────────────────────
 
+    /// Веха 233.16 — сказать про окно, чей буфер короче объявленного размера. ОДИН раз на окно:
+    /// это состояние держится несколько кадров (окно получило новый размер и ещё не прислало
+    /// кадр), и строка в журнале на каждый кадр превратила бы журнал в мусор.
+    ///
+    /// Говорим вообще — потому что раньше это была молчаливая пропажа: место, которое окно
+    /// закрывает собой, оставалось нерисованным. Дыру видно глазом, а причину — нет.
+    fn note_short_buffer(&self, win: &Win, len: usize) {
+        if win.short_noted.get() {
+            return;
+        }
+        win.short_noted.set(true);
+        sys::write_console(
+            alloc::format!(
+                "[wm] окно {}: буфер {} Б короче объявленного {}×{} — рисую фоном\n",
+                win.id,
+                len,
+                win.bw,
+                win.bh,
+            )
+            .as_bytes(),
+        );
+    }
+
     /// Веха 233.7 — отдать железу КАРТИНКУ указателя: те же 12×19 точек, разложенные в поле
     /// 64×64 с прозрачностью.
     ///
@@ -4508,6 +4553,7 @@ impl Wm {
             let now = sys::monotonic_ns();
             let has_shot = own.is_some();
             let win = Win {
+                short_noted: core::cell::Cell::new(false),
                 id,
                 // Хозяин плитки — САМА позванная программа, а не мы. У плитки запуска хозяин
                 // другой (сторож `run`), и разница по делу: там за окном стоит чужой ребёнок и
@@ -6275,6 +6321,7 @@ impl Wm {
                 let (buf, buf_len, slot, span) =
                     self.map_client_buf(m.cap, w, h).unwrap_or((0, 0, 0, 0));
                 let win = Win {
+                short_noted: core::cell::Cell::new(false),
                     id,
                     owner: m.sender,
                     x: 60 + n * 40,
@@ -6393,6 +6440,7 @@ impl Wm {
                 // Проявляются только ОБОИ (нижний слой): см. ниже, у поля `shown`.
                 let fade = spec.layer == win::LAYER_BG;
                 let win = Win {
+                short_noted: core::cell::Cell::new(false),
                     id,
                     owner: m.sender,
                     x: r.x,
@@ -6817,6 +6865,7 @@ impl Wm {
                 self.next_id += 1;
                 let now = sys::monotonic_ns();
                 let win = Win {
+                short_noted: core::cell::Cell::new(false),
                     id,
                     // Хозяин плитки — ТОТ, КТО ЗАПУСКАЕТ (сторож `run`), а не запускаемый: это
                     // он с нами говорит и он же умрёт, если запуск сорвётся вместе с ним.
