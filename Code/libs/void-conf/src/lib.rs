@@ -371,10 +371,10 @@ pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
         return check_rights(r);
     }
     if let Some(rest) = tok.strip_prefix("dev:") {
-        let Some((вид, r)) = rest.split_once(':') else {
+        let Some((kind, r)) = rest.split_once(':') else {
             return Err("жду `dev:net:ПРАВА` или `dev:block:ПРАВА`");
         };
-        if вид != "net" && вид != "block" {
+        if kind != "net" && kind != "block" {
             return Err("устройств в строке запуска два: `dev:net` и `dev:block`");
         }
         return check_rights(r);
@@ -386,14 +386,14 @@ pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
         };
     }
     if let Some(rest) = tok.strip_prefix("endpoint:") {
-        let (имя, права) = match rest.split_once(':') {
+        let (name, rights) = match rest.split_once(':') {
             Some((n, r)) => (n, Some(r)),
             None => (rest, None),
         };
-        if имя.is_empty() {
+        if name.is_empty() {
             return Err("`endpoint:` без имени сервера");
         }
-        return match права {
+        return match rights {
             // Веха 229 ([[0022-app-state-directory]]) — третья часть может быть ПУТЁМ, а не
             // буквами прав: `endpoint:posixfs:/etc/apps/hda` — право на файлы, сужённое этим
             // корнем. Спутать нельзя: в правах косой черты не бывает, в абсолютном пути она
@@ -408,11 +408,11 @@ pub fn check_cap_token(tok: &str) -> Result<(), &'static str> {
     }
     // Веха 230 — `clock` (подвести часы по сети) стоит в одном ряду с `power` и `sysview`:
     // общесистемное действие, названное строкой конфига.
-    for одиночный in ["power", "sysview", "hwprobe", "clock"] {
-        if tok == одиночный {
+    for single in ["power", "sysview", "hwprobe", "clock"] {
+        if tok == single {
             return Ok(());
         }
-        if let Some(r) = tok.strip_prefix(одиночный).and_then(|s| s.strip_prefix(':')) {
+        if let Some(r) = tok.strip_prefix(single).and_then(|s| s.strip_prefix(':')) {
             return check_rights(r);
         }
     }

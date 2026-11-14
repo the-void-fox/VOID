@@ -25,19 +25,19 @@ use void_fs::*;
 ///
 /// Здесь имя — два байта из всего диапазона (имена это байты, не текст), значит сочетаний
 /// 65536, и отказ придёт ровно от края буфера.
-fn полный_индекс(d: &mut [u8; DIR_MAX]) -> (usize, usize) {
+fn full_index(d: &mut [u8; DIR_MAX]) -> (usize, usize) {
     let mut n = 0usize;
-    let mut записей = 0usize;
+    let mut records = 0usize;
     for i in 0..u16::MAX as usize {
-        let имя = [(i % 256) as u8, (i / 256) as u8];
-        let было = n;
-        n = idx_add(d, n, &имя, false);
-        if n == было {
+        let name = [(i % 256) as u8, (i / 256) as u8];
+        let prev = n;
+        n = idx_add(d, n, &name, false);
+        if n == prev {
             break; // больше не лезет — ровно то, что нам нужно
         }
-        записей += 1;
+        records += 1;
     }
-    (n, записей)
+    (n, records)
 }
 
 // ─── правило «не влезло — не соврали» ────────────────────────────────────────
@@ -45,18 +45,18 @@ fn полный_индекс(d: &mut [u8; DIR_MAX]) -> (usize, usize) {
 #[test]
 fn переполненный_индекс_не_растёт_и_не_портится() {
     let mut d = [0u8; DIR_MAX];
-    let (n, записей) = полный_индекс(&mut d);
+    let (n, records) = full_index(&mut d);
     // Записи по 4 байта (вид + длина + два байта имени) плюс двухбайтная шапка: в 4096 их
     // помещается около тысячи. Меньше — значит отказали не от края буфера, а по другой причине.
-    assert!(записей > 900, "набралось подозрительно мало записей: {записей}");
+    assert!(records > 900, "набралось подозрительно мало записей: {records}");
     assert!(n + 4 > DIR_MAX, "до края буфера осталось место: {n} из {DIR_MAX}");
 
     // Ещё одна запись не влезает: длина та же.
-    let после = idx_add(&mut d, n, "ещё".as_bytes(), false);
-    assert_eq!(после, n, "переполненный индекс изменил длину");
+    let after = idx_add(&mut d, n, "ещё".as_bytes(), false);
+    assert_eq!(after, n, "переполненный индекс изменил длину");
 
     // И, главное, он остался ЧИТАЕМЫМ: перебор отдаёт ровно столько, сколько клали.
-    assert_eq!(entries(&d, n).count(), записей, "индекс распался после отказа");
+    assert_eq!(entries(&d, n).count(), records, "индекс распался после отказа");
 }
 
 #[test]
@@ -64,11 +64,11 @@ fn имя_длиннее_предела_не_принимается() {
     let mut d = [0u8; DIR_MAX];
     let n = idx_add(&mut d, 0, "обычное".as_bytes(), false);
     // Длина имени хранится одним байтом, поэтому 256 не выразимо. Отказ, а не обрезка.
-    let длинное = [b'x'; 256];
-    assert_eq!(idx_add(&mut d, n, &длинное, false), n, "имя в 256 байт приняли");
+    let long_text = [b'x'; 256];
+    assert_eq!(idx_add(&mut d, n, &long_text, false), n, "имя в 256 байт приняли");
     // А 255 — влезает: граница именно там, где объявлена.
-    let предельное = [b'y'; 255];
-    assert!(idx_add(&mut d, n, &предельное, false) > n, "имя в 255 байт отвергли");
+    let limit_text = [b'y'; 255];
+    assert!(idx_add(&mut d, n, &limit_text, false) > n, "имя в 255 байт отвергли");
 }
 
 #[test]
@@ -76,9 +76,9 @@ fn удаление_отсутствующего_ничего_не_меняет(
     let mut d = [0u8; DIR_MAX];
     let mut n = idx_add(&mut d, 0, b"a", false);
     n = idx_add(&mut d, n, b"b", true);
-    let снимок = d;
+    let snapshot = d;
     assert_eq!(idx_remove(&mut d, n, "нет-такого".as_bytes()), n, "длина изменилась");
-    assert_eq!(&d[..n], &снимок[..n], "байты индекса изменились");
+    assert_eq!(&d[..n], &snapshot[..n], "байты индекса изменились");
 }
 
 // ─── арифметика, заявленная в шапке: времён всегда хватает ───────────────────
@@ -89,18 +89,18 @@ fn удаление_отсутствующего_ничего_не_меняет(
 #[test]
 fn времён_хватает_даже_на_битком_набитый_каталог() {
     let mut d = [0u8; DIR_MAX];
-    let (n, записей) = полный_индекс(&mut d);
+    let (n, records) = full_index(&mut d);
 
     let mut t = [0u8; MT_MAX];
     let mut m = 0usize;
-    let mut проставлено = 0usize;
+    let mut stamped = 0usize;
     for (i, e) in entries(&d, n).enumerate() {
-        let было = m;
+        let prev = m;
         m = mt_set(&mut t, m, e.name, 1000 + i as u64);
-        assert!(m > было, "время не влезло на записи {i} из {записей}");
-        проставлено += 1;
+        assert!(m > prev, "время не влезло на записи {i} из {records}");
+        stamped += 1;
     }
-    assert_eq!(проставлено, записей, "времена проставлены не всем");
+    assert_eq!(stamped, records, "времена проставлены не всем");
     assert!(m <= MT_MAX, "буфер времён переполнен: {m} > {MT_MAX}");
 }
 
@@ -109,8 +109,8 @@ fn времён_хватает_даже_на_битком_набитый_кат�
 #[test]
 fn слишком_длинный_путь_обрезается_по_потолку_а_не_ломает_буфер() {
     let mut p = [0u8; PATH_MAX];
-    let длинный = vec![b'z'; PATH_MAX * 2];
-    let n = normalize(&длинный, &mut p);
+    let long = vec![b'z'; PATH_MAX * 2];
+    let n = normalize(&long, &mut p);
     assert_eq!(n, PATH_MAX, "нормализация вышла за потолок пути");
     assert_eq!(p[0], b'/', "ведущий слэш потерян при обрезке");
 }
@@ -130,9 +130,9 @@ fn снимается_один_хвостовой_слэш_а_не_все() {
 #[test]
 fn корень_остаётся_корнем_как_его_ни_назови() {
     let mut p = [0u8; PATH_MAX];
-    for запрос in [b"".as_slice(), b".".as_slice(), b"/".as_slice()] {
-        let n = normalize(запрос, &mut p);
-        assert_eq!(&p[..n], b"/", "запрос {запрос:?} дал не корень");
+    for request in [b"".as_slice(), b".".as_slice(), b"/".as_slice()] {
+        let n = normalize(request, &mut p);
+        assert_eq!(&p[..n], b"/", "запрос {request:?} дал не корень");
     }
 }
 
@@ -152,12 +152,12 @@ fn родитель_и_лист_на_краях() {
 /// путь обязаны помещаться без обрезки. Тест держит связь между двумя константами.
 #[test]
 fn самый_длинный_путь_помещается_в_имя_корня_целиком() {
-    let путь = vec![b'q'; PATH_MAX];
+    let path = vec![b'q'; PATH_MAX];
     let mut r = [0u8; ROOT_MAX];
-    let n = root_name(K_FILE, &путь, &mut r);
+    let n = root_name(K_FILE, &path, &mut r);
     assert_eq!(n, ROOT_MAX, "имя корня обрезало предельный путь");
     assert_eq!(r[0], K_FILE);
-    assert_eq!(&r[1..n], &путь[..]);
+    assert_eq!(&r[1..n], &path[..]);
 }
 
 // ─── имена — это БАЙТЫ, а не текст ───────────────────────────────────────────
@@ -165,15 +165,15 @@ fn самый_длинный_путь_помещается_в_имя_корня_
 #[test]
 fn имена_не_обязаны_быть_текстом() {
     let mut d = [0u8; DIR_MAX];
-    let кириллица = "заметки".as_bytes();
-    let байты: &[u8] = &[0x00, 0xff, 0x01, 0xfe]; // не UTF-8 вовсе
-    let mut n = idx_add(&mut d, 0, кириллица, true);
-    n = idx_add(&mut d, n, байты, false);
-    assert_eq!(idx_type(&d, n, кириллица), Some(T_DIR));
-    assert_eq!(idx_type(&d, n, байты), Some(T_FILE));
+    let cyrillic = "заметки".as_bytes();
+    let bytes: &[u8] = &[0x00, 0xff, 0x01, 0xfe]; // не UTF-8 вовсе
+    let mut n = idx_add(&mut d, 0, cyrillic, true);
+    n = idx_add(&mut d, n, bytes, false);
+    assert_eq!(idx_type(&d, n, cyrillic), Some(T_DIR));
+    assert_eq!(idx_type(&d, n, bytes), Some(T_FILE));
     // И перебор их видит теми же байтами, какими клали.
-    let собранные: Vec<&[u8]> = entries(&d, n).map(|e| e.name).collect();
-    assert_eq!(собранные, vec![кириллица, байты]);
+    let gathered: Vec<&[u8]> = entries(&d, n).map(|e| e.name).collect();
+    assert_eq!(gathered, vec![cyrillic, bytes]);
 }
 
 // ─── порча: индекс приезжает с диска ─────────────────────────────────────────
@@ -182,15 +182,15 @@ fn имена_не_обязаны_быть_текстом() {
 fn обрезанный_индекс_разбирается_без_паники() {
     let mut d = [0u8; DIR_MAX];
     let mut n = 0;
-    for имя in ["первый".as_bytes(), "второй".as_bytes(), "третий".as_bytes()] {
-        n = idx_add(&mut d, n, имя, false);
+    for name in ["первый".as_bytes(), "второй".as_bytes(), "третий".as_bytes()] {
+        n = idx_add(&mut d, n, name, false);
     }
     // Режем на каждой возможной длине: так выглядит недочитанный с диска кадр.
-    for обрез in 0..=n {
-        let сколько = entries(&d, обрез).count();
-        assert!(сколько <= 3, "обрезок длиной {обрез} выдал записей больше, чем клали");
-        for e in entries(&d, обрез) {
-            assert!(!e.name.is_empty(), "пустое имя из обрезка длиной {обрез}");
+    for clip in 0..=n {
+        let count = entries(&d, clip).count();
+        assert!(count <= 3, "обрезок длиной {clip} выдал записей больше, чем клали");
+        for e in entries(&d, clip) {
+            assert!(!e.name.is_empty(), "пустое имя из обрезка длиной {clip}");
         }
     }
 }

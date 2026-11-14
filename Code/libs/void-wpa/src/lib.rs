@@ -302,13 +302,13 @@ mod tests {
     #[test]
     fn порции_не_меняют_свёртку() {
         let data: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
-        let целиком = sha1(&data);
-        for шаг in [1, 3, 64, 63, 65, 127] {
+        let entire = sha1(&data);
+        for step in [1, 3, 64, 63, 65, 127] {
             let mut h = Sha1::new();
-            for кусок in data.chunks(шаг) {
-                h.update(кусок);
+            for chunk in data.chunks(step) {
+                h.update(chunk);
             }
-            assert_eq!(h.finish(), целиком, "порции по {шаг} дали другую свёртку");
+            assert_eq!(h.finish(), entire, "порции по {step} дали другую свёртку");
         }
     }
 
@@ -398,10 +398,10 @@ mod tests {
         let k = pmk(b"password", b"IEEE");
         let (a, b) = ([0x02u8; 6], [0x0au8; 6]);
         let (na, nb) = ([0x11u8; 32], [0x22u8; 32]);
-        let базовый = ptk(&k, &a, &b, &na, &nb);
-        assert_ne!(базовый, ptk(&pmk(b"other", b"IEEE"), &a, &b, &na, &nb));
-        assert_ne!(базовый, ptk(&k, &[0x03; 6], &b, &na, &nb));
-        assert_ne!(базовый, ptk(&k, &a, &b, &[0x12; 32], &nb));
+        let base = ptk(&k, &a, &b, &na, &nb);
+        assert_ne!(base, ptk(&pmk(b"other", b"IEEE"), &a, &b, &na, &nb));
+        assert_ne!(base, ptk(&k, &[0x03; 6], &b, &na, &nb));
+        assert_ne!(base, ptk(&k, &a, &b, &[0x12; 32], &nb));
     }
 
 
@@ -443,14 +443,14 @@ mod tests {
         let kck = [0x11u8; 16];
         let replay = [0, 0, 0, 0, 0, 0, 0, 7];
         let nonce = [0x33u8; 32];
-        let данные = [48u8, 2, 1, 0];
+        let data = [48u8, 2, 1, 0];
         let f =
-            build_key_frame(KI_VERSION_2 | KI_PAIRWISE | KI_MIC, 0, &replay, &nonce, &kck, &данные);
+            build_key_frame(KI_VERSION_2 | KI_PAIRWISE | KI_MIC, 0, &replay, &nonce, &kck, &data);
         let kf = parse_key_frame(&f).expect("свой же кадр не разобрался");
         assert_eq!(kf.info, KI_VERSION_2 | KI_PAIRWISE | KI_MIC);
         assert_eq!(kf.replay, replay);
         assert_eq!(kf.nonce, nonce);
-        assert_eq!(kf.data, &данные);
+        assert_eq!(kf.data, &data);
         assert!(key_mic_ok(&kck, &f, &kf.mic), "своя же подпись не сошлась");
     }
 
@@ -476,14 +476,14 @@ mod tests {
     #[test]
     fn подпись_берёт_длинный_кадр_целиком() {
         let kck = [0x11u8; 16];
-        let данные = alloc::vec![0x5au8; 400];
-        let f = build_key_frame(KI_VERSION_2 | KI_PAIRWISE | KI_MIC, 0, &[0; 8], &[0; 32], &kck, &данные);
+        let data = alloc::vec![0x5au8; 400];
+        let f = build_key_frame(KI_VERSION_2 | KI_PAIRWISE | KI_MIC, 0, &[0; 8], &[0; 32], &kck, &data);
         assert!(f.len() > 256, "кадр короче прежнего буфера — проверка ничего не докажет");
         let kf = parse_key_frame(&f).expect("длинный кадр не разобрался");
         assert!(key_mic_ok(&kck, &f, &kf.mic));
-        let mut порченый = f.clone();
-        *порченый.last_mut().unwrap() ^= 1;
-        assert!(!key_mic_ok(&kck, &порченый, &kf.mic), "хвост кадра в подпись не попал");
+        let mut broken = f.clone();
+        *broken.last_mut().unwrap() ^= 1;
+        assert!(!key_mic_ok(&kck, &broken, &kf.mic), "хвост кадра в подпись не попал");
     }
 
     /// Поле «длина ключа» кладётся туда, где его ждёт точка, и берётся из аргумента, а не из
@@ -501,13 +501,13 @@ mod tests {
     #[test]
     fn обрезанный_кадр_разбор_не_роняет() {
         let f = build_key_frame(KI_VERSION_2 | KI_PAIRWISE, 0, &[0; 8], &[0; 32], &[], &[1, 2, 3]);
-        for обрез in 0..f.len() {
-            let _ = parse_key_frame(&f[..обрез]); // важно лишь, что не паникует
+        for clip in 0..f.len() {
+            let _ = parse_key_frame(&f[..clip]); // важно лишь, что не паникует
         }
         // Длина вложения больше самого кадра — враньё, и его надо заметить.
-        let mut порченый = f.clone();
-        порченый[EAPOL_HDR + KEY_DATA_LEN] = 0xff;
-        assert!(parse_key_frame(&порченый).is_none(), "поверили длине вложения, а не кадру");
+        let mut broken = f.clone();
+        broken[EAPOL_HDR + KEY_DATA_LEN] = 0xff;
+        assert!(parse_key_frame(&broken).is_none(), "поверили длине вложения, а не кадру");
     }
 
     #[test]
@@ -515,9 +515,9 @@ mod tests {
         // Вложение: dd, длина, 00-0f-ac, вид 1, номер ключа, запас, сам ключ.
         let mut kde = alloc::vec![0xdd, 6 + 16, 0x00, 0x0f, 0xac, 0x01, 0x02, 0x00];
         kde.extend_from_slice(&[0x5a; 16]);
-        let (номер, ключ) = find_gtk(&kde).expect("ключ не нашёлся");
-        assert_eq!(номер, 2);
-        assert_eq!(ключ, &[0x5a; 16]);
+        let (nr, key) = find_gtk(&kde).expect("ключ не нашёлся");
+        assert_eq!(nr, 2);
+        assert_eq!(key, &[0x5a; 16]);
         // Вложение другого вида — не ключ.
         assert!(find_gtk(&[0xdd, 4, 0x00, 0x0f, 0xac, 0x04]).is_none());
         assert!(find_gtk(&[]).is_none());
@@ -528,18 +528,18 @@ mod tests {
     #[test]
     fn кадр_с_данными_разбирается_обратно() {
         let (bssid, mac) = ([0x11u8; 6], [0x22u8; 6]);
-        let тело = [2u8, 3, 0, 2, 0xaa, 0xbb]; // версия, тип «ключ», длина тела 2, само тело
-        let f = frame_eapol(&bssid, &mac, &тело);
+        let body = [2u8, 3, 0, 2, 0xaa, 0xbb]; // версия, тип «ключ», длина тела 2, само тело
+        let f = frame_eapol(&bssid, &mac, &body);
         // Адрес 1 — точка, адрес 2 — мы: кадр идёт К точке.
         assert_eq!(&f[4..10], &bssid);
         assert_eq!(&f[10..16], &mac);
         assert_eq!(f[1] & 0x03, 0x01, "не выставлено «к точке»");
         // А разбираем мы то, что пришло ОТ точки: адрес 1 — наш.
-        let mut обратно = f.clone();
-        обратно[1] = 0x02; // «от точки»
-        обратно[4..10].copy_from_slice(&mac);
-        обратно[10..16].copy_from_slice(&bssid);
-        assert_eq!(eapol_of(&обратно, &mac), Some(&тело[..]));
+        let mut back = f.clone();
+        back[1] = 0x02; // «от точки»
+        back[4..10].copy_from_slice(&mac);
+        back[10..16].copy_from_slice(&bssid);
+        assert_eq!(eapol_of(&back, &mac), Some(&body[..]));
     }
 
     /// Фильтр карты пропускает и чужое. Кадр соседа выглядит так же, как наш, — и отличает их
@@ -549,13 +549,13 @@ mod tests {
         let f = frame_eapol(&[0x11; 6], &[0x22; 6], &[2, 3]);
         assert!(eapol_of(&f, &[0x33; 6]).is_none(), "взяли кадр, адресованный не нам");
         // Не EAPOL: тот же кадр с другим кодом протокола.
-        let mut чужой_код = f.clone();
+        let mut foreign_code = f.clone();
         let at = hdr_len(&f) + 6;
-        чужой_код[at..at + 2].copy_from_slice(&[0x08, 0x00]); // IPv4
-        assert!(eapol_of(&чужой_код, &[0x22; 6]).is_none(), "приняли за EAPOL чужой протокол");
+        foreign_code[at..at + 2].copy_from_slice(&[0x08, 0x00]); // IPv4
+        assert!(eapol_of(&foreign_code, &[0x22; 6]).is_none(), "приняли за EAPOL чужой протокол");
         // Обрезанный кадр: отказ, а не паника.
-        for обрез in 0..f.len() {
-            let _ = eapol_of(&f[..обрез], &[0x22; 6]);
+        for clip in 0..f.len() {
+            let _ = eapol_of(&f[..clip], &[0x22; 6]);
         }
     }
 
@@ -567,25 +567,25 @@ mod tests {
     /// здесь единственная правда.
     #[test]
     fn хвост_за_кадром_отрезается() {
-        let (bssid, мы) = ([0x11u8; 6], [0x22u8; 6]);
-        let кадр = build_key_frame(KI_VERSION_2 | KI_PAIRWISE | KI_MIC, 0, &[0; 8], &[0; 32], &[9; 16], &[48, 2, 1, 0]);
-        let air = frame_eapol(&bssid, &мы, &кадр);
-        let mut с_хвостом = air.clone();
-        с_хвостом.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // контрольная сумма кадра
+        let (bssid, me) = ([0x11u8; 6], [0x22u8; 6]);
+        let frame = build_key_frame(KI_VERSION_2 | KI_PAIRWISE | KI_MIC, 0, &[0; 8], &[0; 32], &[9; 16], &[48, 2, 1, 0]);
+        let air = frame_eapol(&bssid, &me, &frame);
+        let mut with_tail = air.clone();
+        with_tail.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // контрольная сумма кадра
         // Кадр «от точки»: адрес 1 — наш.
-        for f in [&mut с_хвостом] {
+        for f in [&mut with_tail] {
             f[1] = 0x02;
-            f[4..10].copy_from_slice(&мы);
+            f[4..10].copy_from_slice(&me);
             f[10..16].copy_from_slice(&bssid);
         }
-        let тело = eapol_of(&с_хвостом, &мы).expect("кадр не разобрался");
-        assert_eq!(тело, &кадр[..], "хвост попал в кадр");
-        let kf = parse_key_frame(тело).expect("не разобрался");
-        assert!(key_mic_ok(&[9; 16], тело, &kf.mic), "подпись не сошлась из-за хвоста");
+        let body = eapol_of(&with_tail, &me).expect("кадр не разобрался");
+        assert_eq!(body, &frame[..], "хвост попал в кадр");
+        let kf = parse_key_frame(body).expect("не разобрался");
+        assert!(key_mic_ok(&[9; 16], body, &kf.mic), "подпись не сошлась из-за хвоста");
 
         // А кадр, оборванный по-настоящему (длина названа больше, чем приехало), — не кадр.
-        let обрыв = &с_хвостом[..с_хвостом.len() - 10];
-        assert!(eapol_of(обрыв, &мы).is_none(), "взяли оборванный кадр");
+        let cut = &with_tail[..with_tail.len() - 10];
+        assert!(eapol_of(cut, &me).is_none(), "взяли оборванный кадр");
     }
 
     /// Точка сама решает ставить кадрам приоритет, и тогда заголовок на два байта длиннее. Не
@@ -615,41 +615,41 @@ mod tests {
     /// перевода, поэтому круг проверяется целиком.
     #[test]
     fn кадр_ethernet_возвращается_собой() {
-        let (bssid, мы, они) = ([0x11u8; 6], [0x22u8; 6], [0x33u8; 6]);
+        let (bssid, me, them) = ([0x11u8; 6], [0x22u8; 6], [0x33u8; 6]);
         let mut eth = alloc::vec::Vec::new();
-        eth.extend_from_slice(&они); // кому
-        eth.extend_from_slice(&мы); // от кого
+        eth.extend_from_slice(&them); // кому
+        eth.extend_from_slice(&me); // от кого
         eth.extend_from_slice(&[0x08, 0x00]); // IPv4
         eth.extend_from_slice(&[1, 2, 3, 4, 5]);
 
         let air = eth_to_wifi(&bssid, &eth).expect("не собралось");
         assert_eq!(&air[4..10], &bssid, "адрес 1 — точка");
-        assert_eq!(&air[10..16], &мы, "адрес 2 — отправитель");
-        assert_eq!(&air[16..22], &они, "адрес 3 — настоящий получатель");
+        assert_eq!(&air[10..16], &me, "адрес 2 — отправитель");
+        assert_eq!(&air[16..22], &them, "адрес 3 — настоящий получатель");
 
         // Точка перекладывает тот же кадр обратно: «от точки», адрес 1 — кому, адрес 3 — от кого.
-        let mut обратно = air.clone();
-        обратно[1] = 0x02;
-        обратно[4..10].copy_from_slice(&они);
-        обратно[10..16].copy_from_slice(&bssid);
-        обратно[16..22].copy_from_slice(&мы);
-        assert_eq!(wifi_to_eth(&обратно), Some(eth));
+        let mut back = air.clone();
+        back[1] = 0x02;
+        back[4..10].copy_from_slice(&them);
+        back[10..16].copy_from_slice(&bssid);
+        back[16..22].copy_from_slice(&me);
+        assert_eq!(wifi_to_eth(&back), Some(eth));
     }
 
     #[test]
     fn пустышка_и_обрезки_не_кадры() {
         let f = eth_to_wifi(&[0x11; 6], &[0u8; 20]).expect("собралось");
         // Подтип 4 — «мне нечего сказать»: тела нет, переводить нечего.
-        let mut пустышка = f.clone();
-        пустышка[0] = 0x48;
-        assert!(wifi_to_eth(&пустышка).is_none(), "приняли пустышку за кадр с данными");
+        let mut empty_one = f.clone();
+        empty_one[0] = 0x48;
+        assert!(wifi_to_eth(&empty_one).is_none(), "приняли пустышку за кадр с данными");
         // Маяк — не данные.
-        let mut маяк = f.clone();
-        маяк[0] = 0x80;
-        assert!(wifi_to_eth(&маяк).is_none());
+        let mut beacon = f.clone();
+        beacon[0] = 0x80;
+        assert!(wifi_to_eth(&beacon).is_none());
         // Обрезки: отказ, а не паника.
-        for обрез in 0..f.len() {
-            let _ = wifi_to_eth(&f[..обрез]);
+        for clip in 0..f.len() {
+            let _ = wifi_to_eth(&f[..clip]);
         }
         assert!(eth_to_wifi(&[0x11; 6], &[0u8; 13]).is_none(), "кадр короче заголовка Ethernet");
     }
@@ -658,12 +658,12 @@ mod tests {
     /// адрес и потеряешь кадр целиком.
     #[test]
     fn набивка_снимается_после_заголовка() {
-        let тело = [2u8, 3, 0, 2, 0xaa, 0xbb]; // версия, тип «ключ», длина тела 2, само тело
-        let целый = frame_eapol(&[0x11; 6], &[0x22; 6], &тело);
-        let mut с_набивкой = целый.clone();
-        с_набивкой.splice(24..24, [0xff, 0xff]);
-        let n = strip_l2pad(&mut с_набивкой);
-        assert_eq!(&с_набивкой[..n], &целый[..]);
+        let body = [2u8, 3, 0, 2, 0xaa, 0xbb]; // версия, тип «ключ», длина тела 2, само тело
+        let whole = frame_eapol(&[0x11; 6], &[0x22; 6], &body);
+        let mut padded = whole.clone();
+        padded.splice(24..24, [0xff, 0xff]);
+        let n = strip_l2pad(&mut padded);
+        assert_eq!(&padded[..n], &whole[..]);
     }
 
     #[test]
@@ -882,19 +882,19 @@ pub fn eapol_of<'a>(f: &'a [u8], mac: &[u8; 6]) -> Option<&'a [u8]> {
     if llc[..6] != LLC_SNAP || llc[6..] != ETHERTYPE_EAPOL {
         return None;
     }
-    let тело = &f[h + 8..];
+    let body = &f[h + 8..];
     // Веха 220.2 — ОБРЕЗАТЬ ПО СОБСТВЕННОЙ ДЛИНЕ. EAPOL несёт длину тела третьим и четвёртым
     // байтом заголовка, и она — единственная правда о том, где кадр кончается. Всё, что за ней,
     // кадру не принадлежит: выравнивание, контрольная сумма, добивка до минимальной длины.
     //
     // Для подписи это не мелочь, а всё: она считается по кадру ЦЕЛИКОМ, и лишний байт делает её
     // другой. Ровно так «верный пароль» однажды и превратился в «пароль не тот».
-    if тело.len() < EAPOL_HDR {
+    if body.len() < EAPOL_HDR {
         return None;
     }
-    let длина = EAPOL_HDR + u16::from_be_bytes([тело[2], тело[3]]) as usize;
-    match длина <= тело.len() {
-        true => Some(&тело[..длина]),
+    let len = EAPOL_HDR + u16::from_be_bytes([body[2], body[3]]) as usize;
+    match len <= body.len() {
+        true => Some(&body[..len]),
         // Названо больше, чем приехало, — кадр оборван. Отдавать такой нельзя: подпись по нему
         // всё равно не сойдётся, а «не сошлась подпись» скажет человеку не то.
         false => None,

@@ -213,6 +213,11 @@ static USER_OWNED: AtomicUsize = AtomicUsize::new(0);
 static EXTRA: AtomicUsize = AtomicUsize::new(0);
 
 /// Объявить, что за кадром есть ещё столько же байт под второй буфер.
+///
+/// Только x86: второй буфер берётся из украденной памяти графики Intel ([`crate::intel_fb`]),
+/// а на riscv экран приходит от virtio-gpu, где переключать страницу нечем. Помечено `cfg`, а
+/// не `allow(dead_code)`, чтобы причина была видна — как и у [`init`] выше.
+#[cfg(target_arch = "x86_64")]
 pub fn set_extra_buffers(bytes: usize) {
     EXTRA.store(bytes, Ordering::Relaxed);
 }

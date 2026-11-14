@@ -64,7 +64,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         sys::write("  icat проба [ширина]   — клетчатый квадрат: умеет ли терминал картинки\n".as_bytes());
         sys::exit(2);
     };
-    let ширина = argv.str(1).and_then(|s| s.parse::<u16>().ok());
+    let width = argv.str(1).and_then(|s| s.parse::<u16>().ok());
 
     // ПРОБА: картинка, которой не нужен файл. Нужна ровно затем, зачем `beep` звуку — ответить
     // на вопрос «а вообще работает?» одной командой, без поиска подходящего файла на машине,
@@ -77,15 +77,15 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                 let i = (y * w as usize + x) * 4;
                 // Клетка 16×16 плюс наклонный градиент: по клетке видно геометрию и масштаб, по
                 // градиенту — что цвета доехали, а не превратились в плашку.
-                let клетка = ((x / 16) + (y / 16)) % 2 == 0;
+                let cell = ((x / 16) + (y / 16)) % 2 == 0;
                 let g = (x * 255 / w as usize) as u8;
-                px[i] = if клетка { g } else { 255 - g };
+                px[i] = if cell { g } else { 255 - g };
                 px[i + 1] = (y * 255 / h as usize) as u8;
-                px[i + 2] = if клетка { 220 } else { 40 };
+                px[i + 2] = if cell { 220 } else { 40 };
                 px[i + 3] = 255;
             }
         }
-        let cols = ширина.unwrap_or(32).clamp(1, 200);
+        let cols = width.unwrap_or(32).clamp(1, 200);
         let rows = (cols as u32 * h * CELL.0 / (w * CELL.1)).max(1) as u16;
         send(&px, w, h, cols, rows);
         sys::exit(0);
@@ -109,25 +109,25 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // Сколько знакомест отдать картинке. Окно знает терминал — спрашиваем его; нет ответа
     // (нас запустили не из терминала) — берём безопасные 80×25.
     let (cols, rows) = stdio::win_size().unwrap_or((80, 25));
-    let по_ширине = ширина.unwrap_or(cols.saturating_sub(MARGIN_COLS)).clamp(1, cols);
+    let by_width = width.unwrap_or(cols.saturating_sub(MARGIN_COLS)).clamp(1, cols);
     // Пропорции считаем В ПИКСЕЛЯХ: знакоместо вдвое выше своей ширины, и картинка, вписанная
     // «по числу клеток», вышла бы вытянутой вдвое.
-    let w_px = по_ширине as u32 * CELL.0;
+    let w_px = by_width as u32 * CELL.0;
     let h_px = (w_px as u64 * img.h as u64 / img.w.max(1) as u64) as u32;
     // Не выше окна: в терминале картинка живёт в ленте, и та её часть, что уехала за верх,
     // прокруткой не вернётся (мы храним знаки, а не пиксели).
-    let потолок = (rows.saturating_sub(2)).max(1) as u32 * CELL.1;
-    let (w_px, h_px) = if h_px > потолок {
-        ((потолок as u64 * img.w as u64 / img.h.max(1) as u64) as u32, потолок)
+    let cap_limit = (rows.saturating_sub(2)).max(1) as u32 * CELL.1;
+    let (w_px, h_px) = if h_px > cap_limit {
+        ((cap_limit as u64 * img.w as u64 / img.h.max(1) as u64) as u32, cap_limit)
     } else {
         (w_px, h_px)
     };
     let (w_px, h_px) = (w_px.max(1), h_px.max(1));
-    let cols_в = w_px.div_ceil(CELL.0).max(1) as u16;
-    let rows_в = h_px.div_ceil(CELL.1).max(1) as u16;
+    let cols_out = w_px.div_ceil(CELL.0).max(1) as u16;
+    let rows_out = h_px.div_ceil(CELL.1).max(1) as u16;
 
-    let мелкая = shrink(&img, w_px, h_px);
-    send(&мелкая, w_px, h_px, cols_в, rows_в);
+    let small = shrink(&img, w_px, h_px);
+    send(&small, w_px, h_px, cols_out, rows_out);
     sys::exit(0);
 }
 
@@ -154,23 +154,23 @@ fn shrink(img: &void_img::Image, w: u32, h: u32) -> Vec<u8> {
 /// Отправить картинку терминалу: `ESC _ G <ключи> ; <данные base64> ESC \`, кусками.
 fn send(px: &[u8], w: u32, h: u32, cols: u16, rows: u16) {
     let b64 = base64ct::Base64::encode_string(px);
-    let всего = b64.len().div_ceil(CHUNK).max(1);
-    for (i, кусок) in b64.as_bytes().chunks(CHUNK).enumerate() {
-        let ещё = if i + 1 < всего { 1 } else { 0 };
-        let ключи = if i == 0 {
+    let total = b64.len().div_ceil(CHUNK).max(1);
+    for (i, chunk) in b64.as_bytes().chunks(CHUNK).enumerate() {
+        let more = if i + 1 < total { 1 } else { 0 };
+        let keys = if i == 0 {
             // `a=T` — принять и показать; `f=32` — пиксели RGBA как есть; `s`/`v` — их размер;
             // `c`/`r` — во сколько знакомест вписать.
-            format!("a=T,f=32,s={w},v={h},c={cols},r={rows},m={ещё}")
+            format!("a=T,f=32,s={w},v={h},c={cols},r={rows},m={more}")
         } else {
-            format!("m={ещё}")
+            format!("m={more}")
         };
-        let mut посылка = Vec::with_capacity(кусок.len() + ключи.len() + 8);
-        посылка.extend_from_slice(b"\x1b_G");
-        посылка.extend_from_slice(ключи.as_bytes());
-        посылка.push(b';');
-        посылка.extend_from_slice(кусок);
-        посылка.extend_from_slice(b"\x1b\\");
-        sys::write(&посылка);
+        let mut packet = Vec::with_capacity(chunk.len() + keys.len() + 8);
+        packet.extend_from_slice(b"\x1b_G");
+        packet.extend_from_slice(keys.as_bytes());
+        packet.push(b';');
+        packet.extend_from_slice(chunk);
+        packet.extend_from_slice(b"\x1b\\");
+        sys::write(&packet);
     }
 }
 

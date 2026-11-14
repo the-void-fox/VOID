@@ -9,7 +9,7 @@
 
 /// Кадр EAPOL-Key, собранный штатной сборкой крейта: правильная отправная точка для мутаций.
 /// Из случайного шума мутатор дальше первых двух байт не уехал бы.
-fn эталонный_кадр() -> Vec<u8> {
+fn reference_frame() -> Vec<u8> {
     let bssid = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
     let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
     // Тело EAPOL-Key: заголовок (версия, тип 3, длина) + сто байт содержимого.
@@ -19,14 +19,14 @@ fn эталонный_кадр() -> Vec<u8> {
 }
 
 /// Кадр с данными (не EAPOL) — второй род входа: его разбирает `wifi_to_eth`.
-fn кадр_данных() -> Vec<u8> {
+fn data_frame() -> Vec<u8> {
     let bssid = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
     let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
     void_wpa::frame_eapol(&bssid, &mac, &[0x45, 0x00, 0x00, 0x20, 0xde, 0xad, 0xbe, 0xef])
 }
 
 /// Хвост с информационными элементами — на нём работает поиск группового ключа.
-fn элементы() -> Vec<u8> {
+fn items_list() -> Vec<u8> {
     let mut v = vec![0xddu8, 0x16, 0x00, 0x0f, 0xac, 0x01];
     v.extend_from_slice(&[0x11; 20]);
     v.extend_from_slice(&[0x30, 0x14]);
@@ -34,14 +34,14 @@ fn элементы() -> Vec<u8> {
     v
 }
 
-fn корпус() -> Vec<Vec<u8>> {
-    vec![эталонный_кадр(), кадр_данных(), элементы()]
+fn corpus() -> Vec<Vec<u8>> {
+    vec![reference_frame(), data_frame(), items_list()]
 }
 
 #[test]
 fn разбор_кадров_не_паникует_на_мусоре() {
     let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
-    void_fuzz::run("wpa::кадры", 2026, void_fuzz::rounds(), &корпус(), move |b| {
+    void_fuzz::run("wpa::кадры", 2026, void_fuzz::rounds(), &corpus(), move |b| {
         // Все четыре разборщика на одном входе: кадр из эфира проходит через них подряд, и
         // гонять их врозь значило бы проверять не тот путь, которым идут настоящие байты.
         let _ = void_wpa::parse_key_frame(b);
@@ -55,8 +55,8 @@ fn разбор_кадров_не_паникует_на_мусоре() {
 #[test]
 fn снятие_набивки_не_паникует_на_мусоре() {
     // `strip_l2pad` берёт кадр ИЗМЕНЯЕМЫМ и двигает память внутри него — отдельный риск.
-    void_fuzz::run("wpa::strip_l2pad", 11, void_fuzz::rounds(), &корпус(), |b| {
-        let mut копия = b.to_vec();
-        let _ = void_wpa::strip_l2pad(&mut копия);
+    void_fuzz::run("wpa::strip_l2pad", 11, void_fuzz::rounds(), &corpus(), |b| {
+        let mut copy = b.to_vec();
+        let _ = void_wpa::strip_l2pad(&mut copy);
     });
 }

@@ -50,14 +50,14 @@ fn say(s: &str) {
 
 /// Вид строки текста. От него зависит и цвет, и подложка, и черта под ней.
 #[derive(Clone, Copy, PartialEq)]
-enum Вид {
+enum Kind {
     /// Заголовок верхнего уровня — акцентом.
-    Глава,
+    Head,
     /// Подзаголовок.
-    Раздел,
-    Текст,
+    Part,
+    Text,
     /// Строка блока кода: своя подложка на всю ширину.
-    Код,
+    Code,
 }
 
 /// Готовая к рисованию строка — РОВНО ОДНА строка на экране.
@@ -68,17 +68,17 @@ enum Вид {
 /// при возврате вверх пустоту приходится отматывать назад. Ровно это здесь и было — ряд таблицы
 /// хранился ЗАПИСЬЮ НА ЯЧЕЙКУ, а рисовался одной строкой, — поэтому ряд теперь одна запись со
 /// всеми ячейками.
-enum Строка {
+enum Line {
     /// Текст с отступом слева в точках.
-    Текст { текст: String, вид: Вид, отступ: i32 },
+    Text { text: String, kind: Kind, indent: i32 },
     /// Ряд таблицы: ячейки по колонкам таблицы `таблица` (ширины — в [`App::колонки`]).
-    Ряд { таблица: usize, ячейки: Vec<String> },
+    Row { table: usize, cells: Vec<String> },
 }
 
 /// Раздел руководства: имя корня и его текст (читается при первом открытии).
-struct Раздел {
-    имя: String,
-    блоки: Option<Vec<void_md::Block>>,
+struct Part {
+    name: String,
+    blocks: Option<Vec<void_md::Block>>,
 }
 
 #[derive(Default)]
@@ -100,16 +100,16 @@ struct Lay {
     rows: usize,
     /// Шаг строки ТЕКСТА справа. Другое число, чем [`Lay::row_h`], — и именно их путаница была
     /// багом прокрутки (см. [`ui::Pane`]).
-    шаг: i32,
+    step: i32,
 }
 
 struct App {
     w: i32,
     h: i32,
-    разделы: Vec<Раздел>,
+    parts: Vec<Part>,
     ls: ui::List,
     /// Разложенные строки текущего раздела и ширина, под которую их раскладывали.
-    строки: Vec<Строка>,
+    строки: Vec<Line>,
     /// Веха 223.3 — прокрутка текста ЦЕЛИКОМ виджетом тулкита ([`ui::Pane`]).
     ///
     /// Сперва здесь был свой счётчик «первая видимая строка», и прокрутка шла СТРОКАМИ: строка
@@ -122,10 +122,10 @@ struct App {
     /// Полотно тулкита меры принимает ОДИН раз, и ни колесу, ни полосе их больше не передают —
     /// значит разойтись им нечем. Заодно оно само держит и якорь протяжки, и попадание в полосу,
     /// которые тут были переписаны заново.
-    текст: ui::Pane,
-    разложено_для: Option<(usize, i32)>,
+    text: ui::Pane,
+    laid_out_for: Option<(usize, i32)>,
     /// Ширины колонок таблиц — по одной записи на каждую таблицу, в порядке встречи.
-    колонки: Vec<Vec<i32>>,
+    columns: Vec<Vec<i32>>,
     lay: Lay,
     store: Option<usize>,
 }
@@ -147,40 +147,40 @@ impl App {
         // Полосы обеих колонок — СРАЗУ такими, какими рисуются (поля внутрь здесь, а не на месте
         // вызова): по ним же считается попадание.
         let list_bar = list.cut_right(th.px(6)).inset_xy(th.px(1), th.px(2));
-        let mut текст = body;
-        let полоса = текст.cut_right(th.px(6));
+        let mut text = body;
+        let band = text.cut_right(th.px(6));
         let rows = (list.h / row_h).max(1) as usize;
         Lay {
             head,
             col,
             list,
             list_bar,
-            body: текст,
-            body_bar: полоса.inset_xy(th.px(1), th.px(2)),
+            body: text,
+            body_bar: band.inset_xy(th.px(1), th.px(2)),
             row_h,
             rows,
-            шаг: font_h + th.px(4),
+            step: font_h + th.px(4),
         }
     }
 
     fn filter(&mut self) {
         let q = self.ls.query.to_lowercase();
-        self.ls.hits = (0..self.разделы.len())
-            .filter(|&i| q.is_empty() || self.разделы[i].имя.to_lowercase().contains(&q))
+        self.ls.hits = (0..self.parts.len())
+            .filter(|&i| q.is_empty() || self.parts[i].name.to_lowercase().contains(&q))
             .collect();
         self.ls.refiltered();
     }
 
     /// Прочитать текст раздела из store и разобрать. Делается ОДИН раз на раздел: разбор это
     /// проход по тексту, и повторять его на каждый кадр не за что.
-    fn загрузить(&mut self, i: usize) {
-        if self.разделы[i].блоки.is_some() {
+    fn load(&mut self, i: usize) {
+        if self.parts[i].blocks.is_some() {
             return;
         }
         let Some(scap) = self.store else { return };
-        let корень = alloc::format!("doc/{}", self.разделы[i].имя);
+        let root = alloc::format!("doc/{}", self.parts[i].name);
         let mut id = [0u8; 32];
-        if sys::obj_get_root(scap, корень.as_bytes(), &mut id) != 32 {
+        if sys::obj_get_root(scap, root.as_bytes(), &mut id) != 32 {
             return;
         }
         let mut buf = alloc::vec![0u8; 128 * 1024];
@@ -190,7 +190,7 @@ impl App {
         }
         buf.truncate(got);
         if let Ok(t) = String::from_utf8(buf) {
-            self.разделы[i].блоки = Some(void_md::parse(&t));
+            self.parts[i].blocks = Some(void_md::parse(&t));
         }
     }
 
@@ -198,49 +198,49 @@ impl App {
     ///
     /// Считается при смене раздела или ширины окна, а не каждый кадр: перенос по словам требует
     /// мерить КАЖДОЕ слово шрифтом, и делать это шестьдесят раз в секунду — чистый убыток.
-    fn разложить(&mut self, u: &mut Ui, w: i32) {
+    fn unpack(&mut self, u: &mut Ui, w: i32) {
         let Some(i) = self.ls.current() else { return };
-        if self.разложено_для == Some((i, w)) {
+        if self.laid_out_for == Some((i, w)) {
             return;
         }
-        self.загрузить(i);
+        self.load(i);
         self.строки.clear();
-        self.колонки.clear();
-        self.текст.reset();
-        self.разложено_для = Some((i, w));
-        let Some(блоки) = self.разделы[i].блоки.take() else { return };
-        let отступ_пункта = u.text_w("— ");
-        for b in &блоки {
+        self.columns.clear();
+        self.text.reset();
+        self.laid_out_for = Some((i, w));
+        let Some(blocks) = self.parts[i].blocks.take() else { return };
+        let item_indent = u.text_w("— ");
+        for b in &blocks {
             match b {
-                void_md::Block::Heading(уровень, t) => {
+                void_md::Block::Heading(level, t) => {
                     // Пустая строка перед заголовком — воздух, которым разделы и отличаются
                     // друг от друга. Кроме самого первого: сверху и так поле.
                     if !self.строки.is_empty() {
-                        self.пустая();
+                        self.empty();
                     }
-                    let вид = if *уровень <= 1 { Вид::Глава } else { Вид::Раздел };
-                    self.строки.push(Строка::Текст { текст: снять(t), вид, отступ: 0 });
+                    let kind = if *level <= 1 { Kind::Head } else { Kind::Part };
+                    self.строки.push(Line::Text { text: strip(t), kind, indent: 0 });
                 }
                 void_md::Block::Para(t) => {
-                    self.пустая();
-                    self.перенести(u, &снять(t), w, 0, Вид::Текст);
+                    self.empty();
+                    self.wrap(u, &strip(t), w, 0, Kind::Text);
                 }
-                void_md::Block::List(пункты) => {
-                    self.пустая();
-                    for p in пункты {
-                        let было = self.строки.len();
-                        self.перенести(u, &снять(p), w - отступ_пункта, отступ_пункта, Вид::Текст);
+                void_md::Block::List(items) => {
+                    self.empty();
+                    for p in items {
+                        let prev = self.строки.len();
+                        self.wrap(u, &strip(p), w - item_indent, item_indent, Kind::Text);
                         // Знак пункта — на первой строке, продолжение под текстом.
-                        if let Some(Строка::Текст { текст, отступ, .. }) = self.строки.get_mut(было)
+                        if let Some(Line::Text { text, indent, .. }) = self.строки.get_mut(prev)
                         {
-                            текст.insert_str(0, "— ");
-                            *отступ = 0;
+                            text.insert_str(0, "— ");
+                            *indent = 0;
                         }
                     }
                 }
                 void_md::Block::Code(строки) => {
-                    self.пустая();
-                    let отступ = u.text_w("  ");
+                    self.empty();
+                    let indent = u.text_w("  ");
                     for s in строки {
                         // Веха 223.3 — ДЛИННУЮ строку кода переносим, а не обрезаем.
                         //
@@ -249,42 +249,42 @@ impl App {
                         // пояснением в неё не влезает. Обрезка многоточием выбрасывает ровно то,
                         // ради чего строку читают («switch gen11 — выбрать другое (действует п…»),
                         // а перенос лишь делает её некрасивой. Некрасивая и целая лучше.
-                        if u.text_w(s) <= w - отступ {
-                            self.строки.push(Строка::Текст {
-                                текст: s.clone(),
-                                вид: Вид::Код,
-                                отступ,
+                        if u.text_w(s) <= w - indent {
+                            self.строки.push(Line::Text {
+                                text: s.clone(),
+                                kind: Kind::Code,
+                                indent,
                             });
                         } else {
-                            self.перенести(u, s, w - отступ * 2, отступ, Вид::Код);
+                            self.wrap(u, s, w - indent * 2, indent, Kind::Code);
                         }
                     }
                 }
-                void_md::Block::Table { head, rows: ряды } => {
-                    self.пустая();
-                    let столбцов = ряды.iter().map(|r| r.len()).max().unwrap_or(0);
-                    let mut ширины = alloc::vec![0i32; столбцов];
-                    for r in ряды {
+                void_md::Block::Table { head, rows: rows } => {
+                    self.empty();
+                    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                    let mut widths = alloc::vec![0i32; cols];
+                    for r in rows {
                         for (k, c) in r.iter().enumerate() {
-                            ширины[k] = ширины[k].max(u.text_w(&снять(c)));
+                            widths[k] = widths[k].max(u.text_w(&strip(c)));
                         }
                     }
-                    let зазор = u.text_w("    ");
-                    let мера: i32 =
-                        ширины.iter().sum::<i32>() + зазор * (столбцов as i32 - 1).max(0);
-                    if столбцов == 0 {
+                    let gap = u.text_w("    ");
+                    let measure: i32 =
+                        widths.iter().sum::<i32>() + gap * (cols as i32 - 1).max(0);
+                    if cols == 0 {
                         continue;
                     }
-                    if мера <= w {
+                    if measure <= w {
                         // Влезает — колонками, как в исходнике. Ряд — ОДНА запись: он и рисуется
                         // одной строкой, а запись на ячейку делала содержимое выше, чем оно есть
                         // (см. [`Строка`]).
-                        let n = self.колонки.len();
-                        self.колонки.push(ширины);
-                        for r in ряды {
-                            self.строки.push(Строка::Ряд {
-                                таблица: n,
-                                ячейки: r.iter().map(|c| снять(c)).collect(),
+                        let n = self.columns.len();
+                        self.columns.push(widths);
+                        for r in rows {
+                            self.строки.push(Line::Row {
+                                table: n,
+                                cells: r.iter().map(|c| strip(c)).collect(),
                             });
                         }
                     } else {
@@ -298,63 +298,63 @@ impl App {
                         // Пара читается в любой ширине: первый столбец строкой, остальные —
                         // абзацем под ним с отступом. Шапку пропускаем: подписи к колонкам без
                         // колонок — пара без смысла.
-                        let отступ = u.text_w("    ");
-                        for r in ряды.iter().skip(if *head { 1 } else { 0 }) {
-                            let Some(ключ) = r.first() else { continue };
-                            self.строки.push(Строка::Текст {
-                                текст: снять(ключ),
-                                вид: Вид::Раздел,
-                                отступ: 0,
+                        let indent = u.text_w("    ");
+                        for r in rows.iter().skip(if *head { 1 } else { 0 }) {
+                            let Some(key) = r.first() else { continue };
+                            self.строки.push(Line::Text {
+                                text: strip(key),
+                                kind: Kind::Part,
+                                indent: 0,
                             });
-                            let хвост: Vec<String> =
-                                r.iter().skip(1).map(|c| снять(c)).filter(|c| !c.is_empty()).collect();
-                            if !хвост.is_empty() {
-                                let текст = хвост.join(" · ");
-                                self.перенести(u, &текст, w - отступ, отступ, Вид::Текст);
+                            let tail: Vec<String> =
+                                r.iter().skip(1).map(|c| strip(c)).filter(|c| !c.is_empty()).collect();
+                            if !tail.is_empty() {
+                                let text = tail.join(" · ");
+                                self.wrap(u, &text, w - indent, indent, Kind::Text);
                             }
                         }
                     }
                 }
             }
         }
-        self.разделы[i].блоки = Some(блоки);
+        self.parts[i].blocks = Some(blocks);
     }
 
-    fn пустая(&mut self) {
+    fn empty(&mut self) {
         if !self.строки.is_empty() {
-            self.строки.push(Строка::Текст {
-                текст: String::new(),
-                вид: Вид::Текст,
-                отступ: 0,
+            self.строки.push(Line::Text {
+                text: String::new(),
+                kind: Kind::Text,
+                indent: 0,
             });
         }
     }
 
     /// Перенос абзаца ПО СЛОВАМ под ширину в точках. Шрифт пропорциональный, поэтому мерить
     /// приходится каждое слово — знаков тут не посчитаешь.
-    fn перенести(&mut self, u: &mut Ui, s: &str, w: i32, отступ: i32, вид: Вид) {
-        let пробел = u.text_w(" ");
-        let mut строка = String::new();
-        let mut ширина = 0;
-        for слово in s.split_whitespace() {
-            let ws = u.text_w(слово);
-            if !строка.is_empty() && ширина + пробел + ws > w {
-                self.строки.push(Строка::Текст {
-                    текст: core::mem::take(&mut строка),
-                    вид,
-                    отступ,
+    fn wrap(&mut self, u: &mut Ui, s: &str, w: i32, indent: i32, kind: Kind) {
+        let space = u.text_w(" ");
+        let mut line = String::new();
+        let mut width = 0;
+        for word in s.split_whitespace() {
+            let ws = u.text_w(word);
+            if !line.is_empty() && width + space + ws > w {
+                self.строки.push(Line::Text {
+                    text: core::mem::take(&mut line),
+                    kind,
+                    indent,
                 });
-                ширина = 0;
+                width = 0;
             }
-            if !строка.is_empty() {
-                строка.push(' ');
-                ширина += пробел;
+            if !line.is_empty() {
+                line.push(' ');
+                width += space;
             }
-            строка.push_str(слово);
-            ширина += ws;
+            line.push_str(word);
+            width += ws;
         }
-        if !строка.is_empty() {
-            self.строки.push(Строка::Текст { текст: строка, вид, отступ });
+        if !line.is_empty() {
+            self.строки.push(Line::Text { text: line, kind, indent });
         }
     }
 
@@ -366,14 +366,14 @@ impl App {
         //
         // Полоса только РИСУЕТСЯ, как и у текста: начало перечня посчитано событием.
         self.ls.bar(u);
-        let было = self.ls.sel;
+        let prev = self.ls.sel;
         let mut list = lay.list;
         for k in 0..lay.rows {
             let rr = list.cut_top(lay.row_h);
             let Some(&i) = self.ls.hits.get(self.ls.top + k) else { continue };
             let sel = if self.ls.top + k == self.ls.sel { 256 } else { 0 };
             let hot = if u.hot(rr) { 256 } else { 0 };
-            if u.entry(rr, &self.разделы[i].имя, "", "", sel, hot) {
+            if u.entry(rr, &self.parts[i].name, "", "", sel, hot) {
                 self.ls.sel = self.ls.top + k;
             }
         }
@@ -382,62 +382,62 @@ impl App {
         //
         // Полоса только РИСУЕТСЯ: смещение к этому моменту уже посчитано обработчиком события
         // (Веха 202.17) — иначе текст доезжал бы до бегунка на кадр-два позже руки.
-        self.текст.bar(u);
+        self.text.bar(u);
         // Содержимое режется областью, и прежний клип при этом СОХРАНЯЕТСЯ: кадр мог прийти с
         // объёмом `Scope::Part` (подсветка строки перечня), а `Ui::clip` ставит прямоугольник
         // НАПРЯМУЮ, не пересекая с тем, что было. Затереть им объём кадра значит рисовать и
         // объявлять композитору то, о чём объём не просил.
-        let было_clip = u.c.clip();
-        u.clip(было_clip.intersect(self.текст.area()));
-        let зазор = u.text_w("    ");
-        for (k, r) in self.текст.visible() {
+        let prev_clip = u.c.clip();
+        u.clip(prev_clip.intersect(self.text.area()));
+        let gap = u.text_w("    ");
+        for (k, r) in self.text.visible() {
             // Крайние строки приходят с ПОЛНЫМ прямоугольником, наполовину их обрежет клип, —
             // в этом и разница с построчной прокруткой.
             match &self.строки[k] {
-                Строка::Текст { текст, вид, отступ } => {
-                    let отступ = (*отступ).max(0);
-                    let внутри = Rect::new(r.x + отступ, r.y, r.w - отступ, r.h);
-                    match вид {
-                        Вид::Глава => {
-                            u.label(внутри, текст, th.accent, Align::Left);
+                Line::Text { text, kind, indent } => {
+                    let indent = (*indent).max(0);
+                    let inner = Rect::new(r.x + indent, r.y, r.w - indent, r.h);
+                    match kind {
+                        Kind::Head => {
+                            u.label(inner, text, th.accent, Align::Left);
                         }
-                        Вид::Раздел => {
-                            u.label(внутри, текст, th.text, Align::Left);
+                        Kind::Part => {
+                            u.label(inner, text, th.text, Align::Left);
                             // Черта под подзаголовком: иначе заголовок теряется в сплошном тексте.
-                            let цвет = u.tint(th.border);
-                            u.c.fill(Rect::new(r.x, r.bottom() - th.px(2), r.w, th.px(1)), цвет);
+                            let color = u.tint(th.border);
+                            u.c.fill(Rect::new(r.x, r.bottom() - th.px(2), r.w, th.px(1)), color);
                         }
-                        Вид::Текст => {
-                            if !текст.is_empty() {
-                                u.label(внутри, текст, th.text, Align::Left);
+                        Kind::Text => {
+                            if !text.is_empty() {
+                                u.label(inner, text, th.text, Align::Left);
                             }
                         }
-                        Вид::Код => {
-                            let подложка = u.tint(th.band);
-                            u.c.fill(r, подложка);
-                            u.label(внутри, текст, th.muted, Align::Left);
+                        Kind::Code => {
+                            let backdrop = u.tint(th.band);
+                            u.c.fill(r, backdrop);
+                            u.label(inner, text, th.muted, Align::Left);
                         }
                     }
                 }
-                Строка::Ряд { таблица, ячейки } => {
-                    let ширины = &self.колонки[*таблица];
+                Line::Row { table, cells } => {
+                    let widths = &self.columns[*table];
                     let mut x = r.x;
-                    for (i, c) in ячейки.iter().enumerate() {
-                        let w = ширины.get(i).copied().unwrap_or(0);
-                        let цвет = if i == 0 { th.text } else { th.muted };
-                        u.label(Rect::new(x, r.y, w, r.h), c, цвет, Align::Left);
-                        x += w + зазор;
+                    for (i, c) in cells.iter().enumerate() {
+                        let w = widths.get(i).copied().unwrap_or(0);
+                        let color = if i == 0 { th.text } else { th.muted };
+                        u.label(Rect::new(x, r.y, w, r.h), c, color, Align::Left);
+                        x += w + gap;
                     }
                 }
             }
         }
-        u.clip(было_clip);
-        self.ls.sel != было
+        u.clip(prev_clip);
+        self.ls.sel != prev
     }
 }
 
 /// Снять знаки разметки, которые рисовать нечем (обратные кавычки, звёздочки жирного).
-fn снять(s: &str) -> String {
+fn strip(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
@@ -459,7 +459,7 @@ impl ui::Client for App {
                 self.w = w as i32;
                 self.h = h as i32;
                 // Ширина сменилась — перенос по словам стал другим.
-                self.разложено_для = None;
+                self.laid_out_for = None;
                 ui::Scope::All
             }
             Event::Key { sym: code, ch, down, .. } if down => {
@@ -469,19 +469,19 @@ impl ui::Client for App {
                     }
                     self.ls.query.clear();
                     self.filter();
-                    self.разложено_для = None;
+                    self.laid_out_for = None;
                     return ui::Scope::All;
                 }
                 match self.ls.key(code, ch) {
                     ui::Hit::None => ui::Scope::No,
                     ui::Hit::Moved => {
                         // Выбрали другой раздел — текст справа другой.
-                        self.разложено_для = None;
+                        self.laid_out_for = None;
                         ui::Scope::All
                     }
                     ui::Hit::Query => {
                         self.filter();
-                        self.разложено_для = None;
+                        self.laid_out_for = None;
                         ui::Scope::All
                     }
                 }
@@ -489,12 +489,12 @@ impl ui::Client for App {
             Event::Wheel { delta, .. } => {
                 // Колесо над перечнем крутит перечень, над текстом — текст. Иначе длинный
                 // раздел нечем читать: курсор стоит там, куда смотрят.
-                let над_списком = input.ptr.map_or(false, |p| self.lay.col.contains(p.0, p.1));
+                let above_list = input.ptr.map_or(false, |p| self.lay.col.contains(p.0, p.1));
                 // Мер колесу не передаём ВОВСЕ — полотно знает их само (см. [`ui::Pane`]).
                 // Прежде здесь стояла высота строки ЛЕВОГО ПЕРЕЧНЯ, и это был баг прокрутки.
-                let двинулись =
-                    if над_списком { self.ls.wheel(delta) } else { self.текст.wheel(delta) };
-                if двинулись { ui::Scope::All } else { ui::Scope::No }
+                let moved =
+                    if above_list { self.ls.wheel(delta) } else { self.text.wheel(delta) };
+                if moved { ui::Scope::All } else { ui::Scope::No }
             }
             // Веха 223.3 — БЕЗ ЭТОГО ПЕРЕЧЕНЬ НЕ НАЖИМАЛСЯ МЫШЬЮ.
             //
@@ -508,11 +508,11 @@ impl ui::Client for App {
                     // или захват бегунка. Не попали ни в одну — щелчок достанется строке перечня
                     // во время кадра.
                     let p = (x as i32, y as i32);
-                    if !self.текст.press(p) {
+                    if !self.text.press(p) {
                         self.ls.bar_press(p);
                     }
                 } else if !down {
-                    self.текст.release();
+                    self.text.release();
                     self.ls.bar_release();
                 }
                 ui::Scope::All
@@ -520,9 +520,9 @@ impl ui::Client for App {
             Event::Motion { .. } => {
                 // Схваченную полосу ведём СРАЗУ, до кадра: тогда содержимое едет вместе с
                 // бегунком, а не догоняет его.
-                if self.текст.dragging() {
+                if self.text.dragging() {
                     return match input.ptr {
-                        Some(p) if self.текст.motion(p) => ui::Scope::All,
+                        Some(p) if self.text.motion(p) => ui::Scope::All,
                         _ => ui::Scope::No,
                     };
                 }
@@ -545,8 +545,8 @@ impl ui::Client for App {
 
     /// Веха 151 — чем вернуть окно после перезагрузки: разделом, на котором читали.
     fn persist(&mut self) -> Option<String> {
-        Some(match self.ls.current().map(|i| self.разделы[i].имя.as_str()) {
-            Some(имя) => alloc::format!("docs {}", имя),
+        Some(match self.ls.current().map(|i| self.parts[i].name.as_str()) {
+            Some(name) => alloc::format!("docs {}", name),
             None => String::from("docs"),
         })
     }
@@ -555,16 +555,16 @@ impl ui::Client for App {
         let th = u.th.clone();
         self.lay = self.measure(u.font, &th);
         self.ls.measure(self.lay.list, self.lay.list_bar, self.lay.row_h, self.lay.rows);
-        let ширина = self.lay.body.w;
-        self.разложить(u, ширина);
+        let width = self.lay.body.w;
+        self.unpack(u, width);
         // Меры полотну даются ОДИН раз и ПОСЛЕ укладки: число строк известно только теперь.
         // Здесь же смещение зажимается в краях — окно могло стать выше, а раздел короче.
-        self.текст.measure(self.lay.body, self.lay.body_bar, self.lay.шаг, self.строки.len());
+        self.text.measure(self.lay.body, self.lay.body_bar, self.lay.step, self.строки.len());
         let lay = core::mem::take(&mut self.lay);
-        let сменили = self.paint(u, &th, &lay);
+        let switched = self.paint(u, &th, &lay);
         self.lay = lay;
-        if сменили {
-            self.разложено_для = None;
+        if switched {
+            self.laid_out_for = None;
             ui::Scope::All
         } else {
             ui::Scope::No
@@ -579,23 +579,23 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     // Разделы берутся из store, а не из таблицы здесь: они приезжают с образом, и знать их
     // наперёд окну неоткуда — ровно как команде `doc`.
-    let mut разделы: Vec<Раздел> = Vec::new();
+    let mut parts: Vec<Part> = Vec::new();
     if let Some(cap) = store {
         if let Some(list) = roots::text(cap) {
-            for имя in roots::suffixes(&list, b"doc/") {
-                if let Ok(s) = core::str::from_utf8(имя) {
-                    разделы.push(Раздел { имя: s.to_string(), блоки: None });
+            for name in roots::suffixes(&list, b"doc/") {
+                if let Ok(s) = core::str::from_utf8(name) {
+                    parts.push(Part { name: s.to_string(), blocks: None });
                 }
             }
         }
     }
     // Веха 223.2 — ОБЗОР ПЕРВЫМ, остальное по алфавиту. Руководство открывают не затем, чтобы
     // попасть на раздел, чьё имя раньше по азбуке: первым должен стоять тот, с которого читают.
-    разделы.sort_by(|a, b| {
-        let вес = |имя: &str| if имя == "void" { 0 } else { 1 };
-        вес(&a.имя).cmp(&вес(&b.имя)).then_with(|| a.имя.cmp(&b.имя))
+    parts.sort_by(|a, b| {
+        let weight = |name: &str| if name == "void" { 0 } else { 1 };
+        weight(&a.name).cmp(&weight(&b.name)).then_with(|| a.name.cmp(&b.name))
     });
-    if разделы.is_empty() {
+    if parts.is_empty() {
         say("[docs] разделов руководства нет (права на store?)\n");
     }
 
@@ -608,19 +608,19 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let mut app = App {
         w: w as i32,
         h: h as i32,
-        разделы,
+        parts,
         ls: ui::List::default(),
         строки: Vec::new(),
-        разложено_для: None,
-        колонки: Vec::new(),
-        текст: ui::Pane::default(),
+        laid_out_for: None,
+        columns: Vec::new(),
+        text: ui::Pane::default(),
         lay: Lay::default(),
         store,
     };
     app.filter();
     // Открыться на названном разделе — так нас возвращает сеанс и так же может позвать человек.
-    if let Some(имя) = sys::argv::Argv::take().str(0) {
-        if let Some(k) = app.ls.hits.iter().position(|&i| app.разделы[i].имя == имя) {
+    if let Some(name) = sys::argv::Argv::take().str(0) {
+        if let Some(k) = app.ls.hits.iter().position(|&i| app.parts[i].name == name) {
             app.ls.sel = k;
             app.ls.scroll_to_sel();
         }

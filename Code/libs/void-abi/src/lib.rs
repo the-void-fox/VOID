@@ -210,11 +210,11 @@ mod tests {
     /// Именно на этом держится механизм отзыва, и проверять его надо здесь, а не гадать.
     #[test]
     fn рост_поколения_обесценивает_прежний_дескриптор() {
-        let было = Cap::new(5, 1);
-        let стало = Cap::new(5, 2);
-        assert_ne!(было, стало);
-        assert_eq!(было.slot(), стало.slot());
-        assert!(стало.generation() > было.generation());
+        let prev = Cap::new(5, 1);
+        let now = Cap::new(5, 2);
+        assert_ne!(prev, now);
+        assert_eq!(prev.slot(), now.slot());
+        assert!(now.generation() > prev.generation());
     }
 
     #[test]
@@ -236,11 +236,11 @@ mod tests {
     /// сломанной реализации. Вектор — официальный для пустого входа.
     #[test]
     fn адрес_пустого_значения_совпадает_с_эталоном_blake3() {
-        let ожидание = [
+        let waiting = [
             0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc,
             0xc9, 0x49, 0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca,
             0xe4, 0x1f, 0x32, 0x62,
         ];
-        assert_eq!(ContentId::hash(b"").0, ожидание);
+        assert_eq!(ContentId::hash(b"").0, waiting);
     }
 }

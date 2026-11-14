@@ -163,22 +163,22 @@ pub fn diff(prev: &Buffer, next: &Buffer, out: &mut String) {
     let mut pen: Option<Style> = None;
     for y in 0..next.h {
         // Правый нижний угол исключаем из рассмотрения совсем — см. шапку.
-        let край = if y + 1 == next.h { next.w.saturating_sub(1) } else { next.w };
+        let edge = if y + 1 == next.h { next.w.saturating_sub(1) } else { next.w };
         let mut x = 0;
-        while x < край {
+        while x < edge {
             if prev.get(x, y) == next.get(x, y) {
                 x += 1;
                 continue;
             }
             // Начало полосы: ставим курсор (строки и колонки у CSI считаются с единицы).
             let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
-            while x < край {
+            while x < edge {
                 let c = next.get(x, y);
                 if prev.get(x, y) == c {
                     // Одна совпавшая ячейка — не повод рвать полосу: перевод курсора стоит
                     // восемь байт, а знак один. Рвём, когда совпало две подряд — или когда
                     // совпавшая ячейка последняя в строке: тянуть полосу дальше некуда.
-                    if x + 1 >= край || prev.get(x + 1, y) == next.get(x + 1, y) {
+                    if x + 1 >= edge || prev.get(x + 1, y) == next.get(x + 1, y) {
                         break;
                     }
                 }

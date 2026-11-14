@@ -28,7 +28,7 @@
 /// Диск как его видит установщик: открыть, спросить ёмкость, писать и читать АБСОЛЮТНЫМИ
 /// секторами. Ровно то и не больше — установка не знает ни про разделы store, ни про кэш.
 #[derive(Clone, Copy)]
-enum Цель {
+enum Target {
     Ahci,
     Nvme,
     /// Веха 196 — USB-накопитель. Ставить НА флешку — не экзотика, а ровно то, ради чего
@@ -36,40 +36,40 @@ enum Цель {
     Usb,
 }
 
-impl Цель {
+impl Target {
     /// Выбрать шину по номеру диска и открыть цель. `None` — такого диска нет либо с него
     /// работает система (отказывает сам драйвер, и это правильное место для отказа).
     fn open(slot: usize) -> Option<Self> {
         if slot >= crate::xhci::SLOT_BASE {
-            crate::xhci::target_open(slot).then_some(Цель::Usb)
+            crate::xhci::target_open(slot).then_some(Target::Usb)
         } else if slot >= crate::nvme::SLOT_BASE {
-            crate::nvme::target_open(slot).then_some(Цель::Nvme)
+            crate::nvme::target_open(slot).then_some(Target::Nvme)
         } else {
-            crate::ahci::target_open(slot).then_some(Цель::Ahci)
+            crate::ahci::target_open(slot).then_some(Target::Ahci)
         }
     }
 
     fn sectors(&self) -> u64 {
         match self {
-            Цель::Ahci => crate::ahci::target_sectors(),
-            Цель::Nvme => crate::nvme::target_sectors(),
-            Цель::Usb => crate::xhci::target_sectors(),
+            Target::Ahci => crate::ahci::target_sectors(),
+            Target::Nvme => crate::nvme::target_sectors(),
+            Target::Usb => crate::xhci::target_sectors(),
         }
     }
 
     fn write(&self, sector: u64, buf: &[u8; 512]) -> bool {
         match self {
-            Цель::Ahci => crate::ahci::target_write(sector, buf),
-            Цель::Nvme => crate::nvme::target_write(sector, buf),
-            Цель::Usb => crate::xhci::target_write(sector, buf),
+            Target::Ahci => crate::ahci::target_write(sector, buf),
+            Target::Nvme => crate::nvme::target_write(sector, buf),
+            Target::Usb => crate::xhci::target_write(sector, buf),
         }
     }
 
     fn read(&self, sector: u64, buf: &mut [u8; 512]) -> bool {
         match self {
-            Цель::Ahci => crate::ahci::target_read(sector, buf),
-            Цель::Nvme => crate::nvme::target_read(sector, buf),
-            Цель::Usb => crate::xhci::target_read(sector, buf),
+            Target::Ahci => crate::ahci::target_read(sector, buf),
+            Target::Nvme => crate::nvme::target_read(sector, buf),
+            Target::Usb => crate::xhci::target_read(sector, buf),
         }
     }
 }
@@ -79,21 +79,21 @@ impl Цель {
 /// Нужен затем, чтобы установщик мог положить в свежую систему объект ДО её первой загрузки.
 /// Store абстрагирован от носителя трейтом ([`void_store::BlockIo`]) с Вехи 29 — ядро подставляет
 /// свой диск, хостовая утилита файл-образ; здесь третий случай: диск, который ядру не свой.
-struct ЦелевойStore {
-    цель: Цель,
+struct TargetStore {
+    target: Target,
     /// Первый сектор раздела store на цели. Store считает от нуля и про смещение не знает.
     base: u64,
 }
 
-impl void_store::BlockIo for ЦелевойStore {
+impl void_store::BlockIo for TargetStore {
     fn read(&mut self, sector: u64, buf: &mut [u8; 512]) -> bool {
-        self.цель.read(self.base + sector, buf)
+        self.target.read(self.base + sector, buf)
     }
     fn write(&mut self, sector: u64, buf: &[u8; 512]) -> bool {
-        self.цель.write(self.base + sector, buf)
+        self.target.write(self.base + sector, buf)
     }
     fn capacity(&mut self) -> u64 {
-        self.цель.sectors().saturating_sub(self.base)
+        self.target.sectors().saturating_sub(self.base)
     }
 }
 
@@ -108,11 +108,11 @@ pub const SETUP_ROOT: &str = "system/setup";
 /// Отдельным шагом ПОСЛЕ обнуления суперблока, а не вместо него: обнуление говорит «начни с
 /// чистого листа», а первый же коммит store инициализирует формат с нуля — ровно так же, как
 /// хостовая утилита пишет в пустой образ.
-fn посеять_пожелание(цель: Цель, base: u64, setup: &str) -> Result<(), &'static str> {
+fn seed_wish(target: Target, base: u64, setup: &str) -> Result<(), &'static str> {
     if setup.is_empty() {
         return Ok(());
     }
-    let mut io = ЦелевойStore { цель, base };
+    let mut io = TargetStore { target, base };
     let mut st = void_store::Store::new();
     let id = st.put(setup.as_bytes());
     st.set_root(SETUP_ROOT, id);
@@ -134,10 +134,10 @@ pub fn run(slot: usize, setup: &str) -> Result<u64, &'static str> {
     // Веха 174 — ставим на ВЫБРАННЫЙ диск, а не на «тот, что нашёлся первым». Открытие цели
     // само отказывает, если названный порт — это диск, с которого работает store: система,
     // стирающая диск из-под себя, не установка, а потеря.
-    let Some(цель) = Цель::open(slot) else {
+    let Some(target) = Target::open(slot) else {
         return Err("такого диска нет либо это диск, с которого работает система");
     };
-    let total = цель.sectors();
+    let total = target.sectors();
     if total == 0 {
         return Err("диск не сказал свою ёмкость");
     }
@@ -165,18 +165,18 @@ pub fn run(slot: usize, setup: &str) -> Result<u64, &'static str> {
     for s in 0..p2_start {
         let o = (s as usize) * 512;
         sec.copy_from_slice(&img[o..o + 512]);
-        if !цель.write(s, &sec) {
+        if !target.write(s, &sec) {
             return Err("сбой записи загрузочного префикса на диск");
         }
     }
 
     // 2) MBR диска: растянуть p2 (store) на весь диск — num_sectors@+12 = total − p2_start.
-    if !цель.read(0, &mut sec) {
+    if !target.read(0, &mut sec) {
         return Err("сбой чтения MBR после записи");
     }
     let cnt = ((total - p2_start) as u32).to_le_bytes();
     sec[p2 + 12..p2 + 16].copy_from_slice(&cnt);
-    if !цель.write(0, &sec) {
+    if !target.write(0, &sec) {
         return Err("сбой записи MBR");
     }
 
@@ -184,7 +184,7 @@ pub fn run(slot: usize, setup: &str) -> Result<u64, &'static str> {
     //    и засеет программы (как первый запуск), не подхватив мусор старого содержимого диска.
     let zero = [0u8; 512];
     for s in 0..64u64 {
-        if !цель.write(p2_start + s, &zero) {
+        if !target.write(p2_start + s, &zero) {
             return Err("сбой очистки области store");
         }
     }
@@ -196,7 +196,7 @@ pub fn run(slot: usize, setup: &str) -> Result<u64, &'static str> {
     //    исходника `/etc/system/*.vv`, где по-прежнему написано «оконный режим». Выбор, живущий
     //    до первой пересборки, — не выбор, а ловушка. Поэтому установщик говорит будущей системе,
     //    какой ей посеять ИСХОДНИК, и она сеет его сама на первой загрузке.
-    посеять_пожелание(цель, p2_start, setup)?;
+    seed_wish(target, p2_start, setup)?;
 
     // Веха 174 — заморозки store БОЛЬШЕ НЕТ, и это следствие выбора диска. Она стояла здесь
     // потому, что установка меняла раскладку диска, С КОТОРОГО СИСТЕМА И РАБОТАЛА: писать туда
@@ -237,7 +237,7 @@ pub fn run(slot: usize, setup: &str) -> Result<u64, &'static str> {
 pub fn update(slot: usize) -> Result<u64, &'static str> {
     let (mbase, mlen) =
         crate::arch::boot_module().ok_or("нет образа (обновляют с той же флешки, что и ставят)")?;
-    let Some(цель) = Цель::open(slot) else {
+    let Some(target) = Target::open(slot) else {
         return Err("такого диска нет либо это диск, с которого работает система");
     };
     let img = unsafe { core::slice::from_raw_parts(crate::frame::ptr(mbase), mlen) };
@@ -256,18 +256,18 @@ pub fn update(slot: usize) -> Result<u64, &'static str> {
     // 1) Читаем MBR ДИСКА и убеждаемся, что обновлять есть что. Диск без нашего раздела store —
     //    это не «старая версия VOID», это чужой диск, и писать на него загрузчик значило бы
     //    сломать чужую систему молча.
-    let mut диск_mbr = [0u8; 512];
-    if !цель.read(0, &mut диск_mbr) {
+    let mut disk_mbr = [0u8; 512];
+    if !target.read(0, &mut disk_mbr) {
         return Err("MBR диска не читается");
     }
-    if диск_mbr[510] != 0x55 || диск_mbr[511] != 0xaa {
+    if disk_mbr[510] != 0x55 || disk_mbr[511] != 0xaa {
         return Err("на диске нет MBR — это не установленная система (нужна `install`)");
     }
-    let наш = (0..4).any(|i| диск_mbr[446 + i * 16 + 4] == crate::ahci::VOID_STORE_TYPE);
-    if !наш {
+    let ours = (0..4).any(|i| disk_mbr[446 + i * 16 + 4] == crate::ahci::VOID_STORE_TYPE);
+    if !ours {
         return Err("на диске нет раздела store — VOID сюда не ставили (нужна `install`)");
     }
-    let старый_p2 = le32(&диск_mbr, p2 + 8);
+    let old_p2 = le32(&disk_mbr, p2 + 8);
 
     // 2) Загрузочный префикс из образа — кроме нулевого сектора. В нём зазор с `core.img` и
     //    раздел p1 с GRUB и ЯДРОМ; ядро и есть вся система.
@@ -281,7 +281,7 @@ pub fn update(slot: usize) -> Result<u64, &'static str> {
     //    по размеру ядра, и каждый мегабайт роста сдвигал store. То есть обновление отказывало
     //    почти всегда — владелец это и увидел. Лечится с двух сторон: отсюда послаблением, а со
     //    стороны образа — круглым размером p1 (`Code/boot/layout.sh`).
-    if старый_p2 < p2_start {
+    if old_p2 < p2_start {
         return Err(
             "загрузочный раздел на диске меньше, чем нужно новому образу: обновить нельзя, \
              нужна установка заново (диск будет стёрт)",
@@ -291,16 +291,16 @@ pub fn update(slot: usize) -> Result<u64, &'static str> {
     for s in 1..p2_start {
         let o = (s as usize) * 512;
         sec.copy_from_slice(&img[o..o + 512]);
-        if !цель.write(s, &sec) {
+        if !target.write(s, &sec) {
             return Err("сбой записи загрузочного раздела");
         }
     }
 
     // 3) MBR: код загрузчика из образа, ТАБЛИЦА РАЗДЕЛОВ — с диска. Первые 446 байт — начало
     //    GRUB, и обновлять его надо вместе с остальным; всё, что после, описывает этот диск.
-    let mut новый_mbr = диск_mbr;
-    новый_mbr[..446].copy_from_slice(&img[..446]);
-    if !цель.write(0, &новый_mbr) {
+    let mut new_mbr = disk_mbr;
+    new_mbr[..446].copy_from_slice(&img[..446]);
+    if !target.write(0, &new_mbr) {
         return Err("сбой записи MBR");
     }
     Ok(p2_start)

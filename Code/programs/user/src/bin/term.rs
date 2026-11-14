@@ -1597,33 +1597,33 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
             // приехала или уехала, а знаки под ней те же), и без этой добавки показ не попал бы
             // на экран вовсе — грязные строки считаются по знакам.
             {
-                let mut добавить: Vec<usize> = Vec::new();
+                let mut push: Vec<usize> = Vec::new();
                 for pane in panes.iter_mut() {
                     if !pane.pics_dirty {
                         continue;
                     }
                     pane.pics_dirty = false;
-                    let Some(обл) = rects.iter().find(|r| r.id == pane.id).map(|r| r.area) else {
+                    let Some(area) = rects.iter().find(|r| r.id == pane.id).map(|r| r.area) else {
                         continue;
                     };
                     for pl in pane.places.iter() {
                         for k in 0..pl.rows {
-                            let y = обл.row as usize + pl.row + k;
+                            let y = area.row as usize + pl.row + k;
                             if y < view.rows {
-                                добавить.push(y);
+                                push.push(y);
                             }
                         }
                     }
                     // Убранная картинка оставляет за собой чужие пиксели: строки, где она была,
                     // надо перерисовать знаками. Проще всего — пометить всю панель.
                     if pane.places.is_empty() {
-                        for y in обл.row as usize..(обл.row as usize + обл.rows as usize).min(view.rows) {
-                            добавить.push(y);
+                        for y in area.row as usize..(area.row as usize + area.rows as usize).min(view.rows) {
+                            push.push(y);
                         }
                     }
                 }
-                if !добавить.is_empty() {
-                    for y in добавить {
+                if !push.is_empty() {
+                    for y in push {
                         if !dirty.contains(&y) {
                             dirty.push(y);
                         }
@@ -1674,12 +1674,12 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                     if pane.places.is_empty() {
                         continue;
                     }
-                    let Some(обл) = rects.iter().find(|r| r.id == pane.id).map(|r| r.area) else {
+                    let Some(area) = rects.iter().find(|r| r.id == pane.id).map(|r| r.area) else {
                         continue;
                     };
                     let cw = view.renderer.metrics().width.max(1) as usize;
                     for pl in pane.places.iter() {
-                        let y0 = обл.row as usize + pl.row;
+                        let y0 = area.row as usize + pl.row;
                         // Рисуем, только если хоть одна строка картинки перерисовывалась:
                         // иначе она и так цела на поверхности.
                         if !(y0..y0 + pl.rows).any(|y| dirty.contains(&y)) {
@@ -1687,7 +1687,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
                         }
                         view.surface.blit_rgba(
                             ereb_render::Rect {
-                                x: ((обл.col as usize + pl.col) * cw) as i32,
+                                x: ((area.col as usize + pl.col) * cw) as i32,
                                 y: (y0 * ch) as i32,
                                 w: pl.pw,
                                 h: pl.ph,
@@ -1790,38 +1790,38 @@ fn handle(panes: &mut [Pane], m: &sys::Message, buf: &[u8]) -> bool {
             // Делить до `vte`, а не чинить `vte`, — решение осознанное: он чужой и вендоренный
             // ради воспроизводимой сборки, а форк чужого крейта стоит дороже сорока строк
             // расщепителя.
-            for (кусок, это_apc) in split_apc(pane, &buf[..len]) {
-                if это_apc {
-                    kitty_apc(pane, &кусок);
+            for (chunk, is_apc) in split_apc(pane, &buf[..len]) {
+                if is_apc {
+                    kitty_apc(pane, &chunk);
                     continue;
                 }
                 let mut from = 0usize;
-                for at in 0..кусок.len() {
-                    if кусок[at] == b'\n' && (at == 0 || кусок[at - 1] != b'\r') {
-                        pane.parser.advance(&mut pane.grid, &кусок[from..at]);
+                for at in 0..chunk.len() {
+                    if chunk[at] == b'\n' && (at == 0 || chunk[at - 1] != b'\r') {
+                        pane.parser.advance(&mut pane.grid, &chunk[from..at]);
                         pane.parser.advance(&mut pane.grid, b"\r\n");
-                        pane.out_log.extend_from_slice(&кусок[from..at]);
+                        pane.out_log.extend_from_slice(&chunk[from..at]);
                         pane.out_log.extend_from_slice(b"\r\n");
                         from = at + 1;
                     }
                 }
-                pane.parser.advance(&mut pane.grid, &кусок[from..]);
-                pane.out_log.extend_from_slice(&кусок[from..]);
+                pane.parser.advance(&mut pane.grid, &chunk[from..]);
+                pane.out_log.extend_from_slice(&chunk[from..]);
                 // Экран стёрли — картинкам на нём делать нечего. Ловим последовательность в
                 // потоке, а не спрашиваем грид: знать, что `ESC[2J` случилось, кроме нас
                 // некому, а картинка, пережившая `clear`, — это мусор поверх чистого экрана.
-                if содержит_очистку(&кусок) {
+                if has_clear(&chunk) {
                     pane.places.clear();
                     pane.pics_dirty = true;
                 }
             }
             if pane.out_log.len() > HIST_MAX {
-                let лишнее = pane.out_log.len() - HIST_MAX;
-                let срез = pane.out_log[лишнее..]
+                let extra = pane.out_log.len() - HIST_MAX;
+                let slice = pane.out_log[extra..]
                     .iter()
                     .position(|&b| b == b'\n')
-                    .map_or(pane.out_log.len(), |k| лишнее + k + 1);
-                pane.out_log.drain(..срез);
+                    .map_or(pane.out_log.len(), |k| extra + k + 1);
+                pane.out_log.drain(..slice);
             }
             let grown = pane.grid.scrollback_len().saturating_sub(before);
             if pane.scroll > 0 {
@@ -1924,32 +1924,32 @@ enum ApcSt {
 /// Разложить поток ребёнка на куски: обычные байты и тела APC-последовательностей.
 fn split_apc(pane: &mut Pane, buf: &[u8]) -> Vec<(Vec<u8>, bool)> {
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
-    let mut обычное: Vec<u8> = Vec::new();
+    let mut plain: Vec<u8> = Vec::new();
     for &b in buf {
         match pane.apc_st {
             ApcSt::Idle => {
                 if b == 0x1b {
                     pane.apc_st = ApcSt::SawEsc;
                 } else {
-                    обычное.push(b);
+                    plain.push(b);
                 }
             }
             ApcSt::SawEsc => {
                 if b == b'_' {
                     // Началась APC: всё обычное до неё отдаём разборщику VT как есть.
-                    if !обычное.is_empty() {
-                        out.push((core::mem::take(&mut обычное), false));
+                    if !plain.is_empty() {
+                        out.push((core::mem::take(&mut plain), false));
                     }
                     pane.apc = Some(Vec::new());
                     pane.apc_st = ApcSt::In;
                 } else {
                     // Не APC — значит обычная escape-последовательность: `ESC` возвращаем на
                     // место, иначе разборщик VT получит обрубок и покажет мусор.
-                    обычное.push(0x1b);
+                    plain.push(0x1b);
                     if b == 0x1b {
                         pane.apc_st = ApcSt::SawEsc; // два ESC подряд: второй ещё в игре
                     } else {
-                        обычное.push(b);
+                        plain.push(b);
                         pane.apc_st = ApcSt::Idle;
                     }
                 }
@@ -1978,24 +1978,24 @@ fn split_apc(pane: &mut Pane, buf: &[u8]) -> Vec<(Vec<u8>, bool)> {
             }
         }
     }
-    if !обычное.is_empty() {
-        out.push((обычное, false));
+    if !plain.is_empty() {
+        out.push((plain, false));
     }
     out
 }
 
 /// Есть ли в куске очистка экрана (`ESC[2J` / `ESC[3J`, в том числе с параметрами перед ней).
-fn содержит_очистку(кусок: &[u8]) -> bool {
+fn has_clear(chunk: &[u8]) -> bool {
     let mut i = 0;
-    while i + 3 < кусок.len() {
-        if кусок[i] == 0x1b && кусок[i + 1] == b'[' {
+    while i + 3 < chunk.len() {
+        if chunk[i] == 0x1b && chunk[i + 1] == b'[' {
             let mut j = i + 2;
-            while j < кусок.len() && (кусок[j].is_ascii_digit() || кусок[j] == b';') {
+            while j < chunk.len() && (chunk[j].is_ascii_digit() || chunk[j] == b';') {
                 j += 1;
             }
-            if j < кусок.len() && кусок[j] == b'J' {
-                let п = &кусок[i + 2..j];
-                if п == b"2" || п == b"3" {
+            if j < chunk.len() && chunk[j] == b'J' {
+                let p = &chunk[i + 2..j];
+                if p == b"2" || p == b"3" {
                     return true;
                 }
             }
@@ -2008,52 +2008,52 @@ fn содержит_очистку(кусок: &[u8]) -> bool {
 }
 
 /// Разобрать тело APC. Нас интересует только то, что начинается с `G` — графика Kitty.
-fn kitty_apc(pane: &mut Pane, тело: &[u8]) {
-    let Some(тело) = тело.strip_prefix(b"G") else { return };
+fn kitty_apc(pane: &mut Pane, body: &[u8]) {
+    let Some(body) = body.strip_prefix(b"G") else { return };
     // Тело: `ключ=значение,…;данные`. Точка с запятой может и отсутствовать (команда без данных).
-    let (ctrl, данные) = match тело.iter().position(|&b| b == b';') {
-        Some(k) => (&тело[..k], &тело[k + 1..]),
-        None => (тело, &[][..]),
+    let (ctrl, data) = match body.iter().position(|&b| b == b';') {
+        Some(k) => (&body[..k], &body[k + 1..]),
+        None => (body, &[][..]),
     };
     // Продолжение многокускового запроса: управляющая часть была у первого куска.
-    let первый = pane.pic_ctrl.is_none();
-    if первый {
+    let first = pane.pic_ctrl.is_none();
+    if first {
         pane.pic_ctrl = Some(ctrl.to_vec());
         pane.pic_data.clear();
     }
-    pane.pic_data.extend_from_slice(данные);
-    let ещё = ключ(ctrl, b'm').unwrap_or(0) == 1;
-    if ещё {
+    pane.pic_data.extend_from_slice(data);
+    let more = key(ctrl, b'm').unwrap_or(0) == 1;
+    if more {
         return; // ждём остальные куски
     }
     let ctrl = pane.pic_ctrl.take().unwrap_or_default();
-    let данные = core::mem::take(&mut pane.pic_data);
-    kitty_command(pane, &ctrl, &данные);
+    let data = core::mem::take(&mut pane.pic_data);
+    kitty_command(pane, &ctrl, &data);
 }
 
 /// Числовое значение ключа управляющей части (`s=640` → 640).
-fn ключ(ctrl: &[u8], имя: u8) -> Option<u32> {
-    for поле in ctrl.split(|&b| b == b',') {
-        if поле.len() >= 2 && поле[0] == имя && поле[1] == b'=' {
-            return core::str::from_utf8(&поле[2..]).ok()?.trim().parse().ok();
+fn key(ctrl: &[u8], name: u8) -> Option<u32> {
+    for field in ctrl.split(|&b| b == b',') {
+        if field.len() >= 2 && field[0] == name && field[1] == b'=' {
+            return core::str::from_utf8(&field[2..]).ok()?.trim().parse().ok();
         }
     }
     None
 }
 
 /// Буквенное значение ключа (`a=T` → `T`).
-fn буква(ctrl: &[u8], имя: u8) -> Option<u8> {
-    for поле in ctrl.split(|&b| b == b',') {
-        if поле.len() == 3 && поле[0] == имя && поле[1] == b'=' {
-            return Some(поле[2]);
+fn letter(ctrl: &[u8], name: u8) -> Option<u8> {
+    for field in ctrl.split(|&b| b == b',') {
+        if field.len() == 3 && field[0] == name && field[1] == b'=' {
+            return Some(field[2]);
         }
     }
     None
 }
 
 /// Исполнить собранную команду графики.
-fn kitty_command(pane: &mut Pane, ctrl: &[u8], данные: &[u8]) {
-    match буква(ctrl, b'a').unwrap_or(b'T') {
+fn kitty_command(pane: &mut Pane, ctrl: &[u8], data: &[u8]) {
+    match letter(ctrl, b'a').unwrap_or(b'T') {
         b'd' => {
             pane.places.clear();
             pane.pics_dirty = true;
@@ -2065,43 +2065,43 @@ fn kitty_command(pane: &mut Pane, ctrl: &[u8], данные: &[u8]) {
             return;
         }
     }
-    let id = ключ(ctrl, b'i').unwrap_or(0);
+    let id = key(ctrl, b'i').unwrap_or(0);
     // Показать принятую раньше (`a=p,i=N`) — данных при этом нет.
-    if данные.is_empty() && pane.pics.iter().any(|p| p.id == id) {
-        return place_pic(pane, id, ключ(ctrl, b'c'), ключ(ctrl, b'r'));
+    if data.is_empty() && pane.pics.iter().any(|p| p.id == id) {
+        return place_pic(pane, id, key(ctrl, b'c'), key(ctrl, b'r'));
     }
-    let (Some(w), Some(h)) = (ключ(ctrl, b's'), ключ(ctrl, b'v')) else {
+    let (Some(w), Some(h)) = (key(ctrl, b's'), key(ctrl, b'v')) else {
         log_line("[term] картинка: нет размера (нужны s= и v=)");
         return;
     };
-    let формат = ключ(ctrl, b'f').unwrap_or(32);
-    if формат != 24 && формат != 32 {
+    let format = key(ctrl, b'f').unwrap_or(32);
+    if format != 24 && format != 32 {
         log_line(&alloc::format!(
-            "[term] картинка: формат {формат} не поддержан — шлите сырые пиксели (f=24 или f=32)"
+            "[term] картинка: формат {format} не поддержан — шлите сырые пиксели (f=24 или f=32)"
         ));
         return;
     }
     use base64ct::Encoding;
-    let Ok(сырьё) = base64ct::Base64::decode_vec(core::str::from_utf8(данные).unwrap_or("")) else {
+    let Ok(raw) = base64ct::Base64::decode_vec(core::str::from_utf8(data).unwrap_or("")) else {
         log_line("[term] картинка: данные не base64");
         return;
     };
-    let шаг = if формат == 24 { 3 } else { 4 };
-    let нужно = w as usize * h as usize * шаг;
-    if сырьё.len() < нужно {
+    let step = if format == 24 { 3 } else { 4 };
+    let needed = w as usize * h as usize * step;
+    if raw.len() < needed {
         log_line(&alloc::format!(
-            "[term] картинка: данных {} из {нужно} — показывать нечего",
-            сырьё.len()
+            "[term] картинка: данных {} из {needed} — показывать нечего",
+            raw.len()
         ));
         return;
     }
     // Внутри держим RGBA: `blit_rgba` ждёт именно его, а перекладывать на каждом кадре дороже,
     // чем один раз при приёме.
-    let px = if формат == 32 {
-        сырьё
+    let px = if format == 32 {
+        raw
     } else {
         let mut v = Vec::with_capacity(w as usize * h as usize * 4);
-        for p in сырьё.chunks_exact(3) {
+        for p in raw.chunks_exact(3) {
             v.extend_from_slice(&[p[0], p[1], p[2], 255]);
         }
         v
@@ -2112,11 +2112,11 @@ fn kitty_command(pane: &mut Pane, ctrl: &[u8], данные: &[u8]) {
         if pane.pics.is_empty() {
             break;
         }
-        let ушла = pane.pics.remove(0).id;
-        pane.places.retain(|p| p.pic != ушла);
+        let gone = pane.pics.remove(0).id;
+        pane.places.retain(|p| p.pic != gone);
     }
     pane.pics.push(Pic { id, w, h, px });
-    place_pic(pane, id, ключ(ctrl, b'c'), ключ(ctrl, b'r'));
+    place_pic(pane, id, key(ctrl, b'c'), key(ctrl, b'r'));
 }
 
 /// Показать картинку в текущем знакоместе курсора.
@@ -2601,8 +2601,8 @@ fn detect_scroll(prev: &[Cell], now: &[Cell], cols: usize, rows: usize) -> Optio
             }
         }
         let real = filled[start..start + run].iter().any(|&f| f);
-        let различимы = run > 0 && !band_is_uniform(now, cols, start, run);
-        if run >= MIN_BAND && real && различимы && best.map_or(true, |(_, _, b)| run > b) {
+        let distinct = run > 0 && !band_is_uniform(now, cols, start, run);
+        if run >= MIN_BAND && real && distinct && best.map_or(true, |(_, _, b)| run > b) {
             best = Some((dy, start, run));
         }
     }

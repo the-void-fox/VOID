@@ -452,10 +452,10 @@ pub fn narrow(dom: DomainId, cap: Cap, path: &str) -> Result<Cap, CapError> {
     };
     // Только внутрь: `/etc/apps` → `/etc/apps/fm` можно, `/etc/apps` → `/etc` нельзя.
     if let Some(r) = old {
-        let внутри = path.len() > r.len()
+        let inner = path.len() > r.len()
             && path.starts_with(r)
             && path.as_bytes()[r.len()] == b'/';
-        if !внутри {
+        if !inner {
             return Err(CapError::WrongKind);
         }
     }

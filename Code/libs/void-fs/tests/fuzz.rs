@@ -10,23 +10,23 @@
 //! длина» и есть тот случай, который руками не пишут, а фаззер подставляет сразу.
 
 /// Правильный каталог: счётчик записей, затем записи `(тип, длина имени, имя)`.
-fn каталог() -> Vec<u8> {
+fn dir() -> Vec<u8> {
     let mut d = vec![0u8; 512];
     let mut len = 2;
-    for (имя, это_каталог) in [(&b"bin"[..], true), (b"hello", false), (b"\xd0\xb8\xd0\xbc\xd1\x8f", false)] {
-        len = void_fs::idx_add(&mut d, len, имя, это_каталог);
+    for (name, is_dir) in [(&b"bin"[..], true), (b"hello", false), (b"\xd0\xb8\xd0\xbc\xd1\x8f", false)] {
+        len = void_fs::idx_add(&mut d, len, name, is_dir);
     }
     d.truncate(len);
     d
 }
 
-fn корпус() -> Vec<Vec<u8>> {
-    vec![каталог(), vec![0u8, 0], vec![1u8, 0, 0, 3, b'a', b'b', b'c']]
+fn corpus() -> Vec<Vec<u8>> {
+    vec![dir(), vec![0u8, 0], vec![1u8, 0, 0, 3, b'a', b'b', b'c']]
 }
 
 #[test]
 fn разбор_каталога_не_паникует_на_мусоре() {
-    void_fuzz::run("fs::каталог", 2026, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("fs::каталог", 2026, void_fuzz::rounds(), &corpus(), |b| {
         // Длина — В ПРЕДЕЛАХ ДОГОВОРА (`len <= dir.len()`), и это не поблажка разборщику.
         // Первый заход бил длиной `usize::MAX`, получил три «находки» — и все три оказались
         // негодным опытом: ВСЕ вызывающие длину ограничивают буфером (`if n > t.len() { 0 }`).
@@ -42,36 +42,36 @@ fn разбор_каталога_не_паникует_на_мусоре() {
 
 #[test]
 fn правка_каталога_не_паникует_на_мусоре() {
-    void_fuzz::run("fs::правка", 13, void_fuzz::rounds(), &корпус(), |b| {
-        let mut копия = b.to_vec();
-        if копия.is_empty() {
+    void_fuzz::run("fs::правка", 13, void_fuzz::rounds(), &corpus(), |b| {
+        let mut copy = b.to_vec();
+        if copy.is_empty() {
             return;
         }
-        let len = (копия[0] as usize * 7).min(копия.len());
-        let _ = void_fs::idx_add(&mut копия, len, "новое".as_bytes(), false);
-        let _ = void_fs::idx_remove(&mut копия, len, b"hello");
+        let len = (copy[0] as usize * 7).min(copy.len());
+        let _ = void_fs::idx_add(&mut copy, len, "новое".as_bytes(), false);
+        let _ = void_fs::idx_remove(&mut copy, len, b"hello");
     });
 }
 
 #[test]
 fn пути_не_паникуют_на_мусоре() {
-    void_fuzz::run("fs::пути", 29, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("fs::пути", 29, void_fuzz::rounds(), &corpus(), |b| {
         // Пути приходят байтами, а не строкой: имя файла на VOID — это байты, и разборщик
         // обязан пережить любые, включая недопустимый UTF-8 и ведущие слэши пачками.
-        let mut буф = [0u8; void_fs::PATH_MAX];
-        let _ = void_fs::normalize(b, &mut буф);
+        let mut buf = [0u8; void_fs::PATH_MAX];
+        let _ = void_fs::normalize(b, &mut buf);
         let _ = void_fs::parent(b);
         let _ = void_fs::leaf(b);
-        let mut корень = [0u8; void_fs::ROOT_MAX];
-        for вид in [0u8, 1, 2, 255] {
-            let _ = void_fs::root_name(вид, b, &mut корень);
+        let mut root = [0u8; void_fs::ROOT_MAX];
+        for kind in [0u8, 1, 2, 255] {
+            let _ = void_fs::root_name(kind, b, &mut root);
         }
     });
 }
 
 #[test]
 fn времена_не_паникуют_на_мусоре() {
-    void_fuzz::run("fs::времена", 31, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("fs::времена", 31, void_fuzz::rounds(), &corpus(), |b| {
         let len = if b.is_empty() { 0 } else { (b[0] as usize * 7).min(b.len()) };
         for l in [b.len(), len, len / 2] {
             let _ = void_fs::mt_find(b, l, b"hello");

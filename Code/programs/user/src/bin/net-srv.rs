@@ -540,7 +540,7 @@ impl Cfg {
                 warn_arg(tok);
             }
             if tok == b"verbose" {
-                ПОДРОБНО.store(true, core::sync::atomic::Ordering::Relaxed);
+                VERBOSE.store(true, core::sync::atomic::Ordering::Relaxed);
             }
         }
         cfg
@@ -552,11 +552,11 @@ impl Cfg {
 /// Сервер и так немногословен, но две его строки — диагностические: самопинг шлюза при подъёме
 /// и счёт кадров на каждый `ping`. На машине, где журнал читают, чтобы найти чужой отказ, они
 /// лишние, а при разборе сети — незаменимы.
-static ПОДРОБНО: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Печать ПОДРОБНОСТИ: при `arg:verbose` — как обычно, иначе ни байта.
-fn шум(b: &[u8]) {
-    if ПОДРОБНО.load(core::sync::atomic::Ordering::Relaxed) {
+fn noise(b: &[u8]) {
+    if VERBOSE.load(core::sync::atomic::Ordering::Relaxed) {
         sys::write(b);
     }
 }
@@ -770,10 +770,10 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
     // Веха 227.5 — удачный самопинг печатается только при `arg:verbose`: «сеть работает» и так
     // видно по адресу строкой выше, а неудачный остаётся всегда — это уже не отчёт, а отказ.
     if let Some(gw) = default_gateway(&mut iface) {
-        шум("[net-srv] самопинг шлюза ".as_bytes());
+        noise("[net-srv] самопинг шлюза ".as_bytes());
         match ping(&mut iface, &mut device, &mut sockets, &mut pings, gw) {
             Ok(rtt) => {
-                if ПОДРОБНО.load(core::sync::atomic::Ordering::Relaxed) {
+                if VERBOSE.load(core::sync::atomic::Ordering::Relaxed) {
                     write_ipv4(gw);
                     sys::write(": ответ за ".as_bytes());
                     write_dec(rtt);
@@ -1570,7 +1570,7 @@ fn sync_clock(
     ntp_handle: SocketHandle,
     cfg: &Cfg,
     bl: &Blocklist,
-    первый: bool,
+    first: bool,
 ) {
     // Адрес сервера: либо прямо числами, либо через DNS — ровно как это делает `ping`.
     let spec = &cfg.ntp[..cfg.ntp_len];
@@ -1652,7 +1652,7 @@ fn sync_clock(
         Some(cap) if sys::clock_set(cap, unix * 1_000_000_000) => {
             // О первой сверке говорим — это часть рассказа о подъёме системы; о повторных
             // молчим: ядро само скажет, если часы сдвинулись заметно.
-            if первый {
+            if first {
                 sys::write("[net-srv] часы подведены по NTP (".as_bytes());
                 sys::write(spec);
                 sys::write(")\n".as_bytes());
@@ -1702,15 +1702,15 @@ fn ping(
     // Взять ПЕРВЫЙ СВОБОДНЫЙ по кругу: занятым считается тот, у кого в очереди передачи остался
     // пакет с прошлого раза (адрес так и не разрешился). Круг начинается с места, где кончили в
     // прошлый раз, — иначе один и тот же сокет брался бы всегда.
-    let mut выбран = None;
-    for шаг in 0..PING_SOCKETS {
-        let i = (pool.cur + шаг) % PING_SOCKETS;
+    let mut selected = None;
+    for step in 0..PING_SOCKETS {
+        let i = (pool.cur + step) % PING_SOCKETS;
         if sockets.get_mut::<icmp::Socket>(pool.handles[i]).send_queue() == 0 {
-            выбран = Some(i);
+            selected = Some(i);
             break;
         }
     }
-    let Some(i) = выбран else {
+    let Some(i) = selected else {
         return Err(PING_EXHAUSTED);
     };
     pool.cur = (i + 1) % PING_SOCKETS;

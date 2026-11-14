@@ -563,7 +563,7 @@ system(
     /// никто не читает. Теперь — претензия на каждую.
     #[test]
     fn опечатки_в_правах_ловятся() {
-        let случаи = [
+        let cases = [
             r#"service("a", "stroe:rw")"#,      // вид права
             r#"service("a", "store:q")"#,       // буква права
             r#"service("a", "store:")"#,        // права не названы
@@ -574,9 +574,9 @@ system(
             r#"service("a", "endpoint:")"#,     // сервер без имени
             r#"shell("s", "power:z")"#,         // буква права и у одиночных
         ];
-        for строка in случаи {
-            let norm = build_config(&alloc::format!("system([{}])", строка)).expect("конфиг");
-            assert_eq!(check_config(&norm).len(), 1, "не поймано: {}", строка);
+        for line in cases {
+            let norm = build_config(&alloc::format!("system([{}])", line)).expect("конфиг");
+            assert_eq!(check_config(&norm).len(), 1, "не поймано: {}", line);
         }
     }
 
@@ -588,9 +588,9 @@ system(
             r#"system([service("posixfs", "store:rw"), shell("wm", "endpoint:hda")])"#,
         )
         .expect("конфиг");
-        let беды = check_config(&norm);
-        assert_eq!(беды.len(), 1);
-        assert!(беды[0].contains("endpoint:hda"), "{}", беды[0]);
+        let problems = check_config(&norm);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("endpoint:hda"), "{}", problems[0]);
 
         // А объявленный — проходит, в том числе с правами и с пометкой «не наследуется».
         let norm = build_config(
@@ -618,28 +618,28 @@ system(
     /// перезагрузки. Здесь проверяется и то, что НЕ считается потерей: правка аргумента.
     #[test]
     fn потеря_возможности_видна() {
-        let было = build_config(
+        let prev = build_config(
             r#"system([service("net-srv", "dev:net:rw", "store:r", "arg:dhcp=on"),
                        service("hda", "mmio:hda", "dma")])"#,
         )
         .expect("конфиг");
-        let стало = build_config(
+        let now = build_config(
             r#"system([service("net-srv", "dev:net:rw", "arg:dhcp=off")])"#,
         )
         .expect("конфиг");
-        let потери = lost_entries(&было, &стало);
-        assert_eq!(потери.len(), 2, "{:?}", потери);
-        assert!(потери.iter().any(|p| p.contains("store:r")), "{:?}", потери);
-        assert!(потери.iter().any(|p| p.contains("hda")), "{:?}", потери);
+        let lost = lost_entries(&prev, &now);
+        assert_eq!(lost.len(), 2, "{:?}", lost);
+        assert!(lost.iter().any(|p| p.contains("store:r")), "{:?}", lost);
+        assert!(lost.iter().any(|p| p.contains("hda")), "{:?}", lost);
         // Тот же конфиг сам с собой — потерь нет.
-        assert!(lost_entries(&было, &было).is_empty());
+        assert!(lost_entries(&prev, &prev).is_empty());
         // Добавление — не потеря.
-        let шире = build_config(
+        let wider = build_config(
             r#"system([service("net-srv", "dev:net:rw", "store:r", "arg:dhcp=on", "netdev"),
                        service("hda", "mmio:hda", "dma"), service("wifi", "mmio:wifi")])"#,
         )
         .expect("конфиг");
-        assert!(lost_entries(&было, &шире).is_empty(), "{:?}", lost_entries(&было, &шире));
+        assert!(lost_entries(&prev, &wider).is_empty(), "{:?}", lost_entries(&prev, &wider));
     }
 
     /// Веха 219.1 — имя корня со знаком `@` находится, а обычное значение — нет.

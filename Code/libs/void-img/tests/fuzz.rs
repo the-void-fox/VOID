@@ -15,7 +15,7 @@ use std::path::Path;
 /// Корпус: настоящие файлы, которые уже лежат в репозитории ради честных тестов декодера, плюс
 /// снимки экрана. Мутатору нужен ПРАВИЛЬНЫЙ вход как отправная точка — из случайного шума он
 /// дальше проверки сигнатуры не уедет.
-fn корпус() -> Vec<Vec<u8>> {
+fn corpus() -> Vec<Vec<u8>> {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut c = void_fuzz::corpus_dir(&here.join("tests/corpus"));
     c.extend(void_fuzz::corpus_dir(&here.join("../../../IMG/shots")));
@@ -27,7 +27,7 @@ fn корпус() -> Vec<Vec<u8>> {
 fn декодер_не_паникует_на_мусоре() {
     // Потолок пикселей тот же, что у настоящих потребителей: иначе мы проверяли бы не декодер,
     // а защиту от исчерпания памяти, и первый же «ширина = 0xffffffff» съел бы машину.
-    void_fuzz::run("img::decode", 2026, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("img::decode", 2026, void_fuzz::rounds(), &corpus(), |b| {
         let _ = void_img::decode(b, 64 << 20);
     });
 }
@@ -36,7 +36,7 @@ fn декодер_не_паникует_на_мусоре() {
 fn probe_не_паникует_на_мусоре() {
     // `probe` читает ТОЛЬКО заголовок и зовётся раньше `decode` — у него свой путь разбора,
     // и мусор до него доходит первым.
-    void_fuzz::run("img::probe", 7, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("img::probe", 7, void_fuzz::rounds(), &corpus(), |b| {
         let _ = void_img::probe(b);
     });
 }

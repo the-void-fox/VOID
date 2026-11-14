@@ -139,11 +139,11 @@ pub fn list(
 /// Рисуется блоками `█` по заполненному и `░` по пустому — и то и другое есть во встроенном
 /// шрифте. Цветом фона полосу не делаем: в терминале фон это чужая тема, и «синяя полоса» на
 /// синей теме исчезает.
-pub fn gauge(buf: &mut Buffer, r: Rect, доля: f32, style: Style) {
+pub fn gauge(buf: &mut Buffer, r: Rect, share: f32, style: Style) {
     if r.is_empty() {
         return;
     }
-    let full = (доля.clamp(0.0, 1.0) * r.w as f32 + 0.5) as u16;
+    let full = (share.clamp(0.0, 1.0) * r.w as f32 + 0.5) as u16;
     for x in 0..r.w {
         buf.set(r.x + x, r.y, if x < full { '█' } else { '░' }, style);
     }

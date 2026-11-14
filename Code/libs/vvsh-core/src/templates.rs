@@ -540,9 +540,9 @@ mod tests {
 
     /// Загрузчик «из шаблонов»: `import("услуги.vv")` отдаёт ровно тот текст, который сеется на
     /// чистую машину. Значит тест собирает не выдумку, а то же самое поколение.
-    struct Шаблоны;
+    struct Templates;
 
-    impl ModuleLoader for Шаблоны {
+    impl ModuleLoader for Templates {
         fn load(&self, name: &str) -> Result<String, String> {
             let t = match name {
                 "net.vv" => NET_VV,
@@ -560,33 +560,33 @@ mod tests {
         }
     }
 
-    fn поколение() -> String {
-        build_config_with(DEFAULT_VV, &Шаблоны).expect("шаблоны обязаны собираться")
+    fn generation() -> String {
+        build_config_with(DEFAULT_VV, &Templates).expect("шаблоны обязаны собираться")
     }
 
     /// Тот же загрузчик с подменённым `apps.vv` — так его видит человек, поправивший список
     /// мест или умолчаний состояния.
-    struct ШаблоныApps(String);
+    struct TemplatesApps(String);
 
-    impl ModuleLoader for ШаблоныApps {
+    impl ModuleLoader for TemplatesApps {
         fn load(&self, name: &str) -> Result<String, String> {
             if name == "apps.vv" {
                 return Ok(self.0.clone());
             }
-            Шаблоны.load(name)
+            Templates.load(name)
         }
     }
 
     /// Тот же загрузчик, но с ПОДМЕНЁННЫМ `terminal.vv` — так его видит первая загрузка системы,
     /// поставленной установщиком.
-    struct ШаблоныС(String);
+    struct TemplatesWith(String);
 
-    impl ModuleLoader for ШаблоныС {
+    impl ModuleLoader for TemplatesWith {
         fn load(&self, name: &str) -> Result<String, String> {
             if name == "terminal.vv" {
                 return Ok(self.0.clone());
             }
-            Шаблоны.load(name)
+            Templates.load(name)
         }
     }
 
@@ -600,7 +600,7 @@ mod tests {
     fn выбор_установщика_доезжает_до_поколения() {
         let (text, bad) = with_wish(TERMINAL_VV, "term", "en", "voidbook");
         assert!(bad.is_empty(), "подстановке некуда встать: {bad:?}");
-        let g = build_config_with(DEFAULT_VV, &ШаблоныС(text)).expect("шаблоны обязаны собираться");
+        let g = build_config_with(DEFAULT_VV, &TemplatesWith(text)).expect("шаблоны обязаны собираться");
         assert!(g.contains("shell term"), "выбран терминал, а в поколении его нет:\n{g}");
         assert!(!g.contains("shell wm"), "выбран терминал, а поднимается композитор:\n{g}");
         assert!(g.contains("ui language en"), "язык не доехал:\n{g}");
@@ -610,7 +610,7 @@ mod tests {
         // то же поколение, что и до этой вехи.
         let (same, bad) = with_wish(TERMINAL_VV, "", "", "");
         assert!(bad.is_empty() && same == TERMINAL_VV, "пустое пожелание правит шаблон");
-        assert_eq!(поколение(), build_config_with(DEFAULT_VV, &ШаблоныС(same)).expect("сборка"));
+        assert_eq!(generation(), build_config_with(DEFAULT_VV, &TemplatesWith(same)).expect("сборка"));
     }
 
     /// Веха 229.2 — ПЕРЕНАЗНАЧЕНИЕ МЕСТА доезжает из шаблона до поколения.
@@ -621,13 +621,13 @@ mod tests {
     /// соседних строк. Тест держит оба конца.
     #[test]
     fn переназначение_места_доезжает_до_поколения() {
-        let было = "places = []\nstate = []";
-        assert!(APPS_VV.contains(было), "в шаблоне нет строк `places` и `state`");
-        let мой = APPS_VV.replace(
-            было,
+        let prev = "places = []\nstate = []";
+        assert!(APPS_VV.contains(prev), "в шаблоне нет строк `places` и `state`");
+        let mine = APPS_VV.replace(
+            prev,
             "places = [\"fm /etc/мои-закладки\"]\nstate = [app(\"fm\", \"marks\", \"/nix\")]",
         );
-        let g = build_config_with(DEFAULT_VV, &ШаблоныApps(мой)).expect("шаблоны обязаны собираться");
+        let g = build_config_with(DEFAULT_VV, &TemplatesApps(mine)).expect("шаблоны обязаны собираться");
         assert!(
             g.contains("desktop state fm /etc/мои-закладки"),
             "переназначение не доехало до поколения:\n{g}"
@@ -635,9 +635,9 @@ mod tests {
         assert!(g.contains("app fm marks /nix"), "умолчание состояния не доехало:\n{g}");
         // А по умолчанию их нет вовсе: место программы — её имя, состояние — её дело, и строк
         // об этом в конфиге не должно появляться само.
-        let пусто = поколение();
-        assert!(!пусто.contains("desktop state"), "место переназначено без спроса");
-        assert!(!пусто.contains("app "), "состояние объявлено без спроса");
+        let is_empty = generation();
+        assert!(!is_empty.contains("desktop state"), "место переназначено без спроса");
+        assert!(!is_empty.contains("app "), "состояние объявлено без спроса");
     }
 
     /// А если шаблон уедет из-под подстановки — она обязана СКАЗАТЬ, а не промолчать.
@@ -654,7 +654,7 @@ mod tests {
     /// чего поколение неполно.
     #[test]
     fn пересборка_не_отнимает_возможностей() {
-        let g = поколение();
+        let g = generation();
 
         // Сервисы. Машина без соответствующего железа строку просто не поднимет — и это верно;
         // а вот ОТСУТСТВИЕ строки значит, что возможности нет ни на какой машине.
@@ -687,23 +687,23 @@ mod tests {
     /// кончилась бы отказом — и виноватой выглядела бы проверка, а не шаблон.
     #[test]
     fn шаблоны_проходят_строгую_проверку() {
-        let беды = crate::check_config(&поколение());
-        assert!(беды.is_empty(), "шаблоны не проходят собственную проверку: {:?}", беды);
+        let problems = crate::check_config(&generation());
+        assert!(problems.is_empty(), "шаблоны не проходят собственную проверку: {:?}", problems);
     }
 
     /// Выключенная сеть выключает СЕТЬ, а не всё подряд: ни сервера, ни раздачи канала.
     #[test]
     fn без_сети_поколение_остаётся_целым() {
-        struct БезСети;
-        impl ModuleLoader for БезСети {
+        struct NoNet;
+        impl ModuleLoader for NoNet {
             fn load(&self, name: &str) -> Result<String, String> {
                 if name == "net.vv" {
                     return Ok("false\n".to_string());
                 }
-                Шаблоны.load(name)
+                Templates.load(name)
             }
         }
-        let g = build_config_with(DEFAULT_VV, &БезСети).expect("сборка без сети");
+        let g = build_config_with(DEFAULT_VV, &NoNet).expect("сборка без сети");
         assert!(!g.contains("service net-srv"), "сеть выключена, а сервер остался:\n{g}");
         assert!(!g.contains("endpoint:net-srv"), "сеть выключена, а канал выдан:\n{g}");
         assert!(!g.contains("desktop net"), "сеть выключена, а канал кому-то раздаётся:\n{g}");

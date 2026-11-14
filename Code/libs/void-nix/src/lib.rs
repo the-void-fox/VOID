@@ -283,8 +283,8 @@ mod tests {
         use alloc::rc::Rc;
         use core::cell::RefCell;
 
-        struct Записал(RefCell<alloc::vec::Vec<(String, String)>>);
-        impl crate::derive::StoreText for Записал {
+        struct Wrote(RefCell<alloc::vec::Vec<(String, String)>>);
+        impl crate::derive::StoreText for Wrote {
             fn add(&self, path: &str, text: &str) -> Result<(), String> {
                 self.0.borrow_mut().push((String::from(path), String::from(text)));
                 Ok(())
@@ -293,7 +293,7 @@ mod tests {
                 None
             }
         }
-        let store = Rc::new(Записал(RefCell::new(alloc::vec::Vec::new())));
+        let store = Rc::new(Wrote(RefCell::new(alloc::vec::Vec::new())));
         let src = r#"derivation {
             name = "privet";
             system = "x86_64-linux";
@@ -319,8 +319,8 @@ mod tests {
         use alloc::rc::Rc;
         use core::cell::RefCell;
 
-        struct Память(RefCell<alloc::collections::BTreeMap<String, String>>);
-        impl crate::derive::StoreText for Память {
+        struct Memory(RefCell<alloc::collections::BTreeMap<String, String>>);
+        impl crate::derive::StoreText for Memory {
             fn add(&self, path: &str, text: &str) -> Result<(), String> {
                 self.0.borrow_mut().insert(String::from(path), String::from(text));
                 Ok(())
@@ -329,7 +329,7 @@ mod tests {
                 self.0.borrow().get(path).cloned()
             }
         }
-        let store = Rc::new(Память(RefCell::new(alloc::collections::BTreeMap::new())));
+        let store = Rc::new(Memory(RefCell::new(alloc::collections::BTreeMap::new())));
         let src = r#"
           let hello = derivation {
             name = "hello"; system = "x86_64-linux"; builder = "/bin/busybox";

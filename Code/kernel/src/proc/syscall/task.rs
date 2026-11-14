@@ -651,10 +651,10 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                 let f = &t.procs[cur].frame;
                 (f.arg(0), f.arg(1), f.arg(2))
             };
-            let мой = sender < t.procs.len()
+            let mine = sender < t.procs.len()
                 && t.procs[sender].state == State::ReplyWait
                 && t.procs[sender].call_dest == cur;
-            let result = match (мой, t.procs.get(sender).and_then(|p| p.call_root)) {
+            let result = match (mine, t.procs.get(sender).and_then(|p| p.call_root)) {
                 (true, Some(root)) if len != 0 && ensure_heap_range(t, cur, buf, len) => {
                     let b = root.as_bytes();
                     let n = b.len().min(len);

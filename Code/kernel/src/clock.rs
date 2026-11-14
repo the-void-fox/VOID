@@ -134,12 +134,12 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// Возвращает сдвиг в наносекундах (со знаком) — звать его есть кому: тому, кто подводит,
 /// полезно сказать человеку, НАСКОЛЬКО врали часы.
 pub fn set_realtime_ns(ns: u64) -> i64 {
-    let было = realtime_ns();
+    let prev = realtime_ns();
     WALL_BASE_NS.store(ns.saturating_sub(uptime_ns()), Ordering::Relaxed);
     // Часы теперь известны — даже если RTC не нашлось вовсе. Потребителям важно не «есть ли
     // микросхема», а «можно ли верить дате»; с этой минуты можно.
     HAS_RTC.store(true, Ordering::Relaxed);
-    ns as i64 - было as i64
+    ns as i64 - prev as i64
 }
 
 /// Настенное время, наносекунды Unix (UTC).

@@ -63,7 +63,7 @@ const FIRST_BOOT_SEED: &str = "service vvsh endpoint:posixfs store:rwx arg:init-
 /// исходника, где написано `mode = "wm"`, и выбор пропал бы молча, без единого сообщения.
 /// Поэтому установщик не выбирает поколение, а говорит, КАКОЙ ПОСЕЯТЬ ИСХОДНИК.
 #[derive(Default)]
-struct Пожелание {
+struct Wish {
     /// `wm` | `term` | `vsh` — чем система встречает. Пусто — как в образе.
     mode: String,
     /// `ru` | `en` — язык интерфейса (журнал ядра остаётся русским).
@@ -72,12 +72,12 @@ struct Пожелание {
     name: String,
 }
 
-impl Пожелание {
+impl Wish {
     /// Прочитать и разобрать. `None` — пожелания нет (система поставлена без установщика либо
     /// обновлена), и тогда всё идёт ровно так, как шло до этой вехи.
-    fn read() -> Option<Пожелание> {
+    fn read() -> Option<Wish> {
         let text = read_text(crate::install::SETUP_ROOT)?;
-        let mut w = Пожелание::default();
+        let mut w = Wish::default();
         for line in text.lines() {
             let line = line.trim();
             let Some((key, val)) = line.split_once(' ') else { continue };
@@ -743,7 +743,7 @@ pub fn boot() {
     let windowed = arch::video_mode().is_some();
     let clean = object::root("system/gen1").is_none();
     // Веха 227.1 — записка от установщика. Читается ровно один раз, на первой загрузке цели.
-    let wish = if clean { Пожелание::read() } else { None };
+    let wish = if clean { Wish::read() } else { None };
     if clean {
         write_text("system/gen1", DEFAULT_GEN1);
         write_text("system/gen2", DEFAULT_GEN2);

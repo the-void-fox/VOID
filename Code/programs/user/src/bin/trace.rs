@@ -62,60 +62,60 @@ const TOP: usize = 12;
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let argv = sys::argv::Argv::take();
-    let режим = argv.str(0).unwrap_or("");
-    let секунды = argv.str(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
+    let mode = argv.str(0).unwrap_or("");
+    let seconds = argv.str(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(3).clamp(1, 60);
 
-    let обзор = sys::win::cap_or_grant(13);
-    if обзор == sys::NO_CAP {
+    let sysview = sys::win::cap_or_grant(13);
+    if sysview == sys::NO_CAP {
         sys::write("trace: нет права обзора (sysview)\n".as_bytes());
         sys::write("выдаётся строкой `desktop sysview trace` в конфиге поколения\n".as_bytes());
         sys::exit(1);
     }
 
-    let теги: &[u16] = match режим {
+    let tags: &[u16] = match mode {
         "вызовы" | "calls" => &[trace::TAG_SYSCALL, trace::TAG_LINUX],
         "выборка" | "sample" => &[trace::TAG_SAMPLE_U, trace::TAG_SAMPLE_K],
         "события" | "events" => {
             &[trace::TAG_SYSCALL, trace::TAG_LINUX, trace::TAG_SAMPLE_U, trace::TAG_SAMPLE_K]
         }
         _ => {
-            помощь();
+            usage();
             sys::exit(2);
         }
     };
 
-    if !trace::enable(обзор, trace::mask_of(теги)) {
+    if !trace::enable(sysview, trace::mask_of(tags)) {
         sys::write("trace: ядро не включило трассировку (нужен sysview:w)\n".as_bytes());
         sys::exit(1);
     }
 
-    let собрано = собрать(обзор, секунды);
+    let collected = collect(sysview, seconds);
     // Выключаем ВСЕГДА, в том числе если дальше печать упадёт: оставить систему
     // трассирующей после выхода инструмента — это молчаливый расход, который потом ищут.
-    trace::enable(обзор, 0);
+    trace::enable(sysview, 0);
 
-    let (_, записей, потеряно) = trace::stats(обзор).unwrap_or((0, 0, 0));
-    match режим {
-        "вызовы" | "calls" => печать_вызовов(&собрано, секунды),
-        "выборка" | "sample" => печать_выборки(&собрано, обзор, секунды),
-        _ => печать_событий(&собрано),
+    let (_, records, lost_count) = trace::stats(sysview).unwrap_or((0, 0, 0));
+    match mode {
+        "вызовы" | "calls" => print_calls(&collected, seconds),
+        "выборка" | "sample" => print_sample(&collected, sysview, seconds),
+        _ => print_events(&collected),
     }
     // Потери печатаем ПОСЛЕ таблицы и всегда, когда они есть: таблица, посчитанная по неполным
     // данным, выглядит так же убедительно, как полная.
-    if потеряно > 0 {
+    if lost_count > 0 {
         sys::write(
             format!(
                 "\nВНИМАНИЕ: {} записей потеряно (кольцо ядра переполнилось) — числа НЕПОЛНЫЕ\n",
-                потеряно
+                lost_count
             )
             .as_bytes(),
         );
     }
-    sys::write(format!("записей в ядре за замер: {}\n", записей).as_bytes());
+    sys::write(format!("записей в ядре за замер: {}\n", records).as_bytes());
     sys::exit(0);
 }
 
-fn помощь() {
+fn usage() {
     sys::write("trace: спросить систему, чем она занята\n\n".as_bytes());
     sys::write("  trace вызовы [секунд]    какие вызовы и сколько времени ядра они заняли\n".as_bytes());
     sys::write("  trace выборка [секунд]   где горит процессор (адреса кода)\n".as_bytes());
@@ -124,15 +124,15 @@ fn помощь() {
 }
 
 /// Вычерпывать кольцо, пока не выйдет время замера.
-fn собрать(обзор: usize, секунды: u64) -> Vec<trace::Event> {
-    let мишень = sys::monotonic_ns() + секунды * 1_000_000_000;
+fn collect(sysview: usize, seconds: u64) -> Vec<trace::Event> {
+    let until = sys::monotonic_ns() + seconds * 1_000_000_000;
     let mut all: Vec<trace::Event> = Vec::new();
     let mut raw = vec![0u8; BATCH * trace::REC];
     let mut ev = vec![trace::Event::default(); BATCH];
-    while sys::monotonic_ns() < мишень {
+    while sys::monotonic_ns() < until {
         sys::sleep_ns(DRAIN_MS * 1_000_000);
         loop {
-            let n = trace::read(обзор, &mut raw, &mut ev);
+            let n = trace::read(sysview, &mut raw, &mut ev);
             all.extend_from_slice(&ev[..n]);
             // Меньше полного пакета — кольцо вычерпано досуха, больше читать нечего.
             if n < BATCH {
@@ -144,76 +144,76 @@ fn собрать(обзор: usize, секунды: u64) -> Vec<trace::Event> {
 }
 
 /// Имена процессов по номеру — чтобы в таблицах стояло `wm`, а не `P7`.
-fn имена(обзор: usize) -> Vec<(u16, String)> {
+fn names(sysview: usize) -> Vec<(u16, String)> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; sys::PROC_REC * 96];
-    let Some(всего) = sys::proc_list(обзор, &mut buf) else { return out };
-    let показано = всего.min(buf.len() / sys::PROC_REC);
-    for k in 0..показано {
+    let Some(total) = sys::proc_list(sysview, &mut buf) else { return out };
+    let shown_count = total.min(buf.len() / sys::PROC_REC);
+    for k in 0..shown_count {
         let r = &buf[k * sys::PROC_REC..(k + 1) * sys::PROC_REC];
         let pid = u16::from_le_bytes([r[0], r[1]]);
         let len = r[7] as usize;
-        let имя = core::str::from_utf8(&r[40..40 + len.min(24)]).unwrap_or("?");
-        out.push((pid, String::from(имя)));
+        let name = core::str::from_utf8(&r[40..40 + len.min(24)]).unwrap_or("?");
+        out.push((pid, String::from(name)));
     }
     out
 }
 
-fn имя_проц(список: &[(u16, String)], pid: u16) -> String {
-    match список.iter().find(|(p, _)| *p == pid) {
+fn proc_name(list: &[(u16, String)], pid: u16) -> String {
+    match list.iter().find(|(p, _)| *p == pid) {
         Some((_, n)) => format!("{n}"),
         None => format!("P{pid}"),
     }
 }
 
 /// `trace вызовы` — сводка по номерам вызовов: сколько раз и сколько времени ЯДРА.
-fn печать_вызовов(ev: &[trace::Event], секунды: u64) {
+fn print_calls(ev: &[trace::Event], seconds: u64) {
     // (тег, номер) → (сколько, суммарно нс, худший нс)
-    let mut свод: Vec<(u16, u64, u64, u64, u64)> = Vec::new();
+    let mut summary: Vec<(u16, u64, u64, u64, u64)> = Vec::new();
     for e in ev {
         if e.tag != trace::TAG_SYSCALL && e.tag != trace::TAG_LINUX {
             continue;
         }
-        match свод.iter_mut().find(|(t, n, ..)| *t == e.tag && *n == e.a) {
+        match summary.iter_mut().find(|(t, n, ..)| *t == e.tag && *n == e.a) {
             Some(row) => {
                 row.2 += 1;
                 row.3 += e.b;
                 row.4 = row.4.max(e.b);
             }
-            None => свод.push((e.tag, e.a, 1, e.b, e.b)),
+            None => summary.push((e.tag, e.a, 1, e.b, e.b)),
         }
     }
-    if свод.is_empty() {
+    if summary.is_empty() {
         sys::write("вызовов не было вовсе — система стояла\n".as_bytes());
         return;
     }
-    свод.sort_by(|a, b| b.3.cmp(&a.3));
-    let всего_вызовов: u64 = свод.iter().map(|r| r.2).sum();
-    let всего_нс: u64 = свод.iter().map(|r| r.3).sum();
+    summary.sort_by(|a, b| b.3.cmp(&a.3));
+    let total_calls: u64 = summary.iter().map(|r| r.2).sum();
+    let total_ns: u64 = summary.iter().map(|r| r.3).sum();
     sys::write(
         format!(
             "ВЫЗОВЫ за {} с: {} штук, {} мкс работы ядра ({} вызовов/с)\n\n",
-            секунды,
-            всего_вызовов,
-            всего_нс / 1000,
-            всего_вызовов / секунды,
+            seconds,
+            total_calls,
+            total_ns / 1000,
+            total_calls / seconds,
         )
         .as_bytes(),
     );
     sys::write("  вызов                 сколько   ядро, мкс   худший, мкс\n".as_bytes());
-    for (тег, номер, сколько, сумма, худший) in свод.iter().take(TOP) {
-        let имя = if *тег == trace::TAG_LINUX {
-            format!("linux #{номер}")
+    for (tag, nr, count, sum, worst) in summary.iter().take(TOP) {
+        let name = if *tag == trace::TAG_LINUX {
+            format!("linux #{nr}")
         } else {
-            format!("{}", имя_вызова(*номер))
+            format!("{}", syscall_name(*nr))
         };
         sys::write(
             format!(
                 "  {:<20} {:>8}   {:>9}   {:>11}\n",
-                имя,
-                сколько,
-                сумма / 1000,
-                худший / 1000
+                name,
+                count,
+                sum / 1000,
+                worst / 1000
             )
             .as_bytes(),
         );
@@ -226,71 +226,71 @@ fn печать_вызовов(ev: &[trace::Event], секунды: u64) {
 }
 
 /// `trace выборка` — где застали код. Разделяем процессы и ядро: лечатся они по-разному.
-fn печать_выборки(ev: &[trace::Event], обзор: usize, секунды: u64) {
-    let список = имена(обзор);
-    let mut по_процессам: Vec<(u16, u64)> = Vec::new();
-    let mut адреса: Vec<(u16, u64, u64)> = Vec::new(); // (pid|0=ядро, адрес, сколько)
-    let mut ядро = 0u64;
-    let mut всего = 0u64;
+fn print_sample(ev: &[trace::Event], sysview: usize, seconds: u64) {
+    let list = names(sysview);
+    let mut by_proc: Vec<(u16, u64)> = Vec::new();
+    let mut addrs: Vec<(u16, u64, u64)> = Vec::new(); // (pid|0=ядро, адрес, сколько)
+    let mut kernel = 0u64;
+    let mut total = 0u64;
     for e in ev {
-        let ядерный = e.tag == trace::TAG_SAMPLE_K;
-        if !ядерный && e.tag != trace::TAG_SAMPLE_U {
+        let in_kernel = e.tag == trace::TAG_SAMPLE_K;
+        if !in_kernel && e.tag != trace::TAG_SAMPLE_U {
             continue;
         }
-        всего += 1;
-        if ядерный {
-            ядро += 1;
+        total += 1;
+        if in_kernel {
+            kernel += 1;
         } else {
-            match по_процессам.iter_mut().find(|(p, _)| *p == e.pid) {
+            match by_proc.iter_mut().find(|(p, _)| *p == e.pid) {
                 Some(row) => row.1 += 1,
-                None => по_процессам.push((e.pid, 1)),
+                None => by_proc.push((e.pid, 1)),
             }
         }
         // Адреса сводим по 16 байт: разные команды одного цикла — это одно место, а не десять.
-        let ключ = e.a & !0xf;
-        let чей = if ядерный { u16::MAX } else { e.pid };
-        match адреса.iter_mut().find(|(p, a, _)| *p == чей && *a == ключ) {
+        let key = e.a & !0xf;
+        let owner = if in_kernel { u16::MAX } else { e.pid };
+        match addrs.iter_mut().find(|(p, a, _)| *p == owner && *a == key) {
             Some(row) => row.2 += 1,
-            None => адреса.push((чей, ключ, 1)),
+            None => addrs.push((owner, key, 1)),
         }
     }
-    if всего == 0 {
+    if total == 0 {
         sys::write("отсчётов нет: за это время никого не вытесняли — система спала\n".as_bytes());
         return;
     }
-    по_процессам.sort_by(|a, b| b.1.cmp(&a.1));
-    адреса.sort_by(|a, b| b.2.cmp(&a.2));
+    by_proc.sort_by(|a, b| b.1.cmp(&a.1));
+    addrs.sort_by(|a, b| b.2.cmp(&a.2));
     sys::write(
         format!(
             "ВЫБОРКА за {} с: {} отсчётов ({} в секунду), из них в ядре {} %\n\n",
-            секунды,
-            всего,
-            всего / секунды,
-            ядро * 100 / всего,
+            seconds,
+            total,
+            total / seconds,
+            kernel * 100 / total,
         )
         .as_bytes(),
     );
     sys::write("  КТО ЖЖЁТ ПРОЦЕССОР\n".as_bytes());
-    for (pid, n) in по_процессам.iter().take(TOP) {
+    for (pid, n) in by_proc.iter().take(TOP) {
         sys::write(
             format!(
                 "  {:<20} {:>6} отсчётов  {:>3} %\n",
-                имя_проц(&список, *pid),
+                proc_name(&list, *pid),
                 n,
-                n * 100 / всего
+                n * 100 / total
             )
             .as_bytes(),
         );
     }
     sys::write("\n  ГДЕ ИМЕННО (адрес кода, перевести — tools/ksyms.py)\n".as_bytes());
-    for (чей, адрес, n) in адреса.iter().take(TOP) {
-        let кто = if *чей == u16::MAX {
+    for (owner, addr, n) in addrs.iter().take(TOP) {
+        let who = if *owner == u16::MAX {
             String::from("ядро")
         } else {
-            имя_проц(&список, *чей)
+            proc_name(&list, *owner)
         };
         sys::write(
-            format!("  {:<14} {:#018x}  {:>5}  {:>3} %\n", кто, адрес, n, n * 100 / всего)
+            format!("  {:<14} {:#018x}  {:>5}  {:>3} %\n", who, addr, n, n * 100 / total)
                 .as_bytes(),
         );
     }
@@ -304,34 +304,34 @@ fn печать_выборки(ev: &[trace::Event], обзор: usize, секу�
 }
 
 /// `trace события` — сырой хвост. Нужен, когда вопрос не «сколько», а «в каком порядке».
-fn печать_событий(ev: &[trace::Event]) {
-    let хвост = ev.len().saturating_sub(64);
-    sys::write(format!("СОБЫТИЯ: всего {}, ниже последние {}\n\n", ev.len(), ev.len() - хвост).as_bytes());
-    for e in &ev[хвост..] {
-        let мс = e.t_ns / 1_000_000;
-        let мкс = (e.t_ns % 1_000_000) / 1000;
+fn print_events(ev: &[trace::Event]) {
+    let tail = ev.len().saturating_sub(64);
+    sys::write(format!("СОБЫТИЯ: всего {}, ниже последние {}\n\n", ev.len(), ev.len() - tail).as_bytes());
+    for e in &ev[tail..] {
+        let ms = e.t_ns / 1_000_000;
+        let us = (e.t_ns % 1_000_000) / 1000;
         match e.tag {
             trace::TAG_SYSCALL => sys::write(
                 format!(
                     "  {:>6}.{:03} P{:<3} ц{} {} → {} мкс\n",
-                    мс,
-                    мкс,
+                    ms,
+                    us,
                     e.pid,
                     e.cpu,
-                    имя_вызова(e.a),
+                    syscall_name(e.a),
                     e.b / 1000
                 )
                 .as_bytes(),
             ),
             trace::TAG_LINUX => sys::write(
-                format!("  {:>6}.{:03} P{:<3} ц{} linux #{} → {}\n", мс, мкс, e.pid, e.cpu, e.a, e.b as i64)
+                format!("  {:>6}.{:03} P{:<3} ц{} linux #{} → {}\n", ms, us, e.pid, e.cpu, e.a, e.b as i64)
                     .as_bytes(),
             ),
             trace::TAG_SAMPLE_U => sys::write(
-                format!("  {:>6}.{:03} P{:<3} ц{} код {:#x}\n", мс, мкс, e.pid, e.cpu, e.a).as_bytes(),
+                format!("  {:>6}.{:03} P{:<3} ц{} код {:#x}\n", ms, us, e.pid, e.cpu, e.a).as_bytes(),
             ),
             trace::TAG_SAMPLE_K => sys::write(
-                format!("  {:>6}.{:03} ядро  ц{} код {:#x}\n", мс, мкс, e.cpu, e.a).as_bytes(),
+                format!("  {:>6}.{:03} ядро  ц{} код {:#x}\n", ms, us, e.cpu, e.a).as_bytes(),
             ),
             _ => {}
         }
@@ -341,7 +341,7 @@ fn печать_событий(ev: &[trace::Event]) {
 /// Имена вызовов VOID. Таблица снята С КОНСТАНТ библиотеки (`SYS_*` в `lib.rs`), а не набрана
 /// по памяти: подписать вызов чужим именем — худший вид вранья в измерителе. Незнакомый номер
 /// печатается номером, и это тоже ответ: значит вызов новый, а инструмент не обновили.
-fn имя_вызова(n: u64) -> String {
+fn syscall_name(n: u64) -> String {
     let s = match n {
         1 => "WRITE",
         2 => "EXIT",

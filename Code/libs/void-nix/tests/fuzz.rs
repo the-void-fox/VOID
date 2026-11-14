@@ -8,7 +8,7 @@
 //! ловить её сроком — значит мерить скорость машины. Потолок рекурсии и бюджет шагов — отдельная
 //! работа; пока здесь ловится только паника.
 
-fn корпус() -> Vec<Vec<u8>> {
+fn corpus() -> Vec<Vec<u8>> {
     vec![
         "{ a = 1; b = \"два\"; c = [ 1 2 3 ]; }".as_bytes().to_vec(),
         b"let x = 1; y = x + 2; in { inherit x y; }".to_vec(),
@@ -20,7 +20,7 @@ fn корпус() -> Vec<Vec<u8>> {
 
 #[test]
 fn вычислитель_не_паникует_на_мусоре() {
-    void_fuzz::run("nix::eval_str", 2026, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("nix::eval_str", 2026, void_fuzz::rounds(), &corpus(), |b| {
         let s = String::from_utf8_lossy(b);
         let _ = void_nix::eval_str(&s);
     });

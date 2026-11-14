@@ -73,18 +73,18 @@ fn объект_и_корень_переживают_перезагрузку() 
     let mut s = Store::new();
     assert!(s.load(&mut io), "загрузка не прошла");
     assert_eq!(s.root("система/тест"), Some(id), "корень не нашёлся после загрузки");
-    let вернулось = s.with(&mut io, &id, |b| b.map(Vec::from));
-    assert_eq!(вернулось.as_deref(), Some(&bytes(1, 5000)[..]), "содержимое не сошлось");
+    let returned = s.with(&mut io, &id, |b| b.map(Vec::from));
+    assert_eq!(returned.as_deref(), Some(&bytes(1, 5000)[..]), "содержимое не сошлось");
 }
 
 #[test]
 fn одинаковые_байты_кладутся_один_раз() {
     let mut s = Store::new();
     let a = s.put(b"void");
-    let было = s.len();
+    let prev = s.len();
     let b = s.put(b"void");
     assert_eq!(a, b, "один и тот же вход дал разные адреса");
-    assert_eq!(s.len(), было, "дедупликация не сработала: объект лёг вторым");
+    assert_eq!(s.len(), prev, "дедупликация не сработала: объект лёг вторым");
 }
 
 // ─── обещание второе: корни ──────────────────────────────────────────────────
@@ -114,38 +114,38 @@ fn сборка_мусора_щадит_достижимое_и_убирает_�
     let mut io = Ram::new(4096);
     let mut s = Store::new();
 
-    let лист = s.put("лист: на него ссылается узел".as_bytes());
-    let узел = s.put_node("узел".as_bytes(), &[лист]);
-    let сирота = s.put("сирота: на неё не ссылается никто".as_bytes());
-    s.set_root("корень", узел);
+    let leaf = s.put("лист: на него ссылается узел".as_bytes());
+    let node = s.put_node("узел".as_bytes(), &[leaf]);
+    let orphan = s.put("сирота: на неё не ссылается никто".as_bytes());
+    s.set_root("корень", node);
     assert!(s.commit(&mut io));
 
-    let (было, стало) = s.gc(&mut io);
-    assert!(было > стало, "сборка не убрала ничего (было {было}, стало {стало})");
+    let (prev, now) = s.gc(&mut io);
+    assert!(prev > now, "сборка не убрала ничего (было {prev}, стало {now})");
 
     // Достижимое живо — И САМО, И ПО ССЫЛКЕ. Второе важнее: ссылка из узла — единственное,
     // что держит лист, и именно её легко потерять при правке обхода.
-    assert!(s.with(&mut io, &узел, |b| b.is_some()), "узел собран");
-    assert!(s.with(&mut io, &лист, |b| b.is_some()), "ЛИСТ СОБРАН по ссылке");
+    assert!(s.with(&mut io, &node, |b| b.is_some()), "узел собран");
+    assert!(s.with(&mut io, &leaf, |b| b.is_some()), "ЛИСТ СОБРАН по ссылке");
     // Недостижимое — ушло.
-    assert!(!s.with(&mut io, &сирота, |b| b.is_some()), "сирота пережила сборку");
+    assert!(!s.with(&mut io, &orphan, |b| b.is_some()), "сирота пережила сборку");
 }
 
 #[test]
 fn снятый_корень_перестаёт_держать_своё_дерево() {
     let mut io = Ram::new(4096);
     let mut s = Store::new();
-    let лист = s.put("держится только корнем".as_bytes());
-    let узел = s.put_node("узел".as_bytes(), &[лист]);
-    s.set_root("временный", узел);
+    let leaf = s.put("держится только корнем".as_bytes());
+    let node = s.put_node("узел".as_bytes(), &[leaf]);
+    s.set_root("временный", node);
     assert!(s.commit(&mut io));
     s.gc(&mut io);
-    assert!(s.with(&mut io, &лист, |b| b.is_some()), "лист собран при живом корне");
+    assert!(s.with(&mut io, &leaf, |b| b.is_some()), "лист собран при живом корне");
 
     s.del_root("временный");
     s.gc(&mut io);
     assert!(
-        !s.with(&mut io, &лист, |b| b.is_some()),
+        !s.with(&mut io, &leaf, |b| b.is_some()),
         "лист пережил снятие последнего корня, который его держал"
     );
 }
@@ -157,29 +157,29 @@ fn снятый_корень_перестаёт_держать_своё_дере
 #[test]
 fn хвост_носителя_не_трогают() {
     let mut io = Ram::new(600);
-    let ёмкость = io.capacity();
+    let capacity = io.capacity();
     let mut s = Store::new();
     // Пишем, пока принимает, — именно так и наступают на границу.
     for i in 0..400u32 {
         s.put(&bytes(i as u8, 1200));
     }
-    let конец = s.put("конец".as_bytes());
-    s.set_root("много", конец);
+    let end = s.put("конец".as_bytes());
+    s.set_root("много", end);
     s.commit(&mut io);
 
-    let запретные = ёмкость - TAIL_RESERVED;
-    let нарушение = io.touched.iter().copied().find(|&sec| sec >= запретные);
-    assert_eq!(нарушение, None, "store написал в зарезервированный хвост носителя");
+    let forbidden = capacity - TAIL_RESERVED;
+    let violation = io.touched.iter().copied().find(|&sec| sec >= forbidden);
+    assert_eq!(violation, None, "store написал в зарезервированный хвост носителя");
 }
 
 #[test]
 fn место_для_опытов_лежит_в_хвосте_и_внутри_носителя() {
     // Маленький носитель — места для опытов нет вовсе, и это честный ответ, а не адрес наугад.
     assert_eq!(scratch_sector(4), None);
-    for ёмкость in [1024u64, 65536, 1 << 20] {
-        let s = scratch_sector(ёмкость).expect("на таком носителе место должно найтись");
-        assert!(s < ёмкость, "адрес за пределами носителя");
-        assert!(s >= ёмкость - TAIL_RESERVED, "адрес не в зарезервированном хвосте");
+    for capacity in [1024u64, 65536, 1 << 20] {
+        let s = scratch_sector(capacity).expect("на таком носителе место должно найтись");
+        assert!(s < capacity, "адрес за пределами носителя");
+        assert!(s >= capacity - TAIL_RESERVED, "адрес не в зарезервированном хвосте");
     }
 }
 
@@ -202,15 +202,15 @@ fn кончившееся_место_замечено_а_не_пропущено
 fn поколение_растёт_с_каждым_коммитом() {
     let mut io = Ram::new(4096);
     let mut s = Store::new();
-    let было = s.generation();
+    let prev = s.generation();
     s.put("раз".as_bytes());
     assert!(s.commit(&mut io));
-    let после_первого = s.generation();
-    assert!(после_первого > было, "поколение не выросло после коммита");
+    let after_first = s.generation();
+    assert!(after_first > prev, "поколение не выросло после коммита");
 
     s.put("два".as_bytes());
     assert!(s.commit(&mut io));
-    assert!(s.generation() > после_первого, "поколение не выросло после второго коммита");
+    assert!(s.generation() > after_first, "поколение не выросло после второго коммита");
 }
 
 #[test]

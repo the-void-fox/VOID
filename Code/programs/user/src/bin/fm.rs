@@ -983,9 +983,9 @@ impl App {
     fn load_marks(&mut self) {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut buf = alloc::vec![0u8; 4096];
-        let мой = sys::state::load(Self::MARKS_FILE, &mut buf).map(|n| buf[..n].to_vec());
-        let переезд = мой.is_none();
-        let text = мой.or_else(|| ui::font::read_path(Self::MARKS_WAS));
+        let mine = sys::state::load(Self::MARKS_FILE, &mut buf).map(|n| buf[..n].to_vec());
+        let slide = mine.is_none();
+        let text = mine.or_else(|| ui::font::read_path(Self::MARKS_WAS));
         if let Some(text) = text {
             for line in String::from_utf8_lossy(&text).lines() {
                 let p = line.trim();
@@ -994,7 +994,7 @@ impl App {
                 }
             }
         }
-        if !out.is_empty() && переезд {
+        if !out.is_empty() && slide {
             // Прочитали со старого места — переписываем на новое. Старый файл убираем своим
             // широким правом: держать две копии значит ждать, когда они разойдутся.
             self.marks = out.clone();

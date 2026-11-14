@@ -5,7 +5,7 @@
 //! (описание пакета, README из store). Дешевле держать разборщик целым заранее, чем вспоминать
 //! про него в тот день.
 
-fn корпус() -> Vec<Vec<u8>> {
+fn corpus() -> Vec<Vec<u8>> {
     vec![
         "# Заголовок\n\nАбзац с `кодом` и **жирным**.\n\n- пункт\n- второй\n\n```sh\nls -la\n```\n".as_bytes().to_vec(),
         b"| a | b |\n|---|---|\n| 1 | 2 |\n".to_vec(),
@@ -15,12 +15,12 @@ fn корпус() -> Vec<Vec<u8>> {
 
 #[test]
 fn разбор_разметки_не_паникует_на_мусоре() {
-    void_fuzz::run("md::parse", 2026, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("md::parse", 2026, void_fuzz::rounds(), &corpus(), |b| {
         let s = String::from_utf8_lossy(b);
         let blocks = void_md::parse(&s);
         // Ширина — тоже вход: окно документации отдаёт свою, а она бывает крохотной.
-        for ширина in [0usize, 1, 80, usize::MAX] {
-            let _ = void_md::render_text(&blocks, ширина);
+        for width in [0usize, 1, 80, usize::MAX] {
+            let _ = void_md::render_text(&blocks, width);
         }
     });
 }

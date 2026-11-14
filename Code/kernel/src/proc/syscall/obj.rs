@@ -342,17 +342,17 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     }
                     Err(e) => {
                         crate::println!("  [install] обновление отклонено: {}", e);
-                        сказать_причину(t, cur, eptr, elen, e);
+                        say_reason(t, cur, eptr, elen, e);
                         usize::MAX
                     }
                 },
                 // Веха 227.1 — вместе с номером диска едет ПОЖЕЛАНИЕ установщика (`buf`/`len`):
                 // режим сеанса, язык, имя машины. Те же два аргумента, что перечисляют диски при
                 // `op = 0`, — новых у вызова не появилось.
-                Ok(()) => match читать_пожелание(t, cur, ptr, len) {
+                Ok(()) => match read_wish(t, cur, ptr, len) {
                     None => {
                         crate::println!("  [install] отказ: пожелание установки не читается");
-                        сказать_причину(t, cur, eptr, elen, "пожелание установки не читается");
+                        say_reason(t, cur, eptr, elen, "пожелание установки не читается");
                         usize::MAX
                     }
                     Some(setup) => match crate::install::run(slot, &setup) {
@@ -362,7 +362,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         }
                         Err(e) => {
                             crate::println!("  [install] отказ: {}", e);
-                            сказать_причину(t, cur, eptr, elen, e);
+                            say_reason(t, cur, eptr, elen, e);
                             usize::MAX
                         }
                     },
@@ -554,12 +554,12 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
 /// Потолок намеренно мал: пожелание — три-четыре строки вида `mode wm`. Всё, что длиннее,
 /// означает ошибку вызывающего, а не настройку, и отказать здесь дешевле, чем выяснять потом,
 /// почему свежая система не поднялась.
-fn читать_пожелание(t: &Table, cur: usize, ptr: usize, len: usize) -> Option<alloc::string::String> {
-    const ПОТОЛОК: usize = 512;
+fn read_wish(t: &Table, cur: usize, ptr: usize, len: usize) -> Option<alloc::string::String> {
+    const LIMIT: usize = 512;
     if len == 0 {
         return Some(alloc::string::String::new());
     }
-    if len > ПОТОЛОК || !ensure_heap_range(t, cur, ptr, len) {
+    if len > LIMIT || !ensure_heap_range(t, cur, ptr, len) {
         return None;
     }
     // SAFETY: диапазон проверен выше — он же дотянул ленивые страницы кучи.
@@ -577,7 +577,7 @@ fn читать_пожелание(t: &Table, cur: usize, ptr: usize, len: usize
 /// Буфер — аргументы 5 и 6 того же вызова (раньше не использовались), текст кладётся с нулём на
 /// конце. Нет буфера или он не читается — молча пропускаем: отказ УЖЕ произошёл, и ронять его
 /// ещё и об это незачем.
-fn сказать_причину(t: &Table, cur: usize, ptr: usize, len: usize, why: &str) {
+fn say_reason(t: &Table, cur: usize, ptr: usize, len: usize, why: &str) {
     if ptr == 0 || len < 2 || !ensure_heap_range(t, cur, ptr, len) {
         return;
     }

@@ -95,9 +95,9 @@ fn head_is(items: &[Value], sym: &str) -> bool {
 ///
 /// Возвращается список претензий, по одной на строку; пустой список — конфиг чист.
 pub fn check_config(norm: &str) -> alloc::vec::Vec<alloc::string::String> {
-    let mut беды = alloc::vec::Vec::new();
+    let mut problems = alloc::vec::Vec::new();
     // Первым проходом — кто вообще объявлен: на них ссылаются `endpoint:`.
-    let объявлены: alloc::vec::Vec<&str> = norm
+    let declared: alloc::vec::Vec<&str> = norm
         .lines()
         .filter_map(|l| {
             let mut w = l.split_whitespace();
@@ -111,26 +111,26 @@ pub fn check_config(norm: &str) -> alloc::vec::Vec<alloc::string::String> {
         if !void_conf::spawns_program(kind) {
             continue;
         }
-        let Some(имя) = w.next() else { continue };
+        let Some(name) = w.next() else { continue };
         for tok in w {
-            if let Err(почему) = void_conf::check_cap_token(tok) {
-                беды.push(alloc::format!("{} {}: `{}` — {}", kind, имя, tok, почему));
+            if let Err(why) = void_conf::check_cap_token(tok) {
+                problems.push(alloc::format!("{} {}: `{}` — {}", kind, name, tok, why));
                 continue;
             }
             // Ссылку на сервер проверяем здесь: по одному токену не видно, есть ли такой.
-            let база = tok.strip_suffix('!').unwrap_or(tok);
-            if let Some(rest) = база.strip_prefix("endpoint:") {
-                let сервер = rest.split(':').next().unwrap_or(rest);
-                if !объявлены.contains(&сервер) {
-                    беды.push(alloc::format!(
+            let base_addr = tok.strip_suffix('!').unwrap_or(tok);
+            if let Some(rest) = base_addr.strip_prefix("endpoint:") {
+                let server = rest.split(':').next().unwrap_or(rest);
+                if !declared.contains(&server) {
+                    problems.push(alloc::format!(
                         "{} {}: `{}` — такого сервера в конфиге нет",
-                        kind, имя, tok
+                        kind, name, tok
                     ));
                 }
             }
         }
     }
-    беды
+    problems
 }
 
 /// Веха 220.1 — ЧТО НОВЫЙ КОНФИГ ТЕРЯЕТ по сравнению со старым.
@@ -143,7 +143,7 @@ pub fn check_config(norm: &str) -> alloc::vec::Vec<alloc::string::String> {
 /// Сравниваются программы (`service`/`shell`) по имени и их права по токенам. Возвращается список
 /// потерь; пустой — новый конфиг умеет всё, что умел старый.
 pub fn lost_entries(old: &str, new: &str) -> alloc::vec::Vec<alloc::string::String> {
-    let программы = |t: &str| -> alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<alloc::string::String>)> {
+    let programs = |t: &str| -> alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<alloc::string::String>)> {
         t.lines()
             .filter_map(|l| {
                 let mut w = l.split_whitespace();
@@ -151,31 +151,31 @@ pub fn lost_entries(old: &str, new: &str) -> alloc::vec::Vec<alloc::string::Stri
                 if !void_conf::spawns_program(kind) {
                     return None;
                 }
-                let имя = w.next()?;
+                let name = w.next()?;
                 Some((
-                    alloc::format!("{} {}", kind, имя),
+                    alloc::format!("{} {}", kind, name),
                     w.map(alloc::string::String::from).collect(),
                 ))
             })
             .collect()
     };
-    let (было, стало) = (программы(old), программы(new));
-    let mut потери = alloc::vec::Vec::new();
-    for (имя, права) in &было {
-        match стало.iter().find(|(n, _)| n == имя) {
-            None => потери.push(alloc::format!("{} — программы больше нет", имя)),
-            Some((_, новые)) => {
-                for p in права {
+    let (prev, now) = (programs(old), programs(new));
+    let mut lost = alloc::vec::Vec::new();
+    for (name, rights) in &prev {
+        match now.iter().find(|(n, _)| n == name) {
+            None => lost.push(alloc::format!("{} — программы больше нет", name)),
+            Some((_, fresh)) => {
+                for p in rights {
                     // Аргументы не права: их меняют осознанно и часто (`arg:ssid=…`), и
                     // предупреждать о каждой правке значило бы приучить не читать.
-                    if !p.starts_with("arg:") && !новые.contains(p) {
-                        потери.push(alloc::format!("{} — нет права `{}`", имя, p));
+                    if !p.starts_with("arg:") && !fresh.contains(p) {
+                        lost.push(alloc::format!("{} — нет права `{}`", name, p));
                     }
                 }
             }
         }
     }
-    потери
+    lost
 }
 
 /// Веха 219.1 — КОРНИ STORE, НАЗВАННЫЕ КОНФИГОМ.

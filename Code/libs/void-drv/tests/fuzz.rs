@@ -4,7 +4,7 @@
 //! разбор обязан быть не только безопасным, но и строгим: всё, что он не понял, должно быть
 //! отказом, а не догадкой.
 
-fn корпус() -> Vec<Vec<u8>> {
+fn corpus() -> Vec<Vec<u8>> {
     vec![
         br#"Derive([("out","/nix/store/aaa-x","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("name","x")])"#.to_vec(),
         br#"Derive([("out","/nix/store/b-y","sha256","deadbeef")],[("/nix/store/c.drv",["out"])],["/nix/store/d"],"x86_64-linux","/bin/sh",[],[])"#.to_vec(),
@@ -14,7 +14,7 @@ fn корпус() -> Vec<Vec<u8>> {
 
 #[test]
 fn разбор_деривации_не_паникует_на_мусоре() {
-    void_fuzz::run("drv::parse", 2026, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("drv::parse", 2026, void_fuzz::rounds(), &corpus(), |b| {
         let _ = void_drv::parse(b);
     });
 }

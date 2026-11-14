@@ -696,16 +696,16 @@ fn run_rebuild() {
     // система меняется только в одну сторону — становится беднее, а человек узнаёт об этом
     // последним. Ровно так дважды пропадала сеть.
     if let Some(cn) = &cur {
-        if let Some(старый) = gen_content_id(scap, cn).and_then(|id| gen_text(scap, &id)) {
-            let потери = vvsh_core::lost_entries(&старый, &norm);
-            if !потери.is_empty() {
+        if let Some(old) = gen_content_id(scap, cn).and_then(|id| gen_text(scap, &id)) {
+            let lost = vvsh_core::lost_entries(&old, &norm);
+            if !lost.is_empty() {
                 sys::write(
                     tf("vvsh: ВНИМАНИЕ — по сравнению с {} теряется:\n", &[
                         core::str::from_utf8(cn).unwrap_or("?"),
                     ])
                     .as_bytes(),
                 );
-                for p in &потери {
+                for p in &lost {
                     sys::write(tf("vvsh:   {}\n", &[p]).as_bytes());
                 }
             }
@@ -768,16 +768,16 @@ const ARCH: &str = "riscv64";
 /// разошёлся бы с кодом на первой же вехе, и разошёлся бы молча. Здесь расходиться не на чем.
 fn sh_doc(args: &[Value]) -> Result<Value, EvalError> {
     let scap = cap_store();
-    let Some(раздел) = args.first() else {
+    let Some(part) = args.first() else {
         // Без имени — что вообще есть. Список берётся из store, а не из таблицы здесь: разделы
         // приезжают с образом, и знать их наперёд шеллу неоткуда.
         let mut out = String::from("разделы руководства (`doc ИМЯ`):
 ");
         match roots::text(scap) {
             Some(list) => {
-                for имя in roots::suffixes(&list, b"doc/") {
+                for name in roots::suffixes(&list, b"doc/") {
                     out.push_str("  ");
-                    out.push_str(core::str::from_utf8(имя).unwrap_or("?"));
+                    out.push_str(core::str::from_utf8(name).unwrap_or("?"));
                     out.push('\n');
                 }
             }
@@ -788,18 +788,18 @@ fn sh_doc(args: &[Value]) -> Result<Value, EvalError> {
 ");
         return Ok(Value::str(&out));
     };
-    let Value::Str(имя) = раздел else {
+    let Value::Str(name) = part else {
         return Err(EvalError::new("doc: (doc \"имя раздела\")"));
     };
-    if &**имя == "entries" {
+    if &**name == "entries" {
         return Ok(Value::str(&config_entries()));
     }
-    let корень = alloc::format!("doc/{}", имя);
+    let root = alloc::format!("doc/{}", name);
     let mut id = [0u8; 32];
-    if sys::obj_get_root(scap, корень.as_bytes(), &mut id) != 32 {
+    if sys::obj_get_root(scap, root.as_bytes(), &mut id) != 32 {
         return Err(EvalError::new(alloc::format!(
             "doc: нет раздела «{}» — список покажет `doc` без имени",
-            имя
+            name
         )));
     }
     let mut buf = alloc::vec![0u8; 64 * 1024];
@@ -808,7 +808,7 @@ fn sh_doc(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::new("doc: раздел не читается целиком"));
     }
     buf.truncate(got);
-    let текст = match String::from_utf8(buf) {
+    let text = match String::from_utf8(buf) {
         Ok(t) => t,
         Err(_) => return Err(EvalError::new("doc: раздел не текст")),
     };
@@ -816,8 +816,8 @@ fn sh_doc(args: &[Value]) -> Result<Value, EvalError> {
     // таблицы палками, код тройными кавычками. В терминале это читается плохо, а таблица — не
     // читается вовсе: `| что | где |` не колонки, а строка со знаками. Ширину берём у окна: свой
     // размер знает только оно, и переносить под чужой — значит переносить мимо.
-    let ширина = sys::stdio::win_size().map_or(78, |(c, _)| c as usize);
-    Ok(Value::str(&void_md::render_text(&void_md::parse(&текст), ширина)))
+    let width = sys::stdio::win_size().map_or(78, |(c, _)| c as usize);
+    Ok(Value::str(&void_md::render_text(&void_md::parse(&text), width)))
 }
 
 /// Веха 223 — виды записей конфига ИЗ СЛОВАРЯ. Не список здесь, а то, по чему система работает.
@@ -862,7 +862,7 @@ fn config_entries() -> String {
 /// Чего НЕ проверяем: есть ли в ЭТОЙ машине названное устройство. Один конфиг ездит по разным
 /// машинам, и `mmio:wifi` на машине без беспроводной карты — верная строка, а не ошибка.
 fn check_strict(scap: usize, norm: &str) -> bool {
-    let mut беды = vvsh_core::check_config(norm);
+    let mut problems = vvsh_core::check_config(norm);
     // Программы — по списку корней store. Читается он один раз и целиком: частичный список
     // сказал бы «программы нет» о программе, которая есть.
     match roots::text(scap) {
@@ -873,21 +873,21 @@ fn check_strict(scap: usize, norm: &str) -> bool {
                 if !void_conf::spawns_program(kind) {
                     continue;
                 }
-                let Some(имя) = w.next() else { continue };
-                let корень = alloc::format!("bin/{}/{}", ARCH, имя);
-                if !roots::has(&list, корень.as_bytes()) {
-                    беды.push(alloc::format!("{} {}: такой программы в store нет", kind, имя));
+                let Some(name) = w.next() else { continue };
+                let root = alloc::format!("bin/{}/{}", ARCH, name);
+                if !roots::has(&list, root.as_bytes()) {
+                    problems.push(alloc::format!("{} {}: такой программы в store нет", kind, name));
                 }
             }
         }
-        None => беды.push(alloc::string::String::from(
+        None => problems.push(alloc::string::String::from(
             "список корней store не читается — проверить программы нечем",
         )),
     }
-    if беды.is_empty() {
+    if problems.is_empty() {
         return true;
     }
-    for b in &беды {
+    for b in &problems {
         sys::write(tf("vvsh: {}\n", &[b]).as_bytes());
     }
     sys::write(sys::i18n::t("vvsh: поколение не собрано\n").as_bytes());
@@ -913,17 +913,17 @@ fn check_store_refs(scap: usize, norm: &str) -> bool {
         );
         return false;
     };
-    let mut плохих = 0;
+    let mut bad_count = 0;
     for r in refs {
         if r.is_empty() {
             sys::write(sys::i18n::t("vvsh: в конфиге `=@` без имени корня\n").as_bytes());
-            плохих += 1;
+            bad_count += 1;
         } else if !roots::has(&list, r.as_bytes()) {
             sys::write(tf("vvsh: нет корня {} — задай его `secret {}`\n", &[r, r]).as_bytes());
-            плохих += 1;
+            bad_count += 1;
         }
     }
-    if плохих > 0 {
+    if bad_count > 0 {
         sys::write(sys::i18n::t("vvsh: поколение не собрано\n").as_bytes());
         return false;
     }
@@ -1115,8 +1115,8 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     }
     // Веха 230.4 — `&` ПОСЛЕДНИМ СЛОВОМ значит «не жди». Отдельным словом, а не приклеенным к
     // команде (`sleep&`): так его видно в строке, и разбирать нечего — слова уже нарезаны.
-    let фоном = words.last() == Some(&b"&".as_slice());
-    if фоном {
+    let background = words.last() == Some(&b"&".as_slice());
+    if background {
         words.pop();
         if words.is_empty() {
             return sys::write(sys::i18n::t("vvsh: `&` без команды\n").as_bytes());
@@ -1134,7 +1134,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
         Ok(s) => s,
         Err(_) => return sys::write(sys::i18n::t("vvsh: имя команды не UTF-8\n").as_bytes()),
     };
-    if фоном {
+    if background {
         // В фон уходят только ПРОГРАММЫ: встроенная команда исполняется внутри процесса шелла,
         // и отправить её в фон нечем. Сказать об этом прямо честнее, чем выполнить её молча
         // не так, как просили.
@@ -1198,32 +1198,32 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
 /// тем, что владелец разбирал руками.
 fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
     // Хвост `> путь` отрезаем первым: он не звено, а место назначения.
-    let mut тело = words;
-    let mut файл: Option<alloc::vec::Vec<u8>> = None;
+    let mut body = words;
+    let mut file: Option<alloc::vec::Vec<u8>> = None;
     if let Some(i) = words.iter().rposition(|w| *w == b">") {
         if i + 2 != words.len() {
             return sys::write(sys::i18n::t("vvsh: `>` хочет ПУТЬ и ничего после\n").as_bytes());
         }
         // Команды, разбирающие `>` сами (они пишут потоком, а не собранным текстом), остаются
         // при своём: их имя стоит первым, и звено у строки одно.
-        let сама = matches!(core::str::from_utf8(words[0]), Ok("klog" | "echo" | "cat"))
+        let self_prints = matches!(core::str::from_utf8(words[0]), Ok("klog" | "echo" | "cat"))
             && !words[..i].iter().any(|w| *w == b">>" || *w == b"|>");
-        if !сама {
-            файл = Some(resolve(words[i + 1]));
-            тело = &words[..i];
+        if !self_prints {
+            file = Some(resolve(words[i + 1]));
+            body = &words[..i];
         }
     }
     // Звенья.
-    let mut звенья: alloc::vec::Vec<&[&[u8]]> = alloc::vec::Vec::new();
-    let mut от = 0usize;
-    for (i, w) in тело.iter().enumerate() {
+    let mut links: alloc::vec::Vec<&[&[u8]]> = alloc::vec::Vec::new();
+    let mut from = 0usize;
+    for (i, w) in body.iter().enumerate() {
         if *w == b">>" || *w == b"|>" {
-            звенья.push(&тело[от..i]);
-            от = i + 1;
+            links.push(&body[from..i]);
+            from = i + 1;
         }
     }
-    звенья.push(&тело[от..]);
-    if звенья.iter().any(|з| з.is_empty()) {
+    links.push(&body[from..]);
+    if links.iter().any(|z| z.is_empty()) {
         return sys::write(
             sys::i18n::t("vvsh: у конвейера пустое звено — нужна команда с обеих сторон знака\n")
                 .as_bytes(),
@@ -1231,30 +1231,30 @@ fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
     }
     // Гоним текст слева направо. Первое звено идёт без входа, каждое следующее получает текст
     // предыдущего последним аргументом.
-    let mut текст: Option<String> = None;
-    let последнее = звенья.len() - 1;
-    for (n, звено) in звенья.iter().enumerate() {
+    let mut text: Option<String> = None;
+    let last = links.len() - 1;
+    for (n, link) in links.iter().enumerate() {
         // Последнему звену текст нужен, только если итог никуда не уезжает дальше: иначе его
         // значение тоже надо взять, а не напечатать.
-        let берём_значение = n < последнее || файл.is_some();
-        let итог = run_stage(interp, env, звено, текст.as_deref(), берём_значение);
-        match итог {
-            Ok(t) => текст = t,
+        let takes_value = n < last || file.is_some();
+        let result = run_stage(interp, env, link, text.as_deref(), takes_value);
+        match result {
+            Ok(t) => text = t,
             Err(e) => return sys::write(e.as_bytes()),
         }
-        if берём_значение && текст.is_none() {
+        if takes_value && text.is_none() {
             return sys::write(
                 alloc::format!(
                     "vvsh: `{}` ничего не отдала — передавать дальше нечего\n",
-                    String::from_utf8_lossy(звено[0]),
+                    String::from_utf8_lossy(link[0]),
                 )
                 .as_bytes(),
             );
         }
     }
     // Итог: в файл либо на экран.
-    let Some(path) = файл else { return };
-    let Some(text) = текст else { return };
+    let Some(path) = file else { return };
+    let Some(text) = text else { return };
     let fd = px::open(cap_fs(), &path, px::O_TRUNC);
     if fd == usize::MAX {
         return sys::write(
@@ -1275,33 +1275,33 @@ fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
 fn run_stage(
     interp: &vvsh_core::Interp,
     env: &Env,
-    звено: &[&[u8]],
-    вход: Option<&str>,
-    нужен_текст: bool,
+    link: &[&[u8]],
+    input: Option<&str>,
+    needs_text: bool,
 ) -> Result<Option<String>, String> {
-    let head = core::str::from_utf8(звено[0]).unwrap_or("");
+    let head = core::str::from_utf8(link[0]).unwrap_or("");
     // Программа: запускаем, собрав её вывод, и отдаём ей вход конвейера её же `stdin`
     // (Веха 228.2). До этого шелл здесь отказывал, и конвейер работал только между своими
     // формами — то есть ровно до первой настоящей программы.
     if !env.lookup(head).is_some_and(|v| is_callable(&v)) {
-        let args: alloc::vec::Vec<&[u8]> = звено[1..].to_vec();
-        let вход_байт = вход.map(|s| s.as_bytes()).unwrap_or(&[]);
-        let out = run_captured(звено[0], &args, вход_байт).ok_or_else(|| {
+        let args: alloc::vec::Vec<&[u8]> = link[1..].to_vec();
+        let input_byte = input.map(|s| s.as_bytes()).unwrap_or(&[]);
+        let out = run_captured(link[0], &args, input_byte).ok_or_else(|| {
             alloc::format!(
                 "{}{}\n",
                 sys::i18n::t("vvsh: команда не найдена: "),
                 head,
             )
         })?;
-        if !нужен_текст {
+        if !needs_text {
             sys::write(out.as_bytes());
             return Ok(None);
         }
         return Ok(Some(out));
     }
     // Команда шелла: вычисляем форму, дописав вход последним аргументом.
-    let form = build_command_form(звено, env).map_err(|e| alloc::format!("vvsh: {e}\n"))?;
-    let form = match (вход, form) {
+    let form = build_command_form(link, env).map_err(|e| alloc::format!("vvsh: {e}\n"))?;
+    let form = match (input, form) {
         (Some(t), Value::List(items)) => {
             let mut v = items.to_vec();
             v.push(Value::str(t));
@@ -1311,7 +1311,7 @@ fn run_stage(
     };
     match interp.eval(&form, env) {
         Ok(Value::Str(s)) => Ok(Some(String::from(&*s))),
-        Ok(v) if !нужен_текст => {
+        Ok(v) if !needs_text => {
             render(&v);
             Ok(None)
         }
@@ -1350,7 +1350,7 @@ fn run_stage(
 /// Отдаём КУСКАМИ по запросу (`want` в теле запроса), как это делает терминал: ответ больше
 /// буфера ядро обрежет, а мы бы уже посчитали байты отданными (та же ловушка Вехи 101).
 /// Вход кончился — пустой ответ, и программа читает его как конец, а не как «ещё подожди».
-fn run_captured(name: &[u8], args: &[&[u8]], вход: &[u8]) -> Option<alloc::string::String> {
+fn run_captured(name: &[u8], args: &[&[u8]], input: &[u8]) -> Option<alloc::string::String> {
     let mut blob = alloc::vec::Vec::new();
     for w in args {
         blob.extend_from_slice(w);
@@ -1363,7 +1363,7 @@ fn run_captured(name: &[u8], args: &[&[u8]], вход: &[u8]) -> Option<alloc::s
     });
     let pid = pid?;
     let mut out = alloc::string::String::new();
-    let mut отдано = 0usize; // сколько байт входа программа уже забрала
+    let mut given = 0usize; // сколько байт входа программа уже забрала
     let mut msg = [0u8; sys::stdio::CHUNK + 64];
     loop {
         // Спим коротко: пока ребёнок пишет — просыпаемся на его сообщения, пока молчит — на
@@ -1387,14 +1387,14 @@ fn run_captured(name: &[u8], args: &[&[u8]], вход: &[u8]) -> Option<alloc::s
                         sys::stdio::CHUNK
                     };
                     let want = want.clamp(1, sys::stdio::CHUNK - 1);
-                    let n = (вход.len() - отдано).min(want);
+                    let n = (input.len() - given).min(want);
                     if n == 0 {
                         sys::reply(m.reply_cap, &[]);
                     } else {
                         let mut rep = alloc::vec::Vec::with_capacity(n + 1);
                         rep.push(sys::stdio::IN_BYTES);
-                        rep.extend_from_slice(&вход[отдано..отдано + n]);
-                        отдано += n;
+                        rep.extend_from_slice(&input[given..given + n]);
+                        given += n;
                         sys::reply(m.reply_cap, &rep);
                     }
                 }
@@ -1586,12 +1586,12 @@ fn jobs_reap() {
         match list[i].done {
             Some(code) => {
                 let j = list.remove(i);
-                let итог = if code == 0 {
+                let result = if code == 0 {
                     String::from(sys::i18n::t("готово"))
                 } else {
                     alloc::format!("{} {}", sys::i18n::t("код"), code)
                 };
-                sys::write(alloc::format!("[{}] {}: {}\n", j.n, итог, j.cmd).as_bytes());
+                sys::write(alloc::format!("[{}] {}: {}\n", j.n, result, j.cmd).as_bytes());
             }
             None => i += 1,
         }
@@ -1606,12 +1606,12 @@ fn sh_jobs(_args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::nil());
     }
     for j in list.iter() {
-        let состояние = match sys::wait(j.pid, true) {
+        let state = match sys::wait(j.pid, true) {
             sys::Wait::Running => String::from(sys::i18n::t("работает")),
             sys::Wait::Exited(code) => alloc::format!("{} {}", sys::i18n::t("кончилась, код"), code),
             sys::Wait::NoChild => String::from(sys::i18n::t("пропала")),
         };
-        sys::write(alloc::format!("[{}] {} {} — {}\n", j.n, j.pid, состояние, j.cmd).as_bytes());
+        sys::write(alloc::format!("[{}] {} {} — {}\n", j.n, j.pid, state, j.cmd).as_bytes());
     }
     Ok(Value::nil())
 }
@@ -2359,7 +2359,7 @@ fn sh_freeze(args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::nil());
     }
     let list = String::from_utf8_lossy(&names[..n]).into_owned();
-    let mut сказано = false;
+    let mut said = false;
     for name in list.lines() {
         let name = name.trim();
         // Подкаталогов в своём месте не предусмотрено, и замораживать их нечем.
@@ -2374,10 +2374,10 @@ fn sh_freeze(args: &[Value]) -> Result<Value, EvalError> {
                 continue;
             }
             sys::write(alloc::format!("app(\"{who}\", \"{name}\", \"{line}\"),\n").as_bytes());
-            сказано = true;
+            said = true;
         }
     }
-    if сказано {
+    if said {
         sys::write(
             sys::i18n::t("↑ вставьте в список `state` файла /etc/system/apps.vv, затем `rebuild`\n")
                 .as_bytes(),
@@ -3455,7 +3455,7 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
 
     // 1. Найти само устройство. Встроенная графика Intel всегда 00:02.0, но ищем перебором:
     // утверждение «всегда» проверяется дешевле, чем потом объясняется.
-    let Some((bdf, vendor_device, class)) = intel_найти(hw) else {
+    let Some((bdf, vendor_device, class)) = intel_find(hw) else {
         out.push_str("устройство: не найдено (вендор 8086 + класс 0x03 на шине 0)\n");
         return Ok(Value::str(&out));
     };
@@ -3498,7 +3498,7 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
 
     // 3. Конвейеры и плоскости — что показывает железо прямо сейчас.
     for i in 0..2 {
-        let имя = if i == 0 { 'A' } else { 'B' };
+        let name = if i == 0 { 'A' } else { 'B' };
         let conf = sys::hw_read(hw, bar0 + intel_reg::PIPECONF[i]).unwrap_or(0);
         let src = sys::hw_read(hw, bar0 + intel_reg::PIPESRC[i]).unwrap_or(0);
         let cntr = sys::hw_read(hw, bar0 + intel_reg::DSPCNTR[i]).unwrap_or(0);
@@ -3508,7 +3508,7 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
         let tileoff = sys::hw_read(hw, bar0 + intel_reg::DSPTILEOFF[i]).unwrap_or(0);
         out.push_str(&alloc::format!(
             "\nконвейер {}  {}  источник {}×{}  (PIPECONF {:#010x})\n",
-            имя,
+            name,
             if conf & (1 << 31) != 0 { "ВКЛЮЧЁН" } else { "выключен" },
             (src >> 16) + 1,
             (src & 0xffff) + 1,
@@ -3516,9 +3516,9 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
         ));
         out.push_str(&alloc::format!(
             "  плоскость {}  {}  {}  шаг {} Б  плитка {}  (DSPCNTR {:#010x})\n",
-            имя,
+            name,
             if cntr & (1 << 31) != 0 { "ВКЛЮЧЕНА" } else { "выключена" },
-            intel_формат((cntr >> 26) & 0xf),
+            intel_pixel_format((cntr >> 26) & 0xf),
             stride,
             if cntr & (1 << 10) != 0 { "ДА" } else { "нет" },
             cntr,
@@ -3542,15 +3542,15 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
         ));
         // Та самая цепочка: поверхность → запись GTT → физическая страница.
         if cntr & (1 << 31) != 0 {
-            let идx = (surf >> 12) as usize;
-            let адрес_записи = bar0 + intel_reg::GTT_OFF + идx * 4;
-            match sys::hw_read(hw, адрес_записи) {
+            let idx = (surf >> 12) as usize;
+            let pte_addr = bar0 + intel_reg::GTT_OFF + idx * 4;
+            match sys::hw_read(hw, pte_addr) {
                 Some(pte) => {
                     let phys = (pte as u64 & 0xffff_f000) | ((pte as u64 & 0xff0) << 28);
                     out.push_str(&alloc::format!(
                         "  запись GTT #{} ({:#x}): {:#010x} → страница {:#x}, годна {}\n",
-                        идx,
-                        адрес_записи,
+                        idx,
+                        pte_addr,
                         pte,
                         phys,
                         if pte & 1 != 0 { "ДА" } else { "НЕТ" },
@@ -3565,20 +3565,20 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
     // куда положить второй буфер и отображён ли он уже. Числа печатаются как есть — куда
     // годится увиденное, решает читатель, а не команда.
     out.push_str("\nтаблица GTT (записи за кадром):\n");
-    for &идx in &[768usize, 769, 1024, 2048, 4096, 8192, 16_383, 16_384, 32_768] {
-        match sys::hw_read(hw, bar0 + intel_reg::GTT_OFF + идx * 4) {
+    for &idx in &[768usize, 769, 1024, 2048, 4096, 8192, 16_383, 16_384, 32_768] {
+        match sys::hw_read(hw, bar0 + intel_reg::GTT_OFF + idx * 4) {
             Some(pte) => {
                 let phys = (pte as u64 & 0xffff_f000) | ((pte as u64 & 0xff0) << 28);
                 out.push_str(&alloc::format!(
                     "  #{:<6} смещение {:#010x}  запись {:#010x}  страница {:#x}  годна {}\n",
-                    идx,
-                    идx * 4096,
+                    idx,
+                    idx * 4096,
                     pte,
                     phys,
                     if pte & 1 != 0 { "да" } else { "нет" },
                 ));
             }
-            None => out.push_str(&alloc::format!("  #{:<6} прочитать не удалось\n", идx)),
+            None => out.push_str(&alloc::format!("  #{:<6} прочитать не удалось\n", idx)),
         }
     }
 
@@ -3594,17 +3594,17 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
         lvds,
         if lvds & (1 << 31) != 0 { "включён" } else { "выключен" },
     ));
-    let период = pch2 >> 16;
-    let уровень = cpu1 & 0xffff;
+    let period = pch2 >> 16;
+    let level = cpu1 & 0xffff;
     out.push_str(&alloc::format!(
         "подсветка  PCH CTL1 {:#010x}  PCH CTL2 {:#010x}  ЦП CTL2 {:#010x}  ЦП CTL {:#010x}\n",
         pch1, pch2, cpu2, cpu1,
     ));
     out.push_str(&alloc::format!(
         "  период (PCH CTL2 старшие 16) {}, уровень (ЦП CTL младшие 16) {} — {} %\n",
-        период,
-        уровень,
-        if период > 0 { уровень * 100 / период } else { 0 },
+        period,
+        level,
+        if period > 0 { level * 100 / period } else { 0 },
     ));
     Ok(Value::str(&out))
 }
@@ -3636,7 +3636,7 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
 /// «поставлено 40 %» было бы враньём.
 fn sh_brightness(args: &[Value]) -> Result<Value, EvalError> {
     let hw = cap_hw("brightness")?;
-    let Some((bdf, _, _)) = intel_найти(hw) else {
+    let Some((bdf, _, _)) = intel_find(hw) else {
         return Err(EvalError::new(
             "brightness: графики Intel на шине нет — этим регистром здесь управлять нечем",
         ));
@@ -3648,43 +3648,43 @@ fn sh_brightness(args: &[Value]) -> Result<Value, EvalError> {
     let cpu2 = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL2).unwrap_or(0);
     let cpu = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL).unwrap_or(0);
     // Максимум — период ШИМ из PCH. Ноль значит, что подсветкой правит не эта пара регистров.
-    let макс = pch2 >> 16;
-    if макс == 0 {
+    let max = pch2 >> 16;
+    if max == 0 {
         return Err(EvalError::new(alloc::format!(
             "brightness: период ШИМ нулевой (PCH CTL2 {:#010x}, CPU CTL {:#010x}) — подсветкой\n\
              правит не эта пара регистров; числа целиком показывает `intel`",
             pch2, cpu,
         )));
     }
-    let сейчас = (cpu & 0xffff) * 100 / макс;
+    let now_val = (cpu & 0xffff) * 100 / max;
     let Some(v) = args.first() else {
         return Ok(Value::str(&alloc::format!(
             "яркость {} % (уровень {} из {})",
-            сейчас,
+            now_val,
             cpu & 0xffff,
-            макс,
+            max,
         )));
     };
-    let Some(хочу) = num(v) else {
+    let Some(want) = num(v) else {
         return Err(EvalError::new("brightness: (brightness) либо (brightness 1..100)"));
     };
-    let хочу = хочу.clamp(5, 100) as u32;
-    let уровень = (макс * хочу / 100).max(1);
+    let want = want.clamp(5, 100) as u32;
+    let level = (max * want / 100).max(1);
     // Старшие биты CPU CTL сохраняем: там у поколения живут служебные признаки, и обнулять их
     // заодно с установкой яркости — менять то, о чём не просили.
-    if !sys::hw_write(hw, bar0 + intel_reg::BLC_CPU_CTL, (cpu & !0xffff) | уровень) {
+    if !sys::hw_write(hw, bar0 + intel_reg::BLC_CPU_CTL, (cpu & !0xffff) | level) {
         return Err(EvalError::new("brightness: записать не удалось (нет права `w`)"));
     }
-    let стало = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL).unwrap_or(0);
-    let вышло = (стало & 0xffff) * 100 / макс;
+    let now = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL).unwrap_or(0);
+    let got = (now & 0xffff) * 100 / max;
     let mut out = alloc::format!(
         "яркость {} % → {} % (CPU CTL {:#010x} → {:#010x}, максимум {})",
-        сейчас, вышло, cpu, стало, макс,
+        now_val, got, cpu, now, max,
     );
     if cpu2 & (1 << 31) == 0 {
         out.push_str("\nШИМ процессора помечен выключенным (CPU CTL2) — подсветка могла не измениться");
     }
-    if стало & 0xffff != уровень {
+    if now & 0xffff != level {
         out.push_str("\nрегистр не принял значение: прочитано другое");
     }
     Ok(Value::str(&out))
@@ -3695,7 +3695,7 @@ fn sh_brightness(args: &[Value]) -> Result<Value, EvalError> {
 /// Перебором по нулевой шине, а не «она всегда 00:02.0»: перебор стоит тридцать две пары чтений,
 /// а «всегда» однажды оказывается неправдой на чужой машине — и тогда команда молча читает чужие
 /// регистры, что хуже, чем честное «не найдено».
-fn intel_найти(hw: usize) -> Option<(usize, u32, u32)> {
+fn intel_find(hw: usize) -> Option<(usize, u32, u32)> {
     for dev in 0..32u16 {
         let bdf = dev << 3;
         let Some(id) = sys::hw_pci_read(hw, bdf, 0) else { continue };
@@ -3721,7 +3721,7 @@ fn intel_bar(hw: usize, bdf: usize, off: usize) -> Option<usize> {
 }
 
 /// Формат пикселя плоскости — поле 29:26 регистра DSPCNTR.
-fn intel_формат(code: u32) -> &'static str {
+fn intel_pixel_format(code: u32) -> &'static str {
     match code {
         0x2 => "8 бит по палитре",
         0x5 => "16 бит BGRX565",
@@ -4196,19 +4196,19 @@ fn read_line(prompt: &[u8], line: &mut [u8], hist: &History) -> Option<usize> {
                     // их общее начало, а список показывается. Ноль — молчим: звонок на каждое
                     // «не знаю» раздражает ровно тех, кто жмёт `Tab` вслепую.
                     b'\t' => {
-                        let (начало, кандидаты) = complete(&line[..pos], pos);
-                        if !кандидаты.is_empty() {
-                            let общее = common_prefix(&кандидаты);
-                            let хвост = &общее[начало.min(общее.len())..];
-                            if !хвост.is_empty() && llen + хвост.len() <= line.len() {
-                                line.copy_within(pos..llen, pos + хвост.len());
-                                line[pos..pos + хвост.len()].copy_from_slice(хвост.as_bytes());
-                                llen += хвост.len();
-                                pos += хвост.len();
-                            } else if кандидаты.len() > 1 {
+                        let (start, candidates) = complete(&line[..pos], pos);
+                        if !candidates.is_empty() {
+                            let common = common_prefix(&candidates);
+                            let tail = &common[start.min(common.len())..];
+                            if !tail.is_empty() && llen + tail.len() <= line.len() {
+                                line.copy_within(pos..llen, pos + tail.len());
+                                line[pos..pos + tail.len()].copy_from_slice(tail.as_bytes());
+                                llen += tail.len();
+                                pos += tail.len();
+                            } else if candidates.len() > 1 {
                                 // Дописывать нечего, а вариантов несколько — показать их.
                                 sys::write(b"\r\n");
-                                for (i, k) in кандидаты.iter().enumerate() {
+                                for (i, k) in candidates.iter().enumerate() {
                                     if i != 0 {
                                         sys::write(b"  ");
                                     }
@@ -4306,26 +4306,26 @@ fn utf8_len(b: u8) -> usize {
 /// Делим мир ровно так же, как делит его сам шелл при исполнении строки: ПЕРВОЕ слово — команда,
 /// остальные — пути. Своя, вторая классификация здесь разошлась бы с настоящей, и `Tab` обещал
 /// бы то, чего шелл не исполнит.
-fn complete(строка: &[u8], _pos: usize) -> (usize, Vec<String>) {
-    let ws = строка.iter().rposition(|&b| b == b' ').map_or(0, |i| i + 1);
-    let слово = &строка[ws..];
+fn complete(line: &[u8], _pos: usize) -> (usize, Vec<String>) {
+    let ws = line.iter().rposition(|&b| b == b' ').map_or(0, |i| i + 1);
+    let word = &line[ws..];
     let mut out: Vec<String> = Vec::new();
     if ws == 0 {
         // ── команда ──
-        for (имя, _) in CMDS {
-            if имя.as_bytes().starts_with(слово) {
-                out.push(String::from(*имя));
+        for (name, _) in CMDS {
+            if name.as_bytes().starts_with(word) {
+                out.push(String::from(*name));
             }
         }
         // Программы store: те же имена, которыми их зовёт `spawn_program` (`bin/<арх>/<имя>`).
         if let Some(list) = roots::text(cap_store()) {
-            for суф in roots::suffixes(&list, b"bin/") {
-                let имя = match суф.iter().rposition(|&b| b == b'/') {
-                    Some(i) => &суф[i + 1..],
-                    None => суф,
+            for suffix in roots::suffixes(&list, b"bin/") {
+                let name = match suffix.iter().rposition(|&b| b == b'/') {
+                    Some(i) => &suffix[i + 1..],
+                    None => suffix,
                 };
-                if имя.starts_with(слово) {
-                    if let Ok(s) = core::str::from_utf8(имя) {
+                if name.starts_with(word) {
+                    if let Ok(s) = core::str::from_utf8(name) {
                         if !out.iter().any(|k| k == s) {
                             out.push(String::from(s));
                         }
@@ -4335,34 +4335,34 @@ fn complete(строка: &[u8], _pos: usize) -> (usize, Vec<String>) {
         }
     } else {
         // ── путь ──
-        let (dir, base) = match слово.iter().rposition(|&b| b == b'/') {
-            Some(i) => (&слово[..i + 1], &слово[i + 1..]),
-            None => (&b""[..], слово),
+        let (dir, base) = match word.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&word[..i + 1], &word[i + 1..]),
+            None => (&b""[..], word),
         };
-        let мест = resolve(dir);
+        let slots = resolve(dir);
         let mut buf = alloc::vec![0u8; 16 * 1024];
-        let n = px::readdir(cap_fs(), &мест, &mut buf);
-        for запись in buf[..n].split(|&b| b == b'\n').filter(|e| !e.is_empty()) {
+        let n = px::readdir(cap_fs(), &slots, &mut buf);
+        for entry in buf[..n].split(|&b| b == b'\n').filter(|e| !e.is_empty()) {
             // Формат строки каталога — «имя» либо «имя/» у каталогов; нам годится как есть.
-            let имя = запись;
-            if имя.starts_with(base) {
-                if let (Ok(s), Ok(d)) = (core::str::from_utf8(имя), core::str::from_utf8(dir)) {
+            let name = entry;
+            if name.starts_with(base) {
+                if let (Ok(s), Ok(d)) = (core::str::from_utf8(name), core::str::from_utf8(dir)) {
                     out.push(alloc::format!("{d}{s}"));
                 }
             }
         }
     }
     out.sort();
-    (слово.len(), out)
+    (word.len(), out)
 }
 
 /// Общее начало кандидатов. Один кандидат — он сам; пусто — пустая строка.
-fn common_prefix(кандидаты: &[String]) -> String {
-    let Some(первый) = кандидаты.first() else { return String::new() };
-    let mut n = первый.len();
-    for k in &кандидаты[1..] {
+fn common_prefix(candidates: &[String]) -> String {
+    let Some(first) = candidates.first() else { return String::new() };
+    let mut n = first.len();
+    for k in &candidates[1..] {
         n = n.min(
-            первый
+            first
                 .as_bytes()
                 .iter()
                 .zip(k.as_bytes())
@@ -4371,10 +4371,10 @@ fn common_prefix(кандидаты: &[String]) -> String {
         );
     }
     // По границе символа: дописать пол-буквы значит испортить строку.
-    while n > 0 && !первый.is_char_boundary(n) {
+    while n > 0 && !first.is_char_boundary(n) {
         n -= 1;
     }
-    String::from(&первый[..n])
+    String::from(&first[..n])
 }
 
 fn redraw(prompt: &[u8], line: &[u8], llen: usize, pos: usize) {

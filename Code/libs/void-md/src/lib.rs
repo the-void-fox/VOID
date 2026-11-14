@@ -64,102 +64,102 @@ pub fn parse(src: &str) -> Vec<Block> {
         }
         // ── блок кода ──
         if t.trim_start().starts_with("```") {
-            let mut код = Vec::new();
+            let mut code = Vec::new();
             for l in строки.by_ref() {
                 if l.trim_start().starts_with("```") {
                     break;
                 }
-                код.push(String::from(l));
+                code.push(String::from(l));
             }
-            out.push(Block::Code(код));
+            out.push(Block::Code(code));
             continue;
         }
         // ── заголовок ──
         if let Some(rest) = t.strip_prefix('#') {
-            let mut уровень = 1u8;
+            let mut level = 1u8;
             let mut rest = rest;
             while let Some(r) = rest.strip_prefix('#') {
-                уровень += 1;
+                level += 1;
                 rest = r;
             }
-            out.push(Block::Heading(уровень, String::from(rest.trim())));
+            out.push(Block::Heading(level, String::from(rest.trim())));
             continue;
         }
         // ── таблица ──
         if t.trim_start().starts_with('|') {
-            let mut ряды = Vec::new();
-            let mut строка = t;
+            let mut rows = Vec::new();
+            let mut line = t;
             let mut head = false;
             loop {
                 // Разделитель `|---|---|` — не данные, а черта под шапкой. Встретив его первым
                 // делом, запоминаем: значит ряд над ним был шапкой.
-                let ячейки = ячейки_ряда(строка);
-                if ячейки.iter().all(|c| разделитель(c)) {
-                    head = ряды.len() == 1;
+                let cells = row_cells(line);
+                if cells.iter().all(|c| sep(c)) {
+                    head = rows.len() == 1;
                 } else {
-                    ряды.push(ячейки);
+                    rows.push(cells);
                 }
                 match строки.peek() {
-                    Some(n) if n.trim_start().starts_with('|') => строка = строки.next().unwrap(),
+                    Some(n) if n.trim_start().starts_with('|') => line = строки.next().unwrap(),
                     _ => break,
                 }
             }
-            out.push(Block::Table { head, rows: ряды });
+            out.push(Block::Table { head, rows: rows });
             continue;
         }
         // ── список ──
-        if пункт(t).is_some() {
-            let mut пункты = Vec::new();
-            let mut текущий = String::from(пункт(t).unwrap());
+        if item(t).is_some() {
+            let mut items = Vec::new();
+            let mut current = String::from(item(t).unwrap());
             loop {
                 match строки.peek() {
                     // Продолжение пункта: непустая строка с отступом и не новый пункт.
                     Some(n)
                         if !n.trim().is_empty()
                             && n.starts_with(' ')
-                            && пункт(n.trim_start()).is_none() =>
+                            && item(n.trim_start()).is_none() =>
                     {
-                        текущий.push(' ');
-                        текущий.push_str(строки.next().unwrap().trim());
+                        current.push(' ');
+                        current.push_str(строки.next().unwrap().trim());
                     }
-                    Some(n) if пункт(n.trim_start()).is_some() => {
-                        пункты.push(core::mem::take(&mut текущий));
-                        текущий = String::from(пункт(строки.next().unwrap().trim_start()).unwrap());
+                    Some(n) if item(n.trim_start()).is_some() => {
+                        items.push(core::mem::take(&mut current));
+                        current = String::from(item(строки.next().unwrap().trim_start()).unwrap());
                     }
                     _ => break,
                 }
             }
-            пункты.push(текущий);
-            out.push(Block::List(пункты));
+            items.push(current);
+            out.push(Block::List(items));
             continue;
         }
         // ── абзац ──
-        let mut абзац = String::from(t.trim());
+        let mut para = String::from(t.trim());
         while let Some(n) = строки.peek() {
             let n = n.trim_end();
             if n.trim().is_empty()
                 || n.trim_start().starts_with('#')
                 || n.trim_start().starts_with('|')
                 || n.trim_start().starts_with("```")
-                || пункт(n.trim_start()).is_some()
+                || item(n.trim_start()).is_some()
             {
                 break;
             }
-            абзац.push(' ');
-            абзац.push_str(строки.next().unwrap().trim());
+            para.push(' ');
+            para.push_str(строки.next().unwrap().trim());
         }
-        out.push(Block::Para(абзац));
+        out.push(Block::Para(para));
     }
     out
 }
 
 /// Текст пункта списка без его знака. `None` — строка не пункт.
-fn пункт(s: &str) -> Option<&str> {
+fn item(s: &str) -> Option<&str> {
     s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")).map(str::trim)
 }
 
 /// Ячейки строки таблицы: режем по `|`, крайние пустышки отбрасываем.
-fn ячейки_ряда(s: &str) -> Vec<String> {
+fn row_cells(s: &str) -> Vec<String> {
     let s = s.trim();
     let s = s.strip_prefix('|').unwrap_or(s);
     let s = s.strip_suffix('|').unwrap_or(s);
@@ -167,7 +167,7 @@ fn ячейки_ряда(s: &str) -> Vec<String> {
 }
 
 /// Ячейка-разделитель шапки: только дефисы и двоеточия (`---`, `:--`, `--:`).
-fn разделитель(c: &str) -> bool {
+fn sep(c: &str) -> bool {
     !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':')
 }
 
@@ -192,27 +192,27 @@ pub fn render_text(blocks: &[Block], width: usize) -> String {
             out.push('\n');
         }
         match b {
-            Block::Heading(уровень, t) => {
-                let t = снять_знаки(t);
+            Block::Heading(level, t) => {
+                let t = strip_marks(t);
                 out.push_str(&t);
                 out.push('\n');
                 // Первый уровень — двойной чертой, прочие одинарной: иерархию видно и так.
-                let черта = if *уровень <= 1 { '=' } else { '-' };
+                let rule = if *level <= 1 { '=' } else { '-' };
                 for _ in 0..t.chars().count().min(w) {
-                    out.push(черта);
+                    out.push(rule);
                 }
                 out.push('\n');
             }
             Block::Para(t) => {
-                перенести(&снять_знаки(t), w, "", &mut out);
+                wrap(&strip_marks(t), w, "", &mut out);
             }
-            Block::List(пункты) => {
-                for p in пункты {
-                    let мера = out.len();
-                    перенести(&снять_знаки(p), w.saturating_sub(2), "  ", &mut out);
+            Block::List(items) => {
+                for p in items {
+                    let measure = out.len();
+                    wrap(&strip_marks(p), w.saturating_sub(2), "  ", &mut out);
                     // Знак пункта ставим поверх отступа первой строки — так продолжение
                     // выравнивается под текстом, а не под знаком.
-                    unsafe { out.as_bytes_mut()[мера] = b'-' };
+                    unsafe { out.as_bytes_mut()[measure] = b'-' };
                 }
             }
             Block::Code(строки) => {
@@ -222,14 +222,14 @@ pub fn render_text(blocks: &[Block], width: usize) -> String {
                     out.push('\n');
                 }
             }
-            Block::Table { rows, .. } => таблица(rows, w, &mut out),
+            Block::Table { rows, .. } => table(rows, w, &mut out),
         }
     }
     out
 }
 
 /// Снять знаки разметки, которые в моноширинном тексте показать нечем.
-fn снять_знаки(s: &str) -> String {
+fn strip_marks(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
@@ -245,84 +245,84 @@ fn снять_знаки(s: &str) -> String {
 }
 
 /// Перенести абзац по словам. `indent` ставится перед КАЖДОЙ строкой.
-fn перенести(s: &str, w: usize, indent: &str, out: &mut String) {
-    let mut длина = 0usize;
-    let mut первое = true;
-    for слово in s.split_whitespace() {
-        let n = слово.chars().count();
-        if !первое && длина + 1 + n > w {
+fn wrap(s: &str, w: usize, indent: &str, out: &mut String) {
+    let mut len = 0usize;
+    let mut first_one = true;
+    for word in s.split_whitespace() {
+        let n = word.chars().count();
+        if !first_one && len + 1 + n > w {
             out.push('\n');
-            длина = 0;
-            первое = true;
+            len = 0;
+            first_one = true;
         }
-        if первое {
+        if first_one {
             out.push_str(indent);
-            первое = false;
+            first_one = false;
         } else {
             out.push(' ');
-            длина += 1;
+            len += 1;
         }
-        out.push_str(слово);
-        длина += n;
+        out.push_str(word);
+        len += n;
     }
     out.push('\n');
 }
 
 /// Таблица колонками. Ширины считаются по самой длинной ячейке, но вся таблица обязана влезть в
 /// `w`: если не влезает, лишнее срезается — обрезанная колонка читается, уехавшая нет.
-fn таблица(ряды: &[Vec<String>], w: usize, out: &mut String) {
-    let столбцов = ряды.iter().map(|r| r.len()).max().unwrap_or(0);
-    if столбцов == 0 {
+fn table(rows: &[Vec<String>], w: usize, out: &mut String) {
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols == 0 {
         return;
     }
-    let чистые: Vec<Vec<String>> =
-        ряды.iter().map(|r| r.iter().map(|c| снять_знаки(c)).collect()).collect();
-    let mut ширины = alloc::vec![0usize; столбцов];
-    for r in &чистые {
+    let clean: Vec<Vec<String>> =
+        rows.iter().map(|r| r.iter().map(|c| strip_marks(c)).collect()).collect();
+    let mut widths = alloc::vec![0usize; cols];
+    for r in &clean {
         for (i, c) in r.iter().enumerate() {
-            ширины[i] = ширины[i].max(c.chars().count());
+            widths[i] = widths[i].max(c.chars().count());
         }
     }
     // Два пробела между колонками.
-    let зазор = 2;
-    let всего: usize = ширины.iter().sum::<usize>() + зазор * (столбцов - 1);
-    if всего > w {
+    let gap = 2;
+    let total: usize = widths.iter().sum::<usize>() + gap * (cols - 1);
+    if total > w {
         // Режем САМУЮ ШИРОКУЮ колонку, пока не влезет: обычно это колонка описания, и потерять
         // хвост описания легче, чем съехавшую разметку.
-        let mut лишнее = всего - w;
-        while лишнее > 0 {
-            let (i, _) = ширины.iter().enumerate().max_by_key(|(_, v)| **v).unwrap();
-            let срез = лишнее.min(ширины[i].saturating_sub(4));
-            if срез == 0 {
+        let mut extra = total - w;
+        while extra > 0 {
+            let (i, _) = widths.iter().enumerate().max_by_key(|(_, v)| **v).unwrap();
+            let slice = extra.min(widths[i].saturating_sub(4));
+            if slice == 0 {
                 break;
             }
-            ширины[i] -= срез;
-            лишнее -= срез;
+            widths[i] -= slice;
+            extra -= slice;
         }
     }
-    for r in &чистые {
-        let mut строка = String::new();
-        for i in 0..столбцов {
+    for r in &clean {
+        let mut line = String::new();
+        for i in 0..cols {
             if i > 0 {
-                строка.push_str("  ");
+                line.push_str("  ");
             }
-            let пусто = String::new();
-            let c = r.get(i).unwrap_or(&пусто);
-            let мера = c.chars().count();
-            if мера > ширины[i] {
-                строка.extend(c.chars().take(ширины[i].saturating_sub(1)));
-                строка.push('…');
+            let is_empty = String::new();
+            let c = r.get(i).unwrap_or(&is_empty);
+            let measure = c.chars().count();
+            if measure > widths[i] {
+                line.extend(c.chars().take(widths[i].saturating_sub(1)));
+                line.push('…');
             } else {
-                строка.push_str(c);
+                line.push_str(c);
                 // Хвост последней колонки не добиваем: пробелы в конце строки никому не нужны.
-                if i + 1 < столбцов {
-                    for _ in мера..ширины[i] {
-                        строка.push(' ');
+                if i + 1 < cols {
+                    for _ in measure..widths[i] {
+                        line.push(' ');
                     }
                 }
             }
         }
-        out.push_str(строка.trim_end());
+        out.push_str(line.trim_end());
         out.push('\n');
     }
 }
@@ -403,8 +403,8 @@ mod tests {
     /// Таблица шире окна не уезжает за край: лишнее срезается с самой широкой колонки.
     #[test]
     fn широкая_таблица_режется_по_ширине() {
-        let длинная = "| имя | описание очень длинное которое никуда не влезет совсем |";
-        let t = render_text(&parse(длинная), 30);
+        let long_one = "| имя | описание очень длинное которое никуда не влезет совсем |";
+        let t = render_text(&parse(long_one), 30);
         for l in t.lines() {
             assert!(l.chars().count() <= 30, "строка шире окна: {:?}", l);
         }
@@ -414,10 +414,10 @@ mod tests {
     /// превращается там в пару без смысла.
     #[test]
     fn шапка_таблицы_помнится() {
-        let с_шапкой = parse("| что | где |\n|---|---|\n| а | б |\n");
-        assert!(matches!(с_шапкой[0], Block::Table { head: true, .. }));
-        let без = parse("| а | б |\n| в | г |\n");
-        assert!(matches!(без[0], Block::Table { head: false, .. }));
+        let with_head = parse("| что | где |\n|---|---|\n| а | б |\n");
+        assert!(matches!(with_head[0], Block::Table { head: true, .. }));
+        let without = parse("| а | б |\n| в | г |\n");
+        assert!(matches!(without[0], Block::Table { head: false, .. }));
     }
 
     #[test]

@@ -385,18 +385,18 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             let dom = t.procs[cur].domain;
             let ok = cap::may_set_clock(dom, Cap::from_bits(cap as u64));
             if ok {
-                let сдвиг = crate::clock::set_realtime_ns(ns);
+                let shift = crate::clock::set_realtime_ns(ns);
                 let (y, mo, d, h, mi, sec) = crate::clock::civil_from_unix(ns / 1_000_000_000);
                 // Говорим, только если часы ДЕЙСТВИТЕЛЬНО сдвинулись хотя бы на секунду.
                 // Сверка повторяется раз в несколько часов, и «подведены на 0 с» — это не
                 // событие, а шум: по умолчанию система молчит.
-                if сдвиг.abs() >= 1_000_000_000 {
+                if shift.abs() >= 1_000_000_000 {
                     crate::println!(
                         "  [clock] часы подведены: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC (сдвиг {} с)",
-                        y, mo, d, h, mi, sec, сдвиг / 1_000_000_000,
+                        y, mo, d, h, mi, sec, shift / 1_000_000_000,
                     );
                 } else {
-                    vprintln!("  [clock] сверка часов: сдвиг {} нс", сдвиг);
+                    vprintln!("  [clock] сверка часов: сдвиг {} нс", shift);
                 }
             } else {
                 crate::println!("  [clock] P{} подвод часов ОТКЛОНЁН: нет права clock:w", cur);

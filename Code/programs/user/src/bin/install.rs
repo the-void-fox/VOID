@@ -154,7 +154,7 @@ const MODES: [(&str, &str, &str); 3] = [
 ///
 /// Поэтому непозволенный знак просто не набирается — как не набирается буква в поле для числа.
 /// Буквы любые, в том числе русские: имя показывает меню оболочки, а не сетевой стек.
-fn имя_ок(c: char) -> bool {
+fn name_ok(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 
@@ -226,7 +226,7 @@ impl App {
         // Второй рубеж: поле уже не даёт набрать лишнего, но имя может приехать и не с
         // клавиатуры (вставка, восстановленный сеанс), а цена пропущенного пробела — отказ
         // установки на последнем шаге.
-        let name: String = self.name.text.trim().chars().filter(|c| имя_ок(*c)).collect();
+        let name: String = self.name.text.trim().chars().filter(|c| name_ok(*c)).collect();
         if !name.is_empty() {
             s.push_str(&alloc::format!("name {}\n", name));
         }
@@ -247,8 +247,8 @@ impl ui::Client for App {
                 (Step::System, _) => {
                     // Знак, которому в имени не место, до правки не доходит. Управляющие
                     // (Backspace, стрелки, Enter) пропускаем: они не знаки, а движения.
-                    let печатный = char::from_u32(ch as u32).filter(|c| !c.is_control());
-                    if печатный.is_some_and(|c| !имя_ок(c)) {
+                    let printable = char::from_u32(ch as u32).filter(|c| !c.is_control());
+                    if printable.is_some_and(|c| !name_ok(c)) {
                         return ui::Scope::No;
                     }
                     self.name.key(code, ch, mods);
@@ -298,18 +298,18 @@ impl ui::Client for App {
         let (tx, mu) = (u.th.text, u.th.muted);
 
         match &self.stage {
-            Stage::Working(обновление) => {
-                let слово = if *обновление { ui::t("обновляю…") } else { ui::t("ставлю…") };
+            Stage::Working(update) => {
+                let word = if *update { ui::t("обновляю…") } else { ui::t("ставлю…") };
                 let mut mid = body;
                 let bar = mid.cut_top(mid.h / 2 + line);
-                u.label(bar, слово, tx, Align::Center);
+                u.label(bar, word, tx, Align::Center);
                 // Полоса хода честная ровно настолько, насколько честно ядро: оно не говорит,
                 // сколько секторов уже записано, и выдумывать проценты мы не станем. Полоса
                 // показывает, что дело ИДЁТ, и доезжает до конца к последнему кадру.
                 let w = (mid.w / 2).min(360);
                 let line_r = Rect::new(mid.x + (mid.w - w) / 2, mid.y, w, line * 2);
-                let ход = u.anim(ANIM_WORK, 256).clamp(0, 256) as u32;
-                u.progress(line_r, ход);
+                let progress = u.anim(ANIM_WORK, 256).clamp(0, 256) as u32;
+                u.progress(line_r, progress);
                 return ui::Scope::No;
             }
             Stage::Done(text, ok) => {
@@ -374,9 +374,9 @@ impl ui::Client for App {
                 //
                 // Опасная справа, где и была; безопасная слева от неё. Читают слева направо, и
                 // порядок тут работает в нужную сторону: сперва встречается то, что не стирает.
-                let опасная = next_r;
-                let hot = if u.hot(опасная) { 256 } else { 0 };
-                if u.danger(опасная, ui::t("Стереть и поставить"), hot) {
+                let risky = next_r;
+                let hot = if u.hot(risky) { 256 } else { 0 };
+                if u.danger(risky, ui::t("Стереть и поставить"), hot) {
                     self.stage = Stage::Working(false);
                     return ui::Scope::All; // кадр «ставлю…» — ДО самой установки
                 }
@@ -399,7 +399,7 @@ impl ui::Client for App {
         }
 
         // ── содержимое шага ────────────────────────────────────────────────────
-        let mut язык: Option<Rect> = None; // список языков рисуется ПОСЛЕДНИМ (он поверх всего)
+        let mut lang: Option<Rect> = None; // список языков рисуется ПОСЛЕДНИМ (он поверх всего)
         match self.step() {
             Step::Lang => {
                 // Знак системы крупно: это первый экран, и он обязан сказать, куда человек попал.
@@ -408,15 +408,15 @@ impl ui::Client for App {
                 // выглядел бы началом списка, под которым что-то ещё будет, — а под ним ничего
                 // нет и не должно быть: на первом экране ровно один вопрос.
                 let d = (body.h / 3).min(body.w / 4).min(line * 8);
-                let всего = d + line * 5;
-                body.cut_top(((body.h - всего) / 2).max(0));
+                let total = d + line * 5;
+                body.cut_top(((body.h - total) / 2).max(0));
                 let logo = body.cut_top(d);
                 u.icon(Rect::new(logo.x + (logo.w - d) / 2, logo.y, d, d), ui::icon::LOGO, tx);
                 u.label(body.cut_top(line * 2), ui::t("Установка VOID"), tx, Align::Center);
                 u.label(body.cut_top(line), ui::t("Язык установки и системы"), mu, Align::Center);
                 body.cut_top(u.th.gap);
                 let w = (body.w / 2).min(320);
-                язык = Some(Rect::new(body.x + (body.w - w) / 2, body.y, w, line * 2));
+                lang = Some(Rect::new(body.x + (body.w - w) / 2, body.y, w, line * 2));
             }
             Step::Disk => {
                 u.label(body.cut_top(line * 2), ui::t("Куда поставить систему"), tx, Align::Center);
@@ -465,14 +465,14 @@ impl ui::Client for App {
                 let tiles = body.cut_top(line * 3);
                 let mut row = tiles;
                 let w = row.w / MODES.len() as i32;
-                for (i, (имя, _, _)) in MODES.iter().enumerate() {
+                for (i, (name, _, _)) in MODES.iter().enumerate() {
                     let mut cell = row.cut_left(w);
                     if i + 1 < MODES.len() {
                         cell.w -= u.th.gap;
                     }
                     let hot = if u.hot(cell) { 256 } else { 0 };
                     let on = if i == self.mode { 256 } else { 0 };
-                    if u.tile(cell, ui::t(имя), hot, on) {
+                    if u.tile(cell, ui::t(name), hot, on) {
                         self.mode = i;
                         again = true;
                     }
@@ -520,20 +520,20 @@ impl ui::Client for App {
                         },
                     ),
                 ];
-                for (ключ, знач) in строки {
+                for (key, value) in строки {
                     let row = body.cut_top(line * 2);
-                    u.label(row, ключ, mu, Align::Left);
-                    u.label(row, &знач, tx, Align::Right);
+                    u.label(row, key, mu, Align::Left);
+                    u.label(row, &value, tx, Align::Right);
                     u.c.fill(Rect::new(row.x, row.bottom(), row.w, 1), u.th.text.with_a(0x18));
                 }
                 body.cut_top(line);
-                let опасно = !self.can_update();
+                let is_risky = !self.can_update();
                 wrap(
                     u,
                     body.x,
                     body.y,
                     body.w,
-                    if опасно {
+                    if is_risky {
                         ui::t(
                             "Диск будет стёрт целиком: таблица разделов, все разделы, все файлы. \
                              Отменить это нельзя.",
@@ -544,15 +544,15 @@ impl ui::Client for App {
                              поколения и пакеты останутся на месте.",
                         )
                     },
-                    if опасно { u.th.danger } else { mu },
+                    if is_risky { u.th.danger } else { mu },
                 );
             }
         }
 
         // Список языков — ПОСЛЕДНИМ в кадре: он ложится поверх всего нарисованного.
-        if let Some(r) = язык {
-            let имена: Vec<&str> = LANGS.iter().map(|(имя, _)| *имя).collect();
-            match u.select(r, &имена, self.lang, self.lang_open) {
+        if let Some(r) = lang {
+            let names: Vec<&str> = LANGS.iter().map(|(name, _)| *name).collect();
+            match u.select(r, &names, self.lang, self.lang_open) {
                 ui::Pick::Toggle => {
                     self.lang_open = !self.lang_open;
                     again = true;
@@ -583,7 +583,7 @@ impl ui::Client for App {
     /// После кадра — сама установка. Отдельно от рисования намеренно: она занимает секунды, и
     /// делать её внутри кадра значило бы показать человеку замерший экран без единого слова.
     fn after(&mut self, _surf: &Window) -> ui::Scope {
-        let Stage::Working(обновление) = self.stage else {
+        let Stage::Working(update) = self.stage else {
             return ui::Scope::No;
         };
         let slot = self.disks.get(self.sel).map(|d| d.slot).unwrap_or(usize::MAX);
@@ -594,15 +594,15 @@ impl ui::Client for App {
         // самая длинная из них («загрузочный раздел на диске меньше…») на 160 обрывалась —
         // ровно на словах о том, что делать дальше.
         let mut why = [0u8; 320];
-        let вышло = if обновление {
+        let got = if update {
             // Обновление конфига НЕ КАСАЕТСЯ: система на диске уже настроена, и переписать ей
             // выбор установщика значило бы отнять у человека то, что он настраивал сам.
             sys::update(self.store, slot, &mut why).is_some()
         } else {
             sys::install(self.store, slot, &self.wish(), &mut why).is_some()
         };
-        let причина = sys::err_text(&why);
-        let итог = String::from(match (обновление, вышло) {
+        let reason = sys::err_text(&why);
+        let result = String::from(match (update, got) {
                 (true, true) => ui::t(
                     "VOID обновлён. Файлы, поколения и пакеты остались на месте. \
                      Выключи машину, вынь носитель и включи снова.",
@@ -624,15 +624,15 @@ impl ui::Client for App {
         // короткая («раскладка диска не совпадает с образом»), и одной ей человек не поймёт,
         // что делать дальше.
         self.stage = Stage::Done(
-            if вышло || причина.is_empty() {
-                итог
+            if got || reason.is_empty() {
+                result
             } else {
                 // Одним абзацем, без переноса: `wrap` считает перевод строки обычным пробелом
                 // (он разбирает текст по словам), и пустая строка здесь всё равно пропала бы —
                 // но выглядело бы это как недоделка, а не как решение.
-                alloc::format!("{} {}: {}", итог, ui::t("Ядро ответило"), причина)
+                alloc::format!("{} {}: {}", result, ui::t("Ядро ответило"), reason)
             },
-            вышло,
+            got,
         );
         ui::Scope::All
     }
@@ -665,7 +665,7 @@ fn wrap(u: &mut Ui, x: i32, y: i32, w: i32, s: &str, col: ui::Rgba) -> i32 {
 }
 
 /// Без композитора: список словами, установка и ОБНОВЛЕНИЕ по номеру.
-fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>, обновить: bool) -> ! {
+fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>, refresh: bool) -> ! {
     match arg {
         None => {
             sys::write("install: куда ставить? Диски машины:\n".as_bytes());
@@ -695,7 +695,7 @@ fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>, обновить:
             // Веха 222 — два разных действия и два разных предупреждения. Путать их нельзя ни
             // на слово: одно стирает диск, другое обещает этого не делать.
             let mut why = [0u8; 320];
-            let итог = if обновить {
+            let result = if refresh {
                 sys::write(
                     alloc::format!(
                         "install: обновляю диск {} — файлы, поколения и пакеты останутся…\n",
@@ -714,7 +714,7 @@ fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>, обновить:
                 // числом, значило бы устроить второй мастер в неподходящем месте.
                 sys::install(store, slot, "", &mut why)
             };
-            match итог {
+            match result {
                 Some(_) => {
                     sys::write(
                         "Готово. Выключи машину, вынь носитель и включи снова.\n".as_bytes(),
@@ -724,11 +724,11 @@ fn text_mode(store: usize, disks: &[Disk], arg: Option<usize>, обновить:
                 None => {
                     // Причина — ЗДЕСЬ ЖЕ. Отсылка к журналу была отговоркой: ядро причину знает
                     // точно, а в журнале её ещё надо найти среди строк драйверов.
-                    let причина = sys::err_text(&why);
-                    if причина.is_empty() {
+                    let reason = sys::err_text(&why);
+                    if reason.is_empty() {
                         sys::write("Не вышло — причина в журнале ядра (`klog`).\n".as_bytes());
                     } else {
-                        sys::write(alloc::format!("Не вышло: {}\n", причина).as_bytes());
+                        sys::write(alloc::format!("Не вышло: {}\n", reason).as_bytes());
                     }
                     sys::exit(1)
                 }
@@ -748,19 +748,19 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let argv = sys::argv::Argv::take();
     // Веха 222 — `install update <номер>` обновляет, `install <номер>` ставит. Слово впереди
     // числа, а не ключ после него: человек сперва решает ЧТО делает, и только потом — с чем.
-    let обновить = argv.str(0) == Some("update");
+    let refresh = argv.str(0) == Some("update");
     let arg = argv
-        .str(if обновить { 1 } else { 0 })
+        .str(if refresh { 1 } else { 0 })
         .and_then(|s| s.parse::<usize>().ok());
 
     // Обновление словами и делается словами: окно со списком дисков — про выбор, а человек
     // выбор уже сделал, назвав действие и номер.
-    if обновить {
-        text_mode(store, &disks, arg, обновить);
+    if refresh {
+        text_mode(store, &disks, arg, refresh);
     }
     let (w, h) = (720u16, 520u16);
     let Some(mut surf) = Window::create(w, h, ui::t("Установка VOID")) else {
-        text_mode(store, &disks, arg, обновить);
+        text_mode(store, &disks, arg, refresh);
     };
     // Номер, названный словами, слушаемся и в окне: человек уже сказал, куда ставить.
     let sel = arg.and_then(|s| disks.iter().position(|d| d.slot == s)).unwrap_or(0);

@@ -15,7 +15,7 @@ fn tok(out: &mut Vec<u8>, s: &[u8]) {
     out.extend(std::iter::repeat(0).take(pad));
 }
 
-fn файл(out: &mut Vec<u8>, data: &[u8], exec: bool) {
+fn file(out: &mut Vec<u8>, data: &[u8], exec: bool) {
     tok(out, b"(");
     tok(out, b"type");
     tok(out, b"regular");
@@ -30,53 +30,53 @@ fn файл(out: &mut Vec<u8>, data: &[u8], exec: bool) {
 
 /// Корпус: ПРАВИЛЬНЫЕ архивы как отправная точка. Из случайного шума мутатор дальше проверки
 /// заголовка `nix-archive-1` не уедет, и фаззинг выродился бы в проверку одной строки.
-fn корпус() -> Vec<Vec<u8>> {
-    let mut один = Vec::new();
-    tok(&mut один, b"nix-archive-1");
-    файл(&mut один, b"hello", false);
+fn corpus() -> Vec<Vec<u8>> {
+    let mut one = Vec::new();
+    tok(&mut one, b"nix-archive-1");
+    file(&mut one, b"hello", false);
 
     // Дерево: каталог, исполняемый файл и симлинк — все три рода узлов сразу.
-    let mut дерево = Vec::new();
-    tok(&mut дерево, b"nix-archive-1");
+    let mut tree = Vec::new();
+    tok(&mut tree, b"nix-archive-1");
     for t in [&b"("[..], b"type", b"directory", b"entry", b"(", b"name", b"bin", b"node", b"("] {
-        tok(&mut дерево, t);
+        tok(&mut tree, t);
     }
-    tok(&mut дерево, b"type");
-    tok(&mut дерево, b"directory");
-    tok(&mut дерево, b"entry");
-    tok(&mut дерево, b"(");
-    tok(&mut дерево, b"name");
-    tok(&mut дерево, b"hello");
-    tok(&mut дерево, b"node");
-    файл(&mut дерево, b"ELF", true);
+    tok(&mut tree, b"type");
+    tok(&mut tree, b"directory");
+    tok(&mut tree, b"entry");
+    tok(&mut tree, b"(");
+    tok(&mut tree, b"name");
+    tok(&mut tree, b"hello");
+    tok(&mut tree, b"node");
+    file(&mut tree, b"ELF", true);
     for _ in 0..3 {
-        tok(&mut дерево, b")");
+        tok(&mut tree, b")");
     }
-    tok(&mut дерево, b"entry");
-    tok(&mut дерево, b"(");
-    tok(&mut дерево, b"name");
-    tok(&mut дерево, b"link");
-    tok(&mut дерево, b"node");
-    tok(&mut дерево, b"(");
-    tok(&mut дерево, b"type");
-    tok(&mut дерево, b"symlink");
-    tok(&mut дерево, b"target");
-    tok(&mut дерево, b"bin/hello");
+    tok(&mut tree, b"entry");
+    tok(&mut tree, b"(");
+    tok(&mut tree, b"name");
+    tok(&mut tree, b"link");
+    tok(&mut tree, b"node");
+    tok(&mut tree, b"(");
+    tok(&mut tree, b"type");
+    tok(&mut tree, b"symlink");
+    tok(&mut tree, b"target");
+    tok(&mut tree, b"bin/hello");
     for _ in 0..3 {
-        tok(&mut дерево, b")");
+        tok(&mut tree, b")");
     }
 
     // Файл подлиннее: мутации длины содержимого — отдельный интересный случай.
-    let mut длинный = Vec::new();
-    tok(&mut длинный, b"nix-archive-1");
-    файл(&mut длинный, &vec![0x41u8; 1000], false);
+    let mut long = Vec::new();
+    tok(&mut long, b"nix-archive-1");
+    file(&mut long, &vec![0x41u8; 1000], false);
 
-    vec![один, дерево, длинный]
+    vec![one, tree, long]
 }
 
 #[test]
 fn обход_не_паникует_на_мусоре() {
-    void_fuzz::run("nar::walk", 2026, void_fuzz::rounds(), &корпус(), |b| {
+    void_fuzz::run("nar::walk", 2026, void_fuzz::rounds(), &corpus(), |b| {
         let _ = void_nar::walk(b, |_| Ok(()));
     });
 }

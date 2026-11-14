@@ -439,7 +439,7 @@ struct Rx {
     idx: usize,
     /// Сколько кадров карта не сумела расшифровать. Веха 220 — считаем, а не молчим: ноль здесь
     /// и растущее число — разные поломки, и по journal-строке их надо различать.
-    порченых: u64,
+    broken_count: u64,
     /// Веха 220.3 — ОДИН БУФЕР НА ВСЕ КАДРЫ, а не вектор на каждый.
     ///
     /// Первая редакция копировала каждый принятый кадр в кучу. В эфире владельца двенадцать
@@ -472,7 +472,7 @@ impl Rx {
         // Кадр, который карта не сумела расшифровать, — мусор: длины и адреса в нём случайные.
         // Отдать такой сети значит накормить стек выдумкой.
         if w3 & rt2800::RXD_CIPHER_ERROR != 0 {
-            self.порченых += 1;
+            self.broken_count += 1;
         } else if len > rt2800::RXWI_SIZE {
             // Уровень сигнала лежит в заголовке приёма, который карта кладёт ПЕРЕД кадром.
             self.rssi_raw = unsafe { core::ptr::read_volatile((head + 8) as *const u32) } as u8;
@@ -482,10 +482,10 @@ impl Rx {
             // могла положить больше, чем сказала движку DMA.
             let w0 = unsafe { core::ptr::read_volatile(head as *const u32) };
             let mpdu = ((w0 >> rt2800::RXWI_LEN_SHIFT) & rt2800::RXWI_LEN_MASK) as usize;
-            let влезло = (len - rt2800::RXWI_SIZE).min(rt2800::RX_BUF - rt2800::RXWI_SIZE);
+            let fit = (len - rt2800::RXWI_SIZE).min(rt2800::RX_BUF - rt2800::RXWI_SIZE);
             // Ноль значит «карта длины не назвала» — тогда берём всё, что положено: лучше лишний
             // хвост, чем потерянный кадр.
-            let n = if mpdu == 0 { влезло } else { mpdu.min(влезло) };
+            let n = if mpdu == 0 { fit } else { mpdu.min(fit) };
             self.buf[..n].copy_from_slice(unsafe {
                 core::slice::from_raw_parts((head + rt2800::RXWI_SIZE) as *const u8, n)
             });
@@ -525,10 +525,10 @@ impl Tx {
     fn send(&mut self, frame: &[u8], wcid: Option<usize>) -> bool {
         // Кадры разговора идут САМОЙ ЖИВУЧЕЙ скоростью: их единицы, платить за них надёжностью
         // незачем, а на краю слышимости они дойдут.
-        let положили = rt2800::tx_send(self.desc_va, self.buf_va, self.idx, frame, true, wcid, false);
-        let забрали = положили && rt2800::tx_drained(self.idx, 100);
+        let put_count = rt2800::tx_send(self.desc_va, self.buf_va, self.idx, frame, true, wcid, false);
+        let took_count = put_count && rt2800::tx_drained(self.idx, 100);
         self.idx = (self.idx + 1) % rt2800::TX_RING;
-        забрали
+        took_count
     }
 
     /// Веха 222.5 — ЕСТЬ ЛИ МЕСТО в кольце карты.
@@ -574,18 +574,18 @@ fn wait_mgmt(
     rx: &mut Rx,
     mac: &[u8; 6],
     subtype: u8,
-    мс: u64,
-    отложенные: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    ms: u64,
+    deferred: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Option<alloc::vec::Vec<u8>> {
-    let until = sys::monotonic_ns() + мс * 1_000_000;
+    let until = sys::monotonic_ns() + ms * 1_000_000;
     loop {
         while rx.next() {
-            if let Some((подтип, хвост)) = mgmt_reply(rx.frame(), mac) {
-                if подтип == subtype {
-                    return Some(alloc::vec::Vec::from(хвост));
+            if let Some((subtype, tail)) = mgmt_reply(rx.frame(), mac) {
+                if subtype == subtype {
+                    return Some(alloc::vec::Vec::from(tail));
                 }
             } else if let Some(b) = wpa::eapol_of(rx.frame(), mac) {
-                отложенные.push(alloc::vec::Vec::from(b));
+                deferred.push(alloc::vec::Vec::from(b));
             }
         }
         if sys::monotonic_ns() >= until {
@@ -599,13 +599,13 @@ fn wait_mgmt(
 fn wait_eapol(
     rx: &mut Rx,
     mac: &[u8; 6],
-    мс: u64,
-    отложенные: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    ms: u64,
+    deferred: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Option<alloc::vec::Vec<u8>> {
-    if !отложенные.is_empty() {
-        return Some(отложенные.remove(0));
+    if !deferred.is_empty() {
+        return Some(deferred.remove(0));
     }
-    let until = sys::monotonic_ns() + мс * 1_000_000;
+    let until = sys::monotonic_ns() + ms * 1_000_000;
     loop {
         while rx.next() {
             if let Some(b) = wpa::eapol_of(rx.frame(), mac) {
@@ -655,7 +655,7 @@ fn handshake(
     addr: &[u8; 6],
     bssid: &[u8; 6],
     pmk: &[u8; 32],
-    отложенные: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    deferred: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>,
 ) -> Result<Keys, alloc::string::String> {
     // Наше случайное число. Слабый источник — ОТКАЗ, а не «как-нибудь»: предсказуемое число здесь
     // значит, что ключ сеанса можно посчитать со стороны, и защита остаётся только на вид.
@@ -668,9 +668,9 @@ fn handshake(
     }
 
     // ── первый кадр: случайное число точки ──
-    let м1 = wait_eapol(rx, addr, 3000, отложенные).ok_or("точка не начала рукопожатие")?;
+    let m1 = wait_eapol(rx, addr, 3000, deferred).ok_or("точка не начала рукопожатие")?;
     let (anonce, replay1) = {
-        let k = wpa::parse_key_frame(&м1).ok_or("первый кадр рукопожатия не разобрался")?;
+        let k = wpa::parse_key_frame(&m1).ok_or("первый кадр рукопожатия не разобрался")?;
         if k.info & wpa::KI_MIC != 0 || k.info & wpa::KI_PAIRWISE == 0 {
             return Err("первый кадр рукопожатия пришёл не первым".into());
         }
@@ -680,7 +680,7 @@ fn handshake(
     let (kck, kek) = (&ptk[..16], &ptk[16..32]);
 
     // ── второй кадр: наше число и подпись ──
-    let м2 = wpa::build_key_frame(
+    let m2 = wpa::build_key_frame(
         wpa::KI_VERSION_2 | wpa::KI_PAIRWISE | wpa::KI_MIC,
         0,
         &replay1,
@@ -688,13 +688,13 @@ fn handshake(
         kck,
         &RSN_IE,
     );
-    if !tx.send(&wpa::frame_eapol(bssid, addr, &м2), None) {
+    if !tx.send(&wpa::frame_eapol(bssid, addr, &m2), None) {
         return Err("карта не забрала второй кадр рукопожатия".into());
     }
 
     // ── третий кадр: подпись точки и групповой ключ ──
-    let м3 = wait_eapol(rx, addr, 2000, отложенные).ok_or("точка не ответила на наш второй кадр")?;
-    let k3 = wpa::parse_key_frame(&м3).ok_or("третий кадр рукопожатия не разобрался")?;
+    let m3 = wait_eapol(rx, addr, 2000, deferred).ok_or("точка не ответила на наш второй кадр")?;
+    let k3 = wpa::parse_key_frame(&m3).ok_or("третий кадр рукопожатия не разобрался")?;
     // ЗДЕСЬ И ТОЛЬКО ЗДЕСЬ виден неверный пароль — и выглядит он не как отказ, а как ПОВТОР:
     // точка не приняла нашу подпись, молча выбросила второй кадр и прислала первый заново.
     if k3.info & wpa::KI_MIC == 0 {
@@ -706,11 +706,11 @@ fn handshake(
     // из пароля. Пришёл третий — значит пароль ВЕРНЫЙ, точка это уже подтвердила. Не сойтись после
     // этого может только наша проверка ЕЁ подписи: не те байты кадра либо не тот способ подписи.
     // Первый раз причиной была контрольная сумма кадра, посчитанная как часть кадра.
-    if !wpa::key_mic_ok(kck, &м3, &k3.mic) {
+    if !wpa::key_mic_ok(kck, &m3, &k3.mic) {
         return Err(alloc::format!(
             "пароль ВЕРНЫЙ (точка приняла наш второй кадр), но её подпись у нас не сошлась — \
 ошибка на нашей стороне: кадр {} Б, вид подписи {}",
-            м3.len(),
+            m3.len(),
             k3.info & 7,
         ));
     }
@@ -718,25 +718,25 @@ fn handshake(
     // пароль. Контрольное слово упаковки — вторая проверка того же.
     let mut gtk = None;
     if k3.info & wpa::KI_ENCRYPTED != 0 && k3.data.len() >= 24 {
-        let mut внутри = alloc::vec![0u8; k3.data.len() - 8];
-        if !wpa::aes_unwrap(kek, k3.data, &mut внутри) {
+        let mut inner = alloc::vec![0u8; k3.data.len() - 8];
+        if !wpa::aes_unwrap(kek, k3.data, &mut inner) {
             return Err("групповой ключ не развернулся".into());
         }
-        if let Some((номер, ключ)) = wpa::find_gtk(&внутри) {
-            if ключ.len() >= 16 {
+        if let Some((nr, key)) = wpa::find_gtk(&inner) {
+            if key.len() >= 16 {
                 let mut k = [0u8; 16];
-                k.copy_from_slice(&ключ[..16]);
-                gtk = Some((номер, k));
+                k.copy_from_slice(&key[..16]);
+                gtk = Some((nr, k));
             }
         }
-        внутри.fill(0);
+        inner.fill(0);
     }
 
     // ── четвёртый кадр: «подпись сошлась, ключи ставлю» ──
     //
     // Отправляется ДО того, как ключ уйдёт в карту: с установленным ключом карта зашифрует и его,
     // а точка ждёт этот кадр открытым — она сама поставит ключ только получив его.
-    let м4 = wpa::build_key_frame(
+    let m4 = wpa::build_key_frame(
         wpa::KI_VERSION_2 | wpa::KI_PAIRWISE | wpa::KI_MIC | wpa::KI_SECURE,
         0,
         &k3.replay,
@@ -744,14 +744,14 @@ fn handshake(
         kck,
         &[],
     );
-    if !tx.send(&wpa::frame_eapol(bssid, addr, &м4), None) {
+    if !tx.send(&wpa::frame_eapol(bssid, addr, &m4), None) {
         return Err("карта не забрала четвёртый кадр рукопожатия".into());
     }
-    let mut ключи = Keys { tk: [0; 16], gtk, kck: [0; 16], kek: [0; 16] };
-    ключи.tk.copy_from_slice(&ptk[32..48]);
-    ключи.kck.copy_from_slice(kck);
-    ключи.kek.copy_from_slice(kek);
-    Ok(ключи)
+    let mut keys = Keys { tk: [0; 16], gtk, kck: [0; 16], kek: [0; 16] };
+    keys.tk.copy_from_slice(&ptk[32..48]);
+    keys.kck.copy_from_slice(kck);
+    keys.kek.copy_from_slice(kek);
+    Ok(keys)
 }
 
 /// Веха 220 — ДЕРЖАТЬ СОЕДИНЕНИЕ: кадры из эфира в стек, из стека в эфир.
@@ -779,37 +779,37 @@ fn serve(
         // идти: стек один, и адрес он взял у того, кто пришёл раньше.
         return "картой системы уже работает другой драйвер — кадрам некуда идти";
     }
-    let mut всего = 0u64;
-    let mut непонятных = 0u64;
-    let mut из_эфира = 0u64;
-    let mut в_эфир = 0u64;
-    let mut потеряно = 0u64;
-    let mut сказано = sys::monotonic_ns();
+    let mut total = 0u64;
+    let mut unknown_count = 0u64;
+    let mut from_air = 0u64;
+    let mut to_air = 0u64;
+    let mut lost_count = 0u64;
+    let mut said = sys::monotonic_ns();
     // Первый отчёт — скоро: он и есть ответ на «работает ли».
-    let mut срок = 3_000_000_000u64;
-    let mut исходящий = [0u8; 2048];
+    let mut deadline = 3_000_000_000u64;
+    let mut outgoing = [0u8; 2048];
     loop {
-        let mut дело = false;
+        let mut job = false;
 
         // ── из эфира в стек ──
-        let mut подряд = 0u32;
+        let mut in_row = 0u32;
         while rx.next() {
-            дело = true;
-            всего += 1;
+            job = true;
+            total += 1;
             // Та же уступка, что и в обзоре: поток кадров не должен запирать процессор.
-            подряд += 1;
-            if подряд >= 16 {
-                подряд = 0;
+            in_row += 1;
+            if in_row >= 16 {
+                in_row = 0;
                 sys::sleep_ns(1_000_000);
             }
             // Точка прощается — управляющим кадром, и это конец соединения, а не сбой связи.
             // Подтип 10 — «выходи из сети», 12 — «я тебя не знаю».
-            if let Some((подтип, хвост)) = mgmt_reply(rx.frame(), addr) {
-                if подтип == 10 || подтип == 12 {
-                    let причина =
-                        if хвост.len() >= 2 { u16::from_le_bytes([хвост[0], хвост[1]]) } else { 0 };
+            if let Some((subtype, tail)) = mgmt_reply(rx.frame(), addr) {
+                if subtype == 10 || subtype == 12 {
+                    let reason =
+                        if tail.len() >= 2 { u16::from_le_bytes([tail[0], tail[1]]) } else { 0 };
                     sys::write(
-                        alloc::format!("[wifi] точка отключила нас (причина {})\n", причина)
+                        alloc::format!("[wifi] точка отключила нас (причина {})\n", reason)
                             .as_bytes(),
                     );
                     sys::netdev_detach(netdev);
@@ -818,17 +818,17 @@ fn serve(
                 continue;
             }
             // Разговор о ключах: точка меняет групповой ключ, не спрашивая станцию.
-            if let Some(тело) = wpa::eapol_of(rx.frame(), addr) {
-                let кадр = alloc::vec::Vec::from(тело);
-                rekey(tx, addr, bssid, &кадр, keys);
+            if let Some(body) = wpa::eapol_of(rx.frame(), addr) {
+                let frame = alloc::vec::Vec::from(body);
+                rekey(tx, addr, bssid, &frame, keys);
                 continue;
             }
             match wpa::wifi_to_eth(rx.frame()) {
                 Some(eth) => {
                     if sys::netdev_rx(netdev, &eth) {
-                        из_эфира += 1;
+                        from_air += 1;
                     } else {
-                        потеряно += 1;
+                        lost_count += 1;
                     }
                 }
                 None => {
@@ -841,15 +841,15 @@ fn serve(
                     // разные поломки, и других способов их различить у нас нет.
                     let f = rx.frame();
                     if f.len() >= 16 && (f[0] >> 2) & 3 == 2 && &f[4..10] == &addr[..] {
-                        непонятных += 1;
+                        unknown_count += 1;
                         // Первые два — сырьём: шестнадцать байт заголовка отвечают сразу на всё
                         // (тип, защита, адреса), а дальше их печатать незачем.
-                        if непонятных <= 2 {
-                            let mut д = alloc::string::String::from("[wifi] нам, но не понят:");
+                        if unknown_count <= 2 {
+                            let mut d = alloc::string::String::from("[wifi] нам, но не понят:");
                             for b in &f[..16] {
-                                д += &alloc::format!(" {:02x}", b);
+                                d += &alloc::format!(" {:02x}", b);
                             }
-                            шум((д + "\n").as_bytes());
+                            noise((d + "\n").as_bytes());
                         }
                     }
                 }
@@ -861,20 +861,20 @@ fn serve(
         // Веха 222.5 — берём у стека, ТОЛЬКО пока есть куда положить. Иначе взятый кадр
         // выбрасывается, а стек считает его отправленным.
         while tx.has_room() {
-            let n = sys::netdev_tx_pop(netdev, &mut исходящий);
+            let n = sys::netdev_tx_pop(netdev, &mut outgoing);
             if n == 0 {
                 break;
             }
-            дело = true;
-            match wpa::eth_to_wifi(bssid, &исходящий[..n]) {
-                Some(кадр) => {
-                    if tx.post(&кадр, Some(rt2800::WCID_AP)) {
-                        в_эфир += 1;
+            job = true;
+            match wpa::eth_to_wifi(bssid, &outgoing[..n]) {
+                Some(frame) => {
+                    if tx.post(&frame, Some(rt2800::WCID_AP)) {
+                        to_air += 1;
                     } else {
-                        потеряно += 1;
+                        lost_count += 1;
                     }
                 }
-                None => потеряно += 1,
+                None => lost_count += 1,
             }
         }
 
@@ -892,27 +892,27 @@ fn serve(
         // Веха 222.1 — и ВСЕГО кадров из эфира, отдельно от «нам». Ноль всего значит, что радио
         // молчит (канал, фильтр, антенна); много всего и ноль нам — что нас не считают своими
         // (адрес, ключи, точка нас не видит). Тоже разные поломки.
-        let сейчас = sys::monotonic_ns();
-        if сейчас - сказано >= срок {
-            сказано = сейчас;
-            срок = 60_000_000_000;
-            шум(
+        let now_val = sys::monotonic_ns();
+        if now_val - said >= deadline {
+            said = now_val;
+            deadline = 60_000_000_000;
+            noise(
                 alloc::format!(
                     "[wifi] кадров из эфира {} (нам {}, нам но не поняты {}), отправлено {}, \
 потеряно {}, не расшифровано {}; карта: без подтверждения {:#010x}, ушло {:#010x}\n",
-                    всего,
-                    из_эфира,
-                    непонятных,
-                    в_эфир,
-                    потеряно,
-                    rx.порченых,
+                    total,
+                    from_air,
+                    unknown_count,
+                    to_air,
+                    lost_count,
+                    rx.broken_count,
                     rt2800::rd32(rt2800::TX_STA_CNT0),
                     rt2800::rd32(rt2800::TX_STA_CNT1),
                 )
                 .as_bytes(),
             );
         }
-        if !дело {
+        if !job {
             // Прерывание карты мы не заводили — значит опрос; но опрос без сна жжёт процессор
             // впустую (правило Вехи 168). Миллисекунда — компромисс: задержка незаметна человеку,
             // а ядру остаётся девятьсот девяносто девять тысячных.
@@ -932,36 +932,36 @@ fn serve(
 ///
 /// Парный кадр (`KI_PAIRWISE`) сюда попасть не должен: это была бы попытка начать рукопожатие
 /// заново, и разбираться с ней — отдельная работа. Молча его игнорируем: своих ключей не меняем.
-fn rekey(tx: &mut Tx, addr: &[u8; 6], bssid: &[u8; 6], кадр: &[u8], keys: &mut Keys) {
-    let Some(k) = wpa::parse_key_frame(кадр) else { return };
+fn rekey(tx: &mut Tx, addr: &[u8; 6], bssid: &[u8; 6], frame: &[u8], keys: &mut Keys) {
+    let Some(k) = wpa::parse_key_frame(frame) else { return };
     if k.info & wpa::KI_PAIRWISE != 0 || k.info & wpa::KI_MIC == 0 {
         return;
     }
     // Подпись — единственное, что отличает точку от соседа, решившего прислать нам ключ.
-    if !wpa::key_mic_ok(&keys.kck, кадр, &k.mic) {
+    if !wpa::key_mic_ok(&keys.kck, frame, &k.mic) {
         w("[wifi] чужая подпись на смене группового ключа — не беру\n");
         return;
     }
     if k.info & wpa::KI_ENCRYPTED == 0 || k.data.len() < 24 {
         return;
     }
-    let mut внутри = alloc::vec![0u8; k.data.len() - 8];
-    if !wpa::aes_unwrap(&keys.kek, k.data, &mut внутри) {
+    let mut inner = alloc::vec![0u8; k.data.len() - 8];
+    if !wpa::aes_unwrap(&keys.kek, k.data, &mut inner) {
         w("[wifi] новый групповой ключ не развернулся\n");
         return;
     }
-    if let Some((номер, ключ)) = wpa::find_gtk(&внутри) {
-        if ключ.len() >= 16 {
+    if let Some((nr, key)) = wpa::find_gtk(&inner) {
+        if key.len() >= 16 {
             let mut k16 = [0u8; 16];
-            k16.copy_from_slice(&ключ[..16]);
-            rt2800::install_group_key(номер, &k16);
-            keys.gtk = Some((номер, k16));
-            шум(alloc::format!("[wifi] групповой ключ сменился на {}\n", номер).as_bytes());
+            k16.copy_from_slice(&key[..16]);
+            rt2800::install_group_key(nr, &k16);
+            keys.gtk = Some((nr, k16));
+            noise(alloc::format!("[wifi] групповой ключ сменился на {}\n", nr).as_bytes());
         }
     }
-    внутри.fill(0);
+    inner.fill(0);
     // Ответ идёт УЖЕ ПОД ШИФРОМ: соединение защищено, и открытый кадр точка не примет.
-    let ответ = wpa::build_key_frame(
+    let reply = wpa::build_key_frame(
         wpa::KI_VERSION_2 | wpa::KI_MIC | wpa::KI_SECURE,
         0,
         &k.replay,
@@ -969,7 +969,7 @@ fn rekey(tx: &mut Tx, addr: &[u8; 6], bssid: &[u8; 6], кадр: &[u8], keys: &m
         &keys.kck,
         &[],
     );
-    tx.send(&wpa::frame_eapol(bssid, addr, &ответ), Some(rt2800::WCID_AP));
+    tx.send(&wpa::frame_eapol(bssid, addr, &reply), Some(rt2800::WCID_AP));
 }
 
 /// Веха 219 — прочитать пароль сети из корня store.
@@ -997,8 +997,8 @@ fn read_secret(store: usize, root: &[u8], out: &mut [u8]) -> Result<usize, &'sta
 }
 
 /// Значение строки `имя=…` среди аргументов сервиса. `None` — её не передали или она пуста.
-fn arg<'a>(args: &'a [u8], имя: &[u8]) -> Option<&'a [u8]> {
-    args.split(|&b| b == 0).find_map(|a| a.strip_prefix(имя)).filter(|s| !s.is_empty())
+fn arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    args.split(|&b| b == 0).find_map(|a| a.strip_prefix(name)).filter(|s| !s.is_empty())
 }
 
 fn w(s: &str) {
@@ -1018,22 +1018,22 @@ fn w(s: &str) {
 /// ```text
 /// service("wifi", "mmio:wifi", "dma", "store:r", "netdev", "arg:verbose")
 /// ```
-static ПОДРОБНО: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-fn подробно() -> bool {
-    ПОДРОБНО.load(core::sync::atomic::Ordering::Relaxed)
+fn verbose() -> bool {
+    VERBOSE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Печать ПОДРОБНОСТИ: при `arg:verbose` — как обычно, иначе ни байта.
-fn шум(b: &[u8]) {
-    if подробно() {
+fn noise(b: &[u8]) {
+    if verbose() {
         sys::write(b);
     }
 }
 
 /// То же для строковых литералов — пара к [`w`].
-fn шумs(s: &str) {
-    шум(s.as_bytes());
+fn noise_str(s: &str) {
+    noise(s.as_bytes());
 }
 
 /// Ждать, пока бит `mask` в регистре `off` примет значение `want`. `false` — не дождались.
@@ -1148,8 +1148,8 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     {
         let mut buf = [0u8; 256];
         let n = sys::args(&mut buf);
-        let подробно = buf[..n].split(|&b| b == 0).any(|a| a == b"verbose");
-        ПОДРОБНО.store(подробно, core::sync::atomic::Ordering::Relaxed);
+        let verbose = buf[..n].split(|&b| b == 0).any(|a| a == b"verbose");
+        VERBOSE.store(verbose, core::sync::atomic::Ordering::Relaxed);
     }
 
     // Веха 220.3 — ПРАВА БЕРЁМ ПО ИМЕНИ, а не по месту в строке сервиса.
@@ -1187,7 +1187,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         for i in 0..8 {
             line += &alloc::format!(" {:08x}", unsafe { rd32(base + i * 4) });
         }
-        шум((line + "\n").as_bytes());
+        noise((line + "\n").as_bytes());
     }
     // Первое же число отвечает на главный вопрос. `ffffffff` значит «на шине никто не ответил»
     // (так читается отключённое или несуществующее устройство), ноль — «окно есть, карта молчит».
@@ -1210,7 +1210,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     let mac = [a0 as u8, (a0 >> 8) as u8, (a0 >> 16) as u8, (a0 >> 24) as u8, a1 as u8, (a1 >> 8) as u8];
     let efuse = unsafe { rd32(EFUSE_CTRL) };
 
-    шум(
+    noise(
         alloc::format!(
             "[wifi] ASIC {:04x} ревизия {:04x} (MAC_CSR0 {:#010x})\n\
              [wifi] MAC_SYS_CTRL {:#010x} — приём {}, передача {}\n\
@@ -1237,14 +1237,14 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // настроить приём: RF-тип выбирает таблицы инициализации, а поправка частоты — то, попадём
     // ли мы вообще в канал.
     if efuse & EFUSE_PRESENT == 0 {
-        шумs("[wifi] EFUSE нет — калибровки во внешней EEPROM, её чтение ещё не написано\n");
+        noise_str("[wifi] EFUSE нет — калибровки во внешней EEPROM, её чтение ещё не написано\n");
         sys::exit(0);
     }
     let mut ee = [0u16; EE_WORDS];
     for blk in 0..EE_WORDS / 8 {
         let mut part = [0u16; 8];
         if efuse_block(blk * 8, &mut part).is_none() {
-            шум(
+            noise(
                 alloc::format!("[wifi] EFUSE молчит на блоке {} — дальше читать нечего\n", blk)
                     .as_bytes(),
             );
@@ -1269,7 +1269,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     } else {
         (conf0 >> 8) & 0xf
     };
-    шум(
+    noise(
         alloc::format!(
             "[wifi] EFUSE: chip-id {:04x} версия {:04x}\n\
              [wifi] адрес в EFUSE {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n\
@@ -1286,7 +1286,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         for i in 0..8 {
             line += &alloc::format!(" {:04x}", ee[row * 8 + i]);
         }
-        шум((line + "\n").as_bytes());
+        noise((line + "\n").as_bytes());
     }
     // ── прошивка (Веха 207) ──────────────────────────────────────────────────────────────
     //
@@ -1310,13 +1310,13 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         sys::exit(1);
     }
     fw.truncate(got);
-    шум(
+    noise(
         alloc::format!("[wifi] прошивка: {} Б (в объекте {} Б), гружу\n", got, full).as_bytes(),
     );
     match load_firmware(&fw) {
         Ok(()) => {
             let (pbf, mac_ctrl) = unsafe { (rd32(PBF_SYS_CTRL), rd32(MAC_SYS_CTRL)) };
-            шум(
+            noise(
                 alloc::format!(
                     "[wifi] прошивка записана: PBF_SYS_CTRL {:#010x}, MAC_SYS_CTRL {:#010x}\n",
                     pbf, mac_ctrl
@@ -1327,7 +1327,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
             // карте кто-то работает» по регистрам не видна никак; видно только по тому, забрали
             // ли письмо из ящика.
             if mcu_command(MCU_WAKEUP, 0, 2) {
-                шумs("[wifi] ПРОШИВКА ОТВЕЧАЕТ: письмо забрано, процессор карты жив\n");
+                noise_str("[wifi] ПРОШИВКА ОТВЕЧАЕТ: письмо забрано, процессор карты жив\n");
             } else {
                 sys::write(
                     alloc::format!(
@@ -1370,7 +1370,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     sys::sleep_ns(1_000_000);
     match rt2800::bbp_read(0) {
         Some(v) if v != 0 && v != 0xff => {
-            шум(alloc::format!("[wifi] BBP отвечает: версия {:#04x}\n", v).as_bytes());
+            noise(alloc::format!("[wifi] BBP отвечает: версия {:#04x}\n", v).as_bytes());
         }
         other => {
             sys::write(
@@ -1387,7 +1387,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // назвала типом RF. Два независимых источника об одном чипе — лучшая из доступных проверок.
     match rt2800::rfcsr_read(0) {
         Some(v) => {
-            шум(alloc::format!("[wifi] RFCSR[0] = {:#04x}\n", v).as_bytes());
+            noise(alloc::format!("[wifi] RFCSR[0] = {:#04x}\n", v).as_bytes());
         }
         None => w("[wifi] радио не отвечает на чтение\n"),
     }
@@ -1399,7 +1399,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     let (bbp_n, rf_n) = rt2800::table_sizes(rev);
     let mut diff = [(0u8, 0u8, 0u8); 12];
     let (bbp_ok, rf_ok, n_diff) = rt2800::load_tables(rev, &mut diff);
-    шум(
+    noise(
         alloc::format!(
             "[wifi] таблицы: BBP {} из {}, радио {} из {}\n",
             bbp_ok, bbp_n, rf_ok, rf_n
@@ -1411,7 +1411,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // живут биты состояния: их значение по чтению и не обязано совпадать с записанным.
     for &(reg, want, got) in diff.iter().take(n_diff.min(diff.len())) {
         let (kind, num) = if reg & 0x80 != 0 { ("радио", reg & 0x7f) } else { ("BBP", reg) };
-        шум(
+        noise(
             alloc::format!(
                 "[wifi]   {} {}: писали {:#04x}, читается {:#04x}\n",
                 kind, num, want, got
@@ -1422,9 +1422,9 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
     // Нормальный режим: одноантенной карте второй тракт не нужен — он тратит питание и добавляет
     // шум, а сигнала по нему нет. Числа антенн берём из EFUSE, а не из предположений.
     rt2800::normal_mode_5xxx(rx_path, tx_path);
-    шумs("[wifi] радио в нормальном режиме: лишние тракты выключены, калибровка сделана\n");
+    noise_str("[wifi] радио в нормальном режиме: лишние тракты выключены, калибровка сделана\n");
     if n_diff > diff.len() {
-        шум(alloc::format!("[wifi]   …и ещё {}\n", n_diff - diff.len()).as_bytes());
+        noise(alloc::format!("[wifi]   …и ещё {}\n", n_diff - diff.len()).as_bytes());
     }
     // ── канал и приём (Веха 210) ─────────────────────────────────────────────────────────
     //
@@ -1448,7 +1448,7 @@ pub extern "C" fn _start(a0: usize, a1: usize) -> ! {
         rt2800::rd32(rt2800::RX_FILTER_CFG),
         rt2800::rd32(rt2800::TX_PIN_CFG),
     );
-    шум(
+    noise(
         alloc::format!(
             "[wifi] канал {} (поправка {:#04x}, усиление {:#04x}): радио {:#04x}, \
 MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n",
@@ -1460,7 +1460,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // то, что коэффициенты синтезатора читаются такими же, какими их записали, и что приёмный
     // тракт включён. Первый заход судил по передатчику и объявил бы неудачей работающий приём.
     if rt2800::channel_ok(ch) {
-        шум(
+        noise(
             alloc::format!(
                 "[wifi] КАНАЛ {} НАСТРОЕН: синтезатор принял коэффициенты, приёмник включён \
 (радио {:#04x})\n",
@@ -1507,7 +1507,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     rt2800::tx_rings_idle();
     rt2800::rx_ring_init(DESC_VA, dma_pa, buf_pa);
     rt2800::wpdma_rx_on();
-    шум(
+    noise(
         alloc::format!(
             "[wifi] кольцо приёма: {} буферов по {} Б, физ {:#x}, движок {:#010x}; слушаю эфир\n",
             rt2800::RX_RING,
@@ -1538,7 +1538,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
         desc_va: DESC_VA,
         buf_va,
         idx: 0,
-        порченых: 0,
+        broken_count: 0,
         buf: [0; rt2800::RX_BUF],
         len: 0,
         rssi_raw: 0,
@@ -1548,7 +1548,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
             continue;
         }
         let until = sys::monotonic_ns() + DWELL_NS;
-        let mut подряд = 0u32;
+        let mut in_row = 0u32;
         while sys::monotonic_ns() < until {
             if !rx.next() {
                 sys::sleep_ns(2_000_000);
@@ -1558,9 +1558,9 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
             // цикл спал, только НЕ НАЙДЯ кадра, а в людном эфире кадр находится всегда — и
             // четверть секунды на канал программа не отпускала процессор вовсе. Снаружи это
             // выглядело как вязнущая система: нажатия клавиш дублировались и терялись.
-            подряд += 1;
-            if подряд >= 16 {
-                подряд = 0;
+            in_row += 1;
+            if in_row >= 16 {
+                in_row = 0;
                 sys::sleep_ns(1_000_000);
             }
             if let Some(b) = parse_beacon(rx.frame()) {
@@ -1593,14 +1593,14 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // Список сетей — это ОТВЕТ на обзор эфира, и при обзоре он печатается всегда. А когда сеть
     // названа строкой `arg:ssid=…`, человек уже знает, куда подключается, и перечень соседей
     // каждую загрузку — чистый шум.
-    let обзор = {
+    let sysview = {
         let mut buf = [0u8; 256];
         let n = sys::args(&mut buf);
         arg(&buf[..n], b"ssid=").is_none()
     };
     for n in &nets {
-        let печать = if обзор { sys::write } else { шум };
-        печать(
+        let print_fn = if sysview { sys::write } else { noise };
+        print_fn(
             alloc::format!(
                 "[wifi]   {:<24} к{:<3} {:>4} дБм  {}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} маяков)\n",
                 n.ssid,
@@ -1613,7 +1613,7 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
             .as_bytes(),
         );
     }
-    шум(
+    noise(
         alloc::format!(
             "[wifi] кольцо: индекс карты {}, наш {}\n",
             rt2800::rd32(rt2800::RX_DRX_IDX),
@@ -1630,17 +1630,17 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     let mut argbuf = [0u8; 256];
     let n = sys::args(&mut argbuf);
     let args = &argbuf[..n];
-    let Some(цель) = arg(args, b"ssid=") else {
+    let Some(target) = arg(args, b"ssid=") else {
         w("[wifi] кому представляться, не сказано — добавьте `arg:ssid=ИМЯ` в строку сервиса\n");
         rt2800::stop();
         w("[wifi] карта остановлена; обзор эфира — вся работа этого запуска\n");
         sys::exit(0);
     };
-    let Some(сеть) = nets.iter().find(|n| n.ssid.as_bytes() == цель) else {
+    let Some(net) = nets.iter().find(|n| n.ssid.as_bytes() == target) else {
         sys::write(
             alloc::format!(
                 "[wifi] сети «{}» в эфире не нашлось — подключаться не к чему\n",
-                core::str::from_utf8(цель).unwrap_or("?")
+                core::str::from_utf8(target).unwrap_or("?")
             )
             .as_bytes(),
         );
@@ -1650,10 +1650,10 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     sys::write(
         alloc::format!(
             "[wifi] подключаюсь к «{}» (канал {}, {} дБм, {})\n",
-            сеть.ssid,
-            сеть.ch,
-            сеть.rssi,
-            if сеть.secure { "с ключом" } else { "открытая" },
+            net.ssid,
+            net.ch,
+            net.rssi,
+            if net.secure { "с ключом" } else { "открытая" },
         )
         .as_bytes(),
     );
@@ -1664,8 +1664,8 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // SHA-1, и это самая долгая работа во всём подключении. Точка ждёт наш второй кадр
     // рукопожатия десятые доли секунды; посчитанный заранее ключ к тому моменту уже готов.
     let mut pmk = None;
-    if сеть.secure {
-        let Some(имя_корня) = arg(args, b"key=") else {
+    if net.secure {
+        let Some(root_name) = arg(args, b"key=") else {
             w("[wifi] сеть с ключом, а пароля не дали: задай его командой `secret ИМЯ` и добавь \
 `arg:key=@ИМЯ` в строку сервиса\n");
             rt2800::stop();
@@ -1674,16 +1674,16 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
         // Знак `@` говорит «это имя корня store, а не значение»: по нему `rebuild` проверяет, что
         // корень существует, и отказывается собирать конфиг, ссылающийся в никуда. Нам он уже не
         // нужен — но и без него имя годится, чтобы старый конфиг не сломался.
-        let имя_корня = имя_корня.strip_prefix(b"@".as_slice()).unwrap_or(имя_корня);
-        let mut пароль = [0u8; 64];
-        let len = match read_secret(store, имя_корня, &mut пароль) {
+        let root_name = root_name.strip_prefix(b"@".as_slice()).unwrap_or(root_name);
+        let mut password = [0u8; 64];
+        let len = match read_secret(store, root_name, &mut password) {
             Ok(len) => len,
-            Err(почему) => {
+            Err(why) => {
                 sys::write(
                     alloc::format!(
                         "[wifi] пароль не прочитан ({}): {}\n",
-                        core::str::from_utf8(имя_корня).unwrap_or("?"),
-                        почему
+                        core::str::from_utf8(root_name).unwrap_or("?"),
+                        why
                     )
                     .as_bytes(),
                 );
@@ -1698,15 +1698,15 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
             rt2800::stop();
             sys::exit(1);
         }
-        pmk = Some(wpa::pmk(&пароль[..len], сеть.ssid.as_bytes()));
+        pmk = Some(wpa::pmk(&password[..len], net.ssid.as_bytes()));
         // Сам пароль больше не нужен: из него уже выведен ключ сети.
-        пароль.fill(0);
+        password.fill(0);
     }
 
     // Встать на канал сети и назваться карте: свой адрес и адрес точки. Без этого карта не
     // считает ответ точки нашим и не подтверждает его.
-    rt2800::set_channel(сеть.ch, freq_offset, lna_gain);
-    rt2800::set_addresses(&addr, &сеть.bssid);
+    rt2800::set_channel(net.ch, freq_offset, lna_gain);
+    rt2800::set_addresses(&addr, &net.bssid);
     // Кольцо передачи кладём за кольцом приёма, в той же выданной памяти. Раскладка страницы:
     // дескрипторы приёма, дескрипторы передачи, буферы приёма, буферы передачи — всё подряд,
     // потому что карта ходит по физическим адресам и разрывы ей объяснить нечем.
@@ -1718,21 +1718,21 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // чужом трафике (разбор в `rt2800::rx_filter_station`).
     rt2800::rx_filter_station();
     // Кадры рукопожатия, пришедшие раньше, чем мы их ждём, складываются сюда.
-    let mut отложенные: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut deferred: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
 
     // Шаг 1: представиться. Срок ответа щедрый: точка отвечает за миллисекунды, но занятый эфир
     // и повторы растягивают это на порядок.
-    tx.send(&frame_auth(&сеть.bssid, &addr), None);
-    let Some(ответ) = wait_mgmt(&mut rx, &addr, MGMT_AUTH, 500, &mut отложенные) else {
+    tx.send(&frame_auth(&net.bssid, &addr), None);
+    let Some(reply) = wait_mgmt(&mut rx, &addr, MGMT_AUTH, 500, &mut deferred) else {
         w("[wifi] точка не ответила на представление — дальше идти некуда\n");
         rt2800::stop();
         sys::exit(1);
     };
     // Ответ: алгоритм, шаг, состояние. Ненулевое состояние — отказ, и его причину надо назвать.
-    let состояние = if ответ.len() >= 6 { u16::from_le_bytes([ответ[4], ответ[5]]) } else { 0xffff };
-    if состояние != 0 {
+    let state = if reply.len() >= 6 { u16::from_le_bytes([reply[4], reply[5]]) } else { 0xffff };
+    if state != 0 {
         sys::write(
-            alloc::format!("[wifi] точка отказала в представлении: состояние {}\n", состояние)
+            alloc::format!("[wifi] точка отказала в представлении: состояние {}\n", state)
                 .as_bytes(),
         );
         rt2800::stop();
@@ -1740,27 +1740,27 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     }
 
     // Шаг 2: проситься в сеть.
-    tx.send(&frame_assoc(&сеть.bssid, &addr, цель, сеть.secure), None);
-    let Some(ответ) = wait_mgmt(&mut rx, &addr, MGMT_ASSOC_RESP, 800, &mut отложенные) else {
+    tx.send(&frame_assoc(&net.bssid, &addr, target, net.secure), None);
+    let Some(reply) = wait_mgmt(&mut rx, &addr, MGMT_ASSOC_RESP, 800, &mut deferred) else {
         w("[wifi] точка не ответила на просьбу о подключении\n");
         rt2800::stop();
         sys::exit(1);
     };
     // Ответ: возможности, состояние, наш номер в сети.
-    let состояние = if ответ.len() >= 4 { u16::from_le_bytes([ответ[2], ответ[3]]) } else { 0xffff };
-    if состояние != 0 {
+    let state = if reply.len() >= 4 { u16::from_le_bytes([reply[2], reply[3]]) } else { 0xffff };
+    if state != 0 {
         sys::write(
             alloc::format!(
                 "[wifi] точка отказала в подключении: состояние {} (обычные причины: не те \
 шифры в описании защиты либо сеть не принимает новых станций)\n",
-                состояние
+                state
             )
             .as_bytes(),
         );
         rt2800::stop();
         sys::exit(1);
     }
-    let aid = if ответ.len() >= 6 { u16::from_le_bytes([ответ[4], ответ[5]]) & 0x3fff } else { 0 };
+    let aid = if reply.len() >= 6 { u16::from_le_bytes([reply[4], reply[5]]) & 0x3fff } else { 0 };
 
     // ── шаг 3: рукопожатие (Веха 219, шаг 4 ADR 0021) ────────────────────────────────────
     //
@@ -1769,31 +1769,31 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
     // с ключом самое главное только начинается.
     let Some(pmk) = pmk else {
         sys::write(
-            alloc::format!("[wifi] в открытой сети «{}», номер {}\n", сеть.ssid, aid).as_bytes(),
+            alloc::format!("[wifi] в открытой сети «{}», номер {}\n", net.ssid, aid).as_bytes(),
         );
         rt2800::stop();
         sys::exit(0);
     };
-    let mut ключи = match handshake(&mut rx, &mut tx, &addr, &сеть.bssid, &pmk, &mut отложенные) {
-        Ok(ключи) => ключи,
-        Err(почему) => {
-            sys::write(alloc::format!("[wifi] рукопожатие не вышло: {}\n", почему).as_bytes());
+    let mut keys = match handshake(&mut rx, &mut tx, &addr, &net.bssid, &pmk, &mut deferred) {
+        Ok(keys) => keys,
+        Err(why) => {
+            sys::write(alloc::format!("[wifi] рукопожатие не вышло: {}\n", why).as_bytes());
             rt2800::stop();
             sys::exit(1);
         }
     };
-    rt2800::install_pairwise_key(&сеть.bssid, &ключи.tk);
-    let групповой = match ключи.gtk {
-        Some((номер, ключ)) => {
-            rt2800::install_group_key(номер, &ключ);
-            alloc::format!("групповой {}", номер)
+    rt2800::install_pairwise_key(&net.bssid, &keys.tk);
+    let group_key = match keys.gtk {
+        Some((nr, key)) => {
+            rt2800::install_group_key(nr, &key);
+            alloc::format!("групповой {}", nr)
         }
         // Групповой ключ нужен только для того, что точка шлёт всем сразу; без него разговор с
         // точкой работает, а широковещательное — нет. Молчать об этом нельзя.
         None => alloc::string::String::from("группового точка не дала"),
     };
     sys::write(
-        alloc::format!("[wifi] в сети «{}»: пароль верный, ключи в карте ({})\n", сеть.ssid, групповой)
+        alloc::format!("[wifi] в сети «{}»: пароль верный, ключи в карте ({})\n", net.ssid, group_key)
             .as_bytes(),
     );
 
@@ -1807,13 +1807,13 @@ MAC_SYS_CTRL {:#010x}, фильтр {:#010x}, выводы радио {:#010x}\n
 строку сервиса\n");
         sys::exit(1);
     };
-    let почему = serve(&mut rx, &mut tx, netdev, &addr, &сеть.bssid, &mut ключи);
+    let why = serve(&mut rx, &mut tx, netdev, &addr, &net.bssid, &mut keys);
 
     // Веха 213.2 — ОСТАНОВИТЬ КАРТУ ПЕРЕД ВЫХОДОМ. Разбор в `rt2800::stop`: карта, оставленная
     // с живым кольцом, продолжает писать маяки по физическим адресам, которые ядро уже вернуло
     // в общий котёл, — и рано или поздно кладёт кусок эфира на список свободных кадров.
     sys::netdev_detach(netdev);
     rt2800::stop();
-    sys::write(alloc::format!("[wifi] соединение закончилось: {}\n", почему).as_bytes());
+    sys::write(alloc::format!("[wifi] соединение закончилось: {}\n", why).as_bytes());
     sys::exit(1);
 }

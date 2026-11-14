@@ -90,7 +90,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // родителя должен существовать (Веха 187).
     px::mkdir(fs, b"/nix");
     px::mkdir(fs, b"/nix/store");
-    let store: Rc<dyn void_nix::derive::StoreText> = Rc::new(Иерархия { fs });
+    let store: Rc<dyn void_nix::derive::StoreText> = Rc::new(Hierarchy { fs });
 
     match void_nix::eval_with_store(&src, store) {
         Ok(text) => {
@@ -106,11 +106,11 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 }
 
 /// Куда уезжает текст задания: обычный файл в иерархии по вычисленному пути.
-struct Иерархия {
+struct Hierarchy {
     fs: usize,
 }
 
-impl void_nix::derive::StoreText for Иерархия {
+impl void_nix::derive::StoreText for Hierarchy {
     fn add(&self, path: &str, text: &str) -> Result<(), String> {
         // Уже лежит такой же — не работа, а тождество: путь адресует содержимое.
         if let Some((_, size)) = px::stat(self.fs, path.as_bytes()) {

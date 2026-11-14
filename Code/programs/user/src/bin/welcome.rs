@@ -277,7 +277,7 @@ fn wrap(u: &mut Ui, x: i32, y: i32, w: i32, s: &str, col: Rgba) -> i32 {
 ///
 /// Не спрашиваем ядро отдельным вызовом намеренно: второй источник правды про одно и то же
 /// однажды разошёлся бы с первым, и окно говорило бы «ставь командой install» там, где её нет.
-fn живой_носитель() -> bool {
+fn live_media() -> bool {
     let Some(scap) = ui::conf::store_cap() else { return false };
     let Some(list) = roots::text(scap) else { return false };
     roots::suffixes(&list, b"bin/")
@@ -382,7 +382,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         chevron: Rect::ZERO,
         screens: {
             let mut v: Vec<&'static [Line]> = SCREENS.to_vec();
-            if живой_носитель() {
+            if live_media() {
                 v.insert(1, LIVE);
             }
             v

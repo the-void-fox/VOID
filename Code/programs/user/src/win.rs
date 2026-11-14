@@ -542,10 +542,10 @@ pub fn grant(kind: u8) -> usize {
 pub fn state_cap() -> usize {
     use core::sync::atomic::{AtomicUsize, Ordering};
     // `usize::MAX` — «ещё не спрашивали»; `NO_CAP` — спрашивали и не дали.
-    static КЭШ: AtomicUsize = AtomicUsize::new(usize::MAX);
-    let было = КЭШ.load(Ordering::Relaxed);
-    if было != usize::MAX {
-        return было;
+    static CACHE: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let prev = CACHE.load(Ordering::Relaxed);
+    if prev != usize::MAX {
+        return prev;
     }
     let cap = match crate::cap_named("STATE") {
         Some(c) => c,
@@ -554,7 +554,7 @@ pub fn state_cap() -> usize {
             None => crate::NO_CAP,
         },
     };
-    КЭШ.store(cap, Ordering::Relaxed);
+    CACHE.store(cap, Ordering::Relaxed);
     cap
 }
 

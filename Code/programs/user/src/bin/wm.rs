@@ -1287,7 +1287,7 @@ fn main_loop() -> ! {
     //
     // Для сервисов это значит «со следующей загрузки»: они поднялись раньше композитора и своё
     // прочитать уже успели. Честная цена одного прохода вместо участия ядра в раскладке файлов.
-    let мест: Vec<String> = {
+    let slots: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
         for (prog, _, _) in wm.app_seed.iter() {
             if !v.iter().any(|p| p == prog) {
@@ -1296,7 +1296,7 @@ fn main_loop() -> ! {
         }
         v
     };
-    for prog in мест {
+    for prog in slots {
         wm.seed_state(&prog);
     }
 
@@ -6065,30 +6065,30 @@ impl Wm {
             return;
         }
         // Собираем по файлам, сохраняя порядок строк конфига.
-        let mut файлы: Vec<(&String, String)> = Vec::new();
+        let mut files: Vec<(&String, String)> = Vec::new();
         for (prog, file, line) in self.app_seed.iter() {
             if prog != who {
                 continue;
             }
-            match файлы.iter_mut().find(|(f, _)| *f == file) {
+            match files.iter_mut().find(|(f, _)| *f == file) {
                 Some((_, text)) => {
                     text.push_str(line);
                     text.push('\n');
                 }
-                None => файлы.push((file, alloc::format!("{line}\n"))),
+                None => files.push((file, alloc::format!("{line}\n"))),
             }
         }
-        for (file, text) in файлы {
-            let имя = alloc::format!("/{file}");
-            if sys::posix::stat(cap, имя.as_bytes()).is_some() {
+        for (file, text) in files {
+            let name = alloc::format!("/{file}");
+            if sys::posix::stat(cap, name.as_bytes()).is_some() {
                 continue; // своё уже есть — декларация молчит
             }
-            let ok = sys::posix::echo_to(cap, имя.as_bytes(), text.as_bytes());
+            let ok = sys::posix::echo_to(cap, name.as_bytes(), text.as_bytes());
             sys::write_console(
                 alloc::format!(
                     "[wm] объявленное {}{}{}\n",
                     path,
-                    имя,
+                    name,
                     if ok { " разложено" } else { " — ЗАПИСАТЬ НЕ ВЫШЛО" },
                 )
                 .as_bytes(),

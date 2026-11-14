@@ -148,15 +148,15 @@ pub fn ext_attach(pid: usize, mac: [u8; 6]) -> bool {
             true
         }
         // Повторное представление той же картой — не ошибка: драйвер вправе назваться заново.
-        Err(тот) if тот == pid => {
+        Err(that) if that == pid => {
             *EXT_MAC.lock() = mac;
             true
         }
-        Err(чужой) => {
+        Err(foreign) => {
             crate::println!(
                 "  [net] P{} просится быть картой системы, но она уже за P{} — отказано \
 (картой может быть только один)",
-                pid, чужой,
+                pid, foreign,
             );
             false
         }
