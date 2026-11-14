@@ -1127,7 +1127,7 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
     // `klog |> grep wifi |> send 192.168.0.87 9000 > /etc/копия.txt` читается ровно так, как
     // звучит: каждая команда берёт текст предыдущей последним аргументом, а `>` в конце кладёт
     // итог в файл. Разбор — в [`run_pipeline`]; здесь только развилка «есть ли в строке знак».
-    if words.iter().any(|w| *w == b">>" || *w == b"|>" || *w == b">") {
+    if words.iter().any(|w| is_pipe(w) || *w == b">") {
         return run_pipeline(interp, env, &words);
     }
     let head = match core::str::from_utf8(words[0]) {
@@ -1196,6 +1196,14 @@ fn command_line(interp: &vvsh_core::Interp, env: &Env, src: &[u8]) {
 ///
 /// Пустой ответ звена — ошибка ВСЛУХ, а не пустой файл на той стороне: молчаливая пустота и была
 /// тем, что владелец разбирал руками.
+/// Знак конвейера. Их три, и это не роскошь: `|` набирают руки, привыкшие к любой другой
+/// оболочке (владелец так и набрал, а шелл молча проглотил знак и напечатал весь журнал),
+/// `|>` читается как «отдать дальше», `>>` жил здесь с Вехи 199.3. Отдельная функция — чтобы
+/// список знал одно место: три копии условия уже разошлись бы на четвёртом знаке.
+fn is_pipe(w: &[u8]) -> bool {
+    w == b"|" || w == b"|>" || w == b">>"
+}
+
 fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
     // Хвост `> путь` отрезаем первым: он не звено, а место назначения.
     let mut body = words;
@@ -1207,7 +1215,7 @@ fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
         // Команды, разбирающие `>` сами (они пишут потоком, а не собранным текстом), остаются
         // при своём: их имя стоит первым, и звено у строки одно.
         let self_prints = matches!(core::str::from_utf8(words[0]), Ok("klog" | "echo" | "cat"))
-            && !words[..i].iter().any(|w| *w == b">>" || *w == b"|>");
+            && !words[..i].iter().any(|w| is_pipe(w));
         if !self_prints {
             file = Some(resolve(words[i + 1]));
             body = &words[..i];
@@ -1217,7 +1225,7 @@ fn run_pipeline(interp: &vvsh_core::Interp, env: &Env, words: &[&[u8]]) {
     let mut links: alloc::vec::Vec<&[&[u8]]> = alloc::vec::Vec::new();
     let mut from = 0usize;
     for (i, w) in body.iter().enumerate() {
-        if *w == b">>" || *w == b"|>" {
+        if is_pipe(w) {
             links.push(&body[from..i]);
             from = i + 1;
         }
@@ -2077,6 +2085,8 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"echo TEXT", "напечатать ($x — переменная; TEXT > FILE — запись)");
     help_row(b"ved FILE", "экранный редактор: ^S сохранить, ^Q выход (программа)");
     help_row(b"grep SUB L", "фильтр строк списка (для конвейеров)");
+    // Веха 233.8 — сам знак конвейера в справке: без него о нём узнают случайно.
+    help_row(b"A | B", "конвейер: текст A уходит в B (`|`, `|>` и `>>` — одно и то же)");
     help_row(b"run NAME", "запустить программу из store (или просто NAME)");
     help_row(b"thaw NAME", "разморозить процесс из образа");
     help_row(b"ping IP", "ICMP-пинг адреса A.B.C.D");
@@ -3051,6 +3061,15 @@ fn sh_klog(args: &[Value]) -> Result<Value, EvalError> {
         Some(Value::Str(s)) => s.trim().parse::<usize>().ok().filter(|n| *n > 0),
         _ => None,
     };
+    // Непонятый аргумент — ОТКАЗ, а не молчание. Именно молчание и укусило владельца: он набрал
+    // `klog | grep wm` с обычным знаком конвейера, шелл не узнал его, `klog` принял за аргумент
+    // и напечатал весь журнал. Знак теперь понимается ([`is_pipe`]), но правило важнее случая:
+    // команда, делающая НЕ ТО, что просили, обязана сказать об этом.
+    if args.len() > usize::from(lines.is_some()) && out.is_none() {
+        return Err(EvalError::new(
+            "klog: (klog [сколько строк]) либо (klog > путь); конвейер — `klog | grep …`",
+        ));
+    }
     if let Some(n) = lines {
         let keep: alloc::vec::Vec<&str> = text.lines().rev().take(n).collect();
         text = keep.iter().rev().fold(String::new(), |mut acc, l| {
