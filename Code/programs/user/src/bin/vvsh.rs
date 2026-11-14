@@ -3432,6 +3432,17 @@ mod intel_reg {
     /// защёлкивается на следующем обратном ходе луча.
     pub const DSPSURF: [usize; 2] = [0x7019c, 0x7119c];
     pub const DSPTILEOFF: [usize; 2] = [0x701a4, 0x711a4];
+    /// Временная развёртка конвейера A: сколько точек активно и сколько всего. По ней виден
+    /// НАСТОЯЩИЙ режим — тот, который выставила прошивка, а не тот, что попросил GRUB.
+    pub const HTOTAL_A: usize = 0x60000;
+    pub const VTOTAL_A: usize = 0x6000c;
+    /// Те же числа со стороны PCH: у панели ноутбука картинку гонит он.
+    pub const TRANS_HTOTAL_A: usize = 0xe0000;
+    pub const TRANS_VTOTAL_A: usize = 0xe000c;
+    /// Масштабатор панели: растягивает картинку конвейера на панель, когда они разного размера.
+    /// Его окно и есть размер ПАНЕЛИ.
+    pub const PF_CTL_A: usize = 0x68080;
+    pub const PF_WIN_SZ_A: usize = 0x68074;
     /// Порт панели ноутбука (LVDS) — живёт в микросхеме PCH, а не в процессоре.
     pub const PCH_LVDS: usize = 0xe1180;
     /// Подсветка. У Sandy Bridge её две половины: ШИМ процессора и ШИМ микросхемы PCH.
@@ -3601,7 +3612,34 @@ fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
         }
     }
 
-    // 4. Панель и подсветка — вторая половина задачи и единственная часть ноутбучной базы,
+    // 4. Режим панели. Разница между «что просит конвейер» и «что показывает панель» — это и
+    // есть ответ на вопрос, стоит ли менять разрешение: масштабатор молча растягивает одно на
+    // другое, и человек видит мыло, не зная почему.
+    let pair = |v: u32| ((v & 0xffff) + 1, (v >> 16) + 1);
+    let (ha, ht) = pair(sys::hw_read(hw, bar0 + intel_reg::HTOTAL_A).unwrap_or(0));
+    let (va, vt) = pair(sys::hw_read(hw, bar0 + intel_reg::VTOTAL_A).unwrap_or(0));
+    let (tha, tht) = pair(sys::hw_read(hw, bar0 + intel_reg::TRANS_HTOTAL_A).unwrap_or(0));
+    let (tva, tvt) = pair(sys::hw_read(hw, bar0 + intel_reg::TRANS_VTOTAL_A).unwrap_or(0));
+    let pf_ctl = sys::hw_read(hw, bar0 + intel_reg::PF_CTL_A).unwrap_or(0);
+    let pf_sz = sys::hw_read(hw, bar0 + intel_reg::PF_WIN_SZ_A).unwrap_or(0);
+    out.push_str(&alloc::format!(
+        "\nразвёртка ЦП   активно {}×{}, всего {}×{}\n",
+        ha, va, ht, vt,
+    ));
+    out.push_str(&alloc::format!(
+        "развёртка PCH  активно {}×{}, всего {}×{}\n",
+        tha, tva, tht, tvt,
+    ));
+    out.push_str(&alloc::format!(
+        "масштабатор    {} (PF_CTL {:#010x}), окно {}×{} (PF_WIN_SZ {:#010x})\n",
+        if pf_ctl & (1 << 31) != 0 { "ВКЛЮЧЁН" } else { "выключен" },
+        pf_ctl,
+        pf_sz >> 16,
+        pf_sz & 0xffff,
+        pf_sz,
+    ));
+
+    // 5. Панель и подсветка — вторая половина задачи и единственная часть ноутбучной базы,
     // которой не нужен интерпретатор AML.
     let lvds = sys::hw_read(hw, bar0 + intel_reg::PCH_LVDS).unwrap_or(0);
     let cpu2 = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL2).unwrap_or(0);
