@@ -1207,7 +1207,9 @@ fn main_loop() -> ! {
             shadow: vec![0u32; info.width * info.height],
         present_all: false,
         draw_off: 0,
-        prev_damage: None,
+        prev_damage: Vec::new(),
+        needs_full: [true, true],
+        draw_slot: 0,
         // Веха 137 — стол ровно один, пустой. Дальше их число ведёт `tidy_spaces`.
         ov_bands: Vec::new(),
         spaces: vec![Space::default()],
@@ -1935,8 +1937,15 @@ struct Wm {
     draw_off: usize,
     /// Области, нарисованные в ПРОШЛЫЙ кадр. При двух буферах их надо повторить: буфер, в
     /// который мы пишем, показывал кадр ПОЗАПРОШЛЫЙ, и всё, что менялось с тех пор, в нём
-    /// устарело. `None` значит «буфер целиком устарел» — тогда перерисовывается весь экран.
-    prev_damage: Option<Vec<At<Screen>>>,
+    /// устарело.
+    prev_damage: Vec<At<Screen>>,
+    /// Какие буферы ещё ни разу не рисовались ЦЕЛИКОМ. Повтора прошлых областей мало, пока в
+    /// буфере лежит не наш кадр, а то, что оставила прошивка: на машине владельца это было
+    /// белое с точками. Каждый буфер один раз получает полную отрисовку — и только потом в дело
+    /// идут области.
+    needs_full: [bool; 2],
+    /// В какой буфер рисуем сейчас (0 или 1) — чтобы знать, чей полный кадр отмечать.
+    draw_slot: usize,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
     /// ТЕНЕВОЙ КАДР (Веха 126): весь экран в обычной памяти. Кадр собирается здесь, а на экран
     /// уходит блитом. Затевалось ради разрывов, а понадобилось ради СТОИМОСТИ: прокрутка ленты
@@ -2502,6 +2511,9 @@ impl Wm {
                 let (cx, cy) = (self.cursor.x, self.cursor.y);
                 self.damage(At::new(cx - n as i32 - 2, cy - 2, CUR_W + 2 * n as i32 + 4, CUR_H + 4));
                 self.present_all = true;
+                // Веха 233.3 — при двух буферах «перерисовать всё» касается обоих: второй
+                // увидит этот кадр только на следующем обороте, и до тех пор в нём старое.
+                self.needs_full = [true, true];
             } else {
                 self.damage(self.screen());
             }
@@ -2748,7 +2760,7 @@ impl Wm {
         // сейчас пишем, устарел целиком: в нём лежит позапрошлый кадр, а что менялось с тех
         // пор, мы знаем только за один прошлый шаг.
         let double_buffered = self.info.buffers > 1;
-        let whole = self.present_all || (double_buffered && self.prev_damage.is_none());
+        let whole = self.present_all || (double_buffered && self.needs_full[self.draw_slot]);
         if whole {
             self.present_all = false;
             for yy in 0..self.info.height as i32 {
@@ -2760,7 +2772,7 @@ impl Wm {
             // Свои области — и области ПРОШЛОГО кадра: в буфере, куда мы пишем, они показывают
             // позапрошлое. Без этого на экране остаются следы — курсор из прошлого кадра,
             // половина уехавшего окна. Цена — повтор одной перерисовки, а не целого экрана.
-            for r in rects.iter().chain(self.prev_damage.iter().flatten()) {
+            for r in rects.iter().chain(self.prev_damage.iter()) {
                 let r = r.rect();
                 for yy in r.y..r.bottom() {
                     let off = yy as usize * pitch + r.x as usize;
@@ -2769,11 +2781,15 @@ impl Wm {
                 px += (r.w * r.h).max(0) as u32;
             }
         }
-        // Что рисовали сейчас — станет «прошлым» для следующего кадра. Целый кадр обнуляет
-        // память об областях: после него обе половины экрана свежи, кроме той, которую
-        // перерисует следующий заход.
+        // Что рисовали сейчас — станет «прошлым» для следующего кадра: буфер, который получит
+        // его следующим, показывал позапрошлое.
         if double_buffered {
-            self.prev_damage = if whole { Some(Vec::new()) } else { Some(rects.clone()) };
+            if whole {
+                self.needs_full[self.draw_slot] = false;
+                self.prev_damage.clear();
+            } else {
+                self.prev_damage.clone_from(&rects);
+            }
         }
         self.shadow = sh;
         fence();
@@ -2789,6 +2805,7 @@ impl Wm {
             // страница, а не её части. Ответ — смещение, по которому рисовать дальше.
             self.draw_off =
                 sys::video_flush(self.fb_cap, 0, 0, self.info.width as u32, self.info.height as u32);
+            self.draw_slot = usize::from(self.draw_off != 0);
         } else if whole {
             sys::video_flush(self.fb_cap, 0, 0, self.info.width as u32, self.info.height as u32);
         } else {

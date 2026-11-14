@@ -260,7 +260,7 @@ impl App {
                         }
                     }
                 }
-                void_md::Block::Table { head, rows: rows } => {
+                void_md::Block::Table { head, rows } => {
                     self.empty();
                     let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
                     let mut widths = alloc::vec![0i32; cols];

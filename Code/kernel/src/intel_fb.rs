@@ -62,6 +62,9 @@ static GTT_OFF: AtomicUsize = AtomicUsize::new(0);
 static STEP: AtomicUsize = AtomicUsize::new(0);
 /// Какой буфер СЕЙЧАС на экране: 0 — первый, 1 — второй.
 static SHOWN: AtomicUsize = AtomicUsize::new(0);
+/// В какой буфер рисует композитор. Он же уедет на экран ближайшим переключением: показывать
+/// надо нарисованное, а не следующее по счёту.
+static DRAWN: AtomicUsize = AtomicUsize::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 /// Сколько раз переключали и видели ли мы хоть раз, что железо это приняло. Нужны для
 /// САМОПРОВЕРКИ: см. [`flip`].
@@ -239,17 +242,24 @@ pub fn init(fb_phys: usize, pitch: usize, height: usize) -> bool {
     true
 }
 
-/// Показать нарисованное и вернуть смещение, по которому рисовать СЛЕДУЮЩИЙ кадр.
+/// Показать НАРИСОВАННОЕ и вернуть смещение, по которому рисовать следующий кадр.
 ///
 /// Записанное в регистр поверхности защёлкивается на обратном ходе луча — то есть между
 /// кадрами, а не посреди. В этом вся цель: разрыв становится невозможен не потому, что мы
 /// успели, а потому, что переключает железо.
+///
+/// **Показывается именно тот буфер, в который рисовали** ([`DRAWN`]), а не «следующий по
+/// кругу». Первая редакция считала, что очередь можно вывести из того, что показано сейчас, —
+/// и на первом же кадре выводила на экран буфер, в который ещё никто не писал: на машине
+/// владельца это была белая вспышка с точками при загрузке (содержимое украденной памяти,
+/// оставшееся от прошивки).
 pub fn flip() -> usize {
     if !present() {
         return 0;
     }
     let shown = SHOWN.load(Ordering::Relaxed);
-    let next = 1 - shown;
+    // Показываем то, во что рисовали; рисовать дальше будут в тот, что сейчас на экране.
+    let drawn = DRAWN.load(Ordering::Relaxed);
     let step = STEP.load(Ordering::Relaxed);
     // САМОПРОВЕРКА. Регистр «что читает развёртка ПРЯМО СЕЙЧАС» — единственный способ узнать,
     // что переключение дошло до железа, а не осталось нашим мнением. Проверяем ДО записи: к
@@ -268,6 +278,7 @@ pub fn flip() -> usize {
             READY.store(false, Ordering::Relaxed);
             arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, 0);
             SHOWN.store(0, Ordering::Relaxed);
+            DRAWN.store(0, Ordering::Relaxed);
             crate::println!(
                 "  [intel] переключение страницы до железа не дошло ({} проб) — вернулись к одному буферу",
                 TRIES,
@@ -275,16 +286,18 @@ pub fn flip() -> usize {
             return 0;
         }
     }
-    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, (next * step) as u32);
-    SHOWN.store(next, Ordering::Relaxed);
-    // Рисовать дальше — в тот, который только что сошёл с экрана.
-    shown * step
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, (drawn * step) as u32);
+    SHOWN.store(drawn, Ordering::Relaxed);
+    let next = 1 - drawn;
+    DRAWN.store(next, Ordering::Relaxed);
+    next * step
 }
 
 /// Вернуть развёртку на первый буфер. Нужно там, где экран забирает ядро: его консоль рисует
 /// по началу окна, и оставить развёртку на втором буфере значило бы показывать человеку кадр,
 /// в который больше никто не пишет.
 pub fn to_front() {
+    DRAWN.store(0, Ordering::Relaxed);
     if present() && SHOWN.swap(0, Ordering::Relaxed) != 0 {
         arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, 0);
     }
