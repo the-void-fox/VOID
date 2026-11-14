@@ -632,7 +632,8 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         // SYS_VIDEO_SYNC(mmio_cap, op) -> значение | MAX (Веха 233.9) — РИТМ ЭКРАНА.
         //
         //   op=0  защёлкнулось ли последнее переключение страницы (1 — да, 0 — ещё нет);
-        //   op=1  счётчик кадров развёртки.
+        //   op=1  счётчик кадров развёртки;
+        //   op=2  вернуться к ОДНОМУ буферу (просьба рисующего, когда переключения встали).
         //
         // `MAX` — переключать нечего (экран без двойного буфера); тогда спрашивать незачем, и
         // рисующий работает как работал.
@@ -642,11 +643,20 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                 (f.arg(0), f.arg(1))
             };
             let dom = t.procs[cur].domain;
-            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::READ) {
+            // Спросить — чтение; вернуться к одному буферу — запись: это меняет то, что на
+            // экране, и права на просмотр для такого мало.
+            let need = if op == 2 { Rights::WRITE } else { Rights::READ };
+            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), need) {
                 #[cfg(target_arch = "x86_64")]
                 Ok(_) if crate::intel_fb::present() => match op {
                     0 => usize::from(crate::intel_fb::latched()),
                     1 => crate::intel_fb::vblank_count() as usize,
+                    // Веха 233.12 — вернуться к одному буферу. Просит тот, кто рисует: он
+                    // видит, что кадр не меняется, а мы видим только регистр.
+                    2 => {
+                        crate::intel_fb::to_single();
+                        0
+                    }
                     _ => usize::MAX,
                 },
                 Ok(_) => {

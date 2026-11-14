@@ -418,6 +418,19 @@ pub fn flip() -> usize {
     next * step
 }
 
+/// Отказаться от двойной буферизации и вернуть развёртку на первый буфер.
+///
+/// Зовёт это тот, кто рисует, когда видит, что переключения перестали защёлкиваться. Решение
+/// за ним, а не за нами: мы видим регистр, а он видит, что кадр не меняется.
+pub fn to_single() {
+    if READY.swap(false, Ordering::Relaxed) {
+        arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, 0);
+        SHOWN.store(0, Ordering::Relaxed);
+        DRAWN.store(0, Ordering::Relaxed);
+        crate::println!("  [intel] двойная буферизация выключена по просьбе рисующего");
+    }
+}
+
 /// Вернуть развёртку на первый буфер. Нужно там, где экран забирает ядро: его консоль рисует
 /// по началу окна, и оставить развёртку на втором буфере значило бы показывать человеку кадр,
 /// в который больше никто не пишет.
@@ -513,9 +526,14 @@ pub fn cursor_show(on: bool) -> bool {
 ///
 /// Возвращает новые `(ширина, высота, шаг строки)` — или `None`, если ничего не меняли.
 fn try_native_mode(width: usize, height: usize) -> Option<(usize, usize, usize)> {
-    let active = |v: u32| (((v & 0xffff) + 1) as usize, ((v >> 16) + 1) as usize);
-    let (panel_w, _) = active(rd(reg::HTOTAL_A));
-    let (panel_h, _) = active(rd(reg::VTOTAL_A));
+    // ДВА РАЗНЫХ формата, и путать их нельзя — на этом я уже ошибся, и переход не состоялся:
+    //   развёртка   — `(всего-1) << 16 | (активно-1)`, то есть активное число в МЛАДШЕЙ половине;
+    //   размер источника — `(ширина-1) << 16 | (высота-1)`, то есть ширина в СТАРШЕЙ.
+    // Поэтому у каждого своё имя, а не одна «универсальная» функция на оба.
+    let timing_active = |v: u32| ((v & 0xffff) + 1) as usize;
+    let src_size = |v: u32| ((((v >> 16) + 1) as usize), (((v & 0xffff) + 1) as usize));
+    let panel_w = timing_active(rd(reg::HTOTAL_A));
+    let panel_h = timing_active(rd(reg::VTOTAL_A));
     let pf_ctl = rd(reg::PF_CTL_A);
     let win = rd(reg::PF_WIN_SZ_A);
     let (win_w, win_h) = ((win >> 16) as usize, (win & 0xffff) as usize);
@@ -548,7 +566,7 @@ fn try_native_mode(width: usize, height: usize) -> Option<(usize, usize, usize)>
     // Сверяем ЧТЕНИЕМ: регистры могли не принять записанное, и тогда честнее вернуть всё, как
     // было, чем работать с кадром, которого на экране нет.
     let ok = rd(reg::DSPASTRIDE) as usize == pitch
-        && active(rd(reg::PIPEASRC)) == (panel_w, panel_h);
+        && src_size(rd(reg::PIPEASRC)) == (panel_w, panel_h);
     if !ok {
         arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::PF_CTL_A, pf_ctl);
         arch::hw_write32(

@@ -1756,6 +1756,12 @@ pub fn video_latched(mmio_cap: usize) -> Option<bool> {
     (r != usize::MAX).then(|| r != 0)
 }
 
+/// Веха 233.12 — отказаться от двойной буферизации: переключения перестали защёлкиваться, и
+/// правильный ответ — вернуться к одному буферу, а не рисовать поверх показываемого.
+pub fn video_single_buffer(mmio_cap: usize) -> bool {
+    abi::syscall(SYS_VIDEO_SYNC, mmio_cap, 2, 0, 0, 0, 0, 0).0 == 0
+}
+
 /// Веха 233.9 — счётчик кадров развёртки: им меряется настоящий ритм экрана.
 pub fn video_frame_count(mmio_cap: usize) -> Option<u32> {
     let r = abi::syscall(SYS_VIDEO_SYNC, mmio_cap, 1, 0, 0, 0, 0, 0).0;
