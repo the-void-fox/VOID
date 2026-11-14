@@ -119,7 +119,7 @@ const DEVS: [Dev; 6] = [
     Dev { name: "память", why: "" },
     Dev { name: "диск", why: "счётчиков нет" },
     Dev { name: "сеть", why: "счётчиков нет" },
-    Dev { name: "видео", why: "нет драйверов" },
+    Dev { name: "видео", why: "замеров ещё нет" },
     Dev { name: "датчики", why: "нет драйверов" },
 ];
 
@@ -171,6 +171,11 @@ struct App {
     cap_sel: usize,
     /// Для какого pid прочитаны права (чтобы не читать каждый кадр).
     detail_pid: Option<u16>,
+    /// Веха 233.5 — кадров в секунду и размер экрана: плитка «видео» говорила «нет драйверов»
+    /// и тогда, когда экран работал через virtio-gpu и через переключение страницы на Intel.
+    /// Источник есть, и он тот же, что у `fps`, — счёт кадров КОМПОЗИТОРА: кто рисует, тот и
+    /// знает, сколько кадров дошло до экрана ([[compositor-damage]]).
+    video: Option<(u32, u32, u32)>,
     /// Числа про машину целиком и прошлый их замер — для загрузки и графика.
     info: Option<sys::SysInfo>,
     info_prev: Option<sys::SysInfo>,
@@ -303,6 +308,14 @@ impl App {
         }
         if let Some(n) = &self.info {
             self.push_hist(1, n.ram_percent().min(100) as u8);
+        }
+        // Кадры — у композитора. Числа те же, что печатает `fps`, только здесь нужен один
+        // ответ: сколько кадров в секунду дошло до экрана за последнее время.
+        self.video = Self::read_video();
+        if let Some((_, _, fps)) = self.video {
+            // Шкала графика — проценты, поэтому шестьдесят кадров в секунду это полная шкала:
+            // выше неё развёртка не идёт, а ниже видно провал.
+            self.push_hist(4, (fps * 100 / 60).min(100) as u8);
         }
         self.refilter(keep);
     }
@@ -1154,11 +1167,43 @@ impl App {
                 ),
                 None => (String::from("—"), String::from(ui::t("нет права")), th_muted),
             },
+            4 => match self.video {
+                Some((w, h, fps)) => (
+                    ui::f1(ui::t("{} к/с"), &alloc::format!("{fps}")),
+                    alloc::format!("{w}×{h}"),
+                    Rgba::hex(0xdcdcdd),
+                ),
+                None => (String::from("—"), String::from(ui::t("композитор не ответил")), th_muted),
+            },
             _ => (String::from("—"), String::from(ui::t(DEVS[k].why)), th_muted),
         }
     }
 
-    /// Веха 155 — окно без права обзора: что именно не дано и чем это выдаётся.
+    /// Веха 233.5 — спросить композитор: размер экрана и сколько кадров в секунду доходит.
+///
+/// Считается по СЕРЕДИНЕ расстояний между кадрами, а не по среднему: среднее одинаково у ровных
+/// шестидесяти и у «сорок ровных плюс двадцать слипшихся», а на глаз это разные системы — тот же
+/// довод, по которому так устроен `fps`.
+///
+/// `None` — композитор не ответил (например, окно запущено без него). Ноль кадров — тоже
+/// ответ: экран стоит, потому что никто не рисует, и это не поломка.
+fn read_video() -> Option<(u32, u32, u32)> {
+    let mut buf = [0u8; 4096];
+    let n = sys::win::frames_read(&mut buf);
+    if n == 0 {
+        return None;
+    }
+    let (w, h, _, _, it) = sys::win::frames(&buf[..n]);
+    let mut gaps: Vec<u32> = it.map(|f| f.gap_us).filter(|&g| g > 0).collect();
+    if gaps.is_empty() {
+        return Some((w, h, 0));
+    }
+    gaps.sort_unstable();
+    let mid = gaps[gaps.len() / 2].max(1);
+    Some((w, h, (1_000_000 / mid).min(999)))
+}
+
+/// Веха 155 — окно без права обзора: что именно не дано и чем это выдаётся.
     fn paint_denied(&mut self, u: &mut Ui, th: &Theme, lay: &Lay) {
         let font_h = u.font.line_h();
         let mut all = Rect::new(0, 0, self.w, self.h).inset(th.pad);
@@ -1631,6 +1676,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         detail_pid: None,
         info: None,
         info_prev: None,
+        video: None,
         hist: DEVS.iter().map(|_| Vec::new()).collect(),
         dev: 0,
         lay: Lay::default(),
