@@ -56,8 +56,8 @@ pub enum Block {
 /// | таблица | строки, начинающиеся с `\|`; строка-разделитель пропускается |
 pub fn parse(src: &str) -> Vec<Block> {
     let mut out = Vec::new();
-    let mut строки = src.lines().peekable();
-    while let Some(l) = строки.next() {
+    let mut source_lines = src.lines().peekable();
+    while let Some(l) = source_lines.next() {
         let t = l.trim_end();
         if t.trim().is_empty() {
             continue;
@@ -65,7 +65,7 @@ pub fn parse(src: &str) -> Vec<Block> {
         // ── блок кода ──
         if t.trim_start().starts_with("```") {
             let mut code = Vec::new();
-            for l in строки.by_ref() {
+            for l in source_lines.by_ref() {
                 if l.trim_start().starts_with("```") {
                     break;
                 }
@@ -99,8 +99,8 @@ pub fn parse(src: &str) -> Vec<Block> {
                 } else {
                     rows.push(cells);
                 }
-                match строки.peek() {
-                    Some(n) if n.trim_start().starts_with('|') => line = строки.next().unwrap(),
+                match source_lines.peek() {
+                    Some(n) if n.trim_start().starts_with('|') => line = source_lines.next().unwrap(),
                     _ => break,
                 }
             }
@@ -112,7 +112,7 @@ pub fn parse(src: &str) -> Vec<Block> {
             let mut items = Vec::new();
             let mut current = String::from(item(t).unwrap());
             loop {
-                match строки.peek() {
+                match source_lines.peek() {
                     // Продолжение пункта: непустая строка с отступом и не новый пункт.
                     Some(n)
                         if !n.trim().is_empty()
@@ -120,11 +120,11 @@ pub fn parse(src: &str) -> Vec<Block> {
                             && item(n.trim_start()).is_none() =>
                     {
                         current.push(' ');
-                        current.push_str(строки.next().unwrap().trim());
+                        current.push_str(source_lines.next().unwrap().trim());
                     }
                     Some(n) if item(n.trim_start()).is_some() => {
                         items.push(core::mem::take(&mut current));
-                        current = String::from(item(строки.next().unwrap().trim_start()).unwrap());
+                        current = String::from(item(source_lines.next().unwrap().trim_start()).unwrap());
                     }
                     _ => break,
                 }
@@ -135,7 +135,7 @@ pub fn parse(src: &str) -> Vec<Block> {
         }
         // ── абзац ──
         let mut para = String::from(t.trim());
-        while let Some(n) = строки.peek() {
+        while let Some(n) = source_lines.peek() {
             let n = n.trim_end();
             if n.trim().is_empty()
                 || n.trim_start().starts_with('#')
@@ -146,7 +146,7 @@ pub fn parse(src: &str) -> Vec<Block> {
                 break;
             }
             para.push(' ');
-            para.push_str(строки.next().unwrap().trim());
+            para.push_str(source_lines.next().unwrap().trim());
         }
         out.push(Block::Para(para));
     }
@@ -215,8 +215,8 @@ pub fn render_text(blocks: &[Block], width: usize) -> String {
                     unsafe { out.as_bytes_mut()[measure] = b'-' };
                 }
             }
-            Block::Code(строки) => {
-                for s in строки {
+            Block::Code(source_lines) => {
+                for s in source_lines {
                     out.push_str("  ");
                     out.push_str(s);
                     out.push('\n');
@@ -395,9 +395,9 @@ mod tests {
     #[test]
     fn таблица_выравнивается_колонками() {
         let t = render_text(&parse("| что | где |\n|---|---|\n| очень длинный ключ | s |\n"), 60);
-        let строки: Vec<&str> = t.lines().collect();
-        assert_eq!(строки[0], "что                 где");
-        assert_eq!(строки[1], "очень длинный ключ  s");
+        let source_lines: Vec<&str> = t.lines().collect();
+        assert_eq!(source_lines[0], "что                 где");
+        assert_eq!(source_lines[1], "очень длинный ключ  s");
     }
 
     /// Таблица шире окна не уезжает за край: лишнее срезается с самой широкой колонки.

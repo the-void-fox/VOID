@@ -580,8 +580,11 @@ fn wait_mgmt(
     let until = sys::monotonic_ns() + ms * 1_000_000;
     loop {
         while rx.next() {
-            if let Some((subtype, tail)) = mgmt_reply(rx.frame(), mac) {
-                if subtype == subtype {
+            // `got` — то, что ПРИШЛО, `subtype` — то, чего ждём. Имена обязаны различаться:
+            // пока пришедший подтип звался `подтип`, разница была видна, а уборка имён свела
+            // оба к `subtype` и превратила условие в тождество — то есть «подходит любой кадр».
+            if let Some((got, tail)) = mgmt_reply(rx.frame(), mac) {
+                if got == subtype {
                     return Some(alloc::vec::Vec::from(tail));
                 }
             } else if let Some(b) = wpa::eapol_of(rx.frame(), mac) {

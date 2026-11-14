@@ -109,7 +109,7 @@ struct App {
     parts: Vec<Part>,
     ls: ui::List,
     /// Разложенные строки текущего раздела и ширина, под которую их раскладывали.
-    строки: Vec<Line>,
+    lines: Vec<Line>,
     /// Веха 223.3 — прокрутка текста ЦЕЛИКОМ виджетом тулкита ([`ui::Pane`]).
     ///
     /// Сперва здесь был свой счётчик «первая видимая строка», и прокрутка шла СТРОКАМИ: строка
@@ -204,7 +204,7 @@ impl App {
             return;
         }
         self.load(i);
-        self.строки.clear();
+        self.lines.clear();
         self.columns.clear();
         self.text.reset();
         self.laid_out_for = Some((i, w));
@@ -215,11 +215,11 @@ impl App {
                 void_md::Block::Heading(level, t) => {
                     // Пустая строка перед заголовком — воздух, которым разделы и отличаются
                     // друг от друга. Кроме самого первого: сверху и так поле.
-                    if !self.строки.is_empty() {
+                    if !self.lines.is_empty() {
                         self.empty();
                     }
                     let kind = if *level <= 1 { Kind::Head } else { Kind::Part };
-                    self.строки.push(Line::Text { text: strip(t), kind, indent: 0 });
+                    self.lines.push(Line::Text { text: strip(t), kind, indent: 0 });
                 }
                 void_md::Block::Para(t) => {
                     self.empty();
@@ -228,20 +228,20 @@ impl App {
                 void_md::Block::List(items) => {
                     self.empty();
                     for p in items {
-                        let prev = self.строки.len();
+                        let prev = self.lines.len();
                         self.wrap(u, &strip(p), w - item_indent, item_indent, Kind::Text);
                         // Знак пункта — на первой строке, продолжение под текстом.
-                        if let Some(Line::Text { text, indent, .. }) = self.строки.get_mut(prev)
+                        if let Some(Line::Text { text, indent, .. }) = self.lines.get_mut(prev)
                         {
                             text.insert_str(0, "— ");
                             *indent = 0;
                         }
                     }
                 }
-                void_md::Block::Code(строки) => {
+                void_md::Block::Code(lines) => {
                     self.empty();
                     let indent = u.text_w("  ");
-                    for s in строки {
+                    for s in lines {
                         // Веха 223.3 — ДЛИННУЮ строку кода переносим, а не обрезаем.
                         //
                         // Код переносить не хочется: в нём значимы и выравнивание, и пробелы. Но
@@ -250,7 +250,7 @@ impl App {
                         // ради чего строку читают («switch gen11 — выбрать другое (действует п…»),
                         // а перенос лишь делает её некрасивой. Некрасивая и целая лучше.
                         if u.text_w(s) <= w - indent {
-                            self.строки.push(Line::Text {
+                            self.lines.push(Line::Text {
                                 text: s.clone(),
                                 kind: Kind::Code,
                                 indent,
@@ -282,7 +282,7 @@ impl App {
                         let n = self.columns.len();
                         self.columns.push(widths);
                         for r in rows {
-                            self.строки.push(Line::Row {
+                            self.lines.push(Line::Row {
                                 table: n,
                                 cells: r.iter().map(|c| strip(c)).collect(),
                             });
@@ -301,7 +301,7 @@ impl App {
                         let indent = u.text_w("    ");
                         for r in rows.iter().skip(if *head { 1 } else { 0 }) {
                             let Some(key) = r.first() else { continue };
-                            self.строки.push(Line::Text {
+                            self.lines.push(Line::Text {
                                 text: strip(key),
                                 kind: Kind::Part,
                                 indent: 0,
@@ -321,8 +321,8 @@ impl App {
     }
 
     fn empty(&mut self) {
-        if !self.строки.is_empty() {
-            self.строки.push(Line::Text {
+        if !self.lines.is_empty() {
+            self.lines.push(Line::Text {
                 text: String::new(),
                 kind: Kind::Text,
                 indent: 0,
@@ -339,7 +339,7 @@ impl App {
         for word in s.split_whitespace() {
             let ws = u.text_w(word);
             if !line.is_empty() && width + space + ws > w {
-                self.строки.push(Line::Text {
+                self.lines.push(Line::Text {
                     text: core::mem::take(&mut line),
                     kind,
                     indent,
@@ -354,7 +354,7 @@ impl App {
             width += ws;
         }
         if !line.is_empty() {
-            self.строки.push(Line::Text { text: line, kind, indent });
+            self.lines.push(Line::Text { text: line, kind, indent });
         }
     }
 
@@ -393,7 +393,7 @@ impl App {
         for (k, r) in self.text.visible() {
             // Крайние строки приходят с ПОЛНЫМ прямоугольником, наполовину их обрежет клип, —
             // в этом и разница с построчной прокруткой.
-            match &self.строки[k] {
+            match &self.lines[k] {
                 Line::Text { text, kind, indent } => {
                     let indent = (*indent).max(0);
                     let inner = Rect::new(r.x + indent, r.y, r.w - indent, r.h);
@@ -559,7 +559,7 @@ impl ui::Client for App {
         self.unpack(u, width);
         // Меры полотну даются ОДИН раз и ПОСЛЕ укладки: число строк известно только теперь.
         // Здесь же смещение зажимается в краях — окно могло стать выше, а раздел короче.
-        self.text.measure(self.lay.body, self.lay.body_bar, self.lay.step, self.строки.len());
+        self.text.measure(self.lay.body, self.lay.body_bar, self.lay.step, self.lines.len());
         let lay = core::mem::take(&mut self.lay);
         let switched = self.paint(u, &th, &lay);
         self.lay = lay;
@@ -610,7 +610,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
         h: h as i32,
         parts,
         ls: ui::List::default(),
-        строки: Vec::new(),
+        lines: Vec::new(),
         laid_out_for: None,
         columns: Vec::new(),
         text: ui::Pane::default(),
