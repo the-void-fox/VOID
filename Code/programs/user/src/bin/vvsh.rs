@@ -1770,6 +1770,9 @@ const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         // Веха 200 — заглянуть в регистры железа (см. `sh_mmio`/`sh_pci`).
         ("mmio", sh_mmio),
         ("pci", sh_pci),
+        // Веха 232 — разведка дисплея Intel: чем на железе владельца переключать страницу.
+        ("intel", sh_intel),
+        ("brightness", sh_brightness),
         ("poweroff", sh_poweroff),
         ("reboot", sh_reboot),
         ("store-probe", sh_store_probe),
@@ -2121,6 +2124,9 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     // Веха 200 — отладка железа на живой машине, без пересборки.
     help_row(b"mmio A...", "слова регистров по физ-адресам; `mmio A = V` — записать");
     help_row(b"pci B:D.F O...", "слова конфигурации PCI; `pci B:D.F O = V` — записать");
+    // Веха 232 — шаг C: разведка дисплея Intel и яркость панели (на virtio их нет).
+    help_row(b"intel", "разведка дисплея Intel: конвейеры, плоскости, GTT, подсветка");
+    help_row(b"brightness [%]", "яркость панели Intel; без числа — показать нынешнюю");
     help_row(b"poweroff", "выключить машину");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
@@ -3382,6 +3388,333 @@ fn sh_pci(args: &[Value]) -> Result<Value, EvalError> {
 
 /// Как звать `pci` — в одном месте: строка нужна четырежды, и расходиться копиям незачем.
 const PCI_USAGE: &str = "pci: (pci \"04:00.0\" \"0x04\" …) либо (pci \"04:00.0\" \"0x04\" = значение)";
+
+// ─── разведка дисплея Intel (Веха 232, шаг C) ────────────────────────────────
+
+/// Смещения регистров дисплея Intel шестого поколения (Sandy Bridge — та самая машина владельца)
+/// от начала BAR0.
+///
+/// Числа не выдуманы и не подобраны: это открытая документация Intel на поколение (PRM, том
+/// «Display Registers»), те же, что лежат в `i915_reg.h` ядра Linux. Важно, что они ЧИТАЮТСЯ
+/// здесь, а не угадываются на живой машине: ошибиться смещением при ЗАПИСИ — значит получить
+/// чёрный экран у человека, у которого этот ноутбук один.
+mod intel_reg {
+    /// Конвейер (pipe) — то, что гонит картинку на порт. A и B.
+    pub const PIPECONF: [usize; 2] = [0x70008, 0x71008];
+    /// Размер источника конвейера: `(ширина-1) << 16 | (высота-1)`.
+    pub const PIPESRC: [usize; 2] = [0x6001c, 0x6101c];
+    /// Счётчик кадров конвейера — по нему видно, что развёртка ЖИВА.
+    pub const FRMCOUNT: [usize; 2] = [0x70040, 0x71040];
+    /// Плоскость (plane) — то, что читает развёртка из памяти.
+    pub const DSPCNTR: [usize; 2] = [0x70180, 0x71180];
+    pub const DSPLINOFF: [usize; 2] = [0x70184, 0x71184];
+    pub const DSPSTRIDE: [usize; 2] = [0x70188, 0x71188];
+    /// Адрес поверхности. **Он же — спусковой крючок переключения страницы**: запись в него
+    /// защёлкивается на следующем обратном ходе луча.
+    pub const DSPSURF: [usize; 2] = [0x7019c, 0x7119c];
+    pub const DSPTILEOFF: [usize; 2] = [0x701a4, 0x711a4];
+    /// Порт панели ноутбука (LVDS) — живёт в микросхеме PCH, а не в процессоре.
+    pub const PCH_LVDS: usize = 0xe1180;
+    /// Подсветка. У Sandy Bridge её две половины: ШИМ процессора и ШИМ микросхемы PCH.
+    pub const BLC_CPU_CTL2: usize = 0x48250;
+    pub const BLC_CPU_CTL: usize = 0x48254;
+    pub const BLC_PCH_CTL1: usize = 0xc8250;
+    pub const BLC_PCH_CTL2: usize = 0xc8254;
+    /// Таблица трансляции адресов графики (GTT) у шестого поколения лежит во ВТОРОЙ половине
+    /// BAR0: первые 2 МиБ — регистры, вторые — записи таблицы по 4 байта.
+    pub const GTT_OFF: usize = 2 * 1024 * 1024;
+}
+
+/// `(intel)` — РАЗВЕДКА дисплея Intel: что сейчас показывает железо и чем переключать страницу.
+///
+/// ## Зачем команда, а не программа
+///
+/// Снятые с железа числа нужно УНЕСТИ с машины, а конвейер `>>` берёт текст только у того, кто
+/// отдаёт его значением (см. `sh_mmio`). Поэтому разведка живёт рядом с `mmio` и `pci`:
+/// `(intel) >> (send "192.168.0.10" 9000)` уносит отчёт целиком, и человеку не приходится
+/// переписывать шестнадцатеричные слова с экрана.
+///
+/// ## Что она отвечает
+///
+/// Главный вопрос шага C: **чем на этой машине переключать страницу.** У virtio-gpu для этого
+/// есть команда протокола, а у настоящей Intel — регистр `DSPSURF`, и адрес в нём не физический,
+/// а СМЕЩЕНИЕ В ТАБЛИЦЕ GTT. Значит, чтобы показать свой кадр, мало его нарисовать: его страницы
+/// надо сперва вписать в эту таблицу. Разведка читает всю цепочку целиком — плоскость, её
+/// поверхность, запись таблицы под ней и физическую страницу, в которую запись ведёт, — и
+/// печатает, сошлось ли это с кадром, который нам отдал загрузчик.
+///
+/// ## Ничего не записывает
+///
+/// Ни одного слова в регистр. Разведка идёт на машине, которая у владельца одна, и порядок тут
+/// тот же, что был с Wi-Fi: сперва прочитать и показать, потом писать — и писать уже по числам,
+/// а не по догадке ([[0021-wifi-own-stack]], шаг 1).
+fn sh_intel(_args: &[Value]) -> Result<Value, EvalError> {
+    let hw = cap_hw("intel")?;
+    let mut out = String::new();
+    out.push_str("РАЗВЕДКА ДИСПЛЕЯ INTEL (ничего не записано)\n\n");
+
+    // 1. Найти само устройство. Встроенная графика Intel всегда 00:02.0, но ищем перебором:
+    // утверждение «всегда» проверяется дешевле, чем потом объясняется.
+    let Some((bdf, vendor_device, class)) = intel_найти(hw) else {
+        out.push_str("устройство: НЕ НАЙДЕНО — графики Intel на шине нет\n");
+        out.push_str("(в QEMU так и должно быть: там virtio-gpu либо stdvga)\n");
+        return Ok(Value::str(&out));
+    };
+    let (bus, dev, fun) = (bdf >> 8, (bdf >> 3) & 0x1f, bdf & 7);
+    out.push_str(&alloc::format!(
+        "устройство  {:02x}:{:02x}.{}  {:04x}:{:04x}  класс {:#06x}\n",
+        bus,
+        dev,
+        fun,
+        vendor_device & 0xffff,
+        vendor_device >> 16,
+        class >> 16,
+    ));
+
+    // 2. Окна памяти. BAR0 — регистры и таблица GTT, BAR2 — апертура (окно в память графики).
+    // Оба 64-битные, то есть занимают по два слова конфигурации.
+    let bar0 = intel_bar(hw, bdf, 0x10);
+    let bar2 = intel_bar(hw, bdf, 0x18);
+    let Some(bar0) = bar0 else {
+        out.push_str("BAR0 прочитать не удалось — дальше идти некуда\n");
+        return Ok(Value::str(&out));
+    };
+    out.push_str(&alloc::format!("регистры BAR0 {:#x}\n", bar0));
+    match bar2 {
+        Some(b) => out.push_str(&alloc::format!("апертура BAR2 {:#x}\n", b)),
+        None => out.push_str("апертура BAR2: прочитать не удалось\n"),
+    }
+    // Начало украденной памяти (BDSM): кадр загрузчика почти наверняка лежит именно там.
+    if let Some(bdsm) = sys::hw_pci_read(hw, bdf as u16, 0x5c) {
+        out.push_str(&alloc::format!(
+            "украденная память (BDSM) {:#010x} → база {:#x}\n",
+            bdsm,
+            bdsm & 0xfff0_0000,
+        ));
+    }
+    // Управление графической памятью (GGC) живёт у хоста моста, 00:00.0 +0x50.
+    if let Some(ggc) = sys::hw_pci_read(hw, 0, 0x50) {
+        out.push_str(&alloc::format!("GGC (00:00.0 +0x50) {:#010x}\n", ggc));
+    }
+
+    // 3. Конвейеры и плоскости — что показывает железо прямо сейчас.
+    for i in 0..2 {
+        let имя = if i == 0 { 'A' } else { 'B' };
+        let conf = sys::hw_read(hw, bar0 + intel_reg::PIPECONF[i]).unwrap_or(0);
+        let src = sys::hw_read(hw, bar0 + intel_reg::PIPESRC[i]).unwrap_or(0);
+        let cntr = sys::hw_read(hw, bar0 + intel_reg::DSPCNTR[i]).unwrap_or(0);
+        let stride = sys::hw_read(hw, bar0 + intel_reg::DSPSTRIDE[i]).unwrap_or(0);
+        let surf = sys::hw_read(hw, bar0 + intel_reg::DSPSURF[i]).unwrap_or(0);
+        let linoff = sys::hw_read(hw, bar0 + intel_reg::DSPLINOFF[i]).unwrap_or(0);
+        let tileoff = sys::hw_read(hw, bar0 + intel_reg::DSPTILEOFF[i]).unwrap_or(0);
+        out.push_str(&alloc::format!(
+            "\nконвейер {}  {}  источник {}×{}  (PIPECONF {:#010x})\n",
+            имя,
+            if conf & (1 << 31) != 0 { "ВКЛЮЧЁН" } else { "выключен" },
+            (src >> 16) + 1,
+            (src & 0xffff) + 1,
+            conf,
+        ));
+        out.push_str(&alloc::format!(
+            "  плоскость {}  {}  {}  шаг {} Б  плитка {}  (DSPCNTR {:#010x})\n",
+            имя,
+            if cntr & (1 << 31) != 0 { "ВКЛЮЧЕНА" } else { "выключена" },
+            intel_формат((cntr >> 26) & 0xf),
+            stride,
+            if cntr & (1 << 10) != 0 { "ДА" } else { "нет" },
+            cntr,
+        ));
+        out.push_str(&alloc::format!(
+            "  поверхность {:#010x}  смещение строки {:#x}  смещение плитки {:#010x}\n",
+            surf,
+            linoff,
+            tileoff,
+        ));
+        // Счётчик кадров дважды: развёртка либо идёт, либо стоит, и гадать об этом незачем.
+        let f1 = sys::hw_read(hw, bar0 + intel_reg::FRMCOUNT[i]).unwrap_or(0);
+        sys::sleep_ns(100_000_000);
+        let f2 = sys::hw_read(hw, bar0 + intel_reg::FRMCOUNT[i]).unwrap_or(0);
+        out.push_str(&alloc::format!(
+            "  кадров за 100 мс: {} ({} → {}) — развёртка {}\n",
+            f2.wrapping_sub(f1),
+            f1,
+            f2,
+            if f2 != f1 { "ИДЁТ" } else { "стоит" },
+        ));
+        // Та самая цепочка: поверхность → запись GTT → физическая страница.
+        if cntr & (1 << 31) != 0 {
+            let идx = (surf >> 12) as usize;
+            let адрес_записи = bar0 + intel_reg::GTT_OFF + идx * 4;
+            match sys::hw_read(hw, адрес_записи) {
+                Some(pte) => {
+                    let phys = (pte as u64 & 0xffff_f000) | ((pte as u64 & 0xff0) << 28);
+                    out.push_str(&alloc::format!(
+                        "  запись GTT #{} ({:#x}): {:#010x} → страница {:#x}, годна {}\n",
+                        идx,
+                        адрес_записи,
+                        pte,
+                        phys,
+                        if pte & 1 != 0 { "ДА" } else { "НЕТ" },
+                    ));
+                }
+                None => out.push_str("  запись GTT прочитать не удалось\n"),
+            }
+        }
+    }
+
+    // 4. Панель и подсветка — вторая половина задачи и единственная часть ноутбучной базы,
+    // которой не нужен интерпретатор AML.
+    let lvds = sys::hw_read(hw, bar0 + intel_reg::PCH_LVDS).unwrap_or(0);
+    let cpu2 = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL2).unwrap_or(0);
+    let cpu1 = sys::hw_read(hw, bar0 + intel_reg::BLC_CPU_CTL).unwrap_or(0);
+    let pch1 = sys::hw_read(hw, bar0 + intel_reg::BLC_PCH_CTL1).unwrap_or(0);
+    let pch2 = sys::hw_read(hw, bar0 + intel_reg::BLC_PCH_CTL2).unwrap_or(0);
+    out.push_str(&alloc::format!(
+        "\nпанель LVDS {:#010x} — порт {}\n",
+        lvds,
+        if lvds & (1 << 31) != 0 { "ВКЛЮЧЁН" } else { "выключен" },
+    ));
+    out.push_str(&alloc::format!(
+        "подсветка ЦП   CTL2 {:#010x} ({}), CTL {:#010x}\n",
+        cpu2,
+        if cpu2 & (1 << 31) != 0 { "включена" } else { "выключена" },
+        cpu1,
+    ));
+    let период = pch2 >> 16;
+    let скважность = pch2 & 0xffff;
+    out.push_str(&alloc::format!(
+        "подсветка PCH  CTL1 {:#010x} ({}), CTL2 {:#010x}\n",
+        pch1,
+        if pch1 & (1 << 31) != 0 { "включена" } else { "выключена" },
+        pch2,
+    ));
+    out.push_str(&alloc::format!(
+        "  период {} тактов, скважность {} — это {} % яркости\n",
+        период,
+        скважность,
+        if период > 0 { скважность * 100 / период } else { 0 },
+    ));
+
+    out.push_str(
+        "\nЧТО ЭТО ЗНАЧИТ. Поверхность плоскости — не физический адрес, а смещение в таблице\n\
+         GTT. Переключение страницы = вписать свои страницы в свободные записи этой таблицы и\n\
+         записать их смещение в DSPSURF; защёлкнется на обратном ходе луча. Яркость — поле\n\
+         скважности в CTL2 микросхемы PCH, период трогать не надо.\n",
+    );
+    Ok(Value::str(&out))
+}
+
+/// `(brightness)` — сколько сейчас яркости панели; `(brightness 40)` — поставить 40 %.
+///
+/// ## Почему это вообще возможно без интерпретатора AML
+///
+/// Вся ноутбучная база (батарея, крышка, сон) упирается в язык AML, которого у нас нет, — но
+/// яркость из этой развилки ИЗЪЯТА: на Intel подсветкой правит обычный регистр ШИМ, и ставится
+/// она записью одного поля. Это единственная часть ноутбучной базы, которой интерпретатор не
+/// нужен, и поэтому она делается сейчас, а не вместе с остальным ([[todo]], шаг D).
+///
+/// ## Что именно пишется
+///
+/// Только поле СКВАЖНОСТИ (младшие 16 бит `BLC_PWM_PCH_CTL2`). Период (старшие 16) остаётся как
+/// есть: его задаёт прошивка под конкретную панель, и подменять его своим числом — значит
+/// менять частоту мерцания подсветки вслепую.
+///
+/// Ниже пяти процентов не ставим совсем. Ноль — это чёрный экран на машине, где экран
+/// единственный способ что-то увидеть; «я могу, значит можно» здесь плохой довод.
+fn sh_brightness(args: &[Value]) -> Result<Value, EvalError> {
+    let hw = cap_hw("brightness")?;
+    let Some((bdf, _, _)) = intel_найти(hw) else {
+        return Err(EvalError::new(
+            "brightness: графики Intel на шине нет — этим регистром здесь управлять нечем",
+        ));
+    };
+    let Some(bar0) = intel_bar(hw, bdf, 0x10) else {
+        return Err(EvalError::new("brightness: не прочитать окно регистров (BAR0)"));
+    };
+    let ctl1 = sys::hw_read(hw, bar0 + intel_reg::BLC_PCH_CTL1).unwrap_or(0);
+    let ctl2 = sys::hw_read(hw, bar0 + intel_reg::BLC_PCH_CTL2).unwrap_or(0);
+    let период = ctl2 >> 16;
+    if период == 0 {
+        return Err(EvalError::new(alloc::format!(
+            "brightness: период ШИМ нулевой (CTL1 {:#010x}, CTL2 {:#010x}) — подсветкой правит\n\
+             не эта половина; числа покажет `intel`, и по ним будет видно, какая",
+            ctl1, ctl2,
+        )));
+    }
+    let сейчас = (ctl2 & 0xffff) * 100 / период;
+    let Some(v) = args.first() else {
+        return Ok(Value::str(&alloc::format!(
+            "яркость {} % (скважность {} из {})",
+            сейчас,
+            ctl2 & 0xffff,
+            период,
+        )));
+    };
+    let Some(хочу) = num(v) else {
+        return Err(EvalError::new("brightness: (brightness) либо (brightness 1..100)"));
+    };
+    let хочу = хочу.clamp(5, 100) as u32;
+    let скважность = (период * хочу / 100).max(1);
+    if !sys::hw_write(hw, bar0 + intel_reg::BLC_PCH_CTL2, (период << 16) | скважность) {
+        return Err(EvalError::new("brightness: записать не удалось (нет права `w`)"));
+    }
+    // Сверяем записанное ЧТЕНИЕМ, а не верим в успех записи: регистр мог оказаться доступным
+    // только для чтения, и тогда «поставлено 40 %» было бы враньём.
+    let стало = sys::hw_read(hw, bar0 + intel_reg::BLC_PCH_CTL2).unwrap_or(0);
+    let вышло = if период > 0 { (стало & 0xffff) * 100 / период } else { 0 };
+    let mut out = alloc::format!("яркость {} % → {} % (CTL2 {:#010x})", сейчас, вышло, стало);
+    if ctl1 & (1 << 31) == 0 {
+        out.push_str("\nвнимание: ШИМ PCH помечен выключенным (CTL1) — подсветка могла не измениться");
+    }
+    if стало & 0xffff != скважность {
+        out.push_str("\nвнимание: регистр не принял значение — панелью правит другая половина");
+    }
+    Ok(Value::str(&out))
+}
+
+/// Найти встроенную графику Intel: вендор `8086` и класс «дисплей» (0x03).
+///
+/// Перебором по нулевой шине, а не «она всегда 00:02.0»: перебор стоит тридцать две пары чтений,
+/// а «всегда» однажды оказывается неправдой на чужой машине — и тогда команда молча читает чужие
+/// регистры, что хуже, чем честное «не найдено».
+fn intel_найти(hw: usize) -> Option<(usize, u32, u32)> {
+    for dev in 0..32u16 {
+        let bdf = dev << 3;
+        let Some(id) = sys::hw_pci_read(hw, bdf, 0) else { continue };
+        if id == 0xffff_ffff || id & 0xffff != 0x8086 {
+            continue;
+        }
+        let Some(class) = sys::hw_pci_read(hw, bdf, 0x08) else { continue };
+        if class >> 24 == 0x03 {
+            return Some((bdf as usize, id, class));
+        }
+    }
+    None
+}
+
+/// Прочитать 64-битное окно памяти (BAR) по смещению `off`: младшее слово плюс старшее.
+fn intel_bar(hw: usize, bdf: usize, off: usize) -> Option<usize> {
+    let lo = sys::hw_pci_read(hw, bdf as u16, off)?;
+    let hi = sys::hw_pci_read(hw, bdf as u16, off + 4)?;
+    if lo == 0xffff_ffff {
+        return None;
+    }
+    Some(((hi as usize) << 32) | (lo as usize & !0xf))
+}
+
+/// Формат пикселя плоскости — поле 29:26 регистра DSPCNTR.
+fn intel_формат(code: u32) -> &'static str {
+    match code {
+        0x2 => "8 бит по палитре",
+        0x5 => "16 бит BGRX565",
+        0x6 => "32 бита BGRX8888",
+        0x7 => "32 бита BGRA8888",
+        0xa => "30 бит BGRX101010",
+        0xe => "32 бита RGBX8888",
+        0xf => "32 бита RGBA8888",
+        _ => "формат неизвестен",
+    }
+}
 
 /// `(poweroff)` — выключить машину (Веха 101). Нужно право `power` из конфига: выключение —
 /// одностороннее действие над всей системой, и оно названо правом, а не считается общедоступным.
