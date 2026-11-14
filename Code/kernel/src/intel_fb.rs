@@ -52,6 +52,14 @@ mod reg {
     /// Что развёртка читает ПРЯМО СЕЙЧАС (в отличие от [`DSPASURF`], где лежит ожидающее
     /// значение). По нему проверяется, что переключение вообще случилось.
     pub const DSPASURFLIVE: usize = 0x701ac;
+    /// Плоскость КУРСОРА конвейера A: вид, адрес картинки (смещение в GTT) и положение.
+    /// Отдельная плоскость — поэтому курсор и не стоит кадра: двигает его развёртка, а не мы.
+    pub const CURACNTR: usize = 0x70080;
+    pub const CURABASE: usize = 0x70084;
+    pub const CURAPOS: usize = 0x70088;
+    /// Вид курсора: 64×64, 32 бита с альфой. Младшие шесть бит — размер и глубина, бит 5 —
+    /// смешивание по альфе; ноль в этом поле выключает плоскость.
+    pub const CURSOR_64_ARGB: u32 = 0x27;
 }
 
 /// Окно регистров (BAR0). Ноль — двойной буферизации нет.
@@ -60,6 +68,16 @@ static BAR0: AtomicUsize = AtomicUsize::new(0);
 static GTT_OFF: AtomicUsize = AtomicUsize::new(0);
 /// Шаг между буферами в байтах (он же смещение второго).
 static STEP: AtomicUsize = AtomicUsize::new(0);
+/// Смещение картинки курсора в GTT (0 — курсора нет).
+static CURSOR_OFF: AtomicUsize = AtomicUsize::new(0);
+/// Апертура (BAR2): через неё пишется картинка курсора — тем же путём, которым композитор
+/// пишет пиксели кадра.
+static APERTURE: AtomicUsize = AtomicUsize::new(0);
+
+/// Сторона картинки курсора в точках. Железо умеет 64, 128 и 256; берём наименьшую — наш
+/// указатель 12×19, и класть его в большее поле значит возить по шине пустоту.
+pub const CURSOR_SIDE: usize = 64;
+
 /// Какой буфер СЕЙЧАС на экране: 0 — первый, 1 — второй.
 static SHOWN: AtomicUsize = AtomicUsize::new(0);
 /// В какой буфер рисует композитор. Он же уедет на экран ближайшим переключением: показывать
@@ -232,12 +250,26 @@ pub fn init(fb_phys: usize, pitch: usize, height: usize) -> bool {
 
     STEP.store(step, Ordering::Relaxed);
     SHOWN.store(0, Ordering::Relaxed);
+    APERTURE.store(aperture, Ordering::Relaxed);
     READY.store(true, Ordering::Relaxed);
+    // Место под картинку курсора — сразу за обоими кадрами. Требования те же: записи таблицы
+    // отображены и ведут не в кадр. Не сошлось — курсора в железе не будет, а кадры останутся:
+    // это разные вещи, и валить одну из-за другой незачем.
+    let cursor_off = step * 2;
+    let cursor_pages = (CURSOR_SIDE * CURSOR_SIDE * 4).div_ceil(4096);
+    if stolen >= cursor_off + cursor_pages * 4096
+        && (0..cursor_pages).all(|i| {
+            gtt_page(cursor_off / 4096 + i).is_some_and(|page| page < front_lo || page >= front_hi)
+        })
+    {
+        CURSOR_OFF.store(cursor_off, Ordering::Relaxed);
+    }
     crate::println!(
-        "  [intel] двойная буферизация: второй кадр по смещению {:#x} ({} КиБ), украденной памяти {} МиБ",
+        "  [intel] двойная буферизация: второй кадр по смещению {:#x} ({} КиБ), украденной памяти {} МиБ, курсор {}",
         step,
         step / 1024,
         stolen / (1024 * 1024),
+        if CURSOR_OFF.load(Ordering::Relaxed) != 0 { "аппаратный" } else { "НЕТ (рисует композитор)" },
     );
     true
 }
@@ -301,6 +333,69 @@ pub fn to_front() {
     if present() && SHOWN.swap(0, Ordering::Relaxed) != 0 {
         arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::DSPASURF, 0);
     }
+}
+
+/// Есть ли аппаратный курсор.
+pub fn cursor_present() -> bool {
+    present() && CURSOR_OFF.load(Ordering::Relaxed) != 0
+}
+
+/// Положить картинку курсора: `px` — 64×64 точки в формате `0xAARRGGBB`.
+///
+/// Пишется ЧЕРЕЗ АПЕРТУРУ — тем же путём, которым композитор пишет пиксели кадра: апертура
+/// переводит адрес той же таблицей GTT, в которую мы вписали эти страницы. Отдельного
+/// отображения для картинки курсора заводить не надо.
+///
+/// Зовётся редко (картинка меняется, когда меняется сам указатель), поэтому запись идёт
+/// словами, а не блоком: шестнадцать килобайт один раз — это дешевле, чем ещё одна дорога к
+/// памяти ради скорости, которой здесь никто не ждёт.
+pub fn cursor_image(px: &[u32]) -> bool {
+    let off = CURSOR_OFF.load(Ordering::Relaxed);
+    if !cursor_present() || px.len() < CURSOR_SIDE * CURSOR_SIDE {
+        return false;
+    }
+    let base = APERTURE.load(Ordering::Relaxed) + off;
+    for (i, &p) in px.iter().take(CURSOR_SIDE * CURSOR_SIDE).enumerate() {
+        arch::hw_write32(base + i * 4, p);
+    }
+    // Адрес картинки — он же включение плоскости: вид ставим до адреса, чтобы развёртка не
+    // успела прочитать старое поле новым видом.
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::CURACNTR, reg::CURSOR_64_ARGB);
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::CURABASE, off as u32);
+    true
+}
+
+/// Передвинуть курсор. Отрицательные координаты — это курсор, наполовину ушедший за левый или
+/// верхний край: у железа для них отдельный бит знака, а не дополнительный код.
+pub fn cursor_move(x: i32, y: i32) -> bool {
+    if !cursor_present() {
+        return false;
+    }
+    let pack = |v: i32| -> u32 {
+        if v < 0 {
+            (1 << 15) | ((-v) as u32 & 0x7fff)
+        } else {
+            v as u32 & 0x7fff
+        }
+    };
+    let pos = (pack(y) << 16) | pack(x);
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::CURAPOS, pos);
+    true
+}
+
+/// Спрятать курсор (ноль в поле вида выключает плоскость) или показать снова.
+pub fn cursor_show(on: bool) -> bool {
+    if !cursor_present() {
+        return false;
+    }
+    let cntr = if on { reg::CURSOR_64_ARGB } else { 0 };
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::CURACNTR, cntr);
+    if on {
+        // Адрес надо повторить: плоскость, включённая заново, читает его при первом же кадре.
+        let off = CURSOR_OFF.load(Ordering::Relaxed);
+        arch::hw_write32(BAR0.load(Ordering::Relaxed) + reg::CURABASE, off as u32);
+    }
+    true
 }
 
 /// Что развёртка читает прямо сейчас. В отличие от регистра поверхности, где лежит ОЖИДАЮЩЕЕ

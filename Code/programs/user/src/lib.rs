@@ -128,6 +128,8 @@ const SYS_CAP_NARROW: usize = 73;
 const SYS_CLOCK_SET: usize = 74;
 /// Веха 231 — трассировка: включить, вычерпать, спросить числа (право обзора).
 const SYS_TRACE: usize = 75;
+/// Веха 233.7 — аппаратный курсор экрана: картинка, положение, показать/спрятать.
+const SYS_VIDEO_CURSOR: usize = 76;
 const SYS_SPAWN: usize = 41;
 const SYS_WAIT: usize = 42;
 const SYS_SELF_ENDPOINT: usize = 43;
@@ -1712,6 +1714,31 @@ pub fn video_flush(mmio_cap: usize, x: u32, y: u32, w: u32, h: u32) -> usize {
     let r = abi::syscall(SYS_VIDEO_FLUSH, mmio_cap, x as usize, y as usize, wh, 0, 0, 0).0;
     // Отказ (нет права) — это не смещение: рисовать по нему было бы хуже, чем не рисовать.
     if r == usize::MAX { 0 } else { r }
+}
+
+/// Веха 233.7 — сторона картинки аппаратного курсора в точках (столько же в высоту).
+pub const CURSOR_SIDE: usize = 64;
+
+/// Веха 233.7 — отдать железу КАРТИНКУ курсора: 64×64 точки `0xAARRGGBB`.
+///
+/// `false` — аппаратного курсора нет, и указатель придётся рисовать в кадре самому. Спрашивать
+/// это надо ОДИН раз, на старте: ответ не меняется, а движение мыши не место для проверок.
+pub fn video_cursor_image(mmio_cap: usize, px: &[u32]) -> bool {
+    if px.len() < CURSOR_SIDE * CURSOR_SIDE {
+        return false;
+    }
+    abi::syscall(SYS_VIDEO_CURSOR, mmio_cap, 0, px.as_ptr() as usize, 0, 0, 0, 0).0 == 0
+}
+
+/// Веха 233.7 — передвинуть аппаратный курсор. Отрицательные координаты допустимы: это
+/// указатель, наполовину ушедший за левый или верхний край.
+pub fn video_cursor_move(mmio_cap: usize, x: i32, y: i32) -> bool {
+    abi::syscall(SYS_VIDEO_CURSOR, mmio_cap, 1, x as usize, y as usize, 0, 0, 0).0 == 0
+}
+
+/// Веха 233.7 — показать или спрятать аппаратный курсор.
+pub fn video_cursor_show(mmio_cap: usize, on: bool) -> bool {
+    abi::syscall(SYS_VIDEO_CURSOR, mmio_cap, 2, usize::from(on), 0, 0, 0, 0).0 == 0
 }
 
 /// `SYS_VIDEO_INFO(mmio_cap, out)` (Веха 97): геометрия и раскладка цвета экрана. Право то же,

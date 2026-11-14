@@ -573,6 +573,62 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret(result);
             f.advance();
         }
+        // SYS_VIDEO_CURSOR(mmio_cap, op, a, b) -> 0 | MAX (Веха 233.7) — АППАРАТНЫЙ КУРСОР.
+        //
+        //   op=0  картинка: `a` — адрес 64×64 точек `0xAARRGGBB` в памяти процесса;
+        //   op=1  положение: `a` — x, `b` — y (со знаком);
+        //   op=2  показать (`a != 0`) или спрятать.
+        //
+        // `MAX` значит «аппаратного курсора нет» — и это не отказ, а ответ: рисующий обязан
+        // тогда рисовать указатель сам, как делал всегда. Поэтому ответ спрашивают ОДИН раз, на
+        // старте, а не на каждом движении мыши.
+        //
+        // Право — то же, что на кадр (запись в окно экрана): курсор это плоскость того же
+        // экрана, и управлять им должен тот, кто на этом экране рисует.
+        76 => {
+            // На riscv аппаратного курсора нет (экран приходит от virtio-gpu, своей плоскости
+            // курсора у него не бывает) — аргументы там не нужны, и подчёркивание говорит это
+            // прямо, вместо того чтобы глушить предупреждение.
+            #[cfg(not(target_arch = "x86_64"))]
+            let (mcap, op, _a, _b) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            #[cfg(target_arch = "x86_64")]
+            let (mcap, op, a, b) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), Rights::WRITE) {
+                #[cfg(target_arch = "x86_64")]
+                Ok(_) => {
+                    const PX: usize = crate::intel_fb::CURSOR_SIDE * crate::intel_fb::CURSOR_SIDE;
+                    let ok = match op {
+                        0 if ensure_heap_range(t, cur, a, PX * 4) => {
+                            let px = unsafe { core::slice::from_raw_parts(a as *const u32, PX) };
+                            crate::intel_fb::cursor_image(px)
+                        }
+                        1 => crate::intel_fb::cursor_move(a as i32, b as i32),
+                        2 => crate::intel_fb::cursor_show(a != 0),
+                        _ => false,
+                    };
+                    if ok { 0 } else { usize::MAX }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                Ok(_) => {
+                    let _ = op;
+                    usize::MAX
+                }
+                Err(e) => {
+                    vprintln!("  [video] P{} VIDEO_CURSOR отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_VIDEO_INFO(mmio_cap, out) -> 0 | MAX (Веха 97): описание видеорежима в буфер
         // процесса — 10 × u32: ширина, высота, шаг строки, бит/пиксель и по паре
         // (позиция, ширина маски) на R, G, B.

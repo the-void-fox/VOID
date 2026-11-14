@@ -1210,6 +1210,8 @@ fn main_loop() -> ! {
         prev_damage: Vec::new(),
         needs_full: [true, true],
         draw_slot: 0,
+        hw_cursor: false,
+        hw_cursor_pressed: false,
         // Веха 137 — стол ровно один, пустой. Дальше их число ведёт `tidy_spaces`.
         ov_bands: Vec::new(),
         spaces: vec![Space::default()],
@@ -1240,7 +1242,15 @@ fn main_loop() -> ! {
 
     // Рабочий стол целиком — единственная полная заливка за всю сессию.
     wm.fill_rect(0, 0, info.width as i32, info.height as i32, tri(wm.th.desktop));
-    wm.draw_cursor();
+    // Веха 233.7 — курсор пробуем отдать ЖЕЛЕЗУ. Спрашиваем один раз: ответ не меняется, а
+    // движение мыши не место для проверок. Не вышло — рисуем сами, как рисовали всегда.
+    wm.hw_cursor = wm.push_hw_cursor();
+    if wm.hw_cursor {
+        sys::video_cursor_move(wm.fb_cap, wm.cursor.x, wm.cursor.y);
+        sys::write_console("[wm] курсор: аппаратная плоскость\n".as_bytes());
+    } else {
+        wm.draw_cursor();
+    }
     // Веха 142 — скорость анимаций из конфига (`desktop anim <мс>`). Значение чужое, поэтому
     // потолок ставим свой: срок длиннее секунды делает систему не плавной, а задумчивой.
     if let Some(ms) = void_conf::num::<u64>(&generation, "desktop", "anim") {
@@ -1946,6 +1956,13 @@ struct Wm {
     needs_full: [bool; 2],
     /// В какой буфер рисуем сейчас (0 или 1) — чтобы знать, чей полный кадр отмечать.
     draw_slot: usize,
+    /// Веха 233.7 — курсор рисует ЖЕЛЕЗО (отдельной плоскостью), а не мы в кадре. Тогда
+    /// движение мыши не стоит ни перерисовки, ни кадра вообще: развёртка накладывает указатель
+    /// сама. `false` — курсора в железе нет, рисуем как рисовали.
+    hw_cursor: bool,
+    /// Каким был признак нажатия, когда картинку курсора отдавали железу: цвет заливки у
+    /// нажатого другой, и картинку надо обновить — но только когда он ДЕЙСТВИТЕЛЬНО сменился.
+    hw_cursor_pressed: bool,
     /// Строка пикселей в RAM: собираем её здесь, а во фреймбуфер отдаём одной последовательностью.
     /// ТЕНЕВОЙ КАДР (Веха 126): весь экран в обычной памяти. Кадр собирается здесь, а на экран
     /// уходит блитом. Затевалось ради разрывов, а понадобилось ради СТОИМОСТИ: прокрутка ленты
@@ -3374,7 +3391,9 @@ impl Wm {
     /// на экране, на котором Веха 121.2 уже стояла с курсором: помечено старое место, а новое в
     /// пометку не попало.
     fn pointer_rect(&self, p: Pt<Screen>) -> At<Screen> {
-        let cur = p.rect(CUR_W, CUR_H);
+        // Веха 233.7 — когда курсор рисует железо, в кадре от указателя остаётся только ЯРЛЫК
+        // перетаскивания: его мы по-прежнему рисуем сами.
+        let cur = if self.hw_cursor { At::new(p.x, p.y, 0, 0) } else { p.rect(CUR_W, CUR_H) };
         match self.badge_at(p) {
             Some(b) => cur.union(b),
             None => cur,
@@ -3383,6 +3402,9 @@ impl Wm {
 
     fn damage_pointer(&mut self, p: Pt<Screen>) {
         let r = self.pointer_rect(p);
+        if r.rect().is_empty() {
+            return;
+        }
         self.damage(r);
     }
 
@@ -3430,6 +3452,11 @@ impl Wm {
         // Ярлык — ПОД курсором: он говорит, что несут, а курсор говорит, куда целятся, и
         // закрывать второе первым нельзя.
         self.draw_badge_row(out, yy, x0, x1);
+        // Курсор в железе — в кадре его не рисуем вовсе: иначе человек увидит ДВА указателя,
+        // и один из них будет отставать.
+        if self.hw_cursor {
+            return;
+        }
         let cy = yy - self.cursor.y;
         if cy >= 0 && cy < CUR_H {
             let fill = self.pack(if self.buttons != 0 { tri(self.th.accent) } else { (255, 255, 255) });
@@ -4092,6 +4119,32 @@ impl Wm {
 
     // ── курсор (тот же приём, что в `term`: он не часть кадра) ────────────────────────
 
+    /// Веха 233.7 — отдать железу КАРТИНКУ указателя: те же 12×19 точек, разложенные в поле
+    /// 64×64 с прозрачностью.
+    ///
+    /// Прозрачность и есть то, ради чего плоскость курсора берётся в формате с альфой: поле
+    /// вчетверо больше нашего указателя, и без неё вокруг него стоял бы чёрный квадрат.
+    ///
+    /// Возвращает `false`, если аппаратного курсора нет; тогда композитор рисует указатель в
+    /// кадре, как делал всегда.
+    fn push_hw_cursor(&mut self) -> bool {
+        let fill = if self.buttons != 0 { tri(self.th.accent) } else { (255, 255, 255) };
+        let mut px = alloc::vec![0u32; sys::CURSOR_SIDE * sys::CURSOR_SIDE];
+        for (row, line) in CURSOR.iter().enumerate() {
+            for (col, ch) in line.bytes().enumerate() {
+                if ch == b' ' || row >= sys::CURSOR_SIDE || col >= sys::CURSOR_SIDE {
+                    continue;
+                }
+                // Формат плоскости — `0xAARRGGBB`, непрозрачность единицей во всех старших битах.
+                let (r, g, b) = if ch == b'#' { (0, 0, 0) } else { fill };
+                px[row * sys::CURSOR_SIDE + col] =
+                    0xff00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+            }
+        }
+        self.hw_cursor_pressed = self.buttons != 0;
+        sys::video_cursor_image(self.fb_cap, &px)
+    }
+
     fn draw_cursor(&self) {
         let px_fill = self.pack(if self.buttons != 0 { tri(self.th.accent) } else { (255, 255, 255) });
         let px_edge = self.pack((0, 0, 0));
@@ -4593,6 +4646,17 @@ impl Wm {
         self.cursor.y = (self.cursor.y + e.dy as i32).clamp(0, self.info.height as i32 - 1);
         let was = self.buttons;
         self.buttons = e.buttons;
+        // Веха 233.7 — указатель двигает железо: один регистр вместо перерисовки двух
+        // прямоугольников. Делается СРАЗУ, до всей прочей работы по событию, — рука человека не
+        // должна ждать, пока мы разберёмся, во что он целился.
+        if self.hw_cursor {
+            sys::video_cursor_move(self.fb_cap, self.cursor.x, self.cursor.y);
+            // Нажатая кнопка красит указатель — значит картинку надо обновить, но только на
+            // смене состояния, а не на каждом движении с зажатой кнопкой.
+            if (self.buttons != 0) != self.hw_cursor_pressed {
+                self.push_hw_cursor();
+            }
+        }
 
         // В обзоре клик выбирает окно и ВЫХОДИТ к нему — ради этого обзор и открывают.
         // Попадание считается по тому же списку, по которому обзор нарисован: отдельный расчёт
