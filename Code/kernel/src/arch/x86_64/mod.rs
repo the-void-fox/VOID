@@ -1076,6 +1076,11 @@ pub fn acpi_table(sig: [u8; 4], idx: usize) -> Option<&'static [u8]> {
     acpi::table(sig, idx)
 }
 
+/// Веха 236 — порты встроенного контроллера из ECDT (см. [`acpi::ec_ports`]).
+pub fn acpi_ec_ports() -> Option<(u16, u16)> {
+    acpi::ec_ports()
+}
+
 /// Веха 234 — напечатать инвентарь ACPI (см. [`acpi::survey`]).
 pub fn acpi_survey() {
     acpi::survey()

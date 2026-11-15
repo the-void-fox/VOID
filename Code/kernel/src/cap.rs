@@ -78,6 +78,16 @@ pub enum Target {
     /// адресное пространство userspace-драйвера (`SYS_MMIO_MAP`). Эфемерно (минтится на загрузке
     /// после PCI-поиска; не переживает перезагрузку — устройство ищется заново).
     Mmio { base: usize, len: usize },
+    /// Веха 236 — **диапазон портов ввода-вывода**: право читать и писать порты `base..base+len`
+    /// (`SYS_HWPROBE`, вид 2). Отдельно от [`Target::Mmio`], потому что это другое адресное
+    /// пространство, и отдельно от [`Target::HwProbe`], потому что то — инструмент ЧЕЛОВЕКА с
+    /// полной властью над железом, а это право СЛУЖБЫ: сервер ACPI обязан видеть порты своего
+    /// встроенного контроллера и не видеть остальных.
+    ///
+    /// Диапазон, а не один порт: контроллер — это всегда пара (команда/статус и данные), а
+    /// индексный доступ — пара «индекс/данные» подряд. Эфемерно: порты берутся из таблиц
+    /// прошивки на каждой загрузке, как окна MMIO берутся с шины.
+    IoPort { base: u16, len: u16 },
     /// Веха 51 — право выделять DMA-память (`SYS_DMA_ALLOC`): физически-адресуемые страницы под
     /// кольца/буферы устройства (userspace программирует железо физ-адресами). Без IOMMU это
     /// ДОВЕРЕННОЕ право (DMA куда угодно) — даётся только драйверам. Эфемерно.
@@ -582,6 +592,7 @@ pub fn info_kind(t: &Target) -> u8 {
         Target::Sysview => 13,
         Target::HwProbe => 15,
         Target::Clock => 16,
+        Target::IoPort { .. } => 17,
     }
 }
 
@@ -604,7 +615,7 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         // Эндпоинт/reply/устройство/store/mmio/dma — не значения: их «читают» через IPC/BLK_READ/etc.
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power
-        | Target::Shm(_) | Target::Sysview | Target::HwProbe
+        | Target::Shm(_) | Target::Sysview | Target::HwProbe | Target::IoPort { .. }
         | Target::Clock => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
@@ -627,7 +638,7 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
             | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
             | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
-            | Target::Clock => return Err(CapError::WrongKind),
+            | Target::IoPort { .. } | Target::Clock => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -767,6 +778,38 @@ pub fn sysview(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
 /// `WRITE` — писать. Отдельное право, а не часть `sysview`: обзор процессов и доступ к регистрам
 /// устройств — разные виды власти, и складывать их в одно означало бы, что диспетчер задач умеет
 /// останавливать контроллеры.
+/// Веха 236 — проверить право на **порт ввода-вывода** (`SYS_HWPROBE`, вид 2).
+///
+/// Принимает две разные цели, и это не послабление, а признание двух разных ролей:
+///
+/// - [`Target::IoPort`] — право СЛУЖБЫ, суженное диапазоном. Порт обязан целиком лежать внутри:
+///   обращение шириной в два байта по верхней границе диапазона залезло бы в чужой порт, и
+///   проверять надо конец, а не начало. Ровно так же проверяют окно MMIO.
+/// - [`Target::HwProbe`] — инструмент ЧЕЛОВЕКА (`io`, `mmio`, `pci` в шелле). Он и так означает
+///   «любое окно регистров и любая конфигурация PCI», то есть власть остановить любое
+///   устройство машины; отказывать ему в портах значило бы делать вид, что порты опаснее
+///   остального. Сужение — у служебного права, а не у отладочного.
+pub fn ioport(dom: DomainId, cap: Cap, port: u16, width: u16, need: Rights) -> Result<(), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::IoPort { base, len } => {
+            let end = port.checked_add(width).ok_or(CapError::Denied)?;
+            let limit = base.checked_add(len).ok_or(CapError::Denied)?;
+            if port >= base && end <= limit {
+                Ok(())
+            } else {
+                Err(CapError::Denied)
+            }
+        }
+        Target::HwProbe => Ok(()),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
 pub fn hwprobe(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
     let cs = CSPACE.lock();
     let e = resolve(&cs, dom, cap)?;
@@ -962,6 +1005,9 @@ fn target_eq(a: &Target, b: &Target) -> bool {
         (Target::Mmio { base: b1, len: l1 }, Target::Mmio { base: b2, len: l2 }) => {
             b1 == b2 && l1 == l2
         }
+        (Target::IoPort { base: b1, len: l1 }, Target::IoPort { base: b2, len: l2 }) => {
+            b1 == b2 && l1 == l2
+        }
         (Target::Shm(x), Target::Shm(y)) => x == y,
         (Target::Irq { vector: v1 }, Target::Irq { vector: v2 }) => v1 == v2,
         (Target::Sysview, Target::Sysview) => true,
@@ -1094,7 +1140,7 @@ pub fn persist() {
                         Target::Endpoint(_) | Target::Reply(_)
                         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
                         | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
-                        | Target::Clock
+                        | Target::IoPort { .. } | Target::Clock
                         | Target::Device(Device::NetDrv) => 0,
                     },
                     None => 0,

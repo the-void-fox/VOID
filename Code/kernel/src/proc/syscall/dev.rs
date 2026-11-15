@@ -480,7 +480,24 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             };
             let dom = t.procs[cur].domain;
             let need = if write == 0 { Rights::READ } else { Rights::WRITE };
-            let result = match cap::hwprobe(dom, Cap::from_bits(hcap as u64), need) {
+            // Вид 2 (порты) проверяется ДРУГИМ правом: у службы оно сужено диапазоном
+            // (`ioport:ec`), у человека это всё тот же `hwprobe`. Разводится здесь, а не внутри
+            // `cap::hwprobe`, потому что для проверки диапазона нужны номер порта и ширина —
+            // то есть аргументы именно этого вида (Веха 236).
+            let allowed = if kind == 2 {
+                // Номер порта шестнадцатибитный. Обрезать лишнее `as u16` нельзя: 0x10066
+                // превратилось бы в 0x0066 и прошло бы проверку диапазона, а отказал бы уже
+                // `hw_probe` — то есть право сказало бы «можно» про порт, которого не бывает.
+                match (u16::try_from(a), u16::try_from(b.max(1))) {
+                    (Ok(port), Ok(width)) => {
+                        cap::ioport(dom, Cap::from_bits(hcap as u64), port, width, need)
+                    }
+                    _ => Err(cap::CapError::Denied),
+                }
+            } else {
+                cap::hwprobe(dom, Cap::from_bits(hcap as u64), need)
+            };
+            let result = match allowed {
                 Ok(()) => hw_probe(kind, a, b, val, write),
                 Err(e) => {
                     vprintln!("  [hw] P{} SYS_HWPROBE отклонён: {:?}", cur, e);

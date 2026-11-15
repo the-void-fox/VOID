@@ -141,6 +141,9 @@ pub use imp::{
 /// ни ACPI).
 #[cfg(target_arch = "x86_64")]
 pub use imp::{acpi_survey, acpi_table, enable_power_button, touchpad_tune};
+/// Веха 236 — порты встроенного контроллера из ECDT: по ним выдаётся узкое право `ioport:ec`.
+#[cfg(target_arch = "x86_64")]
+pub use imp::acpi_ec_ports;
 
 // Задник текстовой консоли (Веха 226.5). Наружу из `arch` — потому что рисует им общий
 // `crate::textcon`, а не сама архитектура: слой текста один на обе, железо под ним разное.

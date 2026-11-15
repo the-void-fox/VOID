@@ -436,6 +436,45 @@ fn mint_cap(pid: usize, token: &str, services: &[(String, usize)]) -> Option<usi
                 None
             }
         }
+    } else if let Some(name) = token.strip_prefix("ioport:") {
+        // Веха 236 — УЗКОЕ право на порты: `ioport:ec`.
+        //
+        // По ИМЕНИ, а не по числам, ровно как `mmio:УСТРОЙСТВО`. Номера портов у каждой машины
+        // свои (у X54C контроллер на 0x66/0x62, у другой будет иначе), и написать их в конфиг
+        // значило бы сделать конфиг непереносимым — тот самый хардкод под одну машину. Имя
+        // разрешает ЯДРО по таблицам прошивки на этой загрузке.
+        //
+        // Отдельно от `hwprobe`: то — инструмент человека с полной властью над железом, это —
+        // право службы, и служба обязана видеть ровно свой контроллер.
+        let region: Option<(u16, u16)> = match name {
+            // Пара портов контроллера подряд не лежит (у X54C команда 0x66, данные 0x62), так
+            // что диапазон берётся от меньшего до большего включительно. Шире, чем два порта, и
+            // это честно сказано здесь: сузить до ровно двух номеров значило бы завести в праве
+            // список, а список у нас пока один диапазон.
+            #[cfg(target_arch = "x86_64")]
+            "ec" => crate::arch::acpi_ec_ports().map(|(cmd, data)| {
+                let (lo, hi) = (cmd.min(data), cmd.max(data));
+                (lo, hi - lo + 1)
+            }),
+            _ => None,
+        };
+        match region {
+            Some((base, len)) => {
+                println!("  [init] ioport:{} — порты {:#x}..{:#x}", name, base, base + len - 1);
+                Some(
+                    cap::mint(
+                        dom,
+                        cap::Target::IoPort { base, len },
+                        Rights::READ.union(Rights::WRITE),
+                    )
+                    .bits() as usize,
+                )
+            }
+            None => {
+                println!("  [init] ioport:{} — прошивка таких портов не объявила (пропуск)", name);
+                None
+            }
+        }
     } else if let Some(rest) = token.strip_prefix("endpoint:") {
         // endpoint:ИМЯ · endpoint:ИМЯ:права · endpoint:ИМЯ:/префикс (Веха 229).
         //
