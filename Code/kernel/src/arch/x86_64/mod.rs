@@ -11,6 +11,8 @@
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sync::SpinLock;
+
 mod acpi;
 mod gdt;
 mod ioapic;
@@ -179,6 +181,12 @@ fn discover_pvh(info: usize) -> Option<usize> {
                 if top > PHYS_LOW_TOP.load(Ordering::Relaxed) {
                     PHYS_LOW_TOP.store(top, Ordering::Relaxed);
                 }
+                // Веха 236 — та же поправка, что для multiboot выше: типы ACPI запоминаем
+                // поимённо. Не продублировать её здесь значило бы, что право работает при
+                // загрузке с GRUB и молча не работает при `cargo run`.
+                if (2..=4).contains(&ty) {
+                    fw_region_add(addr, size, ty);
+                }
             }
         }
         (total != 0).then_some(total)
@@ -246,6 +254,14 @@ fn discover_multiboot(info: usize) -> usize {
                             let top = base.saturating_add(len).min(0x1_0000_0000);
                             if top > PHYS_LOW_TOP.load(Ordering::Relaxed) {
                                 PHYS_LOW_TOP.store(top, Ordering::Relaxed);
+                            }
+                            // Веха 236 — типы 3 и 4 (ACPI reclaim и ACPI NVS) запоминаем
+                            // ПОИМЁННО: по ним проверяется право интерпретатора AML отображать
+                            // области `SystemMemory`. Остальные типы (reserved, bad) сюда не
+                            // идут — прошивка не называла их своими данными.
+                            let ty = rd(e + 16);
+                            if (2..=4).contains(&ty) {
+                                fw_region_add(base, len, ty);
                             }
                         }
                         e += esize;
@@ -789,6 +805,63 @@ pub fn mouse_take_lost() -> usize {
 /// карты firmware). Нужна одному потребителю — direct-map, чтобы ядро могло ПРОЧИТАТЬ таблицы
 /// ACPI (иначе выключение машины упирается в page fault на первом же указателе).
 static PHYS_LOW_TOP: AtomicUsize = AtomicUsize::new(0);
+
+/// Веха 236 — ОБЛАСТИ ПАМЯТИ, ОБЪЯВЛЕННЫЕ ПРОШИВКОЙ (типы 3 «ACPI reclaim» и 4 «ACPI NVS» из
+/// карты загрузчика).
+///
+/// Задумывалась как ПРОВЕРКА права `fwmem`, но прогон показал, что проверкой ей быть нельзя:
+/// байт-код прошивки адресует и окна регистров, которых в карте нет вовсе (HPET `0xfed00000` в
+/// QEMU лежит в дыре между областями). Правило осталось в `SYS_FW_MAP` одно — «не обычная
+/// память», и там же объяснено, почему.
+///
+/// Карта тем не менее нужна и печатается на загрузке: она отвечает на вопрос «что именно
+/// интерпретатор читает» — а на чужой машине это первое, что спросишь, когда батарея молчит.
+///
+/// Тридцати двух хватает с запасом: областей карты две-шесть, таблиц — до десятка.
+/// Переполнение не молчит.
+const FW_REGIONS_MAX: usize = 32;
+static FW_REGIONS: SpinLock<[(usize, usize, u32); FW_REGIONS_MAX]> =
+    SpinLock::new([(0, 0, 0); FW_REGIONS_MAX]);
+static FW_REGIONS_LEN: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn fw_region_add(base: usize, len: usize, ty: u32) {
+    if len == 0 {
+        return;
+    }
+    let n = FW_REGIONS_LEN.load(Ordering::Relaxed);
+    if n >= FW_REGIONS_MAX {
+        crate::println!("  [acpi] областей прошивки больше {} — лишние не запомнены", FW_REGIONS_MAX);
+        return;
+    }
+    FW_REGIONS.lock()[n] = (base, len, ty);
+    FW_REGIONS_LEN.store(n + 1, Ordering::Relaxed);
+}
+
+/// Напечатать карту НЕпригодной памяти ниже 4 ГиБ — ту, по которой проверяется право `fwmem`.
+///
+/// Нужно потому, что отказ «прошивка такой области не объявляла» сам по себе не говорит, ЧТО
+/// она объявляла, и на чужой машине это тупик. Два числа и тип — и видно сразу.
+pub fn fw_regions_print() {
+    let n = FW_REGIONS_LEN.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    crate::print!("  [acpi] память прошивки:");
+    let regions = FW_REGIONS.lock();
+    for i in 0..n {
+        let (base, len, ty) = regions[i];
+        let name = match ty {
+            2 => "reserved",
+            3 => "reclaim",
+            4 => "NVS",
+            5 => "таблица",
+            _ => "?",
+        };
+        crate::print!(" {:#x}+{:#x} {},", base, len, name);
+    }
+    crate::println!("");
+}
+
 
 /// Докуда стоит дотянуть direct-map сверх обычной RAM (см. [`PHYS_LOW_TOP`]).
 pub(super) fn phys_low_top() -> usize {

@@ -280,6 +280,10 @@ pub fn survey() {
         if let Ok(name) = core::str::from_utf8(&t[..4]) {
             crate::print!(" {}", name);
         }
+        // Веха 236 — запомнить, ГДЕ таблица лежит: по этим страницам проверяется право
+        // `fwmem`. Без них интерпретатор AML не прочёл бы даже FACS — в QEMU область таблиц
+        // объявлена просто «зарезервированной», а такие мы не отдаём.
+        super::fw_region_add(pa, len, 5);
         if &t[..4] == b"SSDT" {
             ssdt += 1;
             aml += len;
@@ -305,6 +309,24 @@ pub fn survey() {
                 aml += dsdt_len;
                 scan_hids(dsdt, &mut found);
                 s3 = dsdt.windows(4).any(|w| w == b"_S3_");
+                super::fw_region_add(dsdt_pa, dsdt_len, 5);
+            }
+        }
+        // FACS — единственная таблица, которой нет ни в корневой, ни среди AML: её называет
+        // FADT (смещение 132 — восьмибайтовое, 36 — старое четырёхбайтовое). Интерпретатор
+        // просит её сразу после подъёма, и без этой строки он падает на первом же шаге.
+        let facs_pa = if fadt.len() >= 140 && rd64(fadt, 132) != 0 {
+            rd64(fadt, 132) as usize
+        } else if fadt.len() >= 40 {
+            rd32(fadt, 36) as usize
+        } else {
+            0
+        };
+        if facs_pa != 0 {
+            let h = unsafe { phys(facs_pa, 36) };
+            if &h[..4] == b"FACS" {
+                let len = (rd32(h, 4) as usize).clamp(64, 0x1000);
+                super::fw_region_add(facs_pa, len, 5);
             }
         }
     }
@@ -332,6 +354,7 @@ pub fn survey() {
     // выдаётся узкое право `ioport:ec`. Печатаем именно потому, что проверить разбор ECDT в
     // QEMU нельзя — встроенного контроллера там нет вовсе, и единственный стенд для этой
     // строки — живая машина владельца.
+    super::fw_regions_print();
     if let Some((cmd, data)) = ec_ports() {
         crate::println!("  [acpi] контроллер: команда {:#x}, данные {:#x}", cmd, data);
     }

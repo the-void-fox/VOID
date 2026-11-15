@@ -70,19 +70,22 @@ let
         dontDisableStatic = true;
       });
       # ── Веха 192: драйверы из ОДНОГО описания ───────────────────────────────
-      # `Code/programs/lx-linux/drivers.list` — единственное место, где драйвер назван. Читают
-      # его четверо (см. шапку файла); здесь из него получаются деривации сборки.
+      # `Code/programs/c-binaries.list` — единственное место, где C-программа названа. Читают
+      # его четверо (см. шапку файла); здесь из него получаются деривации сборки ДРАЙВЕРОВ —
+      # то есть длинных записей. Короткая запись значит «деривация написана руками ниже», и
+      # строить из неё нечего.
       #
       # Раньше на каждый драйвер писались пятнадцать почти одинаковых строк, и отличались в них
       # три вещи: имя, каталог исходников и список файлов. Эти три вещи и остались.
       lib = (import nixpkgs { }).lib;
       lxLines =
-        let text = builtins.readFile ../Code/programs/lx-linux/drivers.list;
+        let text = builtins.readFile ../Code/programs/c-binaries.list;
         in builtins.filter
           (l: l != "" && !(lib.hasPrefix "#" l))
           (map (l: lib.removeSuffix "\r" l) (lib.splitString "\n" text));
+      lxFields = line: builtins.filter (x: x != "") (lib.splitString " " line);
       lxParse = line:
-        let f = builtins.filter (x: x != "") (lib.splitString " " line);
+        let f = lxFields line;
         in {
           name = builtins.elemAt f 0;
           dir = builtins.elemAt f 1;
@@ -115,7 +118,9 @@ let
           name = builtins.replaceStrings [ "-" ] [ "_" ] d.name;
           value = lxDriver d;
         })
-        lxLines);
+        # Только длинные записи: короткая описывает программу со своей деривацией, и попытка
+        # построить её отсюда взяла бы несуществующее второе поле.
+        (builtins.filter (l: builtins.length (lxFields l) >= 4) lxLines));
     in (rec {
       arch = archName;
       inherit void-libc voidify;

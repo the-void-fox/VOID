@@ -78,6 +78,19 @@ pub enum Target {
     /// адресное пространство userspace-драйвера (`SYS_MMIO_MAP`). Эфемерно (минтится на загрузке
     /// после PCI-поиска; не переживает перезагрузку — устройство ищется заново).
     Mmio { base: usize, len: usize },
+    /// Веха 236 — **память, объявленная прошивкой**: право отобразить страницы из областей
+    /// ACPI (`reclaim` и `NVS` карты загрузчика) в своё адресное пространство.
+    ///
+    /// Без диапазона в самом праве, и это не недосмотр: адреса называет БАЙТ-КОД прошивки
+    /// (`OperationRegion (…, SystemMemory, …)`), заранее их не знает никто — ни мы, ни ядро.
+    /// Поэтому право означает «область из карты прошивки», а КАКАЯ именно — проверяется при
+    /// каждом отображении по настоящей карте (`arch::fw_mem_region`).
+    ///
+    /// Почему это всё же узко. В карте есть и обычная ОЗУ (туда нельзя — это память чужих
+    /// процессов), и окна регистров устройств (туда нельзя — это власть над железом, у неё своё
+    /// право `mmio:УСТРОЙСТВО`). Остаются ровно те области, которые прошивка назвала СВОИМИ
+    /// данными; больше интерпретатору AML и не нужно.
+    FwMem,
     /// Веха 236 — **диапазон портов ввода-вывода**: право читать и писать порты `base..base+len`
     /// (`SYS_HWPROBE`, вид 2). Отдельно от [`Target::Mmio`], потому что это другое адресное
     /// пространство, и отдельно от [`Target::HwProbe`], потому что то — инструмент ЧЕЛОВЕКА с
@@ -593,6 +606,7 @@ pub fn info_kind(t: &Target) -> u8 {
         Target::HwProbe => 15,
         Target::Clock => 16,
         Target::IoPort { .. } => 17,
+        Target::FwMem => 18,
     }
 }
 
@@ -616,7 +630,7 @@ pub fn read<R>(dom: DomainId, cap: Cap, f: impl FnOnce(&[u8]) -> R) -> Result<R,
         Target::Endpoint(_) | Target::Reply(_) | Target::Device(_) | Target::Store
         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. } | Target::Power
         | Target::Shm(_) | Target::Sysview | Target::HwProbe | Target::IoPort { .. }
-        | Target::Clock => return Err(CapError::WrongKind),
+        | Target::FwMem | Target::Clock => return Err(CapError::WrongKind),
     };
     object::with(&id, |b| match b {
         Some(bytes) => Ok(f(bytes)),
@@ -638,7 +652,8 @@ pub fn write_root(dom: DomainId, cap: Cap, new_value: ContentId) -> Result<(), C
             Target::Value(_) | Target::Endpoint(_) | Target::Reply(_) | Target::Device(_)
             | Target::Store | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
             | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
-            | Target::IoPort { .. } | Target::Clock => return Err(CapError::WrongKind),
+            | Target::IoPort { .. } | Target::FwMem
+            | Target::Clock => return Err(CapError::WrongKind),
         }
     };
     object::set_root(name, new_value);
@@ -806,6 +821,23 @@ pub fn ioport(dom: DomainId, cap: Cap, port: u16, width: u16, need: Rights) -> R
             }
         }
         Target::HwProbe => Ok(()),
+        _ => Err(CapError::WrongKind),
+    }
+}
+
+/// Веха 236 — проверить право на **память, объявленную прошивкой** (`SYS_FW_MAP`).
+///
+/// Сам отрезок здесь не проверяется: право говорит «можно область прошивки», а какая область
+/// прошивки — знает только карта памяти, и спрашивает её вызов. Разделение намеренное: право
+/// отвечает на вопрос «кому», карта — на вопрос «куда».
+pub fn fwmem(dom: DomainId, cap: Cap, need: Rights) -> Result<(), CapError> {
+    let cs = CSPACE.lock();
+    let e = resolve(&cs, dom, cap)?;
+    if !e.rights.contains(need) {
+        return Err(CapError::Denied);
+    }
+    match e.target {
+        Target::FwMem => Ok(()),
         _ => Err(CapError::WrongKind),
     }
 }
@@ -1012,6 +1044,7 @@ fn target_eq(a: &Target, b: &Target) -> bool {
         (Target::Irq { vector: v1 }, Target::Irq { vector: v2 }) => v1 == v2,
         (Target::Sysview, Target::Sysview) => true,
         (Target::HwProbe, Target::HwProbe) => true,
+        (Target::FwMem, Target::FwMem) => true,
         (Target::Clock, Target::Clock) => true,
         _ => false,
     }
@@ -1140,7 +1173,7 @@ pub fn persist() {
                         Target::Endpoint(_) | Target::Reply(_)
                         | Target::Mmio { .. } | Target::Dma | Target::Irq { .. }
                         | Target::Power | Target::Shm(_) | Target::Sysview | Target::HwProbe
-                        | Target::IoPort { .. } | Target::Clock
+                        | Target::IoPort { .. } | Target::FwMem | Target::Clock
                         | Target::Device(Device::NetDrv) => 0,
                     },
                     None => 0,

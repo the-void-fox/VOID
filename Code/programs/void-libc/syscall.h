@@ -34,6 +34,7 @@
 #define SYS_TIME 36
 #define SYS_HWPROBE 66
 #define SYS_ACPI_TABLE 79
+#define SYS_FW_MAP 80
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
 #define VOID_NO_CAP ((uintptr_t)-1)
@@ -251,6 +252,13 @@ static inline uintptr_t vsys_hw_pci_read(uintptr_t cap, unsigned bdf, unsigned o
 }
 static inline int vsys_hw_pci_write(uintptr_t cap, unsigned bdf, unsigned off, uint32_t val) {
     return vsys(SYS_HWPROBE, cap, 1, bdf, off, val, 1, 0) == 0 ? 0 : -1;
+}
+
+/* Отобразить страницы, объявленные прошивкой (области ACPI), по адресу `va`. Ядро само
+ * выравнивает отрезок вниз до страницы, поэтому `va` соответствует НАЧАЛУ страницы, в которой
+ * лежит `pa`, — смещение внутри страницы вызывающий добавляет сам. 0 — получилось. */
+static inline int vsys_fw_map(uintptr_t cap, uint64_t pa, size_t len, uintptr_t va) {
+    return vsys(SYS_FW_MAP, cap, (uintptr_t)pa, len, va, 0, 0, 0) == 0 ? 0 : -1;
 }
 
 /* Таблица прошивки целиком по сигнатуре; `idx` различает одноимённые (SSDT бывает несколько).

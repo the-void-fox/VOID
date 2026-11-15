@@ -59,7 +59,7 @@ const PROGRAMS_X86: &[&str] = &[
 
 /// Веха 192 — имена C-драйверов читаются из ОДНОГО описания, а не повторяются здесь.
 ///
-/// `Code/programs/lx-linux/drivers.list` — единственное место, где драйвер назван; читают его
+/// `Code/programs/c-binaries.list` — единственное место, где C-программа названа; читают его
 /// nix (деривация), `stage-drivers.sh` (выкладка), этот файл (переменные окружения) и — через
 /// сгенерированную таблицу — сам `main.rs`. До этой вехи список жил в каждом из четырёх, и
 /// забытое четвёртое молчало: ядро собиралось без драйвера и говорило «не вложен».
@@ -67,9 +67,9 @@ fn c_drivers(kernel_dir: &PathBuf) -> Vec<String> {
     let list = kernel_dir
         .parent()
         .expect("kernel/.. — Code/")
-        .join("programs/lx-linux/drivers.list");
+        .join("programs/c-binaries.list");
     println!("cargo:rerun-if-changed={}", list.display());
-    let text = std::fs::read_to_string(&list).expect("не прочитать drivers.list");
+    let text = std::fs::read_to_string(&list).expect("не прочитать c-binaries.list");
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -195,14 +195,14 @@ fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
     let staged = kernel_dir
         .parent()
         .expect("kernel/.. — Code/")
-        .join("programs/lx-linux/prebuilt")
+        .join("programs/prebuilt")
         .join(arch);
     println!("cargo:rerun-if-changed={}", staged.display());
 
     // Таблица семян для `main.rs` — ГЕНЕРИРУЕТСЯ, как и список ярлыков: руками её править
     // значило бы завести пятое место, где драйвер назван.
     let mut table = String::from(
-        "// Сгенерировано build.rs из programs/lx-linux/drivers.list — правится НЕ здесь.\n\
+        "// Сгенерировано build.rs из programs/c-binaries.list — правится НЕ здесь.\n\
          static C_DRIVERS: &[(&str, &[u8])] = &[\n",
     );
     for name in c_drivers(kernel_dir) {
@@ -217,7 +217,7 @@ fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
             let stub = out_dir.join(format!("{name}.absent"));
             std::fs::write(&stub, b"").expect("не записать заглушку драйвера");
             println!(
-                "cargo:warning=C-драйвер {name} ({arch}) не выложен — ядро соберётся БЕЗ него; \
+                "cargo:warning=C-программа {name} ({arch}) не выложена — ядро соберётся БЕЗ неё; \
                  собрать: Code/tools/stage-drivers.sh"
             );
             stub

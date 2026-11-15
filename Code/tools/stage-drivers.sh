@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# stage-drivers.sh — собрать C-драйверы (портированный код Linux) и выложить их туда, откуда
-# их заберёт сборка ядра (Веха 132).
+# stage-drivers.sh — собрать C-ПРОГРАММЫ и выложить их туда, откуда их заберёт сборка ядра
+# (Веха 132; с Вехи 236 это не только драйверы — там же интерпретатор AML).
 #
 # Зачем. Программы на Rust ядро несёт в себе и сеет в store на загрузке. C-драйверы собирает
 # nix, и раньше они попадали в систему мостом `void-store-import` — то есть правкой ОБРАЗА.
@@ -21,14 +21,14 @@ repo="$(cd "$here/../.." && pwd)"
 # Веха 192 — драйверы берутся из ОДНОГО описания, а не из таблицы здесь. Атрибут деривации
 # выводится из имени (`-` → `_`), поэтому отдельного отображения больше не нужно: раньше оно
 # было четвёртым местом, которое надо не забыть.
-list="$repo/Code/programs/lx-linux/drivers.list"
+list="$repo/Code/programs/c-binaries.list"
 mapfile -t DRIVERS < <(grep -v '^[[:space:]]*#' "$list" | awk 'NF { print $1 }')
 
 arches=("${@:-x86_64 riscv64}")
 read -ra arches <<< "${arches[*]}"
 
 for arch in "${arches[@]}"; do
-    dest="$repo/Code/programs/lx-linux/prebuilt/$arch"
+    dest="$repo/Code/programs/prebuilt/$arch"
     mkdir -p "$dest"
     for drv in "${DRIVERS[@]}"; do
         attr="${drv//-/_}"

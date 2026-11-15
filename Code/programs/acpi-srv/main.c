@@ -36,7 +36,7 @@
 #include <uacpi/uacpi.h>
 #include <uacpi/utilities.h>
 
-extern void glue_init(uintptr_t hw_cap, uintptr_t ec_cap);
+extern void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap);
 extern int glue_run_work(void);
 extern int tables_build(void);
 
@@ -150,14 +150,18 @@ int main(void) {
     /* Права позиционны (Веха 99): нулевое — `hwprobe`, первое — `ioport:ec`, если выдано.
      * Конфиг: `service acpi-srv hwprobe ioport:ec`. */
     uintptr_t hw = vsys_start_cap(0);
-    uintptr_t ec = vsys_start_cap(1);
+    uintptr_t fw = vsys_start_cap(1);
+    uintptr_t ec = vsys_start_cap(2);
     if (hw == VOID_NO_CAP) {
         printf("[acpi] нет права `hwprobe` — без него не видно ни таблиц, ни портов\n");
         return 1;
     }
-    glue_init(hw, ec);
+    glue_init(hw, ec, fw);
     if (ec == VOID_NO_CAP) {
         printf("[acpi] узкого права на порты контроллера нет — хожу общим\n");
+    }
+    if (fw == VOID_NO_CAP) {
+        printf("[acpi] нет права `fwmem` — области памяти прошивки будут недоступны\n");
     }
 
     if (tables_build() != 0) {

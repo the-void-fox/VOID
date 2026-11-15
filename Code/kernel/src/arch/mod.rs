@@ -161,6 +161,7 @@ pub use imp::{hw_read32, hw_write32};
 #[cfg(target_arch = "x86_64")]
 pub use imp::{io_read, io_write};
 
+
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).
 #[derive(Clone, Copy, PartialEq, Eq)]

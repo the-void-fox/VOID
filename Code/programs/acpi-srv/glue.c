@@ -43,12 +43,14 @@
 
 uintptr_t g_hw_cap = VOID_NO_CAP;  /* hwprobe: таблицы, порты, PCI */
 uintptr_t g_ec_cap = VOID_NO_CAP;  /* ioport:ec — узкое право, если выдано */
+uintptr_t g_fw_cap = VOID_NO_CAP;  /* fwmem — страницы, объявленные прошивкой */
 
 static uint64_t g_boot_ns;
 
-void glue_init(uintptr_t hw_cap, uintptr_t ec_cap) {
+void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap) {
     g_hw_cap = hw_cap;
     g_ec_cap = ec_cap;
+    g_fw_cap = fw_cap;
     g_boot_ns = vsys_monotonic_ns();
 }
 
@@ -423,6 +425,21 @@ uacpi_status uacpi_kernel_pci_write32(uacpi_handle h, uacpi_size off, uacpi_u32 
  * До тех пор — отказ. Нулями не отвечаем принципиально: прошивка читает из NVS свои флаги, и
  * нули означали бы «графики нет, батареи нет» — правдоподобно и неверно.
  */
+/* Куда ложатся отображения прошивки. Между кучей (растёт вверх от 0x6000_0000) и стеком
+ * (растёт вниз от 0x8000_0000) — область, в которую не дотянется ни та, ни другой. */
+#define FW_VA_BASE 0x70000000u
+#define FW_VA_TOP 0x78000000u
+#define FW_MAPS_MAX 32
+#define PAGE_SIZE 4096u
+
+static struct fw_map {
+    uint64_t pa;   /* начало страницы */
+    uint64_t pages;
+    uintptr_t va;
+} g_maps[FW_MAPS_MAX];
+static int g_maps_len;
+static uintptr_t g_fw_next = FW_VA_BASE;
+
 void *uacpi_kernel_map(uacpi_phys_addr addr, uacpi_size len) {
     /* Таблицы, которые мы собрали сами (см. tables.c), лежат в нашей же памяти, и «физический»
      * адрес у них равен виртуальному. Отличаем их по тому, что они внутри нашей кучи. */
@@ -430,14 +447,53 @@ void *uacpi_kernel_map(uacpi_phys_addr addr, uacpi_size len) {
     if (glue_own_memory(addr, len)) {
         return (void *)(uintptr_t)addr;
     }
-    SAY_ONCE(map, "[acpi] отображение физической памяти ещё не сделано — область %#llx (%llu б) "
-                  "недоступна\n",
-             (unsigned long long)addr, (unsigned long long)len);
-    (void)len;
-    return NULL;
+    if (g_fw_cap == VOID_NO_CAP) {
+        SAY_ONCE(nofw, "[acpi] нет права `fwmem` — память прошивки недоступна\n");
+        return NULL;
+    }
+
+    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t pages = ((addr - page) + len + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    /* Уже отображённое ПЕРЕИСПОЛЬЗУЕМ. uACPI просит одну и ту же область многократно (каждое
+     * поле внутри неё — отдельный запрос), и отображать её заново значило бы за десяток полей
+     * исчерпать и адреса, и таблицы страниц. */
+    for (int i = 0; i < g_maps_len; i++) {
+        if (page >= g_maps[i].pa
+            && page + pages <= g_maps[i].pa + g_maps[i].pages) {
+            return (void *)(g_maps[i].va + (uintptr_t)(addr - g_maps[i].pa));
+        }
+    }
+    if (g_maps_len >= FW_MAPS_MAX || g_fw_next + pages * PAGE_SIZE > FW_VA_TOP) {
+        SAY_ONCE(fwfull, "[acpi] место под отображения прошивки кончилось\n");
+        return NULL;
+    }
+
+    uintptr_t va = g_fw_next;
+    /* Ядру отдаём ИСХОДНЫЕ адрес и длину, а не округлённые до страницы. Округлить здесь
+     * значило бы обнулить его проверку: таблицы прошивки по страницам не выровнены (FACS —
+     * 64 байта), и запрос «страница целиком» не попал бы ни в одну объявленную область.
+     * Страницы считает ядро само — ему же и решать, что из них можно отобразить. */
+    if (vsys_fw_map(g_fw_cap, addr, len, va) != 0) {
+        /* Отказ ядра означает одно из двух: такой области прошивка не объявляла либо не хватило
+         * памяти под таблицы страниц. Первое — не наша беда, а свойство машины; врать об этом
+         * нулями нельзя, поэтому отдаём отказ дальше. */
+        SAY_ONCE(fwdeny, "[acpi] ядро не дало область %#llx (%llu б) — прошивка её не объявляла\n",
+                 (unsigned long long)addr, (unsigned long long)len);
+        return NULL;
+    }
+    g_fw_next += pages * PAGE_SIZE;
+    g_maps[g_maps_len].pa = page;
+    g_maps[g_maps_len].pages = pages;
+    g_maps[g_maps_len].va = va;
+    g_maps_len++;
+    return (void *)(va + (uintptr_t)(addr - page));
 }
 
 void uacpi_kernel_unmap(void *addr, uacpi_size len) {
+    /* Отображения прошивки не снимаем: их единицы, живут они до конца работы сервера, а
+     * возврат страниц потребовал бы обратного вызова к ядру, которого у нас пока нет.
+     * Сказано вслух, чтобы это не выглядело забывчивостью. */
     (void)addr;
     (void)len;
 }
@@ -464,10 +520,19 @@ uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interru
                                                     uacpi_handle ctx, uacpi_handle *out) {
     (void)h;
     (void)ctx;
-    *out = NULL;
-    printf("[acpi] прерывание SCI (вектор %u) ещё не подключено — события опрашиваем\n",
+    *out = (uacpi_handle)1;
+    /* Отвечаем «получилось», хотя обработчик НЕ установлен, и это осознанный выбор между двумя
+     * неправдами. Отказ здесь валит подъём целиком (uACPI считает события обязательными), и
+     * тогда нет ни батареи, ни крышки — то есть цена «честного» отказа оказывается выше цены
+     * потерянных событий.
+     *
+     * Чтобы это не стало молчаливым враньём, говорим вслух КАЖДУЮ загрузку: события прошивки
+     * (крышка, кнопка сна, сообщения контроллера) не придут, пока нет IRQ-права на вектор SCI.
+     * Как только оно появится, здесь будет настоящая установка, и эта строка исчезнет. */
+    printf("[acpi] ВНИМАНИЕ: прерывание SCI (вектор %u) не подключено — события прошивки "
+           "(крышка, кнопка сна, контроллер) НЕ ПРИДУТ\n",
            (unsigned)irq);
-    return UACPI_STATUS_UNIMPLEMENTED;
+    return UACPI_STATUS_OK;
 }
 
 uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler h, uacpi_handle i) {
