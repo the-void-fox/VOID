@@ -138,6 +138,128 @@ fn find_table(rsdp: &[u8], sig: &[u8; 4]) -> Option<&'static [u8]> {
     None
 }
 
+/// Веха 234 — **РАЗВЕДКА ACPI ОДНОЙ СТРОКОЙ**: что прошивка машины вообще объявила.
+///
+/// Зачем. Ноутбучная база (батарея, крышка, сон) упирается не в наше умение, а в то, ЧТО на
+/// конкретной машине описано и чем это описано. Спорить об этом без чисел бессмысленно: на
+/// одной машине батарея — метод AML у встроенного контроллера, на другой — стандартный
+/// Smart Battery по SMBus, на третьей её нет вовсе. Поэтому сперва инвентарь, потом решение.
+///
+/// **Что честно, а что нет.** Имена таблиц и их размеры — факт: они прочитаны из заголовков.
+/// Устройства ищутся ПОИСКОМ СИГНАТУРЫ в байтах AML (идентификатор `PNP0C0A` лежит там
+/// упакованным числом `41 D0 0C 0A`), а не разбором — значит «нашли» означает «объявлено», но
+/// не «работает». Так и сказано в выводе: разбирать AML мы пока не умеем, и притворяться, что
+/// умеем, — худшее, что может сделать разведка.
+///
+/// Размер AML здесь — главное число для развилки: именно столько байт пришлось бы исполнять
+/// интерпретатору, если мы решим его писать.
+pub fn survey() {
+    let Some(rsdp) = find_rsdp() else {
+        crate::println!("  [acpi] таблиц нет (ни от загрузчика, ни в области BIOS)");
+        return;
+    };
+    // 1. Перечислить таблицы и сложить размер всего AML (DSDT + все SSDT).
+    let revision = rsdp[15];
+    let (root_pa, wide) = if revision >= 2 && rd64(rsdp, 24) != 0 {
+        (rd64(rsdp, 24) as usize, true)
+    } else {
+        (rd32(rsdp, 16) as usize, false)
+    };
+    if root_pa == 0 {
+        crate::println!("  [acpi] корневая таблица не названа");
+        return;
+    }
+    let head = unsafe { phys(root_pa, 36) };
+    let rlen = (rd32(head, 4) as usize).clamp(36, 0x10000);
+    let root = unsafe { phys(root_pa, rlen) };
+    let step = if wide { 8 } else { 4 };
+    let mut aml = 0usize;
+    let mut ssdt = 0usize;
+    let mut found = [false; HIDS.len()];
+    crate::print!("  [acpi] таблицы:");
+    let mut at = 36;
+    while at + step <= rlen {
+        let pa = if wide { rd64(root, at) as usize } else { rd32(root, at) as usize };
+        at += step;
+        if pa == 0 {
+            continue;
+        }
+        let t = unsafe { phys(pa, 36) };
+        let len = (rd32(t, 4) as usize).clamp(36, 0x20_0000);
+        if let Ok(name) = core::str::from_utf8(&t[..4]) {
+            crate::print!(" {}", name);
+        }
+        if &t[..4] == b"SSDT" {
+            ssdt += 1;
+            aml += len;
+            scan_hids(unsafe { phys(pa, len) }, &mut found);
+        }
+    }
+    // 2. DSDT — он назван в FADT, а не в корневой таблице.
+    let mut dsdt_len = 0usize;
+    let mut s3 = false;
+    if let Some(fadt) = find_table(rsdp, b"FACP") {
+        let dsdt_pa = if fadt.len() >= 148 && rd64(fadt, 140) != 0 {
+            rd64(fadt, 140) as usize
+        } else if fadt.len() >= 44 {
+            rd32(fadt, 40) as usize
+        } else {
+            0
+        };
+        if dsdt_pa != 0 {
+            let h = unsafe { phys(dsdt_pa, 36) };
+            if &h[..4] == b"DSDT" {
+                dsdt_len = (rd32(h, 4) as usize).clamp(36, 0x20_0000);
+                let dsdt = unsafe { phys(dsdt_pa, dsdt_len) };
+                aml += dsdt_len;
+                scan_hids(dsdt, &mut found);
+                s3 = dsdt.windows(4).any(|w| w == b"_S3_");
+            }
+        }
+    }
+    crate::println!(
+        "; AML {} КиБ (DSDT {} КиБ + {} SSDT)",
+        aml / 1024,
+        dsdt_len / 1024,
+        ssdt,
+    );
+    crate::print!("  [acpi] объявлено (поиск по сигнатуре, AML не разбираем):");
+    let mut any = false;
+    for (i, (_, name)) in HIDS.iter().enumerate() {
+        if found[i] {
+            crate::print!(" {},", name);
+            any = true;
+        }
+    }
+    if !any {
+        crate::print!(" ничего из знакомого,");
+    }
+    crate::println!(" сон S3 {}", if s3 { "есть" } else { "не объявлен" });
+}
+
+/// Что ищем в байтах AML. Первое поле — упакованный идентификатор `_HID` (так ACPI кодирует
+/// `PNP0C0A`: три буквы по пять бит плюс четыре шестнадцатеричные цифры), второе — имя для
+/// человека. Строковые идентификаторы (`ACPI0003`) лежат в AML прямым текстом, поэтому для них
+/// в первом поле стоят те же байты, что и в тексте.
+const HIDS: [(&[u8], &str); 7] = [
+    (&[0x41, 0xD0, 0x0C, 0x09], "встроенный контроллер"),
+    (&[0x41, 0xD0, 0x0C, 0x0A], "батарея (метод AML)"),
+    (&[0x41, 0xD0, 0x0C, 0x0D], "крышка"),
+    (&[0x41, 0xD0, 0x0C, 0x0E], "кнопка сна"),
+    (&[0x41, 0xD0, 0x0C, 0x0C], "кнопка питания"),
+    (b"ACPI0003", "адаптер питания"),
+    (b"ACPI0002", "батарея Smart Battery"),
+];
+
+/// Отметить в `found` те идентификаторы, байты которых встретились в этом куске AML.
+fn scan_hids(aml: &[u8], found: &mut [bool; HIDS.len()]) {
+    for (i, (sig, _)) in HIDS.iter().enumerate() {
+        if !found[i] && aml.windows(sig.len()).any(|w| w == *sig) {
+            found[i] = true;
+        }
+    }
+}
+
 /// Веха 170 — **MADT** (сигнатура `APIC`): таблица, в которой прошивка перечисляет процессоры.
 ///
 /// Отдаётся как есть, разбирает её [`super::smp`]: здесь живёт умение НАЙТИ таблицу ACPI, а что
