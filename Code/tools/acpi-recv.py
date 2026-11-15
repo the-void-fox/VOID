@@ -90,7 +90,15 @@ while True:
     if not ok:
         print("таблица неполная: увеличь буфер в команде или проверь, что весь вывод дошёл")
 
-    aml = os.path.join(outdir, f"{sig if sig.isalnum() else name}.aml")
+    # Одноимённых таблиц бывает несколько (SSDT у ноутбуков обычно две-три), и первая версия
+    # скрипта молча затирала предыдущую: на диске оставалась только последняя. Поэтому к занятому
+    # имени приписываем номер — лучше DSDT.aml и SSDT-1.aml, чем потеря таблицы.
+    stem = sig if sig.isalnum() else name
+    aml = os.path.join(outdir, f"{stem}.aml")
+    n = 1
+    while os.path.exists(aml):
+        aml = os.path.join(outdir, f"{stem}-{n}.aml")
+        n += 1
     with open(aml, "wb") as f:
         f.write(data)
     print(f"записано: {aml}")
@@ -98,7 +106,9 @@ while True:
     if shutil.which("iasl"):
         # `-d` дизассемблирует; рядом ляжет .dsl. Код возврата у iasl бывает ненулевым и при
         # успешном разборе (предупреждения), поэтому смотрим на файл, а не на код.
-        subprocess.run(["iasl", "-d", aml], cwd=outdir or ".", check=False,
+        # Путь даём от каталога запуска: `aml` относителен корню проекта, а cwd мы меняем на
+        # outdir — в первой версии из-за этого iasl искал log/acpi/log/acpi/DSDT.aml и молчал.
+        subprocess.run(["iasl", "-d", os.path.basename(aml)], cwd=outdir or ".", check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         dsl = aml[:-4] + ".dsl"
         if os.path.exists(dsl):
