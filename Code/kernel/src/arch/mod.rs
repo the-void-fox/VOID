@@ -152,6 +152,11 @@ pub use imp::{pci_bdf_by_bar, pci_cfg_read32, pci_cfg_write32, probe_ehci};
 /// Веха 200 — заглянуть в регистр устройства по физическому адресу (`SYS_HWPROBE`).
 #[cfg(target_arch = "x86_64")]
 pub use imp::{hw_read32, hw_write32};
+/// Веха 235 — то же для СТАРЫХ портов: на них сидит встроенный контроллер ноутбука, а окна
+/// MMIO у него нет. На riscv-virt портового пространства не существует вовсе, поэтому экспорт
+/// условный, а не заглушка: заглушка притворялась бы, что порт прочитан.
+#[cfg(target_arch = "x86_64")]
+pub use imp::{io_read, io_write};
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`
 /// (ленивая куча обслуживает Load/Store; Exec в куче — гибель процесса, W^X).

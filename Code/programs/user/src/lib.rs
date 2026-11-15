@@ -1979,6 +1979,21 @@ pub fn hw_pci_write(hw_cap: usize, bdf: u16, off: usize, val: u32) -> bool {
     abi::syscall(SYS_HWPROBE, hw_cap, 1, bdf as usize, off, val as usize, 1, 0).0 == 0
 }
 
+/// Веха 235 — прочитать старый порт ввода-вывода (`width` — 1, 2 или 4 байта).
+///
+/// Третий вид того же права: встроенный контроллер ноутбука (батарея, крышка) окна MMIO не
+/// имеет, он сидит на портах из таблиц прошивки. Ширину спрашиваем явно — у портов она значащая,
+/// и лишнее касание соседнего порта на старом железе иногда переключает устройство.
+pub fn io_read(hw_cap: usize, port: u16, width: u8) -> Option<u32> {
+    let r = abi::syscall(SYS_HWPROBE, hw_cap, 2, port as usize, width as usize, 0, 0, 0).0;
+    (r != NO_CAP).then_some(r as u32)
+}
+
+/// Пара к [`io_read`]. Отдельное право `w`, как у записи в MMIO.
+pub fn io_write(hw_cap: usize, port: u16, width: u8, val: u32) -> bool {
+    abi::syscall(SYS_HWPROBE, hw_cap, 2, port as usize, width as usize, val as usize, 1, 0).0 == 0
+}
+
 /// `SYS_NET_RECV`: принять один кадр в `buf` (неблокирующе, опрос). Возвращает число байт
 /// (0 — приёмник пуст; MAX — отказ). Нужен cap на устройство, право `READ`.
 pub fn net_recv(dev_cap: usize, buf: &mut [u8]) -> usize {

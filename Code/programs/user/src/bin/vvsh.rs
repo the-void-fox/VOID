@@ -1778,6 +1778,8 @@ const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         // Веха 200 — заглянуть в регистры железа (см. `sh_mmio`/`sh_pci`).
         ("mmio", sh_mmio),
         ("pci", sh_pci),
+        // Веха 235 — третье пространство: старые порты, на которых живёт контроллер ноутбука.
+        ("io", sh_io),
         // Веха 232 — разведка дисплея Intel: чем на железе владельца переключать страницу.
         ("intel", sh_intel),
         ("acpi", sh_acpi),
@@ -2135,6 +2137,10 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     // Веха 200 — отладка железа на живой машине, без пересборки.
     help_row(b"mmio A...", "слова регистров по физ-адресам; `mmio A = V` — записать");
     help_row(b"pci B:D.F O...", "слова конфигурации PCI; `pci B:D.F O = V` — записать");
+    // Веха 235 — порты: встроенный контроллер ноутбука окна MMIO не имеет.
+    help_row(b"io read P [W]", "прочитать порт (ширина 1|2|4 байта, по умолчанию 1)");
+    help_row(b"io write P V [W]", "записать порт");
+    help_row(b"io index PI PD A [N]", "выгрузка через пару «индекс/данные» (так лежат числа EC)");
     // Веха 232 — шаг C: разведка дисплея Intel и яркость панели (на virtio их нет).
     help_row(b"intel", "разведка дисплея Intel: конвейеры, плоскости, GTT, подсветка");
     help_row(b"intel test", "проба узором: положить в кадр полосы и рамку — что видно глазом");
@@ -3749,6 +3755,116 @@ fn sh_brightness(args: &[Value]) -> Result<Value, EvalError> {
 ///
 /// Принимающая сторона — `Code/tools/acpi-recv.py`: собирает, проверяет длину и сразу зовёт
 /// дизассемблер.
+/// `(io read порт [ширина])`, `(io write порт значение [ширина])`,
+/// `(io index порт-индекса порт-данных начало [сколько])` — Веха 235.
+///
+/// ## Зачем отдельная команда, а не вид у `mmio`
+///
+/// Порт — не адрес. У него своя разрядность (16 бит), свой способ доступа и, главное, значащая
+/// ширина обращения: регистр данных контроллера байтовый, и чтение его двойным словом задевает
+/// три соседних порта. Сведи их в одну команду — и число `0x25a` означало бы то порт, то
+/// физический адрес, причём различить нельзя, а цена ошибки на старом железе не «пусто в
+/// ответе», а переключенное устройство.
+///
+/// ## Зачем `index`
+///
+/// Встроенный контроллер ноутбука отдаёт свои числа не набором портов, а ПАРОЙ «индекс/данные»:
+/// в первый порт пишут номер байта, из второго его читают. Так в прошивке X54C описаны все
+/// числа батареи — `IndexField` над портами 0x25A/0x25B, заряд лежит по смещению 0xA2. Снимать
+/// такое руками двумя командами на байт немыслимо, поэтому выгрузка здесь своя.
+///
+/// Номера смещений человек берёт ИЗ РАЗБОРА СВОЕЙ прошивки (`acpi DSDT >> send`, потом `iasl`),
+/// а не из нашего кода: у другой машины они другие, и зашить их значило бы соврать про
+/// переносимость. Команда даёт механизм, числа приносит человек.
+fn sh_io(args: &[Value]) -> Result<Value, EvalError> {
+    const USAGE: &str = "io: (io read порт [ширина]) | (io write порт значение [ширина]) | (io index порт-индекса порт-данных начало [сколько])";
+    let Some(Value::Str(mode)) = args.first() else {
+        return Err(EvalError::new(USAGE));
+    };
+    let hw = cap_hw("io")?;
+    // Ширина проверяется ЗДЕСЬ, а не только в ядре: ядро на неверную ответит отказом, и человек
+    // прочёл бы «нет права» там, где дело в тройке вместо четвёрки.
+    let width = |v: Option<u64>| -> Result<u8, EvalError> {
+        match v.unwrap_or(1) {
+            1 => Ok(1),
+            2 => Ok(2),
+            4 => Ok(4),
+            _ => Err(EvalError::new("io: ширина бывает 1, 2 или 4 байта")),
+        }
+    };
+    let port = |v: Option<u64>| -> Result<u16, EvalError> {
+        match v {
+            Some(p) if p <= 0xffff => Ok(p as u16),
+            Some(_) => Err(EvalError::new("io: порт не больше 0xffff")),
+            None => Err(EvalError::new(USAGE)),
+        }
+    };
+    match &**mode {
+        "read" => {
+            let p = port(args.get(1).and_then(num))?;
+            let w = width(args.get(2).and_then(num))?;
+            let Some(v) = sys::io_read(hw, p, w) else {
+                return Err(EvalError::new("io read: нет права на регистры (`r`)"));
+            };
+            Ok(Value::str(&alloc::format!("{:#x}: {:#0w$x} ({})", p, v, v, w = 2 + 2 * w as usize)))
+        }
+        "write" => {
+            let p = port(args.get(1).and_then(num))?;
+            let Some(v) = args.get(2).and_then(num) else {
+                return Err(EvalError::new(USAGE));
+            };
+            let w = width(args.get(3).and_then(num))?;
+            if !sys::io_write(hw, p, w, v as u32) {
+                return Err(EvalError::new("io write: записать не удалось (нет права `w`)"));
+            }
+            Ok(Value::str(&alloc::format!("{:#x} ← {:#x}", p, v)))
+        }
+        "index" => {
+            let pi = port(args.get(1).and_then(num))?;
+            let pd = port(args.get(2).and_then(num))?;
+            let Some(start) = args.get(3).and_then(num) else {
+                return Err(EvalError::new(USAGE));
+            };
+            // Потолок на размер выгрузки: индекс байтовый, больше 256 за раз не бывает нужно, а
+            // опечатка в четвёртом числе иначе читала бы порт десятки тысяч раз.
+            let n = args.get(4).and_then(num).unwrap_or(16).clamp(1, 256) as usize;
+            if start > 0xff {
+                return Err(EvalError::new("io index: начало — байт (индекс у пары байтовый)"));
+            }
+            let mut out = alloc::format!(
+                "# индекс {:#x} данные {:#x}, с {:#04x} по {:#04x}\n",
+                pi, pd, start, start as usize + n - 1
+            );
+            for row in 0..n.div_ceil(16) {
+                out.push_str(&alloc::format!("{:04x} ", start as usize + row * 16));
+                for col in 0..16 {
+                    let off = row * 16 + col;
+                    if off >= n {
+                        break;
+                    }
+                    let idx = start as usize + off;
+                    if idx > 0xff {
+                        break;
+                    }
+                    // Пара работает в два такта: номер байта в порт индекса, затем чтение порта
+                    // данных. Между обращениями индекс НЕ наращивается сам — так описан
+                    // `IndexField` в ACPI, и самовольный автоинкремент читал бы не то.
+                    if !sys::io_write(hw, pi, 1, idx as u32) {
+                        return Err(EvalError::new("io index: нет права на запись (`w`) — а без неё индекс не выставить"));
+                    }
+                    match sys::io_read(hw, pd, 1) {
+                        Some(v) => out.push_str(&alloc::format!("{:02x} ", v)),
+                        None => return Err(EvalError::new("io index: нет права на чтение (`r`)")),
+                    }
+                }
+                out.push('\n');
+            }
+            Ok(Value::str(&out))
+        }
+        _ => Err(EvalError::new(USAGE)),
+    }
+}
+
 fn sh_acpi(args: &[Value]) -> Result<Value, EvalError> {
     const USAGE: &str = "acpi: (acpi \"DSDT\" [номер]) — таблица шестнадцатеричным текстом; имена видно в журнале (`klog | grep acpi`)";
     let hw = cap_hw("acpi")?;
