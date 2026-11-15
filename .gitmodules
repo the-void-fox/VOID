@@ -1,4 +1,5 @@
-# Форки чужих деревьев, от которых зависит сборка std-программ и uutils (Веха 230.2).
+# Форки чужих деревьев, от которых зависит сборка: std-программы и uutils (Веха 230.2),
+# интерпретатор AML (Веха 236, [[0025-aml-foreign-interpreter]]).
 #
 # URL ведёт на НАШИ форки, а не на upstream, и это не предпочтение, а условие работоспособности:
 # закреплены здесь коммиты с нашими правками (порт `std` на VOID, порт uutils), и в upstream их
@@ -15,5 +16,14 @@
 [submodule "vendor/coreutils"]
 	path = vendor/coreutils
 	url = https://github.com/the-void-fox/void-coreutils.git
+	branch = void
+	shallow = true
+# uACPI (MIT) — исполнение AML: батарея, крышка, события встроенного контроллера. Своего
+# интерпретатора мы не пишем сознательно (ADR 0025): правильность здесь определяют не опкоды, а
+# обязанности ОС перед прошивкой, накопленные за десятилетия. Закреплён коммит `c0edece`
+# (7.0.0) — тот самый, на котором прошивка X54C разобрана без ошибок.
+[submodule "vendor/uacpi"]
+	path = vendor/uacpi
+	url = https://github.com/the-void-fox/void-uacpi.git
 	branch = void
 	shallow = true
