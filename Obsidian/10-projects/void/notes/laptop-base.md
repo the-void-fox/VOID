@@ -175,6 +175,26 @@ git clone --depth 1 https://github.com/uACPI/uACPI <куда>
 nix-shell -p cmake gcc gnumake --run "cmake -DCMAKE_BUILD_TYPE=Release <куда>/tests/runner && make -j8"
 ```
 
+## uACPI в дереве (Веха 236)
+
+Подмодуль **`vendor/uacpi`** → форк `the-void-fox/void-uacpi`, ветка `void`, коммит `c0edece`
+(7.0.0) — тот самый, на котором прошивка X54C разобрана без ошибок. Форк, а не upstream, по
+причине из `.gitmodules`: пока URL вёл на upstream, `git submodule update --init` падал у всех,
+кроме владельца.
+
+Собирается деривацией `uacpi` в `nix/default.nix` — тем же кросс-тулчейном поверх `void-libc`,
+которым собраны lx-драйверы. **Статической библиотекой, а не программой**: исполняемой её
+делает сервер вместе с нашей прослойкой. Проверено на обеих архитектурах, без предупреждений
+при `-Wall -Wextra`.
+
+```
+nix-build nix -A x86_64.uacpi     # libuacpi.a + заголовки
+nix-build nix -A riscv64.uacpi
+```
+
+Наружу архив просит **47 символов**: 43 `uacpi_kernel_*` (их пишем мы) и
+`mem{cmp,cpy,move,set}` — эти в `libvoid` уже есть.
+
 ## Что дальше по этому пункту
 
 1. Узкое право на **диапазон портов** для сервера (широкое `hwprobe` — инструмент человека, а
