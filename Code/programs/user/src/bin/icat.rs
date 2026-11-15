@@ -61,7 +61,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let Some(path) = argv.str(0).map(String::from) else {
         sys::write("icat: показать картинку в терминале\n\n".as_bytes());
         sys::write("  icat <файл> [ширина в знакоместах]\n".as_bytes());
-        sys::write("  icat проба [ширина]   — клетчатый квадрат: умеет ли терминал картинки\n".as_bytes());
+        sys::write("  icat test [ширина]    — клетчатый квадрат: умеет ли терминал картинки\n".as_bytes());
         sys::exit(2);
     };
     let width = argv.str(1).and_then(|s| s.parse::<u16>().ok());
@@ -69,7 +69,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     // ПРОБА: картинка, которой не нужен файл. Нужна ровно затем, зачем `beep` звуку — ответить
     // на вопрос «а вообще работает?» одной командой, без поиска подходящего файла на машине,
     // где его может и не быть вовсе.
-    if path == "проба" || path == "test" {
+    if path == "test" {
         let (w, h) = (256u32, 128u32);
         let mut px = alloc::vec![0u8; w as usize * h as usize * 4];
         for y in 0..h as usize {
