@@ -198,6 +198,27 @@ let
         '';
       };
 
+      # Веха 236 — `acpi-srv`: проба подъёма интерпретатора AML на настоящих таблицах машины.
+      # Наша прослойка (40 функций `uacpi_kernel_*`) плюс библиотека выше. Заголовки берём из
+      # деривации `uacpi`, а не из подмодуля напрямую: так в программу не может просочиться
+      # заголовок, по которому библиотека НЕ собиралась.
+      acpi_srv = stdenv.mkDerivation {
+        pname = "acpi-srv";
+        version = "0.236";
+        src = ../Code/programs/acpi-srv;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          $CC ${voidCFlags} -I${void-libc}/lib -I${uacpi}/include \
+            -O2 -static -Wall -Wextra \
+            main.c glue.c tables.c ${uacpi}/lib/libuacpi.a -o acpi-srv
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp acpi-srv $out/bin/
+        '';
+      };
+
       # lx_sort (Веха 55) — НЕИЗМЕНЁННЫЙ lib/sort.c ядра Linux (6.18.7) против рукописных
       # шим-заголовков linux/*.h (начало lx_emul-заголовков): первый реальный .c из Linux на VOID.
       # -I. находит linux/ (sort.c + harness), -DCONFIG_64BIT (обе арх 64-битные) → 64-битный swap.

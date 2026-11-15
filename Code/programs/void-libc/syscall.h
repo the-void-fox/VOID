@@ -29,6 +29,11 @@
 #define SYS_NETDEV 64
 #define SYS_PCI_CFG 65
 #define SYS_RANDOM 37
+/* Веха 236 — нужны серверу ACPI: монотонные часы (TSC для ожиданий не годится — он не
+ * наносекунды), порты и конфигурация PCI одним вызовом, таблицы прошивки по сигнатуре. */
+#define SYS_TIME 36
+#define SYS_HWPROBE 66
+#define SYS_ACPI_TABLE 79
 
 /* «Права нет» — и в аргументе capability SYS_CALL, и в ответе SYS_STARTCAP. */
 #define VOID_NO_CAP ((uintptr_t)-1)
@@ -217,6 +222,45 @@ static inline void vsys_random(void *buf, size_t len) {
  * свою долю процессора вечно. */
 static inline void vsys_sleep_ns(unsigned long long ns) {
     vsys(SYS_SLEEP, (uintptr_t)ns, 0, 0, 0, 0, 0, 0);
+}
+
+/* ─── ЖЕЛЕЗО И ПРОШИВКА (Вехи 200/234/236) ───────────────────────────────────────────────────
+ *
+ * Эти три нужны серверу ACPI, и ни одной из них не было в C-мире: драйверы Linux ходят к
+ * железу через окно MMIO, а интерпретатор AML — через порты, конфигурацию PCI и таблицы.
+ */
+
+/* Монотонные наносекунды. НЕ `vsys_ticks`: тот отдаёт такты процессора (rdtsc/rdtime), а их
+ * цена в наносекундах на каждой машине своя — на ожиданиях прошивки это врало бы молча. */
+static inline unsigned long long vsys_monotonic_ns(void) {
+    return (unsigned long long)vsys(SYS_TIME, 1, 0, 0, 0, 0, 0, 0);
+}
+
+/* Порт ввода-вывода (вид 2). `width` — 1, 2 или 4 байта; ширину обязан задавать вызывающий,
+ * разбивать четырёхбайтовое обращение на четыре однобайтовых железу нельзя. */
+static inline uintptr_t vsys_io_read(uintptr_t cap, unsigned port, unsigned width) {
+    return vsys(SYS_HWPROBE, cap, 2, port, width, 0, 0, 0);
+}
+static inline int vsys_io_write(uintptr_t cap, unsigned port, unsigned width, uint32_t val) {
+    return vsys(SYS_HWPROBE, cap, 2, port, width, val, 1, 0) == 0 ? 0 : -1;
+}
+
+/* Конфигурация PCI по адресу «шина:устройство.функция» (вид 1), словами. */
+static inline uintptr_t vsys_hw_pci_read(uintptr_t cap, unsigned bdf, unsigned off) {
+    return vsys(SYS_HWPROBE, cap, 1, bdf, off, 0, 0, 0);
+}
+static inline int vsys_hw_pci_write(uintptr_t cap, unsigned bdf, unsigned off, uint32_t val) {
+    return vsys(SYS_HWPROBE, cap, 1, bdf, off, val, 1, 0) == 0 ? 0 : -1;
+}
+
+/* Таблица прошивки целиком по сигнатуре; `idx` различает одноимённые (SSDT бывает несколько).
+ * Отдаёт число скопированных байт либо 0. */
+static inline size_t vsys_acpi_table(uintptr_t cap, const char sig[4], unsigned idx,
+                                     void *buf, size_t len) {
+    uintptr_t packed = (uint8_t)sig[0] | ((uint8_t)sig[1] << 8)
+                     | ((uint8_t)sig[2] << 16) | ((uintptr_t)(uint8_t)sig[3] << 24);
+    uintptr_t r = vsys(SYS_ACPI_TABLE, cap, packed, (uintptr_t)buf, len, idx, 0, 0);
+    return r == VOID_NO_CAP ? 0 : (size_t)r;
 }
 
 /* ─── БЫТЬ сетевой картой (SYS_NETDEV, Веха 195) ──────────────────────────────────────────────
