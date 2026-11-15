@@ -140,7 +140,7 @@ pub use imp::{
 /// Веха 198.1 — настройки железа из конфига поколения (только x86: на riscv нет ни тачпада,
 /// ни ACPI).
 #[cfg(target_arch = "x86_64")]
-pub use imp::{acpi_survey, enable_power_button, touchpad_tune};
+pub use imp::{acpi_survey, acpi_table, enable_power_button, touchpad_tune};
 
 // Задник текстовой консоли (Веха 226.5). Наружу из `arch` — потому что рисует им общий
 // `crate::textcon`, а не сама архитектура: слой текста один на обе, железо под ним разное.

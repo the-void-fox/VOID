@@ -1780,6 +1780,7 @@ const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         ("pci", sh_pci),
         // Веха 232 — разведка дисплея Intel: чем на железе владельца переключать страницу.
         ("intel", sh_intel),
+        ("acpi", sh_acpi),
         ("brightness", sh_brightness),
         ("poweroff", sh_poweroff),
         ("reboot", sh_reboot),
@@ -2137,6 +2138,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     // Веха 232 — шаг C: разведка дисплея Intel и яркость панели (на virtio их нет).
     help_row(b"intel", "разведка дисплея Intel: конвейеры, плоскости, GTT, подсветка");
     help_row(b"intel test", "проба узором: положить в кадр полосы и рамку — что видно глазом");
+    help_row(b"acpi DSDT [N]", "выдать таблицу прошивки шестнадцатеричным текстом (для разбора на хосте)");
     help_row(b"brightness [%]", "яркость панели Intel; без числа — показать нынешнюю");
     help_row(b"poweroff", "выключить машину");
     help_row(b"reboot", "перезагрузить машину");
@@ -3735,6 +3737,58 @@ fn sh_brightness(args: &[Value]) -> Result<Value, EvalError> {
 /// Перебором по нулевой шине, а не «она всегда 00:02.0»: перебор стоит тридцать две пары чтений,
 /// а «всегда» однажды оказывается неправдой на чужой машине — и тогда команда молча читает чужие
 /// регистры, что хуже, чем честное «не найдено».
+/// Веха 234 — **ВЫДАТЬ ТАБЛИЦУ ПРОШИВКИ** шестнадцатеричным текстом.
+///
+/// Зачем команда человеку. Батарея, крышка и сон описаны не у нас, а в прошивке машины —
+/// байт-кодом AML, и у каждой машины он свой. Исполнять его мы пока не умеем; решать, писать ли
+/// свой разбор или брать чужой, надо ПО ЭТОМУ КОДУ. Единственный способ его увидеть — снять с
+/// живой машины и разобрать на хосте (`iasl -d`, `acpiexec`).
+///
+/// Вывод — ТЕКСТ, потому что уносится он конвейером: `acpi DSDT >> send "192.168.0.10" 9000`.
+/// Шестнадцатеричный, а не двоичный: наш `send` возит строки, и текст переживает любой перенос.
+///
+/// Принимающая сторона — `Code/tools/acpi-recv.py`: собирает, проверяет длину и сразу зовёт
+/// дизассемблер.
+fn sh_acpi(args: &[Value]) -> Result<Value, EvalError> {
+    const USAGE: &str = "acpi: (acpi \"DSDT\" [номер]) — таблица шестнадцатеричным текстом; имена видно в журнале (`klog | grep acpi`)";
+    let hw = cap_hw("acpi")?;
+    let Some(Value::Str(name)) = args.first() else {
+        return Err(EvalError::new(USAGE));
+    };
+    let bytes = name.as_bytes();
+    if bytes.len() != 4 {
+        return Err(EvalError::new("acpi: сигнатура — ровно четыре знака (DSDT, ECDT, FACP)"));
+    }
+    let mut sig = [0u8; 4];
+    sig.copy_from_slice(bytes);
+    // Потолок буфера: DSDT у настольных машин десятки килобайт, у ноутбуков бывает за двести.
+    // Номер — для одноимённых таблиц: SSDT в машине бывает две и больше, и батарея вполне
+    // может быть описана во второй.
+    let idx = args.get(1).and_then(num).unwrap_or(0) as usize;
+    let mut buf = alloc::vec![0u8; 512 * 1024];
+    let Some(n) = sys::acpi_table(hw, &sig, idx, &mut buf) else {
+        return Err(EvalError::new(alloc::format!(
+            "acpi: таблицы {} №{} в этой машине нет (или ACPI нет вовсе)",
+            name, idx
+        )));
+    };
+    // Длина, записанная в самой таблице, — проверка того, что мы отдали её целиком, а не кусок.
+    let claimed = if n >= 8 {
+        u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize
+    } else {
+        0
+    };
+    let mut out = alloc::format!("# {} №{} {} байт (в заголовке {})\n", name, idx, n, claimed);
+    for (i, chunk) in buf[..n].chunks(32).enumerate() {
+        out.push_str(&alloc::format!("{:06x} ", i * 32));
+        for b in chunk {
+            out.push_str(&alloc::format!("{:02x}", b));
+        }
+        out.push('\n');
+    }
+    Ok(Value::str(&out))
+}
+
 /// Веха 233.17 — **ПРОБА УЗОРОМ**: написать в кадр заведомо узнаваемую картинку и спросить
 /// человека, что он видит.
 ///

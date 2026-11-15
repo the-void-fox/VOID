@@ -1020,6 +1020,11 @@ pub fn init_device_interrupts() {
 /// цена оказалась несимметричной: кнопка питания появилась, а КЛАВИАТУРА ПРОПАЛА. Поэтому
 /// умолчание — не включать, а строка `acpi("power-button", true)` в конфиге включает это
 /// осознанно: на машине, где клавиатура наша (xHCI) или настоящая PS/2, кнопка полезна.
+/// Веха 234 — байты таблицы ACPI по сигнатуре (см. [`acpi::table`]).
+pub fn acpi_table(sig: [u8; 4], idx: usize) -> Option<&'static [u8]> {
+    acpi::table(sig, idx)
+}
+
 /// Веха 234 — напечатать инвентарь ACPI (см. [`acpi::survey`]).
 pub fn acpi_survey() {
     acpi::survey()

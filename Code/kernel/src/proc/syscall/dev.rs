@@ -530,6 +530,53 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             f.set_ret_at(1, lost);
             f.advance();
         }
+        // SYS_ACPI_TABLE(hw_cap, сигнатура, buf, len, номер) -> байт | MAX (Веха 234): отдать
+        // ТАБЛИЦУ ACPI целиком. Сигнатура — четыре ASCII-байта одним словом (`DSDT`, `ECDT`,
+        // `FACP`); номер различает одноимённые (SSDT в машине бывает несколько).
+        //
+        // Зачем это в системе. Ноутбучная база (батарея, крышка, сон) описана не у нас, а в
+        // прошивке машины — байт-кодом AML. Исполнять его мы пока не умеем, а решать, писать ли
+        // свой разбор или брать чужой, надо ПО ЭТОМУ КОДУ, а не по догадке. Снять таблицу с
+        // живой машины и разобрать её на хосте (`iasl`, `acpiexec`) — единственный способ.
+        //
+        // Право — `hwprobe`, то же, что у `mmio`/`pci`: таблицы прошивки это описание железа, и
+        // власть та же. Чтения хватает: мы ничего не меняем.
+        79 => {
+            let (hcap, sig, buf, len, idx) = {
+                let f = &t.procs[cur].frame;
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
+            };
+            let dom = t.procs[cur].domain;
+            let result = match cap::hwprobe(dom, Cap::from_bits(hcap as u64), Rights::READ) {
+                Ok(()) if ensure_heap_range(t, cur, buf, len) => {
+                    let sig = (sig as u32).to_le_bytes();
+                    #[cfg(target_arch = "x86_64")]
+                    let table = arch::acpi_table(sig, idx);
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let table = {
+                        let _ = (sig, idx);
+                        None::<&[u8]>
+                    };
+                    match table {
+                        Some(tbl) => {
+                            let n = tbl.len().min(len);
+                            let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+                            out[..n].copy_from_slice(&tbl[..n]);
+                            n
+                        }
+                        None => usize::MAX,
+                    }
+                }
+                Ok(()) => usize::MAX,
+                Err(e) => {
+                    vprintln!("  [hw] P{} SYS_ACPI_TABLE отклонён: {:?}", cur, e);
+                    usize::MAX
+                }
+            };
+            let f = &mut t.procs[cur].frame;
+            f.set_ret(result);
+            f.advance();
+        }
         // SYS_VIDEO_FLUSH(mmio_cap, x, y, wh) -> 0 | MAX (Веха 224): ПОКАЗАТЬ прямоугольник
         // кадра. `wh` — ширина и высота, упакованные по 32 бита: аргументов у вызова шесть, а
         // тратить два на то, что всегда влезает в одно слово, незачем.

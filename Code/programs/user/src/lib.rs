@@ -169,6 +169,8 @@ const SYS_NETDEV: usize = 64;
 const SYS_PCI_CFG: usize = 65;
 /// Веха 200 — заглянуть в регистр устройства (окно MMIO или конфигурация PCI) по праву `hwprobe`.
 const SYS_HWPROBE: usize = 66;
+/// Веха 234 — отдать таблицу ACPI целиком (под тем же правом `hwprobe`).
+const SYS_ACPI_TABLE: usize = 79;
 /// Веха 223.7 — прервать то, что запустил наш ребёнок (вместо `SIGINT`).
 const SYS_INTERRUPT: usize = 67;
 /// Веха 223.7 — спросить и снять свой флажок «просили прерваться».
@@ -1951,6 +1953,15 @@ pub fn hw_read(hw_cap: usize, pa: usize) -> Option<u32> {
 /// Записать слово в регистр устройства. Нужен `WRITE`. `false` — отказ.
 pub fn hw_write(hw_cap: usize, pa: usize, val: u32) -> bool {
     abi::syscall(SYS_HWPROBE, hw_cap, 0, pa, 0, val as usize, 1, 0).0 == 0
+}
+
+/// Веха 234 — БАЙТЫ ТАБЛИЦЫ ACPI по сигнатуре (`b"DSDT"`, `b"ECDT"`, `b"FACP"`) и номеру
+/// (одноимённых бывает несколько — SSDT). Нужен `hwprobe`. `None` — такой таблицы нет; иначе
+/// сколько байт положено в `buf` (если таблица длиннее буфера — сколько влезло).
+pub fn acpi_table(hw_cap: usize, sig: &[u8; 4], idx: usize, buf: &mut [u8]) -> Option<usize> {
+    let word = u32::from_le_bytes(*sig) as usize;
+    let r = abi::syscall(SYS_ACPI_TABLE, hw_cap, word, buf.as_mut_ptr() as usize, buf.len(), idx, 0, 0).0;
+    (r != NO_CAP).then_some(r)
 }
 
 /// Слово конфигурационного пространства PCI ЛЮБОГО устройства: `bdf` = `шина<<8 | устр<<3 | функция`.

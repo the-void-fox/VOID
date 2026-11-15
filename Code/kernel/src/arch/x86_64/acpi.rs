@@ -138,6 +138,70 @@ fn find_table(rsdp: &[u8], sig: &[u8; 4]) -> Option<&'static [u8]> {
     None
 }
 
+/// Веха 234 — отдать ТАБЛИЦУ ACPI целиком, по её сигнатуре (`DSDT`, `FACP`, `ECDT`, …).
+///
+/// Нужно затем, зачем нужна была разведка, только на шаг дальше: решение «писать ли свой
+/// разбор AML» зависит от того, ЧТО написано в прошивке этой машины, а прочитать это можно
+/// только сняв таблицу с живой машины и разобрав её на хосте (`iasl`, `acpiexec`). Сами мы AML
+/// по-прежнему не исполняем — отдаём байты.
+///
+/// `DSDT` особая: её адрес лежит не в корневой таблице, а в FADT.
+pub fn table(sig: [u8; 4], idx: usize) -> Option<&'static [u8]> {
+    let rsdp = find_rsdp()?;
+    if &sig == b"DSDT" {
+        let fadt = find_table(rsdp, b"FACP")?;
+        let pa = if fadt.len() >= 148 && rd64(fadt, 140) != 0 {
+            rd64(fadt, 140) as usize
+        } else if fadt.len() >= 44 {
+            rd32(fadt, 40) as usize
+        } else {
+            0
+        };
+        if pa == 0 {
+            return None;
+        }
+        let head = unsafe { phys(pa, 36) };
+        if &head[..4] != b"DSDT" {
+            return None;
+        }
+        let len = (rd32(head, 4) as usize).clamp(36, 0x20_0000);
+        return Some(unsafe { phys(pa, len) });
+    }
+    // SSDT в машине бывает несколько, и батарея вполне может жить во второй. Поэтому не
+    // «первая попавшаяся», а названная НОМЕРОМ: иначе часть прошивки осталась бы невидимой, и
+    // мы бы об этом даже не узнали.
+    let revision = rsdp[15];
+    let (root_pa, wide) = if revision >= 2 && rd64(rsdp, 24) != 0 {
+        (rd64(rsdp, 24) as usize, true)
+    } else {
+        (rd32(rsdp, 16) as usize, false)
+    };
+    if root_pa == 0 {
+        return None;
+    }
+    let head = unsafe { phys(root_pa, 36) };
+    let rlen = (rd32(head, 4) as usize).clamp(36, 0x10000);
+    let root = unsafe { phys(root_pa, rlen) };
+    let step = if wide { 8 } else { 4 };
+    let (mut at, mut seen) = (36, 0usize);
+    while at + step <= rlen {
+        let pa = if wide { rd64(root, at) as usize } else { rd32(root, at) as usize };
+        at += step;
+        if pa == 0 {
+            continue;
+        }
+        let t = unsafe { phys(pa, 36) };
+        if t[..4] == sig {
+            if seen == idx {
+                let len = (rd32(t, 4) as usize).clamp(36, 0x20_0000);
+                return Some(unsafe { phys(pa, len) });
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
 /// Веха 234 — **РАЗВЕДКА ACPI ОДНОЙ СТРОКОЙ**: что прошивка машины вообще объявила.
 ///
 /// Зачем. Ноутбучная база (батарея, крышка, сон) упирается не в наше умение, а в то, ЧТО на
