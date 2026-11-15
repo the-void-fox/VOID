@@ -167,6 +167,37 @@ let
         '';
       };
 
+      # Веха 236 — uACPI ([[0025-aml-foreign-interpreter]]): исполнение AML чужой проверенной
+      # реализацией. Лежит подмодулем `vendor/uacpi` (форк the-void-fox/void-uacpi, ветка void).
+      #
+      # Собирается СТАТИЧЕСКОЙ БИБЛИОТЕКОЙ, а не программой, и это не мелочь: uACPI не
+      # исполняема сама по себе — наружу ей нужны 40 функций `uacpi_kernel_*`, которые обязана
+      # дать операционная система. Программой её сделает сервер `acpi-srv` вместе с нашей
+      # прослойкой; библиотека же собирается отдельно, чтобы ломалось по одному: отдельно
+      # «чужой код не компилируется под VOID», отдельно «наша прослойка не та».
+      #
+      # `-ffreestanding` и никаких `-I` на newlib: своей libc у uACPI нет по устройству, она
+      # просит у системы только `mem{cpy,set,move,cmp}` — то есть ровно то, что в libvoid есть.
+      uacpi = stdenv.mkDerivation {
+        pname = "uacpi";
+        version = "7.0.0";
+        src = ../vendor/uacpi;
+        dontConfigure = true;
+        hardeningDisable = [ "all" ];
+        buildPhase = ''
+          for f in source/*.c; do
+            $CC ${voidCFlags} -Iinclude -O2 -ffreestanding -std=c11 \
+              -Wall -Wextra -c "$f" -o "$(basename "$f" .c).o"
+          done
+          $AR rcs libuacpi.a *.o
+        '';
+        installPhase = ''
+          mkdir -p $out/lib $out/include
+          cp libuacpi.a $out/lib/
+          cp -r include/uacpi $out/include/
+        '';
+      };
+
       # lx_sort (Веха 55) — НЕИЗМЕНЁННЫЙ lib/sort.c ядра Linux (6.18.7) против рукописных
       # шим-заголовков linux/*.h (начало lx_emul-заголовков): первый реальный .c из Linux на VOID.
       # -I. находит linux/ (sort.c + harness), -DCONFIG_64BIT (обе арх 64-битные) → 64-битный swap.
