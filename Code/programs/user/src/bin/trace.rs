@@ -96,7 +96,7 @@ pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
 
     let (_, records, lost_count) = trace::stats(sysview).unwrap_or((0, 0, 0));
     match mode {
-        "вызовы" | "calls" => print_calls(&collected, seconds),
+        "вызовы" | "calls" => print_calls(&collected, sysview, seconds),
         "выборка" | "sample" => print_sample(&collected, sysview, seconds),
         _ => print_events(&collected),
     }
@@ -166,30 +166,58 @@ fn proc_name(list: &[(u16, String)], pid: u16) -> String {
     }
 }
 
-/// `trace вызовы` — сводка по номерам вызовов: сколько раз и сколько времени ЯДРА.
-fn print_calls(ev: &[trace::Event], seconds: u64) {
-    // (тег, номер) → (сколько, суммарно нс, худший нс)
-    let mut summary: Vec<(u16, u64, u64, u64, u64)> = Vec::new();
+/// Одна строка сводки вызовов: тег, номер, сколько, нс всего, нс худший, кто звал.
+struct Row {
+    tag: u16,
+    nr: u64,
+    count: u64,
+    sum: u64,
+    worst: u64,
+    /// Звонившие и сколько раз каждый. Их единицы — список дешевле словаря.
+    callers: Vec<(u16, u64)>,
+}
+
+/// `trace вызовы` — сводка по номерам вызовов: сколько раз, сколько времени ЯДРА и КТО звал.
+///
+/// Веха 233.20 — столбец «кто». Без него таблица называет вызов, но не виновника: «TIME
+/// триста раз в секунду» — это вопрос, а не ответ, пока не видно, чей это цикл. Имя берём у
+/// того, кто звал чаще всех, и рядом ставим его долю: когда зовут двое, одно имя врало бы.
+fn print_calls(ev: &[trace::Event], sysview: usize, seconds: u64) {
+    let names = names(sysview);
+    let mut summary: Vec<Row> = Vec::new();
     for e in ev {
         if e.tag != trace::TAG_SYSCALL && e.tag != trace::TAG_LINUX {
             continue;
         }
-        match summary.iter_mut().find(|(t, n, ..)| *t == e.tag && *n == e.a) {
+        match summary.iter_mut().find(|r| r.tag == e.tag && r.nr == e.a) {
             Some(row) => {
-                row.2 += 1;
-                row.3 += e.b;
-                row.4 = row.4.max(e.b);
+                row.count += 1;
+                row.sum += e.b;
+                row.worst = row.worst.max(e.b);
+                match row.callers.iter_mut().find(|(p, _)| *p == e.pid) {
+                    Some(c) => c.1 += 1,
+                    None => row.callers.push((e.pid, 1)),
+                }
             }
-            None => summary.push((e.tag, e.a, 1, e.b, e.b)),
+            None => summary.push(Row {
+                tag: e.tag,
+                nr: e.a,
+                count: 1,
+                sum: e.b,
+                worst: e.b,
+                callers: vec![(e.pid, 1)],
+            }),
         }
     }
     if summary.is_empty() {
         sys::write("вызовов не было вовсе — система стояла\n".as_bytes());
         return;
     }
-    summary.sort_by(|a, b| b.3.cmp(&a.3));
-    let total_calls: u64 = summary.iter().map(|r| r.2).sum();
-    let total_ns: u64 = summary.iter().map(|r| r.3).sum();
+    // Сортируем по ЧИСЛУ вызовов, а не по времени ядра: вопрос «что происходит слишком часто»
+    // задают чаще, чем «что дорого», и холостой цикл виден именно числом.
+    summary.sort_by(|a, b| b.count.cmp(&a.count));
+    let total_calls: u64 = summary.iter().map(|r| r.count).sum();
+    let total_ns: u64 = summary.iter().map(|r| r.sum).sum();
     sys::write(
         format!(
             "ВЫЗОВЫ за {} с: {} штук, {} мкс работы ядра ({} вызовов/с)\n\n",
@@ -200,20 +228,31 @@ fn print_calls(ev: &[trace::Event], seconds: u64) {
         )
         .as_bytes(),
     );
-    sys::write("  вызов                 сколько   ядро, мкс   худший, мкс\n".as_bytes());
-    for (tag, nr, count, sum, worst) in summary.iter().take(TOP) {
-        let name = if *tag == trace::TAG_LINUX {
-            format!("linux #{nr}")
+    sys::write("  вызов              сколько   в секунду   ядро, мкс   кто звал\n".as_bytes());
+    for row in summary.iter().take(TOP) {
+        let name = if row.tag == trace::TAG_LINUX {
+            format!("linux #{}", row.nr)
         } else {
-            format!("{}", syscall_name(*nr))
+            format!("{}", syscall_name(row.nr))
+        };
+        // Кто звал: самый частый и его доля. Доля важнее имени — она говорит, один это цикл
+        // или несколько, а значит, лечить одно место или искать дальше.
+        let top = row.callers.iter().max_by_key(|(_, n)| *n);
+        let who = match top {
+            Some((pid, n)) if *n * 10 >= row.count * 9 => proc_name(&names, *pid),
+            Some((pid, n)) => {
+                format!("{} ({}%, всего {})", proc_name(&names, *pid), n * 100 / row.count, row.callers.len())
+            }
+            None => String::from("?"),
         };
         sys::write(
             format!(
-                "  {:<20} {:>8}   {:>9}   {:>11}\n",
+                "  {:<18} {:>7}   {:>9}   {:>9}   {}\n",
                 name,
-                count,
-                sum / 1000,
-                worst / 1000
+                row.count,
+                row.count / seconds.max(1),
+                row.sum / 1000,
+                who,
             )
             .as_bytes(),
         );

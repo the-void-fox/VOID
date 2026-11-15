@@ -742,7 +742,7 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
             // Сколько спать, называет САМ стек: `poll_delay` — срок его ближайшего таймера
             // (ретрансмиссия DHCP-запроса). Проспать его нельзя, спать дольше незачем.
             let nap = match iface.poll_delay(sys::net_phy::now(), &sockets) {
-                Some(d) => d.millis().clamp(1, 200),
+                Some(d) => d.total_millis().clamp(1, 200),
                 None => 50,
             };
             sys::sleep_ns(nap * 1_000_000);
@@ -852,8 +852,13 @@ pub extern "C" fn _start(dev_cap: usize, _a1: usize) -> ! {
         let sleep_ms = if busy != smoltcp::iface::PollResult::None {
             0 // стек что-то сделал — возможно, есть ещё работа; проверим сразу
         } else {
+            // Веха 233.21 — `total_millis`, а НЕ `millis`: у smoltcp `millis()` это дробная
+            // часть секунды (0…999), а всё время даёт `total_millis()`. Разница не косметическая:
+            // срок «через двенадцать часов» (продление аренды DHCP) давал ноль, сервер не спал
+            // ни одного круга и будился планировщиком по сотне раз в секунду. Снаружи это
+            // выглядело как тысяча системных вызовов в секунду на машине, где сети нет вовсе.
             match iface.poll_delay(sys::net_phy::now(), &sockets) {
-                Some(d) => d.millis().min(IDLE_CAP_MS),
+                Some(d) => d.total_millis().min(IDLE_CAP_MS),
                 None => IDLE_CAP_MS,
             }
         };
@@ -1260,7 +1265,9 @@ fn pending_delay_ms(conns: &[Conn; MAX_CONN], now: Instant) -> u64 {
     let mut best = u64::MAX;
     for c in conns {
         if let Some(p) = c.pending {
-            let left = if p.deadline > now { (p.deadline - now).millis() } else { 0 };
+            // `total_millis`, а не `millis`: дробная часть секунды срезала бы срок клиента до
+            // сотен миллисекунд и будила сервер зря (та же ошибка, что в главном цикле).
+            let left = if p.deadline > now { (p.deadline - now).total_millis() } else { 0 };
             best = best.min(left);
         }
     }
@@ -1820,7 +1827,7 @@ fn wait_step(iface: &mut Interface, sockets: &SocketSet, since: Instant) {
         return;
     }
     let nap = match iface.poll_delay(now, sockets) {
-        Some(d) => d.millis().clamp(1, NAP_CAP_MS),
+        Some(d) => d.total_millis().clamp(1, NAP_CAP_MS),
         None => NAP_CAP_MS,
     };
     sys::sleep_ns(nap * 1_000_000);
