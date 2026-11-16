@@ -160,6 +160,10 @@ pub use imp::{hw_read32, hw_write32};
 /// условный, а не заглушка: заглушка притворялась бы, что порт прочитан.
 #[cfg(target_arch = "x86_64")]
 pub use imp::{io_read, io_write};
+/// Веха 238 — прерывание прошивки (SCI) в пользовательский сервер: кто им владеет, как взвести
+/// линию и каким вектором он зовётся.
+#[cfg(target_arch = "x86_64")]
+pub use imp::{sci_irq_arm, sci_set_owned, sci_vector};
 
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`

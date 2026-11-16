@@ -32,8 +32,10 @@
 
 #include "syscall.h"
 
+#include <uacpi/event.h>
 #include <uacpi/kernel_api.h>
 #include <uacpi/namespace.h>
+#include <uacpi/notify.h>
 #include <uacpi/opregion.h>
 #include <uacpi/status.h>
 #include <uacpi/types.h>
@@ -45,9 +47,13 @@ extern uintptr_t g_ec_cap;
 #define EC_STS_OBF 0x01 /* выходной буфер полон — есть что прочитать */
 #define EC_STS_IBF 0x02 /* входной буфер полон — контроллер ещё не забрал прошлое */
 
+/* Биты статуса (продолжение). */
+#define EC_STS_SCI_EVT 0x20 /* контроллеру есть что сообщить */
+
 /* Команды (§12.3). */
 #define EC_CMD_READ 0x80
 #define EC_CMD_WRITE 0x81
+#define EC_CMD_QUERY 0x84
 
 /* Потолок ожидания. Больше, чем закладывает сама прошивка (127 мс), и с запасом на машину, где
  * контроллер вялее. Превышение — не зависание, а отказ с именем: «контроллер не ответил». */
@@ -56,6 +62,12 @@ extern uintptr_t g_ec_cap;
 static uint16_t g_cmd_port;
 static uint16_t g_data_port;
 static int g_ready;
+
+/* Устройство контроллера в пространстве имён (у него живут методы запросов `_Qxx`) и номер
+ * его события — оба называет ECDT, но узел находится только после разбора AML. */
+static uacpi_namespace_node *g_ec_node;
+static uint8_t g_gpe;
+static int g_has_gpe;
 
 /* Каким правом ходим. Узкое (`ioport:ec`) — если прошивка объявила ECDT и конфиг его дал;
  * иначе общее. Выбор делается один раз: смешивать их в горячем пути незачем. */
@@ -182,9 +194,11 @@ static uacpi_status ec_region(uacpi_region_op op, uacpi_handle op_data) {
  * здесь они читаются заново, потому что серверу нужна таблица целиком, а не пара чисел через
  * ещё один вызов. */
 int ec_init(void) {
-    uint8_t ecdt[64];
+    /* 65 байт — минимум, в котором есть и оба адреса, и номер события (смещение 64). Буфер
+     * больше с запасом: дальше в таблице лежит путь к устройству, его читает `ec_find_node`. */
+    uint8_t ecdt[128];
     size_t n = vsys_acpi_table(g_hw_cap, "ECDT", 0, ecdt, sizeof(ecdt));
-    if (n < 60) {
+    if (n < 65) {
         printf("[ec] ECDT нет — встроенного контроллера эта машина не объявляет\n");
         return -1;
     }
@@ -215,8 +229,122 @@ int ec_init(void) {
         return -1;
     }
     g_ready = 1;
-    printf("[ec] контроллер на портах %#x/%#x, статус %#x%s\n", g_cmd_port, g_data_port, sts,
-           g_cap == g_ec_cap ? " (узкое право)" : " (общее право)");
+    /* Номер события и путь к устройству — там же, в ECDT (смещения 64 и 65). Путь нужен,
+     * чтобы знать, у КОГО спрашивать `_Qxx`: методы запросов живут в самом устройстве. */
+    g_gpe = ecdt[64];
+    g_has_gpe = 1;
+    printf("[ec] контроллер на портах %#x/%#x, статус %#x%s, событие %#x\n", g_cmd_port,
+           g_data_port, sts, g_cap == g_ec_cap ? " (узкое право)" : " (общее право)", g_gpe);
+    return 0;
+}
+
+/* Найти устройство контроллера в пространстве имён по пути из ECDT. Отдельным шагом от
+ * `ec_init`, потому что пространства имён в тот момент ещё нет. */
+int ec_find_node(void) {
+    uint8_t ecdt[128];
+    size_t n = vsys_acpi_table(g_hw_cap, "ECDT", 0, ecdt, sizeof(ecdt));
+    if (n < 66) {
+        return -1;
+    }
+    /* Путь лежит строкой с нулём на конце; длина таблицы его ограничивает. */
+    ecdt[sizeof(ecdt) - 1] = 0;
+    const char *path = (const char *)(ecdt + 65);
+    if (uacpi_namespace_node_find(NULL, path, &g_ec_node) != UACPI_STATUS_OK) {
+        printf("[ec] устройство %s в пространстве имён не найдено\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+/* ─── запросы контроллера ─────────────────────────────────────────────────── */
+
+/* Выполнить `_Q<номер>` — метод прошивки, который знает, что означает это событие.
+ *
+ * Имя собираем из номера: `_Q0A`, `_Q6C`. Шестнадцатеричные цифры ЗАГЛАВНЫЕ — в пространстве
+ * имён ACPI имена различаются регистром, и `_q0a` там просто нет. */
+static void run_query(uint8_t q) {
+    static const char hex[] = "0123456789ABCDEF";
+    char name[5] = { '_', 'Q', hex[q >> 4], hex[q & 0xf], 0 };
+    uacpi_status st = uacpi_eval(g_ec_node, name, NULL, NULL);
+    if (st == UACPI_STATUS_NOT_FOUND) {
+        /* Прошивка подняла событие, которого сама не описала. Это её дело, не наше, и падать
+         * тут не из-за чего — но сказать стоит: на чужой машине это единственный след. */
+        printf("[ec] запрос %s прошивкой не описан\n", name);
+        return;
+    }
+    if (st != UACPI_STATUS_OK) {
+        printf("[ec] запрос %s не выполнился: %s\n", name, uacpi_status_to_string(st));
+    }
+}
+
+/* Обработчик GPE контроллера: спросить, что случилось, и выполнить описанное прошивкой. */
+static uacpi_interrupt_ret ec_gpe(uacpi_handle ctx, uacpi_namespace_node *dev, uacpi_u16 idx) {
+    (void)ctx;
+    (void)dev;
+    (void)idx;
+    /* Цикл с потолком: один SCI несёт сколько угодно запросов, но если контроллер заклинит и
+     * начнёт отвечать бесконечно, бесконечным станет и обработчик. Шестнадцати хватает с
+     * запасом — больше за раз не копится. */
+    for (int i = 0; i < 16; i++) {
+        uint8_t sts;
+        if (io_in(g_cmd_port, &sts) != 0 || !(sts & EC_STS_SCI_EVT)) {
+            break;
+        }
+        if (ec_wait(EC_STS_IBF, 0, "вход занят перед запросом") != 0
+            || io_out(g_cmd_port, EC_CMD_QUERY) != 0
+            || ec_wait(EC_STS_OBF, EC_STS_OBF, "номер запроса не пришёл") != 0) {
+            break;
+        }
+        uint8_t q;
+        if (io_in(g_data_port, &q) != 0 || q == 0) {
+            break; /* ноль значит «больше нечего» */
+        }
+        run_query(q);
+    }
+    return UACPI_INTERRUPT_HANDLED | UACPI_GPE_REENABLE;
+}
+
+/* ─── уведомления ─────────────────────────────────────────────────────────── */
+
+/* Что прошивка сообщает про устройство. Коды — из спецификации: 0x80 у батареи значит
+ * «состояние изменилось», у крышки — «её тронули», 0x81 у батареи — «паспорт изменился». */
+static uacpi_status on_notify(uacpi_handle ctx, uacpi_namespace_node *node, uacpi_u64 value) {
+    (void)ctx;
+    const uacpi_char *path = uacpi_namespace_node_generate_absolute_path(node);
+    printf("[acpi] прошивка сообщает: %s — событие %#llx\n", path ? path : "?",
+           (unsigned long long)value);
+    if (path) {
+        uacpi_free_absolute_path(path);
+    }
+    /* Пока только называем вслух. Что ДЕЛАТЬ по закрытой крышке (гасить экран, усыплять) —
+     * решение не драйвера: его принимает оболочка, и принимать его надо отдельно, вместе с
+     * тем, как этот сигнал до неё доедет. */
+    return UACPI_STATUS_OK;
+}
+
+/* Подключить события контроллера: его GPE (номер даёт ECDT) и приём уведомлений от всех
+ * устройств сразу (корень пространства имён). Зовётся ПОСЛЕ подъёма устройств: до него нет
+ * ни узлов, на которые вешать, ни работающих `_REG`. */
+int ec_events(void) {
+    if (!g_has_gpe || !g_ec_node) {
+        return -1;
+    }
+    uacpi_status st = uacpi_install_gpe_handler(NULL, g_gpe, UACPI_GPE_TRIGGERING_EDGE,
+                                                ec_gpe, NULL);
+    if (st != UACPI_STATUS_OK) {
+        printf("[ec] обработчик события %#x не встал: %s\n", g_gpe, uacpi_status_to_string(st));
+        return -1;
+    }
+    st = uacpi_enable_gpe(NULL, g_gpe);
+    if (st != UACPI_STATUS_OK) {
+        printf("[ec] событие %#x не включилось: %s\n", g_gpe, uacpi_status_to_string(st));
+        return -1;
+    }
+    if (uacpi_install_notify_handler(uacpi_namespace_root(), on_notify, NULL)
+        != UACPI_STATUS_OK) {
+        printf("[acpi] приём уведомлений не встал — о смене заряда и крышки не узнаем\n");
+    }
+    printf("[ec] события контроллера включены (GPE %#x)\n", g_gpe);
     return 0;
 }
 

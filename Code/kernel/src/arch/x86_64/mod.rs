@@ -1108,6 +1108,33 @@ pub fn userdrv_irq_arm() {
     ioapic::set_userdrv_masked(false);
 }
 
+/// Веха 238 — ЕСТЬ ЛИ У SCI ХОЗЯИН В ПОЛЬЗОВАТЕЛЬСКОМ ПРОСТРАНСТВЕ.
+///
+/// Пока его нет, обработчик прерывания не должен ни маскировать линию, ни будить кого-то:
+/// замаскировав её «на будущее», мы убили бы кнопку питания со второго нажатия — первое
+/// сработало бы, а размаскировать было бы некому.
+static SCI_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Сказать, что право на SCI выдано (зовёт `init`, когда минтит его серверу ACPI).
+pub fn sci_set_owned() {
+    SCI_OWNED.store(true, Ordering::Relaxed);
+}
+
+pub fn sci_owned() -> bool {
+    SCI_OWNED.load(Ordering::Relaxed)
+}
+
+/// Взвести линию SCI (размаскировать) — пара к маске в обработчике. Зовёт `SYS_IRQ_WAIT`,
+/// когда сервер ACPI ложится ждать событие.
+pub fn sci_irq_arm() {
+    ioapic::set_sci_masked(false);
+}
+
+/// Вектор SCI — по нему `SYS_IRQ_WAIT` отличает ожидание сервера ACPI от ожидания драйвера.
+pub fn sci_vector() -> u8 {
+    trap::VEC_SCI
+}
+
 /// Маршрутизация прерываний устройств (Веха 27): IOAPIC ведёт GSI4 (COM1) на
 /// [`trap::VEC_CONSOLE`]; сам UART начинает слать прерывания приёма (IER.DR;
 /// OUT2 в MCR — классический «разъём» линии до контроллера). Диск сюда не ходит:

@@ -77,6 +77,23 @@ pub fn route_flags(gsi: u32, vector: u8, active_low: bool, level: bool) {
 /// userspace-драйвера. Модель «oneshot»: `SYS_IRQ_WAIT` размаскирует (взвод перед сном),
 /// обработчик VEC_USERDRV маскирует (иначе level-линию, которую карта держит до чтения ICR,
 /// IOAPIC переотправлял бы штормом). Бит 16 RTE — маска.
+/// Веха 238 — за/раз-маскировать линию SCI по её вектору.
+///
+/// Отдельно от [`set_userdrv_masked`], а не «ещё один вектор в тот же перебор»: у SCI другой
+/// хозяин и другая жизнь. Линия драйвера маскируется, пока драйвер не прочитает регистр карты;
+/// SCI — пока сервер ACPI не разберёт события прошивки. Свести их в одну маску значило бы, что
+/// сон сетевого драйвера глушит кнопку питания.
+pub fn set_sci_masked(masked: bool) {
+    for gsi in 0..24u32 {
+        let lo = read(0x10 + 2 * gsi);
+        if lo & 0xff != super::trap::VEC_SCI as u32 {
+            continue;
+        }
+        let lo = if masked { lo | (1 << 16) } else { lo & !(1 << 16) };
+        write(0x10 + 2 * gsi, lo);
+    }
+}
+
 pub fn set_userdrv_masked(masked: bool) {
     for gsi in 0..24u32 {
         let lo = read(0x10 + 2 * gsi);

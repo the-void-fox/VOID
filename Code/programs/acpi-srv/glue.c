@@ -44,13 +44,20 @@
 uintptr_t g_hw_cap = VOID_NO_CAP;  /* hwprobe: таблицы, порты, PCI */
 uintptr_t g_ec_cap = VOID_NO_CAP;  /* ioport:ec — узкое право, если выдано */
 uintptr_t g_fw_cap = VOID_NO_CAP;  /* fwmem — страницы, объявленные прошивкой */
+uintptr_t g_sci_cap = VOID_NO_CAP; /* irq:sci — прерывание прошивки */
+
+/* Обработчик прерывания, который поставила uACPI. Зовёт его наш цикл событий, а не ядро:
+ * прерывание ловит ядро и будит нас, а разбор регистров прошивки — уже здесь. */
+static uacpi_interrupt_handler g_sci_handler;
+static uacpi_handle g_sci_ctx;
 
 static uint64_t g_boot_ns;
 
-void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap) {
+void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap, uintptr_t sci_cap) {
     g_hw_cap = hw_cap;
     g_ec_cap = ec_cap;
     g_fw_cap = fw_cap;
+    g_sci_cap = sci_cap;
     g_boot_ns = vsys_monotonic_ns();
 }
 
@@ -518,9 +525,16 @@ void uacpi_kernel_mmio_write64(void *p, uacpi_u64 v) { *(volatile uacpi_u64 *)p 
  */
 uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interrupt_handler h,
                                                     uacpi_handle ctx, uacpi_handle *out) {
-    (void)h;
-    (void)ctx;
     *out = (uacpi_handle)1;
+    if (g_sci_cap != VOID_NO_CAP) {
+        /* Веха 238 — прерывание у нас есть. Запоминаем обработчик: звать его будет наш цикл
+         * событий, когда ядро разбудит нас по SCI. Само прерывание ловит ядро — так и должно
+         * быть, пользовательский процесс в обработчике прерывания не живёт. */
+        g_sci_handler = h;
+        g_sci_ctx = ctx;
+        printf("[acpi] прерывание прошивки (вектор %u) подключено\n", (unsigned)irq);
+        return UACPI_STATUS_OK;
+    }
     /* Отвечаем «получилось», хотя обработчик НЕ установлен, и это осознанный выбор между двумя
      * неправдами. Отказ здесь валит подъём целиком (uACPI считает события обязательными), и
      * тогда нет ни батареи, ни крышки — то есть цена «честного» отказа оказывается выше цены
@@ -529,10 +543,24 @@ uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interru
      * Чтобы это не стало молчаливым враньём, говорим вслух КАЖДУЮ загрузку: события прошивки
      * (крышка, кнопка сна, сообщения контроллера) не придут, пока нет IRQ-права на вектор SCI.
      * Как только оно появится, здесь будет настоящая установка, и эта строка исчезнет. */
+    (void)h;
+    (void)ctx;
     printf("[acpi] ВНИМАНИЕ: прерывание SCI (вектор %u) не подключено — события прошивки "
            "(крышка, кнопка сна, контроллер) НЕ ПРИДУТ\n",
            (unsigned)irq);
     return UACPI_STATUS_OK;
+}
+
+/* Есть ли кого звать по событию. */
+int glue_has_sci(void) { return g_sci_handler != NULL; }
+
+/* Разобрать событие прошивки: позвать обработчик uACPI, потом доделать отложенное (запросы
+ * контроллера и уведомления она кладёт именно туда). */
+void glue_handle_sci(void) {
+    if (g_sci_handler) {
+        g_sci_handler(g_sci_ctx);
+    }
+    glue_run_work();
 }
 
 uacpi_status uacpi_kernel_uninstall_interrupt_handler(uacpi_interrupt_handler h, uacpi_handle i) {

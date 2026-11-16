@@ -37,9 +37,14 @@
 #include <uacpi/uacpi.h>
 #include <uacpi/utilities.h>
 
-extern void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap);
+extern void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap,
+                      uintptr_t sci_cap);
+extern int glue_has_sci(void);
+extern void glue_handle_sci(void);
 extern int ec_init(void);
 extern int ec_install(void);
+extern int ec_find_node(void);
+extern int ec_events(void);
 extern int glue_run_work(void);
 extern int tables_build(void);
 
@@ -162,12 +167,13 @@ int main(void) {
      * Конфиг: `service acpi-srv hwprobe ioport:ec`. */
     uintptr_t hw = vsys_start_cap(0);
     uintptr_t fw = vsys_start_cap(1);
-    uintptr_t ec = vsys_start_cap(2);
+    uintptr_t sci = vsys_start_cap(2);
+    uintptr_t ec = vsys_start_cap(3);
     if (hw == VOID_NO_CAP) {
         printf("[acpi] нет права `hwprobe` — без него не видно ни таблиц, ни портов\n");
         return 1;
     }
-    glue_init(hw, ec, fw);
+    glue_init(hw, ec, fw, sci);
     if (ec == VOID_NO_CAP) {
         printf("[acpi] узкого права на порты контроллера нет — хожу общим\n");
     }
@@ -217,6 +223,12 @@ int main(void) {
     }
     glue_run_work();
 
+    /* События контроллера — ПОСЛЕ подъёма устройств: до него нет ни узлов, на которые вешать
+     * обработчик, ни выполненных `_REG`. */
+    if (ec_find_node() == 0) {
+        ec_events();
+    }
+
     /* Кем нас сочла прошивка. Печатаем ПОСЛЕ подъёма: спрашивает она в `_INI`, а до того
      * ответа ещё нет. */
     uacpi_vendor_interface iface = uacpi_latest_queried_vendor_interface();
@@ -259,5 +271,29 @@ int main(void) {
          * ровно это, а не «не работает». */
         printf("[acpi] батареи, крышки и адаптера эта машина не объявляет\n");
     }
-    return 0;
+
+    /* ─── ЦИКЛ СОБЫТИЙ (Веха 238) ─────────────────────────────────────────────
+     *
+     * С этого места программа перестаёт быть пробой и становится службой: она живёт, пока
+     * жива система, и просыпается на каждое сообщение прошивки.
+     *
+     * Ждём ПРЕРЫВАНИЕ, а не опрашиваем. Опрос здесь был бы не просто расточительством: чтобы
+     * не проспать нажатие, спрашивать пришлось бы десятки раз в секунду, и каждый такой
+     * вопрос — разговор с контроллером по портам, то есть миллисекунды занятой шины на
+     * пустом месте (см. [[cpu-budget]] — мы уже вычищали холостые вызовы).
+     *
+     * Срок у ожидания всё же есть, и он не страховка от потерянного прерывания, а защита от
+     * ЗАВИСШЕЙ линии: прерывание SCI уровневое, ядро маскирует его на время нашей работы, и
+     * если мы однажды не снимем причину в регистрах прошивки, линия останется замаскированной
+     * навсегда. Проснувшись по сроку, мы её взведём заново — и в худшем случае событие
+     * опоздает на секунду, а не потеряется насовсем. */
+    if (!glue_has_sci()) {
+        printf("[acpi] событий ждать нечем — выхожу (прошивку можно только спрашивать)\n");
+        return 0;
+    }
+    printf("[acpi] жду события прошивки\n");
+    for (;;) {
+        vsys_irq_wait_to(sci, 1000000000ull); /* секунда */
+        glue_handle_sci();
+    }
 }

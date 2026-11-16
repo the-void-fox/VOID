@@ -296,7 +296,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             };
             let dom = t.procs[cur].domain;
             match cap::irq(dom, Cap::from_bits(icap as u64), Rights::READ) {
-                Ok(_vector) => {
+                Ok(vector) => {
                     let f = &mut t.procs[cur].frame;
                     f.set_ret(0);
                     f.advance();
@@ -305,7 +305,21 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         .then(|| arch::now_ticks() + crate::clock::ns_to_ticks(timeout_ns));
                     // Веха 52 — «взвести» линию (размаскировать в IOAPIC): если причина уже
                     // висит на карте, прерывание доставится сразу; обработчик снова замаскирует.
-                    arch::userdrv_irq_arm();
+                    //
+                    // Веха 238 — ЧТО взводить, решает вектор из права. Сервер ACPI ждёт SCI, а
+                    // не линию драйвера, и взводить ему чужое значило бы размаскировать
+                    // прерывание карты, которую никто не слушает, — и проспать своё.
+                    #[cfg(target_arch = "x86_64")]
+                    if vector == arch::sci_vector() {
+                        arch::sci_irq_arm();
+                    } else {
+                        arch::userdrv_irq_arm();
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        let _ = vector;
+                        arch::userdrv_irq_arm();
+                    }
                     if let Some(n) = t.next_runnable(cur) {
                         t.set_cur(n);
                     }
