@@ -37,6 +37,8 @@
 #include <uacpi/utilities.h>
 
 extern void glue_init(uintptr_t hw_cap, uintptr_t ec_cap, uintptr_t fw_cap);
+extern int ec_init(void);
+extern int ec_install(void);
 extern int glue_run_work(void);
 extern int tables_build(void);
 
@@ -191,6 +193,14 @@ int main(void) {
         printf("[acpi] разбор AML не вышел: %s\n", uacpi_status_to_string(st));
         return 1;
     }
+    /* Веха 237 — обработчик встроенного контроллера ставится ИМЕННО ЗДЕСЬ, между разбором и
+     * подъёмом устройств. Раньше нельзя: пространства имён ещё нет. Позже поздно: `_REG` для
+     * областей контроллера выполняется внутри `uacpi_namespace_initialize`, и опоздав, мы
+     * получили бы прошивку, уверенную, что контроллера в машине нет. */
+    if (ec_init() == 0) {
+        ec_install();
+    }
+
     st = uacpi_namespace_initialize();
     if (st != UACPI_STATUS_OK) {
         printf("[acpi] подъём устройств не вышел: %s\n", uacpi_status_to_string(st));

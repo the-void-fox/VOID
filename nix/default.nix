@@ -216,7 +216,7 @@ let
         buildPhase = ''
           $CC ${voidCFlags} -I${void-libc}/lib -I${uacpi}/include \
             -O2 -static -Wall -Wextra \
-            main.c glue.c tables.c ${uacpi}/lib/libuacpi.a -o acpi-srv
+            main.c glue.c tables.c ec.c ${uacpi}/lib/libuacpi.a -o acpi-srv
         '';
         installPhase = ''
           mkdir -p $out/bin
