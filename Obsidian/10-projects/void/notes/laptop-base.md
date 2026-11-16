@@ -238,4 +238,4 @@ nix-build nix -A riscv64.uacpi
 ## Связано
 
 [[known-gaps]] · [[target-system]] · [[intel-display]] · [[0023-threat-model]] ·
-[[0025-aml-foreign-interpreter]] · [[hw-probe]]
+[[0025-aml-foreign-interpreter]] · [[0026-how-we-answer-firmware]] · [[toolbox]]
