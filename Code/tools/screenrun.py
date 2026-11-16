@@ -43,7 +43,7 @@ VOID_QEMU_NIC, VOID_QEMU_NET, VOID_QEMU_PCAP.
 Сама машина (чипсет, диск, память, энтропия, сеть) описана в `tools/qemu-machine.sh` — общим
 файлом с `run.sh`, чтобы прогон со снимками шёл на ТОМ ЖЕ стенде, что и обычный запуск.
 """
-import json, os, socket, struct, subprocess, sys, time, zlib
+import json, os, socket, struct, subprocess, sys, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Описание СТЕНДА — общее с `run.sh`. До этого машину описывали два места, и совпадали они лишь
@@ -147,8 +147,35 @@ qemu = [
 # переменных окружения, и «забыл переменную» выглядит как «драйвер не работает».
 with open(os.path.join(outdir, "qemu-cmd.txt"), "w") as f:
     f.write(" ".join(qemu) + "\n")
+# Веха 239 — КАЖДАЯ СТРОКА ЖУРНАЛА СО ВРЕМЕНЕМ от запуска машины.
+#
+# Раньше вывод гостя шёл в файл напрямую, и ответить на вопрос «стало ли дольше» было нечем:
+# в журнале есть что произошло, но не когда. Теперь между QEMU и файлом стоит читатель, он и
+# проставляет миллисекунды. Это делает измеримой ЛЮБУЮ сборку — в том числе старый релиз,
+# который сам о себе ничего не печатает.
 log = open(os.path.join(outdir, "serial.log"), "wb")
-p = subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
+p = subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT)
+t0 = time.monotonic()
+
+
+def _stamp_serial():
+    """Переливать вывод гостя в журнал, помечая каждую строку временем."""
+    fresh = True
+    while True:
+        b = p.stdout.read(1)
+        if not b:
+            break
+        if fresh:
+            log.write(b"[%7.3f] " % (time.monotonic() - t0))
+            fresh = False
+        log.write(b)
+        if b == b"\n":
+            fresh = True
+            log.flush()
+
+
+threading.Thread(target=_stamp_serial, daemon=True).start()
 
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(50):
