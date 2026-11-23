@@ -153,7 +153,7 @@ pub fn trap_stack_range() -> (usize, usize) {
 }
 
 // ─── таблица процессов ────────────────────────────────────────────────────────
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum State {
     Runnable,
     RecvWait,  // заблокирован в RECV (ждёт сообщения)
@@ -700,7 +700,12 @@ fn drain_userdrv_irq(t: &mut Table) -> bool {
         if p.state == State::RecvWait && p.wake_on_irq {
             let f = &mut p.frame;
             f.set_ret(usize::MAX);
-            f.set_ret_at(2, 0);
+            // Веха 241 — ЧЕМ разбудили: 1 прерыванием, 0 сроком. Серверу это нужно, чтобы не
+            // звать обработчик прошивки на каждом холостом пробуждении: он там ничего не
+            // находит и ругается в журнал раз в секунду. Линия при этом взводится заново
+            // самим `SYS_RECV`, а SCI уровневый — значит не снятая причина даст прерывание
+            // сразу же, и «пропустить событие» нельзя даже теоретически.
+            f.set_ret_at(2, 1);
             f.advance();
             p.state = State::Runnable;
             p.ready_at = arch::now_ticks();

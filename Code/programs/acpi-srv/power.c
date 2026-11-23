@@ -27,6 +27,7 @@
 #include "syscall.h"
 
 #include <uacpi/namespace.h>
+#include <uacpi/sleep.h>
 #include <uacpi/status.h>
 #include <uacpi/types.h>
 #include <uacpi/uacpi.h>
@@ -236,4 +237,42 @@ void power_report(void) {
     if (s->flags & POWER_HAS_LID) {
         printf("[acpi] крышка %s\n", (s->flags & POWER_LID_OPEN) ? "открыта" : "закрыта");
     }
+}
+
+/* ─── сон (Веха 241) ──────────────────────────────────────────────────────── */
+
+/* Приготовиться ко сну S3: выполнить `_PTS` (и `_TTS`, если прошивка их объявляет).
+ *
+ * Это обязательная часть уговора с прошивкой: ею она гасит то, что гасит сама, и приводит
+ * встроенный контроллер в состояние, из которого умеет просыпаться. Пропустить её значит
+ * уснуть «почти правильно» — а чем кончается «почти» в разговоре с прошивкой, видно по
+ * истории с `_REG` (ADR 0025): молчаливым отказом там, где ждёшь ответа.
+ *
+ * Сам сон делает ядро: записать SLP_TYP можно только с сохранённым состоянием процессора и
+ * запрещёнными прерываниями, а это не наше место. */
+int power_sleep_prepare(void) {
+    uacpi_status st = uacpi_prepare_for_sleep_state(UACPI_SLEEP_STATE_S3);
+    if (st != UACPI_STATUS_OK) {
+        printf("[acpi] прошивка не дала приготовиться ко сну: %s\n", uacpi_status_to_string(st));
+        return -1;
+    }
+    return 0;
+}
+
+/* Проснулись: выполнить `_WAK` и снять то, что прошивка выставила на пробуждении.
+ *
+ * `uacpi_wake_from_sleep_state` заодно отбрасывает «нажатия» кнопок питания и сна, которые
+ * прошивка выставляет самим фактом пробуждения, — без этого машина выключилась бы сразу после
+ * того, как её разбудили. Ядро снимает те же биты со своей стороны; две страховки здесь не
+ * лишние, потому что порядок между нами и прошивкой не наш. */
+int power_sleep_done(void) {
+    uacpi_prepare_for_wake_from_sleep_state(UACPI_SLEEP_STATE_S3);
+    uacpi_status st = uacpi_wake_from_sleep_state(UACPI_SLEEP_STATE_S3);
+    /* Снимок устарел заведомо: пока спали, могли выдернуть кабель. */
+    power_stale();
+    if (st != UACPI_STATUS_OK) {
+        printf("[acpi] `_WAK` не отработал: %s\n", uacpi_status_to_string(st));
+        return -1;
+    }
+    return 0;
 }

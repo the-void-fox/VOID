@@ -502,10 +502,44 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             // Веха 197 — ВТОРОЙ аргумент: 0 выключить, 1 перезагрузить. Право то же и по той же
             // причине: и то и другое — одностороннее действие над всей системой, разница лишь в
             // том, поднимется ли она обратно. Отдельного права на ребут заводить не за что.
-            let restart = t.procs[cur].frame.arg(1) == 1;
+            let mode = t.procs[cur].frame.arg(1);
+            let restart = mode == 1;
             if !cap::may_power_off(dom, Cap::from_bits(ccap as u64)) {
                 let f = &mut t.procs[cur].frame;
                 f.set_ret(usize::MAX);
+                f.advance();
+                return true;
+            }
+            // Веха 241 — ВИД 2: сон S3. Право то же (`power`), и это не экономия: сон — такое
+            // же действие над всей машиной, просто обратимое. Отличается он другим — тем, что
+            // ВОЗВРАЩАЕТСЯ: процесс продолжит работу следующей строкой, когда машину разбудят.
+            if mode == 2 {
+                // Store синхронизируем и перед сном: питание в S3 держится на батарее, и
+                // «проснуться» — не обещание, а надежда.
+                // Store синхронизируем и перед сном: питание в S3 держится на батарее, и
+                // «проснуться» — не обещание, а надежда.
+                crate::object::commit();
+                println!("  [power] засыпаю (S3) по запросу процесса");
+                #[cfg(target_arch = "x86_64")]
+                let r = {
+                    let sie = arch::irq_save_disable();
+                    let r = unsafe { arch::sleep_s3() };
+                    arch::irq_restore(sie);
+                    r
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let r: Result<(), &'static str> = Err("сна на этой архитектуре нет");
+                let f = &mut t.procs[cur].frame;
+                match r {
+                    Ok(()) => {
+                        println!("  [power] проснулись");
+                        f.set_ret(0);
+                    }
+                    Err(e) => {
+                        println!("  [power] уснуть не вышло: {e}");
+                        f.set_ret(usize::MAX);
+                    }
+                }
                 f.advance();
                 return true;
             }

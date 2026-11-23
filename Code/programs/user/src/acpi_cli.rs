@@ -19,6 +19,13 @@ use crate as sys;
 /// «Состояние питания»: `[]` → 16 байт (см. [`Power`]).
 pub const OP_POWER: usize = 1;
 
+/// Веха 241 — «приготовиться ко сну S3» (`_PTS`) и «мы проснулись» (`_WAK`). Между ними
+/// машина спит, и сам сон делает ЯДРО ([`crate::suspend`]): записать `SLP_TYP` можно только с
+/// сохранённым состоянием процессора, а выполнить AML — только здесь. Ответ — один байт:
+/// 0 вышло, иначе нет.
+pub const OP_SLEEP_PREP: usize = 2;
+pub const OP_SLEEP_DONE: usize = 3;
+
 /// Длина ответа. Фиксированная — поля простые, а разбор переменной длины на двух языках это
 /// два разных разбора.
 pub const MSG_LEN: usize = 16;
@@ -105,4 +112,23 @@ pub fn power(ep: usize) -> Option<Power> {
 /// становится подчёркиванием — см. `cap_name` в ядре).
 pub fn find_cap() -> Option<usize> {
     sys::cap_named("ACPI_SRV")
+}
+
+/// Сказать прошивке, что засыпаем (`_PTS`). `false` — прошивка отказала или сервера нет.
+pub fn sleep_prepare(ep: usize) -> bool {
+    one_byte_op(ep, OP_SLEEP_PREP)
+}
+
+/// Сказать прошивке, что проснулись (`_WAK`). Зовётся сразу после возврата из сна.
+pub fn sleep_done(ep: usize) -> bool {
+    one_byte_op(ep, OP_SLEEP_DONE)
+}
+
+fn one_byte_op(ep: usize, op: usize) -> bool {
+    if ep == sys::NO_CAP {
+        return false;
+    }
+    let mut rsp = [1u8; 1];
+    let n = sys::call(ep, op, &[], &mut rsp);
+    n != usize::MAX && n >= 1 && rsp[0] == 0
 }

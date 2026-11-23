@@ -140,7 +140,7 @@ pub use imp::{
 /// Веха 198.1 — настройки железа из конфига поколения (только x86: на riscv нет ни тачпада,
 /// ни ACPI).
 #[cfg(target_arch = "x86_64")]
-pub use imp::{acpi_survey, acpi_table, enable_power_button, touchpad_tune};
+pub use imp::{acpi_survey, acpi_table, enable_power_button, sleep_s3, touchpad_tune};
 /// Веха 236 — порты встроенного контроллера из ECDT: по ним выдаётся узкое право `ioport:ec`.
 #[cfg(target_arch = "x86_64")]
 pub use imp::acpi_ec_ports;

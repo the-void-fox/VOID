@@ -1785,6 +1785,7 @@ const CMDS: &[(&'static str, fn(&[Value]) -> Result<Value, EvalError>)] = &[
         ("acpi", sh_acpi),
         ("brightness", sh_brightness),
         ("poweroff", sh_poweroff),
+        ("suspend", sh_suspend),
         ("reboot", sh_reboot),
         ("store-probe", sh_store_probe),
         ("nar-unpack", sh_nar_unpack),
@@ -2147,6 +2148,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"acpi DSDT [N]", "выдать таблицу прошивки шестнадцатеричным текстом (для разбора на хосте)");
     help_row(b"brightness [%]", "яркость панели Intel; без числа — показать нынешнюю");
     help_row(b"poweroff", "выключить машину");
+    help_row(b"suspend", "уснуть (S3) — машина гаснет, память остаётся");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
     help_row(b"nar-unpack", "разложить NAR из корня store в файлы");
@@ -4090,6 +4092,41 @@ fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
     Err(EvalError::new(
         "poweroff: нет права `power` — в оконном режиме нужна строка `desktop power bin/vvsh`",
     ))
+}
+
+/// `(suspend)` — Веха 241: УСНУТЬ В S3, «сон с сохранением в память».
+///
+/// Право то же, что у выключения (`power`), и по той же причине: действие над всей машиной.
+/// Отличие — вызов ВОЗВРАЩАЕТСЯ: команда допечатает строку, когда машину разбудят.
+fn sh_suspend(_args: &[Value]) -> Result<Value, EvalError> {
+    let pc = sys::win::cap_or_grant(10);
+    if pc == sys::NO_CAP {
+        return Err(EvalError::new(
+            "suspend: нет права `power` — в оконном режиме нужна строка `desktop power bin/vvsh`",
+        ));
+    }
+    // Веха 241 — предупредить ПРОШИВКУ (`_PTS`). Без этого мы уснём «почти правильно»:
+    // встроенный контроллер останется в рабочем состоянии, а чем кончается «почти» в
+    // разговоре с прошивкой, уже видно по истории с `_REG` (ADR 0025).
+    let acpi = sys::acpi_cli::find_cap().unwrap_or(sys::NO_CAP);
+    if acpi == sys::NO_CAP {
+        sys::write("suspend: канала к серверу ACPI нет — прошивку о сне не предупредим\n".as_bytes());
+    } else if !sys::acpi_cli::sleep_prepare(acpi) {
+        return Err(EvalError::new("suspend: прошивка не дала приготовиться ко сну"));
+    }
+    sys::write(sys::i18n::t("засыпаю…\n").as_bytes());
+    if !sys::suspend(pc) {
+        // Почему именно не вышло, уже сказано в журнале ядра: машина может не объявлять S3,
+        // а на нескольких ядрах сон у нас пока не сделан.
+        return Err(EvalError::new("suspend: уснуть не вышло — причина в `klog`"));
+    }
+    // И сказать прошивке, что проснулись (`_WAK`): она же отбрасывает «нажатия» кнопок,
+    // которые сама и выставила фактом пробуждения.
+    if acpi != sys::NO_CAP {
+        sys::acpi_cli::sleep_done(acpi);
+    }
+    sys::write(sys::i18n::t("проснулись\n").as_bytes());
+    Ok(Value::nil())
 }
 
 /// `(reboot)` — перезагрузить машину (Веха 197). Право то же, что у выключения (`power`), и по

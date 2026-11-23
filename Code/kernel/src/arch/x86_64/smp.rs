@@ -176,6 +176,49 @@ fn spin_ns(ns: u64) {
 /// Возвращает `(нашлось, поднялось)` — вместе с загрузочным.
 ///
 /// # Safety
+/// Веха 241 — положить трамплин в низкую память и назвать ему корень таблиц и точку входа;
+/// вернуть УКАЗАТЕЛЬ НА ПОЛЕ СТЕКА, чтобы вызывающий назвал стек сам.
+///
+/// Общая на две дороги, и это не экономия строк: прикладное ядро по SIPI и ВОЗВРАТ ИЗ СНА S3
+/// начинаются одинаково — в реальном режиме по низкому физическому адресу, без длинного
+/// режима, без пейджинга и без нашей GDT. Второй копии такому коду быть не должно: разойдись
+/// они, и одна из двух дорог однажды уйдёт в тройной сбой без единого слова.
+///
+/// `None` — трамплин не поставить (загрузочные таблицы выше четырёх гигабайт).
+///
+/// # Safety
+/// Пишет в физическую страницу [`AP_BASE`]. Зовущие обязаны не делать этого одновременно:
+/// подъём ядер идёт на загрузке, сон — из системного вызова.
+pub(super) unsafe fn install_tramp(entry: u64) -> Option<*mut u64> {
+    // Загрузочные таблицы обязаны быть достижимы 32-битным CR3: трамплин ставит его ещё в
+    // защищённом режиме. У нас они в `.bss` образа, то есть заведомо низкие, — но сказать об
+    // этом вслух дешевле, чем однажды искать тройной сбой на машине с памятью выше четырёх
+    // гигабайт.
+    let cr3 = super::virt_to_phys(&raw const boot_pml4 as usize);
+    if cr3 >= 1 << 32 {
+        crate::println!("  [smp] загрузочные таблицы выше 4 ГиБ — трамплин не поставить");
+        return None;
+    }
+    // Копируем через прямую карту: физического адреса как указателя у ядра больше нет (Веха 87).
+    let src = &raw const ap_tramp_start as usize;
+    let len = &raw const ap_tramp_end as usize - src;
+    let dst = phys_to_virt(AP_BASE) as *mut u8;
+    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst, len) };
+    // Смещения полей внутри копии считаем ПО СИМВОЛАМ: держать их числами значило бы завести
+    // вторую истину о раскладке трамплина.
+    let off = |sym: usize| unsafe { dst.add(sym - src) };
+    unsafe {
+        (off(&raw const ap_cr3 as usize) as *mut u32).write_volatile(cr3 as u32);
+        (off(&raw const ap_entry as usize) as *mut u64).write_volatile(entry);
+    }
+    Some(off(&raw const ap_stack as usize) as *mut u64)
+}
+
+/// Физический адрес трамплина — его кладут в вектор пробуждения FACS (Веха 241).
+pub(super) fn tramp_pa() -> u32 {
+    AP_BASE as u32
+}
+
 /// Пишет в физическую страницу [`AP_BASE`] и рассылает межпроцессорные прерывания. Звать до
 /// `lapic::init` нельзя: ICR живёт в том же блоке регистров.
 pub unsafe fn start_aps() -> (usize, usize) {
@@ -196,33 +239,9 @@ pub unsafe fn start_aps() -> (usize, usize) {
         return (total.max(1), 1);
     }
 
-    // Загрузочные таблицы обязаны быть достижимы 32-битным CR3: прикладное ядро ставит его ещё
-    // в защищённом режиме. У нас они в `.bss` образа, то есть заведомо низкие, — но сказать об
-    // этом вслух дешевле, чем однажды искать тройной сбой на машине с памятью выше четырёх
-    // гигабайт.
-    let cr3 = super::virt_to_phys(&raw const boot_pml4 as usize);
-    if cr3 >= 1 << 32 {
-        crate::println!("  [smp] загрузочные таблицы выше 4 ГиБ — прикладные ядра не поднять");
+    let Some(p_stack) = (unsafe { install_tramp(ap_main as *const () as u64) }) else {
         return (total, 1);
-    }
-
-    // Копируем трамплин в низкую память. Через прямую карту: физического адреса как указателя
-    // у ядра больше нет (Веха 87).
-    let src = &raw const ap_tramp_start as usize;
-    let len = &raw const ap_tramp_end as usize - src;
-    let dst = phys_to_virt(AP_BASE) as *mut u8;
-    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst, len) };
-
-    // Смещения полей внутри копии считаем по символам: держать их числами значило бы завести
-    // вторую истину о раскладке трамплина.
-    let off = |sym: usize| dst.add(sym - src);
-    let p_cr3 = off(&raw const ap_cr3 as usize) as *mut u32;
-    let p_stack = off(&raw const ap_stack as usize) as *mut u64;
-    let p_entry = off(&raw const ap_entry as usize) as *mut u64;
-    unsafe {
-        p_cr3.write_volatile(cr3 as u32);
-        p_entry.write_volatile(ap_main as *const () as u64);
-    }
+    };
 
     let me = lapic::id();
     APIC_OF[0].store(me, Ordering::Relaxed); // загрузочное — ядро 0

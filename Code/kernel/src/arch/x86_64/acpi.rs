@@ -407,9 +407,9 @@ fn aml_int(aml: &[u8], p: &mut usize) -> u8 {
     }
 }
 
-/// `SLP_TYPa`/`SLP_TYPb` из объекта `_S5_` в DSDT.
-fn find_s5(dsdt: &[u8]) -> Option<(u8, u8)> {
-    let at = dsdt.windows(4).position(|w| w == b"_S5_")?;
+/// `SLP_TYPa`/`SLP_TYPb` из объекта `_Sx_` в DSDT (`_S5_` — выключение, `_S3_` — сон).
+fn find_sx(dsdt: &[u8], name: &[u8; 4]) -> Option<(u8, u8)> {
+    let at = dsdt.windows(4).position(|w| w == name)?;
     let mut p = at + 4;
     if p >= dsdt.len() || dsdt[p] != 0x12 {
         return None; // ожидали PackageOp — разбирать что-то сложнее незачем
@@ -461,7 +461,7 @@ pub fn try_power_off() {
     }
     let dlen = (rd32(head, 4) as usize).clamp(36, 0x20_0000);
     let dsdt = unsafe { phys(dsdt_pa, dlen) };
-    let Some((slp_a, slp_b)) = find_s5(dsdt) else { return };
+    let Some((slp_a, slp_b)) = find_sx(dsdt, b"_S5_") else { return };
 
     unsafe {
         // Перевести чипсет в ACPI-режим, если он ещё в legacy (SCI_EN == 0). На реальной машине
@@ -704,5 +704,102 @@ pub fn try_hypervisor_ports() {
         outw(0x604, 0x2000); // QEMU (ACPI PM1a в q35/i440fx современных версий)
         outw(0xB004, 0x2000); // Bochs и старые QEMU
         outw(0x4004, 0x3400); // VirtualBox
+    }
+}
+
+// ─── сон S3 (Веха 241) ────────────────────────────────────────────────────────
+
+/// Таблица DSDT этой машины — срез физической памяти. `None`, если её нет или она не DSDT.
+fn dsdt() -> Option<&'static [u8]> {
+    let rsdp = find_rsdp()?;
+    let fadt = find_table(rsdp, b"FACP")?;
+    let dsdt_pa = if fadt.len() >= 148 && rd64(fadt, 140) != 0 {
+        rd64(fadt, 140) as usize
+    } else if fadt.len() >= 44 {
+        rd32(fadt, 40) as usize
+    } else {
+        return None;
+    };
+    if dsdt_pa == 0 {
+        return None;
+    }
+    let head = unsafe { phys(dsdt_pa, 36) };
+    if &head[..4] != b"DSDT" {
+        return None;
+    }
+    let len = (rd32(head, 4) as usize).clamp(36, 0x20_0000);
+    Some(unsafe { phys(dsdt_pa, len) })
+}
+
+/// Значения `SLP_TYP` для сна S3 — из объекта `_S3_`, тем же коротким разбором, что и `_S5_`.
+///
+/// Разбирать ради двух чисел весь AML незачем: объект `_S3_` — это пакет из констант, и
+/// интерпретатор тут ничего не добавил бы. Остальное в сне — не ACPI, а работа с процессором и
+/// устройствами (см. `sleep.rs`).
+pub fn s3_slp_typ() -> Option<(u8, u8)> {
+    find_sx(dsdt()?, b"_S3_")
+}
+
+/// Блок УПРАВЛЕНИЯ PM1 (`PM1a_CNT_BLK`/`PM1b_CNT_BLK`) — туда пишется `SLP_TYP | SLP_EN`.
+/// Это не блок СОБЫТИЙ (`PM1a_EVT_BLK`, смещение 56), в котором живёт кнопка питания.
+pub fn pm1_control() -> Option<(u16, u16)> {
+    let fadt = find_table(find_rsdp()?, b"FACP")?;
+    if fadt.len() < 72 {
+        return None;
+    }
+    let a = rd32(fadt, 64) as u16;
+    (a != 0).then(|| (a, rd32(fadt, 68) as u16))
+}
+
+/// Физический адрес FACS — таблицы, в которой прошивке оставляют АДРЕС ВОЗВРАТА из сна.
+fn facs_pa() -> Option<usize> {
+    let fadt = find_table(find_rsdp()?, b"FACP")?;
+    let pa = if fadt.len() >= 140 && rd64(fadt, 132) != 0 {
+        rd64(fadt, 132) as usize
+    } else if fadt.len() >= 40 {
+        rd32(fadt, 36) as usize
+    } else {
+        0
+    };
+    if pa == 0 {
+        return None;
+    }
+    let h = unsafe { phys(pa, 36) };
+    (&h[..4] == b"FACS").then_some(pa)
+}
+
+/// Веха 241 — сказать прошивке, КУДА вернуть управление после пробуждения.
+///
+/// Адрес кладётся в FACS, поле `firmware_waking_vector` (смещение 12), и это тридцать два бита:
+/// прошивка передаёт управление В РЕАЛЬНОМ РЕЖИМЕ, то есть адрес обязан лежать ниже мебибайта.
+/// Второе поле, `x_firmware_waking_vector` (24), обнуляем НАРОЧНО: если оно ненулевое, прошивка
+/// предпочтёт его и прыгнет в защищённом режиме — туда, где у нас кода нет.
+///
+/// # Safety
+/// `pa` — физический адрес трамплина, выровненный на 16 байт и ниже 1 МиБ.
+pub unsafe fn set_waking_vector(pa: u32) -> bool {
+    let Some(facs) = facs_pa() else { return false };
+    let p = crate::arch::phys_to_virt(facs) as *mut u8;
+    unsafe {
+        (p.add(12) as *mut u32).write_volatile(pa);
+        (p.add(24) as *mut u64).write_volatile(0);
+    }
+    true
+}
+
+/// Веха 241 — ОЧИСТИТЬ состояние событий PM1 (все биты, запись единицами).
+///
+/// Зовётся сразу после пробуждения, до разрешения прерываний. Прошивка просыпается с
+/// выставленными битами — как минимум `WAK_STS`, а часто и `PWRBTN_STS`, — и, не сняв их, мы
+/// получили бы «кнопку питания», которую никто не нажимал: в QEMU это видно сразу, на живой
+/// машине кончилось бы выключением вместо пробуждения.
+pub fn clear_pm1_status() {
+    for port in [
+        PM1A_STS.load(core::sync::atomic::Ordering::Relaxed),
+        PM1B_STS.load(core::sync::atomic::Ordering::Relaxed),
+    ] {
+        if port != 0 {
+            unsafe { outw(port as u16, 0xffff) };
+        }
     }
 }

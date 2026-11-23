@@ -21,6 +21,8 @@ mod paging;
 mod pci;
 mod ps2;
 mod rtc;
+/// Веха 241 — сон S3: усыпить машину, сохранив память, и собрать себя после пробуждения.
+mod sleep;
 mod smp;
 mod trap;
 /// Задник текстовой консоли: VGA-память и знакогенератор. Публичен ради [`crate::textcon`],
@@ -35,6 +37,8 @@ core::arch::global_asm!(include_str!("switch.s"));
 core::arch::global_asm!(include_str!("enter_user.s"));
 // Веха 170 — трамплин прикладного ядра: 16 → 32 → 64 бита.
 core::arch::global_asm!(include_str!("ap.s"));
+// Веха 241 — сохранить и вернуть состояние процессора вокруг сна S3 (пара `setjmp`/`longjmp`).
+core::arch::global_asm!(include_str!("s3.s"));
 
 pub use pci::{
     e1000_irq_setup, probe_ahci_ports, probe_e1000, probe_virtio_blk, probe_virtio_net,
@@ -1192,10 +1196,45 @@ pub fn acpi_survey() {
     acpi::survey()
 }
 
+/// Веха 241 — УСНУТЬ В S3. Возвращает `Ok(())` ПОСЛЕ пробуждения, `Err` — почему не вышло.
+///
+/// Отказ — нормальный ответ, а не поломка: машина может не объявлять S3 вовсе, а на нескольких
+/// ядрах сон у нас пока не сделан (прикладные ядра надо сперва припарковать — см. `sleep.rs`).
+/// Отказать громко лучше, чем уснуть и не проснуться.
+///
+/// # Safety
+/// Зовётся из ядра, с запрещёнными прерываниями.
+pub unsafe fn sleep_s3() -> Result<(), &'static str> {
+    if smp::cpus_up() > 1 {
+        return Err("сон пока только на одном ядре (добавьте `cores=1` в строку загрузки)");
+    }
+    unsafe { sleep::suspend() }
+}
+
+/// Веха 241 — как заведена линия SCI: `(gsi, active_low, level)`, упакованные в число
+/// (0 — не заводили). После сна IOAPIC пуст, и линию надо завести теми же числами: заново
+/// разбирать FADT и MADT ради них значило бы иметь два места, где решается одно.
+static SCI_LINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Завести линию SCI заново — после сна S3 (см. [`SCI_LINE`]). Молча ничего не делает, если
+/// кнопку питания не включали вовсе.
+pub fn reroute_sci() {
+    let v = SCI_LINE.load(Ordering::Relaxed);
+    if v == 0 {
+        return;
+    }
+    let (gsi, active_low, level) = ((v >> 2) as u32, v & 1 != 0, v & 2 != 0);
+    ioapic::route_flags(gsi, trap::VEC_SCI, active_low, level);
+}
+
 pub fn enable_power_button(switch_mode: bool) -> bool {
     match acpi::enable_power_button(switch_mode) {
         Some((sci, active_low, level)) => {
             ioapic::route_flags(sci, trap::VEC_SCI, active_low, level);
+            SCI_LINE.store(
+                (sci as usize) << 2 | (active_low as usize) | (level as usize) << 1,
+                Ordering::Relaxed,
+            );
             crate::println!(
                 "  [acpi] кнопка питания включена (SCI {}, {}, {})",
                 sci,
@@ -1482,12 +1521,32 @@ fn timer_hz_pit() -> Option<u64> {
     Some(hz)
 }
 
+/// Веха 241 — СДВИГ счётчика тактов. Ноль до первого сна и всю жизнь машины, которая не спала.
+///
+/// Нужен затем, что после сна S3 процессор включается заново и `rdtsc` идёт С НУЛЯ. Монотонное
+/// время системы на этом пошло бы назад — а на нём стоят сроки сна процессов, таймауты IPC и
+/// кванты планировщика: все сроки разом оказались бы в далёком будущем, то есть «спящие
+/// проснутся через вечность». Сдвиг восстанавливает непрерывность: к нему прибавляется и то,
+/// что натикало до сна, и сама длительность сна (её меряют часы машины, см. `sleep.rs`).
+static TSC_OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Назначить сдвиг счётчика (зовёт пробуждение из сна).
+pub fn tsc_set_offset(v: u64) {
+    TSC_OFFSET.store(v, Ordering::Relaxed);
+}
+
+/// Текущий сдвиг — его обязан снимать всякий, кто пишет НАШЕ время в регистр процессора
+/// (таймер по сроку: `IA32_TSC_DEADLINE` сравнивается с сырым `rdtsc`).
+pub fn tsc_offset() -> u64 {
+    TSC_OFFSET.load(Ordering::Relaxed)
+}
+
 /// Веха 35 — монотонный счётчик тиков для futex-дедлайнов (`rdtsc`; частоту измеряет
 /// [`timer_hz`]). Тот же счётчик, что читает U-mode для замеров и `Instant`.
 pub fn now_ticks() -> u64 {
     let (lo, hi): (u32, u32);
     unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
-    (hi as u64) << 32 | lo as u64
+    (((hi as u64) << 32) | lo as u64).wrapping_add(TSC_OFFSET.load(Ordering::Relaxed))
 }
 
 /// Счётчик тактов для джиттер-источника энтропии. На x86 это тот же `rdtsc`, что и таймбаза:
