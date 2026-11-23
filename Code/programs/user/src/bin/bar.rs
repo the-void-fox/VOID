@@ -330,7 +330,12 @@ impl ui::Client for Bar {
             _ if self.busy() => ui::anim::FRAME_MS,
             // Веха 204 — звук считается тем же «раз в секунду»: громкость меняют и мимо нас
             // (`volume` из шелла, чужая программа), а число в панели обязано за этим поспевать.
-            _ if self.sysview != sys::NO_CAP || self.snd != sys::NO_CAP => {
+            // Веха 240 — и ради батареи: заряд, адаптер и крышка меняются мимо нас, а в
+            // панели они обязаны за этим поспевать.
+            _ if self.sysview != sys::NO_CAP
+                || self.snd != sys::NO_CAP
+                || self.acpi != sys::NO_CAP =>
+            {
                 ms_to_next_minute().min(METRIC_MS)
             }
             _ => ms_to_next_minute(),
@@ -470,6 +475,11 @@ struct Bar {
     /// Веха 204 — куда звуковая карта умеет играть и куда играет сейчас. Спрашивается вместе с
     /// состоянием миксера: список короткий и меняться может только вместе с железом.
     outs: Option<sys::snd_cli::Outputs>,
+    /// Веха 240 — КАНАЛ К СЕРВЕРУ ACPI (`endpoint:acpi-srv`, наследуется от композитора, как
+    /// звук). `NO_CAP` — сервера в системе нет, и острова батареи не будет вовсе.
+    acpi: usize,
+    /// Последний снимок питания. `None` — ещё не спрашивали или сервер не ответил.
+    batt: Option<sys::acpi_cli::Power>,
     /// Ползунок, который держат прямо сейчас: 0 — общая громкость, иначе номер голоса.
     ///
     /// Нужен затем же, зачем якорь у полосы прокрутки: пока кнопку держат, громкость ведёт
@@ -591,11 +601,13 @@ enum Slot {
     Notes = 6,
     /// Веха 204 — динамик с громкостью; за ним меню-миксер.
     Sound = 7,
+    /// Веха 240 — БАТАРЕЯ: заряд, зарядка, адаптер. Острова нет на машине без батареи.
+    Battery = 8,
 }
 
 /// Сколько всего островов знает панель. Карточка меню идёт следом отдельным индексом: она не
 /// остров ряда — её нельзя ни переставить, ни убрать, она принадлежит кнопке поколения.
-const SLOTS: usize = 8;
+const SLOTS: usize = 9;
 
 impl Slot {
     fn parse(s: &str) -> Option<Slot> {
@@ -608,6 +620,7 @@ impl Slot {
             "gen" => Slot::Gen,
             "notes" => Slot::Notes,
             "sound" => Slot::Sound,
+            "battery" => Slot::Battery,
             _ => return None,
         })
     }
@@ -647,7 +660,7 @@ fn layout_from(text: &str) -> (Vec<Slot>, Vec<Slot>, Vec<Slot>, bool) {
         (
             alloc::vec![Slot::Clock, Slot::Lang, Slot::Metrics, Slot::Spaces],
             alloc::vec![Slot::Title],
-            alloc::vec![Slot::Sound, Slot::Notes, Slot::Gen],
+            alloc::vec![Slot::Battery, Slot::Sound, Slot::Notes, Slot::Gen],
             false,
         )
     }
@@ -672,6 +685,7 @@ fn slot_names(v: &[Slot]) -> String {
             Slot::Gen => "gen",
             Slot::Notes => "notes",
             Slot::Sound => "sound",
+            Slot::Battery => "battery",
         });
     }
     s
@@ -730,6 +744,8 @@ impl Bar {
             mix_tab: 0,
             outs: None,
             vol_drag: None,
+            acpi: sys::acpi_cli::find_cap().unwrap_or(sys::NO_CAP),
+            batt: None,
             menu_card: Rect::ZERO,
             notes_row: 0,
             notes_content: 0,
@@ -1022,6 +1038,14 @@ impl Bar {
         // Пока меню закрыто, число берётся из последнего снимка; открытие его освежит.
         let vol_text = alloc::format!("{}%", self.mix.as_ref().map_or(0, |m| m.master));
         let vol_w = u.font.width(&vol_text) + th.px(4);
+        // Веха 240 — БАТАРЕЯ. Подпись — проценты, а когда их не знает сама прошивка (ACPI
+        // законно отвечает «неизвестно»), остаётся один знак: соврать нулём нельзя.
+        let bat = self.batt.filter(|p| p.any());
+        let bat_text = match bat {
+            Some(p) if p.has_percent() => alloc::format!("{}%", p.percent),
+            _ => String::new(),
+        };
+        let bat_w = if bat_text.is_empty() { 0 } else { u.font.width(&bat_text) + th.px(4) };
         let gen_w = u.font.width(&self.gen) + 2 * th.pad;
         // Все ширины сняты со шрифта ЗАРАНЕЕ: измерение строки просит шрифт изменяемо (глиф
         // может лечь в кэш), а замыкание, которое так делает, нельзя звать из `map`.
@@ -1043,6 +1067,12 @@ impl Bar {
                 // не управляет, хуже отсутствия ползунка (то же правило, что у метрик выше).
                 Slot::Sound if self.snd == sys::NO_CAP => 0,
                 Slot::Sound => ico + 2 * th.pad + vol_w,
+                // Батареи у машины нет (настольная, QEMU) — нет и острова. То же правило, что
+                // у метрик без права обзора: пустое место не обещает ничего.
+                Slot::Battery if bat.is_none() => 0,
+                // Знак шире прочих в полтора раза: батарея лежачая, и втиснуть её в квадрат
+                // значит получить пятно вместо уровня.
+                Slot::Battery => ico * 3 / 2 + 2 * th.pad + bat_w,
             }
         };
 
@@ -1099,6 +1129,7 @@ impl Bar {
         let lang_isle = at[Slot::Lang.at()];
         let n_isle = at[Slot::Notes.at()];
         let v_isle = at[Slot::Sound.at()];
+        let b_isle = at[Slot::Battery.at()];
         let t_isle = at[Slot::Title.at()];
 
         // Заголовок меняется в ДВА ТАКТА: старый гаснет, подменяется и загорается новый. Смена
@@ -1282,6 +1313,13 @@ impl Bar {
                 ]),
             },
             Isle {
+                rect: b_isle,
+                sig: sig(&[
+                    bat.map_or(0, |p| p.flags as u64),
+                    bat.map_or(0, |p| p.percent as u64),
+                ]),
+            },
+            Isle {
                 rect: if menu_t == 0 { Rect::ZERO } else { sheet },
                 sig: sig(&[menu_t as u64, card_body]),
             },
@@ -1414,6 +1452,27 @@ impl Bar {
             }
         }
 
+        // Веха 240 — БАТАРЕЯ: нарисованный уровень и проценты рядом. Уровень знаком, а не
+        // числом, потому что «сколько осталось» читается боковым зрением; число уточняет.
+        if redraw[Slot::Battery.at()] && !b_isle.is_empty() {
+            if let Some(p) = bat {
+                let inner = u.island(b_isle);
+                let mut d = inner;
+                let ir = d.cut_left(ico * 3 / 2);
+                let on_ac = p.on_ac().unwrap_or(false);
+                u.battery(
+                    Rect::new(ir.x, b_isle.y + (isle_h - ico) / 2, ico * 3 / 2, ico),
+                    if p.has_percent() { p.percent } else { 0 },
+                    p.charging(),
+                    on_ac,
+                );
+                if !bat_text.is_empty() {
+                    let col = if p.critical() { th.danger } else { th.text };
+                    u.label(d, &bat_text, col, Align::Right);
+                }
+            }
+        }
+
         if redraw[I_CARD] {
             // Стереть надо и УГОЛКИ карточки: они торчат за её прямоугольник (слева сверху и
             // справа снизу), и без запаса от прошлого кадра остался бы их след.
@@ -1504,7 +1563,7 @@ impl Bar {
         // Веха 204 — заодно ГРОМКОСТЬ: её число стоит в панели постоянно, а не только при
         // открытом меню. Спрашивать его лишь на открытии значило бы показывать «0 %» до
         // первого щелчка — то есть врать знаком «звук выключен» на исправной системе.
-        let mix_changed = self.sample_mix();
+        let mix_changed = self.sample_mix() | self.sample_power();
         if self.sysview == sys::NO_CAP {
             return mix_changed;
         }
@@ -1539,6 +1598,22 @@ impl Bar {
         };
         let changed = seen(&now) != seen(&self.mix);
         self.mix = now;
+        changed
+    }
+
+    /// Веха 240 — переспросить сервер ACPI о питании. `true` — изменилось видимое.
+    ///
+    /// Раз в секунду, вместе с метриками и громкостью: спрашивать чаще незачем (заряд меняется
+    /// минутами), реже — значит показывать вчерашнее после того, как выдернули кабель. Сам
+    /// сервер держит снимок и к железу ходит не чаще раза в секунду, так что частый вопрос
+    /// ему ничего не стоит.
+    fn sample_power(&mut self) -> bool {
+        if self.acpi == sys::NO_CAP {
+            return false;
+        }
+        let now = sys::acpi_cli::power(self.acpi);
+        let changed = now != self.batt;
+        self.batt = now;
         changed
     }
 

@@ -35,9 +35,9 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         // сериализовал бы всё равно всё, добавив лишь способы ошибиться. Один реактор проще и
         // честнее; ждать СРАЗУ кадра и IPC-сообщения (вместо опроса) научит Веха 91.
         4 => {
-            let (rbuf, rcap, mode, timeout) = {
+            let (rbuf, rcap, mode, timeout, f4) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1), f.arg(2), f.arg(3))
+                (f.arg(0), f.arg(1), f.arg(2), f.arg(3), f.arg(4))
             };
             t.procs[cur].recv_buf = rbuf;
             t.procs[cur].recv_cap = rcap;
@@ -64,13 +64,28 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             } else {
                 // Веха 91: дедлайн живёт в том же поле, что у futex - механика пробуждения по
                 // времени уже есть (`wake_futex_timeouts`), заводить вторую незачем.
-                t.procs[cur].futex_deadline =
-                    (mode >= 2).then(|| arch::now_ticks().wrapping_add(timeout as u64));
+                //
+                // Веха 240 — у вида 5 ноль значит «без срока»: сервер при железе ждёт события,
+                // а не тика, и срок ему не нужен вовсе. У видов 2–4 ноль по-прежнему означает
+                // «проснуться немедленно» — на этом стоят их опрашивающие вызовы.
+                t.procs[cur].futex_deadline = (mode >= 2 && !(mode == 5 && timeout == 0))
+                    .then(|| arch::now_ticks().wrapping_add(timeout as u64));
                 // Режим 3: разбудить ещё и приходом кадра - тогда сервер реагирует на сеть
                 // мгновенно, а не на ближайшем тике таймера.
                 t.procs[cur].wake_on_net = mode == 3;
                 // Веха 103 — режим 4: разбудить и по клавише (реактор терминала).
                 t.procs[cur].wake_on_key = mode == 4;
+                // Веха 240 — режим 5: разбудить и по ПРЕРЫВАНИЮ ПРОШИВКИ. Право на прерывание
+                // называется ЗДЕСЬ, пятым аргументом, и это не формальность: по нему ядро
+                // решает, какую линию взводить (у сервера ACPI это SCI, а не линия драйвера —
+                // размаскировать чужое значило бы проспать своё). Нет права — режим молча
+                // вырождается в обычный сон по сроку, и это честно: без права будить некого.
+                t.procs[cur].wake_on_irq = mode == 5
+                    && cap::irq(t.procs[cur].domain, Cap::from_bits(f4 as u64), Rights::READ)
+                        .map(|vector| {
+                            super::dev::arm_irq_line(vector);
+                        })
+                        .is_ok();
                 t.procs[cur].state = State::RecvWait; // sepc не двигаем: доставка сделает это
                 if let Some(n) = t.next_runnable(cur) {
                     t.set_cur(n);

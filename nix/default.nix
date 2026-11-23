@@ -209,14 +209,14 @@ let
       # заголовок, по которому библиотека НЕ собиралась.
       acpi_srv = stdenv.mkDerivation {
         pname = "acpi-srv";
-        version = "0.236";
+        version = "0.240";
         src = ../Code/programs/acpi-srv;
         dontConfigure = true;
         hardeningDisable = [ "all" ];
         buildPhase = ''
           $CC ${voidCFlags} -I${void-libc}/lib -I${uacpi}/include \
             -O2 -static -Wall -Wextra \
-            main.c glue.c tables.c ec.c ${uacpi}/lib/libuacpi.a -o acpi-srv
+            main.c glue.c tables.c ec.c power.c ${uacpi}/lib/libuacpi.a -o acpi-srv
         '';
         installPhase = ''
           mkdir -p $out/bin

@@ -231,6 +231,15 @@ struct Proc {
     /// Веха 91 — процесс спит в `SYS_RECV` и просил будить его ещё и ПРИХОДОМ КАДРА
     /// (режим 3): так сетевой сервер просыпается от карты, а не от таймера.
     wake_on_net: bool,
+    /// Веха 240 — тот же приём для ПРЕРЫВАНИЯ ПРОШИВКИ: процесс спит в `SYS_RECV`, но
+    /// просыпается и по своему IRQ.
+    ///
+    /// Понадобилось серверу ACPI, и причина общая для всякого сервера при железе: он обязан
+    /// обслуживать два источника — запросы программ и прерывание устройства, — а ждать умел
+    /// только на одном. Оставался опрос: `SYS_IRQ_WAIT` с коротким сроком и `try_recv` следом,
+    /// то есть холостые пробуждения в простаивающей системе (цена этого уже измерена — см.
+    /// комментарий про `wake_on_key`).
+    wake_on_irq: bool,
     /// Веха 103 — тот же приём для КЛАВИАТУРЫ: процесс спит в `SYS_RECV`, но просыпается и от
     /// ввода с консоли. Без этого реактор терминала обязан был крутиться по таймеру: ждать
     /// сообщения и клавишу ОДНОВРЕМЕННО было нечем.
@@ -686,6 +695,19 @@ fn drain_userdrv_irq(t: &mut Table) -> bool {
             p.ready_at = arch::now_ticks();
             woke = true;
         }
+        // Веха 240 — и тех, кто ждал прерывания ВМЕСТЕ с запросом (`SYS_RECV` вид 5). Ответ
+        // тот же, что у кадра сети: «запроса не было» — сервер сходит к железу и вернётся.
+        if p.state == State::RecvWait && p.wake_on_irq {
+            let f = &mut p.frame;
+            f.set_ret(usize::MAX);
+            f.set_ret_at(2, 0);
+            f.advance();
+            p.state = State::Runnable;
+            p.ready_at = arch::now_ticks();
+            p.futex_deadline = None;
+            p.wake_on_irq = false;
+            woke = true;
+        }
     }
     woke
 }
@@ -738,6 +760,7 @@ fn create_process_locked(
         call_root: None,
         call_dest: usize::MAX,
         wake_on_net: false,
+        wake_on_irq: false,
         wake_on_key: false,
         reads_console: false,
         pages: 0,
@@ -808,6 +831,7 @@ fn create_thread_locked(t: &mut Table, leader: usize, entry: usize, arg: usize, 
         call_root: None,
         call_dest: usize::MAX,
         wake_on_net: false,
+        wake_on_irq: false,
         wake_on_key: false,
         reads_console: false,
         pages: 0, // не используется у нити: учёт ведёт лидер

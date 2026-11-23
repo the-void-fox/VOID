@@ -309,17 +309,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     // Веха 238 — ЧТО взводить, решает вектор из права. Сервер ACPI ждёт SCI, а
                     // не линию драйвера, и взводить ему чужое значило бы размаскировать
                     // прерывание карты, которую никто не слушает, — и проспать своё.
-                    #[cfg(target_arch = "x86_64")]
-                    if vector == arch::sci_vector() {
-                        arch::sci_irq_arm();
-                    } else {
-                        arch::userdrv_irq_arm();
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        let _ = vector;
-                        arch::userdrv_irq_arm();
-                    }
+                    arm_irq_line(vector);
                     if let Some(n) = t.next_runnable(cur) {
                         t.set_cur(n);
                     }
@@ -848,4 +838,27 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Веха 240 — ВЗВЕСТИ линию прерывания (размаскировать), на которую указывает право.
+///
+/// Вынесено из `SYS_IRQ_WAIT`, потому что звать это стало и второе место: `SYS_RECV` вида 5,
+/// где сервер ждёт запроса И прерывания разом. Пока код жил в одном месте, он был частью
+/// вызова; теперь он правило, и правило одно на оба входа.
+///
+/// Какую линию — решает ВЕКТОР из права. Сервер ACPI ждёт SCI, а не линию драйвера, и взводить
+/// ему чужое значило бы размаскировать прерывание карты, которую никто не слушает, — и проспать
+/// своё.
+pub(super) fn arm_irq_line(vector: u8) {
+    #[cfg(target_arch = "x86_64")]
+    if vector == arch::sci_vector() {
+        arch::sci_irq_arm();
+    } else {
+        arch::userdrv_irq_arm();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = vector;
+        arch::userdrv_irq_arm();
+    }
 }

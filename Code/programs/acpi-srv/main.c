@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "syscall.h"
+#include "power.h"
 
 #include <uacpi/event.h>
 #include <uacpi/namespace.h>
@@ -48,109 +49,8 @@ extern int ec_events(void);
 extern int glue_run_work(void);
 extern int tables_build(void);
 
-/* ─── чтение найденных устройств ──────────────────────────────────────────── */
-
-/* `_BST` возвращает пакет из четырёх чисел: состояние, ток, остаток, напряжение. Смысл
- * состояния — биты: 1 разряжается, 2 заряжается, 4 «критически мало». */
-static void report_battery(uacpi_namespace_node *node, const char *path) {
-    uacpi_object *obj = UACPI_NULL;
-    uacpi_status st = uacpi_eval_simple_typed(node, "_BST", UACPI_OBJECT_PACKAGE_BIT, &obj);
-    if (st != UACPI_STATUS_OK) {
-        printf("[acpi] %s: _BST не ответил (%s)\n", path, uacpi_status_to_string(st));
-        return;
-    }
-    uacpi_object_array arr;
-    if (uacpi_object_get_package(obj, &arr) != UACPI_STATUS_OK || arr.count < 4) {
-        printf("[acpi] %s: _BST вернул не пакет из четырёх чисел\n", path);
-        uacpi_object_unref(obj);
-        return;
-    }
-    uacpi_u64 v[4] = { 0, 0, 0, 0 };
-    for (int i = 0; i < 4; i++) {
-        uacpi_object_get_integer(arr.objects[i], &v[i]);
-    }
-    uacpi_object_unref(obj);
-
-    /* 0xFFFFFFFF в ACPI значит «неизвестно». Показать его как число значило бы соврать
-     * правдоподобно — говорим словом. */
-    const char *state = (v[0] & 4)   ? "критически мало"
-                        : (v[0] & 2) ? "заряжается"
-                        : (v[0] & 1) ? "разряжается"
-                                     : "полна";
-    printf("[acpi] %s: %s", path, state);
-    if (v[2] == 0xffffffffu) {
-        printf(", остаток неизвестен\n");
-    } else {
-        printf(", остаток %llu мВт·ч, напряжение %llu мВ\n", (unsigned long long)v[2],
-               (unsigned long long)v[3]);
-    }
-
-    /* Паспорт батареи — отдельным методом; из него берём полную ёмкость, чтобы остаток можно
-     * было перевести в проценты. */
-    obj = UACPI_NULL;
-    st = uacpi_eval_simple_typed(node, "_BIF", UACPI_OBJECT_PACKAGE_BIT, &obj);
-    if (st == UACPI_STATUS_OK && uacpi_object_get_package(obj, &arr) == UACPI_STATUS_OK
-        && arr.count >= 13) {
-        uacpi_u64 full = 0, design = 0;
-        uacpi_object_get_integer(arr.objects[1], &design);
-        uacpi_object_get_integer(arr.objects[2], &full);
-        if (full != 0 && full != 0xffffffffu && v[2] != 0xffffffffu) {
-            printf("[acpi] %s: %llu %% (полная %llu, проектная %llu)\n", path,
-                   (unsigned long long)(v[2] * 100 / full), (unsigned long long)full,
-                   (unsigned long long)design);
-        }
-    }
-    if (obj) {
-        uacpi_object_unref(obj);
-    }
-}
-
-static uacpi_iteration_decision on_battery(void *user, uacpi_namespace_node *node, uacpi_u32 d) {
-    const uacpi_char *path = uacpi_namespace_node_generate_absolute_path(node);
-    (void)d;
-    (*(int *)user)++;
-    report_battery(node, path ? path : "?");
-    if (path) {
-        uacpi_free_absolute_path(path);
-    }
-    return UACPI_ITERATION_DECISION_CONTINUE;
-}
-
-static uacpi_iteration_decision on_lid(void *user, uacpi_namespace_node *node, uacpi_u32 d) {
-    const uacpi_char *path = uacpi_namespace_node_generate_absolute_path(node);
-    uacpi_u64 open = 0;
-    uacpi_status st = uacpi_eval_simple_integer(node, "_LID", &open);
-    (void)d;
-    (*(int *)user)++;
-    if (st == UACPI_STATUS_OK) {
-        printf("[acpi] %s: крышка %s\n", path ? path : "?", open ? "открыта" : "закрыта");
-    } else {
-        printf("[acpi] %s: _LID не ответил (%s)\n", path ? path : "?",
-               uacpi_status_to_string(st));
-    }
-    if (path) {
-        uacpi_free_absolute_path(path);
-    }
-    return UACPI_ITERATION_DECISION_CONTINUE;
-}
-
-static uacpi_iteration_decision on_ac(void *user, uacpi_namespace_node *node, uacpi_u32 d) {
-    const uacpi_char *path = uacpi_namespace_node_generate_absolute_path(node);
-    uacpi_u64 online = 0;
-    uacpi_status st = uacpi_eval_simple_integer(node, "_PSR", &online);
-    (void)d;
-    (*(int *)user)++;
-    if (st == UACPI_STATUS_OK) {
-        printf("[acpi] %s: адаптер %s\n", path ? path : "?", online ? "подключён" : "отключён");
-    } else {
-        printf("[acpi] %s: _PSR не ответил (%s)\n", path ? path : "?",
-               uacpi_status_to_string(st));
-    }
-    if (path) {
-        uacpi_free_absolute_path(path);
-    }
-    return UACPI_ITERATION_DECISION_CONTINUE;
-}
+/* Чтение устройств переехало в `power.c` (Веха 240): сервер теперь не рассказывает о
+ * состоянии один раз на подъёме, а ОТВЕЧАЕТ о нём, пока жив. Здесь остался только подъём. */
 
 /* Заглушка под кнопку питания. Пока прерывание SCI ловит ядро, сюда управление не попадёт —
  * см. длинное пояснение в `main`. Когда попадёт, здесь будет чистое выключение сеанса. */
@@ -260,17 +160,11 @@ int main(void) {
                uacpi_status_to_string(st));
     }
 
-    int batteries = 0, lids = 0, acs = 0;
-    uacpi_find_devices("PNP0C0A", on_battery, &batteries);
-    uacpi_find_devices("PNP0C0D", on_lid, &lids);
-    uacpi_find_devices("ACPI0003", on_ac, &acs);
+    /* Найти устройства ОДИН раз и назвать состояние словами. Дальше о нём спрашивают
+     * (`OP_POWER`), а не читают в журнале: журнал — ответ на «работает ли вообще». */
+    power_find();
+    power_report();
     glue_run_work();
-
-    if (batteries == 0 && lids == 0 && acs == 0) {
-        /* Это не поломка: у настольной машины ни батареи, ни крышки и нет. Сказать надо
-         * ровно это, а не «не работает». */
-        printf("[acpi] батареи, крышки и адаптера эта машина не объявляет\n");
-    }
 
     /* ─── ЦИКЛ СОБЫТИЙ (Веха 238) ─────────────────────────────────────────────
      *
@@ -287,13 +181,44 @@ int main(void) {
      * если мы однажды не снимем причину в регистрах прошивки, линия останется замаскированной
      * навсегда. Проснувшись по сроку, мы её взведём заново — и в худшем случае событие
      * опоздает на секунду, а не потеряется насовсем. */
+    /* Веха 240 — и ЗАПРОСЫ ПРОГРАММ в том же ожидании.
+     *
+     * Сервер при железе обязан обслуживать два источника: прерывание прошивки и вопросы тех,
+     * кто хочет знать о питании (панель). Ждать на двух сразу раньше было нечем — пришлось бы
+     * опрашивать, то есть будить процесс десятки раз в секунду в простаивающей системе. Для
+     * этого в ядре и появился `SYS_RECV` вида 5: спать до запроса ИЛИ до своего прерывания.
+     *
+     * Без права на SCI (машина без ACPI-прерывания) вид 5 вырождается в обычный сон по сроку,
+     * и сервер остаётся полезным: спросить прошивку всё равно можно. */
     if (!glue_has_sci()) {
-        printf("[acpi] событий ждать нечем — выхожу (прошивку можно только спрашивать)\n");
-        return 0;
+        printf("[acpi] прерывания прошивки нет — отвечаю на вопросы, событий не жду\n");
+    } else {
+        printf("[acpi] жду события прошивки и вопросы о питании\n");
     }
-    printf("[acpi] жду события прошивки\n");
     for (;;) {
-        vsys_irq_wait_to(sci, 1000000000ull); /* секунда */
-        glue_handle_sci();
+        uint8_t req[64];
+        vsys_msg m = vsys_recv_irq(req, sizeof req, sci, 1000000000ull /* секунда */);
+        if (m.op == VOID_NO_CAP) {
+            /* Запроса не было: разбудило прерывание либо истёк срок. Срок здесь не страховка
+             * от потерянного прерывания, а защита от ЗАВИСШЕЙ линии: SCI уровневый, ядро
+             * маскирует его на время нашей работы, и не сними мы однажды причину в регистрах
+             * прошивки — линия осталась бы замаскированной навсегда. */
+            glue_handle_sci();
+            continue;
+        }
+        uint8_t rsp[POWER_MSG_LEN];
+        switch (m.op) {
+        case OP_POWER: {
+            int n = power_pack(rsp);
+            vsys_reply(m.reply, rsp, (size_t)n);
+            break;
+        }
+        default:
+            /* Пустой ответ значит «не знаю такой операции». Клиент увидит нулевую длину и
+             * скажет об этом сам — молчать в ответ нельзя: он ждёт нас заблокированным. */
+            vsys_reply(m.reply, rsp, 0);
+            break;
+        }
+        glue_run_work();
     }
 }

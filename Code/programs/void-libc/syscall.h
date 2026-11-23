@@ -13,7 +13,9 @@
 #define SYS_WRITE 1
 #define SYS_EXIT 2
 #define SYS_YIELD 3
+#define SYS_RECV 4
 #define SYS_CALL 5
+#define SYS_REPLY 6
 #define SYS_READ 14
 #define SYS_MAP 17
 #define SYS_ARGS 18
@@ -76,6 +78,28 @@ static inline uintptr_t vsys(uintptr_t n, uintptr_t a0, uintptr_t a1, uintptr_t 
     return r0;
 }
 
+/* Веха 240 — вызов с ЧЕТЫРЬМЯ возвратами: `SYS_RECV` отдаёт op, reply-право, длину и право из
+ * сообщения разными регистрами, и обычный `vsys` (только a0) терял три из четырёх. */
+typedef struct {
+    uintptr_t op, reply, len, cap;
+} vsys_msg;
+
+static inline vsys_msg vsys4(uintptr_t n, uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                             uintptr_t a4) {
+    register uintptr_t rn asm("a7") = n;
+    register uintptr_t r0 asm("a0") = a0;
+    register uintptr_t r1 asm("a1") = a1;
+    register uintptr_t r2 asm("a2") = a2;
+    register uintptr_t r3 asm("a3") = a3;
+    register uintptr_t r4 asm("a4") = a4;
+    asm volatile("ecall"
+                 : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
+                 : "r"(rn), "r"(r4)
+                 : "memory");
+    vsys_msg m = {r0, r1, r2, r3};
+    return m;
+}
+
 static inline __attribute__((noreturn)) void vsys_exit(uintptr_t code) {
     register uintptr_t rn asm("a7") = SYS_EXIT;
     register uintptr_t r0 asm("a0") = code;
@@ -103,6 +127,23 @@ static inline uintptr_t vsys(uintptr_t n, uintptr_t a0, uintptr_t a1, uintptr_t 
                  : "b"(a6), "r"(r10), "r"(r8), "r"(r9)
                  : "memory", "cc");
     return n;
+}
+
+/* Веха 240 — см. риск-овый двойник выше: четыре возврата вместо одного. */
+typedef struct {
+    uintptr_t op, reply, len, cap;
+} vsys_msg;
+
+static inline vsys_msg vsys4(uintptr_t n, uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                             uintptr_t a4) {
+    register uintptr_t r10 asm("r10") = a3;
+    register uintptr_t r8 asm("r8") = a4;
+    asm volatile("int $0x80"
+                 : "+a"(n), "+D"(a0), "+S"(a1), "+d"(a2)
+                 : "r"(r10), "r"(r8)
+                 : "memory", "cc");
+    vsys_msg m = {n, a0, a1, a2};
+    return m;
 }
 
 static inline __attribute__((noreturn)) void vsys_exit(uintptr_t code) {
@@ -143,6 +184,35 @@ static inline uintptr_t vsys_call(uintptr_t ep, uintptr_t op, const void *send,
                                   size_t send_len, void *recv, size_t recv_len) {
     return vsys(SYS_CALL, ep, op, (uintptr_t)send, send_len, (uintptr_t)recv, recv_len,
                 VOID_NO_CAP);
+}
+
+/* Таймбаза системы (`SYS_TIME` вид 2): тиков в секунду. Спрашивается один раз — значение не
+ * меняется, а сроки ядра считаются в ТИКАХ, и своей константы тут быть не должно: на живом
+ * процессоре TSC идёт втрое быстрее, чем «примерно гигагерц». */
+static inline uint64_t vsys_tick_hz(void) {
+    static uint64_t cached = 0;
+    if (!cached) {
+        uintptr_t hz = vsys(SYS_TIME, 2, 0, 0, 0, 0, 0, 0);
+        cached = hz ? (uint64_t)hz : 1;
+    }
+    return cached;
+}
+
+/* Веха 240 — `SYS_RECV` вид 5: ждать запрос ИЛИ ПРЕРЫВАНИЕ своего устройства.
+ *
+ * То, без чего сервер при железе обязан опрашивать: ждать он умеет только на одном источнике, а
+ * обслуживает два. `irq_cap` — право на прерывание (по нему ядро знает, какую линию взвести);
+ * `timeout_ns == 0` — ждать без срока. Поле `op == VOID_NO_CAP` значит «запроса не было»:
+ * разбудило прерывание или истёк срок, и сервер идёт смотреть железо. */
+static inline vsys_msg vsys_recv_irq(void *buf, size_t len, uintptr_t irq_cap,
+                                     uint64_t timeout_ns) {
+    uint64_t ticks = timeout_ns ? (timeout_ns * vsys_tick_hz() + 999999999u) / 1000000000u : 0;
+    return vsys4(SYS_RECV, (uintptr_t)buf, len, 5, (uintptr_t)ticks, irq_cap);
+}
+
+/* Ответ клиенту по одноразовому reply-праву из [`vsys_recv_irq`]. */
+static inline uintptr_t vsys_reply(uintptr_t reply_cap, const void *buf, size_t len) {
+    return vsys(SYS_REPLY, reply_cap, (uintptr_t)buf, len, VOID_NO_CAP, 0, 0, 0);
 }
 
 /* ─── драйверные syscall'ы (Веха 54): нити + MMIO/DMA/IRQ фундамента Вех 51–52 ─── */
