@@ -500,7 +500,7 @@ pub fn try_power_off() {
 /// q35 линия SCI объявлена именно там. Первая версия ставила «level, active-low» по букве
 /// спецификации ACPI — и прерывание не приходило вовсе: QEMU объявляет её active-high, а
 /// IOAPIC честно ждал противоположного уровня.
-pub fn enable_power_button() -> Option<(u32, bool, bool)> {
+pub fn enable_power_button(switch_mode: bool) -> Option<(u32, bool, bool)> {
     let rsdp = find_rsdp()?;
     let fadt = find_table(rsdp, b"FACP")?;
     if fadt.len() < 89 {
@@ -522,7 +522,15 @@ pub fn enable_power_button() -> Option<(u32, bool, bool)> {
         let smi_cmd = rd32(fadt, 48);
         let acpi_enable = fadt[52];
         let pm1a_cnt = rd32(fadt, 64) as u16;
-        if smi_cmd != 0 && acpi_enable != 0 && pm1a_cnt != 0 && inw(pm1a_cnt) & 1 == 0 {
+        //
+        // Веха 240.1 — `switch_mode == false` значит «режим ACPI включит кто-то другой».
+        // Другой — это сервер ACPI: uACPI делает это при подъёме, иначе прошивка с ней не
+        // разговаривает. Нам эта запись обходится ДОРОГО и не нашим временем: `outb` в
+        // командный порт поднимает SMI, и машина стоит в режиме управления прошивки, пока её
+        // обработчик не вернётся. На X54C это **секунда** — ровно она и лежала между двумя
+        // строками загрузки. Сервер заплатит её сам, уже своим процессом, не задерживая
+        // остальную загрузку.
+        if switch_mode && smi_cmd != 0 && acpi_enable != 0 && pm1a_cnt != 0 && inw(pm1a_cnt) & 1 == 0 {
             outb(smi_cmd as u16, acpi_enable);
             // Веха 239.1 — ждём ПО ВРЕМЕНИ, а не по числу оборотов, и говорим, чем кончилось.
             //

@@ -1192,8 +1192,8 @@ pub fn acpi_survey() {
     acpi::survey()
 }
 
-pub fn enable_power_button() -> bool {
-    match acpi::enable_power_button() {
+pub fn enable_power_button(switch_mode: bool) -> bool {
+    match acpi::enable_power_button(switch_mode) {
         Some((sci, active_low, level)) => {
             ioapic::route_flags(sci, trap::VEC_SCI, active_low, level);
             crate::println!(
