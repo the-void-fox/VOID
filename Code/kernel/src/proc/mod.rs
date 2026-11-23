@@ -1429,8 +1429,13 @@ pub fn handle_user_trap(frame: &mut TrapFrame, trap: UserTrap) -> ! {
                 if t.procs[cur].linux && is_linux_syscall_insn(&t, cur) {
                     linux_syscall(&mut t, cur);
                 } else {
+                    // Веха 238.1 — КТО умер, а не только где. Строка без имени стоила захода:
+                    // в журнале с живого X54C лежало «неожиданный trap (код 0x27)», и чей это
+                    // процесс, приходилось выводить по тому, чьих строк в журнале больше нет.
                     println!(
-                        "  [proc] неожиданный trap из U (код {:#x}) @ pc={:#x} — процесс завершён",
+                        "  [proc] P{} «{}»: неожиданный trap из U (код {:#x}) @ pc={:#x} — процесс завершён",
+                        cur,
+                        cap::domain_name(t.procs[cur].domain),
                         code,
                         t.procs[cur].frame.user_pc()
                     );
