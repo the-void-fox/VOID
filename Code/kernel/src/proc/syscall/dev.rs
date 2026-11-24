@@ -792,6 +792,8 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                             crate::intel_modeset::set_trace(false);
                             Some(u32::from(ok))
                         }
+                        // Веха 244.3 — чем железо отличается от состояния при загрузке.
+                        4 => Some(crate::intel_modeset::diff() as u32),
                         _ => None,
                     };
                     r.map_or(usize::MAX, |v| v as usize)

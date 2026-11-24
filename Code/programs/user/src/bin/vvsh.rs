@@ -2147,6 +2147,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"intel", "разведка дисплея Intel: конвейеры, плоскости, GTT, подсветка");
     help_row(b"intel test", "проба узором: положить в кадр полосы и рамку — что видно глазом");
     help_row(b"intel modeset", "проба своего модсета: погасить цепь панели и поднять её заново");
+    help_row(b"intel diff", "чем регистры дисплея отличаются от состояния при загрузке");
     help_row(b"acpi DSDT [N]", "выдать таблицу прошивки шестнадцатеричным текстом (для разбора на хосте)");
     help_row(b"brightness [%]", "яркость панели Intel; без числа — показать нынешнюю");
     help_row(b"poweroff", "выключить машину");
@@ -3519,6 +3520,13 @@ fn sh_intel(args: &[Value]) -> Result<Value, EvalError> {
         // Веха 244 — проба СВОЕГО МОДСЕТА. `intel off` гасит всю цепь панели, `intel on`
         // поднимает её заново нашими руками; `intel modeset` — то и другое подряд. Экран при
         // этом гаснет по-настоящему, поэтому `modeset` печатает ответ ПОСЛЕ подъёма.
+        if &**s == "diff" {
+            let n = sys::panel_diff(hw).unwrap_or(u32::MAX);
+            return Ok(Value::str(&alloc::format!(
+                "расхождений с загрузкой: {}\nсписок — в журнале ядра (`klog | grep расхождение`)\n",
+                if n == u32::MAX { "снимка нет".into() } else { alloc::format!("{n}") },
+            )));
+        }
         if &**s == "off" || &**s == "on" || &**s == "modeset" {
             let mut out = String::new();
             if &**s != "on" {
@@ -3537,7 +3545,7 @@ fn sh_intel(args: &[Value]) -> Result<Value, EvalError> {
             return Ok(Value::str(&out));
         }
         return Err(EvalError::new(
-            "intel: (intel) — разведка, \"test\" — узор, \"off\"/\"on\"/\"modeset\" — проба модсета",
+            "intel: (intel) — разведка, \"test\" — узор, \"off\"/\"on\"/\"modeset\" — проба модсета, \"diff\" — сверка с загрузкой",
         ));
     }
     let mut out = String::new();

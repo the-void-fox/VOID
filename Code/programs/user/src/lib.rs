@@ -1823,6 +1823,13 @@ pub fn panel_power(mmio_cap: usize, on: bool) -> Option<u32> {
     (r != usize::MAX).then_some(r as u32)
 }
 
+/// Веха 244.3 — сравнить регистры дисплея с состоянием при загрузке; расхождения уходят в
+/// журнал ядра. Возвращает их число.
+pub fn panel_diff(mmio_cap: usize) -> Option<u32> {
+    let r = abi::syscall(SYS_VIDEO_BACKLIGHT, mmio_cap, 4, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r as u32)
+}
+
 /// `SYS_VIDEO_INFO(mmio_cap, out)` (Веха 97): геометрия и раскладка цвета экрана. Право то же,
 /// что на окно фреймбуфера, — числа неотделимы от права рисовать. `None` — нет права или экрана.
 pub fn video_info(mmio_cap: usize) -> Option<VideoInfo> {
