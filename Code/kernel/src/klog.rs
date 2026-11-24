@@ -150,15 +150,7 @@ pub fn push(bytes: &[u8]) {
         if AT_LINE_START.load(Ordering::Relaxed) && b != b'\n' {
             at = stamp(at);
         }
-        unsafe { BUF[at % CAP] = b };
-        // Веха 243.5 — то же самое в память, переживающую перезагрузку. Вторая запись, а не
-        // перенос кольца туда: кольцо читают из прерываний и из-под замка вывода, и зависеть
-        // от того, удалось ли отрезать память, этот путь не должен.
-        let p = PERSIST.load(Ordering::Relaxed);
-        if p != 0 {
-            unsafe { core::ptr::write_volatile((p + HDR + at % CAP) as *mut u8, b) };
-        }
-        at = at.wrapping_add(1);
+        at = put(at, b);
         AT_LINE_START.store(b == b'\n', Ordering::Relaxed);
     }
     WRITTEN.store(at, Ordering::Relaxed);
@@ -196,10 +188,24 @@ fn stamp(mut at: usize) -> usize {
     buf[9] = b'0' + (frac % 10) as u8;
     buf[10] = b']';
     for &b in buf.iter().chain(b" ".iter()) {
-        unsafe { BUF[at % CAP] = b };
-        at = at.wrapping_add(1);
+        at = put(at, b);
     }
     at
+}
+
+/// Положить байт в кольцо И в его зеркало, переживающее перезагрузку.
+///
+/// Отдельной функцией, потому что писать в оба места надо ВЕЗДЕ: первая версия зеркалила
+/// только строки, а отметку времени писала мимо — и сохранённый журнал приехал с мусором
+/// вместо каждой отметки. Одна дверь вместо двух — чтобы такого больше не вышло.
+#[inline]
+fn put(at: usize, b: u8) -> usize {
+    unsafe { BUF[at % CAP] = b };
+    let p = PERSIST.load(Ordering::Relaxed);
+    if p != 0 {
+        unsafe { core::ptr::write_volatile((p + HDR + at % CAP) as *mut u8, b) };
+    }
+    at.wrapping_add(1)
 }
 
 /// Сколько байт потеряно вытеснением (0 — журнал с самого начала загрузки).

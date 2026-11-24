@@ -47,6 +47,8 @@ unsafe extern "C" {
     static s3_mode_w: u8;
     static s3_mode_h: u8;
     static s3_mode_bpp: u8;
+    static s3_mode_w2: u8;
+    static s3_mode_h2: u8;
     static s3_mode_flags: u8;
     static s3_mode_result: u8;
     static s3_mode_lfb: u8;
@@ -66,7 +68,7 @@ static USE_POST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// # Safety
 /// Пишет в физическую страницу [`S3_BASE`]. Она ниже кучи ядра, и аллокатор фреймов туда не
 /// ходит (`frame::alloc_floor` начинается за образом ядра).
-unsafe fn install_tramp(w: u16, h: u16, bpp: u16) -> bool {
+unsafe fn install_tramp(w: u16, h: u16, bpp: u16, w2: u16, h2: u16) -> bool {
     let Some(cr3) = smp::boot_cr3() else {
         crate::println!("  [acpi] загрузочные таблицы выше 4 ГиБ — трамплин пробуждения не поставить");
         return false;
@@ -85,6 +87,11 @@ unsafe fn install_tramp(w: u16, h: u16, bpp: u16) -> bool {
         (at(&raw const s3_mode_w as usize) as *mut u16).write_volatile(w);
         (at(&raw const s3_mode_h as usize) as *mut u16).write_volatile(h);
         (at(&raw const s3_mode_bpp as usize) as *mut u16).write_volatile(bpp);
+        // Запасной режим — тот, что ставил загрузчик. Нужен, потому что режим, в котором
+        // система работает, видео-BIOS может не знать вовсе: на панель её родного размера
+        // ядро переходит САМО (Веха 232), и в списке VBE такого режима нет.
+        (at(&raw const s3_mode_w2 as usize) as *mut u16).write_volatile(w2);
+        (at(&raw const s3_mode_h2 as usize) as *mut u16).write_volatile(h2);
         // Бит 1 — ставить режим; бит 0 — звать POST (только если в прошлый раз не вышло).
         let flags = 2 | u16::from(USE_POST.load(Ordering::Relaxed));
         (at(&raw const s3_mode_flags as usize) as *mut u16).write_volatile(flags);
@@ -218,6 +225,27 @@ extern "C" fn resume_entry() -> ! {
                     );
                 }
             }
+            3 => {
+                // Видео-BIOS знает только режим загрузчика — он его и поставил. Наш (родной
+                // размер панели) ставили мы сами, значит и вернуть его должны сами: той же
+                // дорогой, что на загрузке.
+                crate::println!("  [video] видео-BIOS вернул режим загрузчика (кадр {lfb:#x})");
+                if let Some((base, _)) = crate::fb::window() {
+                    let (bw, bh, bbpp) = super::video_mode().unwrap_or((0, 0, 32));
+                    let bpitch = bw * bbpp / 8;
+                    if crate::intel_fb::init(base, bpitch, bw, bh) {
+                        match crate::intel_fb::new_mode() {
+                            Some((nw, nh, np)) if nw == w && nh == h && np == our_pitch => {
+                                crate::println!("  [intel] родной размер панели вернули ({nw}×{nh})");
+                            }
+                            other => crate::println!(
+                                "  [intel] после сна размер панели вышел другим: {other:?}, \
+                                 а система работает в {w}×{h} (шаг {our_pitch})",
+                            ),
+                        }
+                    }
+                }
+            }
             2 => {
                 USE_POST.store(true, Ordering::Relaxed);
                 crate::println!(
@@ -259,7 +287,10 @@ pub unsafe fn suspend() -> Result<(), &'static str> {
     // пролог, возвращающий видеорежим через видео-BIOS (`s3tramp.s`), а звать видео-BIOS при
     // подъёме ядра посреди работы системы нельзя — экраном в этот момент владеет композитор.
     let (w, h, _pitch, bpp, _) = crate::fb::info();
-    if !unsafe { install_tramp(w as u16, h as u16, bpp as u16) } {
+    // Второй кандидат — режим ЗАГРУЗЧИКА: его видео-BIOS знает наверняка, а наш текущий может
+    // не знать (на родной размер панели ядро переходит само).
+    let (w2, h2) = super::video_mode().map_or((0, 0), |(w, h, _)| (w as u16, h as u16));
+    if !unsafe { install_tramp(w as u16, h as u16, bpp as u16, w2, h2) } {
         return Err("трамплин возврата не поставить");
     }
     if !unsafe { acpi::set_waking_vector(S3_BASE as u32) } {

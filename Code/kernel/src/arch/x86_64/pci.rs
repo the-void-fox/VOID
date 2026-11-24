@@ -564,7 +564,7 @@ pub fn probe_ahci_ports() -> Option<(usize, [u32; MAX_DISKS], usize)> {
 
 /// Сколько устройств помним. Больше на машинах, куда ставят VOID, не встречалось; не поместилось
 /// — скажем вслух, а не потеряем молча.
-const SAVED_MAX: usize = 32;
+const SAVED_MAX: usize = 48;
 
 /// Что помним про устройство: кто он (BDF), команда, шесть BAR, кэш-линия/латентность и линия
 /// прерывания. Это ровно то, что обнуляется и что нужно, чтобы устройство снова заработало.
@@ -587,7 +587,11 @@ pub fn save_state() {
     let mut g = SAVED.lock();
     let (list, n) = &mut *g;
     *n = 0;
-    find::<()>(BUS0, |d| {
+    // ВСЕ шины, а не только нулевая, и это не придирка: за мостами живут самые нужные
+    // устройства — у X54C там контроллер xHCI (его флешкой машина и грузится), Wi-Fi и
+    // Ethernet. Первая версия берегла только нулевую шину, и после сна xHCI читался как
+    // `0xffffffff`: мы просто не вернули ему окна памяти.
+    find::<()>(ALL_BUSES, |d| {
         if *n < SAVED_MAX {
             list[*n] = Saved {
                 bdf: d.0,
@@ -613,7 +617,7 @@ static BRIDGE: SpinLock<(u16, [u32; 64], bool)> = SpinLock::new((0, [0; 64], fal
 fn save_bridge() {
     let mut g = BRIDGE.lock();
     g.2 = false;
-    find::<()>(BUS0, |d| {
+    find::<()>(ALL_BUSES, |d| {
         if d.class() == (0x06, 0x01, 0x00) && !g.2 {
             g.0 = d.0;
             for (i, slot) in g.1.iter_mut().enumerate() {

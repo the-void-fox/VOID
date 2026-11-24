@@ -39,6 +39,8 @@
 .set OFF_H,      0x27A          # высота, точек (u16)
 .set OFF_BPP,    0x27C          # бит на точку (u16)
 .set OFF_FLAGS,  0x27E          # 1 — звать POST, 2 — ставить режим
+.set OFF_W2,     0x28C          # ЗАПАСНОЙ режим: ширина (его ставил загрузчик)
+.set OFF_H2,     0x28E          # запасной: высота
 .set OFF_RESULT, 0x280          # что вышло: 0 не пробовали, 1 режим поставлен, 2 не нашли
 .set OFF_LFB,    0x284          # физический адрес кадра у найденного режима (u32)
 .set OFF_PITCH,  0x288          # шаг строки найденного режима (u16)
@@ -90,7 +92,14 @@ s3_set_mode:
     int 0x10
     cmp ax, 0x004F
     jne s3_video_fail
+    # Ищем ДВАЖДЫ. Сперва режим, в котором система работает сейчас; если его в списке нет —
+    # тот, что ставил ЗАГРУЗЧИК. Разница на живой машине оказалась решающей: панель у неё
+    # 1366×768, но это НАШ режим (на родной размер панели ядро переходит само, Веха 232), а
+    # видео-BIOS знает только свои — у владельца 1024×768. Первый поиск промахивался,
+    # и экран оставался мёртвым.
+    mov dx, 0                       # dx — номер попытки: 0 наш режим, 1 запасной
     # VideoModePtr — дальний указатель по смещению 0x0E (смещение, затем сегмент).
+s3_try_list:
     mov si, [S3_BASE + OFF_VBE + 0x0E]
     mov ax, [S3_BASE + OFF_VBE + 0x10]
     mov gs, ax
@@ -99,7 +108,7 @@ s3_next_mode:
     mov cx, gs:[si]
     add si, 2
     cmp cx, 0xFFFF
-    je s3_video_fail
+    je s3_list_end
     push si
     mov di, S3_BASE + OFF_MI
     mov ax, 0x4F01
@@ -113,10 +122,22 @@ s3_next_mode:
     cmp ax, 0x0091
     jne s3_next_mode
     mov ax, [S3_BASE + OFF_MI + 0x12]
+    cmp dx, 0
+    jne s3_cmp_w2
     cmp ax, [S3_BASE + OFF_W]
+    jmp s3_cmp_w_done
+s3_cmp_w2:
+    cmp ax, [S3_BASE + OFF_W2]
+s3_cmp_w_done:
     jne s3_next_mode
     mov ax, [S3_BASE + OFF_MI + 0x14]
+    cmp dx, 0
+    jne s3_cmp_h2
     cmp ax, [S3_BASE + OFF_H]
+    jmp s3_cmp_h_done
+s3_cmp_h2:
+    cmp ax, [S3_BASE + OFF_H2]
+s3_cmp_h_done:
     jne s3_next_mode
     xor ax, ax
     mov al, [S3_BASE + OFF_MI + 0x19]
@@ -135,8 +156,22 @@ s3_next_mode:
     or bx, 0xC000
     mov ax, 0x4F02
     int 0x10
-    mov word ptr [S3_BASE + OFF_RESULT], 1
+    # 1 — поставлен НАШ режим, 3 — запасной (ядру придётся вернуть свой поверх него).
+    mov ax, dx
+    add ax, 1
+    add ax, dx                      # dx=0 → 1, dx=1 → 3
+    mov [S3_BASE + OFF_RESULT], ax
     jmp s3_video_done
+
+s3_list_end:
+    # Список кончился. Если искали свой режим — попробовать запасной (его ставил загрузчик).
+    cmp dx, 0
+    jne s3_video_fail
+    mov ax, [S3_BASE + OFF_W2]
+    cmp ax, 0
+    je s3_video_fail
+    mov dx, 1
+    jmp s3_try_list
 
 s3_video_fail:
     mov word ptr [S3_BASE + OFF_RESULT], 2
@@ -244,6 +279,16 @@ s3_mode_lfb:
 .org OFF_PITCH
 .global s3_mode_pitch
 s3_mode_pitch:
+    .short 0
+
+.org OFF_W2
+.global s3_mode_w2
+s3_mode_w2:
+    .short 0
+
+.org OFF_H2
+.global s3_mode_h2
+s3_mode_h2:
     .short 0
 
 .org OFF_END
