@@ -2146,6 +2146,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     // Веха 232 — шаг C: разведка дисплея Intel и яркость панели (на virtio их нет).
     help_row(b"intel", "разведка дисплея Intel: конвейеры, плоскости, GTT, подсветка");
     help_row(b"intel test", "проба узором: положить в кадр полосы и рамку — что видно глазом");
+    help_row(b"intel modeset", "проба своего модсета: погасить цепь панели и поднять её заново");
     help_row(b"acpi DSDT [N]", "выдать таблицу прошивки шестнадцатеричным текстом (для разбора на хосте)");
     help_row(b"brightness [%]", "яркость панели Intel; без числа — показать нынешнюю");
     help_row(b"poweroff", "выключить машину");
@@ -3515,7 +3516,29 @@ fn sh_intel(args: &[Value]) -> Result<Value, EvalError> {
         if &**s == "test" {
             return intel_test(hw);
         }
-        return Err(EvalError::new("intel: (intel) — разведка, (intel \"test\") — проба узором"));
+        // Веха 244 — проба СВОЕГО МОДСЕТА. `intel off` гасит всю цепь панели, `intel on`
+        // поднимает её заново нашими руками; `intel modeset` — то и другое подряд. Экран при
+        // этом гаснет по-настоящему, поэтому `modeset` печатает ответ ПОСЛЕ подъёма.
+        if &**s == "off" || &**s == "on" || &**s == "modeset" {
+            let mut out = String::new();
+            if &**s != "on" {
+                sys::panel_power(hw, false);
+                out.push_str("цепь панели погашена\n");
+            }
+            if &**s != "off" {
+                let ok = sys::panel_power(hw, true) == Some(1);
+                out.push_str(if ok {
+                    "панель поднята своим модсетом\n"
+                } else {
+                    "свой модсет панель не поднял — причина в `klog`\n"
+                });
+            }
+            out.push_str("подробности шагов — в журнале ядра (`klog | grep intel`)\n");
+            return Ok(Value::str(&out));
+        }
+        return Err(EvalError::new(
+            "intel: (intel) — разведка, \"test\" — узор, \"off\"/\"on\"/\"modeset\" — проба модсета",
+        ));
     }
     let mut out = String::new();
     out.push_str("РАЗВЕДКА ДИСПЛЕЯ INTEL (ничего не записано)\n\n");

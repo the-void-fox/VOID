@@ -777,6 +777,14 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                     let r = match op {
                         0 => crate::intel_fb::backlight(),
                         1 => crate::intel_fb::backlight_set(percent as u32),
+                        // Веха 244 — ПРОБА СВОЕГО МОДСЕТА на живой машине, без сна. Погасить
+                        // цепь и поднять её заново — это ровно то, что делает пробуждение,
+                        // только журнал потом можно прочитать: система-то на ходу.
+                        2 => {
+                            crate::intel_modeset::disable();
+                            Some(0)
+                        }
+                        3 => Some(u32::from(crate::intel_modeset::enable())),
                         _ => None,
                     };
                     r.map_or(usize::MAX, |v| v as usize)

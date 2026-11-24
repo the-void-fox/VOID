@@ -157,6 +157,7 @@ mod timer;
 mod trace;
 #[cfg(target_arch = "x86_64")]
 mod intel_fb;
+mod intel_modeset;
 mod virtio;
 mod virtio_blk;
 mod virtio_gpu;
@@ -591,6 +592,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                 }
             }
             fb::set_extra_buffers(intel_fb::step());
+            // Веха 244 — снимок рабочей настройки дисплея. ИМЕННО ЗДЕСЬ: режим уже наш
+            // (родной размер панели), плоскость и масштабатор уже настроены. Снимок нужен
+            // пробуждению: видео-BIOS на машине владельца панель не возвращает, и поднимать
+            // её придётся этими числами ([[intel-display]]).
+            intel_modeset::snapshot();
         }
     }
     // Веха 86 — часы: спросить у платформы настенное время (CMOS RTC на x86, goldfish-rtc из DTB

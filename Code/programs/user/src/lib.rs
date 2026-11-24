@@ -1814,6 +1814,15 @@ pub fn backlight_set(mmio_cap: usize, percent: u32) -> Option<u32> {
     (r != usize::MAX).then_some(r as u32)
 }
 
+/// Веха 244 — ПРОБА СВОЕГО МОДСЕТА: погасить всю цепь панели (`on = false`) и поднять её
+/// заново (`on = true`). Это то же самое, что делает пробуждение, только на ходу — значит
+/// журнал потом можно прочитать. `None` — нет права или машина не та.
+pub fn panel_power(mmio_cap: usize, on: bool) -> Option<u32> {
+    let op = if on { 3 } else { 2 };
+    let r = abi::syscall(SYS_VIDEO_BACKLIGHT, mmio_cap, op, 0, 0, 0, 0, 0).0;
+    (r != usize::MAX).then_some(r as u32)
+}
+
 /// `SYS_VIDEO_INFO(mmio_cap, out)` (Веха 97): геометрия и раскладка цвета экрана. Право то же,
 /// что на окно фреймбуфера, — числа неотделимы от права рисовать. `None` — нет права или экрана.
 pub fn video_info(mmio_cap: usize) -> Option<VideoInfo> {
