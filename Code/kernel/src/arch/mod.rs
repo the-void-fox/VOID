@@ -199,6 +199,10 @@ pub use imp::{io_read, io_write};
 /// линию и каким вектором он зовётся.
 #[cfg(target_arch = "x86_64")]
 pub use imp::{sci_irq_arm, sci_set_owned, sci_vector};
+/// Веха 243.7 — попросить POST видео-BIOS на ближайшем пробуждении (`suspend post`). Только
+/// x86: у riscv-virt ни видео-BIOS, ни реального режима, где его можно позвать, нет.
+#[cfg(target_arch = "x86_64")]
+pub use imp::request_video_post;
 
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`

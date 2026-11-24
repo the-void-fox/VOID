@@ -51,8 +51,29 @@ unsafe extern "C" {
     static s3_mode_h2: u8;
     static s3_mode_flags: u8;
     static s3_mode_result: u8;
+    static s3_video_bdf: u8;
     static s3_mode_lfb: u8;
     static s3_mode_pitch: u8;
+}
+
+/// Просили ли звать POST видео-BIOS на ближайшем сне. Ставится `suspend post`, снимается
+/// самим сном: опыт одноразовый, случайно повторить его нельзя.
+static POST_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Попросить позвать POST видео-BIOS на ближайшем пробуждении.
+pub fn request_video_post(on: bool) {
+    POST_REQ.store(on, Ordering::Relaxed);
+}
+
+/// Где на шине живёт графика: `AH` — шина, `AL` — устройство с функцией. Ищем по классу, а не
+/// по заводскому номеру: машина не обязана быть Intel.
+fn video_bdf() -> u16 {
+    for bdf in 0..0x100u16 {
+        if super::pci_cfg_read32(bdf, 0) != u32::MAX && super::pci_cfg_read32(bdf, 0x08) >> 24 == 0x03 {
+            return bdf;
+        }
+    }
+    0
 }
 
 /// Куда кладётся трамплин пробуждения. Отдельная страница от трамплина прикладных ядер
@@ -88,10 +109,16 @@ unsafe fn install_tramp(w: u16, h: u16, bpp: u16, w2: u16, h2: u16) -> bool {
         // ядро переходит САМО (Веха 232), и в списке VBE такого режима нет.
         (at(&raw const s3_mode_w2 as usize) as *mut u16).write_volatile(w2);
         (at(&raw const s3_mode_h2 as usize) as *mut u16).write_volatile(h2);
-        // Бит 1 — ставить режим. POST видео-BIOS трамплин решает сам: он зовёт его вторым
-        // заходом, если режима не нашлось, — в том же пробуждении, а не «в следующий раз»
-        // (владелец перезагружался между снами, и «следующий раз» не наступал никогда).
-        (at(&raw const s3_mode_flags as usize) as *mut u16).write_volatile(2);
+        // Бит 1 — ставить режим; бит 0 — звать POST видео-BIOS, если режима не нашлось.
+        //
+        // POST — ПО ЯВНОЙ ПРОСЬБЕ (`suspend post`), и это не осторожность вообще, а память о
+        // конкретном: на X54C он подвесил машину наглухо, пробуждение не дошло ни до одной
+        // строки журнала. Отдельным опытом — можно; по умолчанию — нет.
+        let flags = 2 | u16::from(POST_REQ.swap(false, Ordering::Relaxed));
+        (at(&raw const s3_mode_flags as usize) as *mut u16).write_volatile(flags);
+        // Где графика живёт на шине: AH — шина, AL — устройство с функцией. Так велит
+        // соглашение о точке входа ПЗУ устройства PCI, и без этого POST не знает, кого поднимать.
+        (at(&raw const s3_video_bdf as usize) as *mut u16).write_volatile(video_bdf());
         (at(&raw const s3_mode_result as usize) as *mut u16).write_volatile(0);
     }
     true
@@ -202,11 +229,11 @@ extern "C" fn resume_entry() -> ! {
         // видео-BIOS, пока мы были в реальном режиме (единственное место, где это возможно).
         let (res, lfb, pitch) = tramp_video();
         let (w, h, our_pitch, _, _) = crate::fb::info();
-        if res >= 4 {
+        if res == 5 || res == 7 {
             crate::println!("  [video] режим вернулся только после POST видео-BIOS");
         }
-        match res & 3 {
-            1 => {
+        match res {
+            1 | 5 => {
                 crate::println!(
                     "  [video] видео-BIOS вернул режим {w}×{h} (кадр {lfb:#x}, шаг {pitch})",
                 );
@@ -225,7 +252,7 @@ extern "C" fn resume_entry() -> ! {
                     );
                 }
             }
-            3 => {
+            3 | 7 => {
                 // Видео-BIOS знает только режим загрузчика — он его и поставил. Наш (родной
                 // размер панели) ставили мы сами, значит и вернуть его должны сами: той же
                 // дорогой, что на загрузке.
@@ -246,8 +273,14 @@ extern "C" fn resume_entry() -> ! {
                     }
                 }
             }
+            // Два разных отказа, и лечатся они разным. «ПЗУ молчит» — графика после сна без
+            // питания, её не поднять вопросами о режимах; «режима нет в списке» — ПЗУ живо, но
+            // наших размеров не знает. До Вехи 243.7 обе беды выглядели в журнале одинаково.
             2 => crate::println!(
-                "  [video] видео-BIOS не вернул режим ни до POST, ни после — экран остался тёмным",
+                "  [video] видео-BIOS не отвечает (4F00) — графика после сна не поднята",
+            ),
+            6 => crate::println!(
+                "  [video] видео-BIOS жив, но режима {w}×{h} в его списке нет",
             ),
             _ => {}
         }
@@ -257,7 +290,7 @@ extern "C" fn resume_entry() -> ! {
                 v => Some(v as u32),
             };
             crate::intel_fb::resume(saved);
-        } else if res != 1 {
+        } else if res != 1 && res != 5 {
             // Запасной путь для эмуляторов: интерфейс Bochs VBE (DISPI). Зовётся, только если
             // видео-BIOS режима не вернул, — делать ту же работу дважды незачем.
             let (_, _, pitch, bpp, _) = crate::fb::info();

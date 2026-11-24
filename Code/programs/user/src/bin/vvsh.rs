@@ -2149,7 +2149,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"acpi DSDT [N]", "выдать таблицу прошивки шестнадцатеричным текстом (для разбора на хосте)");
     help_row(b"brightness [%]", "яркость панели Intel; без числа — показать нынешнюю");
     help_row(b"poweroff", "выключить машину");
-    help_row(b"suspend", "уснуть (S3) — машина гаснет, память остаётся");
+    help_row(b"suspend", "уснуть (S3) — машина гаснет, память остаётся (`suspend post` — с POST видео-BIOS)");
     help_row(b"reboot", "перезагрузить машину");
     help_row(b"store-probe", "замер: сколько store принимает за сессию (МиБ)");
     help_row(b"nar-unpack", "разложить NAR из корня store в файлы");
@@ -4114,7 +4114,11 @@ fn sh_poweroff(_args: &[Value]) -> Result<Value, EvalError> {
 ///
 /// Право то же, что у выключения (`power`), и по той же причине: действие над всей машиной.
 /// Отличие — вызов ВОЗВРАЩАЕТСЯ: команда допечатает строку, когда машину разбудят.
-fn sh_suspend(_args: &[Value]) -> Result<Value, EvalError> {
+fn sh_suspend(args: &[Value]) -> Result<Value, EvalError> {
+    // `suspend post` — тот же сон, но на пробуждении зовём POST видео-BIOS. Это ОПЫТ: на
+    // X54C он подвесил машину наглухо (выключать пришлось удержанием кнопки), и обычный
+    // `suspend` его не зовёт никогда.
+    let post = matches!(args.first(), Some(Value::Str(s)) if &**s == "post");
     let pc = sys::win::cap_or_grant(10);
     if pc == sys::NO_CAP {
         return Err(EvalError::new(
@@ -4131,7 +4135,11 @@ fn sh_suspend(_args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::new("suspend: прошивка не дала приготовиться ко сну"));
     }
     sys::write(sys::i18n::t("засыпаю…\n").as_bytes());
-    if !sys::suspend(pc) {
+    if post {
+        sys::write("POST видео-BIOS на пробуждении — опыт, машина может не вернуться\n".as_bytes());
+    }
+    let woke = if post { sys::suspend_with_video_post(pc) } else { sys::suspend(pc) };
+    if !woke {
         // Почему именно не вышло, уже сказано в журнале ядра: машина может не объявлять S3,
         // а на нескольких ядрах сон у нас пока не сделан.
         return Err(EvalError::new("suspend: уснуть не вышло — причина в `klog`"));

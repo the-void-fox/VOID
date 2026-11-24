@@ -1242,6 +1242,11 @@ pub fn restart_aps() {
 ///
 /// # Safety
 /// Зовётся из ядра, с запрещёнными прерываниями.
+pub fn request_video_post(on: bool) {
+    sleep::request_video_post(on);
+}
+
+/// Уснуть в S3.
 pub unsafe fn sleep_s3() -> Result<(), &'static str> {
     // Веха 243 — прикладные ядра к этому моменту уже припаркованы планировщиком (см.
     // `proc::drain_sleep`). Проверяем, а не надеемся: уснуть с живым соседом значит разбудить
