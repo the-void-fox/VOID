@@ -781,10 +781,17 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         // цепь и поднять её заново — это ровно то, что делает пробуждение,
                         // только журнал потом можно прочитать: система-то на ходу.
                         2 => {
+                            crate::intel_modeset::set_trace(true);
                             crate::intel_modeset::disable();
+                            crate::intel_modeset::set_trace(false);
                             Some(0)
                         }
-                        3 => Some(u32::from(crate::intel_modeset::enable())),
+                        3 => {
+                            crate::intel_modeset::set_trace(true);
+                            let ok = crate::intel_modeset::enable();
+                            crate::intel_modeset::set_trace(false);
+                            Some(u32::from(ok))
+                        }
                         _ => None,
                     };
                     r.map_or(usize::MAX, |v| v as usize)

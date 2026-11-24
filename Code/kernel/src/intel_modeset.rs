@@ -69,6 +69,16 @@ mod reg {
     pub const DSPSTRIDE: usize = 0x70188;
     pub const DSPSURF: usize = 0x7019c;
     pub const DSPTILEOFF: usize = 0x701a4;
+    /// Счётчик кадров конвейера A: по его изменению видно, что развёртка живая и что
+    /// выключение плоскости УЖЕ защёлкнулось.
+    pub const FRMCOUNT: usize = 0x70040;
+    /// Плоскость КУРСОРА и плоскость наложения (спрайт). Это тоже плоскости конвейера, и
+    /// перед его выключением они обязаны молчать — ровно это проверяет `assert_planes_disabled`
+    /// в i915, а у нас курсор аппаратный и работал.
+    pub const CURCNTR: usize = 0x70080;
+    pub const CURBASE: usize = 0x70084;
+    pub const CURPOS: usize = 0x70088;
+    pub const DVSCNTR: usize = 0x72180;
     pub const BLC_CPU_CTL2: usize = 0x48250;
     pub const BLC_CPU_CTL: usize = 0x48254;
     /// Водяные знаки: сколько конвейер успевает набрать в очередь, прежде чем начнёт показывать.
@@ -120,6 +130,10 @@ mod bit {
     pub const PIPE_STATE: u32 = 1 << 30;
     /// Плоскость (то, что читает пиксели из памяти).
     pub const PLANE_ENABLE: u32 = 1 << 31;
+    /// Плоскость наложения (спрайт) — у неё свой бит включения.
+    pub const DVS_ENABLE: u32 = 1 << 31;
+    /// Вид курсора: нули в младших битах и есть «курсора нет» (`MCURSOR_MODE_DISABLE`).
+    pub const CURSOR_MODE_MASK: u32 = 0x27;
     /// Транскодер PCH.
     pub const TRANS_ENABLE: u32 = 1 << 31;
     pub const TRANS_STATE: u32 = 1 << 30;
@@ -192,6 +206,9 @@ struct Snap {
     dspstride: u32,
     dspsurf: u32,
     dsptileoff: u32,
+    curcntr: u32,
+    curbase: u32,
+    curpos: u32,
     blc_cpu_ctl: u32,
     blc_cpu_ctl2: u32,
     wm_pipe_a: u32,
@@ -230,11 +247,44 @@ struct Snap {
 
 static SNAP: SpinLock<Option<Snap>> = SpinLock::new(None);
 
-fn rd(off: usize) -> u32 {
+/// Говорить ли в журнал о КАЖДОМ обращении к регистру. Включается на время модсета.
+///
+/// Это не отладочный мусор, а единственный способ разбора на этой машине: экран во время
+/// модсета тёмен, последовательного порта нет, а журнал переживает перезагрузку. Если машина
+/// повиснет на обращении к регистру — в журнале останется ровно оно, последней строкой.
+/// Первый же заход так и вышел: `disable()` не напечатал даже своей последней строки, и
+/// место зависания пришлось угадывать.
+static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_trace(on: bool) {
+    TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn tracing() -> bool {
+    TRACE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Чтение БЕЗ трассировки — для опросных циклов. С трассировкой они залили бы журнал
+/// тысячами одинаковых строк и стёрли то, ради чего он ведётся.
+fn rd_raw(off: usize) -> u32 {
     arch::hw_read32(crate::intel_fb::bar0() + off)
 }
 
+fn rd(off: usize) -> u32 {
+    if tracing() {
+        crate::println!("  [intel] ← {off:#07x}");
+    }
+    let v = arch::hw_read32(crate::intel_fb::bar0() + off);
+    if tracing() {
+        crate::println!("  [intel] ← {off:#07x} = {v:#010x}");
+    }
+    v
+}
+
 fn wr(off: usize, v: u32) {
+    if tracing() {
+        crate::println!("  [intel] → {off:#07x} = {v:#010x}");
+    }
     arch::hw_write32(crate::intel_fb::bar0() + off, v);
 }
 
@@ -264,7 +314,7 @@ fn udelay(us: u64) {
 fn wait_set(off: usize, mask: u32, us: u64) -> bool {
     let until = arch::now_ticks() + crate::clock::ns_to_ticks(us * 1000);
     loop {
-        if rd(off) & mask == mask {
+        if rd_raw(off) & mask == mask {
             return true;
         }
         if arch::now_ticks() >= until {
@@ -278,11 +328,26 @@ fn wait_set(off: usize, mask: u32, us: u64) -> bool {
 fn wait_clear(off: usize, mask: u32, us: u64) -> bool {
     let until = arch::now_ticks() + crate::clock::ns_to_ticks(us * 1000);
     loop {
-        if rd(off) & mask == 0 {
+        if rd_raw(off) & mask == 0 {
             return true;
         }
         if arch::now_ticks() >= until {
             return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Дождаться смены кадра: выключение плоскости защёлкивается на обратном ходе луча, и пока
+/// это не случилось, плоскость для железа ВСЁ ЕЩЁ ЧИТАЕТ память. Выключать под ней конвейер
+/// нельзя — i915 про это говорит прямо: «иначе можем подвесить дисплей».
+fn wait_frame() {
+    let was = rd(reg::FRMCOUNT);
+    let until = arch::now_ticks() + crate::clock::ns_to_ticks(50_000_000);
+    while rd_raw(reg::FRMCOUNT) == was {
+        if arch::now_ticks() >= until {
+            crate::println!("  [intel] кадр не сменился за 50 мс — развёртка уже стоит");
+            return;
         }
         core::hint::spin_loop();
     }
@@ -318,6 +383,9 @@ pub fn snapshot() {
         dspstride: rd(reg::DSPSTRIDE),
         dspsurf: rd(reg::DSPSURF),
         dsptileoff: rd(reg::DSPTILEOFF),
+        curcntr: rd(reg::CURCNTR),
+        curbase: rd(reg::CURBASE),
+        curpos: rd(reg::CURPOS),
         blc_cpu_ctl: rd(reg::BLC_CPU_CTL),
         blc_cpu_ctl2: rd(reg::BLC_CPU_CTL2),
         wm_pipe_a: rd(reg::WM_PIPE_A),
@@ -418,7 +486,7 @@ fn train_step(lock: u32) -> bool {
         rmw(reg::FDI_TX_CTL, bit::FDI_VOL_EMP_MASK, param);
         udelay(500);
         for _ in 0..5 {
-            let iir = rd(reg::FDI_RX_IIR);
+            let iir = rd_raw(reg::FDI_RX_IIR);
             if iir & lock != 0 {
                 // Биты IIR сбрасываются ЗАПИСЬЮ ЕДИНИЦЫ — иначе следующий шаблон увидит
                 // старую отметку и решит, что уже защёлкнулся.
@@ -574,6 +642,10 @@ pub fn enable() -> bool {
     wr(reg::DSPTILEOFF, s.dsptileoff);
     wr(reg::DSPCNTR, s.dspcntr | bit::PLANE_ENABLE);
     wr_post(reg::DSPSURF, s.dspsurf);
+    // Курсор — отдельной плоскостью, как и гасили.
+    wr(reg::CURPOS, s.curpos);
+    wr(reg::CURCNTR, s.curcntr);
+    wr_post(reg::CURBASE, s.curbase);
 
     crate::println!(
         "  [intel] панель поднята своими руками: PIPECONF {:#010x}, TRANSCONF {:#010x}, \
@@ -607,10 +679,18 @@ pub fn disable() {
     }
     rmw(reg::PCH_LVDS, bit::LVDS_PORT_EN, 0);
 
-    // 2. Плоскость — и только потом конвейер: иначе она продолжит качать пиксели в
-    // выключающуюся цепь.
+    // 2. ВСЕ плоскости — и только потом конвейер. Плоскостей у конвейера три: кадр, курсор и
+    // наложение; i915 требует молчания от каждой, а первый заход на живой машине повис
+    // именно здесь — курсор у нас аппаратный и продолжал читать память.
     rmw(reg::DSPCNTR, bit::PLANE_ENABLE, 0);
-    wr_post(reg::DSPSURF, rd(reg::DSPSURF));
+    wr(reg::DSPSURF, rd(reg::DSPSURF));
+    rmw(reg::CURCNTR, bit::CURSOR_MODE_MASK, 0);
+    wr(reg::CURBASE, rd(reg::CURBASE));
+    if rd(reg::DVSCNTR) & bit::DVS_ENABLE != 0 {
+        rmw(reg::DVSCNTR, bit::DVS_ENABLE, 0);
+    }
+    // И дождаться кадра: до обратного хода луча выключение плоскостей не действует.
+    wait_frame();
     rmw(reg::PIPECONF, bit::PIPE_ENABLE, 0);
     if !wait_clear(reg::PIPECONF, bit::PIPE_STATE, 100_000) {
         crate::println!("  [intel] конвейер не выключился (PIPECONF {:#010x})", rd(reg::PIPECONF));

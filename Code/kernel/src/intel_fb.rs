@@ -509,7 +509,10 @@ pub fn resume(saved: Option<u32>) {
             crate::println!("  [intel] конвейер выключен, а снимка режима нет — поднимать нечем");
             return;
         }
-        if !crate::intel_modeset::enable() {
+        crate::intel_modeset::set_trace(true);
+        let raised = crate::intel_modeset::enable();
+        crate::intel_modeset::set_trace(false);
+        if !raised {
             crate::println!("  [intel] свой модсет не поднял панель — экран останется тёмным");
             return;
         }
