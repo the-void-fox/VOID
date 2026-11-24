@@ -125,6 +125,8 @@ pub fn adopt_persistent(va: usize, len: usize) {
         }
         core::ptr::write_volatile((va + 8) as *mut u64, have as u64);
     }
+    FLUSHED.store(0, Ordering::Relaxed);
+    flush_persist(va, have);
 }
 
 /// Сколько байт прошлого журнала сохранилось (0 — прошлого нет).
@@ -214,8 +216,55 @@ fn put(at: usize, b: u8) -> usize {
     let p = PERSIST.load(Ordering::Relaxed);
     if p != 0 {
         unsafe { core::ptr::write_volatile((p + HDR + at % CAP) as *mut u8, b) };
+        // Конец строки — вытолкнуть написанное в ПАМЯТЬ. Без этого зеркало живёт в кэше, а
+        // кэш не переживает ни зависания, ни снятия питания: после жёсткой перезагрузки
+        // журнал обрывался на том месте, до которого процессор СЛУЧАЙНО успел выгрузить
+        // строки, — и это стоило нам нескольких заходов разбора вслепую (24.11). Хуже того,
+        // счётчик в заголовке мог выгрузиться позже данных, и журнал выглядел длиннее, чем
+        // был, — хвост читался как мусор.
+        if b == b'\n' || at.wrapping_sub(FLUSHED.load(Ordering::Relaxed)) >= 512 {
+            flush_persist(p, at.wrapping_add(1));
+        }
     }
     at.wrapping_add(1)
+}
+
+/// Докуда зеркало вытолкнуто в память (а не осело в кэше).
+static FLUSHED: AtomicUsize = AtomicUsize::new(0);
+
+/// Вытолкнуть в память всё зеркало до позиции `upto` и заголовок при нём.
+///
+/// Заголовок — ОБЯЗАТЕЛЬНО вместе с данными и ПОСЛЕ них: он говорит, сколько байт считать
+/// настоящими, и если он уйдёт в память раньше хвоста, читатель примет за журнал то, чего
+/// никто не писал.
+fn flush_persist(p: usize, upto: usize) {
+    let from = FLUSHED.swap(upto, Ordering::Relaxed);
+    if upto.wrapping_sub(from) > CAP {
+        // Отстали больше, чем вмещает кольцо, — вытолкнуть его целиком.
+        return flush_range(p, upto.wrapping_sub(CAP), upto);
+    }
+    flush_range(p, from, upto);
+}
+
+fn flush_range(p: usize, from: usize, upto: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_clflush, _mm_sfence};
+        let mut pos = from;
+        while pos < upto {
+            let a = p + HDR + pos % CAP;
+            _mm_clflush(a as *const u8);
+            // До конца этой линии кэша — остальные байты в ней уже накрыты.
+            pos += 64 - a % 64;
+        }
+        _mm_clflush(p as *const u8);
+        _mm_sfence();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (p, from, upto);
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
 }
 
 /// Сколько байт потеряно вытеснением (0 — журнал с самого начала загрузки).
