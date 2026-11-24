@@ -115,6 +115,16 @@ pub fn adopt_persistent(va: usize, len: usize) {
         core::ptr::write_volatile((va + 8) as *mut u64, 0);
     }
     PERSIST.store(va, Ordering::Relaxed);
+    // Перенести в зеркало то, что уже напечатано ДО его появления: баннер, карту памяти,
+    // экран. Иначе сохранённый журнал начинается с мусора — тех байт, которых мы не писали, —
+    // и читатель первым делом решает, что он битый (так и вышло у владельца).
+    let have = WRITTEN.load(Ordering::Relaxed).min(CAP);
+    unsafe {
+        for i in 0..have {
+            core::ptr::write_volatile((va + HDR + i) as *mut u8, BUF[i]);
+        }
+        core::ptr::write_volatile((va + 8) as *mut u64, have as u64);
+    }
 }
 
 /// Сколько байт прошлого журнала сохранилось (0 — прошлого нет).

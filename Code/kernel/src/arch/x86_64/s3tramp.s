@@ -39,6 +39,9 @@
 .set OFF_H,      0x27A          # высота, точек (u16)
 .set OFF_BPP,    0x27C          # бит на точку (u16)
 .set OFF_FLAGS,  0x27E          # 1 — звать POST, 2 — ставить режим
+.set OFF_TRY,    0x290          # номер попытки поиска: 0 наш режим, 1 режим загрузчика
+.set OFF_PTR,    0x292          # где стоим в списке режимов (смещение и сегмент)
+.set OFF_MODE,   0x296          # номер режима, который сейчас разглядываем
 .set OFF_W2,     0x28C          # ЗАПАСНОЙ режим: ширина (его ставил загрузчик)
 .set OFF_H2,     0x28E          # запасной: высота
 .set OFF_RESULT, 0x280          # что вышло: 0 не пробовали, 1 режим поставлен, 2 не нашли
@@ -93,27 +96,37 @@ s3_set_mode:
     cmp ax, 0x004F
     jne s3_video_fail
     # Ищем ДВАЖДЫ. Сперва режим, в котором система работает сейчас; если его в списке нет —
-    # тот, что ставил ЗАГРУЗЧИК. Разница на живой машине оказалась решающей: панель у неё
-    # 1366×768, но это НАШ режим (на родной размер панели ядро переходит само, Веха 232), а
-    # видео-BIOS знает только свои — у владельца 1024×768. Первый поиск промахивался,
-    # и экран оставался мёртвым.
-    mov dx, 0                       # dx — номер попытки: 0 наш режим, 1 запасной
-    # VideoModePtr — дальний указатель по смещению 0x0E (смещение, затем сегмент).
+    # тот, что ставил ЗАГРУЗЧИК. Разница на живой машине решающая: панель у владельца
+    # 1366×768, но это НАШ режим (на родной размер ядро переходит само, Веха 232), а
+    # видео-BIOS знает только свои — там 1024×768.
+    #
+    # ВСЁ СОСТОЯНИЕ ПОИСКА — В ПАМЯТИ, и это не стиль, а цена ошибки. Регистры через `int 0x10`
+    # не переживают НИЧЕГО: видео-BIOS волен портить любой, и первая версия с номером попытки
+    # в `dx` подвесила машину прямо в трамплине — пробуждение не доходило даже до первой
+    # строки журнала. В памяти держим и номер попытки, и место в списке режимов.
+    mov word ptr [S3_BASE + OFF_TRY], 0
+
 s3_try_list:
-    mov si, [S3_BASE + OFF_VBE + 0x0E]
+    # Начать список сначала: дальний указатель лежит в сведениях VBE по смещению 0x0E.
+    mov ax, [S3_BASE + OFF_VBE + 0x0E]
+    mov [S3_BASE + OFF_PTR], ax
     mov ax, [S3_BASE + OFF_VBE + 0x10]
-    mov gs, ax
+    mov [S3_BASE + OFF_PTR + 2], ax
 
 s3_next_mode:
+    # Взять очередной номер режима (gs:si восстанавливаем из памяти каждый раз).
+    mov ax, [S3_BASE + OFF_PTR + 2]
+    mov gs, ax
+    mov si, [S3_BASE + OFF_PTR]
     mov cx, gs:[si]
     add si, 2
+    mov [S3_BASE + OFF_PTR], si
     cmp cx, 0xFFFF
     je s3_list_end
-    push si
+    mov [S3_BASE + OFF_MODE], cx
     mov di, S3_BASE + OFF_MI
     mov ax, 0x4F01
     int 0x10
-    pop si
     cmp ax, 0x004F
     jne s3_next_mode
     # Атрибуты: бит 0 — режим есть, бит 4 — графический, бит 7 — линейный кадр.
@@ -121,56 +134,51 @@ s3_next_mode:
     and ax, 0x0091
     cmp ax, 0x0091
     jne s3_next_mode
+    # Ширину и высоту сравниваем с парой, на которую указывает номер попытки.
+    mov bx, S3_BASE + OFF_W
+    cmp word ptr [S3_BASE + OFF_TRY], 0
+    je s3_have_pair
+    mov bx, S3_BASE + OFF_W2
+s3_have_pair:
     mov ax, [S3_BASE + OFF_MI + 0x12]
-    cmp dx, 0
-    jne s3_cmp_w2
-    cmp ax, [S3_BASE + OFF_W]
-    jmp s3_cmp_w_done
-s3_cmp_w2:
-    cmp ax, [S3_BASE + OFF_W2]
-s3_cmp_w_done:
+    cmp ax, [bx]
     jne s3_next_mode
     mov ax, [S3_BASE + OFF_MI + 0x14]
-    cmp dx, 0
-    jne s3_cmp_h2
-    cmp ax, [S3_BASE + OFF_H]
-    jmp s3_cmp_h_done
-s3_cmp_h2:
-    cmp ax, [S3_BASE + OFF_H2]
-s3_cmp_h_done:
+    cmp ax, [bx + 2]
     jne s3_next_mode
     xor ax, ax
     mov al, [S3_BASE + OFF_MI + 0x19]
     cmp ax, [S3_BASE + OFF_BPP]
     jne s3_next_mode
-    # Нашли. Запомнить, что обещает режим, и поставить его с линейным кадром (бит 14).
+    # Нашли. Запомнить, что обещает режим, и поставить его с линейным кадром (бит 14) и
+    # битом «не чистить память» (бит 15): в ней живой кадр, переживший сон.
     mov ax, [S3_BASE + OFF_MI + 0x10]
     mov [S3_BASE + OFF_PITCH], ax
     mov ax, [S3_BASE + OFF_MI + 0x28]
     mov [S3_BASE + OFF_LFB], ax
     mov ax, [S3_BASE + OFF_MI + 0x2A]
     mov [S3_BASE + OFF_LFB + 2], ax
-    mov bx, cx
-    # Бит 14 — линейный кадр, бит 15 — НЕ ЧИСТИТЬ видеопамять: в ней живой кадр, переживший
-    # сон вместе с остальной памятью (тот же урок, что с Bochs VBE в `vbe.rs`).
+    mov bx, [S3_BASE + OFF_MODE]
     or bx, 0xC000
     mov ax, 0x4F02
     int 0x10
-    # 1 — поставлен НАШ режим, 3 — запасной (ядру придётся вернуть свой поверх него).
-    mov ax, dx
-    add ax, 1
-    add ax, dx                      # dx=0 → 1, dx=1 → 3
+    # 1 — поставлен НАШ режим, 3 — режим загрузчика (ядру придётся вернуть свой поверх него).
+    mov ax, 1
+    cmp word ptr [S3_BASE + OFF_TRY], 0
+    je s3_say_result
+    mov ax, 3
+s3_say_result:
     mov [S3_BASE + OFF_RESULT], ax
     jmp s3_video_done
 
 s3_list_end:
-    # Список кончился. Если искали свой режим — попробовать запасной (его ставил загрузчик).
-    cmp dx, 0
+    # Список кончился. Если искали свой режим — попробовать режим загрузчика.
+    cmp word ptr [S3_BASE + OFF_TRY], 0
     jne s3_video_fail
     mov ax, [S3_BASE + OFF_W2]
     cmp ax, 0
     je s3_video_fail
-    mov dx, 1
+    mov word ptr [S3_BASE + OFF_TRY], 1
     jmp s3_try_list
 
 s3_video_fail:
@@ -289,6 +297,18 @@ s3_mode_w2:
 .org OFF_H2
 .global s3_mode_h2
 s3_mode_h2:
+    .short 0
+
+.org OFF_TRY
+s3_try_no:
+    .short 0
+
+.org OFF_PTR
+s3_list_ptr:
+    .long 0
+
+.org OFF_MODE
+s3_mode_cur:
     .short 0
 
 .org OFF_END
