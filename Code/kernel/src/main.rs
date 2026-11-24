@@ -74,6 +74,10 @@ mod ehci {
     pub fn has_keyboard() -> bool {
         false
     }
+    /// Веха 242 — контроллера нет, значит и спрашивать порты не о чем: простой спит, как спал.
+    pub fn present() -> bool {
+        false
+    }
     pub fn init() -> bool {
         false
     }
@@ -88,6 +92,10 @@ mod xhci {
     //! `cfg`-ами: «устройства нет» здесь отвечают функции, а не условная компиляция.
     pub const SLOT_BASE: usize = 200;
 
+    /// Веха 242 — см. двойник в заглушке `ehci`.
+    pub fn present() -> bool {
+        false
+    }
     pub fn init() -> bool {
         false
     }
