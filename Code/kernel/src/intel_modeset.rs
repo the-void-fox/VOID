@@ -90,6 +90,20 @@ mod reg {
     pub const WM_LP1: usize = 0x45108;
     pub const WM_LP2: usize = 0x4510c;
     pub const WM_LP3: usize = 0x45110;
+    pub const WM1S_LP: usize = 0x45120;
+    /// ОБЩЕЕ ХОЗЯЙСТВО ДИСПЛЕЯ: тактирование, арбитраж памяти и «chicken»-биты — обходы
+    /// ошибок кремния. Прошивка выставляет их при включении, сон сбрасывает, а мы до сих пор
+    /// не трогали вовсе. Без них картинка собирается с мусором: выборка пикселей не успевает
+    /// за развёрткой. В i915 это `ilk_init_clock_gating` / `gen6_init_clock_gating` /
+    /// `cpt_init_clock_gating`, и зовутся они в том числе ПРИ ПРОБУЖДЕНИИ.
+    pub const CHICKEN1: usize = 0x42000;
+    pub const CHICKEN2: usize = 0x42004;
+    pub const DSPCLK_GATE_D: usize = 0x42020;
+    pub const DISP_ARB_CTL: usize = 0x45000;
+    pub const SOUTH_CHICKEN1: usize = 0xc2000;
+    pub const SOUTH_CHICKEN2: usize = 0xc2004;
+    pub const SOUTH_DSPCLK_GATE_D: usize = 0xc2020;
+    pub const TRANS_CHICKEN1: usize = 0xf0060;
 
     // ---- микросхема PCH ----
     pub const DREF_CTL: usize = 0xc6200;
@@ -218,6 +232,15 @@ struct Snap {
     wm_lp1: u32,
     wm_lp2: u32,
     wm_lp3: u32,
+    wm1s_lp: u32,
+    disp_chicken1: u32,
+    disp_chicken2: u32,
+    dspclk_gate: u32,
+    arb_ctl: u32,
+    s_chicken1: u32,
+    s_chicken2: u32,
+    s_dspclk_gate: u32,
+    t_chicken1: u32,
     dref: u32,
     rawclk: u32,
     fpa0: u32,
@@ -395,6 +418,15 @@ pub fn snapshot() {
         wm_lp1: rd(reg::WM_LP1),
         wm_lp2: rd(reg::WM_LP2),
         wm_lp3: rd(reg::WM_LP3),
+        wm1s_lp: rd(reg::WM1S_LP),
+        disp_chicken1: rd(reg::CHICKEN1),
+        disp_chicken2: rd(reg::CHICKEN2),
+        dspclk_gate: rd(reg::DSPCLK_GATE_D),
+        arb_ctl: rd(reg::DISP_ARB_CTL),
+        s_chicken1: rd(reg::SOUTH_CHICKEN1),
+        s_chicken2: rd(reg::SOUTH_CHICKEN2),
+        s_dspclk_gate: rd(reg::SOUTH_DSPCLK_GATE_D),
+        t_chicken1: rd(reg::TRANS_CHICKEN1),
         dref: rd(reg::DREF_CTL),
         rawclk: rd(reg::RAWCLK),
         fpa0: rd(reg::PCH_FPA0),
@@ -521,6 +553,20 @@ pub fn enable() -> bool {
         return false;
     };
 
+    // 0. ОБЩЕЕ ХОЗЯЙСТВО ДИСПЛЕЯ — раньше всего остального. Тактирование, арбитраж памяти и
+    // обходы ошибок кремния: сон их сбрасывает, и без них конвейер запускается, панель
+    // светится, а по картинке бегают цветные точки — выборка пикселей не успевает за
+    // развёрткой. Нашлось сравнением двух трассировок: живой модсет и послесонный писали
+    // ОДНО И ТО ЖЕ, значит дело было в том, чего мы не писали вовсе.
+    wr(reg::CHICKEN1, s.disp_chicken1);
+    wr(reg::CHICKEN2, s.disp_chicken2);
+    wr(reg::DSPCLK_GATE_D, s.dspclk_gate);
+    wr(reg::DISP_ARB_CTL, s.arb_ctl);
+    wr(reg::SOUTH_CHICKEN1, s.s_chicken1);
+    wr(reg::SOUTH_CHICKEN2, s.s_chicken2);
+    wr(reg::SOUTH_DSPCLK_GATE_D, s.s_dspclk_gate);
+    wr_post(reg::TRANS_CHICKEN1, s.t_chicken1);
+
     // 1. Опорные часы микросхемы PCH. Без них не заведётся ни PLL, ни линия; после сна они
     // сброшены вместе со всем остальным.
     wr_post(reg::DREF_CTL, s.dref);
@@ -586,6 +632,7 @@ pub fn enable() -> bool {
     wr(reg::WM_LP1, s.wm_lp1);
     wr(reg::WM_LP2, s.wm_lp2);
     wr(reg::WM_LP3, s.wm_lp3);
+    wr(reg::WM1S_LP, s.wm1s_lp);
 
     // 4. Включить конвейер процессора. Плоскость при этом ОБЯЗАНА быть выключена — иначе она
     // продолжит качать пиксели в ещё не готовую цепь, и это подвешивает дисплей
