@@ -71,6 +71,10 @@ mod reg {
     pub const BLC_PCH_CTL2: usize = 0xc8254;
     pub const BLC_CPU_CTL: usize = 0x48254;
     pub const BLC_CPU_CTL2: usize = 0x48250;
+    /// Питание панели (PCH): состояние и управление. Веха 243.2 — нужны ПРОБУЖДЕНИЮ: после сна
+    /// панель выключена, и по этим двум словам видно, выключена она или просто не светится.
+    pub const PP_STATUS: usize = 0xc7200;
+    pub const PP_CONTROL: usize = 0xc7204;
     pub const CURACNTR: usize = 0x70080;
     pub const CURABASE: usize = 0x70084;
     pub const CURAPOS: usize = 0x70088;
@@ -471,11 +475,23 @@ pub fn resume(saved: Option<u32>) {
     }
     let conf = rd(reg::PIPEACONF);
     let cntr = rd(reg::DSPACNTR);
+    // Печатаем ВСЁ, что отвечает на вопрос «почему темно», одной строкой: конвейер, плоскость,
+    // питание панели и ШИМ подсветки. Эти четыре слова различают четыре разные беды, и без них
+    // каждая выглядит одинаково — чёрным экраном. Строка нужна прежде всего там, где её нельзя
+    // прочитать сразу (живая машина, журнал потом), поэтому она длинная и одна.
+    crate::println!(
+        "  [intel] после сна: PIPEACONF {:#010x}, DSPACNTR {:#010x}, PP_STATUS {:#010x}, \
+         PP_CONTROL {:#010x}, ШИМ {:#010x}/{:#010x}",
+        conf,
+        cntr,
+        rd(reg::PP_STATUS),
+        rd(reg::PP_CONTROL),
+        rd(reg::BLC_CPU_CTL2),
+        rd(reg::BLC_PCH_CTL2),
+    );
     if conf & (1 << 31) == 0 || cntr & (1 << 31) == 0 {
         crate::println!(
-            "  [intel] после сна конвейер выключен (PIPEACONF {:#010x}, DSPACNTR {:#010x}) — \
-             режим заново ставить мы пока не умеем",
-            conf, cntr,
+            "  [intel] конвейер развёртки выключен — режим заново ставить мы пока не умеем",
         );
         return;
     }
