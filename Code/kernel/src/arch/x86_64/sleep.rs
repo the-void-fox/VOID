@@ -59,10 +59,6 @@ unsafe extern "C" {
 /// (`0x8000`): у них разные прологи, а жить в низкой памяти обязаны оба.
 const S3_BASE: usize = 0x9000;
 
-/// Звать ли POST видео-BIOS на следующем пробуждении. Включается сама, если режим вернуть не
-/// вышло: средство тяжёлое, и начинать с него незачем.
-static USE_POST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
 /// Положить трамплин пробуждения в низкую память и назвать ему всё, что он должен знать.
 ///
 /// # Safety
@@ -92,9 +88,10 @@ unsafe fn install_tramp(w: u16, h: u16, bpp: u16, w2: u16, h2: u16) -> bool {
         // ядро переходит САМО (Веха 232), и в списке VBE такого режима нет.
         (at(&raw const s3_mode_w2 as usize) as *mut u16).write_volatile(w2);
         (at(&raw const s3_mode_h2 as usize) as *mut u16).write_volatile(h2);
-        // Бит 1 — ставить режим; бит 0 — звать POST (только если в прошлый раз не вышло).
-        let flags = 2 | u16::from(USE_POST.load(Ordering::Relaxed));
-        (at(&raw const s3_mode_flags as usize) as *mut u16).write_volatile(flags);
+        // Бит 1 — ставить режим. POST видео-BIOS трамплин решает сам: он зовёт его вторым
+        // заходом, если режима не нашлось, — в том же пробуждении, а не «в следующий раз»
+        // (владелец перезагружался между снами, и «следующий раз» не наступал никогда).
+        (at(&raw const s3_mode_flags as usize) as *mut u16).write_volatile(2);
         (at(&raw const s3_mode_result as usize) as *mut u16).write_volatile(0);
     }
     true
@@ -205,7 +202,10 @@ extern "C" fn resume_entry() -> ! {
         // видео-BIOS, пока мы были в реальном режиме (единственное место, где это возможно).
         let (res, lfb, pitch) = tramp_video();
         let (w, h, our_pitch, _, _) = crate::fb::info();
-        match res {
+        if res >= 4 {
+            crate::println!("  [video] режим вернулся только после POST видео-BIOS");
+        }
+        match res & 3 {
             1 => {
                 crate::println!(
                     "  [video] видео-BIOS вернул режим {w}×{h} (кадр {lfb:#x}, шаг {pitch})",
@@ -246,12 +246,9 @@ extern "C" fn resume_entry() -> ! {
                     }
                 }
             }
-            2 => {
-                USE_POST.store(true, Ordering::Relaxed);
-                crate::println!(
-                    "  [video] видео-BIOS не нашёл режима {w}×{h} — в следующий раз позовём его POST",
-                );
-            }
+            2 => crate::println!(
+                "  [video] видео-BIOS не вернул режим ни до POST, ни после — экран остался тёмным",
+            ),
             _ => {}
         }
         if crate::intel_fb::present() {
