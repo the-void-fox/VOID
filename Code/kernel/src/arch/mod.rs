@@ -141,6 +141,41 @@ pub use imp::{
 /// ни ACPI).
 #[cfg(target_arch = "x86_64")]
 pub use imp::{acpi_survey, acpi_table, enable_power_button, sleep_s3, touchpad_tune};
+
+/// Веха 243 — ПАРКОВКА прикладных ядер на время сна. Сна нет на riscv, поэтому там это
+/// заглушки: «парковаться не просят» и «поднимать некого». Отдельные обёртки, а не
+/// `pub use`, ровно затем, чтобы общий планировщик не обрастал `cfg`-ами.
+#[cfg(target_arch = "x86_64")]
+pub fn ap_should_park() -> bool {
+    imp::ap_should_park()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn ap_should_park() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn ap_park() {
+    imp::ap_park()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn ap_park() {}
+
+#[cfg(target_arch = "x86_64")]
+pub fn park_others(timeout_ns: u64) -> bool {
+    imp::park_others(timeout_ns)
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn park_others(_timeout_ns: u64) -> bool {
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn restart_aps() {
+    imp::restart_aps()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn restart_aps() {}
 /// Веха 236 — порты встроенного контроллера из ECDT: по ним выдаётся узкое право `ioport:ec`.
 #[cfg(target_arch = "x86_64")]
 pub use imp::acpi_ec_ports;

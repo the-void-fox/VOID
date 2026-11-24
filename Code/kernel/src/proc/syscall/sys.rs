@@ -92,6 +92,8 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                             State::ChildWait(_) => 11,
                             // Веха 223.6 — linux-`poll`: спит ломтиками и осматривает заново.
                             State::PollWait => 12,
+                            // Веха 243 — ждёт пробуждения машины из сна.
+                            State::SleepWait => 13,
                         };
                         // Имя = argv[0] до NUL, обрезанное до 24 байт.
                         let name: &[u8] = p.args.split(|&b| b == 0).next().unwrap_or(&[]);
@@ -514,33 +516,26 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             // же действие над всей машиной, просто обратимое. Отличается он другим — тем, что
             // ВОЗВРАЩАЕТСЯ: процесс продолжит работу следующей строкой, когда машину разбудят.
             if mode == 2 {
-                // Store синхронизируем и перед сном: питание в S3 держится на батарее, и
-                // «проснуться» — не обещание, а надежда.
-                // Store синхронизируем и перед сном: питание в S3 держится на батарее, и
+                // Веха 243 — сон делает ПЛАНИРОВЩИК, а не этот вызов: усыпить машину можно
+                // только там, где ядро не держит замков (см. `proc::request_sleep`). Здесь мы
+                // лишь ставим отметку и блокируем просителя до пробуждения.
+                //
+                // Store синхронизируем сразу: питание в S3 держится на батарее, и
                 // «проснуться» — не обещание, а надежда.
                 crate::object::commit();
                 println!("  [power] засыпаю (S3) по запросу процесса");
-                #[cfg(target_arch = "x86_64")]
-                let r = {
-                    let sie = arch::irq_save_disable();
-                    let r = unsafe { arch::sleep_s3() };
-                    arch::irq_restore(sie);
-                    r
-                };
-                #[cfg(not(target_arch = "x86_64"))]
-                let r: Result<(), &'static str> = Err("сна на этой архитектуре нет");
+                let taken = crate::proc::request_sleep(cur);
                 let f = &mut t.procs[cur].frame;
-                match r {
-                    Ok(()) => {
-                        println!("  [power] проснулись");
-                        f.set_ret(0);
-                    }
-                    Err(e) => {
-                        println!("  [power] уснуть не вышло: {e}");
-                        f.set_ret(usize::MAX);
-                    }
-                }
+                f.set_ret(if taken { 0 } else { usize::MAX });
                 f.advance();
+                if !taken {
+                    println!("  [power] усыпить уже просят — второй просьбе отказано");
+                    return true;
+                }
+                t.procs[cur].state = State::SleepWait;
+                if let Some(n) = t.next_runnable(cur) {
+                    t.set_cur(n);
+                }
                 return true;
             }
             println!(
