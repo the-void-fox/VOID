@@ -28,6 +28,8 @@
 #define SYS_DMA_ALLOC 32
 #define SYS_IRQ_WAIT 33
 #define SYS_SLEEP 47
+/* Веха 243.3 — выключение машины: нужно серверу ACPI, когда кнопку питания видит ОН. */
+#define SYS_POWEROFF 44
 #define SYS_NETDEV 64
 #define SYS_PCI_CFG 65
 #define SYS_RANDOM 37
@@ -209,6 +211,12 @@ static inline vsys_msg vsys_recv_irq(void *buf, size_t len, uintptr_t irq_cap,
                                      uint64_t timeout_ns) {
     uint64_t ticks = timeout_ns ? (timeout_ns * vsys_tick_hz() + 999999999u) / 1000000000u : 0;
     return vsys4(SYS_RECV, (uintptr_t)buf, len, 5, (uintptr_t)ticks, irq_cap);
+}
+
+/* Веха 243.3 — ВЫКЛЮЧИТЬ МАШИНУ (право `power`). Возвращается только при отказе: ядро
+ * синхронизирует store и снимает питание само. */
+static inline void vsys_power_off(uintptr_t cap) {
+    vsys(SYS_POWEROFF, cap, 0, 0, 0, 0, 0, 0);
 }
 
 /* Ответ клиенту по одноразовому reply-праву из [`vsys_recv_irq`]. */

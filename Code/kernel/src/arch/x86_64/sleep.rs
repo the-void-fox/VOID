@@ -37,6 +37,74 @@ use super::{acpi, gdt, lapic, paging, smp, trap};
 unsafe extern "C" {
     fn s3_save(ctx: *mut u64) -> u64;
     fn s3_restore(ctx: *const u64) -> !;
+    // Веха 243.4 — трамплин пробуждения (`s3tramp.s`). Смещения полей считаем ПО СИМВОЛАМ:
+    // держать их числами значило бы завести вторую истину о раскладке.
+    static s3_tramp_start: u8;
+    static s3_tramp_end: u8;
+    static s3_cr3: u8;
+    static s3_stack: u8;
+    static s3_entry: u8;
+    static s3_mode_w: u8;
+    static s3_mode_h: u8;
+    static s3_mode_bpp: u8;
+    static s3_mode_flags: u8;
+    static s3_mode_result: u8;
+    static s3_mode_lfb: u8;
+    static s3_mode_pitch: u8;
+}
+
+/// Куда кладётся трамплин пробуждения. Отдельная страница от трамплина прикладных ядер
+/// (`0x8000`): у них разные прологи, а жить в низкой памяти обязаны оба.
+const S3_BASE: usize = 0x9000;
+
+/// Звать ли POST видео-BIOS на следующем пробуждении. Включается сама, если режим вернуть не
+/// вышло: средство тяжёлое, и начинать с него незачем.
+static USE_POST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Положить трамплин пробуждения в низкую память и назвать ему всё, что он должен знать.
+///
+/// # Safety
+/// Пишет в физическую страницу [`S3_BASE`]. Она ниже кучи ядра, и аллокатор фреймов туда не
+/// ходит (`frame::alloc_floor` начинается за образом ядра).
+unsafe fn install_tramp(w: u16, h: u16, bpp: u16) -> bool {
+    let Some(cr3) = smp::boot_cr3() else {
+        crate::println!("  [acpi] загрузочные таблицы выше 4 ГиБ — трамплин пробуждения не поставить");
+        return false;
+    };
+    let src = &raw const s3_tramp_start as usize;
+    let len = &raw const s3_tramp_end as usize - src;
+    let dst = crate::arch::phys_to_virt(S3_BASE) as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst, len);
+        let at = |sym: usize| dst.add(sym - src);
+        (at(&raw const s3_cr3 as usize) as *mut u32).write_volatile(cr3);
+        (at(&raw const s3_stack as usize) as *mut u64)
+            .write_volatile(crate::cpu::idle_top(0) as u64);
+        (at(&raw const s3_entry as usize) as *mut u64)
+            .write_volatile(resume_entry as *const () as u64);
+        (at(&raw const s3_mode_w as usize) as *mut u16).write_volatile(w);
+        (at(&raw const s3_mode_h as usize) as *mut u16).write_volatile(h);
+        (at(&raw const s3_mode_bpp as usize) as *mut u16).write_volatile(bpp);
+        // Бит 1 — ставить режим; бит 0 — звать POST (только если в прошлый раз не вышло).
+        let flags = 2 | u16::from(USE_POST.load(Ordering::Relaxed));
+        (at(&raw const s3_mode_flags as usize) as *mut u16).write_volatile(flags);
+        (at(&raw const s3_mode_result as usize) as *mut u16).write_volatile(0);
+    }
+    true
+}
+
+/// Что трамплин сделал с видеорежимом: `(результат, адрес кадра, шаг строки)`.
+unsafe fn tramp_video() -> (u16, u32, u16) {
+    let src = &raw const s3_tramp_start as usize;
+    let dst = crate::arch::phys_to_virt(S3_BASE) as *const u8;
+    unsafe {
+        let at = |sym: usize| dst.add(sym - src);
+        (
+            (at(&raw const s3_mode_result as usize) as *const u16).read_volatile(),
+            (at(&raw const s3_mode_lfb as usize) as *const u32).read_volatile(),
+            (at(&raw const s3_mode_pitch as usize) as *const u16).read_volatile(),
+        )
+    }
 }
 
 /// Время по ЧАСАМ МАШИНЫ, секунды Unix. Именно у железных часов, а не у системных: системные
@@ -69,6 +137,14 @@ extern "C" fn resume_entry() -> ! {
         gdt::init_ap();
         trap::init_ap();
         lapic::init();
+        // РЕЖИМ ACPI. После сна чипсет на живой машине возвращается в legacy: прошивка
+        // восстановила свой блок питания и свои SMI, а бит SCI_EN оставила сброшенным. Без
+        // режима ACPI прерывания прошивки не приходят вовсе — ни кнопка, ни крышка, ни
+        // контроллер, — и кнопку питания обрабатывает прошивка, то есть гасит машину мимо
+        // синхронизации store. Возвращаем режим себе.
+        if !acpi::enter_acpi_mode() {
+            crate::println!("  [acpi] режим ACPI после сна вернуть не вышло — событий прошивки не будет");
+        }
         // Снять состояние событий PM1 ДО того, как разрешим прерывания: прошивка просыпается
         // с выставленными битами, и «нажатая» кнопка питания выключила бы машину вместо
         // пробуждения.
@@ -118,19 +194,50 @@ extern "C" fn resume_entry() -> ! {
         // взяла его себе (эмуляция клавиатуры через 8042). Без этого на машине, где клавиатура
         // única и живёт по USB, пробуждение означало бы «проснулись и остались без ввода».
         crate::ehci::resume();
-        // ЭКРАН. Два разных случая, и путать их нельзя: на живой машине режим ставили мы
-        // (`intel_fb`) — там возвращаем, что можем, и говорим, что видим; в эмуляторе режим
-        // ставил загрузчик через интерфейс Bochs VBE — его и переставляем заново.
+        // ЭКРАН. Первым делом — что сделал трамплин: он пытался вернуть режим через
+        // видео-BIOS, пока мы были в реальном режиме (единственное место, где это возможно).
+        let (res, lfb, pitch) = tramp_video();
+        let (w, h, our_pitch, _, _) = crate::fb::info();
+        match res {
+            1 => {
+                crate::println!(
+                    "  [video] видео-BIOS вернул режим {w}×{h} (кадр {lfb:#x}, шаг {pitch})",
+                );
+                // Кадр обязан лечь туда же, где он был: композитор и консоль пишут по старому
+                // адресу. Разойдись они — картинка ушла бы в никуда, и молчать об этом нельзя.
+                if let Some((base, _)) = crate::fb::window() {
+                    if lfb != 0 && lfb as usize != base {
+                        crate::println!(
+                            "  [video] но кадр переехал: был {base:#x}, стал {lfb:#x} — картинки не будет",
+                        );
+                    }
+                }
+                if pitch != 0 && pitch as usize != our_pitch {
+                    crate::println!(
+                        "  [video] шаг строки сменился: был {our_pitch}, стал {pitch}",
+                    );
+                }
+            }
+            2 => {
+                USE_POST.store(true, Ordering::Relaxed);
+                crate::println!(
+                    "  [video] видео-BIOS не нашёл режима {w}×{h} — в следующий раз позовём его POST",
+                );
+            }
+            _ => {}
+        }
         if crate::intel_fb::present() {
             let saved = match BACKLIGHT_BEFORE.load(Ordering::Relaxed) {
                 u64::MAX => None,
                 v => Some(v as u32),
             };
             crate::intel_fb::resume(saved);
-        } else {
-            let (w, h, pitch, bpp, _) = crate::fb::info();
+        } else if res != 1 {
+            // Запасной путь для эмуляторов: интерфейс Bochs VBE (DISPI). Зовётся, только если
+            // видео-BIOS режима не вернул, — делать ту же работу дважды незачем.
+            let (_, _, pitch, bpp, _) = crate::fb::info();
             if super::vbe::restore(w, h, pitch, bpp) {
-                crate::println!("  [video] режим экрана поставлен заново ({w}×{h})");
+                crate::println!("  [video] режим экрана поставлен заново через Bochs VBE ({w}×{h})");
             }
         }
         s3_restore(&raw const CTX as *const u64);
@@ -148,13 +255,14 @@ pub unsafe fn suspend() -> Result<(), &'static str> {
     let Some((pm1a, pm1b)) = acpi::pm1_control() else {
         return Err("в FADT нет блока управления PM1");
     };
-    let Some(p_stack) = (unsafe { smp::install_tramp(resume_entry as *const () as u64) }) else {
+    // Трамплин пробуждения — СВОЙ, не тот, которым поднимаются прикладные ядра: у него есть
+    // пролог, возвращающий видеорежим через видео-BIOS (`s3tramp.s`), а звать видео-BIOS при
+    // подъёме ядра посреди работы системы нельзя — экраном в этот момент владеет композитор.
+    let (w, h, _pitch, bpp, _) = crate::fb::info();
+    if !unsafe { install_tramp(w as u16, h as u16, bpp as u16) } {
         return Err("трамплин возврата не поставить");
-    };
-    // Стек для точки входа — стек простоя ЗАГРУЗОЧНОГО ядра. Он же определяет, каким номером
-    // ядро себя считает (`cpu::id` смотрит на адрес стека), а значит и чью TSS возьмёт `gdt`.
-    unsafe { p_stack.write_volatile(crate::cpu::idle_top(0) as u64) };
-    if !unsafe { acpi::set_waking_vector(smp::tramp_pa()) } {
+    }
+    if !unsafe { acpi::set_waking_vector(S3_BASE as u32) } {
         return Err("FACS не найдена — некуда положить адрес возврата");
     }
 

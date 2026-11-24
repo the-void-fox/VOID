@@ -296,9 +296,11 @@ pub(super) unsafe fn install_tramp(entry: u64) -> Option<*mut u64> {
     Some(off(&raw const ap_stack as usize) as *mut u64)
 }
 
-/// Физический адрес трамплина — его кладут в вектор пробуждения FACS (Веха 241).
-pub(super) fn tramp_pa() -> u32 {
-    AP_BASE as u32
+/// Корень ЗАГРУЗОЧНЫХ таблиц для трамплина (32 бита). `None` — они выше четырёх гигабайт, и
+/// трамплину их не назвать. Нужен и пробуждению из сна, у которого трамплин свой (Веха 243.4).
+pub(super) fn boot_cr3() -> Option<u32> {
+    let cr3 = super::virt_to_phys(&raw const boot_pml4 as usize);
+    (cr3 < 1 << 32).then_some(cr3 as u32)
 }
 
 /// Пишет в физическую страницу [`AP_BASE`] и рассылает межпроцессорные прерывания. Звать до

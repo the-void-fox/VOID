@@ -41,6 +41,8 @@ core::arch::global_asm!(include_str!("enter_user.s"));
 core::arch::global_asm!(include_str!("ap.s"));
 // Веха 241 — сохранить и вернуть состояние процессора вокруг сна S3 (пара `setjmp`/`longjmp`).
 core::arch::global_asm!(include_str!("s3.s"));
+// Веха 243.4 — трамплин пробуждения: он же возвращает видеорежим через видео-BIOS.
+core::arch::global_asm!(include_str!("s3tramp.s"));
 
 pub use pci::{
     e1000_irq_setup, probe_ahci_ports, probe_e1000, probe_virtio_blk, probe_virtio_net,
