@@ -63,6 +63,9 @@ mod reg {
     pub const PF_WIN_POS: usize = 0x68070;
     pub const PF_WIN_SZ: usize = 0x68074;
     pub const PF_CTL: usize = 0x68080;
+    /// Где сейчас строка развёртки. Меняется — значит конвейер ДЕЙСТВИТЕЛЬНО работает; это
+    /// надёжнее бита состояния, которому нужны часы с микросхемы PCH.
+    pub const PIPEDSL: usize = 0x70000;
     pub const PIPECONF: usize = 0x70008;
     pub const DSPCNTR: usize = 0x70180;
     pub const DSPLINOFF: usize = 0x70184;
@@ -524,7 +527,20 @@ pub fn enable() -> bool {
     wr_post(reg::RAWCLK, s.rawclk);
     udelay(1000);
 
-    // 2. PLL линии FDI (`ilk_fdi_pll_enable`) — ДО включения конвейера, так в i915 и записано
+    // 2. Порт LVDS и задержки панели (`intel_pre_enable_lvds`). ДО включения всех PLL — в
+    // i915 этот шаг прямо проверяет, что PLL линии и PLL микросхемы ещё ВЫКЛЮЧЕНЫ. Питание
+    // панели здесь не включаем: оно последним, когда по линии уже идут пиксели.
+    //
+    // Ключ `PANEL_UNLOCK_REGS` отпирает регистры задержек — значит он первым, иначе запись
+    // задержек уходит в пустоту молча.
+    let pp_unlocked = (s.pp_ctl & !bit::PP_UNLOCK_MASK & !bit::PANEL_POWER_ON) | bit::PP_UNLOCK;
+    wr_post(reg::PP_CONTROL, pp_unlocked);
+    wr(reg::PP_ON_DELAYS, s.pp_on);
+    wr(reg::PP_OFF_DELAYS, s.pp_off);
+    wr(reg::PP_DIVISOR, s.pp_div);
+    wr_post(reg::PCH_LVDS, s.lvds | bit::LVDS_PORT_EN);
+
+    // 3. PLL линии FDI (`ilk_fdi_pll_enable`) — ДО включения конвейера, так в i915 и записано
     // отдельным шагом с объяснением «иначе нельзя». Порядок: приёмник, переход с сырых часов
     // на пиксельные, передатчик.
     //
@@ -576,12 +592,12 @@ pub fn enable() -> bool {
     // (`assert_planes_disabled` в i915 — проверка ровно на это).
     wr(reg::DSPCNTR, s.dspcntr & !bit::PLANE_ENABLE);
     wr_post(reg::PIPECONF, (s.pipeconf & !bit::PIPE_STATE) | bit::PIPE_ENABLE);
-    if !wait_set(reg::PIPECONF, bit::PIPE_STATE, 100_000) {
-        crate::println!(
-            "  [intel] конвейер не подтвердил включение (PIPECONF {:#010x})",
-            rd(reg::PIPECONF),
-        );
-        return false;
+    // Бита «работаю» здесь ЖДАТЬ НЕЛЬЗЯ, и это стоило целого захода: ждал сто миллисекунд,
+    // не дожидался и бросал всю цепочку — то есть сам гарантировал чёрный экран. В i915
+    // после включения конвейера этот бит не ждут ВОВСЕ (ждут его только при выключении).
+    // Смотрим коротко и только ради журнала; правду скажет движение строки развёртки в конце.
+    if !wait_set(reg::PIPECONF, bit::PIPE_STATE, 20_000) {
+        crate::println!("  [intel] конвейер включён, но «работаю» пока не подтвердил — идём дальше");
     }
 
     // 5. Обучить линию FDI — единственное место, где снимком не обойтись.
@@ -620,23 +636,16 @@ pub fn enable() -> bool {
     wr_post(reg::TRANS_CHICKEN2, s.chicken2 | bit::TRANS_TIMING_OVERRIDE);
     wr_post(reg::TRANSCONF, (s.transconf & !bit::TRANS_STATE) | bit::TRANS_ENABLE);
     if !wait_set(reg::TRANSCONF, bit::TRANS_STATE, 100_000) {
+        // Не отказ: дальше мы включаем питание панели и подсветку, и даже половина картинки
+        // лучше гарантированной темноты. Правду скажет итоговая строка.
         crate::println!(
-            "  [intel] транскодер PCH не включился (TRANSCONF {:#010x})",
+            "  [intel] транскодер PCH не подтвердил включение (TRANSCONF {:#010x})",
             rd(reg::TRANSCONF),
         );
-        return false;
     }
 
-    // 9. Порт LVDS и питание панели (`intel_enable_lvds`). Задержки включения диктует сама
-    // панель — они в регистрах `PP_*`, и их мы тоже вернули из снимка.
-    // Ключ в `PP_CONTROL` отпирает и регистры задержек — значит он ПЕРВЫМ, иначе задержки
-    // запишутся в пустоту (молча: отказа такая запись не даёт).
-    let pp_unlocked = (s.pp_ctl & !bit::PP_UNLOCK_MASK & !bit::PANEL_POWER_ON) | bit::PP_UNLOCK;
-    wr_post(reg::PP_CONTROL, pp_unlocked);
-    wr(reg::PP_ON_DELAYS, s.pp_on);
-    wr(reg::PP_OFF_DELAYS, s.pp_off);
-    wr(reg::PP_DIVISOR, s.pp_div);
-    wr_post(reg::PCH_LVDS, s.lvds | bit::LVDS_PORT_EN);
+    // 9. Питание панели (`intel_enable_lvds`): порт включён ещё до PLL, а питание — только
+    // теперь, когда по линии идут пиксели. Задержки включения панель диктует сама.
     wr_post(reg::PP_CONTROL, pp_unlocked | bit::PANEL_POWER_ON);
     if !wait_set(reg::PP_STATUS, bit::PP_ON, 5_000_000) {
         // Не отказ: конвейер уже работает, а питание панели могло просто задержаться.
@@ -664,16 +673,23 @@ pub fn enable() -> bool {
     wr(reg::CURCNTR, s.curcntr);
     wr_post(reg::CURBASE, s.curbase);
 
+    // Главная проверка — не биты состояния, а ДВИЖЕНИЕ: бежит ли строка развёртки. Если
+    // бежит, конвейер живой, что бы ни говорили остальные регистры.
+    let dsl1 = rd_raw(reg::PIPEDSL);
+    udelay(20_000);
+    let dsl2 = rd_raw(reg::PIPEDSL);
+    let running = dsl1 != dsl2;
     crate::println!(
-        "  [intel] панель поднята своими руками: PIPECONF {:#010x}, TRANSCONF {:#010x}, \
-         PP_STATUS {:#010x}, ШИМ {:#010x}/{:#010x}",
+        "  [intel] модсет окончен: развёртка {}, PIPECONF {:#010x}, TRANSCONF {:#010x}, \
+         PP_STATUS {:#010x}, ШИМ {:#010x}/{:#010x}, строка {dsl1}→{dsl2}",
+        if running { "БЕЖИТ" } else { "стоит" },
         rd(reg::PIPECONF),
         rd(reg::TRANSCONF),
         rd(reg::PP_STATUS),
         rd(reg::BLC_CPU_CTL2),
         rd(reg::BLC_PCH_CTL1),
     );
-    true
+    running
 }
 
 /// Погасить панель и всю цепь — обратным порядком. Нужна для ПРОВЕРКИ модсета на живой машине
