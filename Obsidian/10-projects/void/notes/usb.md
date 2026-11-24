@@ -106,6 +106,10 @@ READY, READ CAPACITY(10), READ(10)/WRITE(10). Устройств теперь п
 Стенд научился втыкать: `plug usb-kbd` / `unplug hot1` в сценарии `screenrun.py` (QMP
 `device_add`/`device_del`).
 
+Полный прогон 24.11: машина без PS/2 и с пустым EHCI → `plug usb-kbd` → клавиатура
+перечислена → `Super+Enter` открыл терминал → `suspend` → пробуждение → `echo` печатается
+дальше. То есть горячее подключение и сон проверены одной дорогой.
+
 ## Ограничения / осторожно
 
 - **x54C = Sandy Bridge → EHCI, не xHCI.** Этот драйвер поднимет USB в QEMU и на машинах Ivy Bridge+,

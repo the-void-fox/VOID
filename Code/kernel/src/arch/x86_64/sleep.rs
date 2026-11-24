@@ -52,6 +52,9 @@ static mut CTX: [u64; 8] = [0; 8];
 static TICKS_BEFORE: AtomicU64 = AtomicU64::new(0);
 /// Настенное время (секунды Unix) в момент засыпания — им меряется длительность сна.
 static WALL_BEFORE: AtomicU64 = AtomicU64::new(0);
+/// Яркость панели до сна, проценты (`u32::MAX` — не знали). Регистр ШИМ сон не переживает, и
+/// без этого экран может вернуться живым, но ЧЁРНЫМ — худший вид «не проснулось».
+static BACKLIGHT_BEFORE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Точка входа ПОСЛЕ пробуждения. Сюда прыгает трамплин, уже в длинном режиме, на загрузочных
 /// таблицах и на стеке простоя загрузочного ядра.
@@ -96,6 +99,21 @@ extern "C" fn resume_entry() -> ! {
         // взяла его себе (эмуляция клавиатуры через 8042). Без этого на машине, где клавиатура
         // única и живёт по USB, пробуждение означало бы «проснулись и остались без ввода».
         crate::ehci::resume();
+        // ЭКРАН. Два разных случая, и путать их нельзя: на живой машине режим ставили мы
+        // (`intel_fb`) — там возвращаем, что можем, и говорим, что видим; в эмуляторе режим
+        // ставил загрузчик через интерфейс Bochs VBE — его и переставляем заново.
+        if crate::intel_fb::present() {
+            let saved = match BACKLIGHT_BEFORE.load(Ordering::Relaxed) {
+                u64::MAX => None,
+                v => Some(v as u32),
+            };
+            crate::intel_fb::resume(saved);
+        } else {
+            let (w, h, pitch, bpp, _) = crate::fb::info();
+            if super::vbe::restore(w, h, pitch, bpp) {
+                crate::println!("  [video] режим экрана поставлен заново ({w}×{h})");
+            }
+        }
         s3_restore(&raw const CTX as *const u64);
     }
 }
@@ -121,6 +139,11 @@ pub unsafe fn suspend() -> Result<(), &'static str> {
         return Err("FACS не найдена — некуда положить адрес возврата");
     }
 
+    // Яркость панели: регистр ШИМ сон не переживёт, а вернуть её надо той же, какой была.
+    BACKLIGHT_BEFORE.store(
+        crate::intel_fb::backlight().map_or(u64::MAX, |v| v as u64),
+        Ordering::Relaxed,
+    );
     // Запомнить конфигурацию шины ДО сна: после него у устройств обнулены и окна памяти, и
     // bus master, а восстанавливать это обязана система.
     super::pci::save_state();
