@@ -78,6 +78,8 @@ mod ehci {
     pub fn present() -> bool {
         false
     }
+    /// Веха 243.1 — опрос портов из простоя: спрашивать нечего.
+    pub fn scan() {}
     pub fn init() -> bool {
         false
     }
