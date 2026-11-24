@@ -531,6 +531,17 @@ static LAST_IDLE: [AtomicU64; cpu::MAX] = [const { AtomicU64::new(0) }; cpu::MAX
 /// планировщик снимает его и будит спящих в `SYS_IRQ_WAIT` ([`drain_userdrv_irq`]).
 static USERDRV_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Веха 243.5 — попросили ТЁПЛУЮ ПЕРЕЗАГРУЗКУ (аккорд Ctrl+Alt+F2).
+static REBOOT_REQ: AtomicBool = AtomicBool::new(false);
+
+/// Отметить просьбу о перезагрузке. Зовётся из разбора нажатия, то есть из прерванного
+/// контекста: здесь только отметка, делом занимается планировщик.
+// Аккорд разбирает x86-овый путь клавиатуры; на riscv клавиатуры у нас нет вовсе.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn request_reboot() {
+    REBOOT_REQ.store(true, Ordering::Relaxed);
+}
+
 /// Веха 197 — нажата КНОПКА ПИТАНИЯ (отметка из обработчика SCI).
 static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
 
@@ -548,6 +559,14 @@ pub fn on_power_button() {
 /// Спрашивать человека «точно?» было бы приятнее, но это диалог, окно и ответ от композитора —
 /// то есть работа оболочки, а не ядра, и делать её видом, что ядро само справится, нельзя.
 fn drain_power_button() {
+    // Веха 243.5 — ПЕРЕЗАГРУЗКА по аккорду. Разбирается здесь же, рядом с кнопкой питания:
+    // действие то же по природе (одностороннее, над всей машиной) и той же ценой — синк store
+    // перед тем, как отдать управление прошивке.
+    if REBOOT_REQ.swap(false, Ordering::Relaxed) {
+        println!("  [power] Ctrl+Alt+F2 — перезагружаюсь (память сохранится, журнал тоже)");
+        crate::object::commit();
+        arch::reboot();
+    }
     if !POWER_BUTTON.swap(false, Ordering::Relaxed) {
         return;
     }

@@ -2123,6 +2123,7 @@ fn sh_help(_args: &[Value]) -> Result<Value, EvalError> {
     help_row(b"help", "эта справка");
     help_row(b"exit", "выйти в vsh (спасательный шелл)");
     help_row(b"klog [N]", "журнал ядра (N — последние строки); текст можно передать дальше");
+    help_row(b"klog prev [N]", "журнал ПРОШЛОЙ загрузки — переживает Ctrl+Alt+F2");
     // Веха 199.22 — приёмник назван ЦЕЛИКОМ, с перенаправлением и `</dev/null`.
     //
     // Прежняя подсказка «там: nc -l P» стоила владельцу вечера. `nc` пишет принятое в файл
@@ -3036,9 +3037,21 @@ fn sh_store_probe(args: &[Value]) -> Result<Value, EvalError> {
 /// контроллеры и драйверы, и обрезать его именно там, где началось интересное, было бы
 /// издевательством.
 fn klog_text() -> Result<String, EvalError> {
+    klog_text_of(false)
+}
+
+/// Веха 243.5 — тот же журнал, но можно попросить ПРОШЛУЮ ЗАГРУЗКУ (`klog prev`). Он живёт в
+/// памяти, которую ядро не раздаёт, и переживает тёплую перезагрузку; нужен там, где прочитать
+/// журнал на месте нельзя — пробуждение с мёртвым экраном, зависание, паника без следа.
+fn klog_text_of(prev: bool) -> Result<String, EvalError> {
     let mut buf = alloc::vec![0u8; 128 * 1024];
-    let (got, lost) = sys::klog(&mut buf);
+    let (got, lost) = if prev { (sys::klog_prev(&mut buf), 0) } else { sys::klog(&mut buf) };
     if got == 0 {
+        if prev {
+            return Err(EvalError::new(
+                "журнала прошлой загрузки нет — он переживает только ТЁПЛУЮ перезагрузку (Ctrl+Alt+F2)",
+            ));
+        }
         return Err(EvalError::new("журнал ядра пуст или недоступен"));
     }
     buf.truncate(got);
@@ -3065,9 +3078,12 @@ fn sh_klog(args: &[Value]) -> Result<Value, EvalError> {
         },
         None => None,
     };
-    let mut text = klog_text()?;
+    // Веха 243.5 — `klog prev`: журнал ПРОШЛОЙ загрузки.
+    let prev = matches!(args.first(), Some(Value::Str(s)) if &**s == "prev");
+    let rest = if prev { &args[1..] } else { args };
+    let mut text = klog_text_of(prev)?;
     // Число первым аргументом — сколько ПОСЛЕДНИХ строк оставить.
-    let lines = match args.first() {
+    let lines = match rest.first() {
         Some(Value::Int(n)) if *n > 0 => Some(*n as usize),
         Some(Value::Str(s)) => s.trim().parse::<usize>().ok().filter(|n| *n > 0),
         _ => None,
@@ -3076,9 +3092,9 @@ fn sh_klog(args: &[Value]) -> Result<Value, EvalError> {
     // `klog | grep wm` с обычным знаком конвейера, шелл не узнал его, `klog` принял за аргумент
     // и напечатал весь журнал. Знак теперь понимается ([`is_pipe`]), но правило важнее случая:
     // команда, делающая НЕ ТО, что просили, обязана сказать об этом.
-    if args.len() > usize::from(lines.is_some()) && out.is_none() {
+    if rest.len() > usize::from(lines.is_some()) && out.is_none() {
         return Err(EvalError::new(
-            "klog: (klog [сколько строк]) либо (klog > путь); конвейер — `klog | grep …`",
+            "klog: (klog [prev] [сколько строк]) либо (klog > путь); конвейер — `klog | grep …`",
         ));
     }
     if let Some(n) = lines {

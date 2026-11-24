@@ -3,6 +3,8 @@
 //! ```text
 //! klog        весь журнал, какой сохранился
 //! klog 40     последние 40 строк
+//! klog prev   журнал ПРОШЛОЙ загрузки (переживает тёплую перезагрузку)
+//! klog prev 40  его последние 40 строк
 //! ```
 //!
 //! Зачем это отдельная программа, а не команда шелла: журнал нужен и в спасательном `vsh`, и в
@@ -29,12 +31,22 @@ static ALLOC: sys::heap::Heap<{ 512 * 1024 }> = sys::heap::Heap::new();
 #[no_mangle]
 pub extern "C" fn _start(_a0: usize, _a1: usize) -> ! {
     let argv = sys::argv::Argv::take();
-    let tail = argv.str(0).and_then(|s| s.parse::<usize>().ok());
+    let first = argv.str(0);
+    // Веха 243.5 — `klog prev`: журнал ПРОШЛОЙ загрузки. Он живёт в памяти, которую ядро не
+    // раздаёт, и переживает тёплую перезагрузку. Нужен там, где прочитать журнал на месте
+    // нельзя: пробуждение с мёртвым экраном, зависание, паника без следа.
+    let prev = first == Some("prev");
+    let tail = if prev { argv.str(1) } else { first }.and_then(|s| s.parse::<usize>().ok());
 
     let mut buf = vec![0u8; CAP];
-    let (got, lost) = sys::klog(&mut buf);
+    let (got, lost) = if prev { (sys::klog_prev(&mut buf), 0) } else { sys::klog(&mut buf) };
     if got == 0 {
-        sys::write("журнал ядра пуст\n".as_bytes());
+        let what = if prev {
+            "журнала прошлой загрузки нет (он переживает только ТЁПЛУЮ перезагрузку)\n"
+        } else {
+            "журнал ядра пуст\n"
+        };
+        sys::write(what.as_bytes());
         sys::exit(0);
     }
     let text = core::str::from_utf8(&buf[..got]).unwrap_or("журнал не UTF-8");

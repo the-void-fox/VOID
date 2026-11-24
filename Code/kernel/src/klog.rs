@@ -47,6 +47,95 @@ static WRITTEN: AtomicUsize = AtomicUsize::new(0);
 /// замком вывода, что и [`WRITTEN`]: писатель здесь один (см. [`push`]).
 static AT_LINE_START: AtomicBool = AtomicBool::new(true);
 
+// ─── журнал, переживающий перезагрузку (Веха 243.5) ──────────────────────────
+//
+// ## Зачем
+//
+// Журнал в кольце живёт ровно до перезагрузки — и это оказалось стеной. На живой машине
+// владельца пробуждение из сна оставляло мёртвый экран и мёртвый USB: система, возможно, и
+// работала, но СКАЗАТЬ об этом ей было нечем, а прочитать её журнал было негде. Всякая
+// неполадка, которая убивает экран, убивает и способ о ней узнать.
+//
+// Лечение простое и старое (у Linux это `ramoops`): держать кольцо в памяти, которую НИКТО не
+// раздаёт, и на следующей загрузке проверить, не лежит ли там журнал прошлой жизни. Память
+// переживает тёплую перезагрузку — ту, что без снятия питания.
+//
+// ## Где эта память
+//
+// Хвост самого верхнего региона карты ([`crate::frame::carve_persist`]). Хвост — потому что он
+// постоянен: карта у машины одна и та же, значит и адрес тот же. Знать, ГДЕ лежит журнал, не
+// менее важно, чем сохранить сами байты.
+//
+// ## Что лежит в начале
+//
+// Шапка: слово-примета, длина и позиция записи. Примета отвечает на главный вопрос — журнал
+// это или мусор, оставшийся от чего угодно другого: холодный старт стирает память не всегда и
+// не целиком, и принять случайные байты за журнал было бы хуже, чем не иметь его вовсе.
+
+/// Сколько памяти просить под сохранённый журнал: шапка плюс кольцо.
+pub const PERSIST_BYTES: usize = HDR + CAP;
+
+/// Примета в начале сохранённого журнала: «здесь журнал VOID».
+const MAGIC: u64 = 0x564f_4944_4c4f_4701; // "VOIDLOG"
+
+/// Адрес сохранённого кольца (VA прямой карты) — 0, если отрезать память не вышло.
+static PERSIST: AtomicUsize = AtomicUsize::new(0);
+/// Сколько байт прошлого журнала удалось снять (0 — прошлого журнала нет).
+static PREV_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Копия прошлого журнала. В `.bss`, а не в сохранённой памяти: ту мы тут же начинаем
+/// переписывать своей, а прошлую хотим отдать целиком и спокойно.
+static mut PREV: [u8; CAP] = [0; CAP];
+
+/// Шапка сохранённого журнала: примета и сколько байт всего прошло через кольцо.
+const HDR: usize = 16;
+
+/// Веха 243.5 — принять память под журнал, переживающий перезагрузку, и снять с неё прошлый.
+///
+/// Зовётся на загрузке, сразу как стали известны регионы RAM. `va` — начало отрезанного куска
+/// в прямой карте, `len` — его длина (шапка плюс кольцо).
+pub fn adopt_persistent(va: usize, len: usize) {
+    if len < HDR + CAP {
+        return;
+    }
+    unsafe {
+        let magic = core::ptr::read_volatile(va as *const u64);
+        let written = core::ptr::read_volatile((va + 8) as *const u64) as usize;
+        if magic == MAGIC && written > 0 {
+            // Прошлая жизнь оставила журнал — снять его, пока не затёрли своим.
+            let have = written.min(CAP);
+            let start = written - have;
+            let ring = (va + HDR) as *const u8;
+            let prev = &raw mut PREV as *mut u8;
+            for i in 0..have {
+                core::ptr::write(prev.add(i), core::ptr::read_volatile(ring.add((start + i) % CAP)));
+            }
+            PREV_LEN.store(have, Ordering::Relaxed);
+        }
+        core::ptr::write_volatile(va as *mut u64, MAGIC);
+        core::ptr::write_volatile((va + 8) as *mut u64, 0);
+    }
+    PERSIST.store(va, Ordering::Relaxed);
+}
+
+/// Сколько байт прошлого журнала сохранилось (0 — прошлого нет).
+pub fn prev_len() -> usize {
+    PREV_LEN.load(Ordering::Relaxed)
+}
+
+/// Отдать журнал ПРОШЛОЙ загрузки. Возвращает, сколько скопировано.
+pub fn read_prev(out: &mut [u8]) -> usize {
+    let have = prev_len();
+    let n = have.min(out.len());
+    let from = have - n; // при нехватке места отдаём ХВОСТ: свежее важнее
+    unsafe {
+        let prev = &raw const PREV as *const u8;
+        for i in 0..n {
+            out[i] = core::ptr::read(prev.add(from + i));
+        }
+    }
+    n
+}
+
 /// Добавить байты в журнал.
 ///
 /// # Safety
@@ -62,10 +151,21 @@ pub fn push(bytes: &[u8]) {
             at = stamp(at);
         }
         unsafe { BUF[at % CAP] = b };
+        // Веха 243.5 — то же самое в память, переживающую перезагрузку. Вторая запись, а не
+        // перенос кольца туда: кольцо читают из прерываний и из-под замка вывода, и зависеть
+        // от того, удалось ли отрезать память, этот путь не должен.
+        let p = PERSIST.load(Ordering::Relaxed);
+        if p != 0 {
+            unsafe { core::ptr::write_volatile((p + HDR + at % CAP) as *mut u8, b) };
+        }
         at = at.wrapping_add(1);
         AT_LINE_START.store(b == b'\n', Ordering::Relaxed);
     }
     WRITTEN.store(at, Ordering::Relaxed);
+    let p = PERSIST.load(Ordering::Relaxed);
+    if p != 0 {
+        unsafe { core::ptr::write_volatile((p + 8) as *mut u64, at as u64) };
+    }
 }
 
 /// Положить в кольцо отметку начала строки — `[   12.345] ` — и вернуть новую позицию.

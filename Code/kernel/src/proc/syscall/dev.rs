@@ -538,15 +538,22 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
         // Если буфер меньше журнала, отдаются ПОСЛЕДНИЕ байты: при разборе неполадки ценнее
         // свежее. Сколько потеряно кольцом, читатель узнаёт вторым значением.
         50 => {
-            let (buf, len) = {
+            // Веха 243.5 — ТРЕТИЙ аргумент: 1 — журнал ПРОШЛОЙ загрузки (он переживает тёплую
+            // перезагрузку, см. `klog`). Нужен ровно там, где прочитать журнал на месте нельзя:
+            // пробуждение с мёртвым экраном, зависание, паника без следа.
+            let (buf, len, which) = {
                 let f = &t.procs[cur].frame;
-                (f.arg(0), f.arg(1))
+                (f.arg(0), f.arg(1), f.arg(2))
             };
             let (n, lost) = if !ensure_heap_range(t, cur, buf, len) {
                 (usize::MAX, 0)
             } else {
                 let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-                (klog::read(out), klog::lost())
+                if which == 1 {
+                    (klog::read_prev(out), 0)
+                } else {
+                    (klog::read(out), klog::lost())
+                }
             };
             let f = &mut t.procs[cur].frame;
             f.set_ret(n);
