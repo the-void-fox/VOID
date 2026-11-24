@@ -527,11 +527,25 @@ pub fn enable() -> bool {
     // 2. PLL линии FDI (`ilk_fdi_pll_enable`) — ДО включения конвейера, так в i915 и записано
     // отдельным шагом с объяснением «иначе нельзя». Порядок: приёмник, переход с сырых часов
     // на пиксельные, передатчик.
-    wr_post(reg::FDI_RX_CTL, (s.fdi_rx & !bit::FDI_RX_ENABLE) | bit::FDI_RX_PLL_ENABLE);
+    //
+    // СНИМОК ЗДЕСЬ ОПАСЕН, и это стоило зависания живой машины. В сохранённом значении
+    // взведены биты РАБОТАЮЩЕЙ линии: переход на пиксельные часы (`FDI_PCDCLK`) и рабочий
+    // шаблон. Записать их вместе с включением PLL — значит перевести блок регистров PCH на
+    // часы, которых ещё нет: PLL включился миллисекунду назад и не захватился. Машина встала
+    // намертво на ЧТЕНИИ того же регистра (журнал: `→ 0xf000c = 0x001a2350`, затем тишина).
+    // Поэтому включаем ровно по одному биту за раз, как в i915, и с его же паузами.
+    let rx_warm = (s.fdi_rx & !bit::FDI_RX_ENABLE & !bit::FDI_PCDCLK & !bit::FDI_TRAIN_MASK_CPT)
+        | bit::FDI_TRAIN_PATTERN_1_CPT
+        | bit::FDI_RX_PLL_ENABLE;
+    wr_post(reg::FDI_RX_CTL, rx_warm);
     udelay(200);
+    // Только теперь — с сырых часов на пиксельные.
     rmw(reg::FDI_RX_CTL, 0, bit::FDI_PCDCLK);
     udelay(200);
-    wr_post(reg::FDI_TX_CTL, (s.fdi_tx & !bit::FDI_TX_ENABLE) | bit::FDI_TX_PLL_ENABLE);
+    let tx_warm = (s.fdi_tx & !bit::FDI_TX_ENABLE & !bit::FDI_TRAIN_MASK)
+        | bit::FDI_TRAIN_PATTERN_1
+        | bit::FDI_TX_PLL_ENABLE;
+    wr_post(reg::FDI_TX_CTL, tx_warm);
     udelay(100);
 
     // 3. Тайминги конвейера процессора, соотношение M/N для линии, масштабатор панели и
@@ -615,12 +629,15 @@ pub fn enable() -> bool {
 
     // 9. Порт LVDS и питание панели (`intel_enable_lvds`). Задержки включения диктует сама
     // панель — они в регистрах `PP_*`, и их мы тоже вернули из снимка.
+    // Ключ в `PP_CONTROL` отпирает и регистры задержек — значит он ПЕРВЫМ, иначе задержки
+    // запишутся в пустоту (молча: отказа такая запись не даёт).
+    let pp_unlocked = (s.pp_ctl & !bit::PP_UNLOCK_MASK & !bit::PANEL_POWER_ON) | bit::PP_UNLOCK;
+    wr_post(reg::PP_CONTROL, pp_unlocked);
     wr(reg::PP_ON_DELAYS, s.pp_on);
     wr(reg::PP_OFF_DELAYS, s.pp_off);
     wr(reg::PP_DIVISOR, s.pp_div);
     wr_post(reg::PCH_LVDS, s.lvds | bit::LVDS_PORT_EN);
-    let pp = (s.pp_ctl & !bit::PP_UNLOCK_MASK) | bit::PP_UNLOCK | bit::PANEL_POWER_ON;
-    wr_post(reg::PP_CONTROL, pp);
+    wr_post(reg::PP_CONTROL, pp_unlocked | bit::PANEL_POWER_ON);
     if !wait_set(reg::PP_STATUS, bit::PP_ON, 5_000_000) {
         // Не отказ: конвейер уже работает, а питание панели могло просто задержаться.
         crate::println!("  [intel] панель не отчиталась о питании (PP_STATUS {:#010x})", rd(reg::PP_STATUS));
