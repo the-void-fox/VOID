@@ -67,6 +67,8 @@ const CMD_ASYNC_EN: u32 = 1 << 5;
 const STS_HALTED: u32 = 1 << 12;
 
 const PORT_CONNECT: u32 = 1 << 0;
+/// «Состояние подключения ИЗМЕНИЛОСЬ» (RW1C) — им шина сообщает о горячем подключении.
+const PORT_CSC: u32 = 1 << 1;
 const PORT_ENABLE: u32 = 1 << 2;
 const PORT_RESET: u32 = 1 << 8;
 const PORT_POWER: u32 = 1 << 12;
@@ -149,6 +151,10 @@ struct Dev {
 }
 
 pub struct Ehci {
+    /// Начало окна регистров и адрес на шине — нужны, чтобы поднять контроллер ЗАНОВО после
+    /// сна: там снова придётся отбирать его у прошивки (Веха 242).
+    base: usize,
+    bdf: u16,
     op: usize,        // база операционных регистров
     ports: u32,       // сколько портов у корневого концентратора
     qh: usize,        // очередь асинхронного списка (голова кольца)
@@ -165,7 +171,41 @@ pub struct Ehci {
     /// Веха 199.31 — когда последний раз говорили про молчащий опрос (нс аптайма).
     kbd_said: u64,  // бит переключения данных прерывающей передачи
     prev: [u8; 6],    // прошлый набор нажатых клавиш
+    /// Веха 242 — ХАБЫ, найденные при перечислении: адрес, число портов, размер пакета.
+    ///
+    /// Помним их затем, что горячее подключение на живой машине происходит ИМЕННО за хабом: у
+    /// чипсетов Intel пятой серии и новее в EHCI встроен rate-matching hub, и наружу выведены
+    /// его порты, а не корневые. Клавиатуру владельца втыкают туда же.
+    hubs: [Option<Hub>; MAX_HUBS],
+    /// Когда опрашивать порты в следующий раз (нс аптайма).
+    scan_at: u64,
+    /// Где сидит клавиатура: `(адрес хаба, порт)`; у корневого порта адрес хаба — 0.
+    /// Нужно, чтобы заметить, что её ВЫНУЛИ.
+    kbd_at: Option<(u8, u8)>,
+    /// Какое место перечисляем прямо сейчас — им помечается найденная клавиатура.
+    ///
+    /// Отдельным полем, а не из `Dev`: в `Dev` адрес хаба проставлен ТОЛЬКО для медленных
+    /// устройств (высокоскоростному транслятор транзакций не нужен, и там стоит ноль). Для
+    /// «кого вынули» это не годится — место надо знать всегда.
+    at_now: (u8, u8),
 }
+
+/// Хаб, за которым могут появляться устройства.
+#[derive(Clone, Copy)]
+struct Hub {
+    dev: Dev,
+    ports: u8,
+    mps: u32,
+}
+
+/// Сколько хабов помним. На живой машине их один-два (встроенный плюс воткнутый человеком);
+/// больше — редкость, и лучше честно не заметить третий, чем носить таблицу на тридцать.
+const MAX_HUBS: usize = 4;
+
+/// Как часто спрашивать порты о переменах. Пол-секунды: человек, воткнувший клавиатуру, этого
+/// не заметит, а машина не будет просыпаться почём зря. Опрос стоит одного чтения регистра на
+/// корневой порт и одной управляющей передачи на порт хаба.
+const SCAN_PERIOD_NS: u64 = 500_000_000;
 unsafe impl Send for Ehci {}
 
 static EHCI: SpinLock<Option<Ehci>> = SpinLock::new(None);
@@ -368,6 +408,7 @@ fn init_one(base: usize, bdf: u16) -> bool {
         write_volatile(dm(qh).add(6), 0);
 
         let mut e = Ehci {
+            base, bdf,
             op, ports, qh, td, buf, frames,
             int_qh, int_td, int_buf,
             int_next: 0,
@@ -375,6 +416,10 @@ fn init_one(base: usize, bdf: u16) -> bool {
             kbd: None,
             kbd_said: 0,
             prev: [0; 6],
+            hubs: [None; MAX_HUBS],
+            scan_at: 0,
+            kbd_at: None,
+            at_now: (0, 0),
         };
 
         wr(op + OP_USBINTR, 0); // прерываний не просим: опрос
@@ -463,6 +508,7 @@ impl Ehci {
                 crate::println!("  [usb]  EHCI: порт {} отдан спутнику (не высокая скорость)", p + 1);
                 continue;
             }
+            self.at_now = (0, (p + 1) as u8);
             any |= self.enumerate_device(Dev { addr: 0, speed: EPS_HIGH, hub_addr: 0, hub_port: 0 });
         }
         any
@@ -725,7 +771,13 @@ impl Ehci {
             "  [usb]  EHCI: устройство {:04x}:{:04x} класс {} (адрес {})",
             vid, pid, class, addr,
         );
-        self.setup_keyboard(&dev, mps)
+        let found = self.setup_keyboard(&dev, mps);
+        if found {
+            // Веха 242 — ЗАПОМНИТЬ МЕСТО: без него «клавиатуру вынули» не отличить от
+            // «клавиатура молчит», а это разные вещи и лечатся они по-разному.
+            self.kbd_at = Some(self.at_now);
+        }
+        found
     }
 
     /// Хаб: включить порты, сбросить занятые и перечислить то, что за ними.
@@ -736,6 +788,10 @@ impl Ehci {
         }
         let nports = hd[2];
         crate::println!("  [usb]  EHCI: у хаба портов {}", nports);
+        // Веха 242 — запомнить хаб: за ним и происходит горячее подключение.
+        if let Some(slot) = self.hubs.iter_mut().find(|h| h.is_none()) {
+            *slot = Some(Hub { dev: *hub, ports: nports, mps });
+        }
         let mut any = false;
         for port in 1..=nports {
             // Включить питание порта: SET_FEATURE(PORT_POWER=8).
@@ -780,9 +836,191 @@ impl Ehci {
             } else {
                 (hub.addr, port)
             };
+            self.at_now = (hub.addr, port);
             any |= self.enumerate_device(Dev { addr: 0, speed, hub_addr, hub_port });
         }
         any
+    }
+
+    /// Веха 242 — **ПОДНЯТЬ КОНТРОЛЛЕР ЗАНОВО** после сна S3.
+    ///
+    /// В S3 питание снимается со всей шины: контроллер просыпается в том же состоянии, что при
+    /// включении машины, а устройства теряют адреса — они вернулись к нулевому. Поэтому здесь
+    /// не «починка», а повторный подъём: отобрать у прошивки (она за время сна снова включила
+    /// эмуляцию клавиатуры через 8042), сбросить, назвать расписания, запустить и перечислить
+    /// порты заново.
+    ///
+    /// Структуры в памяти переживают сон вместе с ней, поэтому заново их не выделяем — только
+    /// называем контроллеру их адреса. А вот ЗНАНИЕ об устройствах выбрасываем полностью: оно
+    /// всё про прошлую жизнь шины.
+    unsafe fn restart(&mut self) {
+        let (base, op) = (self.base, self.op);
+        bios_handoff(base, self.bdf);
+        wr(op + OP_USBCMD, rd(op + OP_USBCMD) & !CMD_RUN);
+        for _ in 0..1_000_000 {
+            if rd(op + OP_USBSTS) & STS_HALTED != 0 {
+                break;
+            }
+        }
+        wr(op + OP_USBCMD, CMD_RESET);
+        for _ in 0..1_000_000 {
+            if rd(op + OP_USBCMD) & CMD_RESET == 0 {
+                break;
+            }
+        }
+        // Периодическую таблицу вычистить: в ней остались ссылки на очередь прошлой
+        // клавиатуры, а её эндпоинта больше нет. Наполнит заново `setup_keyboard`.
+        for i in 0..FRAMES {
+            write_volatile(dm(self.frames).add(i), LINK_TERM);
+        }
+        wr(op + OP_USBINTR, 0);
+        wr(op + OP_CTRLDSSEGMENT, 0);
+        wr(op + OP_FRINDEX, 0);
+        wr(op + OP_PERIODICLIST, self.frames as u32);
+        wr(op + OP_ASYNCLIST, self.qh as u32);
+        wr(op + OP_CONFIGFLAG, 1);
+        wr(op + OP_USBCMD, CMD_RUN | CMD_ASYNC_EN | CMD_PERIODIC_EN | (8 << 16));
+        for _ in 0..1_000_000 {
+            if rd(op + OP_USBSTS) & STS_HALTED == 0 {
+                break;
+            }
+        }
+        wait_ms(150); // выдержка после подачи питания на порты — та же, что на загрузке
+        self.kbd = None;
+        self.kbd_at = None;
+        self.hubs = [None; MAX_HUBS];
+        self.next_addr = 1;
+        self.prev = [0; 6];
+        self.int_next = 0;
+        self.scan_at = 0;
+        crate::usb_hid::reset();
+        let found = self.enumerate_root();
+        crate::println!(
+            "  [usb]  EHCI: контроллер поднят после сна — клавиатура {}",
+            if found { "на месте" } else { "не нашлась" },
+        );
+    }
+
+    /// Веха 242 — **ГОРЯЧЕЕ ПОДКЛЮЧЕНИЕ**: спросить порты, не появилось ли (или не пропало ли)
+    /// устройство. Зовётся из общего опроса, не чаще раза в [`SCAN_PERIOD_NS`].
+    ///
+    /// ## Почему опрос, а не прерывание
+    ///
+    /// Прерываний у контроллера мы не просим вовсе (`USBINTR = 0`): клавиатуру и так
+    /// опрашивает тик, и заводить ради смены портов отдельный обработчик значило бы завести
+    /// второй путь туда же. Цена опроса — одно чтение регистра на корневой порт и одна
+    /// управляющая передача на порт хаба раз в полсекунды.
+    ///
+    /// ## Почему без хабов нельзя
+    ///
+    /// На живой машине наружу выведены ПОРТЫ ХАБА, а не корневые: у чипсетов Intel пятой серии
+    /// и новее в EHCI встроен rate-matching hub. Смотреть только корневые порты значило бы
+    /// сделать «горячее подключение», которое не замечает ни одного настоящего подключения.
+    unsafe fn scan_ports(&mut self) {
+        let now = crate::clock::uptime_ns();
+        if now < self.scan_at {
+            return;
+        }
+        self.scan_at = now + SCAN_PERIOD_NS;
+        self.scan_root();
+        for i in 0..MAX_HUBS {
+            if let Some(hub) = self.hubs[i] {
+                self.scan_hub(&hub);
+            }
+        }
+    }
+
+    /// Корневые порты: бит «состояние подключения изменилось» (CSC, бит 1 в PORTSC).
+    unsafe fn scan_root(&mut self) {
+        for p in 0..self.ports {
+            let psc = self.op + OP_PORTSC + p as usize * 4;
+            let v = rd(psc);
+            if v & PORT_CSC == 0 {
+                continue;
+            }
+            // Снять отметку (RW1C) — ПЕРЕД разбором, иначе событие, случившееся во время
+            // перечисления, мы же и затрём как «уже видели».
+            wr(psc, (v & !PORT_CHANGES) | PORT_CSC);
+            if rd(psc) & PORT_CONNECT != 0 {
+                crate::println!("  [usb]  EHCI: на порт {} что-то воткнули", p + 1);
+                wait_ms(100); // дребезг контактов: спецификация просит именно столько
+                if !self.reset_port(psc) {
+                    crate::println!("  [usb]  EHCI: порт {} отдан спутнику (не высокая скорость)", p + 1);
+                    continue;
+                }
+                self.at_now = (0, (p + 1) as u8);
+                self.enumerate_device(Dev { addr: 0, speed: EPS_HIGH, hub_addr: 0, hub_port: 0 });
+            } else {
+                self.forget_at((0, (p + 1) as u8), p + 1);
+            }
+        }
+    }
+
+    /// Порты хаба: `GetPortStatus` (класс-специфичный запрос `0xa3`) отдаёт четыре байта —
+    /// состояние и ПЕРЕМЕНЫ. Нас интересует бит 0 перемен: «подключение изменилось».
+    unsafe fn scan_hub(&mut self, hub: &Hub) {
+        for port in 1..=hub.ports {
+            let Some((status, change)) = self.hub_port_status(&hub.dev, port, hub.mps) else {
+                continue;
+            };
+            if change & 1 == 0 {
+                continue;
+            }
+            // Снять отметку: CLEAR_FEATURE(C_PORT_CONNECTION = 16).
+            self.control(&hub.dev, 0x23, 1, 16, port as u16, 0, hub.mps);
+            if status & 1 == 0 {
+                self.forget_at((hub.dev.addr, port), port as u32);
+                continue;
+            }
+            crate::println!("  [usb]  EHCI: на порт {} хаба что-то воткнули", port);
+            wait_ms(100); // тот же дребезг, что и на корневом порту
+            // Сброс порта и перечисление — той же дорогой, что на загрузке.
+            self.control(&hub.dev, 0x23, 3, 4, port as u16, 0, hub.mps);
+            wait_ms(60);
+            let Some((status, _)) = self.hub_port_status(&hub.dev, port, hub.mps) else {
+                continue;
+            };
+            if status & 2 == 0 {
+                crate::println!("  [usb]  EHCI: порт {} хаба не включился ({:#06x})", port, status);
+                continue;
+            }
+            let speed = if status & (1 << 9) != 0 {
+                EPS_LOW
+            } else if status & (1 << 10) != 0 {
+                EPS_HIGH
+            } else {
+                EPS_FULL
+            };
+            let (hub_addr, hub_port) =
+                if speed == EPS_HIGH { (0, 0) } else { (hub.dev.addr, port) };
+            self.at_now = (hub.dev.addr, port);
+            self.enumerate_device(Dev { addr: 0, speed, hub_addr, hub_port });
+        }
+    }
+
+    /// `GetPortStatus` хаба: `(состояние, перемены)`. `None` — хаб не ответил.
+    unsafe fn hub_port_status(&mut self, hub: &Dev, port: u8, mps: u32) -> Option<(u16, u16)> {
+        if !self.control(hub, 0xa3, 0, 0, port as u16, 4, mps) {
+            return None;
+        }
+        let mut st = [0u8; 4];
+        core::ptr::copy_nonoverlapping(frame::ptr(self.buf + 64) as *const u8, st.as_mut_ptr(), 4);
+        Some((st[0] as u16 | (st[1] as u16) << 8, st[2] as u16 | (st[3] as u16) << 8))
+    }
+
+    /// Устройство с этого места пропало. Если это была наша клавиатура — забыть её, иначе
+    /// опрос продолжал бы ломиться в очередь мёртвого эндпоинта и ругаться в журнал.
+    unsafe fn forget_at(&mut self, at: (u8, u8), port_for_log: u32) {
+        if self.kbd_at != Some(at) {
+            return;
+        }
+        crate::println!("  [usb]  EHCI: клавиатуру вынули (порт {})", port_for_log);
+        self.kbd = None;
+        self.kbd_at = None;
+        self.prev = [0; 6];
+        // Нажатия, оставшиеся «удерживаемыми» в момент отключения, снять: иначе система будет
+        // считать клавишу зажатой до перезагрузки.
+        crate::usb_hid::reset();
     }
 
     /// Если это HID-клавиатура — настроить её прерывающий эндпоинт и поставить первый запрос.
@@ -987,8 +1225,26 @@ impl Ehci {
 /// Опрос клавиатуры — зовётся из общего пути консоли, как и у xHCI.
 pub fn poll() {
     if let Some(e) = EHCI.lock_irq().as_mut() {
-        unsafe { e.poll_keyboard() }
+        unsafe {
+            e.poll_keyboard();
+            // Веха 242 — и спросить порты: не воткнули ли что-нибудь. Внутри стоит свой
+            // предел частоты, поэтому звать можно хоть на каждом тике.
+            e.scan_ports();
+        }
     }
+}
+
+/// Веха 242 — поднять контроллер заново после сна S3 (см. [`Ehci::restart`]).
+pub fn resume() {
+    if let Some(e) = EHCI.lock_irq().as_mut() {
+        unsafe { e.restart() }
+    }
+}
+
+/// Веха 242 — есть ли у нас живой контроллер. Нужно простою: пока контроллер есть, машина
+/// обязана просыпаться хотя бы изредка, иначе воткнутую клавиатуру некому будет заметить.
+pub fn present() -> bool {
+    EHCI.lock_irq().is_some()
 }
 
 /// Есть ли у нас клавиатура на EHCI (нужно тому же, кому и у xHCI: без прерываний её опрашивает
