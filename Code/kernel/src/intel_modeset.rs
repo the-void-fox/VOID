@@ -96,6 +96,11 @@ mod reg {
     /// не трогали вовсе. Без них картинка собирается с мусором: выборка пикселей не успевает
     /// за развёрткой. В i915 это `ilk_init_clock_gating` / `gen6_init_clock_gating` /
     /// `cpt_init_clock_gating`, и зовутся они в том числе ПРИ ПРОБУЖДЕНИИ.
+    /// ВКЛЮЧЕНИЕ таблицы отображения графики. Без него обращения к окну графики (апертуре)
+    /// не переводятся в страницы памяти вовсе: запись туда отбивается шиной — процессор
+    /// получает Machine Check, — а развёртка читает не ту память. Ровно это и случилось у
+    /// владельца (Веха 244.9).
+    pub const PGTBL_CTL: usize = 0x02020;
     pub const CHICKEN1: usize = 0x42000;
     pub const CHICKEN2: usize = 0x42004;
     pub const DSPCLK_GATE_D: usize = 0x42020;
@@ -235,6 +240,7 @@ struct Snap {
     wm_lp2: u32,
     wm_lp3: u32,
     wm1s_lp: u32,
+    pgtbl_ctl: u32,
     disp_chicken1: u32,
     disp_chicken2: u32,
     dspclk_gate: u32,
@@ -431,6 +437,7 @@ pub fn snapshot() {
         wm_lp2: rd(reg::WM_LP2),
         wm_lp3: rd(reg::WM_LP3),
         wm1s_lp: rd(reg::WM1S_LP),
+        pgtbl_ctl: rd(reg::PGTBL_CTL),
         disp_chicken1: rd(reg::CHICKEN1),
         disp_chicken2: rd(reg::CHICKEN2),
         dspclk_gate: rd(reg::DSPCLK_GATE_D),
@@ -557,6 +564,30 @@ pub fn diff() -> usize {
     n
 }
 
+/// Вернуть включение таблицы отображения — и сказать, если оно пропадало.
+///
+/// Зовётся на пробуждении ПЕРЕД любой записью в кадр: пока таблица выключена, окно графики
+/// не отвечает, и запись в него валит процессор аппаратным отказом.
+pub fn restore_gtt_ctl() {
+    let Some(s) = *SNAP.lock() else { return };
+    let now = rd_raw(reg::PGTBL_CTL);
+    if now != s.pgtbl_ctl {
+        crate::println!(
+            "  [intel] таблица отображения была {} ({now:#010x}) — включаю как при загрузке ({:#010x})",
+            if now & 1 == 0 { "ВЫКЛЮЧЕНА" } else { "не та" },
+            s.pgtbl_ctl,
+        );
+        crate::arch::hw_write32(crate::intel_fb::bar0() + reg::PGTBL_CTL, s.pgtbl_ctl);
+        let _ = rd_raw(reg::PGTBL_CTL);
+    }
+}
+
+/// Переводится ли сейчас окно графики в страницы памяти. Пока нет — писать в кадр НЕЛЬЗЯ:
+/// запись отобьёт шина, и процессор получит аппаратный отказ.
+pub fn gtt_enabled() -> bool {
+    crate::intel_fb::known() && rd_raw(reg::PGTBL_CTL) & 1 != 0
+}
+
 /// Есть ли чем поднимать панель.
 pub fn have() -> bool {
     SNAP.lock().is_some()
@@ -656,6 +687,7 @@ fn enable_inner() -> bool {
     // светится, а по картинке бегают цветные точки — выборка пикселей не успевает за
     // развёрткой. Нашлось сравнением двух трассировок: живой модсет и послесонный писали
     // ОДНО И ТО ЖЕ, значит дело было в том, чего мы не писали вовсе.
+    wr_post(reg::PGTBL_CTL, s.pgtbl_ctl);
     wr(reg::CHICKEN1, s.disp_chicken1);
     wr(reg::CHICKEN2, s.disp_chicken2);
     wr(reg::DSPCLK_GATE_D, s.dspclk_gate);
