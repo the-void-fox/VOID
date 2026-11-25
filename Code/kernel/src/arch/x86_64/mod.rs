@@ -1634,6 +1634,49 @@ pub fn mtrr_snapshot() {
     *MTRR_SAVED.lock() = Some(mtrr_read());
 }
 
+/// Выставить ядру ТЕ ЖЕ типы памяти, что у загрузочного.
+///
+/// **Зачем.** После запуска (и после сна) у ядра MTRR в заводском состоянии: `E = 0`, то есть
+/// ВЫКЛЮЧЕНЫ, а выключенные MTRR означают «вся память некэшируемая». Получается, что одна и
+/// та же страница на разных ядрах имеет разный тип памяти, а это SDM запрещает прямо: при
+/// расхождении типов поведение не определено. Заодно прикладное ядро перестаёт ползать:
+/// обычная память ему возвращается кэшируемой.
+///
+/// Обряд смены — по SDM 12.11.7.2: запретить кэш, сбросить, выключить MTRR, записать,
+/// сбросить снова, включить. Порядок здесь не украшение: сменить тип памяти «на ходу» — это
+/// оставить в кэше строки, которых по новому типу там быть не может.
+///
+/// # Safety
+/// Зовётся на ядре, которое ещё не трогает общие структуры: на подъёме или сразу после сна.
+pub unsafe fn mtrr_apply() {
+    let Some(v) = *MTRR_SAVED.lock() else { return };
+    unsafe {
+        let (cr0, cr4): (u64, u64);
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        // Кэш — в режим «не заполнять», и выгрузить всё, что в нём есть.
+        core::arch::asm!("mov cr0, {}", in(reg) (cr0 | (1 << 30)) & !(1 << 29), options(nostack));
+        core::arch::asm!("wbinvd", options(nostack));
+        // Глобальные страницы — выключить, иначе TLB не сбросится целиком.
+        core::arch::asm!("mov cr4, {}", in(reg) cr4 & !(1 << 7), options(nostack));
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+        // Выключить MTRR, записать, включить обратно вместе с типом по умолчанию.
+        wrmsr(MSR_MTRR_DEF_TYPE, v[0] & !(1 << 11));
+        for i in 0..8 {
+            wrmsr(MSR_MTRR_PHYSBASE0 + (i as u32) * 2, v[1 + i * 2]);
+            wrmsr(MSR_MTRR_PHYSBASE0 + (i as u32) * 2 + 1, v[2 + i * 2]);
+        }
+        core::arch::asm!("wbinvd", options(nostack));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+        wrmsr(MSR_MTRR_DEF_TYPE, v[0]);
+        // Кэш обратно и глобальные страницы на место.
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+}
+
 /// Сверить типы памяти с загрузкой и сказать, если разошлись.
 pub fn mtrr_check() {
     let Some(was) = *MTRR_SAVED.lock() else { return };
