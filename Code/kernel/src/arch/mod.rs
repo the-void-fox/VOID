@@ -203,6 +203,9 @@ pub use imp::{sci_irq_arm, sci_set_owned, sci_vector};
 /// x86: у riscv-virt ни видео-BIOS, ни реального режима, где его можно позвать, нет.
 #[cfg(target_arch = "x86_64")]
 pub use imp::request_video_post;
+/// Веха 244.10 — в порядке ли конфигурация графики на шине после сна.
+#[cfg(target_arch = "x86_64")]
+pub use imp::gfx_config_ok;
 
 
 /// Род page fault'а из U-mode — общий язык арха и `proc::handle_user_fault`

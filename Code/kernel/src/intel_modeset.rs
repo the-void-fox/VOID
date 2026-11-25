@@ -584,6 +584,7 @@ pub fn restore_gtt_ctl() {
 
 /// Переводится ли сейчас окно графики в страницы памяти. Пока нет — писать в кадр НЕЛЬЗЯ:
 /// запись отобьёт шина, и процессор получит аппаратный отказ.
+#[allow(dead_code)]
 pub fn gtt_enabled() -> bool {
     crate::intel_fb::known() && rd_raw(reg::PGTBL_CTL) & 1 != 0
 }

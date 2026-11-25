@@ -1242,6 +1242,11 @@ pub fn restart_aps() {
 ///
 /// # Safety
 /// Зовётся из ядра, с запрещёнными прерываниями.
+/// Веха 244.10 — в порядке ли конфигурация графики на шине (после сна).
+pub fn gfx_config_ok() -> bool {
+    pci::gfx_config_ok()
+}
+
 pub fn request_video_post(on: bool) {
     sleep::request_video_post(on);
 }
