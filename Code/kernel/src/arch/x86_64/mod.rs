@@ -1342,6 +1342,7 @@ pub const MAP_SHARED: usize = 1 << 5;
 pub fn mm_init() -> usize {
     // PAT программируется здесь: до первой WC-страницы и до включения трансляции.
     paging::pat_init();
+    mtrr_snapshot();
     paging::init()
 }
 
@@ -1606,6 +1607,49 @@ pub fn now_cycles() -> Option<u64> {
 const IA32_FS_BASE: u32 = 0xC000_0100;
 
 /// Прочитать модельно-специфичный регистр (ring0). `ecx = msr`, ответ в `edx:eax`.
+/// Снимок типов памяти процессора (MTRR): тип по умолчанию и восемь переменных диапазонов.
+///
+/// Нужен ПРОВЕРКЕ, а не работе: MTRR — тоже регистры процессора, и сон их теряет. Если после
+/// пробуждения они не те, что при загрузке, меняется смысл целых областей адресов (например,
+/// окно экрана из «объединять записи» становится «кэшировать»), а выглядит это чем угодно,
+/// только не тем, чем является.
+static MTRR_SAVED: crate::sync::SpinLock<Option<[u64; 17]>> = crate::sync::SpinLock::new(None);
+
+const MSR_MTRR_DEF_TYPE: u32 = 0x2ff;
+const MSR_MTRR_PHYSBASE0: u32 = 0x200;
+
+fn mtrr_read() -> [u64; 17] {
+    let mut v = [0u64; 17];
+    unsafe {
+        v[0] = rdmsr(MSR_MTRR_DEF_TYPE);
+        for i in 0..8 {
+            v[1 + i * 2] = rdmsr(MSR_MTRR_PHYSBASE0 + (i as u32) * 2);
+            v[2 + i * 2] = rdmsr(MSR_MTRR_PHYSBASE0 + (i as u32) * 2 + 1);
+        }
+    }
+    v
+}
+
+pub fn mtrr_snapshot() {
+    *MTRR_SAVED.lock() = Some(mtrr_read());
+}
+
+/// Сверить типы памяти с загрузкой и сказать, если разошлись.
+pub fn mtrr_check() {
+    let Some(was) = *MTRR_SAVED.lock() else { return };
+    let now = mtrr_read();
+    if was == now {
+        return;
+    }
+    crate::println!("  [mm] ТИПЫ ПАМЯТИ ПОСЛЕ СНА НЕ ТЕ:");
+    for i in 0..17 {
+        if was[i] != now[i] {
+            let name = if i == 0 { "по умолчанию".into() } else { alloc::format!("MSR {:#x}", MSR_MTRR_PHYSBASE0 + (i as u32) - 1) };
+            crate::println!("  [mm]   {name}: было {:#018x}, стало {:#018x}", was[i], now[i]);
+        }
+    }
+}
+
 #[inline]
 unsafe fn rdmsr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
