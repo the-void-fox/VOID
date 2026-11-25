@@ -386,6 +386,41 @@ unsafe fn fill_px(x: usize, y: usize, w: usize, h: usize, color: u32) {
     }
 }
 
+/// Веха 244.8 — ОТМЕТКА ЯДРА НА ЭКРАНЕ: полоса во всю ширину, нарисованная ядром напрямую.
+///
+/// Нужна разбору пробуждения. Если после сна полоса ВИДНА — путь «ядро пишет в кадр →
+/// развёртка показывает» цел, и причина чёрного экрана в том, кто рисует. Если не видна —
+/// цела была только наша вера в этот путь.
+///
+/// # Safety
+/// Пишет в окно кадра; границы проверяет сама.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub unsafe fn mark(y: usize, h: usize, color: u32) -> bool {
+    let (w, hh) = (PIX_W.load(Ordering::Relaxed), PIX_H.load(Ordering::Relaxed));
+    if BASE.load(Ordering::Relaxed) == 0 || w == 0 || y + h > hh {
+        return false;
+    }
+    unsafe { fill_px(0, y, w, h, color) };
+    true
+}
+
+/// Записать метку в первую точку кадра и прочитать её обратно ТЕМ ЖЕ путём.
+///
+/// Отвечает тем, что прочиталось. Расхождение значит, что запись в кадр не доходит до памяти
+/// вовсе, — и тогда искать надо не в дисплее.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn probe(magic: u32) -> u32 {
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return 0;
+    }
+    unsafe {
+        core::ptr::write_volatile(base as *mut u32, magic);
+        core::arch::asm!("sfence", options(nostack, nomem));
+        core::ptr::read_volatile(base as *const u32)
+    }
+}
+
 /// Фон знакоместа по его атрибуту.
 fn attr_bg(attr: u8) -> u32 {
     encode(((attr >> 4) & 0x07) as usize)
