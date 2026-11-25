@@ -386,67 +386,6 @@ unsafe fn fill_px(x: usize, y: usize, w: usize, h: usize, color: u32) {
     }
 }
 
-/// Веха 244.8 — ОТМЕТКА ЯДРА НА ЭКРАНЕ: полоса во всю ширину, нарисованная ядром напрямую.
-///
-/// Нужна разбору пробуждения. Если после сна полоса ВИДНА — путь «ядро пишет в кадр →
-/// развёртка показывает» цел, и причина чёрного экрана в том, кто рисует. Если не видна —
-/// цела была только наша вера в этот путь.
-///
-/// # Safety
-/// Пишет в окно кадра; границы проверяет сама.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-pub unsafe fn mark(y: usize, h: usize, color: u32) -> bool {
-    let (w, hh) = (PIX_W.load(Ordering::Relaxed), PIX_H.load(Ordering::Relaxed));
-    if BASE.load(Ordering::Relaxed) == 0 || w == 0 || y + h > hh {
-        return false;
-    }
-    unsafe { fill_px(0, y, w, h, color) };
-    true
-}
-
-/// Залить ЦЕЛЫЙ буфер кадра цветом. `off` — смещение буфера в байтах (0 — первый).
-///
-/// Опыт, который нельзя истолковать двояко: если экран становится этого цвета, значит
-/// развёртка читает именно эту память. Полоса в восемь строк такого ответа не дала —
-/// её могло не быть видно по доброму десятку причин.
-///
-/// # Safety
-/// Пишет в окно кадра на `h` строк от начала буфера.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-pub unsafe fn fill_buffer(off: usize, color: u32) -> bool {
-    let base = BASE.load(Ordering::Relaxed);
-    let (w, h) = (PIX_W.load(Ordering::Relaxed), PIX_H.load(Ordering::Relaxed));
-    let (pitch, bpp) = (PITCH.load(Ordering::Relaxed), BYTES_PP.load(Ordering::Relaxed));
-    if base == 0 || w == 0 || bpp != 4 {
-        return false;
-    }
-    for y in 0..h {
-        let line = base + off + y * pitch;
-        for x in 0..w {
-            unsafe { core::ptr::write_volatile((line + x * bpp) as *mut u32, color) };
-        }
-    }
-    unsafe { core::arch::asm!("sfence", options(nostack, nomem)) };
-    true
-}
-
-/// Записать метку в первую точку кадра и прочитать её обратно ТЕМ ЖЕ путём.
-///
-/// Отвечает тем, что прочиталось. Расхождение значит, что запись в кадр не доходит до памяти
-/// вовсе, — и тогда искать надо не в дисплее.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-pub fn probe(magic: u32) -> u32 {
-    let base = BASE.load(Ordering::Relaxed);
-    if base == 0 {
-        return 0;
-    }
-    unsafe {
-        core::ptr::write_volatile(base as *mut u32, magic);
-        core::arch::asm!("sfence", options(nostack, nomem));
-        core::ptr::read_volatile(base as *const u32)
-    }
-}
-
 /// Фон знакоместа по его атрибуту.
 fn attr_bg(attr: u8) -> u32 {
     encode(((attr >> 4) & 0x07) as usize)
