@@ -135,6 +135,8 @@ mod reg {
     pub const FDI_RX_CTL: usize = 0xf000c;
     pub const FDI_RX_MISC: usize = 0xf0010;
     pub const FDI_RX_IIR: usize = 0xf0014;
+    /// Состояние прерываний дисплея: там же лежит отметка о срыве выборки конвейера.
+    pub const DEIIR: usize = 0x44008;
     pub const FDI_RX_IMR: usize = 0xf0018;
     pub const FDI_RX_TUSIZE1: usize = 0xf0030;
     pub const TRANS_CHICKEN2: usize = 0xf0064;
@@ -261,6 +263,7 @@ struct Snap {
     transconf: u32,
     chicken2: u32,
     fdi_rx: u32,
+    fdi_rx_misc: u32,
     fdi_rx_tusize: u32,
     lvds: u32,
     pp_on: u32,
@@ -447,6 +450,7 @@ pub fn snapshot() {
         transconf: rd(reg::TRANSCONF),
         chicken2: rd(reg::TRANS_CHICKEN2),
         fdi_rx: rd(reg::FDI_RX_CTL),
+        fdi_rx_misc: rd(reg::FDI_RX_MISC),
         fdi_rx_tusize: rd(reg::FDI_RX_TUSIZE1),
         lvds: rd(reg::PCH_LVDS),
         pp_on: rd(reg::PP_ON_DELAYS),
@@ -604,12 +608,18 @@ fn train_step(lock: u32) -> bool {
 }
 
 /// Перевести линию FDI в рабочий режим после обучения (`intel_fdi_normal_train`).
-fn fdi_normal() {
+fn fdi_normal(s: &Snap) {
     rmw(reg::FDI_TX_CTL, bit::FDI_TRAIN_MASK, bit::FDI_TRAIN_NONE | bit::FDI_TX_ENHANCE_FRAME);
     rmw(reg::FDI_RX_CTL, bit::FDI_TRAIN_MASK_CPT,
         bit::FDI_TRAIN_NORMAL_CPT | bit::FDI_RX_ENHANCE_FRAME);
     // Одно время холостого шаблона.
     udelay(1000);
+    // И ВЕРНУТЬ НАСТРОЙКУ ВЫБОРКИ, какую ставила прошивка. На время обучения туда пишется
+    // своё (`FDI_RX_TP1_TO_TP2_48 | FDI_RX_FDI_DELAY_90` — так в i915), и мы это значение
+    // оставляли жить. А в нём ЗАДЕРЖКА ВЫБОРКИ приёмника: у прошивки 0x80, у нас 0x90. Чем
+    // мимо середины глаза попадает защёлка, тем чаще искажается пиксель — и это ровно то, на
+    // что похожи «цветные муравьи» по картинке.
+    wr_post(reg::FDI_RX_MISC, s.fdi_rx_misc);
 }
 
 /// Поднять панель по снимку. `true` — конвейер и панель включились.
@@ -748,7 +758,7 @@ pub fn enable() -> bool {
 
     // 8. Линию — в рабочий режим, и только теперь включать транскодер PCH. Перед ним
     // обязательная оговорка Cougar Point: бит перекрытия таймингов.
-    fdi_normal();
+    fdi_normal(&s);
     wr_post(reg::TRANS_CHICKEN2, s.chicken2 | bit::TRANS_TIMING_OVERRIDE);
     wr_post(reg::TRANSCONF, (s.transconf & !bit::TRANS_STATE) | bit::TRANS_ENABLE);
     if !wait_set(reg::TRANSCONF, bit::TRANS_STATE, 100_000) {
@@ -795,6 +805,23 @@ pub fn enable() -> bool {
     udelay(20_000);
     let dsl2 = rd_raw(reg::PIPEDSL);
     let running = dsl1 != dsl2;
+    // Что приёмник линии и дисплейные прерывания думают о качестве картинки. Биты «липкие»:
+    // раз взведясь, держатся — поэтому перед замером их гасят, а читают через кадр.
+    wr(reg::FDI_RX_IIR, 0xffff);
+    wr(reg::DEIIR, 0xffff_ffff);
+    udelay(50_000);
+    let iir = rd_raw(reg::FDI_RX_IIR);
+    let deiir = rd_raw(reg::DEIIR);
+    if iir & 0x77 != 0 || deiir != 0 {
+        crate::println!(
+            "  [intel] линия жалуется: FDI_RX_IIR {iir:#010x} ({}{}{}{}{}), прерывания дисплея {deiir:#010x}",
+            if iir & (1 << 6) != 0 { "ошибка кода FS " } else { "" },
+            if iir & (1 << 5) != 0 { "ошибка кода FE " } else { "" },
+            if iir & (1 << 4) != 0 { "частых ошибок символов " } else { "" },
+            if iir & (1 << 2) != 0 { "переполнение очереди пикселей " } else { "" },
+            if iir & 3 != 0 { "переполнение символов" } else { "" },
+        );
+    }
     crate::println!(
         "  [intel] модсет окончен: развёртка {}, PIPECONF {:#010x}, TRANSCONF {:#010x}, \
          PP_STATUS {:#010x}, ШИМ {:#010x}/{:#010x}, строка {dsl1}→{dsl2}",
