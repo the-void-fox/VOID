@@ -284,7 +284,7 @@ extern "C" fn resume_entry() -> ! {
             ),
             _ => {}
         }
-        if crate::intel_fb::present() {
+        if crate::intel_fb::known() {
             let saved = match BACKLIGHT_BEFORE.load(Ordering::Relaxed) {
                 u64::MAX => None,
                 v => Some(v as u32),

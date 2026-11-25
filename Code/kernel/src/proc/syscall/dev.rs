@@ -725,7 +725,7 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
             let need = if op == 2 { Rights::WRITE } else { Rights::READ };
             let result = match cap::mmio(dom, Cap::from_bits(mcap as u64), need) {
                 #[cfg(target_arch = "x86_64")]
-                Ok(_) if crate::intel_fb::present() => match op {
+                Ok(_) if crate::intel_fb::known() => match op {
                     0 => usize::from(crate::intel_fb::latched()),
                     1 => crate::intel_fb::vblank_count() as usize,
                     // Веха 233.12 — вернуться к одному буферу. Просит тот, кто рисует: он

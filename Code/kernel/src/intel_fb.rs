@@ -143,6 +143,17 @@ pub fn present() -> bool {
     READY.load(Ordering::Relaxed)
 }
 
+/// Эта ли машина — наша (разведка сошлась, регистры найдены). ОТДЕЛЬНО от [`present`], и
+/// разделение куплено дорого: `present` означает «работает двойная буферизация», а её
+/// рисующий может выключить сам ([`to_single`]). До Вехи 244.4 на этом же флаге висели
+/// подсветка, аппаратный курсор и — главное — подъём панели после сна. Стоило композитору
+/// один раз сказать «вернусь к одному буферу» (а он говорит это всякий раз, когда экран
+/// гаснет на время модсета), как ядро начинало считать, что графики Intel тут нет вовсе:
+/// после сна панель не поднимал никто.
+pub fn known() -> bool {
+    BAR0.load(Ordering::Relaxed) != 0
+}
+
 /// Шаг между буферами в байтах (0 — буфер один).
 pub fn step() -> usize {
     if present() { STEP.load(Ordering::Relaxed) } else { 0 }
@@ -476,7 +487,7 @@ pub fn to_front() {
 ///
 /// `saved` — яркость, снятая перед сном ([`backlight`]).
 pub fn resume(saved: Option<u32>) {
-    if !present() {
+    if !known() {
         return;
     }
     let conf = rd(reg::PIPEACONF);
@@ -528,7 +539,7 @@ pub fn resume(saved: Option<u32>) {
 
 /// Есть ли аппаратный курсор.
 pub fn cursor_present() -> bool {
-    present() && CURSOR_OFF.load(Ordering::Relaxed) != 0
+    known() && CURSOR_OFF.load(Ordering::Relaxed) != 0
 }
 
 /// Положить картинку курсора: `px` — 64×64 точки в формате `0xAARRGGBB`.
@@ -698,7 +709,7 @@ fn try_native_mode(width: usize, height: usize) -> Option<(usize, usize, usize)>
 /// `None` — машина не та, где мы знаем раскладку этих регистров (см. [`generation`]), либо
 /// период ШИМ нулевой: тогда подсветкой правит не эта пара регистров, и писать наугад нельзя.
 pub fn backlight() -> Option<u32> {
-    if !present() {
+    if !known() {
         return None;
     }
     let period = rd(reg::BLC_PCH_CTL2) >> 16;
@@ -716,7 +727,7 @@ pub fn backlight() -> Option<u32> {
 /// панель, и менять частоту мерцания вслепую незачем. Ниже пяти процентов не ставим совсем: ноль
 /// это чёрный экран на машине, где экран единственный способ что-то увидеть.
 pub fn backlight_set(percent: u32) -> Option<u32> {
-    if !present() {
+    if !known() {
         return None;
     }
     let period = rd(reg::BLC_PCH_CTL2) >> 16;
@@ -744,13 +755,19 @@ pub fn latched() -> bool {
     if !present() {
         return true;
     }
+    // Пока идёт модсет, экран не показывает ничего, и переключения страниц, разумеется, не
+    // защёлкиваются. Сказать об этом рисующему — значит получить отказ от двойной
+    // буферизации насовсем: композитор решит, что железо сломалось.
+    if crate::intel_modeset::busy() {
+        return true;
+    }
     let shown = SHOWN.load(Ordering::Relaxed) * STEP.load(Ordering::Relaxed);
     live() == shown as u32
 }
 
 /// Счётчик кадров развёртки — им меряется НАСТОЯЩИЙ ритм экрана, а не наш расчётный.
 pub fn vblank_count() -> u32 {
-    if present() { rd(reg::FRMCOUNT) } else { 0 }
+    if known() { rd(reg::FRMCOUNT) } else { 0 }
 }
 
 /// Что развёртка читает прямо сейчас. В отличие от регистра поверхности, где лежит ОЖИДАЮЩЕЕ

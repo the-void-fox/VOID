@@ -285,6 +285,15 @@ static SNAP: SpinLock<Option<Snap>> = SpinLock::new(None);
 /// место зависания пришлось угадывать.
 static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Идёт ли прямо сейчас модсет. Пока идёт, экран не показывает ничего, и рисующему незачем
+/// считать это поломкой: иначе композитор видит, что переключения страниц не защёлкиваются,
+/// и уходит на один буфер — насовсем, до перезапуска.
+static BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn busy() -> bool {
+    BUSY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_trace(on: bool) {
     TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
 }
@@ -386,7 +395,7 @@ fn wait_frame() {
 /// родной размер панели: восстанавливать надо то, в чём система живёт, а не то, что оставил
 /// загрузчик.
 pub fn snapshot() {
-    if !crate::intel_fb::present() {
+    if !crate::intel_fb::known() {
         return;
     }
     let s = Snap {
@@ -627,6 +636,13 @@ fn fdi_normal(s: &Snap) {
 /// Порядок — `ilk_crtc_enable` + `ilk_pch_enable` из i915, с той разницей, что все значения
 /// берутся из снимка, а не вычисляются.
 pub fn enable() -> bool {
+    BUSY.store(true, core::sync::atomic::Ordering::Relaxed);
+    let r = enable_inner();
+    BUSY.store(false, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+fn enable_inner() -> bool {
     let Some(s) = *SNAP.lock() else {
         crate::println!("  [intel] поднять панель нечем: снимка режима нет");
         return false;
@@ -838,7 +854,13 @@ pub fn enable() -> bool {
 /// Погасить панель и всю цепь — обратным порядком. Нужна для ПРОВЕРКИ модсета на живой машине
 /// без сна: `intel off` гасит, `intel on` поднимает, и видно сразу, работает ли наша цепочка.
 pub fn disable() {
-    if !crate::intel_fb::present() {
+    BUSY.store(true, core::sync::atomic::Ordering::Relaxed);
+    disable_inner();
+    BUSY.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn disable_inner() {
+    if !crate::intel_fb::known() {
         return;
     }
     // Порядок — `ilk_crtc_disable`, и он не зеркальный: конвейер процессора гасится РАНЬШЕ
