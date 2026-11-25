@@ -404,6 +404,32 @@ pub unsafe fn mark(y: usize, h: usize, color: u32) -> bool {
     true
 }
 
+/// Залить ЦЕЛЫЙ буфер кадра цветом. `off` — смещение буфера в байтах (0 — первый).
+///
+/// Опыт, который нельзя истолковать двояко: если экран становится этого цвета, значит
+/// развёртка читает именно эту память. Полоса в восемь строк такого ответа не дала —
+/// её могло не быть видно по доброму десятку причин.
+///
+/// # Safety
+/// Пишет в окно кадра на `h` строк от начала буфера.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub unsafe fn fill_buffer(off: usize, color: u32) -> bool {
+    let base = BASE.load(Ordering::Relaxed);
+    let (w, h) = (PIX_W.load(Ordering::Relaxed), PIX_H.load(Ordering::Relaxed));
+    let (pitch, bpp) = (PITCH.load(Ordering::Relaxed), BYTES_PP.load(Ordering::Relaxed));
+    if base == 0 || w == 0 || bpp != 4 {
+        return false;
+    }
+    for y in 0..h {
+        let line = base + off + y * pitch;
+        for x in 0..w {
+            unsafe { core::ptr::write_volatile((line + x * bpp) as *mut u32, color) };
+        }
+    }
+    unsafe { core::arch::asm!("sfence", options(nostack, nomem)) };
+    true
+}
+
 /// Записать метку в первую точку кадра и прочитать её обратно ТЕМ ЖЕ путём.
 ///
 /// Отвечает тем, что прочиталось. Расхождение значит, что запись в кадр не доходит до памяти

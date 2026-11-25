@@ -631,6 +631,20 @@ pub fn resume(saved: Option<u32>) {
         crate::println!("  [intel] конфигурация графики не восстановлена — в кадр не пишем");
         return;
     }
+    // ОПЫТ НА ТРИ ОТВЕТА. Красим первый буфер красным, второй синим и держим две секунды.
+    // Экран красный — развёртка читает первый буфер, путь записи цел, и виноват рисующий.
+    // Экран синий — читает ВТОРОЙ, то есть наш учёт страниц разошёлся с железом.
+    // Ни то ни другое — развёртка читает вообще не нашу память, и искать надо там.
+    let step = STEP.load(Ordering::Relaxed);
+    let red = unsafe { crate::fb::fill_buffer(0, 0x00ff_0000) };
+    let blue = step != 0 && unsafe { crate::fb::fill_buffer(step, 0x0000_00ff) };
+    crate::println!(
+        "  [intel] проба цветом: первый буфер красный ({red}), второй синий ({blue}, смещение {step:#x}) — держу две секунды",
+    );
+    let until = arch::now_ticks() + crate::clock::ns_to_ticks(2_000_000_000);
+    while arch::now_ticks() < until {
+        core::hint::spin_loop();
+    }
     unsafe { crate::fb::mark(96, 8, 0x00ff_ffff) };
     // И проба памяти: записать метку в кадр и прочитать её обратно тем же путём.
     //
