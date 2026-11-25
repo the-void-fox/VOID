@@ -371,6 +371,11 @@ static inline size_t vsys_netdev_tx_pop(uintptr_t cap, void *buf, size_t len) {
     uintptr_t n = vsys(SYS_NETDEV, cap, 2, (uintptr_t)buf, len, 0, 0, 0);
     return n == (uintptr_t)-1 ? 0 : (size_t)n;
 }
+/* op 4 — теряло ли устройство питание (сон S3) с прошлого вопроса. Ответ одноразовый:
+ * спросил — забрал. Драйверу это значит «поднимай карту заново, как при загрузке». */
+static inline int vsys_netdev_power_lost(uintptr_t cap) {
+    return (int)vsys(SYS_NETDEV, cap, 4, 0, 0, 0, 0, 0) == 1;
+}
 /* op 3 — отсоединиться: картой системы мы больше не являемся. */
 static inline void vsys_netdev_detach(uintptr_t cap) {
     vsys(SYS_NETDEV, cap, 3, 0, 0, 0, 0, 0);

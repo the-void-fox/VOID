@@ -721,6 +721,29 @@ void lx_net_pulse(unsigned long now_jiffies)
 	 * частить ему нечем; важнее успеть сказать между командой и взглядом в журнал. */
 	next = now_jiffies + 2 * HZ;
 
+	/* Веха 245 — ПОСЛЕ СНА КАРТУ НАДО ПОДНЯТЬ ЗАНОВО. Сон снимает питание со всех устройств:
+	 * кольца дескрипторов, адреса DMA, маска прерываний, настройка MAC — всё это у карты
+	 * обнуляется, и дальше она исправно принимает кадры на отправку и не принимает ни одного
+	 * с провода. Ядро чинит так же диск и USB, но сетевую карту чинить ему нечем: драйвер —
+	 * отдельный процесс, и лезть в его внутренности ядро не должно.
+	 *
+	 * Поэтому ядро только ставит отметку, а поднимаемся мы сами и тем же путём, что при
+	 * загрузке: `ndo_stop`, затем `ndo_open`. Это ровно то, что делает Linux в своём
+	 * `atl1c_resume`. */
+	if (vsys_netdev_power_lost(lx_netdev_cap)) {
+		const struct net_device_ops *ops = lx_netdev_dev->netdev_ops;
+		int err;
+
+		printk("[lx_net] устройство теряло питание — поднимаю карту заново\n");
+		if (ops && ops->ndo_stop)
+			ops->ndo_stop(lx_netdev_dev);
+		lx_netdev_dev->flags &= ~IFF_UP;
+		err = lx_netdev_open(lx_netdev_dev);
+		printk("[lx_net] после сна ndo_open вернул %d, несущая %s\n", err,
+		       netif_carrier_ok(lx_netdev_dev) ? "ЕСТЬ" : "нет (ждём согласования)");
+		return;
+	}
+
 	talking = lx_tx_frames != seen_tx;  /* с прошлого раза мы что-то отправляли */
 	deaf    = lx_rx_frames == seen_rx;  /* и не приняли ничего */
 	seen_tx = lx_tx_frames;

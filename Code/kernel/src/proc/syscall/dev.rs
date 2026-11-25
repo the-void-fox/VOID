@@ -261,6 +261,9 @@ pub(super) fn dispatch(t: &mut Table, cur: usize, num: usize) -> bool {
                         crate::net::ext_detach(leader);
                         0
                     }
+                    // Веха 245 — op 4: «теряло ли устройство питание?». Спрашивает драйвер,
+                    // отметку ставит сон. Ответ одноразовый: спросил — забрал.
+                    4 => usize::from(crate::net::take_power_lost()),
                     _ => usize::MAX,
                 },
                 Ok(_) => usize::MAX,
