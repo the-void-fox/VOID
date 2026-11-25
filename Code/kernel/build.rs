@@ -210,6 +210,19 @@ fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
         let var = name.to_uppercase().replace('-', "_");
         let src = staged.join(name);
         let path = if src.is_file() {
+            // ВЫЛОЖЕН, НО УСТАРЕЛ? Бинари C-программ в репозиторий не кладутся: каждый
+            // собирает их у себя (`stage-drivers.sh`). Значит правка исходника может
+            // спокойно НЕ ДОЕХАТЬ до образа — собирается-то готовый бинарь. Один раз это уже
+            // стоило целого захода на живой машине: ядро научилось говорить драйверу
+            // «устройство теряло питание», драйвер этого не умел, и выглядело как «починка
+            // не работает». Поэтому сверяем время: исходник новее бинаря — останавливаем
+            // сборку и говорим, что делать.
+            if let Some(newer) = newer_source(kernel_dir, name, &src) {
+                panic!(
+                    "C-программа {name} ({arch}) собрана РАНЬШЕ своего исходника                      ({}) — образ взял бы старый бинарь. Соберите: Code/tools/stage-drivers.sh",
+                    newer.display(),
+                );
+            }
             src
         } else {
             // Пустой файл-заглушка: `include_bytes!` нужен путь, существующий во время сборки,
@@ -229,6 +242,31 @@ fn stage_c_drivers(kernel_dir: &PathBuf, arch: &str) {
     }
     table.push_str("];\n");
     std::fs::write(out_dir.join("c_drivers.rs"), table).expect("не записать таблицу драйверов");
+}
+
+/// Есть ли исходник C-программы НОВЕЕ её выложенного бинаря. Смотрим и наши файлы рядом с
+/// шимом, и сам шим: драйвер собирается из них вместе с неизменёнными файлами ядра Linux,
+/// а те лежат в nix-сторе и меняться не могут.
+fn newer_source(kernel_dir: &std::path::Path, name: &str, bin: &std::path::Path) -> Option<std::path::PathBuf> {
+    let built = std::fs::metadata(bin).ok()?.modified().ok()?;
+    let programs = kernel_dir.parent()?.join("programs");
+    let dirs = [programs.join("lx-linux"), programs.join(name.to_string())];
+    for dir in dirs.iter().filter(|d| d.is_dir()) {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            let is_src = path
+                .extension()
+                .is_some_and(|e| e == "c" || e == "h");
+            if !is_src {
+                continue;
+            }
+            println!("cargo:rerun-if-changed={}", path.display());
+            if entry.metadata().ok()?.modified().ok()? > built {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Веха 19.1/23 — собрать userspace-программы (крейт `programs/user`: библиотека шимов + все
