@@ -93,18 +93,52 @@ const HDR: usize = 16;
 ///
 /// Зовётся на загрузке, сразу как стали известны регионы RAM. `va` — начало отрезанного куска
 /// в прямой карте, `len` — его длина (шапка плюс кольцо).
+/// Найти зеркало ПРОШЛОЙ жизни. Сперва там, куда положили сейчас, затем по страницам рядом:
+/// пересборка ядра сдвигает место, а журнал от этого терять нельзя.
+fn find_prev(va: usize) -> Option<usize> {
+    const STEP: usize = 4096;
+    const REACH: usize = 512; // по два мегабайта в каждую сторону
+    unsafe {
+        if core::ptr::read_volatile(va as *const u64) == MAGIC {
+            return Some(va);
+        }
+        for i in 1..=REACH {
+            for cand in [va + i * STEP, va.wrapping_sub(i * STEP)] {
+                // Вниз — не дальше, чем на отведённые два мегабайта, и не в нулевые адреса:
+                // там прямой карты может не быть вовсе.
+                if cand < STEP {
+                    continue;
+                }
+                if core::ptr::read_volatile(cand as *const u64) == MAGIC
+                    && core::ptr::read_volatile((cand + 8) as *const u64) as usize <= CAP
+                {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn adopt_persistent(va: usize, len: usize) {
     if len < HDR + CAP {
         return;
     }
+    // ГДЕ ИСКАТЬ ПРОШЛЫЙ ЖУРНАЛ. Зеркало лежит сразу за образом ядра, а образ от сборки к
+    // сборке меняет размер — значит после пересборки место уезжает, и прошлый журнал
+    // оказывается «ничей». Ровно так он и пропал у владельца в самый нужный заход.
+    //
+    // Поэтому ищем отметку рядом: страница за страницей на два мегабайта вниз и вверх. Это
+    // тысяча чтений, то есть ничто, а взамен журнал переживает пересборку ядра.
+    let src = find_prev(va).unwrap_or(va);
     unsafe {
-        let magic = core::ptr::read_volatile(va as *const u64);
-        let written = core::ptr::read_volatile((va + 8) as *const u64) as usize;
+        let magic = core::ptr::read_volatile(src as *const u64);
+        let written = core::ptr::read_volatile((src + 8) as *const u64) as usize;
         if magic == MAGIC && written > 0 {
             // Прошлая жизнь оставила журнал — снять его, пока не затёрли своим.
             let have = written.min(CAP);
             let start = written - have;
-            let ring = (va + HDR) as *const u8;
+            let ring = (src + HDR) as *const u8;
             let prev = &raw mut PREV as *mut u8;
             for i in 0..have {
                 core::ptr::write(prev.add(i), core::ptr::read_volatile(ring.add((start + i) % CAP)));
