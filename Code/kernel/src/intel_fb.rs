@@ -177,6 +177,67 @@ fn rd(off: usize) -> u32 {
 
 /// Разобрать запись таблицы GTT шестого поколения: 4 байта, бит 0 — годна, биты 31:12 —
 /// страница, биты 11:4 — её старшие биты (адреса выше 4 ГиБ).
+/// Сколько записей таблицы отображения храним. Хватает на оба кадра, курсор и запас:
+/// 4096 страниц — это 16 МиБ видеопамяти при наших 8,4 МиБ под два кадра.
+const GTT_SNAP: usize = 4096;
+
+/// Снимок таблицы отображения графики, снятый на загрузке.
+///
+/// **Зачем.** Таблица переводит смещение кадра в НАСТОЯЩИЕ страницы памяти, и живёт она в
+/// украденной памяти, которую сон обязан сохранить. Обязан — но у владельца после
+/// пробуждения экран чёрный, а редкие точки стоят ровной решёткой с одинаковыми пропусками:
+/// так выглядит ОДНА повторяющаяся страница почти-нулей вместо кадра. То есть развёртка
+/// читает не туда, и переводить ей нечем (Веха 244.7).
+static GTT_SAVED: crate::sync::SpinLock<[u32; GTT_SNAP]> =
+    crate::sync::SpinLock::new([0; GTT_SNAP]);
+static GTT_HAVE: AtomicBool = AtomicBool::new(false);
+
+fn gtt_raw(idx: usize) -> u32 {
+    arch::hw_read32(BAR0.load(Ordering::Relaxed) + GTT_OFF.load(Ordering::Relaxed) + idx * 4)
+}
+
+fn gtt_write(idx: usize, v: u32) {
+    arch::hw_write32(BAR0.load(Ordering::Relaxed) + GTT_OFF.load(Ordering::Relaxed) + idx * 4, v);
+}
+
+/// Снять таблицу отображения. Зовётся на загрузке, когда она заведомо верна.
+pub fn gtt_snapshot() {
+    if !known() {
+        return;
+    }
+    let mut g = GTT_SAVED.lock();
+    for (i, slot) in g.iter_mut().enumerate() {
+        *slot = gtt_raw(i);
+    }
+    GTT_HAVE.store(true, Ordering::Relaxed);
+}
+
+/// Сверить таблицу с загрузкой и вернуть, если разошлась. Отвечает числом исправленных записей.
+pub fn gtt_restore() -> usize {
+    if !known() || !GTT_HAVE.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let g = GTT_SAVED.lock();
+    let mut bad = 0;
+    let mut first = usize::MAX;
+    for (i, want) in g.iter().enumerate() {
+        if gtt_raw(i) != *want {
+            gtt_write(i, *want);
+            if first == usize::MAX {
+                first = i;
+            }
+            bad += 1;
+        }
+    }
+    if bad > 0 {
+        crate::println!(
+            "  [intel] таблица отображения после сна разошлась: {bad} записей из {GTT_SNAP}, \
+             первая №{first} — вернули из снимка",
+        );
+    }
+    bad
+}
+
 fn gtt_page(idx: usize) -> Option<u64> {
     let pte = arch::hw_read32(BAR0.load(Ordering::Relaxed) + GTT_OFF.load(Ordering::Relaxed) + idx * 4);
     // Все единицы — это не отображение, а непрограммированная память: бит годности там тоже
@@ -529,6 +590,16 @@ pub fn resume(saved: Option<u32>) {
     match gtt_page(0) {
         Some(page) => crate::println!("  [intel] после сна GTT №0 → страница {page:#x}"),
         None => crate::println!("  [intel] после сна таблица GTT пуста — кадр читать неоткуда"),
+    }
+    // Проверить и вернуть ВСЮ таблицу, а не одну запись: запись №0 может уцелеть, а
+    // остальные — нет, и тогда развёртка читает одну и ту же чужую страницу вместо кадра.
+    gtt_restore();
+    // Отметка об ошибке перевода адреса: если развёртка ходила по несуществующей записи
+    // таблицы, здесь стоит не ноль — и гадать больше не о чем.
+    let err = arch::hw_read32(BAR0.load(Ordering::Relaxed) + 0x2024);
+    if err != 0 {
+        crate::println!("  [intel] железо жалуется на перевод адреса: PGTBL_ER {err:#010x}");
+        arch::hw_write32(BAR0.load(Ordering::Relaxed) + 0x2024, err);
     }
     if conf & (1 << 31) == 0 || cntr & (1 << 31) == 0 {
         // Веха 244 — конвейер после сна мёртв. Раньше здесь всё и кончалось; теперь пробуем

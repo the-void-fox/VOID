@@ -597,6 +597,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // пробуждению: видео-BIOS на машине владельца панель не возвращает, и поднимать
             // её придётся этими числами ([[intel-display]]).
             intel_modeset::snapshot();
+            intel_fb::gtt_snapshot();
         }
     }
     // Веха 86 — часы: спросить у платформы настенное время (CMOS RTC на x86, goldfish-rtc из DTB
